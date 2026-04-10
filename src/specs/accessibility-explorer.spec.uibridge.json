@@ -722,10 +722,374 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "disconnected",
+        "name": "Disconnected",
+        "description": "The initial state when the page loads. The header with 'Accessibility Explorer' title and 'Disconnected' badge is visible, the connection bar with target input and Connect button is shown, and the main area displays the empty-state message 'Connect to an application to explore its accessibility tree'. No tree, details, stats bar, or bottom tabs are visible.",
+        "elements": [
+          { "textContains": "Accessibility Explorer" },
+          { "textContains": "Disconnected" },
+          { "placeholder": "Window title, pid:1234, or 'Desktop'" },
+          { "textContains": "Connect" },
+          { "textContains": "Connect to an application" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "disconnected-to-connecting",
+            "name": "User clicks Connect or presses Enter with a non-empty target",
+            "activateStates": ["connecting"],
+            "deactivateStates": ["disconnected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "Window title, pid:1234, or 'Desktop'" },
+                "value": "Notepad"
+              },
+              {
+                "action": "click",
+                "target": { "textContains": "Connect" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "connecting",
+        "name": "Connecting",
+        "description": "The Connect button shows 'Connecting...' while the a11y_connect and a11y_capture Tauri commands are in flight. The target input remains visible but the user cannot submit again until the attempt resolves.",
+        "elements": [{ "textContains": "Connecting" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "connecting-to-connected",
+            "name": "Connection and tree capture succeed",
+            "activateStates": ["connected-no-selection"],
+            "deactivateStates": ["connecting"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "connecting-to-connection-error",
+            "name": "Connection fails (target not found or backend error)",
+            "activateStates": ["connection-error"],
+            "deactivateStates": ["connecting"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "connection-error",
+        "name": "Connection Error",
+        "description": "The connection attempt failed. The page remains in disconnected layout but a red error message appears below the connection bar with the error text. The target input and Connect button remain available for retry.",
+        "elements": [
+          { "textContains": "Accessibility Explorer" },
+          { "placeholder": "Window title, pid:1234, or 'Desktop'" },
+          { "textContains": "Connect" },
+          { "selector": ".text-red-400" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "connection-error-to-connecting",
+            "name": "User retries connection with a new or same target",
+            "activateStates": ["connecting"],
+            "deactivateStates": ["connection-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Connect" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "connected-no-selection",
+        "name": "Connected (No Selection)",
+        "description": "Successfully connected to a target. The status badge shows the backend name (e.g., 'UIA'). The connection bar is hidden; Refresh and Disconnect buttons appear in the header. The stats bar shows node count, interactive count, and generation number. The two-column layout is visible: the tree view on the left with expandable nodes, and the details panel on the right showing 'Select a node to view details'. The bottom Query and AI Context tabs are available.",
+        "elements": [
+          { "textContains": "Tree View" },
+          { "textContains": "Details" },
+          { "textContains": "Select a node to view details" },
+          { "textContains": "nodes" },
+          { "textContains": "Refresh" },
+          { "textContains": "Disconnect" },
+          { "role": "tab", "textContains": "Query" },
+          { "role": "tab", "textContains": "AI Context" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "connected-to-node-selected",
+            "name": "User clicks a tree node",
+            "activateStates": ["connected-node-selected"],
+            "deactivateStates": ["connected-no-selection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "treeitem" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "connected-no-selection-to-refreshing",
+            "name": "User clicks Refresh to re-capture the tree",
+            "activateStates": ["refreshing"],
+            "deactivateStates": ["connected-no-selection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Refresh" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "connected-no-selection-to-disconnected",
+            "name": "User clicks Disconnect",
+            "activateStates": ["disconnected"],
+            "deactivateStates": ["connected-no-selection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Disconnect" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "refreshing",
+        "name": "Refreshing Tree",
+        "description": "The Refresh button's icon is spinning while a11y_capture re-captures the accessibility tree. The tree view and stats bar remain visible but will be replaced when the capture completes.",
+        "elements": [{ "textContains": "Tree View" }, { "textContains": "Refresh" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "refreshing-to-connected-no-selection",
+            "name": "Tree capture completes successfully",
+            "activateStates": ["connected-no-selection"],
+            "deactivateStates": ["refreshing"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "connected-node-selected",
+        "name": "Connected (Node Selected)",
+        "description": "A tree node is selected (highlighted with primary ring). The details panel shows the selected node's properties organized in sections: Identity (Role, Name, Value, Description, Ref ID with copy button, Source), Bounds (x, y, width, height), State (green/outline badges), Supported Patterns (purple badges), and Actions (Click, Focus, Type buttons). The tree view, stats bar, Refresh, and Disconnect buttons remain visible.",
+        "elements": [
+          { "textContains": "Tree View" },
+          { "textContains": "Details" },
+          { "textContains": "Ref ID" },
+          { "textContains": "Click" },
+          { "textContains": "Focus" },
+          { "textContains": "Type" },
+          { "textContains": "Refresh" },
+          { "textContains": "Disconnect" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "node-selected-to-different-node",
+            "name": "User clicks a different tree node",
+            "activateStates": ["connected-node-selected"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "treeitem" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "node-selected-click-action",
+            "name": "User clicks the Click action button",
+            "activateStates": ["action-result"],
+            "deactivateStates": ["connected-node-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Click" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "node-selected-focus-action",
+            "name": "User clicks the Focus action button",
+            "activateStates": ["action-result"],
+            "deactivateStates": ["connected-node-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Focus" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "node-selected-to-typing",
+            "name": "User clicks the Type... button to reveal the text input",
+            "activateStates": ["typing-action"],
+            "deactivateStates": ["connected-node-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Type" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "node-selected-to-refreshing",
+            "name": "User clicks Refresh to re-capture the tree",
+            "activateStates": ["refreshing"],
+            "deactivateStates": ["connected-node-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Refresh" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "node-selected-to-disconnected",
+            "name": "User clicks Disconnect",
+            "activateStates": ["disconnected"],
+            "deactivateStates": ["connected-node-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Disconnect" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "typing-action",
+        "name": "Typing Action Input",
+        "description": "The Type... button was clicked and a text input field with a Send button is now visible below the action buttons. The user can enter text and press Send or Enter to invoke a11y_type_text. The rest of the connected+selected UI remains visible.",
+        "elements": [
+          { "textContains": "Details" },
+          { "textContains": "Ref ID" },
+          { "textContains": "Send" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "typing-to-action-result",
+            "name": "User enters text and clicks Send or presses Enter",
+            "activateStates": ["action-result"],
+            "deactivateStates": ["typing-action"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Send" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "action-result",
+        "name": "Action Result Displayed",
+        "description": "An action (Click, Focus, or Type) has been executed and the result message is shown inline below the action buttons. A green message ('Action succeeded') on success or a red message with the error text on failure. The node remains selected. Selecting a different node clears this message and returns to the connected-node-selected state.",
+        "elements": [
+          { "textContains": "Details" },
+          { "textContains": "Ref ID" },
+          { "textContains": "Click" },
+          { "textContains": "Focus" },
+          { "textContains": "Type" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "action-result-to-node-selected",
+            "name": "User selects a different tree node, clearing the action message",
+            "activateStates": ["connected-node-selected"],
+            "deactivateStates": ["action-result"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "treeitem" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "action-result-click-again",
+            "name": "User executes another Click action on the same node",
+            "activateStates": ["action-result"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Click" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "action-result-to-disconnected",
+            "name": "User clicks Disconnect",
+            "activateStates": ["disconnected"],
+            "deactivateStates": ["action-result"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Disconnect" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "AccessibilityExplorer",
     "author": "Qontinui",
     "pageUrl": "/accessibility-explorer",
-    "tags": ["accessibility", "debug", "automation", "native", "UIA", "AT-SPI", "AX", "tree-view", "inspector"]
+    "tags": [
+      "accessibility",
+      "debug",
+      "automation",
+      "native",
+      "UIA",
+      "AT-SPI",
+      "AX",
+      "tree-view",
+      "inspector"
+    ]
   }
 }

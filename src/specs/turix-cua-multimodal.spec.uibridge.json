@@ -744,6 +744,230 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "ai-settings-loading",
+        "name": "AI Settings — Loading",
+        "description": "The Settings > AI page is loading AI configuration from the Rust backend via the get_ai_settings Tauri IPC command. A loading indicator is shown while data is fetched.",
+        "elements": [{ "textContent": "Loading AI settings..." }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-provider-selection",
+            "name": "Settings loaded",
+            "description": "AI settings loaded successfully from the backend, displaying the provider selection panel with four provider options",
+            "activateStates": ["ai-settings-provider-selection"],
+            "deactivateStates": ["ai-settings-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Load failed",
+            "description": "Settings failed to load from the backend, showing an error message",
+            "activateStates": ["ai-settings-error"],
+            "deactivateStates": ["ai-settings-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "ai-settings-provider-selection",
+        "name": "AI Settings — Provider Selection",
+        "description": "The AI settings page is loaded with the provider selection panel showing four options: Claude Code CLI, Claude API, Gemini CLI, and Gemini API. The currently selected provider's configuration section is expanded. The Test Connection and Save buttons are available.",
+        "elements": [
+          { "textContent": "Claude Code CLI" },
+          { "textContent": "Save AI Settings" },
+          { "textContent": "Test Connection" }
+        ],
+        "transitions": [
+          {
+            "id": "provider-to-testing",
+            "name": "Test connection",
+            "description": "User clicks the Test Connection button, triggering a connection verification against the selected provider",
+            "activateStates": ["ai-settings-testing"],
+            "deactivateStates": ["ai-settings-provider-selection"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "provider-to-saving",
+            "name": "Save settings",
+            "description": "User clicks Save AI Settings, persisting the configuration to the Rust backend",
+            "activateStates": ["ai-settings-saving"],
+            "deactivateStates": ["ai-settings-provider-selection"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "ai-settings-testing",
+        "name": "AI Settings — Testing Connection",
+        "description": "A connection test is in progress. The Test Connection button shows a loading spinner with 'Testing...' text. The test calls test_ai_connection via Tauri IPC.",
+        "elements": [{ "textContent": "Testing..." }],
+        "transitions": [
+          {
+            "id": "testing-to-provider",
+            "name": "Test completes",
+            "description": "The connection test finishes (success or failure), displaying the result inline and returning to the provider selection state",
+            "activateStates": ["ai-settings-provider-selection"],
+            "deactivateStates": ["ai-settings-testing"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "ai-settings-saving",
+        "name": "AI Settings — Saving",
+        "description": "Settings are being persisted to the backend. The Save button shows a loading spinner with 'Saving...' text.",
+        "elements": [{ "textContent": "Saving..." }],
+        "transitions": [
+          {
+            "id": "saving-to-saved",
+            "name": "Save succeeds",
+            "description": "Settings saved successfully, showing a success banner and the Saved! button state",
+            "activateStates": ["ai-settings-saved"],
+            "deactivateStates": ["ai-settings-saving"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "saving-to-error",
+            "name": "Save fails",
+            "description": "Save operation fails, showing an error message",
+            "activateStates": ["ai-settings-error"],
+            "deactivateStates": ["ai-settings-saving"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "ai-settings-saved",
+        "name": "AI Settings — Saved Successfully",
+        "description": "Settings were saved successfully. A green success banner with 'Settings saved successfully!' is displayed. The save button shows 'Saved!' with a check icon. This state auto-transitions after 3 seconds.",
+        "elements": [{ "textContent": "Settings saved successfully!" }],
+        "transitions": [
+          {
+            "id": "saved-to-provider",
+            "name": "Success banner dismisses",
+            "description": "The success banner auto-dismisses after 3 seconds, returning to the normal provider selection state",
+            "activateStates": ["ai-settings-provider-selection"],
+            "deactivateStates": ["ai-settings-saved"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "ai-settings-error",
+        "name": "AI Settings — Error",
+        "description": "An error occurred during loading or saving. A red error banner is displayed with the error message. The user can still interact with the provider selection controls.",
+        "elements": [{ "textContains": "Failed to" }],
+        "transitions": [
+          {
+            "id": "error-to-provider",
+            "name": "User interacts with settings",
+            "description": "User modifies a setting or retries, clearing the error state",
+            "activateStates": ["ai-settings-provider-selection"],
+            "deactivateStates": ["ai-settings-error"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "run-active-iterating",
+        "name": "Active Run — Iterating",
+        "description": "An agentic verification workflow is currently running. The active dashboard shows live iteration progress with the current phase (verifying/working) and iteration count incrementing in real time. A Stop button is available to halt execution.",
+        "elements": [{ "textContains": "iteration" }, { "role": "button", "textContains": "Stop" }],
+        "transitions": [
+          {
+            "id": "iterating-to-goal-achieved",
+            "name": "Goal achieved",
+            "description": "The verification agent reports Pass with sufficient confidence for the required consecutive passes, and the loop exits successfully",
+            "activateStates": ["run-complete-success"],
+            "deactivateStates": ["run-active-iterating"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "iterating-to-max-iterations",
+            "name": "Max iterations reached",
+            "description": "The loop reaches max_iterations without achieving the goal",
+            "activateStates": ["run-complete-max-iterations"],
+            "deactivateStates": ["run-active-iterating"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "iterating-to-stopped",
+            "name": "User stops run",
+            "description": "User clicks the Stop button, halting the run after the current iteration completes",
+            "activateStates": ["run-complete-stopped"],
+            "deactivateStates": ["run-active-iterating"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "run-complete-success",
+        "name": "Run Complete — Goal Achieved",
+        "description": "The agentic verification run completed successfully with goal_achieved:true. The run summary shows a green success indicator, iteration results with verdicts and confidence percentages, worker summaries, and token usage. A Continue button allows adding more sessions.",
+        "elements": [{ "textContains": "Goal Achieved" }],
+        "transitions": [
+          {
+            "id": "success-to-continue",
+            "name": "Continue run",
+            "description": "User clicks the Continue button to add more sessions to the completed run",
+            "activateStates": ["run-active-iterating"],
+            "deactivateStates": ["run-complete-success"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "run-complete-max-iterations",
+        "name": "Run Complete — Max Iterations Reached",
+        "description": "The run completed by hitting max_iterations without achieving the goal. The status shows 'Max iterations reached' or similar. The final verdict is typically Fail or Partial. A Continue button allows adding more sessions.",
+        "elements": [{ "textContains": "Max Iterations Reached" }],
+        "transitions": [
+          {
+            "id": "max-iter-to-continue",
+            "name": "Continue run",
+            "description": "User clicks the Continue button to add more sessions to the exhausted run",
+            "activateStates": ["run-active-iterating"],
+            "deactivateStates": ["run-complete-max-iterations"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "run-complete-stopped",
+        "name": "Run Complete — Stopped by User",
+        "description": "The run was stopped by the user. The status indicates the run was stopped and shows iterations completed before the stop. A Continue button allows resuming.",
+        "elements": [{ "textContains": "Stopped" }],
+        "transitions": [
+          {
+            "id": "stopped-to-continue",
+            "name": "Continue run",
+            "description": "User clicks the Continue button to resume the stopped run",
+            "activateStates": ["run-active-iterating"],
+            "deactivateStates": ["run-complete-stopped"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "TuriXCUAMultimodalPipeline",
     "pageUrl": "/settings-ai",

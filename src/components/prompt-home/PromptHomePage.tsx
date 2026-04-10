@@ -9,19 +9,11 @@ const EXPLAIN_KEY = "prompt-home-explain";
 
 export function PromptHomePage() {
   const [input, setInput] = useState("");
-  const [explain, setExplain] = useState(
-    () => instanceStorage.getItem(EXPLAIN_KEY) === "true",
-  );
+  const [explain, setExplain] = useState(() => instanceStorage.getItem(EXPLAIN_KEY) === "true");
   const inputRef = useRef<HTMLInputElement>(null);
   const { phase, plan, progress, error, submit, reset } = usePromptExecution();
 
-  useExplainModeTutorial(
-    explain,
-    phase,
-    progress,
-    plan?.steps,
-    plan?.summary,
-  );
+  useExplainModeTutorial(explain, phase, progress, plan?.steps, plan?.summary);
 
   useEffect(() => {
     instanceStorage.setItem(EXPLAIN_KEY, String(explain));
@@ -94,10 +86,7 @@ export function PromptHomePage() {
             className="flex-1 bg-transparent outline-none text-base placeholder:text-muted-foreground/50"
           />
           {input.trim() && !isWorking && (
-            <button
-              type="submit"
-              className="p-1 rounded-lg hover:bg-accent transition-colors"
-            >
+            <button type="submit" className="p-1 rounded-lg hover:bg-accent transition-colors">
               <ChevronRight className="w-5 h-5 text-primary" />
             </button>
           )}
@@ -105,9 +94,7 @@ export function PromptHomePage() {
       </form>
 
       {/* Suggestions (only when idle) */}
-      {!isActive && (
-        <PromptSuggestions onSelect={handleSuggestionSelect} />
-      )}
+      {!isActive && <PromptSuggestions onSelect={handleSuggestionSelect} />}
 
       {/* Explain toggle */}
       {!isActive && (
@@ -176,10 +163,7 @@ export function PromptHomePage() {
                 <CheckCircle2 className="w-4 h-4" />
                 Done!
               </div>
-              <button
-                onClick={handleReset}
-                className="text-sm text-primary hover:underline"
-              >
+              <button onClick={handleReset} className="text-sm text-primary hover:underline">
                 Start another task
               </button>
             </div>

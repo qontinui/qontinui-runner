@@ -534,6 +534,343 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "search-idle",
+        "name": "Search Idle",
+        "description": "The unified search page is loaded with an empty input field and no results displayed. The search button is disabled because the minimum 2-character threshold has not been met.",
+        "elements": [
+          { "role": "form" },
+          { "textContent": "Search findings, fixes, rules, errors..." }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "idle-to-searching",
+            "name": "Submit search query",
+            "description": "User types 2+ characters and submits the form via Enter or the Search button, triggering the search",
+            "activateStates": ["search-searching"],
+            "deactivateStates": ["search-idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": {
+                  "role": "textbox",
+                  "textContent": "Search findings, fixes, rules, errors..."
+                },
+                "value": "test query",
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "idle-to-palette",
+            "name": "Open command palette",
+            "description": "User presses Cmd+K or Ctrl+K to open the global command palette overlay",
+            "activateStates": ["palette-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "keyboard",
+                "target": { "key": "k", "modifiers": ["Control"] },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "search-searching",
+        "name": "Search In Progress",
+        "description": "A search query has been submitted and results are being fetched. The 'Searching...' indicator is visible to provide user feedback.",
+        "elements": [{ "textContent": "Searching..." }],
+        "transitions": [
+          {
+            "id": "searching-to-results",
+            "name": "Results returned",
+            "description": "The search completes successfully with matching results, displaying the results list with entity badges and relevance scores",
+            "activateStates": ["search-results"],
+            "deactivateStates": ["search-searching"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "searching-to-no-results",
+            "name": "No results returned",
+            "description": "The search completes successfully but no entities matched the query",
+            "activateStates": ["search-no-results"],
+            "deactivateStates": ["search-searching"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "searching-to-failed",
+            "name": "Search failed",
+            "description": "The search request encountered an error during processing",
+            "activateStates": ["search-failed"],
+            "deactivateStates": ["search-searching"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "search-results",
+        "name": "Results Displayed",
+        "description": "Search results are displayed with a count header, entity type badges (finding, fix, knowledge, error, rule, workflow), titles, snippets, and relevance score percentages.",
+        "elements": [{ "textContent": "result" }, { "role": "listitem" }, { "textContent": "%" }],
+        "transitions": [
+          {
+            "id": "results-to-searching",
+            "name": "Submit new search query",
+            "description": "User modifies the query and resubmits, starting a new search",
+            "activateStates": ["search-searching"],
+            "deactivateStates": ["search-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": { "role": "textbox" },
+                "value": "new query",
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "results-to-palette",
+            "name": "Open command palette from results",
+            "description": "User presses Cmd+K or Ctrl+K to open the command palette while results are displayed",
+            "activateStates": ["palette-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "keyboard",
+                "target": { "key": "k", "modifiers": ["Control"] },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "search-no-results",
+        "name": "No Results Found",
+        "description": "The search completed but returned no matching entities. A 'No results found' message is displayed to the user.",
+        "elements": [{ "textContent": "No results found" }],
+        "transitions": [
+          {
+            "id": "no-results-to-searching",
+            "name": "Submit new search query",
+            "description": "User modifies the query and resubmits to try a different search",
+            "activateStates": ["search-searching"],
+            "deactivateStates": ["search-no-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": { "role": "textbox" },
+                "value": "different query",
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "search-failed",
+        "name": "Search Failed",
+        "description": "The search encountered an error. A 'Search failed' message is displayed to communicate the technical issue to the user.",
+        "elements": [{ "textContent": "Search failed" }],
+        "transitions": [
+          {
+            "id": "failed-to-searching",
+            "name": "Retry search",
+            "description": "User resubmits the query to retry after a failure",
+            "activateStates": ["search-searching"],
+            "deactivateStates": ["search-failed"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "palette-open",
+        "name": "Command Palette Open",
+        "description": "The command palette modal overlay is open with an auto-focused search input and an ESC hint. Before the user types 2+ characters, a minimum character hint is shown.",
+        "elements": [
+          { "role": "dialog" },
+          { "textContent": "ESC" },
+          { "textContent": "Type at least 2 characters to search" }
+        ],
+        "transitions": [
+          {
+            "id": "palette-to-palette-results",
+            "name": "Type search query in palette",
+            "description": "User types 2+ characters in the palette input, triggering inline results",
+            "activateStates": ["palette-results"],
+            "deactivateStates": ["palette-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": { "role": "textbox" },
+                "value": "test",
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "palette-to-closed-esc",
+            "name": "Close palette with Escape",
+            "description": "User presses Escape to close the command palette and clear the query",
+            "activateStates": ["search-idle"],
+            "deactivateStates": ["palette-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "keyboard",
+                "target": { "key": "Escape" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "palette-to-closed-backdrop",
+            "name": "Close palette with backdrop click",
+            "description": "User clicks outside the modal to close the command palette",
+            "activateStates": ["search-idle"],
+            "deactivateStates": ["palette-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "dialog" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "palette-results",
+        "name": "Command Palette With Results",
+        "description": "The command palette is showing inline search results as clickable buttons. Each result displays an entity icon and can be clicked to navigate.",
+        "elements": [{ "role": "button", "textContains": "result" }],
+        "transitions": [
+          {
+            "id": "palette-results-to-closed-click",
+            "name": "Click a result",
+            "description": "User clicks a search result button in the palette, closing the modal",
+            "activateStates": ["search-idle"],
+            "deactivateStates": ["palette-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "palette-results-to-closed-esc",
+            "name": "Close palette with Escape",
+            "description": "User presses Escape to close the palette and discard results",
+            "activateStates": ["search-idle"],
+            "deactivateStates": ["palette-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "keyboard",
+                "target": { "key": "Escape" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "palette-results-to-no-results",
+            "name": "Query yields no results",
+            "description": "User modifies the query and no results match, showing the no-results message in the palette",
+            "activateStates": ["palette-no-results"],
+            "deactivateStates": ["palette-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": { "role": "textbox" },
+                "value": "zzzznonexistent",
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "palette-no-results",
+        "name": "Command Palette No Results",
+        "description": "The command palette is open but the query returned no matching results. A 'No results' message is displayed within the palette.",
+        "elements": [{ "textContent": "No results" }],
+        "transitions": [
+          {
+            "id": "palette-no-results-to-results",
+            "name": "Modify query to find results",
+            "description": "User changes the query and results are now found",
+            "activateStates": ["palette-results"],
+            "deactivateStates": ["palette-no-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": { "role": "textbox" },
+                "value": "error",
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "palette-no-results-to-closed",
+            "name": "Close palette with Escape",
+            "description": "User presses Escape to close the palette",
+            "activateStates": ["search-idle"],
+            "deactivateStates": ["palette-no-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "keyboard",
+                "target": { "key": "Escape" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "UnifiedSearchPanel",
     "author": "Joshua Spinak",

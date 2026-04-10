@@ -667,5 +667,332 @@
       ],
       "source": "manual"
     }
-  ]
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "skills-loading",
+        "name": "Loading State",
+        "description": "Initial state while fetching skills from GET /skills on mount. The RefreshCw icon in the header has the animate-spin class. No skill rows or empty-state message are visible yet.",
+        "elements": [{ "role": "button", "accessibleName": "Refresh" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-empty",
+            "name": "Load completes with no auto skills",
+            "description": "The API returns successfully but no skills with source='auto' exist, showing the empty-state guidance message on the default Pending filter",
+            "activateStates": ["skills-empty"],
+            "deactivateStates": ["skills-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "No pending skills to review" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-list",
+            "name": "Load completes with skills",
+            "description": "The API returns auto-extracted skills that match the active filter, showing skill rows in the content area",
+            "activateStates": ["skills-list"],
+            "deactivateStates": ["skills-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContains": "Auto:" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "skills-empty",
+        "name": "Empty State — No Skills for Filter",
+        "description": "No auto-extracted skills match the currently active filter tab. For the Pending filter (default), the message reads 'No pending skills to review. Skills are auto-extracted when workflows succeed after complex fixes.' For other filters it reads 'No {status} skills found.' The filter tab bar and refresh button remain visible.",
+        "elements": [{ "textContains": "No pending skills to review" }],
+        "transitions": [
+          {
+            "id": "empty-switch-filter",
+            "name": "Switch filter tab to one with skills",
+            "description": "Click a different filter tab (Approved, Rejected, All) that has matching skills, transitioning to the list view",
+            "activateStates": ["skills-list"],
+            "deactivateStates": ["skills-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Approved" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "empty-switch-filter-still-empty",
+            "name": "Switch filter tab to another empty filter",
+            "description": "Click a different filter tab that also has no matching skills, staying in the empty state with an updated message",
+            "activateStates": ["skills-empty"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Rejected" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "empty-refresh",
+            "name": "Refresh skills",
+            "description": "Click the refresh button to re-fetch skills from GET /skills, returning to loading state",
+            "activateStates": ["skills-loading"],
+            "deactivateStates": ["skills-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "skills-list",
+        "name": "Skill List View",
+        "description": "One or more auto-extracted skills are visible as collapsed rows in the content area. Each row shows a chevron toggle, a status icon (amber Clock for pending, green CheckCircle for approved, red XCircle for rejected), the skill name, and a metadata line. The filter tab bar shows counts for each status. Pending skills show inline Approve and Reject action buttons in the row.",
+        "elements": [{ "textContains": "Auto:" }, { "textContains": "used" }],
+        "transitions": [
+          {
+            "id": "list-expand-skill",
+            "name": "Expand a skill row",
+            "description": "Click the chevron on a skill row to expand it, revealing the detail panel with Description, Tags, Phases, Created, and Provenance fields",
+            "activateStates": ["skills-detail-expanded"],
+            "deactivateStates": ["skills-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Auto:" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "list-approve-skill",
+            "name": "Approve a pending skill",
+            "description": "Click the Approve button on a pending skill row. The skill immediately moves to the Approved filter tab, tab counts update, and the skill disappears from the Pending view. If this was the last pending skill, the view transitions to empty state.",
+            "activateStates": ["skills-list"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Approve" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "list-approve-last-skill",
+            "name": "Approve the last pending skill",
+            "description": "Click Approve on the only remaining pending skill. After approval the Pending filter is empty, transitioning to the empty state.",
+            "activateStates": ["skills-empty"],
+            "deactivateStates": ["skills-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Approve" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "list-reject-skill",
+            "name": "Reject a pending skill",
+            "description": "Click the Reject button on a pending skill row. The skill immediately moves to the Rejected filter tab and tab counts update.",
+            "activateStates": ["skills-list"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Reject" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "list-switch-filter",
+            "name": "Switch filter tab",
+            "description": "Click a filter tab to show skills of a different status. If the target filter has skills, stays in list view; if empty, transitions to empty state.",
+            "activateStates": ["skills-list"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "All" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "list-switch-filter-to-empty",
+            "name": "Switch to empty filter tab",
+            "description": "Click a filter tab that has no matching skills, transitioning to the empty state",
+            "activateStates": ["skills-empty"],
+            "deactivateStates": ["skills-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Rejected" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "list-refresh",
+            "name": "Refresh skills",
+            "description": "Click the refresh button to re-fetch skills from GET /skills",
+            "activateStates": ["skills-loading"],
+            "deactivateStates": ["skills-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "skills-detail-expanded",
+        "name": "Skill Detail Expanded",
+        "description": "A skill row is expanded, showing the detail panel below it. The panel is indented (pl-10) and contains labeled fields: Description, Tags, Phases, Created, and (for auto-extracted skills with provenance data) a Provenance section with Fix type, Source run, Fix ID, and Effectiveness. For approved/rejected skills, the expanded panel also shows Approve, Reject, and Reset to Pending action buttons.",
+        "elements": [
+          { "textContent": "Description:" },
+          { "textContent": "Tags:" },
+          { "textContent": "Phases:" },
+          { "textContent": "Created:" }
+        ],
+        "transitions": [
+          {
+            "id": "expanded-collapse",
+            "name": "Collapse skill detail",
+            "description": "Click the expanded skill's chevron again to collapse the detail panel and return to the list view",
+            "activateStates": ["skills-list"],
+            "deactivateStates": ["skills-detail-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Auto:" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-expand-another",
+            "name": "Expand a different skill",
+            "description": "Click a different skill row's chevron. The previously expanded skill collapses and the new one expands (only one expanded at a time).",
+            "activateStates": ["skills-detail-expanded"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Auto:" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-reset-to-pending",
+            "name": "Reset skill to pending",
+            "description": "Click 'Reset to Pending' on an approved or rejected skill's expanded detail panel. The skill moves to the Pending tab and counts update.",
+            "activateStates": ["skills-list"],
+            "deactivateStates": ["skills-detail-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Reset to Pending" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-approve",
+            "name": "Approve expanded skill",
+            "description": "Click the Approve button in the expanded detail panel of an approved/rejected skill to change its status",
+            "activateStates": ["skills-list"],
+            "deactivateStates": ["skills-detail-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Approve" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-reject",
+            "name": "Reject expanded skill",
+            "description": "Click the Reject button in the expanded detail panel to reject the skill",
+            "activateStates": ["skills-list"],
+            "deactivateStates": ["skills-detail-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Reject" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-switch-filter",
+            "name": "Switch filter tab while expanded",
+            "description": "Click a filter tab while a skill is expanded. The detail panel collapses and the list updates to show skills matching the new filter.",
+            "activateStates": ["skills-list"],
+            "deactivateStates": ["skills-detail-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "All" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-refresh",
+            "name": "Refresh while expanded",
+            "description": "Click the refresh button while a skill is expanded. All expansions collapse and data is re-fetched.",
+            "activateStates": ["skills-loading"],
+            "deactivateStates": ["skills-detail-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
 }

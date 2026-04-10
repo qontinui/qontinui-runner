@@ -200,11 +200,177 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "sched-task-list",
+        "name": "Scheduled Tasks List",
+        "description": "The Scheduled sub-tab is active showing the inventory of scheduled tasks with per-task toggles, the Auto-Fix button, and the New Task creation button. The header displays overall scheduler status (Running/Paused) and running task count.",
+        "elements": [{ "textContent": "New Task" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "list-to-history",
+            "name": "Switch to History sub-tab",
+            "activateStates": ["sched-history"],
+            "deactivateStates": ["sched-task-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "History" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "list-to-settings",
+            "name": "Switch to Settings sub-tab",
+            "activateStates": ["sched-settings"],
+            "deactivateStates": ["sched-task-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Settings" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "list-to-new-task",
+            "name": "Open New Task form",
+            "activateStates": ["sched-new-task-form"],
+            "deactivateStates": ["sched-task-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "New Task" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sched-history",
+        "name": "Execution History",
+        "description": "The History sub-tab is active showing a chronological log of scheduled task executions with task names, timestamps, durations, and success/failure outcomes.",
+        "elements": [{ "textContent": "Execution History" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "history-to-list",
+            "name": "Switch to Scheduled sub-tab",
+            "activateStates": ["sched-task-list"],
+            "deactivateStates": ["sched-history"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Scheduled" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "history-to-settings",
+            "name": "Switch to Settings sub-tab",
+            "activateStates": ["sched-settings"],
+            "deactivateStates": ["sched-history"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Settings" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sched-settings",
+        "name": "Scheduler Settings",
+        "description": "The Settings sub-tab is active showing scheduler engine configuration options including global enable/disable, concurrency limits, and retry policies.",
+        "elements": [{ "textContent": "Scheduler Settings" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "settings-to-list",
+            "name": "Switch to Scheduled sub-tab",
+            "activateStates": ["sched-task-list"],
+            "deactivateStates": ["sched-settings"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Scheduled" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "settings-to-history",
+            "name": "Switch to History sub-tab",
+            "activateStates": ["sched-history"],
+            "deactivateStates": ["sched-settings"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "History" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sched-new-task-form",
+        "name": "New Task Form",
+        "description": "The task creation form is open, showing fields for task name, workflow selection, cron expression or frequency selector, and execution parameters. Cancel and Save buttons are available.",
+        "elements": [{ "textContent": "Cancel" }, { "textContent": "Task Name" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "form-to-list-cancel",
+            "name": "Cancel and return to task list",
+            "activateStates": ["sched-task-list"],
+            "deactivateStates": ["sched-new-task-form"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "form-to-list-save",
+            "name": "Save new task and return to list",
+            "activateStates": ["sched-task-list"],
+            "deactivateStates": ["sched-new-task-form"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Save" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "SchedulerTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/scheduled-tasks",
     "elementSource": "sdk",
     "tags": ["scheduler", "scheduled-tasks", "cron", "recurring", "dev-only"]

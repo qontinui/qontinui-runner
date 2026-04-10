@@ -220,11 +220,287 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "sc-list-browse",
+        "name": "Browsing Command List",
+        "description": "Initial state when the Shell Commands page loads. The left panel displays the full list of saved shell commands and the search box. The right-side editor area shows a placeholder prompt because no command is selected yet.",
+        "elements": [
+          {
+            "role": "list",
+            "textContains": "command"
+          },
+          {
+            "textContains": "Select a command"
+          }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "browse-to-creating",
+            "name": "Create new command",
+            "description": "Click the New button to open a blank editor with default values (any platform, 30 second timeout)",
+            "activateStates": ["sc-creating"],
+            "deactivateStates": ["sc-list-browse"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "New"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "browse-to-editing",
+            "name": "Select existing command",
+            "description": "Click a command in the list to load it into the editor for viewing or modification",
+            "activateStates": ["sc-editing"],
+            "deactivateStates": ["sc-list-browse"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "listitem"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "browse-to-search-filtered",
+            "name": "Enter search query",
+            "description": "Type in the search box to filter the command list by name",
+            "activateStates": ["sc-search-filtered"],
+            "deactivateStates": ["sc-list-browse"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": {
+                  "role": "searchbox"
+                },
+                "value": "build",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sc-creating",
+        "name": "Creating New Command",
+        "description": "The editor is open with a blank form after clicking New. Fields are set to defaults: empty command text, empty name, any platform, 30 second timeout. The user fills in command details and saves.",
+        "elements": [
+          {
+            "textContains": "Any Platform"
+          },
+          {
+            "textContains": "30"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "creating-to-editing",
+            "name": "Save new command",
+            "description": "Click Save to persist the new command, transitioning to the editing state for the now-saved command",
+            "activateStates": ["sc-editing"],
+            "deactivateStates": ["sc-creating"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Save"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
+              }
+            ]
+          },
+          {
+            "id": "creating-to-browse",
+            "name": "Select different command",
+            "description": "Abandon the new command form by clicking an existing command in the list",
+            "activateStates": ["sc-list-browse"],
+            "deactivateStates": ["sc-creating"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "listitem"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sc-editing",
+        "name": "Editing Existing Command",
+        "description": "An existing command is selected and its data is loaded into the editor. All fields (command text, name, working directory, platform, timeout, category, tags) are populated with saved values. The user can modify and save changes or delete the command.",
+        "elements": [
+          {
+            "role": "listitem",
+            "attribute": "aria-selected"
+          },
+          {
+            "role": "textbox",
+            "textContains": "name"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "editing-to-editing",
+            "name": "Save changes",
+            "description": "Click Save to persist modifications to the current command, remaining in the editing state",
+            "activateStates": ["sc-editing"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Save"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
+              }
+            ]
+          },
+          {
+            "id": "editing-to-browse-delete",
+            "name": "Delete command",
+            "description": "Click Delete to remove the command from the library, returning to the browse state with no selection",
+            "activateStates": ["sc-list-browse"],
+            "deactivateStates": ["sc-editing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Delete"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
+              }
+            ]
+          },
+          {
+            "id": "editing-to-creating",
+            "name": "Create new command",
+            "description": "Click New to open a blank editor, leaving the current command",
+            "activateStates": ["sc-creating"],
+            "deactivateStates": ["sc-editing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "New"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sc-search-filtered",
+        "name": "Search Filtering Active",
+        "description": "The user has entered a search query and the command list is filtered to show only matching commands. The search box contains the active query text. The user can select a filtered result or clear the search to return to the full list.",
+        "elements": [
+          {
+            "role": "searchbox",
+            "attribute": "value",
+            "textContains": "filter"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "search-to-editing",
+            "name": "Select filtered result",
+            "description": "Click a command from the filtered list to load it into the editor",
+            "activateStates": ["sc-editing"],
+            "deactivateStates": ["sc-search-filtered"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "listitem"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "search-to-browse",
+            "name": "Clear search",
+            "description": "Clear the search box to return to the full unfiltered command list",
+            "activateStates": ["sc-list-browse"],
+            "deactivateStates": ["sc-search-filtered"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "clear",
+                "target": {
+                  "role": "searchbox"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ShellCommandsPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/build/shell-commands",
     "elementSource": "sdk",
     "tags": ["shell-commands", "builder", "library", "setup", "verification"],

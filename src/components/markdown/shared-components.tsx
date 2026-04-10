@@ -128,7 +128,11 @@ export function SyntaxHighlightedCodeBlock({ code, language }: { code: string; l
         </div>
       )}
       <div className="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity z-10">
-        <ShareToMobileButton getText={() => code} className="bg-muted/80 hover:bg-muted" size={14} />
+        <ShareToMobileButton
+          getText={() => code}
+          className="bg-muted/80 hover:bg-muted"
+          size={14}
+        />
         <button
           onClick={handleCopy}
           className="p-1.5 rounded bg-muted/80 hover:bg-muted"
@@ -196,7 +200,11 @@ export function SimpleCodeBlock({ children }: { children: React.ReactNode }) {
         {children}
       </pre>
       <div className="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-        <ShareToMobileButton getText={() => extractTextContent(children)} className="bg-muted/80 hover:bg-muted" size={14} />
+        <ShareToMobileButton
+          getText={() => extractTextContent(children)}
+          className="bg-muted/80 hover:bg-muted"
+          size={14}
+        />
         <button
           onClick={handleCopy}
           className="p-1.5 rounded bg-muted/80 hover:bg-muted"

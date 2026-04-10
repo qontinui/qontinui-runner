@@ -253,5 +253,189 @@
     "pageUrl": "/runs/ai-output",
     "elementSource": "sdk",
     "tags": ["run-ai-output", "ai-conversation", "sessions", "live-execution", "observe"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "no-run-selected",
+        "name": "No Run Selected",
+        "description": "The RunSelection context is present but no run has been chosen. The page shows a centered prompt with a Bot icon asking the user to select a run from the Run Dashboard.",
+        "elements": [
+          { "textContains": "No Run Selected" },
+          { "textContains": "Select a run from the Run Dashboard" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-run-to-idle-no-sessions",
+            "name": "User selects a run that has no AI sessions",
+            "activateStates": ["idle-no-sessions"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "no-run-to-running",
+            "name": "User selects a run that is currently executing",
+            "activateStates": ["running"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "no-run-to-idle-with-transcript",
+            "name": "User selects a completed run that has AI output",
+            "activateStates": ["idle-with-transcript"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "no-run-to-resumable",
+            "name": "User selects a run that is paused and resumable",
+            "activateStates": ["resumable"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "idle-no-sessions",
+        "name": "Idle — No Sessions",
+        "description": "A run is selected but no AI sessions exist (pure automation workflow or fresh run). The status banner shows 'No Active Run' with an idle icon. The session dropdown area shows 'No sessions yet'. A start button may be visible to launch a task from the Library.",
+        "elements": [{ "textContains": "No Active Run" }, { "textContains": "No sessions yet" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "idle-no-sessions-to-running",
+            "name": "User starts a task or a new AI session begins automatically",
+            "activateStates": ["running"],
+            "deactivateStates": ["idle-no-sessions"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "idle-no-sessions-to-no-run",
+            "name": "User deselects the run or navigates away",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["idle-no-sessions"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "running",
+        "name": "AI Session Running",
+        "description": "An AI session is actively executing. The status banner shows a green running indicator with a spinning loader, the session name, and session count. The AI output streams in progressively. A Stop button is visible for emergency control. The session dropdown lists active sessions with an 'Active' badge. Auto-continue toggle may be visible.",
+        "elements": [{ "textContains": "Running" }, { "textContains": "Stop" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "running-to-idle-with-transcript",
+            "name": "AI session completes successfully",
+            "activateStates": ["idle-with-transcript"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "running-to-resumable",
+            "name": "AI session pauses and becomes resumable",
+            "activateStates": ["resumable"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "running-stopped-by-user",
+            "name": "User clicks Stop to halt the running session",
+            "activateStates": ["idle-with-transcript"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "running-to-no-run",
+            "name": "User deselects the run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "resumable",
+        "name": "Session Paused — Resumable",
+        "description": "The AI task is paused between sessions and can be resumed. The status banner shows an orange indicator with a Clock icon and 'Paused at Session N'. A Resume button is available to continue the task. The transcript from prior sessions is visible below.",
+        "elements": [{ "textContains": "Paused" }, { "textContains": "Resume" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "resumable-to-running",
+            "name": "User clicks Resume to continue the paused task",
+            "activateStates": ["running"],
+            "deactivateStates": ["resumable"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "resumable-to-idle-with-transcript",
+            "name": "User cancels the resumable task or it times out",
+            "activateStates": ["idle-with-transcript"],
+            "deactivateStates": ["resumable"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "resumable-to-no-run",
+            "name": "User deselects the run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["resumable"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "idle-with-transcript",
+        "name": "Idle — Viewing Transcript",
+        "description": "No AI session is active but completed session output is available. The status banner shows 'No Active Run' in an idle state. The session dropdown lists all past sessions with type labels and metadata. The main area displays the conversation transcript with markdown formatting. Copy button, session stats, and loop structure are visible. Users can switch between sessions or select 'All Sessions' view.",
+        "elements": [
+          { "textContains": "No Active Run" },
+          { "textContains": "Messages" },
+          { "textContains": "Sessions" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "idle-transcript-to-running",
+            "name": "User starts a new task or auto-continue triggers a new session",
+            "activateStates": ["running"],
+            "deactivateStates": ["idle-with-transcript"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "idle-transcript-to-no-run",
+            "name": "User deselects the run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["idle-with-transcript"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "idle-transcript-switch-session",
+            "name": "User selects a different session from the dropdown",
+            "activateStates": ["idle-with-transcript"],
+            "deactivateStates": ["idle-with-transcript"],
+            "staysVisible": true,
+            "process": []
+          }
+        ]
+      }
+    ]
   }
 }

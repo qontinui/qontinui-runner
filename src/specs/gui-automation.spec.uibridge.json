@@ -300,8 +300,16 @@
             "deactivateStates": ["gui-no-config"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Load Config", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 3000 } },
-              { "action": "click", "target": { "textContent": "Load from File" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Load Config", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              },
+              {
+                "action": "click",
+                "target": { "textContent": "Load from File" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -311,8 +319,16 @@
             "deactivateStates": ["gui-no-config"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Load Config", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 3000 } },
-              { "action": "click", "target": { "textContent": "Load Last Config" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Load Config", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              },
+              {
+                "action": "click",
+                "target": { "textContent": "Load Last Config" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           }
         ]
@@ -334,7 +350,11 @@
             "deactivateStates": ["gui-config-loaded"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Select a workflow to run..." }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Select a workflow to run..." },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
             ]
           },
           {
@@ -344,7 +364,11 @@
             "deactivateStates": ["gui-config-loaded"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Change", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Change", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
             ]
           }
         ]
@@ -366,7 +390,11 @@
             "deactivateStates": ["gui-workflow-ready"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Start", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Start", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -376,7 +404,11 @@
             "deactivateStates": ["gui-workflow-ready"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContains": "Ready:" }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+              {
+                "action": "click",
+                "target": { "textContains": "Ready:" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
             ]
           }
         ]
@@ -385,10 +417,7 @@
         "id": "gui-execution-running",
         "name": "Execution Active",
         "description": "GUI automation is currently executing. The bottom bar shows 'Running: {workflow name}' with an animated amber indicator. The Stop button is enabled and the Start button is disabled. Workflow selection controls are locked during execution. The page may auto-minimize depending on the toggle setting.",
-        "elements": [
-          { "textContent": "Stop", "role": "button" },
-          { "textContains": "Running" }
-        ],
+        "elements": [{ "textContent": "Stop", "role": "button" }, { "textContains": "Running" }],
         "transitions": [
           {
             "id": "running-to-workflow-ready",
@@ -397,7 +426,11 @@
             "deactivateStates": ["gui-execution-running"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Stop", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Stop", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           }
         ]

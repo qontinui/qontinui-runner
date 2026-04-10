@@ -31,10 +31,29 @@ interface SchedulerTabProps {
 export function SchedulerTab({ className = "" }: SchedulerTabProps) {
   const [activeSubTab, setActiveSubTab] = useState<SchedulerSubTab>("tasks");
 
-  useUIComponent({ id: "scheduler-page", name: "Scheduled Tasks", description: "Manage scheduled tasks, execution history, and scheduler settings" });
-  const { ref: tasksTabRef } = useUIElement({ id: "scheduler-tab-tasks", type: "button", label: "Scheduled tasks tab", actions: ["click"] });
-  const { ref: historyTabRef } = useUIElement({ id: "scheduler-tab-history", type: "button", label: "Task history tab", actions: ["click"] });
-  const { ref: settingsTabRef } = useUIElement({ id: "scheduler-tab-settings", type: "button", label: "Scheduler settings tab", actions: ["click"] });
+  useUIComponent({
+    id: "scheduler-page",
+    name: "Scheduled Tasks",
+    description: "Manage scheduled tasks, execution history, and scheduler settings",
+  });
+  const { ref: tasksTabRef } = useUIElement({
+    id: "scheduler-tab-tasks",
+    type: "button",
+    label: "Scheduled tasks tab",
+    actions: ["click"],
+  });
+  const { ref: historyTabRef } = useUIElement({
+    id: "scheduler-tab-history",
+    type: "button",
+    label: "Task history tab",
+    actions: ["click"],
+  });
+  const { ref: settingsTabRef } = useUIElement({
+    id: "scheduler-tab-settings",
+    type: "button",
+    label: "Scheduler settings tab",
+    actions: ["click"],
+  });
   const [isCreating, setIsCreating] = useState(false);
   const [isAiBuilding, setIsAiBuilding] = useState(false);
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);

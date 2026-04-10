@@ -14,7 +14,11 @@
           "category": "element-presence",
           "severity": "critical",
           "assertionType": "exists",
-          "target": { "type": "search", "criteria": { "role": "navigation", "accessibleName": "Main navigation" }, "label": "Sidebar navigation" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "navigation", "accessibleName": "Main navigation" },
+            "label": "Sidebar navigation"
+          },
           "enabled": true
         }
       ]
@@ -31,9 +35,7 @@
         "id": "sidebar",
         "name": "Sidebar Navigation",
         "description": "The persistent sidebar with navigation items. Always active when the app is loaded.",
-        "elements": [
-          { "role": "navigation", "accessibleName": "Main navigation" }
-        ],
+        "elements": [{ "role": "navigation", "accessibleName": "Main navigation" }],
         "isInitial": true,
         "transitions": [
           {
@@ -43,7 +45,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "workflows" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "workflows" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -53,7 +59,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "active" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "active" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -63,7 +73,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "terminal" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "terminal" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -73,7 +87,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "runs" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "runs" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -83,7 +101,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "error-monitor" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "error-monitor" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -93,7 +115,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "processes" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "processes" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -103,7 +129,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "library" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "library" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -113,7 +143,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "state-machine" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "state-machine" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -123,7 +157,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "settings" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "settings" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           },
           {
@@ -133,7 +171,11 @@
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
-              { "action": "click", "target": { "dataAttributes": { "nav-item": "reflection" } }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "nav-item": "reflection" } },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
             ]
           }
         ]

@@ -407,9 +407,7 @@
         "id": "idle",
         "name": "Idle — No Active Workflow",
         "description": "No workflow is running. The page shows a centered prompt with the 'No Active Workflow' heading and options to run the last workflow or view the last run recap.",
-        "elements": [
-          { "textContent": "No Active Workflow" }
-        ],
+        "elements": [{ "textContent": "No Active Workflow" }],
         "isInitial": true,
         "transitions": [
           {
@@ -432,9 +430,7 @@
         "id": "running",
         "name": "Running — Workflow Executing",
         "description": "A workflow is actively executing. The control bar shows the task name, phase badges (setup/verification/agentic/completion), and Stop button. The dynamic widget layout displays the active widget at 65% width and summary widgets at 35%. The bottom bar shows 'Running' status with elapsed time.",
-        "elements": [
-          { "role": "button", "textContent": "Stop" }
-        ],
+        "elements": [{ "role": "button", "textContent": "Stop" }],
         "isInitial": false,
         "transitions": [
           {
@@ -501,9 +497,7 @@
         "id": "paused",
         "name": "Paused — Workflow Paused",
         "description": "The workflow is temporarily paused. The control bar shows a Play button to resume. All widgets remain visible but execution is halted. The bottom bar reflects paused status.",
-        "elements": [
-          { "role": "button", "accessibleName": "Play" }
-        ],
+        "elements": [{ "role": "button", "accessibleName": "Play" }],
         "isInitial": false,
         "transitions": [
           {
@@ -566,10 +560,7 @@
         "id": "approval-dialog",
         "name": "Approval Dialog Overlay",
         "description": "A modal overlay appears when the workflow pauses for human review. Shows 'Approval Required' header, the approval prompt with context (summary, files modified, optional diff), a comment textarea, and action buttons: Reject, Abort Workflow, and Approve. The running dashboard remains visible behind the backdrop. Can be dismissed with Escape to show a floating 'Approval Waiting' indicator.",
-        "elements": [
-          { "textContent": "Approval Required" },
-          { "textContent": "Approve" }
-        ],
+        "elements": [{ "textContent": "Approval Required" }, { "textContent": "Approve" }],
         "isInitial": false,
         "transitions": [
           {

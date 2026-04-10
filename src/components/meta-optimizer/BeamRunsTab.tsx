@@ -134,10 +134,7 @@ export function BeamRunsTab() {
       {/* Header */}
       <div className="flex items-center gap-3">
         <h2 className="text-sm font-medium text-zinc-200">Beam Search Runs</h2>
-        <button
-          onClick={loadRuns}
-          className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1"
-        >
+        <button onClick={loadRuns} className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1">
           Refresh
         </button>
         <span className="text-xs text-zinc-500 ml-auto">{runs.length} runs</span>
@@ -221,9 +218,7 @@ export function BeamRunsTab() {
                         >
                           {run.status}
                         </span>
-                        <span className="text-xs text-zinc-500">
-                          Generation {run.generation}
-                        </span>
+                        <span className="text-xs text-zinc-500">Generation {run.generation}</span>
                         <span className="text-xs text-zinc-500 ml-auto">
                           {candidates.length} candidates across {sortedGenerations.length}{" "}
                           generation(s)
@@ -259,9 +254,7 @@ export function BeamRunsTab() {
                             role="button"
                             tabIndex={0}
                           >
-                            <span className="text-xs text-zinc-500 font-mono">
-                              {shortId(c.id)}
-                            </span>
+                            <span className="text-xs text-zinc-500 font-mono">{shortId(c.id)}</span>
                             <span
                               className={`text-xs px-1.5 py-0.5 rounded ${CANDIDATE_STATUS_COLORS[c.status] || "text-zinc-400 bg-zinc-800/50"}`}
                             >

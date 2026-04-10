@@ -171,5 +171,184 @@
       ],
       "source": "manual"
     }
-  ]
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "idle",
+        "name": "Idle — No Running Task",
+        "description": "No task is running. The dashboard control bar has no active controls. The orchestration loop banner is hidden. The connection badge shows Connected or Disconnected.",
+        "elements": [{ "textContent": "Connected|Disconnected" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "idle-to-running",
+            "name": "A task run starts (externally triggered or via another page)",
+            "activateStates": ["running"],
+            "deactivateStates": ["idle"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "running",
+        "name": "Running — Task Actively Executing",
+        "description": "A task is running. The control bar shows Stop and Pause buttons. Status widgets reflect 'running'. If the task is part of an orchestration loop, the loop banner is also visible.",
+        "elements": [{ "role": "button", "textContent": "Stop" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "running-to-paused",
+            "name": "Pause the running task via the Pause button",
+            "activateStates": ["paused"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Pause" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "running-to-stopped",
+            "name": "Stop the running task via the Stop button",
+            "activateStates": ["stopped"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stop" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "running-to-loop-active",
+            "name": "Orchestration loop starts (task has max_iterations > 1)",
+            "activateStates": ["loop-active"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "running-to-terminal",
+            "name": "Task completes or fails automatically",
+            "activateStates": ["terminal"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "paused",
+        "name": "Paused — Task Suspended",
+        "description": "The task is paused. The control bar shows Resume and Stop buttons. Widgets show 'paused' status consistently.",
+        "elements": [{ "textContent": "paused" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "paused-to-running",
+            "name": "Resume the paused task via the Resume button",
+            "activateStates": ["running"],
+            "deactivateStates": ["paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Resume" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "paused-to-stopped",
+            "name": "Stop the task while paused",
+            "activateStates": ["stopped"],
+            "deactivateStates": ["paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stop" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "loop-active",
+        "name": "Loop Active — Orchestration Loop Running",
+        "description": "An orchestration loop is running. The banner shows the current phase (Building, Executing, Reflecting, Fixing, Evaluating) and iteration progress (e.g. '2/5'). Stop and Pause controls are available.",
+        "elements": [
+          { "textContent": "Building|Executing|Reflecting|Fixing|Evaluating" },
+          { "textContent": "/" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "loop-active-to-stopped",
+            "name": "Stop the workflow during orchestration loop",
+            "activateStates": ["stopped"],
+            "deactivateStates": ["loop-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stop" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "loop-active-to-terminal",
+            "name": "Orchestration loop completes all iterations",
+            "activateStates": ["terminal"],
+            "deactivateStates": ["loop-active"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "stopped",
+        "name": "Stopped — Task Manually Stopped",
+        "description": "The task was stopped by the user. All widgets consistently show 'stopped' status. The orchestration loop banner (if present) disappears. The connection badge remains visible.",
+        "elements": [{ "textContent": "stopped" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "stopped-to-idle",
+            "name": "Navigate away or select a different task",
+            "activateStates": ["idle"],
+            "deactivateStates": ["stopped"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "terminal",
+        "name": "Terminal — Task Completed or Failed",
+        "description": "The task reached a terminal state (complete or failed) automatically. All widgets show the final status. The loop banner is hidden.",
+        "elements": [{ "textContent": "complete|failed" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "terminal-to-idle",
+            "name": "Navigate away or select a different task",
+            "activateStates": ["idle"],
+            "deactivateStates": ["terminal"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  }
 }

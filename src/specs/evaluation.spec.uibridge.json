@@ -1433,6 +1433,341 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "loading",
+        "name": "Loading — Fetching Evaluation Data",
+        "description": "The page is loading evaluation data from the backend. The dashboard heading is visible but dataset and experiment lists have not yet rendered.",
+        "elements": [{ "textContent": "Evaluation Dashboard" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-empty",
+            "name": "Data loaded with no datasets",
+            "activateStates": ["empty"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-dataset-list",
+            "name": "Data loaded with existing datasets",
+            "activateStates": ["dataset-list"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Data load fails",
+            "activateStates": ["error"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error — Data Load Failed",
+        "description": "Dataset loading failed. The user sees 'Failed to load evaluation data' with the error message and a Retry button to attempt recovery.",
+        "elements": [{ "textContent": "Failed to load evaluation data" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "Retry loading data",
+            "activateStates": ["loading"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Retry" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "empty",
+        "name": "Empty — No Datasets Exist",
+        "description": "No datasets have been created yet. The user sees the 'No datasets yet' empty state message guiding them to create their first dataset.",
+        "elements": [{ "textContent": "No datasets yet" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-creating-dataset",
+            "name": "Open the new dataset form",
+            "activateStates": ["creating-dataset"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New Dataset" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "creating-dataset",
+        "name": "Creating Dataset — Form Open",
+        "description": "The inline dataset creation form is open with fields for Dataset Name and Description (optional), plus Create and Cancel buttons. The Create button is disabled until a name is entered.",
+        "elements": [{ "textContent": "Dataset Name" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "creating-dataset-to-dataset-list",
+            "name": "Submit the new dataset form",
+            "activateStates": ["dataset-list"],
+            "deactivateStates": ["creating-dataset"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Create" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "creating-dataset-to-previous-cancel",
+            "name": "Cancel dataset creation and return to previous state",
+            "activateStates": ["dataset-list"],
+            "deactivateStates": ["creating-dataset"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "dataset-list",
+        "name": "Dataset List — No Selection",
+        "description": "Datasets are loaded and displayed in the left panel. No dataset is selected yet. The detail panel shows 'Select a dataset to view its items' and the experiment panel shows 'Select a dataset to view experiments'.",
+        "elements": [{ "textContent": "Select a dataset to view its items" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "dataset-list-to-dataset-selected",
+            "name": "Select a dataset from the list",
+            "activateStates": ["dataset-selected"],
+            "deactivateStates": ["dataset-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "items" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "dataset-list-to-creating-dataset",
+            "name": "Open the new dataset form",
+            "activateStates": ["creating-dataset"],
+            "deactivateStates": ["dataset-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New Dataset" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "dataset-selected",
+        "name": "Dataset Selected — Items and Experiments Visible",
+        "description": "A dataset is selected (highlighted with primary border). The detail panel shows the dataset's items table with Input/Expected Output columns. The right panel shows the Experiments tab with experiments scoped to this dataset. No experiment is selected yet.",
+        "elements": [{ "textContent": "Select an experiment to view results" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "dataset-selected-to-experiment-selected",
+            "name": "Select an experiment from the list",
+            "activateStates": ["experiment-selected"],
+            "deactivateStates": ["dataset-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "completed" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "dataset-selected-to-creating-experiment",
+            "name": "Open the new experiment form",
+            "activateStates": ["creating-experiment"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New Experiment" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "dataset-selected-to-live-evaluation",
+            "name": "Switch to the Run Evaluation tab",
+            "activateStates": ["live-evaluation"],
+            "deactivateStates": ["dataset-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Run Evaluation" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "dataset-selected-to-dataset-list",
+            "name": "Delete the selected dataset via two-step confirmation",
+            "activateStates": ["dataset-list"],
+            "deactivateStates": ["dataset-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Confirm" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "dataset-selected-to-creating-dataset",
+            "name": "Open the new dataset form while a dataset is selected",
+            "activateStates": ["creating-dataset"],
+            "deactivateStates": ["dataset-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New Dataset" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "creating-experiment",
+        "name": "Creating Experiment — Form Open",
+        "description": "The inline experiment creation form is open with fields for experiment name, description, and prompt variant ID. The Create button is disabled until a name is entered.",
+        "elements": [{ "textContent": "Experiment name" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "creating-experiment-to-dataset-selected",
+            "name": "Submit the new experiment form or cancel",
+            "activateStates": ["dataset-selected"],
+            "deactivateStates": ["creating-experiment"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Create" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "experiment-selected",
+        "name": "Experiment Selected — Results Visible",
+        "description": "An experiment is selected and its results are displayed. Summary cards show average scores, total cost, total tokens, and results count. Below the summary, a paginated results table shows Input, Output, Scores, Duration, Cost, and Tokens columns.",
+        "elements": [{ "textContent": "Total Cost" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "experiment-selected-to-live-evaluation",
+            "name": "Switch to the Run Evaluation tab",
+            "activateStates": ["live-evaluation"],
+            "deactivateStates": ["experiment-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Run Evaluation" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "experiment-selected-to-evaluate-row",
+            "name": "Click Evaluate on a result row to switch to live eval with pre-filled data",
+            "activateStates": ["live-evaluation"],
+            "deactivateStates": ["experiment-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Evaluate this input/output" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "experiment-selected-to-dataset-selected",
+            "name": "Select a different dataset, clearing experiment selection",
+            "activateStates": ["dataset-selected"],
+            "deactivateStates": ["experiment-selected"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "items" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "live-evaluation",
+        "name": "Live Evaluation — Run Evaluation Tab Active",
+        "description": "The Run Evaluation tab is active in the right panel. Users can enter input, output, and optional context, select an eval spec (Saved or Inline JSON), and click Evaluate. Results show pass/fail badges per assertion.",
+        "elements": [
+          { "textContent": "Evaluate an input/output pair using LLM-as-judge assertions" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "live-evaluation-to-dataset-selected",
+            "name": "Switch back to the Experiments tab",
+            "activateStates": ["dataset-selected"],
+            "deactivateStates": ["live-evaluation"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Experiments" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "EvaluationDashboard",
     "author": "opik-integration",

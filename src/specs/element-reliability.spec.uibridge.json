@@ -413,6 +413,107 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "er-loading",
+        "name": "Loading",
+        "description": "Initial state while element reliability data is being fetched from GET /ui-bridge/history/flaky. Only the loading message is visible; summary cards and element list are not rendered.",
+        "elements": [{ "textContains": "Loading element data" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-data",
+            "name": "Data loaded (elements exist)",
+            "description": "The flaky-elements query resolves with a non-empty ElementReliability[] array. The loading message is replaced by the 3-column summary grid and the sorted element list.",
+            "activateStates": ["er-data"],
+            "deactivateStates": ["er-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-empty",
+            "name": "Data loaded (no elements)",
+            "description": "The flaky-elements query resolves successfully but returns an empty array. The loading message is replaced by the empty-state illustration and guidance text.",
+            "activateStates": ["er-empty"],
+            "deactivateStates": ["er-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Fetch failed",
+            "description": "The flaky-elements query rejects or the network request fails. The loading message is replaced by the red error text.",
+            "activateStates": ["er-error"],
+            "deactivateStates": ["er-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "er-error",
+        "name": "Error",
+        "description": "The fetch to /ui-bridge/history/flaky failed. A red error message 'Failed to load element data' is displayed. No summary cards or element list are rendered. React Query will automatically retry after its configured interval.",
+        "elements": [{ "textContains": "Failed to load" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "React Query retry",
+            "description": "React Query automatically retries the failed request after its backoff interval, returning the page to the loading state.",
+            "activateStates": ["er-loading"],
+            "deactivateStates": ["er-error"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "er-empty",
+        "name": "Empty",
+        "description": "Data loaded successfully but no element reliability records exist. The empty-state block shows a muted Shield icon, 'No element reliability data yet' heading, and 'Run some automations to build up element history' guidance. No summary cards or element list are rendered.",
+        "elements": [
+          { "textContains": "No element reliability data yet" },
+          { "textContains": "Run some automations to build up element history" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-loading",
+            "name": "React Query refetch",
+            "description": "React Query's background refetch triggers a new request. If the window is refocused or the stale time expires, the component re-enters loading.",
+            "activateStates": ["er-loading"],
+            "deactivateStates": ["er-empty"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "er-data",
+        "name": "Data Loaded",
+        "description": "Element reliability data is populated. The 3-column summary grid shows Stable (>=95%), Flaky (>=80% and <95%), and Unreliable (<80%) counts. Below, the 'Elements by Reliability' section lists each element sorted by ascending success rate with its percentage, interaction count, and color-coded badge.",
+        "elements": [
+          { "textContains": "Elements by Reliability" },
+          { "textContains": "interactions" },
+          { "textContains": "success" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "data-to-loading",
+            "name": "React Query refetch",
+            "description": "React Query's background refetch triggers a new request, temporarily returning the component to the loading state before re-populating with fresh data.",
+            "activateStates": ["er-loading"],
+            "deactivateStates": ["er-data"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ElementReliabilityDashboard",
     "author": "Joshua Spinak",

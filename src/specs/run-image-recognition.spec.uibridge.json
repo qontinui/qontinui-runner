@@ -149,11 +149,133 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "no-run-selected",
+        "name": "No Run Selected",
+        "description": "No workflow run has been selected. The page displays guidance prompting the user to select a run from the Run Dashboard before image recognition data can be shown.",
+        "elements": [{ "textContains": "No Run Selected" }, { "textContains": "Select a run" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-run-selected-to-empty",
+            "name": "User selects a run with no image recognition attempts",
+            "activateStates": ["empty"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "no-run-selected-to-results-list",
+            "name": "User selects a run that has image recognition data",
+            "activateStates": ["results-list"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "empty",
+        "name": "Empty — No Image Recognition Data",
+        "description": "A run is selected but it contains no image recognition attempts. The page shows a clear empty state message explaining that no image recognition data exists for this run.",
+        "elements": [{ "textContains": "No image recognition" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "empty-to-results-list",
+            "name": "User selects a different run that has image recognition data",
+            "activateStates": ["results-list"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "results-list",
+        "name": "Results List — Image Recognition Attempts Displayed",
+        "description": "Image recognition results are loaded and displayed in a table or list. Each entry shows the template name, match result, and confidence score. The user can scan all attempts and click any row for detail.",
+        "elements": [
+          { "textContains": "image" },
+          { "textContains": "confidence" },
+          { "role": "row" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "results-list-to-detail-view",
+            "name": "User clicks an image recognition row to view details",
+            "activateStates": ["detail-view"],
+            "deactivateStates": ["results-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "row" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "results-list-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["results-list"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "results-list-to-empty",
+            "name": "User selects a different run with no image recognition data",
+            "activateStates": ["empty"],
+            "deactivateStates": ["results-list"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "detail-view",
+        "name": "Detail View — Annotated Screenshot and Coordinates",
+        "description": "The user has selected a specific image recognition attempt. The detail view shows the annotated screenshot with bounding boxes over detected regions, pixel coordinates of matched areas, confidence metrics, and failure diagnosis information when the match was unsuccessful.",
+        "elements": [{ "role": "img" }, { "textContains": "coordinate" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "detail-view-to-results-list",
+            "name": "User navigates back to the results list",
+            "activateStates": ["results-list"],
+            "deactivateStates": ["detail-view"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "detail-view-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["detail-view"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "RunImageRecognitionTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/runs/image-recognition",
     "elementSource": "sdk",
     "tags": ["run-image-recognition", "visual-automation", "dev-only", "debugging", "observe"]

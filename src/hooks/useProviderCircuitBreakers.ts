@@ -26,9 +26,7 @@ export function useProviderCircuitBreakers(): UseProviderCircuitBreakersResult {
 
   const refresh = useCallback(async () => {
     try {
-      const result = await invoke<ProviderCircuitState[]>(
-        "get_provider_circuit_states",
-      );
+      const result = await invoke<ProviderCircuitState[]>("get_provider_circuit_states");
       setStates(result);
       setError(null);
     } catch (e) {
@@ -43,22 +41,17 @@ export function useProviderCircuitBreakers(): UseProviderCircuitBreakersResult {
     refresh();
 
     // Subscribe to real-time circuit breaker state-change events
-    const unlisten = listen<ProviderCircuitState>(
-      "circuit-breaker-change",
-      (event) => {
-        setStates((prev) => {
-          const idx = prev.findIndex(
-            (s) => s.provider_key === event.payload.provider_key,
-          );
-          if (idx >= 0) {
-            const updated = [...prev];
-            updated[idx] = event.payload;
-            return updated;
-          }
-          return [...prev, event.payload];
-        });
-      },
-    );
+    const unlisten = listen<ProviderCircuitState>("circuit-breaker-change", (event) => {
+      setStates((prev) => {
+        const idx = prev.findIndex((s) => s.provider_key === event.payload.provider_key);
+        if (idx >= 0) {
+          const updated = [...prev];
+          updated[idx] = event.payload;
+          return updated;
+        }
+        return [...prev, event.payload];
+      });
+    });
 
     return () => {
       unlisten.then((fn) => fn());

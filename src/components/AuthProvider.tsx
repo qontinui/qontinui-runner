@@ -320,7 +320,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
           setDevAutoLoginPending(false);
         }
       });
-  }, [loading, authStatus?.authenticated, login, checkAuthStatus, testAutoLoginProbed, autoLoginCreds]);
+  }, [
+    loading,
+    authStatus?.authenticated,
+    login,
+    checkAuthStatus,
+    testAutoLoginProbed,
+    autoLoginCreds,
+  ]);
 
   /**
    * Failsafe timeout for loading state

@@ -150,7 +150,10 @@ interface StateMachineAPI {
   navigateTo: (id: string) => Promise<unknown>;
 }
 
-function buildEngineAdapter(engine: AutomationEngine, domExecutor?: DefaultDOMExecutor): StateMachineAPI {
+function buildEngineAdapter(
+  engine: AutomationEngine,
+  domExecutor?: DefaultDOMExecutor,
+): StateMachineAPI {
   const allDefs = () => engine.stateMachine.getAllStateDefinitions();
   const allTransitions = () => engine.stateMachine.getTransitionDefinitions();
 

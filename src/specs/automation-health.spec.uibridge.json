@@ -771,5 +771,246 @@
         }
       ]
     }
-  ]
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "ah-loading",
+        "name": "Loading",
+        "description": "Initial loading state while analytics data is being fetched from the 13 MCP endpoints. Panels display centered muted loading text. No dashboard content is populated yet.",
+        "elements": [{ "textContains": "Loading" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-empty",
+            "name": "Data loaded (no interactions)",
+            "description": "All analytics queries return successfully but ui_bridge_events table has no rows. Health score shows 100% with 0 Total Interactions. All panels display their empty-state messages.",
+            "activateStates": ["ah-empty"],
+            "deactivateStates": ["ah-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-dashboard",
+            "name": "Data loaded (interactions exist)",
+            "description": "Analytics queries return data for the default 7d window. Health score, recommendations, tables, and charts populate with real metrics.",
+            "activateStates": ["ah-dashboard"],
+            "deactivateStates": ["ah-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "ah-empty",
+        "name": "Dashboard — No Data",
+        "description": "All panels are rendered but show empty states: health score is 100% with 0 Total Interactions and 0 Unique Elements, recommendations say 'automation is running well', element reliability says 'No flaky elements detected', regressions say 'No regressions detected', failures say 'No failures recorded', stalls say 'No stall events recorded', annotation gaps say 'All high-interaction elements have annotations'. The 7d time range button is active by default.",
+        "elements": [
+          { "textContains": "automation is running well" },
+          { "textContains": "No regressions detected" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-refresh",
+            "name": "Refresh data",
+            "description": "Click the Refresh button to re-fetch all analytics. If interactions have been recorded since page load, transitions to the populated dashboard.",
+            "activateStates": ["ah-empty"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "empty-to-dashboard",
+            "name": "Data becomes available after refresh",
+            "description": "After refreshing, new interaction data is found. Panels transition from empty states to populated analytics.",
+            "activateStates": ["ah-dashboard"],
+            "deactivateStates": ["ah-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ah-dashboard",
+        "name": "Dashboard — 7d (Default)",
+        "description": "Full dashboard with analytics data scoped to the default 7-day window. The 7d button has bg-primary styling. Health score shows a numeric value 0-100 with color-coded label, breakdown metrics are populated, recommendations list prioritized items (if issues exist), tables show element reliability and action baselines, charts display failure taxonomy, regressions, stall frequency, and intervention effectiveness.",
+        "elements": [
+          { "textContains": "7d window" },
+          { "textContains": "Action Performance Baselines" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "dashboard-refresh",
+            "name": "Refresh data",
+            "description": "Click Refresh to invalidate React Query caches and re-fetch all 13 analytics endpoints without changing the time range.",
+            "activateStates": ["ah-dashboard"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "dashboard-to-24h",
+            "name": "Switch to 24h time range",
+            "description": "Click the 24h button to filter all panels to the last 24 hours. The 24h button gains bg-primary styling while 7d loses it.",
+            "activateStates": ["ah-time-24h"],
+            "deactivateStates": ["ah-dashboard"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "24h", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "dashboard-to-30d",
+            "name": "Switch to 30d time range",
+            "description": "Click the 30d button to expand all panels to the last 30 days. The 30d button gains bg-primary styling while 7d loses it.",
+            "activateStates": ["ah-time-30d"],
+            "deactivateStates": ["ah-dashboard"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "30d", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ah-time-24h",
+        "name": "Dashboard — 24h",
+        "description": "Dashboard with analytics data scoped to the last 24 hours. The 24h button has bg-primary text-primary-foreground styling; 7d and 30d buttons show bg-muted text-muted-foreground. All panels display data filtered to the 24-hour window. Interaction counts may be lower than the 7d view.",
+        "elements": [
+          { "textContains": "24h window" },
+          { "textContains": "Improvement Recommendations" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "24h-to-dashboard",
+            "name": "Switch to 7d time range",
+            "description": "Click the 7d button to return to the default 7-day window.",
+            "activateStates": ["ah-dashboard"],
+            "deactivateStates": ["ah-time-24h"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "7d", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "24h-to-30d",
+            "name": "Switch to 30d time range",
+            "description": "Click the 30d button to expand the window to 30 days.",
+            "activateStates": ["ah-time-30d"],
+            "deactivateStates": ["ah-time-24h"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "30d", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "24h-refresh",
+            "name": "Refresh data (24h)",
+            "description": "Click Refresh to re-fetch all analytics within the 24h window.",
+            "activateStates": ["ah-time-24h"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ah-time-30d",
+        "name": "Dashboard — 30d",
+        "description": "Dashboard with analytics data scoped to the last 30 days. The 30d button has bg-primary text-primary-foreground styling; 24h and 7d buttons show bg-muted text-muted-foreground. All panels display data filtered to the 30-day window. Interaction counts may be higher than the 7d view.",
+        "elements": [{ "textContains": "30d window" }, { "textContains": "Failure Taxonomy" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "30d-to-dashboard",
+            "name": "Switch to 7d time range",
+            "description": "Click the 7d button to return to the default 7-day window.",
+            "activateStates": ["ah-dashboard"],
+            "deactivateStates": ["ah-time-30d"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "7d", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "30d-to-24h",
+            "name": "Switch to 24h time range",
+            "description": "Click the 24h button to narrow the window to 24 hours.",
+            "activateStates": ["ah-time-24h"],
+            "deactivateStates": ["ah-time-30d"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "24h", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "30d-refresh",
+            "name": "Refresh data (30d)",
+            "description": "Click Refresh to re-fetch all analytics within the 30d window.",
+            "activateStates": ["ah-time-30d"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
 }

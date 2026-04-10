@@ -77,7 +77,10 @@ interface TabsTriggerProps {
   disabled?: boolean;
 }
 
-export const TabsTrigger = forwardRef<HTMLButtonElement, TabsTriggerProps>(function TabsTrigger({ value, children, className, disabled }, ref) {
+export const TabsTrigger = forwardRef<HTMLButtonElement, TabsTriggerProps>(function TabsTrigger(
+  { value, children, className, disabled },
+  ref,
+) {
   const { value: currentValue, onValueChange } = useTabsContext();
   const isActive = currentValue === value;
 

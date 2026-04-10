@@ -667,5 +667,176 @@
       "Tauri: set_watcher_enabled(id, enabled: bool) -> bool",
       "Tauri: delete_watcher(id) -> bool"
     ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "empty-list",
+        "name": "Empty List",
+        "description": "No watchers exist and the create form is closed. Shows the empty-state guidance message and the New Watcher button.",
+        "elements": [{ "textContains": "No watchers configured" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "empty-to-create-form",
+            "name": "Open create form from empty state",
+            "activateStates": ["create-form"],
+            "deactivateStates": ["empty-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "New Watcher" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "list-view",
+        "name": "Watcher List",
+        "description": "One or more watchers exist and the create form is closed. Watcher cards are displayed with toggle, delete, and metadata. The New Watcher button is visible.",
+        "elements": [{ "selector": "span.font-medium.text-sm" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "list-to-create-form",
+            "name": "Open create form from list view",
+            "activateStates": ["create-form"],
+            "deactivateStates": ["list-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "New Watcher" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "list-toggle-watcher",
+            "name": "Toggle a watcher enabled/disabled",
+            "activateStates": ["list-view"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "selector": "button[title='Disable'], button[title='Enable']" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "list-delete-to-empty",
+            "name": "Delete the last watcher, returning to empty state",
+            "activateStates": ["empty-list"],
+            "deactivateStates": ["list-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "selector": "button[title='Delete']" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ],
+            "guard": "Only one watcher remains in the list"
+          },
+          {
+            "id": "list-delete-stays",
+            "name": "Delete a watcher while others remain",
+            "activateStates": ["list-view"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "selector": "button[title='Delete']" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ],
+            "guard": "More than one watcher exists in the list"
+          }
+        ]
+      },
+      {
+        "id": "create-form",
+        "name": "Create Form Open",
+        "description": "The inline create form is visible with name, query, schedule, lookback, action, and prompt fields. The Cancel button replaces New Watcher. The Create Watcher submit button is present (disabled until name and query are filled).",
+        "elements": [{ "selector": "input[placeholder*='Error Toast Watcher']" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "form-cancel-to-empty",
+            "name": "Cancel form when no watchers exist",
+            "activateStates": ["empty-list"],
+            "deactivateStates": ["create-form"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ],
+            "guard": "No watchers exist in the list"
+          },
+          {
+            "id": "form-cancel-to-list",
+            "name": "Cancel form when watchers exist",
+            "activateStates": ["list-view"],
+            "deactivateStates": ["create-form"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ],
+            "guard": "At least one watcher exists in the list"
+          },
+          {
+            "id": "form-submit",
+            "name": "Submit the create form",
+            "activateStates": ["creating"],
+            "deactivateStates": ["create-form"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Create Watcher" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ],
+            "guard": "Both name and query fields contain non-whitespace text"
+          }
+        ]
+      },
+      {
+        "id": "creating",
+        "name": "Creating Watcher",
+        "description": "The form has been submitted and the create_watcher Tauri command is in flight. The submit button shows 'Creating...' and is disabled. On completion the form collapses and the new watcher appears in the list.",
+        "elements": [{ "role": "button", "textContains": "Creating..." }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "creating-to-list",
+            "name": "Creation completes, list refreshes with new watcher",
+            "activateStates": ["list-view"],
+            "deactivateStates": ["creating"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "button", "textContains": "New Watcher" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

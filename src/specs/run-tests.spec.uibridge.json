@@ -266,10 +266,7 @@
         "id": "rt-no-run-selected",
         "name": "No Run Selected",
         "description": "The default state when no workflow run is selected. Shows guidance prompting the user to select a run from the Run Dashboard to view test results.",
-        "elements": [
-          { "textContent": "No Run Selected" },
-          { "textContent": "Select a run" }
-        ],
+        "elements": [{ "textContent": "No Run Selected" }, { "textContent": "Select a run" }],
         "isInitial": true,
         "transitions": [
           {
@@ -287,9 +284,7 @@
         "id": "rt-loading",
         "name": "Loading Results",
         "description": "Test results are being fetched from the backend. A spinner and 'Loading test results...' message are displayed while the data request is in progress.",
-        "elements": [
-          { "textContent": "Loading test results" }
-        ],
+        "elements": [{ "textContent": "Loading test results" }],
         "transitions": [
           {
             "id": "loading-to-results",
@@ -416,9 +411,7 @@
         "id": "rt-result-expanded",
         "name": "Test Result Card Expanded",
         "description": "One or more test result cards are expanded, revealing detailed content below the card header. Expanded content may include error messages (red panel with error text), output logs (pre-formatted text), start/complete timestamps, and AI analysis. The summary header and other collapsed cards remain visible.",
-        "elements": [
-          { "textContains": "assertions" }
-        ],
+        "elements": [{ "textContains": "assertions" }],
         "transitions": [
           {
             "id": "expanded-to-results",

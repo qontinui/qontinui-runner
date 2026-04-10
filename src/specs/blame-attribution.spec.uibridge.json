@@ -602,6 +602,135 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "loading",
+        "name": "Loading — Fetching Blame Data",
+        "description": "Blame data is being fetched from the GET /task-runs/{id}/blame endpoint. A loading indicator (progressbar) is visible. No blame content, summary statistics, or warning sections are shown.",
+        "elements": [{ "role": "progressbar" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-blame-populated",
+            "name": "Blame data loads with attributions",
+            "activateStates": ["blame-populated"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-empty",
+            "name": "No blame data available (run passed first iteration or no attributions)",
+            "activateStates": ["empty"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Blame data fetch fails",
+            "activateStates": ["error"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "empty",
+        "name": "Empty — No Blame Attributions",
+        "description": "The run passed verification on the first iteration or blame analysis produced no attributions. An informative empty-state message explains that blame attribution is only generated when verification fails. No summary statistics, iteration details, or warning sections are shown.",
+        "elements": [{ "textContains": "no blame" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-loading",
+            "name": "User navigates to a different run, triggering a reload",
+            "activateStates": ["loading"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "empty-to-live-updating",
+            "name": "A blame-attribution event arrives for an active run that previously had no blame data",
+            "activateStates": ["live-updating"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "blame-populated",
+        "name": "Blame Populated — Attributions and Summary Visible",
+        "description": "Blame data has loaded successfully. The summary statistics section shows total attributions, oscillating files count, and revert patterns count. Per-iteration blame detail sections are visible with iteration headers, failed step names, blamed iteration references, confidence levels, implicated files, and explanation text. Oscillation and revert warning sections appear conditionally based on the data. Escalation status indicators may be present if thresholds were crossed.",
+        "elements": [{ "textContains": "attribution" }, { "textContains": "Iteration" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "blame-populated-to-loading",
+            "name": "User navigates to a different run, triggering a reload",
+            "activateStates": ["loading"],
+            "deactivateStates": ["blame-populated"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "blame-populated-to-live-updating",
+            "name": "A new blame-attribution Tauri event arrives, indicating the run is still active",
+            "activateStates": ["live-updating"],
+            "deactivateStates": ["blame-populated"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "live-updating",
+        "name": "Live Updating — Receiving Real-Time Blame Events",
+        "description": "The run is actively in progress and blame-attribution Tauri events are arriving. The summary statistics update incrementally as new iterations complete. New iteration blame sections are appended without discarding previously displayed ones. Oscillation and revert warnings may appear or update as patterns emerge across iterations. A live-update indicator distinguishes this state from the static blame-populated state.",
+        "elements": [{ "textContains": "Live" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "live-updating-to-blame-populated",
+            "name": "Run completes and no further blame events will arrive",
+            "activateStates": ["blame-populated"],
+            "deactivateStates": ["live-updating"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "live-updating-to-loading",
+            "name": "User navigates to a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["live-updating"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error — Failed to Load Blame Data",
+        "description": "The GET /task-runs/{id}/blame request failed. An error message is displayed explaining the failure. No blame content, summary statistics, or warning sections are shown.",
+        "elements": [{ "textContains": "Failed to load" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "User retries or navigates to a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "BlameAttributionTab",
     "author": "Claude Opus 4.6",

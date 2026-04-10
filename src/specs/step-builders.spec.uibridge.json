@@ -217,11 +217,122 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "sb-card-grid",
+        "name": "Builder Card Grid",
+        "description": "The Step Builders landing page is displayed with the full card grid showing all six builder types. Each card presents an icon, title, and description. This is the only view state of the page; all navigation leads to external builder pages.",
+        "elements": [
+          { "textContent": "Build individual workflow steps with specialized editors" },
+          { "textContent": "Verification checks for validating UI state" },
+          { "textContent": "Group checks into reusable test suites" },
+          { "textContent": "System commands and shell scripts" },
+          { "textContent": "Automation task definitions" },
+          { "textContent": "Reusable context configurations" },
+          { "textContent": "Browser automation tests" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "sb-navigate-checks",
+            "name": "Navigate to Checks builder",
+            "description": "User clicks the Checks card to open the check builder interface for creating verification checks",
+            "activateStates": [],
+            "deactivateStates": ["sb-card-grid"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Checks" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "sb-navigate-check-groups",
+            "name": "Navigate to Check Groups builder",
+            "description": "User clicks the Check Groups card to open the check group builder for bundling checks into test suites",
+            "activateStates": [],
+            "deactivateStates": ["sb-card-grid"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Check Groups" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "sb-navigate-shell-commands",
+            "name": "Navigate to Shell Commands builder",
+            "description": "User clicks the Shell Commands card to open the shell command builder for defining system commands",
+            "activateStates": [],
+            "deactivateStates": ["sb-card-grid"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Shell Commands" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "sb-navigate-tasks",
+            "name": "Navigate to Tasks builder",
+            "description": "User clicks the Tasks card to open the task builder for creating automation task definitions",
+            "activateStates": [],
+            "deactivateStates": ["sb-card-grid"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Tasks" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "sb-navigate-contexts",
+            "name": "Navigate to Contexts builder",
+            "description": "User clicks the Contexts card to open the context builder for creating reusable context configurations",
+            "activateStates": [],
+            "deactivateStates": ["sb-card-grid"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Contexts" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "sb-navigate-playwright",
+            "name": "Navigate to Playwright Tests builder",
+            "description": "User clicks the Playwright Tests card to open the playwright test builder for creating browser automation tests",
+            "activateStates": [],
+            "deactivateStates": ["sb-card-grid"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Playwright Tests" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "StepBuildersPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/build/templates",
     "elementSource": "sdk",
     "tags": ["step-builders", "landing-page", "navigation", "asset-creation"],

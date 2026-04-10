@@ -69,16 +69,65 @@ export function ConnectionBar({
 }: ConnectionBarProps) {
   const [url, setUrl] = useState(connection.url || "http://localhost:3001");
 
-  const { ref: bundledRef } = useUIElement({ id: "specs-btn-bundled", type: "button", label: "Load bundled specs", actions: ["click"] });
-  const { ref: fileRef } = useUIElement({ id: "specs-btn-file", type: "button", label: "Load specs from file", actions: ["click"] });
-  const { ref: discoverRef } = useUIElement({ id: "specs-btn-discover", type: "button", label: "Discover specs from app", actions: ["click"] });
-  const { ref: discoverInputRef } = useUIElement({ id: "specs-input-url", type: "input", label: "App URL for spec discovery" });
-  const { ref: editRef } = useUIElement({ id: "specs-btn-edit", type: "button", label: "Toggle edit mode", actions: ["click"] });
-  const { ref: saveRef } = useUIElement({ id: "specs-btn-save", type: "button", label: "Save spec to file", actions: ["click"] });
-  const { ref: aiEvalRef } = useUIElement({ id: "specs-btn-ai-eval", type: "button", label: "Toggle AI evaluation mode", actions: ["click"] });
-  const { ref: buildRef } = useUIElement({ id: "specs-btn-build-workflow", type: "button", label: "Build workflow from spec", actions: ["click"] });
-  const { ref: syncRef } = useUIElement({ id: "specs-btn-sync-all", type: "button", label: "Sync all specs with AI", actions: ["click"] });
-  const { ref: compileRef } = useUIElement({ id: "specs-btn-compile-sm", type: "button", label: "Compile state machine", actions: ["click"] });
+  const { ref: bundledRef } = useUIElement({
+    id: "specs-btn-bundled",
+    type: "button",
+    label: "Load bundled specs",
+    actions: ["click"],
+  });
+  const { ref: fileRef } = useUIElement({
+    id: "specs-btn-file",
+    type: "button",
+    label: "Load specs from file",
+    actions: ["click"],
+  });
+  const { ref: discoverRef } = useUIElement({
+    id: "specs-btn-discover",
+    type: "button",
+    label: "Discover specs from app",
+    actions: ["click"],
+  });
+  const { ref: discoverInputRef } = useUIElement({
+    id: "specs-input-url",
+    type: "input",
+    label: "App URL for spec discovery",
+  });
+  const { ref: editRef } = useUIElement({
+    id: "specs-btn-edit",
+    type: "button",
+    label: "Toggle edit mode",
+    actions: ["click"],
+  });
+  const { ref: saveRef } = useUIElement({
+    id: "specs-btn-save",
+    type: "button",
+    label: "Save spec to file",
+    actions: ["click"],
+  });
+  const { ref: aiEvalRef } = useUIElement({
+    id: "specs-btn-ai-eval",
+    type: "button",
+    label: "Toggle AI evaluation mode",
+    actions: ["click"],
+  });
+  const { ref: buildRef } = useUIElement({
+    id: "specs-btn-build-workflow",
+    type: "button",
+    label: "Build workflow from spec",
+    actions: ["click"],
+  });
+  const { ref: syncRef } = useUIElement({
+    id: "specs-btn-sync-all",
+    type: "button",
+    label: "Sync all specs with AI",
+    actions: ["click"],
+  });
+  const { ref: compileRef } = useUIElement({
+    id: "specs-btn-compile-sm",
+    type: "button",
+    label: "Compile state machine",
+    actions: ["click"],
+  });
 
   return (
     <div className="border-b border-border bg-white/[0.01]">

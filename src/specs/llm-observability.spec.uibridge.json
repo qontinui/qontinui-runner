@@ -1163,7 +1163,13 @@
             "activateStates": ["dashboard"],
             "deactivateStates": ["loading"],
             "staysVisible": false,
-            "process": [{ "action": "wait", "target": { "textContent": "LLM Analytics" }, "waitAfter": { "type": "idle", "timeout": 5000 } }]
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "LLM Analytics" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
           },
           {
             "id": "loading-to-error",
@@ -1171,7 +1177,13 @@
             "activateStates": ["error"],
             "deactivateStates": ["loading"],
             "staysVisible": false,
-            "process": [{ "action": "wait", "target": { "textContent": "Failed to load LLM analytics" }, "waitAfter": { "type": "idle", "timeout": 5000 } }]
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Failed to load LLM analytics" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
           },
           {
             "id": "loading-to-empty",
@@ -1179,7 +1191,13 @@
             "activateStates": ["empty"],
             "deactivateStates": ["loading"],
             "staysVisible": false,
-            "process": [{ "action": "wait", "target": { "textContent": "No LLM usage data available" }, "waitAfter": { "type": "idle", "timeout": 5000 } }]
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "No LLM usage data available" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
           }
         ]
       },
@@ -1196,7 +1214,13 @@
             "activateStates": ["loading"],
             "deactivateStates": ["error"],
             "staysVisible": false,
-            "process": [{ "action": "click", "target": { "role": "button", "textContent": "Retry" }, "waitAfter": { "type": "idle", "timeout": 2000 } }]
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Retry" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
           }
         ]
       },
@@ -1212,7 +1236,13 @@
         "id": "dashboard",
         "name": "Dashboard",
         "description": "Full analytics view with summary cards, Cost Over Time chart, Cost by Model chart, Cost Trend chart, Cost by Phase chart, Provider Latency chart, and Task Run Cost table. Time range selector and refresh button in the header.",
-        "elements": [{ "textContent": "LLM Analytics" }, { "accessibleName": "Select time range" }, { "textContent": "Total Cost" }, { "textContent": "Cost Over Time" }, { "textContent": "Task Run Costs" }],
+        "elements": [
+          { "textContent": "LLM Analytics" },
+          { "accessibleName": "Select time range" },
+          { "textContent": "Total Cost" },
+          { "textContent": "Cost Over Time" },
+          { "textContent": "Task Run Costs" }
+        ],
         "isInitial": false,
         "transitions": [
           {
@@ -1221,7 +1251,14 @@
             "activateStates": ["dashboard"],
             "deactivateStates": [],
             "staysVisible": true,
-            "process": [{ "action": "select", "target": { "accessibleName": "Select time range" }, "value": "1d", "waitAfter": { "type": "idle", "timeout": 3000 } }]
+            "process": [
+              {
+                "action": "select",
+                "target": { "accessibleName": "Select time range" },
+                "value": "1d",
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
           },
           {
             "id": "dashboard-select-7d",
@@ -1229,7 +1266,14 @@
             "activateStates": ["dashboard"],
             "deactivateStates": [],
             "staysVisible": true,
-            "process": [{ "action": "select", "target": { "accessibleName": "Select time range" }, "value": "7d", "waitAfter": { "type": "idle", "timeout": 3000 } }]
+            "process": [
+              {
+                "action": "select",
+                "target": { "accessibleName": "Select time range" },
+                "value": "7d",
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
           },
           {
             "id": "dashboard-select-30d",
@@ -1237,7 +1281,14 @@
             "activateStates": ["dashboard"],
             "deactivateStates": [],
             "staysVisible": true,
-            "process": [{ "action": "select", "target": { "accessibleName": "Select time range" }, "value": "30d", "waitAfter": { "type": "idle", "timeout": 3000 } }]
+            "process": [
+              {
+                "action": "select",
+                "target": { "accessibleName": "Select time range" },
+                "value": "30d",
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
           },
           {
             "id": "dashboard-select-all",
@@ -1245,7 +1296,14 @@
             "activateStates": ["dashboard"],
             "deactivateStates": [],
             "staysVisible": true,
-            "process": [{ "action": "select", "target": { "accessibleName": "Select time range" }, "value": "all", "waitAfter": { "type": "idle", "timeout": 3000 } }]
+            "process": [
+              {
+                "action": "select",
+                "target": { "accessibleName": "Select time range" },
+                "value": "all",
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
           },
           {
             "id": "dashboard-refresh",
@@ -1253,7 +1311,13 @@
             "activateStates": ["dashboard"],
             "deactivateStates": [],
             "staysVisible": true,
-            "process": [{ "action": "click", "target": { "accessibleName": "Refresh analytics" }, "waitAfter": { "type": "idle", "timeout": 3000 } }]
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh analytics" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
           }
         ]
       }

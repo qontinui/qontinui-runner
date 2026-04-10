@@ -326,11 +326,223 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "exec-empty-queue",
+        "name": "Empty Queue — Default Landing",
+        "description": "The initial state when the page loads with no workflows queued. The two-panel layout is visible with the library panel open on the left and an empty queue panel on the right. The Run Queue and Clear buttons are disabled because there is nothing to execute. The bottom bar shows 'Queue: 0 workflows'.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Workflow Queue"
+          },
+          {
+            "role": "searchbox"
+          },
+          {
+            "textContent": "Library"
+          },
+          {
+            "textContent": "Queue: 0 workflows"
+          }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "empty-to-populated",
+            "name": "Add a workflow to the queue",
+            "description": "User clicks a workflow in the library panel to add it to the execution queue, enabling the Run Queue and Clear buttons",
+            "activateStates": ["exec-populated-queue"],
+            "deactivateStates": ["exec-empty-queue"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Add"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "empty-to-options-open",
+            "name": "Open execution options panel",
+            "description": "User clicks the settings icon in the bottom bar to reveal execution options like stop-on-failure",
+            "activateStates": ["exec-options-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Execution options"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "exec-populated-queue",
+        "name": "Populated Queue — Ready to Execute",
+        "description": "One or more workflows have been added to the queue. The queue panel shows the ordered list of workflows with remove buttons. The bottom bar displays the workflow count and total step count. The Run Queue and Clear buttons are enabled.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Run Queue"
+          },
+          {
+            "role": "button",
+            "textContent": "Clear"
+          },
+          {
+            "textContent": "Queue:"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "populated-to-empty",
+            "name": "Clear the entire queue",
+            "description": "User clicks the Clear button to remove all workflows from the queue, returning to the empty state",
+            "activateStates": ["exec-empty-queue"],
+            "deactivateStates": ["exec-populated-queue"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Clear"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "populated-to-executing",
+            "name": "Launch the queue",
+            "description": "User clicks Run Queue to execute all queued workflows as a composed workflow sequence",
+            "activateStates": ["exec-executing"],
+            "deactivateStates": ["exec-populated-queue"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Run Queue"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          },
+          {
+            "id": "populated-to-options-open",
+            "name": "Open execution options panel",
+            "description": "User clicks the settings icon in the bottom bar to configure execution options before launching",
+            "activateStates": ["exec-options-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Execution options"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "exec-options-open",
+        "name": "Execution Options Panel Open",
+        "description": "The execution options dropdown is visible above the bottom bar, showing the 'Stop on failure' checkbox with its description. A click-outside overlay is present to dismiss the panel. This state overlays either the empty or populated queue state.",
+        "elements": [
+          {
+            "textContent": "Execution Options"
+          },
+          {
+            "textContent": "Stop on failure"
+          },
+          {
+            "textContent": "Stop the sequence if any workflow fails"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "options-close",
+            "name": "Close execution options panel",
+            "description": "User clicks outside the options panel or clicks the settings icon again to dismiss the dropdown",
+            "activateStates": [],
+            "deactivateStates": ["exec-options-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Execution options"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "exec-executing",
+        "name": "Executing — Queue Running",
+        "description": "The composed workflow has been submitted to the runner. The Run Queue button shows a loading spinner with 'Starting...' text and both Run Queue and Clear are disabled. On success, the page automatically navigates to the Active Dashboard.",
+        "elements": [
+          {
+            "textContent": "Starting..."
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "executing-to-active-dashboard",
+            "name": "Navigate to Active Dashboard on success",
+            "description": "After the composed workflow is successfully submitted, the page automatically navigates to the Active Dashboard to monitor execution progress",
+            "activateStates": [],
+            "deactivateStates": ["exec-executing"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "WorkflowQueueTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/execute",
     "elementSource": "sdk",
     "tags": ["execute", "workflow-queue", "composed-workflow", "run-group", "tier-1"],

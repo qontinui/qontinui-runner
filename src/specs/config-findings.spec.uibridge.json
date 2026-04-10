@@ -200,11 +200,126 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "category-list",
+        "name": "Category List",
+        "description": "Main view showing all finding categories (built-in and custom) with their names, icons, colors, action types, reorder controls, visibility toggles, and reset/legend footer",
+        "elements": [{ "textContent": "Finding Categories" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "list-to-form-new",
+            "name": "Open new category form",
+            "activateStates": ["category-form"],
+            "deactivateStates": ["category-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "New Category" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "list-to-delete-confirm",
+            "name": "Open delete confirmation dialog",
+            "activateStates": ["delete-confirm"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Delete" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "category-form",
+        "name": "Category Form",
+        "description": "Create or edit form for a custom finding category with fields for name, description, icon picker, color picker, default action type selector, and a live preview of the category appearance",
+        "elements": [{ "textContent": "Category Name" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "form-to-list-save",
+            "name": "Save category and return to list",
+            "activateStates": ["category-list"],
+            "deactivateStates": ["category-form"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Save" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "form-to-list-cancel",
+            "name": "Cancel form and return to list",
+            "activateStates": ["category-list"],
+            "deactivateStates": ["category-form"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "delete-confirm",
+        "name": "Delete Confirmation",
+        "description": "Confirmation dialog warning that deleting a custom category will leave associated findings uncategorized, with confirm and cancel actions",
+        "elements": [{ "textContent": "uncategorized" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "delete-confirm-yes",
+            "name": "Confirm deletion and return to list",
+            "activateStates": ["category-list"],
+            "deactivateStates": ["delete-confirm"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Confirm" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "delete-confirm-no",
+            "name": "Cancel deletion and return to list",
+            "activateStates": ["category-list"],
+            "deactivateStates": ["delete-confirm"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "CategoryManager",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/settings/finding-rules",
     "elementSource": "sdk",
     "tags": ["findings", "categories", "configuration", "settings"]

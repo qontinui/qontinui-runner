@@ -193,11 +193,219 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "dashboard-view",
+        "name": "Dashboard — Aggregate Metrics",
+        "description": "The Dashboard tab is active, showing aggregate generation quality metrics including Total Generations, Success Rate, and Avg Duration cards, plus a trend chart. This is the default tab when the page loads.",
+        "elements": [{ "textContent": "Total Generations" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "dashboard-to-inspector",
+            "name": "Switch to Pipeline Inspector tab",
+            "activateStates": ["inspector-view"],
+            "deactivateStates": ["dashboard-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Pipeline Inspector" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "dashboard-to-step-quality",
+            "name": "Switch to Step Quality tab",
+            "activateStates": ["step-quality-view"],
+            "deactivateStates": ["dashboard-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Step Quality" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "dashboard-to-edit-analysis",
+            "name": "Switch to Edit Analysis tab",
+            "activateStates": ["edit-analysis-view"],
+            "deactivateStates": ["dashboard-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Edit Analysis" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "inspector-view",
+        "name": "Pipeline Inspector — Step-by-Step Analysis",
+        "description": "The Pipeline Inspector tab is active, showing a left panel with a list of generation artifacts and a right panel with pipeline stage details (Discovery, Builder, Auto-fix, Verification, Hardener) for the selected artifact. Before selection, prompts the user to select a generation.",
+        "elements": [{ "textContent": "1. Discovery" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "inspector-to-dashboard",
+            "name": "Switch to Dashboard tab",
+            "activateStates": ["dashboard-view"],
+            "deactivateStates": ["inspector-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Dashboard" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "inspector-to-step-quality",
+            "name": "Switch to Step Quality tab",
+            "activateStates": ["step-quality-view"],
+            "deactivateStates": ["inspector-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Step Quality" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "inspector-to-edit-analysis",
+            "name": "Switch to Edit Analysis tab",
+            "activateStates": ["edit-analysis-view"],
+            "deactivateStates": ["inspector-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Edit Analysis" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "step-quality-view",
+        "name": "Step Quality — Per-Step Evaluation",
+        "description": "The Step Quality tab is active, showing a textarea for pasting workflow JSON (auto-loads from the most recent artifact) and an Evaluate button. After evaluation, displays an Overall Score, Quality Gate result, Steps Evaluated count, Coverage percentage, and a step-level heatmap with dimension scores.",
+        "elements": [{ "textContent": "Evaluate" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "step-quality-to-dashboard",
+            "name": "Switch to Dashboard tab",
+            "activateStates": ["dashboard-view"],
+            "deactivateStates": ["step-quality-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Dashboard" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "step-quality-to-inspector",
+            "name": "Switch to Pipeline Inspector tab",
+            "activateStates": ["inspector-view"],
+            "deactivateStates": ["step-quality-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Pipeline Inspector" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "step-quality-to-edit-analysis",
+            "name": "Switch to Edit Analysis tab",
+            "activateStates": ["edit-analysis-view"],
+            "deactivateStates": ["step-quality-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Edit Analysis" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "edit-analysis-view",
+        "name": "Edit Analysis — Generated vs Edited Comparison",
+        "description": "The Edit Analysis tab is active, showing charts and statistics about the gap between AI-generated workflows and their human-edited versions, including a Most Edited Fields bar chart and edit distance distribution.",
+        "elements": [{ "textContent": "Most Edited Fields" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "edit-analysis-to-dashboard",
+            "name": "Switch to Dashboard tab",
+            "activateStates": ["dashboard-view"],
+            "deactivateStates": ["edit-analysis-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Dashboard" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "edit-analysis-to-inspector",
+            "name": "Switch to Pipeline Inspector tab",
+            "activateStates": ["inspector-view"],
+            "deactivateStates": ["edit-analysis-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Pipeline Inspector" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "edit-analysis-to-step-quality",
+            "name": "Switch to Step Quality tab",
+            "activateStates": ["step-quality-view"],
+            "deactivateStates": ["edit-analysis-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Step Quality" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "GeneratorEvalPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-04-02T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/generator-eval",
     "elementSource": "sdk",
     "tags": [

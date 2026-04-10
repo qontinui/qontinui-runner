@@ -13,7 +13,11 @@
           "description": "The page header displays 'Online Learning' as the title text.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContent": "Online Learning" }, "label": "Page title" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Online Learning" },
+            "label": "Page title"
+          },
           "assertionType": "containsText",
           "expected": "Online Learning",
           "source": "ai-generated",
@@ -25,7 +29,11 @@
           "description": "A 'Refresh' button is present in the header bar for manual data reload.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button", "textContent": "Refresh" }, "label": "Refresh button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Refresh" },
+            "label": "Refresh button"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -36,7 +44,11 @@
           "description": "Clicking the Refresh button triggers a fresh fetch of all 7 online learning API endpoints (/online-learning/model-routing, /model-routing/table, /drift-signals, /drift-monitor, /step-scorecard, /strategies, /experiences) and updates the displayed data without a full page reload.",
           "category": "interaction",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button", "textContent": "Refresh" }, "label": "Refresh button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Refresh" },
+            "label": "Refresh button"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -47,7 +59,11 @@
           "description": "While data is being fetched, a 'Loading...' text with pulse animation appears next to the page title.",
           "category": "element-presence",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Loading" }, "label": "Loading indicator" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Loading" },
+            "label": "Loading indicator"
+          },
           "assertionType": "semantic",
           "precondition": "Data is being fetched (initial load or refresh in progress)",
           "source": "ai-generated",
@@ -68,7 +84,11 @@
           "description": "Exactly 6 sub-tab buttons are present: Overview, Model Routing, Drift Detection, Step Credits, Strategies, Experiences.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContent": "Overview" }, "label": "Overview tab" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Overview" },
+            "label": "Overview tab"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -79,7 +99,11 @@
           "description": "The 'Model Routing' sub-tab is present.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Model Routing" }, "label": "Model Routing tab" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Model Routing" },
+            "label": "Model Routing tab"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -90,7 +114,11 @@
           "description": "The currently active tab has a blue background (bg-blue-500/20) and blue text (text-blue-400), while inactive tabs have muted text (text-white/50). On initial load, the Overview tab is active.",
           "category": "design",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContent": "Overview" }, "label": "Active tab" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Overview" },
+            "label": "Active tab"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -101,7 +129,11 @@
           "description": "Clicking a tab switches the content area to display the corresponding panel without losing data or triggering a refetch. Switching from Overview to Model Routing shows the Q-table; switching to Drift Detection shows drift signals.",
           "category": "navigation",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Drift Detection" }, "label": "Drift Detection tab" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Drift Detection" },
+            "label": "Drift Detection tab"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -112,7 +144,11 @@
           "description": "When unacknowledged drift signals exist, the Drift Detection tab shows an amber badge with the signal count (e.g., '3'). The badge has amber background (bg-amber-500/20) and amber text. When there are no drift signals, no badge is shown.",
           "category": "data-display",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Drift Detection" }, "label": "Drift tab with badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Drift Detection" },
+            "label": "Drift tab with badge"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -132,7 +168,11 @@
           "description": "A stat card labeled 'Routing Entries' displays the number of (context, model) pairs in the Q-table, with a sub-label showing the number of available models (e.g., '3 models').",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Routing Entries" }, "label": "Routing entries stat card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Routing Entries" },
+            "label": "Routing entries stat card"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -143,7 +183,11 @@
           "description": "A stat card labeled 'Drift Signals' displays the count of unacknowledged drift signals. When signals are present, the card has an amber border and background tint (border-amber-500/30, bg-amber-500/5) to draw attention. The sub-label shows the total detector count.",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Drift Signals" }, "label": "Drift signals stat card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Drift Signals" },
+            "label": "Drift signals stat card"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -154,7 +198,11 @@
           "description": "A stat card labeled 'Step Types Scored' displays the count of distinct step types that have credit attribution data, with sub-label 'credit attribution'.",
           "category": "data-display",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Step Types Scored" }, "label": "Step types stat card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Step Types Scored" },
+            "label": "Step types stat card"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -165,7 +213,11 @@
           "description": "A stat card labeled 'Strategies' displays the total strategy count with a sub-label showing how many are active (e.g., '2 active').",
           "category": "data-display",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Strategies" }, "label": "Strategies stat card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Strategies" },
+            "label": "Strategies stat card"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -185,7 +237,11 @@
           "description": "When unacknowledged drift signals exist, an 'Active Drift Signals' section with amber border appears. Each signal line shows a colored dot (red for drift, amber for warning), the metric name, context key, and pre/post mean values separated by an arrow.",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Active Drift Signals" }, "label": "Drift alert banner" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Active Drift Signals" },
+            "label": "Drift alert banner"
+          },
           "assertionType": "semantic",
           "precondition": "At least one unacknowledged drift signal exists in the database",
           "source": "ai-generated",
@@ -197,7 +253,11 @@
           "description": "When there are no unacknowledged drift signals, the 'Active Drift Signals' banner is not rendered.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Active Drift Signals" }, "label": "Drift alert banner" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Active Drift Signals" },
+            "label": "Drift alert banner"
+          },
           "assertionType": "notExists",
           "precondition": "No drift signals exist in the database",
           "source": "ai-generated",
@@ -209,7 +269,11 @@
           "description": "Each drift signal displayed must show: (1) a drift_level indicator dot — red for 'drift', amber for 'warning'; (2) the metric_name (composite_score, success_rate, cost_usd, or duration_secs); (3) the context_key in domain:complexity:has_ui format; (4) pre_drift_mean and post_drift_mean numeric values. If the post_drift_mean is lower than pre_drift_mean for composite_score, this indicates performance degradation.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Active Drift Signals" }, "label": "Drift signals list" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Active Drift Signals" },
+            "label": "Drift signals list"
+          },
           "assertionType": "semantic",
           "precondition": "Drift signals are visible",
           "source": "ai-generated",
@@ -230,7 +294,11 @@
           "description": "Available model names are displayed as small badges above the Q-table. Default models are claude-haiku-4-5, claude-sonnet-4, and claude-opus-4.",
           "category": "data-display",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "claude-" }, "label": "Model badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "claude-" },
+            "label": "Model badge"
+          },
           "assertionType": "exists",
           "precondition": "Model routing data has been loaded",
           "source": "ai-generated",
@@ -242,7 +310,11 @@
           "description": "The Q-table has 4 columns: Context (context_key in prompt:file:complexity:domain:ui format), Model (truncated name), Q-Value (4 decimal places), and Visits (integer count).",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Context" }, "label": "Q-table header" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Context" },
+            "label": "Q-table header"
+          },
           "assertionType": "semantic",
           "precondition": "Model routing tab is active and data exists",
           "source": "ai-generated",
@@ -254,7 +326,11 @@
           "description": "When no model routing data exists, the message 'No model routing data yet. The bandit learns from workflow outcomes.' is displayed instead of the table.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No model routing data yet" }, "label": "Empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No model routing data yet" },
+            "label": "Empty state"
+          },
           "assertionType": "semantic",
           "precondition": "Model routing tab is active and no data has been collected",
           "source": "ai-generated",
@@ -287,7 +363,11 @@
           "description": "A status line shows the number of active detectors and the algorithm names: 'ADWIN + DDM + Page-Hinkley'. ADWIN handles continuous metrics (score, cost, duration), DDM handles binary outcomes (success rate), and Page-Hinkley detects gradual trends.",
           "category": "data-display",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "ADWIN + DDM + Page-Hinkley" }, "label": "Detector status" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "ADWIN + DDM + Page-Hinkley" },
+            "label": "Detector status"
+          },
           "assertionType": "exists",
           "precondition": "Drift Detection tab is active and drift monitor is initialized",
           "source": "ai-generated",
@@ -299,7 +379,11 @@
           "description": "The drift signals table has 6 columns: Level (badge with 'drift' or 'warning'), Metric, Context, Detector, Pre-Drift (4 decimal places), Post-Drift (4 decimal places). Drift-level badges are red; warning-level badges are amber.",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Level" }, "label": "Drift table header" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Level" },
+            "label": "Drift table header"
+          },
           "assertionType": "semantic",
           "precondition": "Drift Detection tab is active and drift signals exist",
           "source": "ai-generated",
@@ -311,7 +395,11 @@
           "description": "When no drift signals exist, the message 'No drift signals. The system is monitoring composite score, success rate, cost, and duration per context.' is shown.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No drift signals" }, "label": "Empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No drift signals" },
+            "label": "Empty state"
+          },
           "assertionType": "semantic",
           "precondition": "Drift Detection tab is active and no signals exist",
           "source": "ai-generated",
@@ -332,7 +420,11 @@
           "description": "The credits table has 5 columns: Step Type, Avg Credit (4 decimal places, blue monospace), Raw Credit (4 decimal places), Count, and a visual Bar. The table is sorted by average credit descending (highest-contributing step types first).",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Step Type" }, "label": "Credits table header" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Step Type" },
+            "label": "Credits table header"
+          },
           "assertionType": "semantic",
           "precondition": "Step Credits tab is active and credit data exists",
           "source": "ai-generated",
@@ -344,7 +436,11 @@
           "description": "Each row has a green (emerald-500/60) horizontal bar whose width is proportional to the normalized credit value. The bar fills a fixed-width container. A step type with higher credit has a wider bar than one with lower credit.",
           "category": "design",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "tagName": "table" }, "label": "Credits table" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "table" },
+            "label": "Credits table"
+          },
           "assertionType": "semantic",
           "precondition": "Credits table has at least two rows",
           "source": "ai-generated",
@@ -356,7 +452,11 @@
           "description": "When no credit data exists, the message 'No step credits yet. Credits are computed from pipeline traces after each workflow run.' is shown.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No step credits yet" }, "label": "Empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No step credits yet" },
+            "label": "Empty state"
+          },
           "assertionType": "semantic",
           "precondition": "Step Credits tab is active and no data exists",
           "source": "ai-generated",
@@ -377,7 +477,11 @@
           "description": "Each strategy card shows: (1) name as a white heading, (2) status badge — green for 'active', blue for 'candidate', grey for 'degraded'/'retired', (3) description text in muted white, (4) performance stats: Selected count, Success percentage, Avg Score (3 decimal places), Avg Cost (2 decimal places with $ prefix).",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Selected:" }, "label": "Strategy card stats" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Selected:" },
+            "label": "Strategy card stats"
+          },
           "assertionType": "semantic",
           "precondition": "Strategies tab is active and at least one strategy exists",
           "source": "ai-generated",
@@ -389,7 +493,11 @@
           "description": "Strategy status badges use consistent colors: 'active' = emerald green (bg-emerald-500/20 text-emerald-400), 'candidate' = blue (bg-blue-500/20 text-blue-400), 'degraded' or 'retired' = grey (bg-white/10 text-white/40). These match the severity semantics — active strategies are proven, candidates are under evaluation.",
           "category": "design",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "active" }, "label": "Status badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "active" },
+            "label": "Status badge"
+          },
           "assertionType": "semantic",
           "precondition": "At least one strategy exists",
           "source": "ai-generated",
@@ -401,7 +509,11 @@
           "description": "When no strategies exist, the message 'No strategies yet. Strategies are extracted from P90+ performing runs and validated through canary testing.' is shown.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No strategies yet" }, "label": "Empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No strategies yet" },
+            "label": "Empty state"
+          },
           "assertionType": "semantic",
           "precondition": "Strategies tab is active and no strategies exist",
           "source": "ai-generated",
@@ -422,7 +534,11 @@
           "description": "Each experience card shows: (1) outcome badge — green for success/complete/completed, red for failure/failed, (2) domain tag, (3) complexity tier, (4) truncated task_run_id (first 12 chars + '...') aligned right, (5) counts: 'N decisions', 'N failures', 'N patterns'.",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "decisions" }, "label": "Experience card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "decisions" },
+            "label": "Experience card"
+          },
           "assertionType": "semantic",
           "precondition": "Experiences tab is active and at least one experience exists",
           "source": "ai-generated",
@@ -434,7 +550,11 @@
           "description": "When no experiences exist, the message 'No experience summaries yet. Experiences are extracted after each workflow run.' is shown.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No experience summaries yet" }, "label": "Empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No experience summaries yet" },
+            "label": "Empty state"
+          },
           "assertionType": "semantic",
           "precondition": "Experiences tab is active and no experiences exist",
           "source": "ai-generated",
@@ -455,7 +575,11 @@
           "description": "The page background is #0a0a0f (near-black). All content panels use white/[0.02] or white/[0.03] backgrounds for subtle contrast against the page background. Borders use white/10 opacity.",
           "category": "design",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContent": "Online Learning" }, "label": "Page container" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Online Learning" },
+            "label": "Page container"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -466,7 +590,11 @@
           "description": "Primary text (titles, stat numbers) uses white/90 opacity. Secondary text (labels, descriptions) uses white/60. Tertiary text (sub-labels, IDs) uses white/30-40. All text is legible against the dark background — no text should be invisible or nearly invisible.",
           "category": "design",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContent": "Online Learning" }, "label": "Title text" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Online Learning" },
+            "label": "Title text"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -477,7 +605,11 @@
           "description": "Stat card numbers use text-2xl font-semibold in white/90. Labels use text-xs in white/60. Sub-labels use text-[10px] in white/30.",
           "category": "design",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Routing Entries" }, "label": "Stat card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Routing Entries" },
+            "label": "Stat card"
+          },
           "assertionType": "semantic",
           "precondition": "Overview tab is active",
           "source": "ai-generated",
@@ -510,7 +642,11 @@
           "description": "The dashboard automatically refreshes all data every 60 seconds without user interaction. After 60 seconds, any new drift signals, routing updates, or experience summaries appear in the UI.",
           "category": "behavior",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContent": "Online Learning" }, "label": "Dashboard" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Online Learning" },
+            "label": "Dashboard"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -521,7 +657,11 @@
           "description": "When the Rust backend emits a 'drift-detected' Tauri event (triggered by the drift detection engine detecting a performance shift), the dashboard immediately refreshes all data to show the new drift signal. The drift count badge on the Drift Detection tab updates in real-time.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Drift Detection" }, "label": "Drift tab" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Drift Detection" },
+            "label": "Drift tab"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -553,7 +693,11 @@
           "description": "For a given task run's step credits (visible via the Step Credits tab), the sum of all normalized_credit values should approximately equal the workflow's composite_agentic_score. A significant discrepancy indicates a normalization bug in the ADCA credit assignment algorithm.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "tagName": "table" }, "label": "Credits table" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "table" },
+            "label": "Credits table"
+          },
           "assertionType": "semantic",
           "precondition": "Step Credits tab shows per-run credit data",
           "source": "ai-generated",
@@ -565,7 +709,11 @@
           "description": "Every strategy must have a provenance description explaining how it was created: 'Extracted from run X' (P90+ run extraction), 'Failure-mined from X' (failure contrast analysis), or 'Variant of X' (mutation). A strategy without clear provenance indicates a creation bug.",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Extracted" }, "label": "Strategy description" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Extracted" },
+            "label": "Strategy description"
+          },
           "assertionType": "semantic",
           "precondition": "Strategies tab has at least one strategy",
           "source": "ai-generated",
@@ -576,9 +724,826 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "ol-state-loading",
+        "name": "Loading — Initial Data Fetch",
+        "description": "The page is fetching data from the 7 online learning API endpoints. A 'Loading...' indicator with pulse animation appears next to the page title. The tab bar is visible but content panels are empty or show skeleton placeholders. This state resolves automatically once all fetches complete, transitioning to the Overview tab.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Online Learning"
+          },
+          {
+            "textContains": "Loading"
+          }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-overview",
+            "name": "Data fetch completes",
+            "description": "All API endpoints have responded and data is populated into the dashboard. The loading indicator disappears and the Overview tab content becomes visible with stat cards and any drift alerts.",
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ol-state-overview",
+        "name": "Overview Tab Active",
+        "description": "The Overview tab is selected and highlighted with blue styling. The content area shows 4 stat cards (Routing Entries, Drift Signals, Step Types Scored, Strategies) in a grid. If drift signals exist, an amber 'Active Drift Signals' alert banner appears below the stat cards.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Online Learning"
+          },
+          {
+            "textContains": "Routing Entries"
+          },
+          {
+            "textContains": "Step Types Scored"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "overview-to-model-routing",
+            "name": "Switch to Model Routing tab",
+            "description": "User clicks the Model Routing tab to view the bandit Q-table with context/model pairs, Q-values, and visit counts.",
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-overview"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Model Routing"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "overview-to-drift-detection",
+            "name": "Switch to Drift Detection tab",
+            "description": "User clicks the Drift Detection tab to view the drift signals table and detector status.",
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-overview"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Drift Detection"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "overview-to-step-credits",
+            "name": "Switch to Step Credits tab",
+            "description": "User clicks the Step Credits tab to view the ADCA credit attribution scorecard.",
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-overview"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Step Credits"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "overview-to-strategies",
+            "name": "Switch to Strategies tab",
+            "description": "User clicks the Strategies tab to view the evolvable strategy bank cards.",
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-overview"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Strategies"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "overview-to-experiences",
+            "name": "Switch to Experiences tab",
+            "description": "User clicks the Experiences tab to view post-run experience summary cards.",
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-overview"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Experiences"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "overview-refresh",
+            "name": "Manual refresh from Overview",
+            "description": "User clicks the Refresh button to re-fetch all API endpoints. The loading indicator briefly appears, then the Overview tab re-renders with fresh data.",
+            "activateStates": ["ol-state-loading"],
+            "deactivateStates": ["ol-state-overview"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Refresh"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ol-state-model-routing",
+        "name": "Model Routing Tab Active",
+        "description": "The Model Routing tab is selected. The content area shows model name badges and the Q-table with Context, Model, Q-Value, and Visits columns sorted by Q-value descending. If no data exists, an empty state message is shown instead.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Online Learning"
+          },
+          {
+            "textContains": "Model Routing"
+          },
+          {
+            "textContains": "Context"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "model-routing-to-overview",
+            "name": "Switch to Overview tab",
+            "description": "User clicks the Overview tab to return to the stat cards and drift alert summary.",
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-model-routing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Overview"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "model-routing-to-drift-detection",
+            "name": "Switch to Drift Detection tab",
+            "description": "User clicks the Drift Detection tab.",
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-model-routing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Drift Detection"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "model-routing-to-step-credits",
+            "name": "Switch to Step Credits tab",
+            "description": "User clicks the Step Credits tab.",
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-model-routing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Step Credits"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "model-routing-to-strategies",
+            "name": "Switch to Strategies tab",
+            "description": "User clicks the Strategies tab.",
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-model-routing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Strategies"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "model-routing-to-experiences",
+            "name": "Switch to Experiences tab",
+            "description": "User clicks the Experiences tab.",
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-model-routing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Experiences"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ol-state-drift-detection",
+        "name": "Drift Detection Tab Active",
+        "description": "The Drift Detection tab is selected. The content area shows a detector status line ('ADWIN + DDM + Page-Hinkley') and a table of drift signals with Level, Metric, Context, Detector, Pre-Drift, and Post-Drift columns. If no signals exist, an empty state message is shown.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Online Learning"
+          },
+          {
+            "textContains": "Drift Detection"
+          },
+          {
+            "textContains": "Level"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "drift-detection-to-overview",
+            "name": "Switch to Overview tab",
+            "description": "User clicks the Overview tab.",
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-drift-detection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Overview"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "drift-detection-to-model-routing",
+            "name": "Switch to Model Routing tab",
+            "description": "User clicks the Model Routing tab.",
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-drift-detection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Model Routing"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "drift-detection-to-step-credits",
+            "name": "Switch to Step Credits tab",
+            "description": "User clicks the Step Credits tab.",
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-drift-detection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Step Credits"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "drift-detection-to-strategies",
+            "name": "Switch to Strategies tab",
+            "description": "User clicks the Strategies tab.",
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-drift-detection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Strategies"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "drift-detection-to-experiences",
+            "name": "Switch to Experiences tab",
+            "description": "User clicks the Experiences tab.",
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-drift-detection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Experiences"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ol-state-step-credits",
+        "name": "Step Credits Tab Active",
+        "description": "The Step Credits tab is selected. The content area shows the credit attribution table with Step Type, Avg Credit, Raw Credit, Count, and Bar columns sorted by average credit descending. If no data exists, an empty state message is shown.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Online Learning"
+          },
+          {
+            "textContent": "Step Credits"
+          },
+          {
+            "textContains": "Step Type"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "step-credits-to-overview",
+            "name": "Switch to Overview tab",
+            "description": "User clicks the Overview tab.",
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-step-credits"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Overview"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "step-credits-to-model-routing",
+            "name": "Switch to Model Routing tab",
+            "description": "User clicks the Model Routing tab.",
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-step-credits"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Model Routing"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "step-credits-to-drift-detection",
+            "name": "Switch to Drift Detection tab",
+            "description": "User clicks the Drift Detection tab.",
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-step-credits"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Drift Detection"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "step-credits-to-strategies",
+            "name": "Switch to Strategies tab",
+            "description": "User clicks the Strategies tab.",
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-step-credits"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Strategies"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "step-credits-to-experiences",
+            "name": "Switch to Experiences tab",
+            "description": "User clicks the Experiences tab.",
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-step-credits"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Experiences"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ol-state-strategies",
+        "name": "Strategies Tab Active",
+        "description": "The Strategies tab is selected. The content area shows strategy cards with name, status badge (active/candidate/degraded/retired), description, and performance stats (Selected, Success %, Avg Score, Avg Cost). If no strategies exist, an empty state message is shown.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Online Learning"
+          },
+          {
+            "textContent": "Strategies"
+          },
+          {
+            "textContains": "Selected:"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "strategies-to-overview",
+            "name": "Switch to Overview tab",
+            "description": "User clicks the Overview tab.",
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-strategies"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Overview"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "strategies-to-model-routing",
+            "name": "Switch to Model Routing tab",
+            "description": "User clicks the Model Routing tab.",
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-strategies"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Model Routing"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "strategies-to-drift-detection",
+            "name": "Switch to Drift Detection tab",
+            "description": "User clicks the Drift Detection tab.",
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-strategies"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Drift Detection"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "strategies-to-step-credits",
+            "name": "Switch to Step Credits tab",
+            "description": "User clicks the Step Credits tab.",
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-strategies"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Step Credits"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "strategies-to-experiences",
+            "name": "Switch to Experiences tab",
+            "description": "User clicks the Experiences tab.",
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-strategies"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Experiences"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ol-state-experiences",
+        "name": "Experiences Tab Active",
+        "description": "The Experiences tab is selected. The content area shows experience summary cards with outcome badge (green success / red failure), domain tag, complexity tier, truncated task_run_id, and counts of decisions, failures, and patterns. If no experiences exist, an empty state message is shown.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Online Learning"
+          },
+          {
+            "textContent": "Experiences"
+          },
+          {
+            "textContains": "decisions"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "experiences-to-overview",
+            "name": "Switch to Overview tab",
+            "description": "User clicks the Overview tab.",
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-experiences"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Overview"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "experiences-to-model-routing",
+            "name": "Switch to Model Routing tab",
+            "description": "User clicks the Model Routing tab.",
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-experiences"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Model Routing"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "experiences-to-drift-detection",
+            "name": "Switch to Drift Detection tab",
+            "description": "User clicks the Drift Detection tab.",
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-experiences"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContains": "Drift Detection"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "experiences-to-step-credits",
+            "name": "Switch to Step Credits tab",
+            "description": "User clicks the Step Credits tab.",
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-experiences"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Step Credits"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "experiences-to-strategies",
+            "name": "Switch to Strategies tab",
+            "description": "User clicks the Strategies tab.",
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-experiences"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "tab",
+                  "textContent": "Strategies"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "OnlineLearningDashboard",
     "pageUrl": "/online-learning",
-    "tags": ["online-learning", "bandit", "drift-detection", "credit-assignment", "strategy-bank", "model-routing", "dashboard"]
+    "tags": [
+      "online-learning",
+      "bandit",
+      "drift-detection",
+      "credit-assignment",
+      "strategy-bank",
+      "model-routing",
+      "dashboard"
+    ]
   }
 }

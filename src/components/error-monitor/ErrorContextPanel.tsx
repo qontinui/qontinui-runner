@@ -126,15 +126,12 @@ export function ErrorContextPanel({
           )}
 
           {!loading && error && (
-            <div className="p-4 text-sm text-red-500">
-              Failed to load context: {error}
-            </div>
+            <div className="p-4 text-sm text-red-500">Failed to load context: {error}</div>
           )}
 
           {!loading && !error && lines && lines.length === 0 && (
             <div className="p-6 text-sm text-muted-foreground text-center">
-              No log context available — the error may be older than the log
-              retention window.
+              No log context available — the error may be older than the log retention window.
             </div>
           )}
 
@@ -176,9 +173,7 @@ export function ErrorContextPanel({
         <div className="px-4 py-2 border-t border-border text-xs text-muted-foreground flex items-center justify-between">
           <span>
             {lines ? `${lines.length} line${lines.length === 1 ? "" : "s"}` : ""}
-            {highlightIndex >= 0 && lines && (
-              <> · highlighted line is closest to error timestamp</>
-            )}
+            {highlightIndex >= 0 && lines && <> · highlighted line is closest to error timestamp</>}
           </span>
           <button
             onClick={onClose}

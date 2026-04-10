@@ -167,11 +167,131 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "no-run-selected",
+        "name": "No Run Selected",
+        "description": "No workflow run has been chosen. The page displays guidance prompting the user to select a run from the Run Dashboard before any exploration data can be shown.",
+        "elements": [{ "textContains": "No Run Selected" }, { "textContains": "Select a run" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-run-selected-to-history-browsing",
+            "name": "User selects a run that has state explorations",
+            "activateStates": ["history-browsing"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "no-run-selected-to-empty",
+            "name": "User selects a run that has no explorations",
+            "activateStates": ["empty"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "empty",
+        "name": "Empty — No Explorations",
+        "description": "A run is selected but it has no state exploration results yet. The page shows a message indicating no explorations are available for this run.",
+        "elements": [{ "textContains": "No explorations" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-history-browsing",
+            "name": "Exploration results arrive for the selected run",
+            "activateStates": ["history-browsing"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "empty-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "history-browsing",
+        "name": "Exploration History Browsing",
+        "description": "The history of past state explorations is displayed for the selected run. Each entry shows when the exploration was performed. The user can select an individual exploration to view its detailed report.",
+        "elements": [{ "textContains": "exploration" }, { "textContains": "history" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "history-browsing-to-report-viewing",
+            "name": "User selects an exploration to view its report",
+            "activateStates": ["report-viewing"],
+            "deactivateStates": ["history-browsing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "history-browsing-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["history-browsing"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "report-viewing",
+        "name": "Exploration Report Viewing",
+        "description": "A detailed exploration report is displayed showing captured UI state including element properties, values, and structural information. The user can navigate back to the history list or trigger AI analysis of the results.",
+        "elements": [
+          { "textContains": "report" },
+          { "textContains": "element" },
+          { "textContains": "Back" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "report-viewing-to-history-browsing",
+            "name": "User clicks Back to return to exploration history",
+            "activateStates": ["history-browsing"],
+            "deactivateStates": ["report-viewing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Back" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "report-viewing-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["report-viewing"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "StateExplorerTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/runs/state-exploration",
     "elementSource": "sdk",
     "tags": ["run-state-explorer", "state-exploration", "dev-only", "verification", "observe"]

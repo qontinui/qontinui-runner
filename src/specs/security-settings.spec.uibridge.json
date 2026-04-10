@@ -13,7 +13,11 @@
           "description": "The page heading 'Security & Sandboxing' is displayed at the top",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "heading", "textContains": "Security" }, "label": "Page title" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContains": "Security" },
+            "label": "Page title"
+          },
           "assertionType": "containsText",
           "expected": "Security & Sandboxing",
           "source": "ai-generated",
@@ -25,7 +29,11 @@
           "description": "Subtitle text explains the page purpose: sandbox constraints for workflow execution",
           "category": "element-presence",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "sandbox constraints" }, "label": "Subtitle" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "sandbox constraints" },
+            "label": "Subtitle"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -45,7 +53,11 @@
           "description": "A 'Security Profile' label is visible above the dropdown",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Security Profile" }, "label": "Profile label" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Security Profile" },
+            "label": "Profile label"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -56,7 +68,11 @@
           "description": "A select dropdown with profile options is present. It must include at least Permissive, Standard, Strict, and Custom options.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "combobox" }, "label": "Profile dropdown" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox" },
+            "label": "Profile dropdown"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -67,7 +83,11 @@
           "description": "When a built-in profile is selected (permissive/standard/strict), a description panel appears below the dropdown explaining the profile's posture. The description should mention key features like 'No restrictions' for permissive, 'Balanced' for standard, or 'Maximum isolation' for strict.",
           "category": "data-display",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "restrictions" }, "label": "Profile description" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "restrictions" },
+            "label": "Profile description"
+          },
           "assertionType": "semantic",
           "precondition": "A built-in profile (not custom) is selected",
           "source": "ai-generated",
@@ -79,7 +99,11 @@
           "description": "When a built-in profile is selected, the AST fingerprint notation is displayed in monospace font (e.g., 'L1:2/L2:1/L3:1/L4:0/L5:1/L6:1')",
           "category": "data-display",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "AST Fingerprint" }, "label": "Fingerprint label" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "AST Fingerprint" },
+            "label": "Fingerprint label"
+          },
           "assertionType": "exists",
           "precondition": "A built-in profile is selected",
           "source": "ai-generated",
@@ -91,7 +115,11 @@
           "description": "Changing the profile dropdown to 'Standard' updates the description to mention balanced security, credential proxy, and destructive command blocking. The Security Posture visualization bars should also update to show higher scores.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "combobox" }, "label": "Profile dropdown" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox" },
+            "label": "Profile dropdown"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -111,7 +139,11 @@
           "description": "The 'Security Posture' section heading is visible",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Security Posture" }, "label": "Posture heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Security Posture" },
+            "label": "Posture heading"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -122,7 +154,11 @@
           "description": "All 7 AST layers are listed: L1:Compute, L2:Resources, L3:Filesystem, L4:Network, L5:Credentials, L6:Actions, L7:Audit. Each has a label, colored bar segments, and a score label.",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "L1:Compute" }, "label": "First layer" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "L1:Compute" },
+            "label": "First layer"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -133,7 +169,11 @@
           "description": "When 'Permissive' profile is selected, the L4:Network layer should show the lowest score (None/0) since permissive mode has no network restrictions. Most other layers should show low scores (1-2).",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "L4:Network" }, "label": "Network layer" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "L4:Network" },
+            "label": "Network layer"
+          },
           "assertionType": "semantic",
           "precondition": "Permissive profile is selected",
           "source": "ai-generated",
@@ -154,7 +194,11 @@
           "description": "When the profile dropdown is set to 'Custom', the 'Custom Policy Editor' panel appears with a Sliders icon and sub-sections for Network, Actions, Filesystem, Resources, and Credentials.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Custom Policy Editor" }, "label": "Custom editor" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Custom Policy Editor" },
+            "label": "Custom editor"
+          },
           "assertionType": "behavior",
           "precondition": "Profile is set to 'Custom'",
           "source": "ai-generated",
@@ -166,7 +210,11 @@
           "description": "The Network section has a Mode dropdown with options: Unrestricted, Allow List, Deny List, Disabled. Selecting 'Allow List' or 'Deny List' reveals a textarea for entering domains (one per line).",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Network" }, "label": "Network section" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Network" },
+            "label": "Network section"
+          },
           "assertionType": "behavior",
           "precondition": "Custom profile editor is visible",
           "source": "ai-generated",
@@ -178,7 +226,11 @@
           "description": "The Actions section has a 'Block destructive commands' toggle and a textarea for blocked command regex patterns.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Block destructive" }, "label": "Destructive toggle" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Block destructive" },
+            "label": "Destructive toggle"
+          },
           "assertionType": "exists",
           "precondition": "Custom profile editor is visible",
           "source": "ai-generated",
@@ -190,7 +242,11 @@
           "description": "The Resources section shows a 2x2 grid with CPU limit (cores), Memory (MB), PID limit, and Timeout (sec) number inputs.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "CPU limit" }, "label": "CPU input" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "CPU limit" },
+            "label": "CPU input"
+          },
           "assertionType": "exists",
           "precondition": "Custom profile editor is visible",
           "source": "ai-generated",
@@ -202,7 +258,11 @@
           "description": "The Credentials section has a Mode dropdown with options: Direct, Proxy (placeholder injection), Denied (no credentials).",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Direct (current behavior)" }, "label": "Credential mode" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Direct (current behavior)" },
+            "label": "Credential mode"
+          },
           "assertionType": "exists",
           "precondition": "Custom profile editor is visible",
           "source": "ai-generated",
@@ -223,7 +283,11 @@
           "description": "The 'Features' section heading is visible",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Features" }, "label": "Features heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Features" },
+            "label": "Features heading"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -234,7 +298,11 @@
           "description": "A 'Credential Proxy' toggle is present with description mentioning placeholder injection",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Credential Proxy" }, "label": "Credential toggle" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Credential Proxy" },
+            "label": "Credential toggle"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -245,7 +313,11 @@
           "description": "A 'Network Mediation' toggle is present with description mentioning domain allowlisting",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Network Mediation" }, "label": "Network toggle" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Network Mediation" },
+            "label": "Network toggle"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -256,7 +328,11 @@
           "description": "A 'Security Audit Log' toggle is present with description mentioning policy decisions",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Security Audit Log" }, "label": "Audit toggle" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Security Audit Log" },
+            "label": "Audit toggle"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -267,7 +343,11 @@
           "description": "When the audit log toggle is enabled, an 'Audit Retention (days)' number input appears with a left border indent. Default value should be 30.",
           "category": "behavior",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Audit Retention" }, "label": "Retention field" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Audit Retention" },
+            "label": "Retention field"
+          },
           "assertionType": "behavior",
           "precondition": "Security Audit Log toggle is enabled",
           "source": "ai-generated",
@@ -288,7 +368,11 @@
           "description": "When audit logging is enabled, the 'Audit Log' panel appears with a FileSearch icon, heading, and summary badges showing allowed/denied/warning counts.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Audit Log" }, "label": "Audit panel" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Audit Log" },
+            "label": "Audit panel"
+          },
           "assertionType": "behavior",
           "precondition": "Security Audit Log toggle is enabled",
           "source": "ai-generated",
@@ -300,7 +384,11 @@
           "description": "A filter dropdown with options All, Denied, Allowed, Warnings is present in the audit log header",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "combobox" }, "label": "Audit filter" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox" },
+            "label": "Audit filter"
+          },
           "assertionType": "exists",
           "precondition": "Audit log viewer is visible",
           "source": "ai-generated",
@@ -336,7 +424,11 @@
           "description": "When no audit events exist, the table area shows 'No audit events. Click refresh to load.' message",
           "category": "state-consistency",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "No audit events" }, "label": "Empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No audit events" },
+            "label": "Empty state"
+          },
           "assertionType": "exists",
           "precondition": "Audit logging is enabled but no events loaded yet",
           "source": "ai-generated",
@@ -348,7 +440,11 @@
           "description": "When audit events are loaded, a download button appears in the audit header. Clicking it exports the events as a JSON file with filename format 'security-audit-YYYY-MM-DD.json'.",
           "category": "behavior",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Export button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Export button"
+          },
           "assertionType": "behavior",
           "precondition": "Audit events are loaded",
           "source": "ai-generated",
@@ -369,7 +465,11 @@
           "description": "A blue-tinted info banner mentions 'Agent Sandbox Taxonomy (AST)' and lists all 7 layers: L1:Compute, L2:Resources, L3:Filesystem, L4:Network, L5:Credentials, L6:Actions, L7:Audit",
           "category": "element-presence",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Agent Sandbox Taxonomy" }, "label": "AST banner" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Agent Sandbox Taxonomy" },
+            "label": "AST banner"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -389,7 +489,11 @@
           "description": "A 'Reset to Defaults' button is present with neutral styling",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Reset to Defaults" }, "label": "Reset button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Reset to Defaults" },
+            "label": "Reset button"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -400,7 +504,11 @@
           "description": "A 'Save Security Settings' button is present with blue/primary styling and a Shield icon",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Save Security Settings" }, "label": "Save button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Save Security Settings" },
+            "label": "Save button"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -411,7 +519,11 @@
           "description": "Clicking 'Save Security Settings' shows a spinner while saving, then shows 'Saved' with a check icon on success. A green 'Settings saved' toast appears. On error, a red error banner appears at the top.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Save" }, "label": "Save button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Save" },
+            "label": "Save button"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -422,7 +534,11 @@
           "description": "Clicking 'Reset to Defaults' resets the profile to 'permissive', disables all feature toggles (credential proxy, network mediation, audit log), and clears any custom policy.",
           "category": "behavior",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Reset" }, "label": "Reset button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Reset" },
+            "label": "Reset button"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -442,7 +558,11 @@
           "description": "All settings cards use a dark semi-transparent background (bg-neutral-800/50) with subtle border (border-neutral-700/50) and rounded corners (rounded-lg).",
           "category": "design",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Security Profile" }, "label": "Profile card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Security Profile" },
+            "label": "Profile card"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -464,7 +584,11 @@
           "description": "Toggle switches use blue-600 when enabled and neutral-600 when disabled. The toggle knob is white and transitions smoothly.",
           "category": "design",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Toggle switch" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Toggle switch"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -475,7 +599,11 @@
           "description": "The Save button uses bg-blue-600 with white text. The Reset button uses bg-neutral-700 with neutral-200 text. Both have hover states.",
           "category": "design",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Save" }, "label": "Save button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Save" },
+            "label": "Save button"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -495,7 +623,11 @@
           "description": "While settings are loading, a centered 'Loading security settings...' message is displayed instead of the form.",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Loading security settings" }, "label": "Loading text" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Loading security settings" },
+            "label": "Loading text"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -506,7 +638,11 @@
           "description": "When a settings operation fails, a red error banner appears at the top showing the error message with red-400 text on red-500/10 background.",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Failed" }, "label": "Error banner" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Failed" },
+            "label": "Error banner"
+          },
           "assertionType": "semantic",
           "precondition": "A save or load operation has failed",
           "source": "ai-generated",
@@ -518,7 +654,11 @@
           "description": "After successful save, a green 'Settings saved' banner appears with a Check icon. It auto-dismisses after 3 seconds.",
           "category": "state-consistency",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Settings saved" }, "label": "Success banner" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Settings saved" },
+            "label": "Success banner"
+          },
           "assertionType": "semantic",
           "precondition": "Settings were just saved successfully",
           "source": "ai-generated",
@@ -529,6 +669,265 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "loading",
+        "name": "Loading",
+        "description": "Initial loading state while security settings are fetched from the backend. Shows a centered loading message instead of the form.",
+        "elements": [{ "textContent": "Loading security settings" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-builtin-profile",
+            "name": "Settings loaded with built-in profile",
+            "activateStates": ["builtin-profile"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "builtin-profile",
+        "name": "Built-in Profile Selected",
+        "description": "A built-in security profile (Permissive, Standard, or Strict) is selected. The profile description, AST fingerprint, and 7-layer security posture visualization are visible. The custom policy editor is hidden.",
+        "elements": [
+          { "textContent": "Security Profile" },
+          { "textContent": "Security Posture" },
+          { "textContent": "AST Fingerprint" },
+          { "textContent": "Features" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "builtin-to-custom",
+            "name": "Switch to Custom profile",
+            "activateStates": ["custom-profile"],
+            "deactivateStates": ["builtin-profile"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "select",
+                "target": { "role": "combobox", "accessibleName": "Security Profile" },
+                "value": "custom",
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "builtin-enable-audit",
+            "name": "Enable audit logging",
+            "activateStates": ["audit-active"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Security Audit Log", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "builtin-to-saving",
+            "name": "Save security settings",
+            "activateStates": ["saving"],
+            "deactivateStates": ["builtin-profile"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Save Security Settings" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "builtin-reset",
+            "name": "Reset to defaults",
+            "activateStates": ["builtin-profile"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Reset to Defaults" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "custom-profile",
+        "name": "Custom Profile Selected",
+        "description": "The Custom profile is selected. The custom policy editor panel is visible with sub-sections for Network, Actions, Filesystem, Resources, and Credentials. The built-in profile description and AST fingerprint are hidden.",
+        "elements": [
+          { "textContent": "Custom Policy Editor" },
+          { "textContent": "Block destructive commands" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "custom-to-builtin",
+            "name": "Switch to a built-in profile",
+            "activateStates": ["builtin-profile"],
+            "deactivateStates": ["custom-profile"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "select",
+                "target": { "role": "combobox", "accessibleName": "Security Profile" },
+                "value": "standard",
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "custom-enable-audit",
+            "name": "Enable audit logging from custom profile",
+            "activateStates": ["audit-active"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Security Audit Log", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "custom-to-saving",
+            "name": "Save custom security settings",
+            "activateStates": ["saving"],
+            "deactivateStates": ["custom-profile"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Save Security Settings" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "audit-active",
+        "name": "Audit Logging Enabled",
+        "description": "The Security Audit Log toggle is enabled. The audit retention days field and the audit log viewer panel with filter, refresh, and export controls are visible.",
+        "elements": [
+          { "textContent": "Audit Retention" },
+          { "textContent": "Audit Log" },
+          { "textContent": "No audit events" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "audit-disable",
+            "name": "Disable audit logging",
+            "activateStates": [],
+            "deactivateStates": ["audit-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Security Audit Log", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "saving",
+        "name": "Saving In Progress",
+        "description": "The save operation is in progress. The Save button shows a spinner animation.",
+        "elements": [{ "textContent": "Saving" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "saving-to-success",
+            "name": "Save completes successfully",
+            "activateStates": ["save-success"],
+            "deactivateStates": ["saving"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "saving-to-error",
+            "name": "Save fails with error",
+            "activateStates": ["save-error"],
+            "deactivateStates": ["saving"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "save-success",
+        "name": "Save Succeeded",
+        "description": "Settings saved successfully. A green success banner with check icon is displayed. The banner auto-dismisses after 3 seconds, returning to the previous profile state.",
+        "elements": [{ "textContent": "Settings saved" }, { "textContent": "Saved" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "success-to-builtin",
+            "name": "Success banner dismisses, return to built-in profile view",
+            "activateStates": ["builtin-profile"],
+            "deactivateStates": ["save-success"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "waitAfter": { "type": "delay", "timeout": 3500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "save-error",
+        "name": "Save Failed",
+        "description": "A save operation failed. A red error banner is displayed at the top of the page showing the error message.",
+        "elements": [{ "textContent": "Failed" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-retry-save",
+            "name": "Retry save after error",
+            "activateStates": ["saving"],
+            "deactivateStates": ["save-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Save Security Settings" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "SecuritySettings",
     "pageUrl": "/settings/security",

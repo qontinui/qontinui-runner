@@ -241,8 +241,7 @@
         }
       ],
       "source": "manual"
-    }
-    ,
+    },
     {
       "id": "ai-data-pagination-memory-protection",
       "name": "Pagination and Memory Protection",
@@ -378,6 +377,407 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "no-run-selected",
+        "name": "No Run Selected",
+        "description": "No task run is selected. The sidebar navigation is visible with all category groups. The main content area shows 'Select a task run to view the AI prompt' because the default active category is ai-prompt.",
+        "elements": [{ "textContains": "Select a task run" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-run-to-loading",
+            "name": "User selects a task run from the RunSelector",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "loading-data",
+        "name": "Loading Panel Data",
+        "description": "A task run is selected and the active panel is fetching its data from the backend. A loading spinner with a message like 'Loading prompt...' or 'Loading events...' is shown in the content area. The sidebar remains fully interactive.",
+        "elements": [{ "textContains": "Loading" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "loading-to-ai-session",
+            "name": "AI Session data loads successfully (prompt, output, or contexts)",
+            "activateStates": ["ai-session-active"],
+            "deactivateStates": ["loading-data"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-execution-logs",
+            "name": "Execution Logs data loads successfully (events, API requests, MCP calls, etc.)",
+            "activateStates": ["execution-logs-active"],
+            "deactivateStates": ["loading-data"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-captures",
+            "name": "Captures data loads successfully (DOM snapshots)",
+            "activateStates": ["captures-active"],
+            "deactivateStates": ["loading-data"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-configuration",
+            "name": "Configuration data loads successfully (loaded config or dev logs)",
+            "activateStates": ["configuration-active"],
+            "deactivateStates": ["loading-data"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-empty",
+            "name": "Data loads but the active panel has no entries for this run",
+            "activateStates": ["empty-data"],
+            "deactivateStates": ["loading-data"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Data fetch fails with an error",
+            "activateStates": ["error"],
+            "deactivateStates": ["loading-data"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "ai-session-active",
+        "name": "AI Session Panel Active",
+        "description": "The user is viewing one of the AI Session sub-panels: Prompt, AI Output, or Contexts. The sidebar shows AI Session group expanded with the active item highlighted. The content area displays the selected data with proper formatting (markdown for prompts/output, structured JSON for contexts).",
+        "elements": [
+          { "textContent": "AI Session" },
+          { "textContains": "Prompt|AI Output|Contexts" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "ai-session-to-execution-logs",
+            "name": "User clicks an Execution Logs category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["ai-session-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Events" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "ai-session-to-captures",
+            "name": "User clicks DOM Snapshots in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["ai-session-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "DOM Snapshots" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "ai-session-to-configuration",
+            "name": "User clicks a Configuration category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["ai-session-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Loaded Config" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "ai-session-switch-sub-panel",
+            "name": "User clicks a different AI Session sub-item (e.g., from Prompt to AI Output)",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["ai-session-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "AI Output" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "ai-session-change-run",
+            "name": "User selects a different task run from the RunSelector",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["ai-session-active"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "execution-logs-active",
+        "name": "Execution Logs Panel Active",
+        "description": "The user is viewing one of the Execution Logs sub-panels: Events, API Requests, MCP Calls, Image Recognition, Playwright Tests, AWAS Steps, or Execution Spans. Data is displayed as structured tables or formatted JSON with pagination controls (Show more) for large datasets.",
+        "elements": [
+          { "textContent": "Execution Logs" },
+          { "textContains": "Events|API Requests|MCP|Playwright|AWAS|Execution Spans" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "execution-logs-to-ai-session",
+            "name": "User clicks an AI Session category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["execution-logs-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Prompt" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "execution-logs-to-captures",
+            "name": "User clicks DOM Snapshots in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["execution-logs-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "DOM Snapshots" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "execution-logs-to-configuration",
+            "name": "User clicks a Configuration category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["execution-logs-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Loaded Config" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "execution-logs-switch-sub-panel",
+            "name": "User clicks a different Execution Logs sub-item (e.g., from Events to API Requests)",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["execution-logs-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "API Requests" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "execution-logs-change-run",
+            "name": "User selects a different task run from the RunSelector",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["execution-logs-active"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "captures-active",
+        "name": "Captures Panel Active",
+        "description": "The user is viewing the DOM Snapshots panel under Captures. DOM snapshots show the page structure and element tree at specific points during execution, rendered as an interactive tree viewer.",
+        "elements": [{ "textContains": "DOM" }, { "textContains": "Snapshot" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "captures-to-ai-session",
+            "name": "User clicks an AI Session category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["captures-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Prompt" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "captures-to-execution-logs",
+            "name": "User clicks an Execution Logs category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["captures-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Events" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "captures-to-configuration",
+            "name": "User clicks a Configuration category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["captures-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Loaded Config" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "captures-change-run",
+            "name": "User selects a different task run from the RunSelector",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["captures-active"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "configuration-active",
+        "name": "Configuration Panel Active",
+        "description": "The user is viewing one of the Configuration sub-panels: Loaded Config or Dev Logs. Loaded Config shows the workflow configuration as formatted JSON. Dev Logs shows development-mode log entries.",
+        "elements": [
+          { "textContent": "Configuration" },
+          { "textContains": "Loaded Config|Dev Logs" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "configuration-to-ai-session",
+            "name": "User clicks an AI Session category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["configuration-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Prompt" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "configuration-to-execution-logs",
+            "name": "User clicks an Execution Logs category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["configuration-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Events" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "configuration-to-captures",
+            "name": "User clicks DOM Snapshots in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["configuration-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "DOM Snapshots" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "configuration-change-run",
+            "name": "User selects a different task run from the RunSelector",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["configuration-active"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "empty-data",
+        "name": "Empty Data Panel",
+        "description": "A task run is selected but the currently active panel has no data entries. The content area shows a message like 'No AI prompt found for this task run' or 'No events during this task run'. The sidebar remains fully interactive for switching to other categories.",
+        "elements": [{ "textContains": "No .* for this task run|No .* during this task run" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-switch-category",
+            "name": "User clicks a different category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["empty-data"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "empty-change-run",
+            "name": "User selects a different task run from the RunSelector",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["empty-data"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error State",
+        "description": "A data fetch failed for the currently active panel. A red error message is displayed in the content area. The sidebar remains interactive so the user can switch categories or select a different run.",
+        "elements": [{ "role": "alert" }, { "textContains": "Error|error|Failed" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-switch-category",
+            "name": "User clicks a different category in the sidebar",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "error-change-run",
+            "name": "User selects a different task run from the RunSelector",
+            "activateStates": ["loading-data"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "AiDataViewerTab",
     "author": "Joshua Spinak",
@@ -385,6 +785,14 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/runs/ai-data",
     "elementSource": "sdk",
-    "tags": ["run-ai-data", "data-viewer", "mcp-tools", "debugging", "observe", "pagination", "memory-protection"]
+    "tags": [
+      "run-ai-data",
+      "data-viewer",
+      "mcp-tools",
+      "debugging",
+      "observe",
+      "pagination",
+      "memory-protection"
+    ]
   }
 }

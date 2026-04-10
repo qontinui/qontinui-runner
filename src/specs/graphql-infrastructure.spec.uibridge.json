@@ -247,5 +247,145 @@
       "assertions": [],
       "source": "manual"
     }
-  ]
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "playground-loaded",
+        "name": "GraphiQL IDE Loaded",
+        "description": "The GraphiQL IDE has loaded at /graphql. The query editor is visible and empty or contains the default query. The results panel is empty. The schema docs explorer is collapsed.",
+        "elements": [{ "textContent": "GraphiQL" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "playground-to-query-result",
+            "name": "Execute a query or mutation via the play button",
+            "activateStates": ["query-result"],
+            "deactivateStates": ["playground-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Execute query" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "playground-to-docs-open",
+            "name": "Open the schema documentation explorer",
+            "activateStates": ["docs-open"],
+            "deactivateStates": ["playground-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Docs" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "query-result",
+        "name": "Query Result Displayed",
+        "description": "A query or mutation has been executed and the results panel shows JSON response data. The ping mutation returns 'pong', runnerStatus returns apiPort and other fields.",
+        "elements": [{ "textContent": "data" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "query-result-to-playground",
+            "name": "Clear the editor to return to empty state",
+            "activateStates": ["playground-loaded"],
+            "deactivateStates": ["query-result"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "query-result-to-docs-open",
+            "name": "Open the schema documentation explorer while results are shown",
+            "activateStates": ["docs-open"],
+            "deactivateStates": ["query-result"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Docs" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "query-result-to-error",
+            "name": "Execute a malformed or depth-exceeding query",
+            "activateStates": ["query-error"],
+            "deactivateStates": ["query-result"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Execute query" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "docs-open",
+        "name": "Schema Docs Explorer Open",
+        "description": "The schema documentation explorer panel is open, showing types including QueryRoot, MutationRoot, GqlTaskRun, and other schema types. Browsing types and fields is possible.",
+        "elements": [{ "textContent": "QueryRoot|GqlTaskRun" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "docs-to-playground",
+            "name": "Close the documentation explorer",
+            "activateStates": ["playground-loaded"],
+            "deactivateStates": ["docs-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Docs" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "query-error",
+        "name": "Query Error Displayed",
+        "description": "A query was rejected or returned an error. The results panel shows an error response, for example when depth limit 12 is exceeded or complexity limit 500 is breached.",
+        "elements": [{ "textContent": "errors" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-query-result",
+            "name": "Fix the query and re-execute successfully",
+            "activateStates": ["query-result"],
+            "deactivateStates": ["query-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Execute query" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "error-to-playground",
+            "name": "Clear the editor to return to empty state",
+            "activateStates": ["playground-loaded"],
+            "deactivateStates": ["query-error"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  }
 }

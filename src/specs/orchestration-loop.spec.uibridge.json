@@ -987,10 +987,7 @@
         "id": "configuring",
         "name": "Configuring — Library Panel Open",
         "description": "The saved configurations library panel is open, showing a 'Saved Configurations' heading with a count and list of saved configs. Each entry shows name, mode, and last updated date. The config form remains visible behind the library panel. Users can load, overwrite, favorite, or delete configs.",
-        "elements": [
-          { "textContent": "Saved Configurations" },
-          { "textContent": "Run Loop" }
-        ],
+        "elements": [{ "textContent": "Saved Configurations" }, { "textContent": "Run Loop" }],
         "isInitial": false,
         "transitions": [
           {
@@ -1027,10 +1024,7 @@
         "id": "running",
         "name": "Running — Loop Executing Iterations",
         "description": "The orchestration loop is actively executing. The config form is hidden and replaced by a progress bar showing iteration count (e.g., '2/5') and a colored fill. A phase badge in the header shows the current sub-phase: running workflow (blue), building workflow (yellow), diagnosing (teal), reflecting (purple), implementing fixes (orange), waiting for fixer (cyan), between iterations (purple), evaluating exit (yellow), or waiting for runner (yellow). The header shows a red Stop button and optionally a yellow Signal button when between-iterations mode is restart_on_signal. The iteration history table accumulates results as iterations complete.",
-        "elements": [
-          { "textContent": "Stop" },
-          { "textContent": "Iteration History" }
-        ],
+        "elements": [{ "textContent": "Stop" }, { "textContent": "Iteration History" }],
         "isInitial": false,
         "transitions": [
           {
@@ -1069,10 +1063,7 @@
         "id": "completed",
         "name": "Completed — Loop Finished Successfully",
         "description": "The loop has completed all iterations or the exit condition was met. The phase badge shows 'complete' in green. The progress bar is at 100% with green fill. The iteration history table shows all completed iteration results. The config form reappears, allowing the user to start a new loop.",
-        "elements": [
-          { "textContent": "Run Loop" },
-          { "textContent": "Iteration History" }
-        ],
+        "elements": [{ "textContent": "Run Loop" }, { "textContent": "Iteration History" }],
         "isInitial": false,
         "transitions": [
           {
@@ -1103,9 +1094,7 @@
         "id": "error",
         "name": "Error — Loop Failed",
         "description": "The loop encountered an error. The phase badge shows 'error' in red. An error message appears in a red-bordered container with the error details. The config form reappears, allowing the user to correct settings and retry.",
-        "elements": [
-          { "textContent": "Run Loop" }
-        ],
+        "elements": [{ "textContent": "Run Loop" }],
         "isInitial": false,
         "transitions": [
           {

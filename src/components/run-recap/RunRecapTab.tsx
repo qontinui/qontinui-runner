@@ -57,16 +57,65 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
   const { data, isLoading, error, refetch } = useTaskRunRecap(runSelection?.selectedRunId);
   const [activeTab, setActiveTab] = useState("timeline");
 
-  useUIComponent({ id: "run-summary-page", name: "Run Summary", description: "Task run recap with timeline, verification, knowledge, and context tabs" });
-  const { ref: timelineRef } = useUIElement({ id: "run-tab-timeline", type: "button", label: "Timeline tab", actions: ["click"] });
-  const { ref: verificationRef } = useUIElement({ id: "run-tab-verification", type: "button", label: "Verification tab", actions: ["click"] });
-  const { ref: knowledgeRef } = useUIElement({ id: "run-tab-knowledge", type: "button", label: "Knowledge tab", actions: ["click"] });
-  const { ref: contextRef } = useUIElement({ id: "run-tab-context", type: "button", label: "Context tab", actions: ["click"] });
-  const { ref: canvasRef } = useUIElement({ id: "run-tab-canvas", type: "button", label: "Canvas tab", actions: ["click"] });
-  const { ref: durableRef } = useUIElement({ id: "run-tab-durable", type: "button", label: "Diffs and Replay tab", actions: ["click"] });
-  const { ref: feedbackRef } = useUIElement({ id: "run-tab-feedback", type: "button", label: "Feedback Scores tab", actions: ["click"] });
-  const { ref: costsRef } = useUIElement({ id: "run-tab-llm-costs", type: "button", label: "LLM Costs tab", actions: ["click"] });
-  const { ref: errorsRef } = useUIElement({ id: "run-tab-errors", type: "button", label: "Errors tab", actions: ["click"] });
+  useUIComponent({
+    id: "run-summary-page",
+    name: "Run Summary",
+    description: "Task run recap with timeline, verification, knowledge, and context tabs",
+  });
+  const { ref: timelineRef } = useUIElement({
+    id: "run-tab-timeline",
+    type: "button",
+    label: "Timeline tab",
+    actions: ["click"],
+  });
+  const { ref: verificationRef } = useUIElement({
+    id: "run-tab-verification",
+    type: "button",
+    label: "Verification tab",
+    actions: ["click"],
+  });
+  const { ref: knowledgeRef } = useUIElement({
+    id: "run-tab-knowledge",
+    type: "button",
+    label: "Knowledge tab",
+    actions: ["click"],
+  });
+  const { ref: contextRef } = useUIElement({
+    id: "run-tab-context",
+    type: "button",
+    label: "Context tab",
+    actions: ["click"],
+  });
+  const { ref: canvasRef } = useUIElement({
+    id: "run-tab-canvas",
+    type: "button",
+    label: "Canvas tab",
+    actions: ["click"],
+  });
+  const { ref: durableRef } = useUIElement({
+    id: "run-tab-durable",
+    type: "button",
+    label: "Diffs and Replay tab",
+    actions: ["click"],
+  });
+  const { ref: feedbackRef } = useUIElement({
+    id: "run-tab-feedback",
+    type: "button",
+    label: "Feedback Scores tab",
+    actions: ["click"],
+  });
+  const { ref: costsRef } = useUIElement({
+    id: "run-tab-llm-costs",
+    type: "button",
+    label: "LLM Costs tab",
+    actions: ["click"],
+  });
+  const { ref: errorsRef } = useUIElement({
+    id: "run-tab-errors",
+    type: "button",
+    label: "Errors tab",
+    actions: ["click"],
+  });
   const [additionalSessions, setAdditionalSessions] = useState(3);
   const reopenMutation = useReopenTaskRun();
   const errorBadge = useErrorBadge(runSelection?.selectedRunId || undefined);
@@ -186,10 +235,18 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
       {/* 3. Tabbed Content */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         <TabsList className="w-full justify-start flex-wrap gap-1">
-          <TabsTrigger ref={timelineRef} value="timeline">Timeline</TabsTrigger>
-          <TabsTrigger ref={verificationRef} value="verification">Verification</TabsTrigger>
-          <TabsTrigger ref={knowledgeRef} value="knowledge">Knowledge</TabsTrigger>
-          <TabsTrigger ref={contextRef} value="context">Context</TabsTrigger>
+          <TabsTrigger ref={timelineRef} value="timeline">
+            Timeline
+          </TabsTrigger>
+          <TabsTrigger ref={verificationRef} value="verification">
+            Verification
+          </TabsTrigger>
+          <TabsTrigger ref={knowledgeRef} value="knowledge">
+            Knowledge
+          </TabsTrigger>
+          <TabsTrigger ref={contextRef} value="context">
+            Context
+          </TabsTrigger>
           <TabsTrigger ref={canvasRef} value="canvas" className="flex items-center gap-1.5">
             <LayoutDashboard className="w-3.5 h-3.5" />
             Canvas
@@ -271,4 +328,3 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
     </div>
   );
 }
-

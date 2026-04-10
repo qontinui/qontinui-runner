@@ -1,11 +1,5 @@
 import * as Tabs from "@radix-ui/react-tabs";
-import {
-  BarChart3,
-  Gauge,
-  Microscope,
-  PenLine,
-  FlaskConical,
-} from "lucide-react";
+import { BarChart3, Gauge, Microscope, PenLine, FlaskConical } from "lucide-react";
 import { useState } from "react";
 import { DashboardTab } from "./generator-eval/DashboardTab";
 import { PipelineInspectorTab } from "./generator-eval/PipelineInspectorTab";

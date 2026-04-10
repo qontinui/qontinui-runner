@@ -200,6 +200,228 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "idle",
+        "name": "Idle — Ready to Record",
+        "description": "The initial state of the Capture page. The user sees the page header, input type indicators (Mouse, Keyboard, Video), a description of the tool's purpose, and a green Start Recording button. No recording is active and no previous recording results are displayed.",
+        "elements": [
+          {
+            "textContains": "Start Recording"
+          },
+          {
+            "textContains": "Record your interactions"
+          }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "idle-to-recording",
+            "name": "Start a recording session",
+            "activateStates": ["recording"],
+            "deactivateStates": ["idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Start Recording"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          },
+          {
+            "id": "idle-to-settings",
+            "name": "Open settings panel",
+            "activateStates": ["settings-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "aria-label": "Settings"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "recording",
+        "name": "Recording in Progress",
+        "description": "An active recording session is underway. A pulsing red indicator and live timer show elapsed duration. An event counter displays the number of captured mouse and keyboard events. A red Stop Recording button is prominently displayed. The Start Recording button is not visible.",
+        "elements": [
+          {
+            "textContains": "Stop Recording"
+          },
+          {
+            "textContains": "events"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "recording-to-completed",
+            "name": "Stop the recording session",
+            "activateStates": ["completed"],
+            "deactivateStates": ["recording"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Stop Recording"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "completed",
+        "name": "Recording Completed — Results Available",
+        "description": "A recording session has finished. The user sees the Start Recording button again (ready for another session) plus a Last Recording summary section showing session duration, event count, and an Open Output Folder link to access the JSONL events file and video.",
+        "elements": [
+          {
+            "textContains": "Last Recording"
+          },
+          {
+            "textContains": "Open Output Folder"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "completed-to-recording",
+            "name": "Start a new recording session",
+            "activateStates": ["recording"],
+            "deactivateStates": ["completed"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Start Recording"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          },
+          {
+            "id": "completed-to-settings",
+            "name": "Open settings panel",
+            "activateStates": ["settings-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "aria-label": "Settings"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "settings-open",
+        "name": "Settings Panel Expanded",
+        "description": "The collapsible settings panel is open, showing the Video FPS slider (range 10-60, default 30) and a recommendation note. The slider is disabled during an active recording. This state overlays either idle or completed.",
+        "elements": [
+          {
+            "textContains": "Video FPS"
+          },
+          {
+            "textContains": "30 FPS is recommended"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "settings-close",
+            "name": "Close settings panel",
+            "activateStates": [],
+            "deactivateStates": ["settings-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "aria-label": "Settings"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error Banner Displayed",
+        "description": "An error occurred while starting or stopping a recording. A red error banner with an AlertCircle icon is displayed at the top of the main content area, showing the error message. This state overlays the current base state (idle or completed). The error clears when the user retries the action.",
+        "elements": [
+          {
+            "role": "alert",
+            "textContains": "Failed"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-retry-start",
+            "name": "Retry starting a recording",
+            "activateStates": ["recording"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Start Recording"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "CaptureTab",
     "author": "Joshua Spinak",

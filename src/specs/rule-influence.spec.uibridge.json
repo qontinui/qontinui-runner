@@ -258,11 +258,81 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "rule-inf-loading",
+        "name": "Loading — Fetching Rule Influence Data",
+        "description": "The panel is loading rule influence data from the backend. A loading indicator is displayed to prevent confusion about a blank panel.",
+        "elements": [{ "textContent": "Loading rules..." }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-all-effective",
+            "name": "No ineffective rules found",
+            "description": "Data fetch completes and no rules meet the ineffectiveness threshold, showing the positive empty state",
+            "activateStates": ["rule-inf-all-effective"],
+            "deactivateStates": ["rule-inf-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-populated",
+            "name": "Ineffective rules found",
+            "description": "Data fetch completes and one or more rules meet the ineffectiveness threshold, displaying the rule list",
+            "activateStates": ["rule-inf-populated"],
+            "deactivateStates": ["rule-inf-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Data fetch fails",
+            "description": "The API request fails, transitioning to an error state",
+            "activateStates": ["rule-inf-error"],
+            "deactivateStates": ["rule-inf-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "rule-inf-all-effective",
+        "name": "All Effective — No Ineffective Rules",
+        "description": "No rules meet the ineffectiveness threshold. A positive message ('All rules appear effective' with ShieldCheck icon) communicates that all rules are contributing value. This is the normal/healthy state.",
+        "elements": [
+          { "textContent": "Rule Influence" },
+          { "textContent": "All rules appear effective" }
+        ],
+        "transitions": []
+      },
+      {
+        "id": "rule-inf-populated",
+        "name": "Populated — Ineffective Rules Listed",
+        "description": "One or more ineffective rules are displayed in a list. Each row shows the truncated rule ID (monospace), loaded count, no-effect count, prevented count, and effectiveness percentage. Rules with high no-effect counts display an orange warning badge.",
+        "elements": [
+          { "textContent": "Rule Influence" },
+          { "textContent": "Loaded" },
+          { "textContent": "No effect" },
+          { "textContent": "Prevented" },
+          { "textContent": "%" }
+        ],
+        "transitions": []
+      },
+      {
+        "id": "rule-inf-error",
+        "name": "Error — Data Fetch Failed",
+        "description": "The API request to fetch rule influence data has failed. An error message is displayed.",
+        "elements": [{ "textContent": "Rule Influence" }],
+        "transitions": []
+      }
+    ]
+  },
   "metadata": {
     "component": "RuleInfluencePanel",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-26T00:00:00.000Z",
-    "updatedAt": "2026-03-26T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/rule-influence",
     "elementSource": "sdk",
     "tags": ["knowledge-graph", "rules", "generation", "effectiveness", "runner-only"],

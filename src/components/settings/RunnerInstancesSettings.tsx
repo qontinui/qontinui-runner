@@ -243,7 +243,9 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
                   <span className="ml-2">PID {instance.pid}</span>
                 )}
                 {instance.running_tasks != null && instance.running_tasks > 0 && (
-                  <span className="ml-2">{instance.running_tasks} task{instance.running_tasks !== 1 ? "s" : ""}</span>
+                  <span className="ml-2">
+                    {instance.running_tasks} task{instance.running_tasks !== 1 ? "s" : ""}
+                  </span>
                 )}
               </div>
             </div>

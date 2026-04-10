@@ -1566,9 +1566,7 @@
         "id": "no-run-selected",
         "name": "No Run Selected",
         "description": "No execution ID is set. The page shows a centered prompt asking the user to select a task run.",
-        "elements": [
-          { "textContains": "Select a task run" }
-        ],
+        "elements": [{ "textContains": "Select a task run" }],
         "isInitial": true,
         "transitions": [
           {
@@ -1585,9 +1583,7 @@
         "id": "loading",
         "name": "Loading Trace Data",
         "description": "Trace data is being fetched from the execution_spans API. A centered 'Loading trace data...' message is shown. No views or toolbars are rendered.",
-        "elements": [
-          { "textContains": "Loading trace data" }
-        ],
+        "elements": [{ "textContains": "Loading trace data" }],
         "isInitial": false,
         "transitions": [
           {
@@ -1620,9 +1616,7 @@
         "id": "error",
         "name": "Error State",
         "description": "Trace data failed to load. A red error message displays 'Failed to load traces:' followed by the error details.",
-        "elements": [
-          { "textContains": "Failed to load traces" }
-        ],
+        "elements": [{ "textContains": "Failed to load traces" }],
         "isInitial": false,
         "transitions": [
           {
@@ -1639,9 +1633,7 @@
         "id": "empty-traces",
         "name": "Empty Traces",
         "description": "A run is selected but no execution spans exist. The page shows 'No spans to display'.",
-        "elements": [
-          { "textContains": "No spans" }
-        ],
+        "elements": [{ "textContains": "No spans" }],
         "isInitial": false,
         "transitions": [
           {
@@ -1876,10 +1868,7 @@
         "id": "agent-graph-view",
         "name": "Agent Graph View Active",
         "description": "The Agent Graph tab is highlighted. A ReactFlow-based directed graph shows agent pipeline topology with nodes representing agent roles and edges showing data flow. Only reachable when the trace contains agent pipeline spans.",
-        "elements": [
-          { "textContent": "Agent Graph" },
-          { "role": "group" }
-        ],
+        "elements": [{ "textContent": "Agent Graph" }, { "role": "group" }],
         "isInitial": false,
         "transitions": [
           {
@@ -1965,10 +1954,7 @@
         "id": "span-detail-open",
         "name": "Span Detail Panel Open",
         "description": "A 280px-wide detail panel is visible on the right side showing the selected span's name, status, phase badge, duration, timestamps, trace/span/parent IDs, error message (if any), and attributes. When critical path is enabled, shows on/off critical path status with slack. For AI session spans, shows Token Usage grid, Tool Calls list, and GenAI Attributes section.",
-        "elements": [
-          { "textContains": "Status" },
-          { "textContent": "\u2715" }
-        ],
+        "elements": [{ "textContains": "Status" }, { "textContent": "\u2715" }],
         "isInitial": false,
         "transitions": [
           {

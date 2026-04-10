@@ -296,6 +296,167 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "gi-loading",
+        "name": "Loading State",
+        "description": "Initial loading state while graph analytics data is being fetched from /graph/* endpoints. Panels display 'Loading patterns...' placeholder text.",
+        "elements": [{ "textContent": "Loading patterns..." }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-error",
+            "name": "Fetch fails",
+            "description": "API request to /graph/cross-run-patterns fails, showing error message in the panel",
+            "activateStates": ["gi-error"],
+            "deactivateStates": ["gi-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Failed to load patterns" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-empty",
+            "name": "Fetch returns no patterns",
+            "description": "API responds with an empty patterns array; the panel shows an informational empty state",
+            "activateStates": ["gi-empty"],
+            "deactivateStates": ["gi-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "No cross-run patterns detected" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-patterns",
+            "name": "Fetch returns patterns",
+            "description": "API responds with one or more cross-run patterns; the panel renders pattern rows with badges and occurrence counts",
+            "activateStates": ["gi-patterns-active"],
+            "deactivateStates": ["gi-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Cross-Run Patterns" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "gi-error",
+        "name": "Error State",
+        "description": "An API error occurred fetching graph data. The CrossRunPatternsPanel displays a 'Failed to load patterns' error message.",
+        "elements": [{ "textContent": "Failed to load patterns" }],
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "Data refetch triggered",
+            "description": "React Query polling or event-driven invalidation triggers a refetch, returning to loading state",
+            "activateStates": ["gi-loading"],
+            "deactivateStates": ["gi-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Loading patterns..." },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "gi-empty",
+        "name": "Empty State — No Patterns",
+        "description": "No cross-run patterns have been detected. The CrossRunPatternsPanel shows 'No cross-run patterns detected' and the TopPatternsWidget on the Active Dashboard is auto-hidden (returns null).",
+        "elements": [{ "textContent": "No cross-run patterns detected" }],
+        "transitions": [
+          {
+            "id": "empty-to-loading-poll",
+            "name": "Polling refetch",
+            "description": "React Query 60-second polling interval triggers a data refetch",
+            "activateStates": ["gi-loading"],
+            "deactivateStates": ["gi-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Loading patterns..." },
+                "waitAfter": { "type": "idle", "timeout": 60000 }
+              }
+            ]
+          },
+          {
+            "id": "empty-to-loading-event",
+            "name": "Task or reflection completes",
+            "description": "useGraphDataRefresh hook invalidates queries after a task run or reflection completes (500ms debounce), triggering a refetch",
+            "activateStates": ["gi-loading"],
+            "deactivateStates": ["gi-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Loading patterns..." },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "gi-patterns-active",
+        "name": "Patterns Displayed",
+        "description": "One or more cross-run patterns are displayed in the CrossRunPatternsPanel with pattern type badges (Recurring Finding or Fix Oscillation), occurrence counts, and status indicators. The TopPatternsWidget is visible on the Active Dashboard showing summary counts.",
+        "elements": [
+          { "textContent": "Cross-Run Patterns" },
+          { "textContent": "Recurring Finding" },
+          { "textContent": "active" }
+        ],
+        "transitions": [
+          {
+            "id": "patterns-to-loading-poll",
+            "name": "Polling refetch",
+            "description": "React Query 60-second polling interval triggers a data refetch to update pattern data",
+            "activateStates": ["gi-loading"],
+            "deactivateStates": ["gi-patterns-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Loading patterns..." },
+                "waitAfter": { "type": "idle", "timeout": 60000 }
+              }
+            ]
+          },
+          {
+            "id": "patterns-to-loading-event",
+            "name": "Task or reflection completes",
+            "description": "Event-driven query invalidation triggers refetch after task/reflection completion",
+            "activateStates": ["gi-loading"],
+            "deactivateStates": ["gi-patterns-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Loading patterns..." },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ReflectionDashboard",
     "author": "Joshua Spinak",

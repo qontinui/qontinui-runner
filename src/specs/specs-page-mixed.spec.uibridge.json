@@ -177,6 +177,189 @@
       ]
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "specs-editor-no-selection",
+        "name": "Editor — No Spec Selected",
+        "description": "The Specs page is in Editor view mode with no spec selected. The left sidebar shows the Specifications tree, the center panel shows a placeholder or empty state, and the right panel shows the AI Chat heading.",
+        "elements": [{ "textContent": "AI Chat" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-selection-to-spec-selected",
+            "name": "Select a spec from the tree",
+            "description": "User clicks a spec node in the left sidebar tree, loading its detail in the center panel",
+            "activateStates": ["specs-editor-spec-selected"],
+            "deactivateStates": ["specs-editor-no-selection"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "no-selection-to-contracts",
+            "name": "Switch to Contracts view",
+            "description": "User clicks the Contracts tab in the header to switch view mode",
+            "activateStates": ["specs-contracts-view"],
+            "deactivateStates": ["specs-editor-no-selection"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "no-selection-to-experimentation",
+            "name": "Switch to Experimentation view",
+            "description": "User clicks the Experimentation tab in the header to switch view mode",
+            "activateStates": ["specs-experimentation-view"],
+            "deactivateStates": ["specs-editor-no-selection"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "specs-editor-spec-selected",
+        "name": "Editor — Spec Selected",
+        "description": "A spec is selected in the tree. The center panel shows the spec detail with groups and assertions. Action buttons like Build Workflow, Build verification workflow, and Review spec quality are visible. The AI Chat panel is available for spec-related queries.",
+        "elements": [
+          { "textContent": "Build Workflow" },
+          { "textContent": "Build verification workflow" },
+          { "textContent": "Review spec quality" }
+        ],
+        "transitions": [
+          {
+            "id": "spec-selected-to-no-selection",
+            "name": "Clear selection",
+            "description": "User navigates away from the selected spec or clears the selection",
+            "activateStates": ["specs-editor-no-selection"],
+            "deactivateStates": ["specs-editor-spec-selected"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "spec-selected-to-syncing",
+            "name": "Start Sync All Specs",
+            "description": "User triggers Sync All Specs from the connection bar, showing a progress banner",
+            "activateStates": ["specs-editor-syncing"],
+            "deactivateStates": ["specs-editor-spec-selected"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "spec-selected-to-contracts",
+            "name": "Switch to Contracts view",
+            "description": "User clicks the Contracts tab in the header",
+            "activateStates": ["specs-contracts-view"],
+            "deactivateStates": ["specs-editor-spec-selected"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "spec-selected-to-experimentation",
+            "name": "Switch to Experimentation view",
+            "description": "User clicks the Experimentation tab in the header",
+            "activateStates": ["specs-experimentation-view"],
+            "deactivateStates": ["specs-editor-spec-selected"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "specs-editor-syncing",
+        "name": "Editor — Sync In Progress",
+        "description": "The Sync All Specs operation is running. A progress banner appears below the connection bar showing the current sync phase (analyzing, syncing, compiling), a progress bar, and the current spec being processed.",
+        "elements": [{ "textContains": "Syncing" }],
+        "transitions": [
+          {
+            "id": "syncing-to-sync-done",
+            "name": "Sync completes",
+            "description": "The sync operation finishes, showing a summary of updated, skipped, and failed specs",
+            "activateStates": ["specs-editor-sync-done"],
+            "deactivateStates": ["specs-editor-syncing"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "syncing-to-spec-selected",
+            "name": "Cancel sync",
+            "description": "User cancels the sync operation via the dismiss button on the progress banner",
+            "activateStates": ["specs-editor-spec-selected"],
+            "deactivateStates": ["specs-editor-syncing"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "specs-editor-sync-done",
+        "name": "Editor — Sync Complete",
+        "description": "The sync operation has completed. The progress banner shows a summary with counts of updated, skipped, and failed specs, along with any warnings. A dismiss button allows returning to normal editing.",
+        "elements": [{ "textContent": "Sync complete" }],
+        "transitions": [
+          {
+            "id": "sync-done-to-spec-selected",
+            "name": "Dismiss sync results",
+            "description": "User dismisses the sync results banner, returning to normal spec editing with updated specs",
+            "activateStates": ["specs-editor-spec-selected"],
+            "deactivateStates": ["specs-editor-sync-done"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "specs-contracts-view",
+        "name": "Contracts View",
+        "description": "The page is in Contracts view mode showing the ContractBuilder component. The header shows the Contracts tab as active. The three-panel editor layout is hidden.",
+        "elements": [{ "textContent": "Contracts" }],
+        "transitions": [
+          {
+            "id": "contracts-to-editor",
+            "name": "Switch to Editor view",
+            "description": "User clicks the Editor tab in the header to return to the spec editor",
+            "activateStates": ["specs-editor-no-selection"],
+            "deactivateStates": ["specs-contracts-view"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "contracts-to-experimentation",
+            "name": "Switch to Experimentation view",
+            "description": "User clicks the Experimentation tab in the header",
+            "activateStates": ["specs-experimentation-view"],
+            "deactivateStates": ["specs-contracts-view"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "specs-experimentation-view",
+        "name": "Experimentation View",
+        "description": "The page is in Experimentation view mode showing the SpecExperimentationDashboard. The header shows the Experimentation tab as active with a flask icon. The three-panel editor layout is hidden.",
+        "elements": [{ "textContent": "Experimentation" }],
+        "transitions": [
+          {
+            "id": "experimentation-to-editor",
+            "name": "Switch to Editor view",
+            "description": "User clicks the Editor tab in the header to return to the spec editor",
+            "activateStates": ["specs-editor-no-selection"],
+            "deactivateStates": ["specs-experimentation-view"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "experimentation-to-contracts",
+            "name": "Switch to Contracts view",
+            "description": "User clicks the Contracts tab in the header",
+            "activateStates": ["specs-contracts-view"],
+            "deactivateStates": ["specs-experimentation-view"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "elementSource": "control",
     "specType": "mixed"

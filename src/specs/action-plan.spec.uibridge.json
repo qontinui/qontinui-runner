@@ -688,6 +688,207 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "runner-loading",
+        "name": "Runner Loading",
+        "description": "The runner application is starting up. The UI has not finished rendering and the UI Bridge element registry is empty. Action plan endpoints exist on the HTTP server but have no element targets to resolve against.",
+        "elements": [{ "selector": "body:not(:has(button))" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-idle",
+            "name": "Runner UI finishes loading with registered elements",
+            "activateStates": ["idle"],
+            "deactivateStates": ["runner-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "button", "textContains": "RUN" },
+                "waitAfter": { "type": "idle", "timeout": 10000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "idle",
+        "name": "Ready for Action Plans",
+        "description": "The runner UI is fully loaded with interactive elements registered in the UI Bridge element registry. The action plan endpoint accepts requests and can resolve element targets via elementId, searchText, testId, or CSS selector. The sidebar tabs (Workflows, Active, Terminal) and control buttons (RUN, OBSERVE) are available as targets.",
+        "elements": [{ "role": "button", "textContains": "RUN" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "idle-to-executing",
+            "name": "Submit an action plan via POST /ui-bridge/control/action-plan",
+            "activateStates": ["plan-executing"],
+            "deactivateStates": ["idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Active" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "idle-to-snapshot",
+            "name": "Request AI snapshot with optional token budget via GET /ui-bridge/ai/snapshot",
+            "activateStates": ["idle"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "heading", "textContains": "Qontinui Runner" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "plan-executing",
+        "name": "Action Plan Executing",
+        "description": "An action plan has been submitted and the endpoint is sequentially executing the actions array. Each action resolves its element target, performs the DOM interaction via IPC, and records the result. Actions with confidence below the threshold are skipped. If stopOnFailure is true and an action fails, remaining actions are not executed.",
+        "elements": [{ "role": "button", "textContains": "Active" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "executing-to-succeeded",
+            "name": "All actions complete successfully",
+            "activateStates": ["plan-succeeded"],
+            "deactivateStates": ["plan-executing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "button", "textContains": "Workflows" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ],
+            "guard": "Every action in the plan resolved its target and executed without error"
+          },
+          {
+            "id": "executing-to-failed",
+            "name": "One or more actions fail during execution",
+            "activateStates": ["plan-failed"],
+            "deactivateStates": ["plan-executing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "button", "textContains": "Workflows" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ],
+            "guard": "At least one action failed (element not found, IPC error, or validation rejection)"
+          }
+        ]
+      },
+      {
+        "id": "plan-succeeded",
+        "name": "Plan Succeeded",
+        "description": "The action plan completed with success=true. The response contains executedCount matching the number of non-skipped actions, failedCount=0, and totalDurationMs. If the request included pageUrl and elementSnapshot, the plan was stored in the LRU cache (cached=true) and the cache-populated state is also active.",
+        "elements": [{ "role": "button", "textContains": "Terminal" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "succeeded-to-idle",
+            "name": "Return to idle, ready for next plan",
+            "activateStates": ["idle"],
+            "deactivateStates": ["plan-succeeded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "button", "textContains": "RUN" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "succeeded-to-cache-populated",
+            "name": "Successful plan with pageUrl+elementSnapshot populates cache",
+            "activateStates": ["cache-populated"],
+            "deactivateStates": ["plan-succeeded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "button", "textContains": "RUN" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ],
+            "guard": "The request included pageUrl and elementSnapshot fields"
+          }
+        ]
+      },
+      {
+        "id": "plan-failed",
+        "name": "Plan Failed",
+        "description": "The action plan completed with success=false. The response contains failedCount >= 1 with error messages on failed actions. If stopOnFailure was true, skipped actions beyond the failure point are not in results. Previously cached plans with the same key are evicted on failure.",
+        "elements": [{ "role": "button", "textContains": "OBSERVE" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "failed-to-idle",
+            "name": "Return to idle, ready to retry or submit a different plan",
+            "activateStates": ["idle"],
+            "deactivateStates": ["plan-failed"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "button", "textContains": "RUN" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cache-populated",
+        "name": "Cache Has Entries",
+        "description": "The action plan cache contains one or more stored plans. GET /cache/stats shows totalEntries >= 1. Cache lookups with matching URL and element fingerprint return hit=true with the stored plan. The cache is an in-memory LRU store with max 100 entries and 1-hour TTL.",
+        "elements": [{ "role": "button", "textContains": "Workflows" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "cache-to-idle",
+            "name": "Acknowledge cache state and return to idle for next operation",
+            "activateStates": ["idle"],
+            "deactivateStates": ["cache-populated"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "button", "textContains": "RUN" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "cache-to-executing",
+            "name": "Submit another action plan while cache has entries",
+            "activateStates": ["plan-executing"],
+            "deactivateStates": ["cache-populated"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Active" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ActionPlanSystem",
     "author": "Claude Opus 4.6",

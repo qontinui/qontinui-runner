@@ -1314,5 +1314,364 @@
     "elementSource": "sdk",
     "specType": "semantic",
     "tags": ["feedback-scores", "llm-costs", "run-recap", "opik", "tier-2"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "feedback-loading",
+        "name": "Feedback Loading",
+        "description": "Feedback scores are being fetched. A spinner and 'Loading feedback scores...' text are displayed. No score rows or summary strip are visible.",
+        "elements": [{ "textContains": "Loading feedback scores..." }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "feedback-loading-to-scores-visible",
+            "name": "Scores load successfully with at least one score",
+            "activateStates": ["feedback-scores-visible"],
+            "deactivateStates": ["feedback-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "feedback-loading-to-empty",
+            "name": "Scores load successfully but none exist",
+            "activateStates": ["feedback-empty"],
+            "deactivateStates": ["feedback-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "feedback-loading-to-error",
+            "name": "Scores endpoint returns an error",
+            "activateStates": ["feedback-error"],
+            "deactivateStates": ["feedback-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "feedback-scores-visible",
+        "name": "Feedback Scores Visible",
+        "description": "Scores have loaded and at least one exists. The summary strip shows average score, total count, and source badges. Individual score rows display name, progress bar, percentage, and source badge. The 'Add Score' button is in the panel header.",
+        "elements": [
+          { "textContains": "Avg Score" },
+          { "textContains": "scores:" },
+          { "role": "heading", "textContains": "Feedback Scores" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "scores-visible-to-add-form",
+            "name": "User clicks Add Score to open inline form",
+            "activateStates": ["feedback-add-form-open"],
+            "deactivateStates": ["feedback-scores-visible"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Add Score" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "scores-visible-to-score-expanded",
+            "name": "User clicks an expandable score row to reveal reason",
+            "activateStates": ["feedback-score-expanded"],
+            "deactivateStates": ["feedback-scores-visible"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "ariaLabel": "Expand reason for" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "scores-visible-to-costs-tab",
+            "name": "User switches to LLM Costs tab",
+            "activateStates": ["costs-loading"],
+            "deactivateStates": ["feedback-scores-visible"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "LLM Costs" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "feedback-empty",
+        "name": "Feedback Empty State",
+        "description": "Scores loaded but none exist. The panel shows 'No Feedback Scores' heading with explanatory text and an Add Score button.",
+        "elements": [
+          { "textContains": "No Feedback Scores" },
+          { "textContains": "Scores will appear here once" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-add-form",
+            "name": "User clicks Add Score from empty state",
+            "activateStates": ["feedback-add-form-open"],
+            "deactivateStates": ["feedback-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Add Score" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "empty-to-costs-tab",
+            "name": "User switches to LLM Costs tab from empty state",
+            "activateStates": ["costs-loading"],
+            "deactivateStates": ["feedback-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "LLM Costs" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "feedback-error",
+        "name": "Feedback Error State",
+        "description": "The feedback scores endpoint failed. The panel shows 'Failed to load feedback scores' with the error message and a Retry button.",
+        "elements": [
+          { "textContains": "Failed to load feedback scores" },
+          { "role": "button", "textContains": "Retry" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "feedback-error-to-loading",
+            "name": "User clicks Retry to re-fetch scores",
+            "activateStates": ["feedback-loading"],
+            "deactivateStates": ["feedback-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Retry" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "feedback-add-form-open",
+        "name": "Add Score Form Open",
+        "description": "The inline Add Score form is visible with Name, Value (0-1), and Reason fields. Submit is disabled until a name is entered. Cancel dismisses the form.",
+        "elements": [
+          { "role": "textbox", "id": "score-name" },
+          { "role": "spinbutton", "id": "score-value" },
+          { "role": "textbox", "id": "score-reason" },
+          { "role": "button", "textContains": "Submit" },
+          { "role": "button", "textContains": "Cancel" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "add-form-submit-to-scores-visible",
+            "name": "User submits the form with valid data, score is created",
+            "activateStates": ["feedback-scores-visible"],
+            "deactivateStates": ["feedback-add-form-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": { "id": "score-name" },
+                "value": "test-score"
+              },
+              {
+                "action": "fill",
+                "target": { "id": "score-value" },
+                "value": "0.75"
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Submit" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "add-form-cancel-to-scores-visible",
+            "name": "User cancels the form, returning to scores list",
+            "activateStates": ["feedback-scores-visible"],
+            "deactivateStates": ["feedback-add-form-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "add-form-cancel-to-empty",
+            "name": "User cancels the form when no scores exist, returning to empty state",
+            "activateStates": ["feedback-empty"],
+            "deactivateStates": ["feedback-add-form-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "feedback-score-expanded",
+        "name": "Score Row Expanded",
+        "description": "A score row with a reason field is expanded, showing the reason text with a MessageSquare icon in a bordered section below the progress bar. The chevron points downward. Aria-label reads 'Collapse reason for {name}'.",
+        "elements": [{ "role": "button", "ariaLabelContains": "Collapse reason for" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "score-expanded-to-scores-visible",
+            "name": "User clicks the expanded row to collapse it",
+            "activateStates": ["feedback-scores-visible"],
+            "deactivateStates": ["feedback-score-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "ariaLabel": "Collapse reason for" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "costs-loading",
+        "name": "Costs Loading",
+        "description": "LLM cost data is being fetched. A spinner and 'Loading cost breakdown...' text are displayed.",
+        "elements": [{ "textContains": "Loading cost breakdown..." }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "costs-loading-to-data-visible",
+            "name": "Cost data loads successfully with at least one LLM action",
+            "activateStates": ["costs-data-visible"],
+            "deactivateStates": ["costs-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "costs-loading-to-empty",
+            "name": "Cost data loads but run had no LLM actions",
+            "activateStates": ["costs-empty"],
+            "deactivateStates": ["costs-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "costs-loading-to-error",
+            "name": "Cost summary endpoint returns an error",
+            "activateStates": ["costs-error"],
+            "deactivateStates": ["costs-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "costs-data-visible",
+        "name": "Cost Data Visible",
+        "description": "Cost data has loaded with at least one LLM action. The totals strip shows Total Cost, Tokens In, Tokens Out, and LLM Actions. The per-model breakdown table displays rows sorted by cost descending.",
+        "elements": [
+          { "textContains": "Total Cost" },
+          { "textContains": "Tokens In" },
+          { "textContains": "Tokens Out" },
+          { "textContains": "LLM Actions" },
+          { "role": "columnheader", "textContains": "Model" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "costs-data-to-feedback-tab",
+            "name": "User switches back to Feedback Scores tab",
+            "activateStates": ["feedback-loading"],
+            "deactivateStates": ["costs-data-visible"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Feedback Scores" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "costs-empty",
+        "name": "Costs Empty State",
+        "description": "Cost data loaded but the run had zero LLM actions. The panel shows 'No LLM Costs' with the message 'This run did not include any LLM actions.'",
+        "elements": [
+          { "textContains": "No LLM Costs" },
+          { "textContains": "This run did not include any LLM actions." }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "costs-empty-to-feedback-tab",
+            "name": "User switches back to Feedback Scores tab from costs empty state",
+            "activateStates": ["feedback-loading"],
+            "deactivateStates": ["costs-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Feedback Scores" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "costs-error",
+        "name": "Costs Error State",
+        "description": "The cost summary endpoint failed. The panel shows 'Failed to load cost breakdown' with the error message.",
+        "elements": [{ "textContains": "Failed to load cost breakdown" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "costs-error-to-feedback-tab",
+            "name": "User switches back to Feedback Scores tab from costs error state",
+            "activateStates": ["feedback-loading"],
+            "deactivateStates": ["costs-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Feedback Scores" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

@@ -209,10 +209,62 @@
         "elements": [{ "textContent": "No triggers configured" }],
         "isInitial": true,
         "transitions": [
-          { "id": "list-to-history", "name": "Switch to History sub-tab", "activateStates": ["trigger-history-no-selection"], "deactivateStates": ["trigger-list"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "History" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "list-to-editor-create", "name": "Open New Trigger editor", "activateStates": ["trigger-editor"], "deactivateStates": ["trigger-list"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "New Trigger" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "list-to-test-result", "name": "Test a trigger and view result", "activateStates": ["trigger-test-result"], "deactivateStates": [], "staysVisible": true, "process": [{ "action": "click", "target": { "textContent": "Test" }, "waitAfter": { "type": "idle", "timeout": 3000 } }] },
-          { "id": "list-to-history-for-trigger", "name": "View history for a specific trigger", "activateStates": ["trigger-history-active"], "deactivateStates": ["trigger-list"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "History" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "list-to-history",
+            "name": "Switch to History sub-tab",
+            "activateStates": ["trigger-history-no-selection"],
+            "deactivateStates": ["trigger-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "History" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "list-to-editor-create",
+            "name": "Open New Trigger editor",
+            "activateStates": ["trigger-editor"],
+            "deactivateStates": ["trigger-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "New Trigger" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "list-to-test-result",
+            "name": "Test a trigger and view result",
+            "activateStates": ["trigger-test-result"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Test" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "list-to-history-for-trigger",
+            "name": "View history for a specific trigger",
+            "activateStates": ["trigger-history-active"],
+            "deactivateStates": ["trigger-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "History" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -222,7 +274,20 @@
         "elements": [{ "textContent": "No trigger selected" }],
         "isInitial": false,
         "transitions": [
-          { "id": "history-nosel-to-list", "name": "Switch to All Triggers sub-tab", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-history-no-selection"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContains": "All Triggers" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "history-nosel-to-list",
+            "name": "Switch to All Triggers sub-tab",
+            "activateStates": ["trigger-list"],
+            "deactivateStates": ["trigger-history-no-selection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "All Triggers" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -232,7 +297,20 @@
         "elements": [{ "textContent": "Filter:" }],
         "isInitial": false,
         "transitions": [
-          { "id": "history-active-to-list", "name": "Switch to All Triggers sub-tab", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-history-active"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContains": "All Triggers" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "history-active-to-list",
+            "name": "Switch to All Triggers sub-tab",
+            "activateStates": ["trigger-list"],
+            "deactivateStates": ["trigger-history-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "All Triggers" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -242,8 +320,34 @@
         "elements": [{ "textContent": "Cancel" }, { "textContent": "Name *" }],
         "isInitial": false,
         "transitions": [
-          { "id": "editor-to-list-cancel", "name": "Cancel editing and return to list", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-editor"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "Cancel" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "editor-to-list-save", "name": "Save trigger and return to list", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-editor"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "Create" }, "waitAfter": { "type": "idle", "timeout": 3000 } }] }
+          {
+            "id": "editor-to-list-cancel",
+            "name": "Cancel editing and return to list",
+            "activateStates": ["trigger-list"],
+            "deactivateStates": ["trigger-editor"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "editor-to-list-save",
+            "name": "Save trigger and return to list",
+            "activateStates": ["trigger-list"],
+            "deactivateStates": ["trigger-editor"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Create" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -253,7 +357,20 @@
         "elements": [{ "textContent": "Test Result" }],
         "isInitial": false,
         "transitions": [
-          { "id": "test-result-to-list", "name": "Close test result modal", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-test-result"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "Close" }, "waitAfter": { "type": "idle", "timeout": 1000 } }] }
+          {
+            "id": "test-result-to-list",
+            "name": "Close test result modal",
+            "activateStates": ["trigger-list"],
+            "deactivateStates": ["trigger-test-result"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Close" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
         ]
       }
     ]

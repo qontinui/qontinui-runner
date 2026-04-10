@@ -200,11 +200,340 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "discovery",
+        "name": "Discovery",
+        "description": "Scan for and find UI Bridge-enabled applications running on the local network or at known URLs",
+        "elements": [{ "textContent": "Scan" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "discovery-to-injection",
+            "name": "Switch to Runtime Injection tab",
+            "activateStates": ["injection"],
+            "deactivateStates": ["discovery"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Runtime Injection" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "discovery-to-source",
+            "name": "Switch to Source Integration tab",
+            "activateStates": ["source"],
+            "deactivateStates": ["discovery"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Source Integration" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "discovery-to-health",
+            "name": "Switch to Health Monitor tab",
+            "activateStates": ["health"],
+            "deactivateStates": ["discovery"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Health Monitor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "discovery-to-explorer",
+            "name": "Switch to State Explorer tab",
+            "activateStates": ["explorer"],
+            "deactivateStates": ["discovery"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "State Explorer" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "injection",
+        "name": "Runtime Injection",
+        "description": "Inject the UI Bridge SDK into running applications without modifying their source code",
+        "elements": [{ "textContent": "Inject" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "injection-to-discovery",
+            "name": "Switch to Discovery tab",
+            "activateStates": ["discovery"],
+            "deactivateStates": ["injection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "injection-to-source",
+            "name": "Switch to Source Integration tab",
+            "activateStates": ["source"],
+            "deactivateStates": ["injection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Source Integration" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "injection-to-health",
+            "name": "Switch to Health Monitor tab",
+            "activateStates": ["health"],
+            "deactivateStates": ["injection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Health Monitor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "injection-to-explorer",
+            "name": "Switch to State Explorer tab",
+            "activateStates": ["explorer"],
+            "deactivateStates": ["injection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "State Explorer" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "source",
+        "name": "Source Integration",
+        "description": "Instructions and tools for permanently embedding the UI Bridge SDK into an application's source code",
+        "elements": [{ "textContent": "Embed" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "source-to-discovery",
+            "name": "Switch to Discovery tab",
+            "activateStates": ["discovery"],
+            "deactivateStates": ["source"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "source-to-injection",
+            "name": "Switch to Runtime Injection tab",
+            "activateStates": ["injection"],
+            "deactivateStates": ["source"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Runtime Injection" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "source-to-health",
+            "name": "Switch to Health Monitor tab",
+            "activateStates": ["health"],
+            "deactivateStates": ["source"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Health Monitor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "source-to-explorer",
+            "name": "Switch to State Explorer tab",
+            "activateStates": ["explorer"],
+            "deactivateStates": ["source"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "State Explorer" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "health",
+        "name": "Health Monitor",
+        "description": "Track response times, error rates, and connection stability for each connected UI Bridge application",
+        "elements": [{ "textContent": "Response Time" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "health-to-discovery",
+            "name": "Switch to Discovery tab",
+            "activateStates": ["discovery"],
+            "deactivateStates": ["health"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "health-to-injection",
+            "name": "Switch to Runtime Injection tab",
+            "activateStates": ["injection"],
+            "deactivateStates": ["health"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Runtime Injection" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "health-to-source",
+            "name": "Switch to Source Integration tab",
+            "activateStates": ["source"],
+            "deactivateStates": ["health"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Source Integration" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "health-to-explorer",
+            "name": "Switch to State Explorer tab",
+            "activateStates": ["explorer"],
+            "deactivateStates": ["health"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "State Explorer" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "explorer",
+        "name": "State Explorer",
+        "description": "Inspect live UI state of connected applications, browse the element tree, and verify SDK reporting",
+        "elements": [{ "textContent": "Element Tree" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "explorer-to-discovery",
+            "name": "Switch to Discovery tab",
+            "activateStates": ["discovery"],
+            "deactivateStates": ["explorer"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "explorer-to-injection",
+            "name": "Switch to Runtime Injection tab",
+            "activateStates": ["injection"],
+            "deactivateStates": ["explorer"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Runtime Injection" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "explorer-to-source",
+            "name": "Switch to Source Integration tab",
+            "activateStates": ["source"],
+            "deactivateStates": ["explorer"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Source Integration" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "explorer-to-health",
+            "name": "Switch to Health Monitor tab",
+            "activateStates": ["health"],
+            "deactivateStates": ["explorer"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Health Monitor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "UIBridgeIntegrationPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/config/ui-bridge",
     "elementSource": "sdk",
     "tags": ["ui-bridge", "integration", "discovery", "health-monitoring", "runner-only"]

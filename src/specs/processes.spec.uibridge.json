@@ -742,10 +742,7 @@
         "id": "pm-historical-view",
         "name": "Historical Session View",
         "description": "A historical session is selected in the picker. The output area shows the persisted lines from that session (batch fetch, not live stream). The Tauri process-output event subscription is paused for this process ID.",
-        "elements": [
-          { "placeholder": "Search output..." },
-          { "tagName": "select" }
-        ],
+        "elements": [{ "placeholder": "Search output..." }, { "tagName": "select" }],
         "transitions": [
           {
             "id": "pm-historical-to-live",
@@ -774,6 +771,13 @@
     "updatedAt": "2026-04-08T00:00:00.000Z",
     "pageUrl": "/processes",
     "elementSource": "sdk",
-    "tags": ["process-manager", "lifecycle", "diagnostics", "runner-only", "log-persistence", "historical-sessions"]
+    "tags": [
+      "process-manager",
+      "lifecycle",
+      "diagnostics",
+      "runner-only",
+      "log-persistence",
+      "historical-sessions"
+    ]
   }
 }

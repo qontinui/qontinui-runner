@@ -172,9 +172,7 @@
         "id": "loading",
         "name": "Loading — Fetching Action Log",
         "description": "Action log data is being fetched for the selected run. A spinner and 'Loading action log...' text are displayed. No table or empty message is visible.",
-        "elements": [
-          { "textContains": "Loading action log" }
-        ],
+        "elements": [{ "textContains": "Loading action log" }],
         "isInitial": true,
         "transitions": [
           {
@@ -207,9 +205,7 @@
         "id": "error",
         "name": "Error — Failed to Load Action Log",
         "description": "An error occurred while fetching action log data. A red alert icon and the error message are displayed.",
-        "elements": [
-          { "textContains": "Error:" }
-        ],
+        "elements": [{ "textContains": "Error:" }],
         "isInitial": false,
         "transitions": [
           {
@@ -226,9 +222,7 @@
         "id": "empty",
         "name": "Empty — No Actions Recorded",
         "description": "The selected run has no GUI actions. A Zap icon and 'No actions recorded for this run' message are displayed.",
-        "elements": [
-          { "textContains": "No actions recorded for this run" }
-        ],
+        "elements": [{ "textContains": "No actions recorded for this run" }],
         "isInitial": false,
         "transitions": [
           {
@@ -283,9 +277,7 @@
         "id": "action-detail",
         "name": "Action Detail — Modal Open",
         "description": "A modal is open showing detailed information about a single action, including screenshots, coordinates, and full execution context. The action table remains visible behind the modal.",
-        "elements": [
-          { "role": "dialog" }
-        ],
+        "elements": [{ "role": "dialog" }],
         "isInitial": false,
         "transitions": [
           {

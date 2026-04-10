@@ -13,7 +13,11 @@
           "description": "A horizontal tab bar is present at the top of the page containing all sub-tab buttons",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "dataAttributes": { "tutorial-id": "progress-tab" } }, "label": "First tab button in tab bar" },
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "tutorial-id": "progress-tab" } },
+            "label": "First tab button in tab bar"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -24,7 +28,11 @@
           "description": "The tab bar contains exactly 14 tab buttons: Progress, Recommendations, Prompt Optimization, Prompt Registry, Config Suggestions, Run History, Eval Specs, Robustness, Duel Pools, Beam Runs, Span Events, Adaptive Learning, Playbook, Prompt Evolution",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "dataAttributes": { "tutorial-id": "progress-tab" } }, "label": "Tab bar" },
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "tutorial-id": "progress-tab" } },
+            "label": "Tab bar"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -35,7 +43,11 @@
           "description": "On initial load, the Progress tab is selected (active styling: bg-zinc-800, text-zinc-100, border-zinc-700) and its content is visible",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "dataAttributes": { "tutorial-id": "progress-tab" } }, "label": "Progress tab button" },
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "tutorial-id": "progress-tab" } },
+            "label": "Progress tab button"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -55,7 +67,11 @@
           "description": "Clicking the 'Duel Pools' tab button switches to the DuelPoolsTab content panel, showing the header 'Duel Pools' and hiding the previous tab's content",
           "category": "navigation",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "dataAttributes": { "tutorial-id": "duel_pools-tab" } }, "label": "Duel Pools tab button" },
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "tutorial-id": "duel_pools-tab" } },
+            "label": "Duel Pools tab button"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -66,7 +82,11 @@
           "description": "Clicking the 'Beam Runs' tab button switches to the BeamRunsTab content panel, showing the header 'Beam Search Runs'",
           "category": "navigation",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "dataAttributes": { "tutorial-id": "beam_runs-tab" } }, "label": "Beam Runs tab button" },
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "tutorial-id": "beam_runs-tab" } },
+            "label": "Beam Runs tab button"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -77,7 +97,11 @@
           "description": "Clicking the 'Span Events' tab button switches to the SpanEventsTab content panel, showing the header 'Span Events' and filter inputs",
           "category": "navigation",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "dataAttributes": { "tutorial-id": "span_events-tab" } }, "label": "Span Events tab button" },
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "tutorial-id": "span_events-tab" } },
+            "label": "Span Events tab button"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -88,7 +112,11 @@
           "description": "The currently active tab has distinct styling (bg-zinc-800 background, text-zinc-100 text, border with no bottom border) while inactive tabs show text-zinc-400 with hover states",
           "category": "design",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "dataAttributes": { "tutorial-id": "progress-tab" } }, "label": "Active tab" },
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "tutorial-id": "progress-tab" } },
+            "label": "Active tab"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -108,7 +136,11 @@
           "description": "The Duel Pools tab displays a header with text 'Duel Pools', a 'Refresh' button, and a pool count indicator showing 'N pools'",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "heading", "textContains": "Duel Pools" }, "label": "Duel Pools heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContains": "Duel Pools" },
+            "label": "Duel Pools heading"
+          },
           "assertionType": "exists",
           "precondition": "Duel Pools tab is selected",
           "source": "ai-generated",
@@ -120,7 +152,11 @@
           "description": "When no duel pools exist, displays: 'No duel pools yet. Duel pools are created by the optimization pipeline during prompt evolution.'",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No duel pools yet" }, "label": "Empty state message" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No duel pools yet" },
+            "label": "Empty state message"
+          },
           "assertionType": "semantic",
           "precondition": "Duel Pools tab is selected and no pools exist in the database",
           "source": "ai-generated",
@@ -132,7 +168,11 @@
           "description": "While fetching pools, the tab shows 'Loading...' text",
           "category": "state-consistency",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContent": "Loading..." }, "label": "Loading indicator" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Loading..." },
+            "label": "Loading indicator"
+          },
           "assertionType": "semantic",
           "precondition": "Duel Pools tab is selected and API request is in flight",
           "source": "ai-generated",
@@ -153,7 +193,11 @@
           "description": "Each pool item in the sidebar shows: a status badge (color-coded: active=green, complete=blue, converged=cyan, failed=red), the agent_type, generation number, truncated pool ID (8 chars), and creation date",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Pool list item" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Pool list item"
+          },
           "assertionType": "semantic",
           "precondition": "Duel Pools tab is selected and at least one pool exists",
           "source": "ai-generated",
@@ -165,7 +209,11 @@
           "description": "Clicking a pool in the sidebar fetches pool detail from GET /meta-optimizer/duel-pools/:id and displays a candidates table with columns: #, ID, Status, Copeland, Alpha, Beta, Win Rate, Gen, Variant. Candidates are ranked by Copeland score descending.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Pool list item" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Pool list item"
+          },
           "assertionType": "behavior",
           "precondition": "Duel Pools tab is selected and pools exist",
           "source": "ai-generated",
@@ -177,7 +225,11 @@
           "description": "Clicking a candidate row in the table expands it to reveal the full prompt_content in a pre-formatted code block (bg-zinc-900/50, max-h-48, whitespace-pre-wrap). Clicking again collapses it.",
           "category": "interaction",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "tagName": "tr" }, "label": "Candidate table row" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "tr" },
+            "label": "Candidate table row"
+          },
           "assertionType": "behavior",
           "precondition": "A pool is selected and candidates are displayed",
           "source": "ai-generated",
@@ -198,7 +250,11 @@
           "description": "A 'Show Duel Results' button is present below the candidates table. After clicking, it changes text to 'Refresh Results' and displays a results table.",
           "category": "interaction",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Duel Results" }, "label": "Show Duel Results button" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Duel Results" },
+            "label": "Show Duel Results button"
+          },
           "assertionType": "behavior",
           "precondition": "A pool is selected",
           "source": "ai-generated",
@@ -210,7 +266,11 @@
           "description": "The duel results table has columns: Candidate A, Candidate B, Winner, Confidence, Swapped, Date. Each row shows truncated IDs (8 chars), the winner highlighted, confidence as a decimal, position_swapped as Yes/No, and a formatted date.",
           "category": "data-display",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "tagName": "table" }, "label": "Duel results table" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "table" },
+            "label": "Duel results table"
+          },
           "assertionType": "semantic",
           "precondition": "Duel results have been loaded and at least one result exists",
           "source": "ai-generated",
@@ -222,7 +282,11 @@
           "description": "When a pool has no duel results, displays: 'No duel results for this pool.'",
           "category": "state-consistency",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "No duel results" }, "label": "Empty results message" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No duel results" },
+            "label": "Empty results message"
+          },
           "assertionType": "semantic",
           "precondition": "Duel results loaded but none exist",
           "source": "ai-generated",
@@ -243,7 +307,11 @@
           "description": "Candidates in the detail table are ranked by Copeland score in descending order. The # column shows 1-based rank. The candidate with the highest Copeland score is row #1.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "tagName": "table" }, "label": "Candidates ranking table" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "table" },
+            "label": "Candidates ranking table"
+          },
           "assertionType": "semantic",
           "precondition": "A pool is selected with 2+ candidates",
           "source": "ai-generated",
@@ -255,7 +323,11 @@
           "description": "The Win Rate column shows alpha/(alpha+beta) formatted as a percentage. This must be consistent with the displayed Alpha and Beta values for each candidate.",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "tagName": "table" }, "label": "Candidates ranking table" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "table" },
+            "label": "Candidates ranking table"
+          },
           "assertionType": "semantic",
           "precondition": "A pool is selected with candidates showing alpha/beta values",
           "source": "ai-generated",
@@ -267,7 +339,11 @@
           "description": "If duel results are loaded, the number of wins for the top-ranked candidate (visible in the results table as winner_id matches) should be greater than or equal to wins for lower-ranked candidates. The Copeland ranking must be consistent with the displayed duel outcomes.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "tagName": "table" }, "label": "Results and ranking tables" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "table" },
+            "label": "Results and ranking tables"
+          },
           "assertionType": "semantic",
           "precondition": "Pool selected with both candidates and duel results loaded",
           "source": "ai-generated",
@@ -288,7 +364,11 @@
           "description": "The Beam Runs tab displays a header with text 'Beam Search Runs', a 'Refresh' button, and a run count indicator showing 'N runs'",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "heading", "textContains": "Beam Search Runs" }, "label": "Beam Runs heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContains": "Beam Search Runs" },
+            "label": "Beam Runs heading"
+          },
           "assertionType": "exists",
           "precondition": "Beam Runs tab is selected",
           "source": "ai-generated",
@@ -300,7 +380,11 @@
           "description": "When no beam runs exist, displays: 'No beam search runs yet. Beam search is triggered by the optimization pipeline to explore prompt variations.'",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No beam search runs yet" }, "label": "Empty state message" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No beam search runs yet" },
+            "label": "Empty state message"
+          },
           "assertionType": "semantic",
           "precondition": "Beam Runs tab is selected and no runs exist",
           "source": "ai-generated",
@@ -321,7 +405,11 @@
           "description": "Each beam run in the sidebar shows: a status badge (running=green, complete=blue, converged=cyan, failed=red), agent_type, generation count, truncated ID, optional pool_id link, and creation date",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Beam run list item" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Beam run list item"
+          },
           "assertionType": "semantic",
           "precondition": "Beam Runs tab is selected and runs exist",
           "source": "ai-generated",
@@ -333,7 +421,11 @@
           "description": "After selecting a beam run, candidates are displayed grouped by generation number. Each group has a heading 'Generation N (M candidates)'. Groups are sorted by generation ascending (0 = seed, 1 = first children, etc.).",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Generation" }, "label": "Generation group heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Generation" },
+            "label": "Generation group heading"
+          },
           "assertionType": "semantic",
           "precondition": "A beam run is selected with candidates",
           "source": "ai-generated",
@@ -345,7 +437,11 @@
           "description": "Clicking a beam candidate card expands it to show three sections: Critique (the LLM's critique of the parent prompt), Changes Summary (what was changed), and Prompt Content (the full rewritten prompt in a pre-formatted block). Clicking again collapses.",
           "category": "interaction",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Beam candidate card header" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Beam candidate card header"
+          },
           "assertionType": "behavior",
           "precondition": "A beam run is selected with candidates",
           "source": "ai-generated",
@@ -357,7 +453,11 @@
           "description": "Beam candidates with a thinking_style display a purple badge (text-purple-400 bg-purple-900/30) showing the style name. Seed candidates (generation 0) may not have a thinking style.",
           "category": "design",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Candidate card with thinking style" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Candidate card with thinking style"
+          },
           "assertionType": "semantic",
           "precondition": "Beam run selected with candidates that have thinking_style set",
           "source": "ai-generated",
@@ -378,7 +478,11 @@
           "description": "The Span Events tab displays a header with text 'Span Events' and an event count indicator",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "heading", "textContains": "Span Events" }, "label": "Span Events heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContains": "Span Events" },
+            "label": "Span Events heading"
+          },
           "assertionType": "exists",
           "precondition": "Span Events tab is selected",
           "source": "ai-generated",
@@ -390,7 +494,11 @@
           "description": "A text input with placeholder 'execution_id filter' (w-64) allows filtering span events by execution ID",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "placeholder": "execution_id filter" }, "label": "Execution ID filter input" },
+          "target": {
+            "type": "search",
+            "criteria": { "placeholder": "execution_id filter" },
+            "label": "Execution ID filter input"
+          },
           "assertionType": "exists",
           "precondition": "Span Events tab is selected",
           "source": "ai-generated",
@@ -402,7 +510,11 @@
           "description": "A text input with placeholder 'agent_type filter' (w-48) allows filtering span events by agent type",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "placeholder": "agent_type filter" }, "label": "Agent type filter input" },
+          "target": {
+            "type": "search",
+            "criteria": { "placeholder": "agent_type filter" },
+            "label": "Agent type filter input"
+          },
           "assertionType": "exists",
           "precondition": "Span Events tab is selected",
           "source": "ai-generated",
@@ -414,7 +526,11 @@
           "description": "Clicking the 'Load' button fetches span events from GET /meta-optimizer/span-events with the current filter values and displays them grouped by execution_id",
           "category": "interaction",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContent": "Load" }, "label": "Load button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Load" },
+            "label": "Load button"
+          },
           "assertionType": "behavior",
           "precondition": "Span Events tab is selected",
           "source": "ai-generated",
@@ -426,7 +542,11 @@
           "description": "Before clicking Load, displays: 'No span events loaded. Enter optional filters and click Load.'",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No span events loaded" }, "label": "Empty state message" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No span events loaded" },
+            "label": "Empty state message"
+          },
           "assertionType": "semantic",
           "precondition": "Span Events tab is selected and Load has not been clicked",
           "source": "ai-generated",
@@ -447,7 +567,11 @@
           "description": "Events are grouped by execution_id. Each group has a collapsible header showing the truncated execution ID (8 chars), event count, and agent type. Clicking the header toggles collapse ('+' when collapsed, '-' when expanded).",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Execution group header" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Execution group header"
+          },
           "assertionType": "semantic",
           "precondition": "Span events have been loaded",
           "source": "ai-generated",
@@ -459,7 +583,11 @@
           "description": "Each execution group contains a table with columns: Step, Type, Agent, Details, Date. The Type column shows color-coded badges: reward=green, message=blue, object=purple.",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "tagName": "table" }, "label": "Span events table" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "table" },
+            "label": "Span events table"
+          },
           "assertionType": "semantic",
           "precondition": "Span events loaded and at least one group is expanded",
           "source": "ai-generated",
@@ -471,7 +599,11 @@
           "description": "Reward events display metric_name and reward_value. Values below 0.5 are shown in red (text-red-400), values >= 0.5 in green (text-green-400). This highlights underperforming agent steps.",
           "category": "design",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "tagName": "td" }, "label": "Reward value cell" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "td" },
+            "label": "Reward value cell"
+          },
           "assertionType": "semantic",
           "precondition": "Span events loaded with reward-type events visible",
           "source": "ai-generated",
@@ -483,7 +615,11 @@
           "description": "Message events show role (cyan) and content truncated to 200 characters. Clicking the content expands it to show the full text. Clicking again collapses to truncated form.",
           "category": "interaction",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Expandable message content" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Expandable message content"
+          },
           "assertionType": "behavior",
           "precondition": "Span events loaded with message-type events where content > 200 chars",
           "source": "ai-generated",
@@ -495,7 +631,11 @@
           "description": "Object events show data_key (purple) and data_json truncated to 200 characters. Clicking expands to full JSON. This is used to inspect agent config snapshots and output data.",
           "category": "interaction",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Expandable object content" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Expandable object content"
+          },
           "assertionType": "behavior",
           "precondition": "Span events loaded with object-type events where data_json > 200 chars",
           "source": "ai-generated",
@@ -516,7 +656,11 @@
           "description": "The page content area uses a dark background. Panel containers use bg-zinc-900 with border-zinc-800 borders. Selected/active items use bg-zinc-800.",
           "category": "design",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "heading", "textContains": "Duel Pools" }, "label": "Content panel" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContains": "Duel Pools" },
+            "label": "Content panel"
+          },
           "assertionType": "semantic",
           "precondition": "Any of the three new tabs is selected",
           "source": "ai-generated",
@@ -540,7 +684,11 @@
           "description": "Status badges across all tabs use consistent color coding: active/running=green (text-green-400 bg-green-900/30), complete=blue, converged=cyan, failed=red, eliminated/pruned=zinc-500. The color conveys status at a glance.",
           "category": "design",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "tagName": "span" }, "label": "Status badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "span" },
+            "label": "Status badge"
+          },
           "assertionType": "semantic",
           "precondition": "Tab with data items showing status badges",
           "source": "ai-generated",
@@ -552,7 +700,11 @@
           "description": "All interactive elements (pool items, run items, candidate cards, table rows, expandable content) show hover feedback: hover:bg-zinc-800/50 or hover:bg-zinc-800/30 for rows. Cursor changes to pointer on hoverable elements.",
           "category": "design",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Interactive list item" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Interactive list item"
+          },
           "assertionType": "semantic",
           "precondition": "Any of the three new tabs with data loaded",
           "source": "ai-generated",
@@ -573,7 +725,11 @@
           "description": "The DuelPoolsTab automatically fetches from GET /meta-optimizer/duel-pools?limit=50 on mount. The Refresh button re-fetches the same endpoint.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Refresh" }, "label": "Refresh button" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Refresh" },
+            "label": "Refresh button"
+          },
           "assertionType": "behavior",
           "precondition": "Duel Pools tab is selected",
           "source": "ai-generated",
@@ -585,7 +741,11 @@
           "description": "The BeamRunsTab automatically fetches from GET /meta-optimizer/beam-runs?limit=50 on mount.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "heading", "textContains": "Beam Search Runs" }, "label": "Beam runs heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContains": "Beam Search Runs" },
+            "label": "Beam runs heading"
+          },
           "assertionType": "behavior",
           "precondition": "Beam Runs tab is selected",
           "source": "ai-generated",
@@ -597,7 +757,11 @@
           "description": "The SpanEventsTab does NOT auto-fetch on mount. Events are loaded only when the user clicks Load. This is intentional because span events can be voluminous and require filtering.",
           "category": "behavior",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button", "textContent": "Load" }, "label": "Load button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Load" },
+            "label": "Load button"
+          },
           "assertionType": "semantic",
           "precondition": "Span Events tab is selected",
           "source": "ai-generated",
@@ -618,7 +782,11 @@
           "description": "Pool list items, beam run items, and candidate cards have role='button', tabIndex={0}, and onKeyDown handlers supporting Enter/Space activation",
           "category": "accessibility",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Interactive list items" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Interactive list items"
+          },
           "assertionType": "semantic",
           "precondition": "Any tab with interactive list items",
           "source": "ai-generated",
@@ -630,7 +798,11 @@
           "description": "Expandable message and object content cells in SpanEventsTab have role='button' and tabIndex={0} for keyboard activation",
           "category": "accessibility",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Expandable content cell" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Expandable content cell"
+          },
           "assertionType": "semantic",
           "precondition": "Span events loaded with expandable content",
           "source": "ai-generated",
@@ -644,7 +816,14 @@
   "metadata": {
     "component": "MetaOptimizerPage",
     "pageUrl": "/meta-optimizer",
-    "tags": ["meta-optimizer", "duel-pools", "beam-search", "span-events", "copeland-ranking", "prompt-optimization"]
+    "tags": [
+      "meta-optimizer",
+      "duel-pools",
+      "beam-search",
+      "span-events",
+      "copeland-ranking",
+      "prompt-optimization"
+    ]
   },
   "stateMachine": {
     "states": [

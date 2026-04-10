@@ -191,7 +191,11 @@ export function useNetworkIdleEvents(
           const uiBridgeGlobalNav = getUIBridgeGlobal();
           const navTracker = uiBridgeGlobalNav?.navigationTracker as
             | {
-                lastCompleteNavigation: { completedAt: number; url: string; routeKey: string } | null;
+                lastCompleteNavigation: {
+                  completedAt: number;
+                  url: string;
+                  routeKey: string;
+                } | null;
                 onNavigationComplete: (
                   listener: (data: { completedAt: number; url: string; routeKey: string }) => void,
                 ) => () => void;

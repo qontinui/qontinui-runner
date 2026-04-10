@@ -130,7 +130,10 @@ function AppContent() {
   const handleReorganize = useCallback(
     async (plan: ReorganizePlan) => {
       // Build a map of session ID → current page_id from terminal_list
-      const listResult = await invoke<{ success: boolean; data?: { terminals: Array<{ id: string; page_id: string; title: string }> } }>("terminal_list");
+      const listResult = await invoke<{
+        success: boolean;
+        data?: { terminals: Array<{ id: string; page_id: string; title: string }> };
+      }>("terminal_list");
       const terminals = listResult?.data?.terminals ?? [];
       const terminalPageMap = new Map(terminals.map((t) => [t.id, t.page_id]));
 
@@ -191,7 +194,9 @@ function AppContent() {
       }
 
       // Remove pages that are now empty (no sessions assigned to them)
-      const assignedPageIds = new Set(plan.pages.map((g) => pageNameToId.get(g.name)).filter(Boolean));
+      const assignedPageIds = new Set(
+        plan.pages.map((g) => pageNameToId.get(g.name)).filter(Boolean),
+      );
       for (const page of terminalPages.pages) {
         if (!assignedPageIds.has(page.id) && page.id !== "default") {
           try {

@@ -646,9 +646,7 @@
         "id": "wf-constraints-open",
         "name": "Constraints Panel — Execution Constraints",
         "description": "The constraints panel is expanded, showing constraint configuration for the workflow. Settings panel is hidden (mutually exclusive). The phase editor remains visible beneath.",
-        "elements": [
-          { "role": "button", "accessibleName": "Constraints" }
-        ],
+        "elements": [{ "role": "button", "accessibleName": "Constraints" }],
         "transitions": [
           {
             "id": "constraints-to-phase-editor",
@@ -703,9 +701,7 @@
         "id": "wf-executing",
         "name": "Executing — Workflow Running",
         "description": "The workflow is currently being executed. A blue status bar is shown below the toolbar indicating the running workflow name with a spinner. The Run button is replaced by a Stop button. The phase editor remains visible underneath.",
-        "elements": [
-          { "role": "button", "textContent": "Stop" }
-        ],
+        "elements": [{ "role": "button", "textContent": "Stop" }],
         "transitions": [
           {
             "id": "executing-to-phase-editor",

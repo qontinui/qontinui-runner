@@ -191,5 +191,255 @@
     "pageUrl": "/config/hooks",
     "elementSource": "sdk",
     "tags": ["hooks", "lifecycle", "webhooks", "configuration", "dev-only", "runner-only"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "loading",
+        "name": "Loading Hooks",
+        "description": "The page has just mounted and is fetching the list of configured lifecycle hooks from the backend. A loading indicator is shown while the request is in flight.",
+        "elements": [{ "textContains": "Loading" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-empty",
+            "name": "No hooks returned from backend",
+            "activateStates": ["empty"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-list",
+            "name": "One or more hooks returned from backend",
+            "activateStates": ["list"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Backend request to fetch hooks fails",
+            "activateStates": ["error"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "empty",
+        "name": "Empty State",
+        "description": "No lifecycle hooks are configured. The page shows a helpful empty state message guiding the user to create their first hook. The New Hook button is available.",
+        "elements": [{ "textContains": "No lifecycle hooks" }, { "textContent": "New Hook" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-editing",
+            "name": "User clicks New Hook to create their first hook",
+            "activateStates": ["editing"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "New Hook" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "list",
+        "name": "Hook List",
+        "description": "One or more lifecycle hooks are displayed in a list. Each hook card shows its name, event triggers, and enabled/disabled state. The page heading with hook count, the New Hook button, and per-hook action buttons (edit, test, toggle, delete) are available.",
+        "elements": [
+          { "textContent": "Lifecycle Hooks" },
+          { "textContains": "Configure actions to run at specific execution events" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "list-to-editing-new",
+            "name": "User clicks New Hook to add another hook",
+            "activateStates": ["editing"],
+            "deactivateStates": ["list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "New Hook" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "list-to-editing-existing",
+            "name": "User clicks edit on an existing hook card",
+            "activateStates": ["editing"],
+            "deactivateStates": ["list"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "list-to-confirm-delete",
+            "name": "User clicks delete on a hook card",
+            "activateStates": ["confirm-delete"],
+            "deactivateStates": ["list"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "list-to-test-result",
+            "name": "User clicks test on a hook and the test completes",
+            "activateStates": ["test-result"],
+            "deactivateStates": ["list"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "list-toggle-hook",
+            "name": "User toggles a hook enabled or disabled",
+            "activateStates": ["list"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": []
+          },
+          {
+            "id": "list-to-error",
+            "name": "A hook operation fails unexpectedly",
+            "activateStates": ["error"],
+            "deactivateStates": ["list"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "editing",
+        "name": "Hook Editor",
+        "description": "The hook editor modal or panel is open. When creating a new hook the form is empty; when editing an existing hook the form is pre-populated. The editor includes fields for hook name, URL endpoint, event triggers, custom headers, and payload configuration, along with Save and Cancel actions.",
+        "elements": [{ "textContains": "Hook" }, { "role": "button" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "editing-to-list",
+            "name": "User saves the hook successfully",
+            "activateStates": ["list"],
+            "deactivateStates": ["editing"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "editing-cancel-to-list",
+            "name": "User cancels the editor and returns to the hook list",
+            "activateStates": ["list"],
+            "deactivateStates": ["editing"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "editing-cancel-to-empty",
+            "name": "User cancels the editor and no hooks exist yet",
+            "activateStates": ["empty"],
+            "deactivateStates": ["editing"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "editing-to-error",
+            "name": "Save operation fails with a validation or backend error",
+            "activateStates": ["error"],
+            "deactivateStates": ["editing"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "confirm-delete",
+        "name": "Delete Confirmation",
+        "description": "A confirmation dialog is shown asking the user to confirm deletion of a specific hook. The dialog displays the hook name and warns that the action is irreversible, with Confirm and Cancel buttons.",
+        "elements": [{ "textContent": "Delete Hook" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "confirm-delete-to-list",
+            "name": "User confirms deletion and hooks remain",
+            "activateStates": ["list"],
+            "deactivateStates": ["confirm-delete"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "confirm-delete-to-empty",
+            "name": "User confirms deletion of the last hook",
+            "activateStates": ["empty"],
+            "deactivateStates": ["confirm-delete"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "confirm-delete-cancel",
+            "name": "User cancels the deletion and returns to the hook list",
+            "activateStates": ["list"],
+            "deactivateStates": ["confirm-delete"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "confirm-delete-to-error",
+            "name": "Delete operation fails",
+            "activateStates": ["error"],
+            "deactivateStates": ["confirm-delete"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "test-result",
+        "name": "Test Result Display",
+        "description": "A hook test has completed and the result is displayed, showing whether the test passed or failed along with the response details and execution duration in milliseconds. The user can dismiss the result and return to the hook list.",
+        "elements": [{ "textContains": "Test" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "test-result-to-list",
+            "name": "User dismisses the test result and returns to the hook list",
+            "activateStates": ["list"],
+            "deactivateStates": ["test-result"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error",
+        "description": "An operation has failed and an error banner is displayed with details about the failure. The user can dismiss the error to return to the previous functional state.",
+        "elements": [{ "role": "alert" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-list",
+            "name": "User dismisses the error and hooks exist",
+            "activateStates": ["list"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "error-to-empty",
+            "name": "User dismisses the error and no hooks exist",
+            "activateStates": ["empty"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
   }
 }

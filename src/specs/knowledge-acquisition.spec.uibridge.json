@@ -643,6 +643,166 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "ka-idle",
+        "name": "Idle — No Active Search",
+        "description": "The knowledge acquisition system is ready but no search is in progress. All API endpoints are available. Provider status can be queried at /knowledge/providers and stats at /knowledge/stats.",
+        "elements": [
+          { "role": "status", "accessibleName": "Provider availability list" },
+          { "role": "status", "accessibleName": "Knowledge acquisition stats" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "ka-idle-to-searching-web",
+            "name": "Initiate Web Search",
+            "activateStates": ["ka-searching"],
+            "deactivateStates": [],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "httpPost",
+                "target": { "endpoint": "/knowledge/search-web" },
+                "waitAfter": { "type": "idle", "timeout": 30000 }
+              }
+            ]
+          },
+          {
+            "id": "ka-idle-to-searching-error",
+            "name": "Initiate Error Research",
+            "activateStates": ["ka-searching"],
+            "deactivateStates": [],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "httpPost",
+                "target": { "endpoint": "/knowledge/research-error" },
+                "waitAfter": { "type": "idle", "timeout": 30000 }
+              }
+            ]
+          },
+          {
+            "id": "ka-idle-to-searching-vuln",
+            "name": "Initiate Vulnerability Search",
+            "activateStates": ["ka-searching"],
+            "deactivateStates": [],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "httpPost",
+                "target": { "endpoint": "/knowledge/search-vulnerabilities" },
+                "waitAfter": { "type": "idle", "timeout": 30000 }
+              }
+            ]
+          },
+          {
+            "id": "ka-idle-to-searching-audit",
+            "name": "Initiate Dependency Audit",
+            "activateStates": ["ka-searching"],
+            "deactivateStates": [],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "httpPost",
+                "target": { "endpoint": "/knowledge/audit-dependencies" },
+                "waitAfter": { "type": "idle", "timeout": 30000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ka-searching",
+        "name": "Searching — Tiered Escalation In Progress",
+        "description": "A search is actively executing through the tiered escalation chain. Tier 0 checks local cache, Tier 1 checks UI Bridge, Tier 2 queries web providers (DuckDuckGo, Tavily, Perplexity), Tier 3 ingests results. Budget enforcement (5 actions, 80KB, 30s/provider) is active.",
+        "elements": [{ "role": "status", "accessibleName": "Active search progress" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "ka-searching-to-results",
+            "name": "Search Completed Successfully",
+            "activateStates": ["ka-results-returned"],
+            "deactivateStates": ["ka-searching"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "condition": "response.success === true" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          },
+          {
+            "id": "ka-searching-to-error",
+            "name": "Search Failed or Timed Out",
+            "activateStates": ["ka-error"],
+            "deactivateStates": ["ka-searching"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "condition": "budget exhausted or all providers failed" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ka-results-returned",
+        "name": "Results Returned — Flywheel Storage Active",
+        "description": "Search completed with results. Results have been returned to the caller and Tier 3 flywheel is storing them: summarizing (if >3000 chars), embedding (MiniLM-L6-v2, 384-dim), deduplicating (cosine >0.85), and inserting into task_knowledge. Stats counters have been updated.",
+        "elements": [
+          { "role": "status", "accessibleName": "Search results with provider attribution" },
+          { "role": "status", "accessibleName": "Ingestion and dedup counters" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "ka-results-to-idle",
+            "name": "Return to Idle",
+            "activateStates": ["ka-idle"],
+            "deactivateStates": ["ka-results-returned"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "condition": "ingestion complete" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ka-error",
+        "name": "Error — Graceful Degradation",
+        "description": "All providers failed, timed out, or budget was exhausted. The system returns success=true with an empty results array — never success=false. Provider failures are logged but not propagated. The system is ready for the next search immediately.",
+        "elements": [
+          { "role": "status", "accessibleName": "Empty results with graceful degradation" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "ka-error-to-idle",
+            "name": "Return to Idle",
+            "activateStates": ["ka-idle"],
+            "deactivateStates": ["ka-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "condition": "response delivered" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "KnowledgeAcquisition",
     "pageUrl": "/knowledge/*",

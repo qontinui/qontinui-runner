@@ -142,7 +142,16 @@ export function useDebugInspectEvents(
 
           if (shouldGroup) {
             const { computeFingerprint: fingerprint } = await import("ui-bridge/debug");
-            const groupMap = new Map<string, { fingerprint: string; count: number; first: unknown; last: unknown; samples: unknown[] }>();
+            const groupMap = new Map<
+              string,
+              {
+                fingerprint: string;
+                count: number;
+                first: unknown;
+                last: unknown;
+                samples: unknown[];
+              }
+            >();
             for (const err of errors) {
               const fp = fingerprint(err as import("ui-bridge/debug").AnyCapturedEvent);
               const existing = groupMap.get(fp);
@@ -151,7 +160,13 @@ export function useDebugInspectEvents(
                 existing.last = err;
                 if (existing.samples.length < 3) existing.samples.push(err);
               } else {
-                groupMap.set(fp, { fingerprint: fp, count: 1, first: err, last: err, samples: [err] });
+                groupMap.set(fp, {
+                  fingerprint: fp,
+                  count: 1,
+                  first: err,
+                  last: err,
+                  samples: [err],
+                });
               }
             }
             const groups = Array.from(groupMap.values());

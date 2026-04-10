@@ -359,9 +359,7 @@
         "id": "loading",
         "name": "Loading — Fetching Recap Data",
         "description": "Recap data is being fetched. The page shows a pulsing activity icon and 'Loading recap...' text. No run content or tabs are visible.",
-        "elements": [
-          { "textContains": "Loading recap" }
-        ],
+        "elements": [{ "textContains": "Loading recap" }],
         "isInitial": true,
         "transitions": [
           {
@@ -394,9 +392,7 @@
         "id": "error",
         "name": "Error — Failed to Load Recap",
         "description": "An error occurred while fetching recap data. The page shows a red X icon, 'Failed to load recap' heading, and the error message.",
-        "elements": [
-          { "textContains": "Failed to load recap" }
-        ],
+        "elements": [{ "textContains": "Failed to load recap" }],
         "isInitial": false,
         "transitions": []
       },
@@ -404,9 +400,7 @@
         "id": "no-data",
         "name": "No Data — No Run Selected or No Recap",
         "description": "No recap data is available. The page shows a guidance message prompting the user to select a run or execute a task first.",
-        "elements": [
-          { "textContains": "No Recap Data" }
-        ],
+        "elements": [{ "textContains": "No Recap Data" }],
         "isInitial": false,
         "transitions": [
           {
@@ -606,7 +600,11 @@
         "name": "Tab — Verification Active",
         "description": "The Verification tab is selected, showing the verification plan and iteration results with pass/fail details.",
         "elements": [
-          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Verification" }
+          {
+            "tagName": "div",
+            "dataAttributes": { "state": "active" },
+            "textContains": "Verification"
+          }
         ],
         "isInitial": false,
         "transitions": [
@@ -771,7 +769,11 @@
         "name": "Tab — Feedback Scores Active",
         "description": "The Feedback Scores tab is selected, showing feedback scoring panel for the run.",
         "elements": [
-          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Feedback Scores" }
+          {
+            "tagName": "div",
+            "dataAttributes": { "state": "active" },
+            "textContains": "Feedback Scores"
+          }
         ],
         "isInitial": false,
         "transitions": [
@@ -874,6 +876,13 @@
     "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/runs/summary",
     "elementSource": "sdk",
-    "tags": ["run-summary", "recap", "post-run-analysis", "observe", "pagination", "memory-protection"]
+    "tags": [
+      "run-summary",
+      "recap",
+      "post-run-analysis",
+      "observe",
+      "pagination",
+      "memory-protection"
+    ]
   }
 }

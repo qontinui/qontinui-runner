@@ -258,7 +258,7 @@ export function SpanEventsTab() {
                                   <span className="text-cyan-400 mr-2">{ev.role ?? "?"}</span>
                                   <span className="text-zinc-300">
                                     {isExpanded
-                                      ? ev.content ?? ""
+                                      ? (ev.content ?? "")
                                       : truncate(ev.content ?? "", 200)}
                                   </span>
                                 </div>
@@ -281,7 +281,7 @@ export function SpanEventsTab() {
                                   </span>
                                   <span className="text-zinc-300 font-mono">
                                     {isExpanded
-                                      ? ev.data_json ?? ""
+                                      ? (ev.data_json ?? "")
                                       : truncate(ev.data_json ?? "", 200)}
                                   </span>
                                 </div>

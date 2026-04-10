@@ -49,9 +49,7 @@ export function ProviderHealthStatus() {
 
   if (error) {
     return (
-      <div className="text-xs text-muted-foreground">
-        Provider health unavailable: {error}
-      </div>
+      <div className="text-xs text-muted-foreground">Provider health unavailable: {error}</div>
     );
   }
 

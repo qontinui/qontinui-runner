@@ -273,9 +273,7 @@ export function useControlEvents(
 
           try {
             const { resolveStableRef } = await import("ui-bridge/core");
-            const resolved = resolveStableRef(
-              stableRef as Parameters<typeof resolveStableRef>[0],
-            );
+            const resolved = resolveStableRef(stableRef as Parameters<typeof resolveStableRef>[0]);
             await sendResponse({
               requestId,
               type,

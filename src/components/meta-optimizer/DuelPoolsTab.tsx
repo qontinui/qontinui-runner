@@ -143,10 +143,7 @@ export function DuelPoolsTab() {
       {/* Header */}
       <div className="flex items-center gap-3">
         <h2 className="text-sm font-medium text-zinc-200">Duel Pools</h2>
-        <button
-          onClick={loadPools}
-          className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1"
-        >
+        <button onClick={loadPools} className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1">
           Refresh
         </button>
         <span className="text-xs text-zinc-500 ml-auto">{pools.length} pools</span>
@@ -213,9 +210,7 @@ export function DuelPoolsTab() {
                 {/* Pool info */}
                 <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
                   <div className="flex items-center gap-3 text-sm">
-                    <span className="text-zinc-200 font-medium">
-                      {poolDetail.pool.agent_type}
-                    </span>
+                    <span className="text-zinc-200 font-medium">{poolDetail.pool.agent_type}</span>
                     <span
                       className={`text-xs px-1.5 py-0.5 rounded ${STATUS_COLORS[poolDetail.pool.status] || ""}`}
                     >
@@ -299,21 +294,22 @@ export function DuelPoolsTab() {
                   </table>
 
                   {/* Expanded candidate prompt */}
-                  {expandedCandidate && (() => {
-                    const c = poolDetail.candidates.find((x) => x.id === expandedCandidate);
-                    if (!c) return null;
-                    return (
-                      <div className="mt-2 bg-zinc-800/50 rounded p-3 space-y-2">
-                        <div className="flex items-center gap-2 text-xs text-zinc-500">
-                          <span>Candidate {shortId(c.id)}</span>
-                          {c.parent_id && <span>parent: {shortId(c.parent_id)}</span>}
+                  {expandedCandidate &&
+                    (() => {
+                      const c = poolDetail.candidates.find((x) => x.id === expandedCandidate);
+                      if (!c) return null;
+                      return (
+                        <div className="mt-2 bg-zinc-800/50 rounded p-3 space-y-2">
+                          <div className="flex items-center gap-2 text-xs text-zinc-500">
+                            <span>Candidate {shortId(c.id)}</span>
+                            {c.parent_id && <span>parent: {shortId(c.parent_id)}</span>}
+                          </div>
+                          <pre className="text-xs text-zinc-300 bg-zinc-900/50 p-2 rounded overflow-auto max-h-48 whitespace-pre-wrap">
+                            {c.prompt_content}
+                          </pre>
                         </div>
-                        <pre className="text-xs text-zinc-300 bg-zinc-900/50 p-2 rounded overflow-auto max-h-48 whitespace-pre-wrap">
-                          {c.prompt_content}
-                        </pre>
-                      </div>
-                    );
-                  })()}
+                      );
+                    })()}
                 </div>
 
                 {/* Duel results toggle */}

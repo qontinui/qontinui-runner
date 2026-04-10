@@ -38,9 +38,7 @@ export interface CompilationResult {
 /**
  * Compile all spec stateMachine sections into a single runtime state machine.
  */
-export function compileStateMachineFromSpecs(
-  specs: SpecConfig[],
-): CompilationResult {
+export function compileStateMachineFromSpecs(specs: SpecConfig[]): CompilationResult {
   const warnings: string[] = [];
   const allStates: StateDefinition[] = [];
   const allTransitions: TransitionDefinition[] = [];
@@ -146,9 +144,7 @@ function convertTransition(
  * Engine queries use:
  *   { role, text, ariaLabel, tagName, attributes, placeholder }
  */
-function convertElementCriteria(
-  criteria: Record<string, unknown>,
-): ElementQuery {
+function convertElementCriteria(criteria: Record<string, unknown>): ElementQuery {
   const query: ElementQuery = {};
 
   if (criteria.role) query.role = criteria.role as string;
@@ -163,9 +159,7 @@ function convertElementCriteria(
   // Convert dataAttributes → attributes
   if (criteria.dataAttributes && typeof criteria.dataAttributes === "object") {
     query.attributes = {};
-    for (const [key, value] of Object.entries(
-      criteria.dataAttributes as Record<string, string>,
-    )) {
+    for (const [key, value] of Object.entries(criteria.dataAttributes as Record<string, string>)) {
       // Spec uses short keys ("page-id"), engine uses full ("data-page-id")
       const attrKey = key.startsWith("data-") ? key : `data-${key}`;
       query.attributes[attrKey] = value;
@@ -183,9 +177,7 @@ function convertElementCriteria(
 }
 
 /** Convert a spec transition action to an engine TransitionAction. */
-function convertAction(
-  specAction: SpecTransitionAction,
-): EngineTransitionAction {
+function convertAction(specAction: SpecTransitionAction): EngineTransitionAction {
   return {
     target: convertElementCriteria(specAction.target),
     action: specAction.action,
@@ -200,7 +192,5 @@ function convertAction(
 
 /** Check if a state ID exists in any spec's stateMachine section. */
 function hasStateInSpecs(stateId: string, specs: SpecConfig[]): boolean {
-  return specs.some(
-    (spec) => spec.stateMachine?.states?.some((s) => s.id === stateId) ?? false,
-  );
+  return specs.some((spec) => spec.stateMachine?.states?.some((s) => s.id === stateId) ?? false);
 }

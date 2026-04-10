@@ -611,7 +611,9 @@ export function ClaudeCliSection({
                   }`}
                 >
                   <div className="text-xs font-medium">Least Usage</div>
-                  <div className="text-[10px] text-muted-foreground">Auto-select &amp; failover on rate-limit</div>
+                  <div className="text-[10px] text-muted-foreground">
+                    Auto-select &amp; failover on rate-limit
+                  </div>
                 </button>
               </div>
             </div>

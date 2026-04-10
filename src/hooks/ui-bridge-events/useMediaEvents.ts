@@ -315,9 +315,7 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
 
           // 5. aria-label match
           if (!domElement) {
-            const labelGuess = elementId
-              .replace(/^button-/, "")
-              .replace(/-/g, " ");
+            const labelGuess = elementId.replace(/^button-/, "").replace(/-/g, " ");
             domElement = document.querySelector(`[aria-label="${labelGuess}" i]`);
           }
 
@@ -492,8 +490,7 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
           // prepends "data:image/png;base64," to the .data field. So we
           // must strip any existing data-URL prefix to avoid double-
           // prefixing ("data:...data:...") which produces a 0x0 image.
-          const stripDataUrl = (s: string) =>
-            s.replace(/^data:image\/[^;]+;base64,/, "");
+          const stripDataUrl = (s: string) => s.replace(/^data:image\/[^;]+;base64,/, "");
 
           const wrap = (data: string) => ({
             data: stripDataUrl(data),

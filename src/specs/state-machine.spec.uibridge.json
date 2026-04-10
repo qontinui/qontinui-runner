@@ -2343,7 +2343,11 @@
             "deactivateStates": ["sm-discovery"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Graph Editor", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Graph Editor", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           },
           {
@@ -2353,7 +2357,11 @@
             "deactivateStates": ["sm-discovery"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "State View", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "State View", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           },
           {
@@ -2363,7 +2371,11 @@
             "deactivateStates": ["sm-discovery"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Transitions", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Transitions", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           },
           {
@@ -2373,7 +2385,11 @@
             "deactivateStates": ["sm-discovery"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Pathfinding", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Pathfinding", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           },
           {
@@ -2383,7 +2399,11 @@
             "deactivateStates": ["sm-discovery"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Export", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Export", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           }
         ]
@@ -2392,9 +2412,7 @@
         "id": "sm-graph",
         "name": "Graph Editor Tab",
         "description": "Interactive dagre node-edge layout with element thumbnails and transition editing",
-        "elements": [
-          { "textContent": "Graph Editor", "role": "tab" }
-        ],
+        "elements": [{ "textContent": "Graph Editor", "role": "tab" }],
         "transitions": [
           {
             "id": "graph-to-discovery",
@@ -2403,7 +2421,11 @@
             "deactivateStates": ["sm-graph"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Discovery", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           },
           {
@@ -2413,7 +2435,11 @@
             "deactivateStates": ["sm-graph"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "State View", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "State View", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           }
         ]
@@ -2422,9 +2448,7 @@
         "id": "sm-states",
         "name": "State View Tab",
         "description": "View states in list, spatial, or screenshot mode with element details",
-        "elements": [
-          { "textContent": "State View", "role": "tab" }
-        ],
+        "elements": [{ "textContent": "State View", "role": "tab" }],
         "transitions": [
           {
             "id": "states-to-discovery",
@@ -2433,7 +2457,11 @@
             "deactivateStates": ["sm-states"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Discovery", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           },
           {
@@ -2443,7 +2471,11 @@
             "deactivateStates": ["sm-states"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Graph Editor", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Graph Editor", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           }
         ]
@@ -2452,9 +2484,7 @@
         "id": "sm-transitions",
         "name": "Transitions Tab",
         "description": "Manage and view transitions between states",
-        "elements": [
-          { "textContent": "Transitions", "role": "tab" }
-        ],
+        "elements": [{ "textContent": "Transitions", "role": "tab" }],
         "transitions": [
           {
             "id": "transitions-to-discovery",
@@ -2463,7 +2493,11 @@
             "deactivateStates": ["sm-transitions"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Discovery", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           }
         ]
@@ -2472,9 +2506,7 @@
         "id": "sm-pathfinding",
         "name": "Pathfinding Tab",
         "description": "Find optimal paths between states",
-        "elements": [
-          { "textContent": "Pathfinding", "role": "tab" }
-        ],
+        "elements": [{ "textContent": "Pathfinding", "role": "tab" }],
         "transitions": [
           {
             "id": "pathfinding-to-discovery",
@@ -2483,7 +2515,11 @@
             "deactivateStates": ["sm-pathfinding"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Discovery", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           }
         ]
@@ -2492,9 +2528,7 @@
         "id": "sm-export",
         "name": "Export Tab",
         "description": "Export state machine configuration to JSON or load into Python runtime",
-        "elements": [
-          { "textContent": "Export", "role": "tab" }
-        ],
+        "elements": [{ "textContent": "Export", "role": "tab" }],
         "transitions": [
           {
             "id": "export-to-discovery",
@@ -2503,7 +2537,11 @@
             "deactivateStates": ["sm-export"],
             "staysVisible": false,
             "process": [
-              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+              {
+                "action": "click",
+                "target": { "textContent": "Discovery", "role": "tab" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
             ]
           }
         ]

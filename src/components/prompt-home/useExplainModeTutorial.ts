@@ -16,7 +16,8 @@ function buildTutorialSteps(steps: PlanStep[]): TutorialStep[] {
     }
     return {
       id: `explain-step-${i}`,
-      title: step.type === "navigate" ? `Navigating to ${step.target ?? "page"}` : "Performing action",
+      title:
+        step.type === "navigate" ? `Navigating to ${step.target ?? "page"}` : "Performing action",
       content,
       action: step.instruction,
       estimatedDuration: 1,

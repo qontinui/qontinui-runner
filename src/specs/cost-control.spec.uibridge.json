@@ -13,7 +13,11 @@
           "description": "The page header displays 'Cost Control' as a heading with a DollarSign icon.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Cost Control" }, "label": "Page title" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cost Control" },
+            "label": "Page title"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -24,7 +28,11 @@
           "description": "Subtitle text reads 'Budget tracking, anomaly detection, and cost optimization'.",
           "category": "element-presence",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Budget tracking, anomaly detection" }, "label": "Page subtitle" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Budget tracking, anomaly detection" },
+            "label": "Page subtitle"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -35,7 +43,11 @@
           "description": "A refresh button with aria-label 'Refresh cost data' is present in the header area.",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "accessibleName": "Refresh cost data", "role": "button" }, "label": "Refresh button" },
+          "target": {
+            "type": "search",
+            "criteria": { "accessibleName": "Refresh cost data", "role": "button" },
+            "label": "Refresh button"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -46,7 +58,11 @@
           "description": "When data is loading, the panel shows a spinning refresh icon centered on the page instead of the dashboard content.",
           "category": "behavior",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "tagName": "svg" }, "label": "Loading spinner" },
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "svg" },
+            "label": "Loading spinner"
+          },
           "assertionType": "behavior",
           "precondition": "Data is still loading (isLoading is true)",
           "source": "ai-generated",
@@ -58,7 +74,11 @@
           "description": "The page renders five sections in order: (1) Budget warning banner (conditional), (2) Summary cards + budget gauge + phase chart, (3) Circuit breaker + anomaly feed, (4) Cost feed table, (5) Optimization recommendations. The page scrolls vertically with 16px padding and 16px gaps between sections.",
           "category": "layout",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Cost Control" }, "label": "Page container" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cost Control" },
+            "label": "Page container"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -78,7 +98,11 @@
           "description": "A MetricCard titled 'Total Cost' displays the total cost in USD format (e.g., '$1.23' or '$0.0045') with subtitle 'Last 30 days' and a DollarSign icon.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Total Cost" }, "label": "Total Cost card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Total Cost" },
+            "label": "Total Cost card"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -89,7 +113,11 @@
           "description": "A MetricCard titled 'Total Tokens' displays formatted token count (K/M suffixes) with subtitle 'Input + Output'.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Total Tokens" }, "label": "Total Tokens card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Total Tokens" },
+            "label": "Total Tokens card"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -100,7 +128,11 @@
           "description": "A MetricCard titled 'Cache Hit Rate' displays the rate as a percentage (e.g., '45%') with subtitle 'Token cache efficiency'.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Cache Hit Rate" }, "label": "Cache Hit Rate card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cache Hit Rate" },
+            "label": "Cache Hit Rate card"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -111,7 +143,11 @@
           "description": "A MetricCard titled 'Cache Savings' displays estimated savings in USD with subtitle 'Estimated savings' and uses the success variant (green accent).",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Cache Savings" }, "label": "Cache Savings card" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cache Savings" },
+            "label": "Cache Savings card"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -122,7 +158,11 @@
           "description": "The four summary cards are arranged in a responsive grid: 2 columns on small screens (grid-cols-2) and 4 columns on medium+ screens (md:grid-cols-4) with 12px gaps.",
           "category": "layout",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Total Cost" }, "label": "Summary cards grid" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Total Cost" },
+            "label": "Summary cards grid"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -142,7 +182,11 @@
           "description": "The budget gauge section has a heading 'Budget Utilization' with a Wallet icon.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Budget Utilization" }, "label": "Budget Utilization heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Budget Utilization" },
+            "label": "Budget Utilization heading"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -153,7 +197,11 @@
           "description": "When no run is active, the budget gauge section shows an AlertTriangle icon with text 'No active run' and detail 'Budget tracking will appear when a run starts'.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "No active run" }, "label": "Inactive budget state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No active run" },
+            "label": "Inactive budget state"
+          },
           "assertionType": "semantic",
           "precondition": "No workflow run is currently active",
           "source": "ai-generated",
@@ -165,7 +213,11 @@
           "description": "When a run is active, the circular gauge shows: (1) a percentage number in the center (e.g., '67%' with label 'used'), (2) an SVG progress arc colored green/yellow/red based on utilization, (3) cost amounts below as '$X.XX / $Y.YY', (4) remaining percentage as 'X% remaining'. The progress arc animates smoothly over 500ms.",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "remaining" }, "label": "Active budget gauge" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "remaining" },
+            "label": "Active budget gauge"
+          },
           "assertionType": "semantic",
           "precondition": "A workflow run is currently active with an active budget",
           "source": "ai-generated",
@@ -198,7 +250,11 @@
           "description": "The phase breakdown section has a heading 'Cost by Phase' with a Layers icon.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Cost by Phase" }, "label": "Cost by Phase heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cost by Phase" },
+            "label": "Cost by Phase heading"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -209,7 +265,11 @@
           "description": "When no phase data exists, displays 'No phase cost data available' centered in the card.",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No phase cost data" }, "label": "Phase chart empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No phase cost data" },
+            "label": "Phase chart empty state"
+          },
           "assertionType": "semantic",
           "precondition": "No phase cost data in the database",
           "source": "ai-generated",
@@ -221,7 +281,11 @@
           "description": "Hovering over a bar in the phase breakdown chart shows a tooltip with: phase name (bold), cost in USD, input token count, output token count, cache created tokens, and cache read tokens — all with K/M formatting for large numbers.",
           "category": "interaction",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Cost by Phase" }, "label": "Phase chart" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cost by Phase" },
+            "label": "Phase chart"
+          },
           "assertionType": "behavior",
           "precondition": "Phase cost data exists and chart is rendered",
           "source": "ai-generated",
@@ -242,7 +306,11 @@
           "description": "The circuit breaker card has heading 'Circuit Breaker'.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Circuit Breaker" }, "label": "Circuit Breaker heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Circuit Breaker" },
+            "label": "Circuit Breaker heading"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -253,7 +321,11 @@
           "description": "When the circuit breaker is not tripped, a green Shield icon is shown with a 'Closed' badge using the success variant. If no active budget exists, text reads 'No active budget'.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Closed" }, "label": "Closed badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Closed" },
+            "label": "Closed badge"
+          },
           "assertionType": "semantic",
           "precondition": "Circuit breaker is not tripped",
           "source": "ai-generated",
@@ -265,7 +337,11 @@
           "description": "When the circuit breaker is tripped, a red ShieldAlert icon is shown with a 'Tripped' badge using the danger variant. Additional text reads 'Budget exceeded or anomaly detected' in red.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Tripped" }, "label": "Tripped badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Tripped" },
+            "label": "Tripped badge"
+          },
           "assertionType": "semantic",
           "precondition": "Circuit breaker has been tripped by budget exceeded or cache failure",
           "source": "ai-generated",
@@ -277,7 +353,11 @@
           "description": "When an active budget exists, the card shows 'Anomaly samples: N' and optionally 'Mean cost: $X.XXXX' (only when mean > 0).",
           "category": "data-display",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Anomaly samples" }, "label": "Anomaly stats" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Anomaly samples" },
+            "label": "Anomaly stats"
+          },
           "assertionType": "semantic",
           "precondition": "Active budget exists",
           "source": "ai-generated",
@@ -298,7 +378,11 @@
           "description": "The anomaly feed has heading 'Anomaly Detection' with an AlertTriangle icon.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Anomaly Detection" }, "label": "Anomaly Detection heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Anomaly Detection" },
+            "label": "Anomaly Detection heading"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -309,7 +393,11 @@
           "description": "When no anomalies have been detected, the section shows 'No anomalies detected' centered.",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No anomalies detected" }, "label": "Anomaly empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No anomalies detected" },
+            "label": "Anomaly empty state"
+          },
           "assertionType": "semantic",
           "precondition": "No cost anomalies detected during the current or recent runs",
           "source": "ai-generated",
@@ -321,7 +409,11 @@
           "description": "Each anomaly entry shows: z-score value (yellow text), timestamp, the anomaly message, the actual cost (e.g., 'Cost: $0.0234'), and the mean cost (e.g., 'Mean: $0.0089'). Items are styled with yellow-tinted background (bg-yellow-500/5) and border (border-yellow-500/20).",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "z-score" }, "label": "Anomaly item" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "z-score" },
+            "label": "Anomaly item"
+          },
           "assertionType": "semantic",
           "precondition": "At least one anomaly has been detected",
           "source": "ai-generated",
@@ -342,7 +434,11 @@
           "description": "When a budget warning event fires, a yellow-tinted banner appears at the top of the page with an AlertTriangle icon, title 'Budget Warning - N% remaining', the warning message, and cost display '$X.XX / $Y.YY'.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Budget Warning" }, "label": "Budget warning banner" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Budget Warning" },
+            "label": "Budget warning banner"
+          },
           "assertionType": "behavior",
           "precondition": "A budget warning event has been emitted (budget >80% consumed)",
           "source": "ai-generated",
@@ -354,7 +450,11 @@
           "description": "Clicking the dismiss button (X icon, aria-label 'Dismiss warning') hides the warning banner. The banner stays dismissed for the current session.",
           "category": "interaction",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "accessibleName": "Dismiss warning", "role": "button" }, "label": "Dismiss button" },
+          "target": {
+            "type": "search",
+            "criteria": { "accessibleName": "Dismiss warning", "role": "button" },
+            "label": "Dismiss button"
+          },
           "assertionType": "behavior",
           "precondition": "A budget warning banner is currently visible",
           "source": "ai-generated",
@@ -366,7 +466,11 @@
           "description": "When multiple budget warnings exist, the banner shows the latest warning and a count of additional warnings (e.g., '+2 more warnings').",
           "category": "data-display",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "more warning" }, "label": "Multi-warning indicator" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "more warning" },
+            "label": "Multi-warning indicator"
+          },
           "assertionType": "semantic",
           "precondition": "Multiple budget warning events have been emitted",
           "source": "ai-generated",
@@ -387,7 +491,11 @@
           "description": "The cost feed section has heading 'Recent Cost Events' with a List icon. When events exist, a count badge shows '(N of M)' where N is min(events, 50).",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Recent Cost Events" }, "label": "Cost feed heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Recent Cost Events" },
+            "label": "Cost feed heading"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -398,7 +506,11 @@
           "description": "When no cost events exist, shows 'No cost events yet' centered in the card.",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No cost events yet" }, "label": "Feed empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No cost events yet" },
+            "label": "Feed empty state"
+          },
           "assertionType": "semantic",
           "precondition": "No workflow runs have generated cost events",
           "source": "ai-generated",
@@ -410,7 +522,11 @@
           "description": "The table has 7 columns: Time, Phase, Iter, Tokens, Cost, Cumulative, Cache. The header row is sticky (stays visible when scrolling). Cost and Cumulative columns use monospace font.",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Cumulative" }, "label": "Table header" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cumulative" },
+            "label": "Table header"
+          },
           "assertionType": "semantic",
           "precondition": "At least one cost event exists",
           "source": "ai-generated",
@@ -443,7 +559,11 @@
           "description": "The recommendations section has heading 'Optimization Recommendations' with a Lightbulb icon.",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Optimization Recommendations" }, "label": "Recommendations heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Optimization Recommendations" },
+            "label": "Recommendations heading"
+          },
           "assertionType": "exists",
           "source": "ai-generated",
           "reviewed": false,
@@ -454,7 +574,11 @@
           "description": "When no recommendations or insights exist, shows a TrendingDown icon with 'No cost optimization recommendations yet' and 'Run workflows to accumulate data for cost analysis'.",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "No cost optimization recommendations" }, "label": "Recs empty state" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No cost optimization recommendations" },
+            "label": "Recs empty state"
+          },
           "assertionType": "semantic",
           "precondition": "No recommendations or insights available",
           "source": "ai-generated",
@@ -466,7 +590,11 @@
           "description": "Meta-optimizer recommendations show: a CheckCircle2 icon, recommendation title (semibold), confidence badge (colored green/yellow/gray based on percentage), status badge (pending/applied/rejected/rolled_back), and description text. The confidence badge shows the percentage value (e.g., '85%').",
           "category": "data-display",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Optimization Recommendations" }, "label": "Recommendation cards" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Optimization Recommendations" },
+            "label": "Recommendation cards"
+          },
           "assertionType": "semantic",
           "precondition": "Meta-optimizer has generated cost-related recommendations",
           "source": "ai-generated",
@@ -478,7 +606,11 @@
           "description": "Dashboard-derived insights display as color-coded cards: blue border/background for info severity, yellow for warning, red for critical. Each shows a colored severity dot, title, and actionable description. Insights include: low cache hit rate (<30%), high budget utilization (>85%), dominant phase spending (>60%), and cache savings acknowledgment.",
           "category": "data-display",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Optimization Recommendations" }, "label": "Insight cards" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Optimization Recommendations" },
+            "label": "Insight cards"
+          },
           "assertionType": "semantic",
           "precondition": "Dashboard data exists with actionable patterns",
           "source": "ai-generated",
@@ -499,7 +631,11 @@
           "description": "All section cards use consistent styling: bg-card background, rounded-lg corners, border with border-border/50 (50% opacity), and 16px padding (p-4).",
           "category": "design",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Cost Control" }, "label": "Card containers" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cost Control" },
+            "label": "Card containers"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -510,7 +646,11 @@
           "description": "All section headings use text-sm font-semibold with a flex layout containing a w-4 h-4 icon and 8px gap. Heading text is clearly legible against the card background.",
           "category": "design",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Cost by Phase" }, "label": "Section heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cost by Phase" },
+            "label": "Section heading"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -521,7 +661,11 @@
           "description": "Muted text (text-muted-foreground) used for subtitles, timestamps, and secondary information is legible against bg-card backgrounds. This includes: subtitle text, table cell text, empty state messages, and metric card subtitles.",
           "category": "design",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Last 30 days" }, "label": "Muted text" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Last 30 days" },
+            "label": "Muted text"
+          },
           "assertionType": "semantic",
           "source": "ai-generated",
           "reviewed": false,
@@ -532,7 +676,11 @@
           "description": "Warning elements use yellow-500 consistently: budget warning banner (border-yellow-500/30, bg-yellow-500/10), anomaly items (bg-yellow-500/5, border-yellow-500/20), and warning badge text (text-yellow-500).",
           "category": "design",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Budget Warning" }, "label": "Warning color usage" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Budget Warning" },
+            "label": "Warning color usage"
+          },
           "assertionType": "semantic",
           "precondition": "Warning elements are visible",
           "source": "ai-generated",
@@ -553,7 +701,11 @@
           "description": "When an AI call completes during a workflow run, a new cost event appears at the top of the Recent Cost Events table within 1 second. The event shows the phase, iteration, token counts, cost, cumulative cost, and cache hit rate. Events are capped at 200 total.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Recent Cost Events" }, "label": "Cost feed table" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Recent Cost Events" },
+            "label": "Cost feed table"
+          },
           "assertionType": "behavior",
           "precondition": "A workflow run is active and making AI calls",
           "source": "ai-generated",
@@ -565,7 +717,11 @@
           "description": "The budget gauge and active budget status update every 5 seconds during an active run, reflecting current spend, remaining fraction, and circuit breaker state.",
           "category": "behavior",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Budget Utilization" }, "label": "Budget gauge" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Budget Utilization" },
+            "label": "Budget gauge"
+          },
           "assertionType": "behavior",
           "precondition": "A workflow run is active",
           "source": "ai-generated",
@@ -577,7 +733,11 @@
           "description": "When cost-update events fire, the dashboard summary cards (Total Cost, Total Tokens, Cache Hit Rate, Cache Savings) refresh with updated data after a 300ms debounce. No fixed polling interval is used for the dashboard — updates are event-driven.",
           "category": "behavior",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Total Cost" }, "label": "Summary cards" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Total Cost" },
+            "label": "Summary cards"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -588,7 +748,11 @@
           "description": "Clicking the 'Refresh cost data' button manually refreshes both the dashboard summary and the active budget status queries.",
           "category": "interaction",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "accessibleName": "Refresh cost data" }, "label": "Refresh button" },
+          "target": {
+            "type": "search",
+            "criteria": { "accessibleName": "Refresh cost data" },
+            "label": "Refresh button"
+          },
           "assertionType": "behavior",
           "source": "ai-generated",
           "reviewed": false,
@@ -608,7 +772,11 @@
           "description": "When an active budget exists, the budget gauge percentage plus the 'X% remaining' text should sum to 100%. The gauge cost display '$A / $B' should show A <= B. The gauge color should match the utilization level: green if usage < 60%, yellow if 60-80%, red if > 80%.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "remaining" }, "label": "Budget consistency" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "remaining" },
+            "label": "Budget consistency"
+          },
           "assertionType": "semantic",
           "precondition": "Active budget exists",
           "source": "ai-generated",
@@ -620,7 +788,11 @@
           "description": "In the cost feed table, the cumulative cost column should be monotonically non-decreasing when reading from bottom to top (oldest to newest). Each new event's cumulative cost should be >= the previous event's cumulative cost.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "textContains": "Cumulative" }, "label": "Cumulative cost column" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cumulative" },
+            "label": "Cumulative cost column"
+          },
           "assertionType": "semantic",
           "precondition": "Multiple cost events exist in the feed",
           "source": "ai-generated",
@@ -632,7 +804,11 @@
           "description": "If the circuit breaker shows 'Tripped', the budget gauge should show high utilization (>80%) or the anomaly feed should contain recent entries. The tripped state should not appear when the budget gauge shows low utilization with no anomalies.",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Circuit Breaker" }, "label": "CB-budget correlation" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Circuit Breaker" },
+            "label": "CB-budget correlation"
+          },
           "assertionType": "semantic",
           "precondition": "Both circuit breaker and budget gauge are visible",
           "source": "ai-generated",
@@ -646,7 +822,14 @@
   "metadata": {
     "component": "CostControlPanel",
     "pageUrl": "cost-control",
-    "tags": ["cost-optimization", "budget-tracking", "circuit-breaker", "anomaly-detection", "real-time", "observability"]
+    "tags": [
+      "cost-optimization",
+      "budget-tracking",
+      "circuit-breaker",
+      "anomaly-detection",
+      "real-time",
+      "observability"
+    ]
   },
   "stateMachine": {
     "states": [
@@ -654,9 +837,7 @@
         "id": "cc-loading",
         "name": "Loading",
         "description": "Initial loading state: a spinning RefreshCw icon is displayed centered on the page while cost data is being fetched. No dashboard content is visible.",
-        "elements": [
-          { "tagName": "svg" }
-        ],
+        "elements": [{ "tagName": "svg" }],
         "isInitial": true,
         "transitions": [
           {
@@ -683,10 +864,7 @@
         "id": "cc-dashboard-idle",
         "name": "Dashboard — No Active Run",
         "description": "Full dashboard visible: header with 'Cost Control' title, four summary metric cards (Total Cost, Total Tokens, Cache Hit Rate, Cache Savings), budget gauge showing 'No active run', phase breakdown chart, circuit breaker in 'Closed' state with 'No active budget', cost event feed table, and optimization recommendations section. No budget warning banner is shown.",
-        "elements": [
-          { "textContains": "No active run" },
-          { "textContains": "No active budget" }
-        ],
+        "elements": [{ "textContains": "No active run" }, { "textContains": "No active budget" }],
         "transitions": [
           {
             "id": "idle-refresh",
@@ -724,10 +902,7 @@
         "id": "cc-dashboard-active",
         "name": "Dashboard — Active Run",
         "description": "Full dashboard with live budget tracking: header, summary cards updating via events, budget gauge showing utilization percentage with color-coded arc (green <60%, yellow 60-80%, red >80%), cost amounts ('$X.XX / $Y.YY'), remaining percentage, phase breakdown chart, circuit breaker status (Closed), anomaly feed, live cost event feed table with newest events at top, and recommendations.",
-        "elements": [
-          { "textContains": "Anomaly samples" },
-          { "textContent": "Closed" }
-        ],
+        "elements": [{ "textContains": "Anomaly samples" }, { "textContent": "Closed" }],
         "transitions": [
           {
             "id": "active-refresh",

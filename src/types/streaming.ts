@@ -20,7 +20,7 @@ export interface PairResponse {
 }
 
 export interface FocusRequest {
-  target: 'runner' | 'window' | 'desktop';
+  target: "runner" | "window" | "desktop";
   window_title?: string;
 }
 

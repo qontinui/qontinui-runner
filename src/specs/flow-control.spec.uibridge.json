@@ -637,6 +637,216 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "loading",
+        "name": "Loading Workflow",
+        "description": "Workflow editor is loading the workflow data from the backend. The FlowControlPanel has not yet received its props (flowControlJson, phaseTimeoutsJson). No flow control UI is interactive yet.",
+        "elements": [
+          {
+            "textContent": "Loading"
+          }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-empty-config",
+            "name": "Workflow loaded with no saved flow control",
+            "activateStates": ["empty-config"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-has-config",
+            "name": "Workflow loaded with existing flow control config",
+            "activateStates": ["has-config"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "empty-config",
+        "name": "Empty Configuration",
+        "description": "The FlowControlPanel is visible inside the workflow editor with no saved flow_control_json or phase_timeouts_json. All inputs show defaults or empty placeholders. Concurrency, throttle, rate limit, debounce, and phase timeout sections are all present but unconfigured.",
+        "elements": [
+          {
+            "textContent": "Flow Control"
+          },
+          {
+            "textContent": "Phase Timeouts"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-has-config-concurrency",
+            "name": "Set concurrency limit",
+            "activateStates": ["has-config"],
+            "deactivateStates": ["empty-config"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": {
+                  "role": "spinbutton",
+                  "accessibleName": "Concurrency limit"
+                },
+                "value": "2",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "empty-to-has-config-throttle",
+            "name": "Set throttle via preset",
+            "activateStates": ["has-config"],
+            "deactivateStates": ["empty-config"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "1min"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "empty-to-has-config-timeout",
+            "name": "Set a phase timeout override",
+            "activateStates": ["has-config"],
+            "deactivateStates": ["empty-config"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": {
+                  "role": "spinbutton",
+                  "accessibleName": "Execution timeout"
+                },
+                "value": "45",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "has-config",
+        "name": "Configured",
+        "description": "The FlowControlPanel has at least one non-default value set, either loaded from existing flow_control_json/phase_timeouts_json or entered by the user. Callbacks (onFlowControlChange, onPhaseTimeoutsChange) have fired with valid JSON. The parent WorkflowEditor has unsaved or saved changes.",
+        "elements": [
+          {
+            "textContent": "Concurrency"
+          },
+          {
+            "textContent": "Throttle"
+          },
+          {
+            "textContent": "Rate Limit"
+          },
+          {
+            "textContent": "Debounce"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "has-config-modify-preset",
+            "name": "Change a throttle or debounce preset",
+            "activateStates": ["has-config"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "5min"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "has-config-modify-concurrency",
+            "name": "Change the concurrency limit",
+            "activateStates": ["has-config"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "fill",
+                "target": {
+                  "role": "spinbutton",
+                  "accessibleName": "Concurrency limit"
+                },
+                "value": "5",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "has-config-select-debounce",
+            "name": "Select a debounce preset",
+            "activateStates": ["has-config"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "500ms"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "FlowControlPanel",
     "author": "Joshua Spinak",

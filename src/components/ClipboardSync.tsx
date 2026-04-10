@@ -84,11 +84,7 @@ export function ShareToMobileButton({
     />
   );
 
-  const title = shared
-    ? "Shared to mobile!"
-    : error
-      ? `Share failed: ${error}`
-      : "Share to mobile";
+  const title = shared ? "Shared to mobile!" : error ? `Share failed: ${error}` : "Share to mobile";
 
   return (
     <button
@@ -119,11 +115,7 @@ interface ShareFileButtonProps {
  * Button that opens a file picker and uploads the selected file to the
  * backend for mobile access.
  */
-export function ShareFileButton({
-  filePath,
-  className = "",
-  size = 14,
-}: ShareFileButtonProps) {
+export function ShareFileButton({ filePath, className = "", size = 14 }: ShareFileButtonProps) {
   const [uploading, setUploading] = useState(false);
   const [uploaded, setUploaded] = useState(false);
   const [error, setError] = useState<string | null>(null);

@@ -310,9 +310,7 @@
         "id": "em-list",
         "name": "Error List — Default View",
         "description": "Default state: error list visible with search bar and filter toggle. Filter panel is collapsed. Shows severity badges in header and error count in footer.",
-        "elements": [
-          { "textContent": "Error Monitor" }
-        ],
+        "elements": [{ "textContent": "Error Monitor" }],
         "isInitial": true,
         "transitions": [
           {
@@ -371,10 +369,7 @@
         "id": "em-filtered",
         "name": "Filter Panel Open",
         "description": "Filter panel expanded showing Severity and Status filter button groups. Users can toggle individual severity levels and statuses to narrow the error list.",
-        "elements": [
-          { "textContent": "Severity" },
-          { "textContent": "Status" }
-        ],
+        "elements": [{ "textContent": "Severity" }, { "textContent": "Status" }],
         "transitions": [
           {
             "id": "filtered-to-list",
@@ -412,9 +407,7 @@
         "id": "em-expanded",
         "name": "Error Detail Expanded",
         "description": "An error row is expanded showing full message, optional stack trace, context lines, triage action buttons (Acknowledge, Mark Resolved, Ignore), and Open in Editor link.",
-        "elements": [
-          { "textContent": "Full Message" }
-        ],
+        "elements": [{ "textContent": "Full Message" }],
         "transitions": [
           {
             "id": "expanded-to-list",
@@ -482,9 +475,7 @@
         "id": "em-empty",
         "name": "Empty State — No Errors",
         "description": "No errors match current filters or no errors detected. Shows success icon with 'No Errors Detected' message and guidance.",
-        "elements": [
-          { "textContent": "No Errors Detected" }
-        ],
+        "elements": [{ "textContent": "No Errors Detected" }],
         "transitions": [
           {
             "id": "empty-to-list",

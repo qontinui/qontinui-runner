@@ -543,12 +543,16 @@
             "process": [
               {
                 "action": "type",
-                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "target": {
+                  "placeholder": "Search activity timeline... (e.g., 'login button disabled')"
+                },
                 "params": { "text": "login button", "clear": true }
               },
               {
                 "action": "sendKeys",
-                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "target": {
+                  "placeholder": "Search activity timeline... (e.g., 'login button disabled')"
+                },
                 "params": { "keys": [{ "key": "Enter" }] },
                 "waitAfter": { "type": "idle", "timeout": 5000 }
               }
@@ -590,9 +594,7 @@
         "id": "at-searching",
         "name": "Searching — Query In Progress",
         "description": "A search is in-flight. The Search button shows 'Searching...' and is disabled. Results area may be empty or showing previous results.",
-        "elements": [
-          { "role": "button", "textContent": "Searching..." }
-        ],
+        "elements": [{ "role": "button", "textContent": "Searching..." }],
         "transitions": [
           {
             "id": "searching-to-results",
@@ -618,9 +620,7 @@
         "id": "at-results",
         "name": "Results Displayed",
         "description": "Search completed with at least one result. Result cards are shown with source badges, timestamps, text previews, and optional URLs.",
-        "elements": [
-          { "tagName": "div", "dataAttributes": { "tutorial-id": "timeline-results" } }
-        ],
+        "elements": [{ "tagName": "div", "dataAttributes": { "tutorial-id": "timeline-results" } }],
         "transitions": [
           {
             "id": "results-to-searching",
@@ -632,7 +632,9 @@
             "process": [
               {
                 "action": "type",
-                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "target": {
+                  "placeholder": "Search activity timeline... (e.g., 'login button disabled')"
+                },
                 "params": { "text": "error monitor", "clear": true }
               },
               {
@@ -648,9 +650,7 @@
         "id": "at-empty",
         "name": "Empty Results — No Matches",
         "description": "Search completed but returned zero results. Shows 'No results found. Try a different query.' guidance message.",
-        "elements": [
-          { "textContent": "No results found. Try a different query." }
-        ],
+        "elements": [{ "textContent": "No results found. Try a different query." }],
         "transitions": [
           {
             "id": "empty-to-searching",
@@ -662,12 +662,16 @@
             "process": [
               {
                 "action": "type",
-                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "target": {
+                  "placeholder": "Search activity timeline... (e.g., 'login button disabled')"
+                },
                 "params": { "text": "button click", "clear": true }
               },
               {
                 "action": "sendKeys",
-                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "target": {
+                  "placeholder": "Search activity timeline... (e.g., 'login button disabled')"
+                },
                 "params": { "keys": [{ "key": "Enter" }] },
                 "waitAfter": { "type": "idle", "timeout": 5000 }
               }
@@ -705,9 +709,7 @@
         "id": "at-stats-loaded",
         "name": "Statistics Displayed",
         "description": "Capture statistics are loaded and shown as colored badges. Each badge shows '{sourceType} ({captureMode}): {count} entries'. This state overlays the current search state.",
-        "elements": [
-          { "textContains": "entries" }
-        ],
+        "elements": [{ "textContains": "entries" }],
         "transitions": []
       }
     ]

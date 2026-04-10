@@ -237,11 +237,246 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "chk-list-empty",
+        "name": "Empty Library — No Checks Exist",
+        "description": "The page loads with no saved checks. The left panel list is empty, and the right panel editor shows a blank or placeholder state inviting the user to create their first check.",
+        "elements": [{ "textContent": "Checks" }, { "role": "button", "textContent": "New" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "empty-to-editing-new",
+            "name": "Create new check",
+            "description": "User clicks the New button to begin creating a check, populating the editor with a blank form and sensible defaults",
+            "activateStates": ["chk-editing-new"],
+            "deactivateStates": ["chk-list-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "chk-list-populated",
+        "name": "Populated — Check List with Editor Idle",
+        "description": "One or more saved checks exist and are displayed in the left panel list with name, type badge, and tool info. No check is actively selected for editing. The search box is available for filtering.",
+        "elements": [
+          { "textContent": "Checks" },
+          { "role": "button", "textContent": "New" },
+          { "role": "searchbox" }
+        ],
+        "transitions": [
+          {
+            "id": "populated-to-editing-existing",
+            "name": "Select a check to edit",
+            "description": "User clicks a check in the list to load it into the right-panel editor for viewing or editing",
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": ["chk-list-populated"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "populated-to-editing-new",
+            "name": "Create new check",
+            "description": "User clicks the New button to clear the editor and start a blank check form",
+            "activateStates": ["chk-editing-new"],
+            "deactivateStates": ["chk-list-populated"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "populated-to-search-active",
+            "name": "Enter search query",
+            "description": "User types in the search box to filter the check list by name",
+            "activateStates": ["chk-search-active"],
+            "deactivateStates": ["chk-list-populated"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "role": "searchbox" },
+                "params": { "text": "lint", "clear": true }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "chk-search-active",
+        "name": "Search Active — Filtering Check List",
+        "description": "A search query has been entered in the search box and the left-panel list is filtered to show only checks matching the query by name.",
+        "elements": [{ "textContent": "Checks" }, { "role": "searchbox" }],
+        "transitions": [
+          {
+            "id": "search-to-populated",
+            "name": "Clear search query",
+            "description": "User clears the search input to return to the full unfiltered check list",
+            "activateStates": ["chk-list-populated"],
+            "deactivateStates": ["chk-search-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "role": "searchbox" },
+                "params": { "text": "", "clear": true }
+              }
+            ]
+          },
+          {
+            "id": "search-to-editing-existing",
+            "name": "Select a filtered check",
+            "description": "User clicks a check from the filtered search results to load it into the editor",
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": ["chk-search-active"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "chk-editing-new",
+        "name": "Editing New — Creating a Check",
+        "description": "The editor is active with a blank check form. Users can select the check type and tool, configure the command, working directory, timeout, and behavioral flags (auto-fix, fail-on-warning, is-critical), add tags, and save. The Save button is available but Delete is not (no existing check to delete).",
+        "elements": [{ "textContent": "Checks" }, { "role": "button", "textContent": "Save" }],
+        "transitions": [
+          {
+            "id": "editing-new-to-editing-existing",
+            "name": "Save new check",
+            "description": "User clicks Save to persist the new check to the library, transitioning to the editing-existing state with the newly saved check loaded",
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": ["chk-editing-new"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Save" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "editing-new-to-populated",
+            "name": "Cancel or select existing check",
+            "description": "User clicks a different check in the list, discarding the unsaved new check and loading the selected one",
+            "activateStates": ["chk-list-populated"],
+            "deactivateStates": ["chk-editing-new"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "chk-editing-existing",
+        "name": "Editing Existing — Modifying a Saved Check",
+        "description": "A saved check is loaded in the editor. All fields are populated with the check's current values: type, tool, name, command, working directory, timeout, behavioral flags, and tags. Both Save and Delete buttons are available in the toolbar.",
+        "elements": [
+          { "textContent": "Checks" },
+          { "role": "button", "textContent": "Save" },
+          { "role": "button", "textContent": "Delete" }
+        ],
+        "transitions": [
+          {
+            "id": "editing-existing-save",
+            "name": "Save changes",
+            "description": "User clicks Save to persist modifications to the existing check",
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Save" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "editing-existing-to-confirm-delete",
+            "name": "Delete check",
+            "description": "User clicks the Delete button to initiate deletion of the current check, triggering a confirmation dialog",
+            "activateStates": ["chk-confirm-delete"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Delete" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "editing-existing-to-editing-new",
+            "name": "Create new check while editing",
+            "description": "User clicks the New button to clear the editor and start a fresh check form",
+            "activateStates": ["chk-editing-new"],
+            "deactivateStates": ["chk-editing-existing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "editing-existing-to-another",
+            "name": "Select a different check",
+            "description": "User clicks another check in the list to switch to editing that check instead",
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "chk-confirm-delete",
+        "name": "Confirm Delete — Deletion Confirmation Dialog",
+        "description": "A confirmation dialog is displayed asking the user to confirm deletion of the selected check. The editor and list remain visible behind the dialog.",
+        "elements": [{ "role": "dialog" }],
+        "transitions": [
+          {
+            "id": "confirm-delete-to-populated",
+            "name": "Confirm deletion",
+            "description": "User confirms the deletion, removing the check from the library and returning to the populated list view",
+            "activateStates": ["chk-list-populated"],
+            "deactivateStates": ["chk-confirm-delete", "chk-editing-existing"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "confirm-delete-cancel",
+            "name": "Cancel deletion",
+            "description": "User cancels the deletion dialog, returning to the editing state with the check still intact",
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": ["chk-confirm-delete"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ChecksPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/build/checks",
     "elementSource": "sdk",
     "tags": ["checks", "verification", "builder", "library", "linter", "test-runner"],

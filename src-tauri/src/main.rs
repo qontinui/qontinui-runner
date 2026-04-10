@@ -1334,6 +1334,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // WebView2 profile is needed (secondary/test runners). The
                 // primary uses the declarative window from tauri.conf.json.
                 if data_dir.is_some() {
+                    // Close the declarative window from tauri.conf.json first —
+                    // we need to recreate it with data_directory() for profile
+                    // isolation, but Tauri doesn't allow duplicate labels.
+                    if let Some(existing) = app.get_webview_window("main") {
+                        let _ = existing.destroy();
+                    }
                     let url = tauri::WebviewUrl::App("index.html".into());
                     let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
                         .title("Qontinui Runner")

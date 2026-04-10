@@ -1680,11 +1680,513 @@
       ]
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "pm-registry-list",
+        "name": "Registry List",
+        "description": "Initial state showing the PromptRegistryTab with agent-type grouped prompt variants. The PromptCanaryPanel is at the top showing active and completed canary A/B tests. Each variant can be expanded to reveal Version History and Create A/B Test action buttons.",
+        "elements": [
+          {
+            "textContains": "Prompt Canary A/B Tests"
+          },
+          {
+            "textContains": "Version History"
+          }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "registry-to-version-history",
+            "name": "Open version history",
+            "description": "Click the Version History button on an expanded prompt variant to toggle the PromptVersionHistory panel inline below the variant",
+            "activateStates": ["pm-version-history-list"],
+            "deactivateStates": ["pm-registry-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Version History"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "registry-to-canary-creation",
+            "name": "Open canary creation form",
+            "description": "Click the Create A/B Test button on an expanded prompt variant to reveal the CreatePromptCanaryForm pre-filled with the variant's ID and version",
+            "activateStates": ["pm-canary-creation"],
+            "deactivateStates": ["pm-registry-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Create A/B Test"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "registry-to-canary-creation-panel",
+            "name": "Toggle canary creation from panel",
+            "description": "Click the Create A/B Test toggle button in the PromptCanaryPanel header to show the creation form",
+            "activateStates": ["pm-canary-creation"],
+            "deactivateStates": ["pm-registry-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Create A/B Test"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-version-history-list",
+        "name": "Version History List",
+        "description": "The PromptVersionHistory panel is open showing all versions for a prompt template sorted by version number descending. Each version row shows version badge, change description, truncated hash, and date. Compare and Refresh controls are in the header.",
+        "elements": [
+          {
+            "textContains": "versions"
+          },
+          {
+            "textContains": "Compare"
+          },
+          {
+            "textContains": "Refresh"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "version-list-to-detail",
+            "name": "View version detail",
+            "description": "Click a version row to navigate to the detail view showing full prompt content, metadata, and performance metrics",
+            "activateStates": ["pm-version-detail"],
+            "deactivateStates": ["pm-version-history-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "className": "cursor-pointer"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "version-list-to-compare-selection",
+            "name": "Enter compare mode",
+            "description": "Click the Compare button to enter compare mode where two versions can be selected as A and B",
+            "activateStates": ["pm-compare-selection"],
+            "deactivateStates": ["pm-version-history-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Compare"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "version-list-to-registry",
+            "name": "Close version history",
+            "description": "Click the Version History button again to toggle the panel closed and return to the registry list",
+            "activateStates": ["pm-registry-list"],
+            "deactivateStates": ["pm-version-history-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Version History"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-version-detail",
+        "name": "Version Detail View",
+        "description": "The full version detail is displayed showing version number, creation timestamp, truncated content hash, change description, full prompt content in a scrollable pre block, and performance metrics (success rate, avg cost, avg latency). A Restore this version button is available.",
+        "elements": [
+          {
+            "textContains": "Back to history"
+          },
+          {
+            "textContains": "Prompt Content"
+          },
+          {
+            "textContains": "Restore this version"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "detail-to-version-list",
+            "name": "Back to version list",
+            "description": "Click Back to history to return to the version list, clearing selectedVersion and setting view to list",
+            "activateStates": ["pm-version-history-list"],
+            "deactivateStates": ["pm-version-detail"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Back to history"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "detail-to-restore-confirm",
+            "name": "Initiate version restore",
+            "description": "Click Restore this version to open the confirmation dialog asking to create a new version with this content",
+            "activateStates": ["pm-restore-confirmation"],
+            "deactivateStates": ["pm-version-detail"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Restore this version"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-restore-confirmation",
+        "name": "Restore Confirmation",
+        "description": "A confirmation prompt is displayed asking 'Create new version with this content?' with Confirm and Cancel buttons. Confirming creates a new version with the restored content and shows Restoring... while in progress.",
+        "elements": [
+          {
+            "textContains": "Create new version with this content?"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "restore-confirm-to-version-list",
+            "name": "Confirm restore",
+            "description": "Click Confirm to create a new version with the restored content, then refetch returns to the updated version list",
+            "activateStates": ["pm-version-history-list"],
+            "deactivateStates": ["pm-restore-confirmation"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Confirm"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
+              }
+            ]
+          },
+          {
+            "id": "restore-cancel-to-detail",
+            "name": "Cancel restore",
+            "description": "Click Cancel to dismiss the confirmation and return to the version detail view",
+            "activateStates": ["pm-version-detail"],
+            "deactivateStates": ["pm-restore-confirmation"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Cancel"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-compare-selection",
+        "name": "Compare Version Selection",
+        "description": "Compare mode is active. The user selects two versions as A and B. The prompt text guides through 'Select first version' then 'Select second version' then 'Ready to compare' with a View Diff button. Selected versions show A/B badges with blue highlighting. A Cancel button exits compare mode.",
+        "elements": [
+          {
+            "textContains": "Select first version"
+          },
+          {
+            "textContains": "Cancel"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "compare-selection-to-diff",
+            "name": "View diff",
+            "description": "After selecting both A and B versions, click View Diff to navigate to the diff view",
+            "activateStates": ["pm-diff-view"],
+            "deactivateStates": ["pm-compare-selection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "className": "cursor-pointer"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
+              },
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "className": "cursor-pointer"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
+              },
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "View Diff"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "compare-selection-cancel",
+            "name": "Cancel compare mode",
+            "description": "Click Cancel to exit compare mode and return to the normal version history list",
+            "activateStates": ["pm-version-history-list"],
+            "deactivateStates": ["pm-compare-selection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Cancel"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-diff-view",
+        "name": "Version Diff View",
+        "description": "The diff view shows a unified or side-by-side comparison between two versions. Displays version labels, addition/deletion counts, and diff lines with color coding. Toggle between Inline and Side-by-side view modes. Shows 'No differences found.' for identical versions.",
+        "elements": [
+          {
+            "textContains": "Comparing"
+          },
+          {
+            "textContains": "Inline"
+          },
+          {
+            "textContains": "Side-by-side"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "diff-to-version-list",
+            "name": "Back to version list",
+            "description": "Click Back to history to return to the version list, resetting view to list and clearing compareA/compareB",
+            "activateStates": ["pm-version-history-list"],
+            "deactivateStates": ["pm-diff-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Back to history"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-canary-creation",
+        "name": "Canary Creation Form",
+        "description": "The CreatePromptCanaryForm is visible with fields for Template ID, Baseline Version, Candidate Version, and Candidate Traffic percentage slider (1-100%). When opened from a variant, template ID and baseline version are pre-filled. Shows Create Canary submit button.",
+        "elements": [
+          {
+            "textContains": "Create Prompt Canary A/B Test"
+          },
+          {
+            "textContains": "Template ID"
+          },
+          {
+            "textContains": "Candidate Traffic:"
+          },
+          {
+            "textContains": "Create Canary"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "canary-creation-submit",
+            "name": "Submit canary creation",
+            "description": "Click Create Canary to submit the form. On success shows 'Canary A/B test created successfully.' with a Create Another button",
+            "activateStates": ["pm-canary-success"],
+            "deactivateStates": ["pm-canary-creation"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Create Canary"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
+              }
+            ]
+          },
+          {
+            "id": "canary-creation-close",
+            "name": "Close canary form",
+            "description": "Click Close to dismiss the creation form and return to the registry list",
+            "activateStates": ["pm-registry-list"],
+            "deactivateStates": ["pm-canary-creation"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Close"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-canary-success",
+        "name": "Canary Creation Success",
+        "description": "The canary was created successfully. A green-bordered notification displays 'Canary A/B test created successfully.' with a Create Another button to reset the form for additional tests.",
+        "elements": [
+          {
+            "textContains": "Canary A/B test created successfully."
+          },
+          {
+            "textContains": "Create Another"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "canary-success-create-another",
+            "name": "Create another canary",
+            "description": "Click Create Another to reset the form fields to defaults for creating additional canary tests",
+            "activateStates": ["pm-canary-creation"],
+            "deactivateStates": ["pm-canary-success"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Create Another"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "PromptRegistryTab",
     "author": "opik-integration",
     "createdAt": "2026-03-26T00:00:00.000Z",
-    "updatedAt": "2026-03-26T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/meta-optimizer",
     "elementSource": "sdk",
     "specType": "semantic",

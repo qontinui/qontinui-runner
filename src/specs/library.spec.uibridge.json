@@ -223,9 +223,7 @@
         "id": "lib-loading",
         "name": "Loading — Fetching Library Items",
         "description": "Initial state while the dashboard fetches items from all category endpoints in parallel. A spinner is displayed in the content area.",
-        "elements": [
-          { "role": "status" }
-        ],
+        "elements": [{ "role": "status" }],
         "isInitial": true,
         "transitions": [
           {
@@ -392,10 +390,7 @@
         "id": "lib-favorites-active",
         "name": "Favorites — Showing Favorited Workflows Only",
         "description": "The Favorites filter pill is active, showing only workflows marked as favorites. The pill is highlighted with amber styling.",
-        "elements": [
-          { "textContent": "Library Dashboard" },
-          { "textContent": "Favorites" }
-        ],
+        "elements": [{ "textContent": "Library Dashboard" }, { "textContent": "Favorites" }],
         "transitions": [
           {
             "id": "favorites-to-populated",

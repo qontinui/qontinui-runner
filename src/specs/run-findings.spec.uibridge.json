@@ -402,10 +402,7 @@
         "id": "filters-active",
         "name": "Filters Active — Filtered Findings View",
         "description": "One or more filters are applied (mode, severity, or category). The active filter count badge and Clear button are visible. Category sections show filtered subsets with 'N of M' counts.",
-        "elements": [
-          { "textContains": "Clear" },
-          { "textContains": "Total" }
-        ],
+        "elements": [{ "textContains": "Clear" }, { "textContains": "Total" }],
         "isInitial": false,
         "transitions": [
           {
@@ -458,10 +455,7 @@
         "id": "auto-fix-enabled",
         "name": "Auto-Fix Enabled",
         "description": "The Auto-Fix toggle is active. The toggle button shows a blue highlighted state indicating AI will automatically fix eligible issues. The rest of the findings display remains visible.",
-        "elements": [
-          { "textContains": "Auto-Fix" },
-          { "textContains": "Total" }
-        ],
+        "elements": [{ "textContains": "Auto-Fix" }, { "textContains": "Total" }],
         "isInitial": false,
         "transitions": [
           {
@@ -506,9 +500,7 @@
         "id": "fixing-in-progress",
         "name": "Fixing In Progress — Bulk Fix Running",
         "description": "The Fix All bulk operation is running. The Fix All button shows a spinner and 'Fixing...' text. The button is disabled to prevent duplicate submissions. Findings remain visible underneath.",
-        "elements": [
-          { "textContains": "Fixing..." }
-        ],
+        "elements": [{ "textContains": "Fixing..." }],
         "isInitial": false,
         "transitions": [
           {

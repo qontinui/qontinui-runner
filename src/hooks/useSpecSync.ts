@@ -97,7 +97,11 @@ function analyzeSpecs(specs: LoadedSpec[]): { toSync: SpecToSync[]; toSkip: stri
     const config = spec.config as SpecConfig;
 
     // Check if stateMachine section is missing
-    if (!config.stateMachine || !config.stateMachine.states || config.stateMachine.states.length === 0) {
+    if (
+      !config.stateMachine ||
+      !config.stateMachine.states ||
+      config.stateMachine.states.length === 0
+    ) {
       toSync.push({ spec, reason: "missing-state-machine" });
       continue;
     }
@@ -105,9 +109,7 @@ function analyzeSpecs(specs: LoadedSpec[]): { toSync: SpecToSync[]; toSkip: stri
     // Check if the spec is stale: state machine references groups that no longer
     // exist, or groups exist that have no corresponding state machine state.
     const groupNames = new Set(config.groups.map((g) => g.name));
-    const smStateNames = new Set(
-      config.stateMachine.states.map((s: { name: string }) => s.name),
-    );
+    const smStateNames = new Set(config.stateMachine.states.map((s: { name: string }) => s.name));
     const hasOrphanedStates = [...smStateNames].some((n) => !groupNames.has(n));
     const hasMissingStates = [...groupNames].some((n) => !smStateNames.has(n));
     if (hasOrphanedStates || hasMissingStates) {
@@ -189,10 +191,7 @@ async function tryReadPageSource(
 // Hook
 // ============================================================================
 
-export function useSpecSync(
-  specs: LoadedSpec[],
-  onSpecUpdated: (spec: LoadedSpec) => void,
-) {
+export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpec) => void) {
   const [state, setState] = useState<SpecSyncState>({
     phase: "idle",
     progress: { current: 0, total: 0, currentSpec: "" },

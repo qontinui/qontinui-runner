@@ -168,11 +168,179 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "ctx-list-browse",
+        "name": "Context List Browsing",
+        "description": "The default landing state showing the searchable context list in the left panel. The header displays the page title and a New button. No context is selected and the right editor panel is empty or shows an empty-state prompt.",
+        "elements": [
+          { "role": "heading", "textContent": "Contexts" },
+          { "role": "button", "textContent": "New" },
+          { "role": "searchbox" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "browse-to-creating",
+            "name": "Create new context",
+            "description": "User clicks the New button in the header to open a blank editor form for creating a new context",
+            "activateStates": ["ctx-creating"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "browse-to-editing",
+            "name": "Select existing context",
+            "description": "User clicks a context item in the list to load it into the editor panel for viewing or editing",
+            "activateStates": ["ctx-editing"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "listitem" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ctx-creating",
+        "name": "Creating New Context",
+        "description": "The editor panel displays a blank form for creating a new context. Fields include name, scope selector, content textarea, auto-include toggle, priority input, and tags. The Save button persists the new context to the library. No Delete button is present because the item has not been saved yet.",
+        "elements": [
+          { "role": "checkbox", "accessibleName": "Auto-include" },
+          { "role": "spinbutton", "accessibleName": "Priority" },
+          { "textContent": "Basic Info" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "creating-save",
+            "name": "Save new context",
+            "description": "User fills in the form and clicks Save to persist the new context, which then appears in the list and transitions to editing state",
+            "activateStates": ["ctx-editing"],
+            "deactivateStates": ["ctx-creating"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Save" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "creating-to-editing",
+            "name": "Select different context",
+            "description": "User abandons the new form by clicking an existing context in the list",
+            "activateStates": ["ctx-editing"],
+            "deactivateStates": ["ctx-creating"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "listitem" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ctx-editing",
+        "name": "Editing Existing Context",
+        "description": "A context is selected from the list and its data is loaded into the editor panel. The user can modify the name, scope, content, options, and tags. Save persists changes, Delete removes the context. The Delete button distinguishes this state from the creating state.",
+        "elements": [
+          { "role": "button", "textContent": "Delete" },
+          { "role": "button", "textContent": "Save" },
+          { "textContent": "Options" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "editing-save",
+            "name": "Save changes",
+            "description": "User clicks Save to persist modifications to the selected context",
+            "activateStates": [],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Save" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "editing-delete",
+            "name": "Delete context",
+            "description": "User clicks Delete to remove the context, returning to the browse state with no selection",
+            "activateStates": ["ctx-list-browse"],
+            "deactivateStates": ["ctx-editing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Delete" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Confirm" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "editing-to-creating",
+            "name": "Create new context while editing",
+            "description": "User clicks New to start creating a fresh context, replacing the current editor contents",
+            "activateStates": ["ctx-creating"],
+            "deactivateStates": ["ctx-editing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "editing-switch-item",
+            "name": "Switch to different context",
+            "description": "User clicks a different context in the list to load it into the editor",
+            "activateStates": [],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "listitem" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ContextsPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/build/contexts",
     "tags": ["context-builder", "contexts", "ai-configuration", "library-asset"],
     "specType": "semantic"

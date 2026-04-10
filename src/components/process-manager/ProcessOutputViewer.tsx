@@ -1,4 +1,12 @@
-import { useEffect, useRef, useState, useCallback, useMemo, startTransition, type ReactElement } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  useMemo,
+  startTransition,
+  type ReactElement,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { List, useListRef, type RowComponentProps } from "react-window";
@@ -380,9 +388,7 @@ export function ProcessOutputViewer({
                     {new Date(hit.timestamp).toLocaleString()} · {hit.process_name} ·{" "}
                     {hit.session_id.slice(0, 8)}
                   </div>
-                  <div className="whitespace-nowrap overflow-hidden text-ellipsis">
-                    {hit.line}
-                  </div>
+                  <div className="whitespace-nowrap overflow-hidden text-ellipsis">{hit.line}</div>
                 </button>
               ))}
             </div>

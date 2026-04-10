@@ -89,6 +89,123 @@
       "source": "manual"
     },
     {
+      "id": "settings-claude-accounts",
+      "name": "Claude Account Switching",
+      "description": "The AI tab's Claude Accounts section supports multi-account management with automatic failover on rate-limit. Users can see which account is active, which are rate-limited, and manually switch between accounts. When in Least Usage mode, the runner auto-selects the best account at startup and auto-rotates on rate-limit during workflows.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "settings-claude-accounts-heading",
+          "description": "The Claude Accounts section is visible within the AI Providers tab, showing a Users icon and 'Claude Accounts' heading",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Claude Accounts"
+            },
+            "label": "Claude Accounts section heading"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-active-badge",
+          "description": "The currently active account (used by the runner at runtime) displays a blue 'Active' badge. Exactly one account should have this badge at any time when accounts are configured.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Active"
+            },
+            "label": "Active account badge"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected and at least one Claude account directory is configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-switch-button",
+          "description": "Non-active accounts show a 'Switch' button that allows manually switching to that account. Clicking Switch calls the switch_claude_account Tauri command, clears any cooldown on the target account, and refreshes the live account state to reflect the new active account.",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Switch"
+            },
+            "label": "Account switch button"
+          },
+          "assertionType": "behavior",
+          "precondition": "AI Providers tab is selected and at least two Claude account directories are configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-rate-limited-badge",
+          "description": "When an account has been rate-limited (hit token/usage limits), it displays a red 'Rate-limited' badge. The badge appears based on live backend state from get_claude_accounts, not from the usage check.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Rate-limited"
+            },
+            "label": "Rate-limited badge"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected, at least one account is in cooldown from a rate-limit hit",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-selection-mode",
+          "description": "When two or more accounts are configured, a Selection Mode section appears with Manual and Least Usage options. Least Usage mode description reads 'Auto-select & failover on rate-limit', indicating the runner will auto-select the best account at startup and auto-rotate when one hits a rate limit during workflows.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "failover on rate-limit"
+            },
+            "label": "Least Usage mode description"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected and at least two Claude account directories are configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-switch-shows-spinner",
+          "description": "When the Switch button is clicked, the targeted account's button shows 'Switching...' text with a spinning icon while the backend processes the switch. All other Switch buttons are disabled during this time to prevent concurrent switches.",
+          "category": "interaction",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Switching..."
+            },
+            "label": "Switching state indicator"
+          },
+          "assertionType": "behavior",
+          "precondition": "User has just clicked Switch on a non-active account",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
       "id": "settings-agentic",
       "name": "Agentic Behavior Goals",
       "description": "Users fine-tune how the AI behaves during workflow execution.",
@@ -227,19 +344,188 @@
         "elements": [{ "textContent": "Connection" }],
         "isInitial": true,
         "transitions": [
-          { "id": "account-to-ai", "name": "Switch to AI Providers tab", "activateStates": ["ai"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "AI Providers" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-agentic", "name": "Switch to Advanced AI tab", "activateStates": ["agentic"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Advanced AI" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-self-healing", "name": "Switch to Self-Healing tab", "activateStates": ["self-healing"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Self-Healing" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-playwright", "name": "Switch to Playwright tab", "activateStates": ["playwright"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Playwright" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-mobile", "name": "Switch to Mobile tab", "activateStates": ["mobile"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Mobile" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-mcp", "name": "Switch to MCP Servers tab", "activateStates": ["mcp"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "MCP Servers" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-log-sources", "name": "Switch to Log Sources tab", "activateStates": ["log-sources"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Log Sources" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-storage", "name": "Switch to Storage tab", "activateStates": ["storage"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Storage" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-backup", "name": "Switch to Backup tab", "activateStates": ["backup"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Backup" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-updates", "name": "Switch to Updates tab", "activateStates": ["updates"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Updates" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-security", "name": "Switch to Security tab", "activateStates": ["security"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Security" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "account-to-advanced", "name": "Switch to Debug tab", "activateStates": ["advanced"], "deactivateStates": ["account"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Debug" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "account-to-ai",
+            "name": "Switch to AI Providers tab",
+            "activateStates": ["ai"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "AI Providers" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-agentic",
+            "name": "Switch to Advanced AI tab",
+            "activateStates": ["agentic"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Advanced AI" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-self-healing",
+            "name": "Switch to Self-Healing tab",
+            "activateStates": ["self-healing"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Self-Healing" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-playwright",
+            "name": "Switch to Playwright tab",
+            "activateStates": ["playwright"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Playwright" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-mobile",
+            "name": "Switch to Mobile tab",
+            "activateStates": ["mobile"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Mobile" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-mcp",
+            "name": "Switch to MCP Servers tab",
+            "activateStates": ["mcp"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "MCP Servers" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-log-sources",
+            "name": "Switch to Log Sources tab",
+            "activateStates": ["log-sources"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Log Sources" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-storage",
+            "name": "Switch to Storage tab",
+            "activateStates": ["storage"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Storage" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-backup",
+            "name": "Switch to Backup tab",
+            "activateStates": ["backup"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Backup" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-updates",
+            "name": "Switch to Updates tab",
+            "activateStates": ["updates"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Updates" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-security",
+            "name": "Switch to Security tab",
+            "activateStates": ["security"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Security" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "account-to-advanced",
+            "name": "Switch to Debug tab",
+            "activateStates": ["advanced"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Debug" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -249,9 +535,48 @@
         "elements": [{ "textContent": "AI Provider" }],
         "isInitial": false,
         "transitions": [
-          { "id": "ai-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["ai"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "ai-to-agentic", "name": "Switch to Advanced AI tab", "activateStates": ["agentic"], "deactivateStates": ["ai"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Advanced AI" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "ai-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["ai"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "ai-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["ai"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "ai-to-agentic",
+            "name": "Switch to Advanced AI tab",
+            "activateStates": ["agentic"],
+            "deactivateStates": ["ai"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Advanced AI" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "ai-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["ai"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -261,9 +586,48 @@
         "elements": [{ "textContent": "Advanced AI Features" }],
         "isInitial": false,
         "transitions": [
-          { "id": "agentic-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["agentic"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "agentic-to-ai", "name": "Switch to AI Providers tab", "activateStates": ["ai"], "deactivateStates": ["agentic"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "AI Providers" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "agentic-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["agentic"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "agentic-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["agentic"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "agentic-to-ai",
+            "name": "Switch to AI Providers tab",
+            "activateStates": ["ai"],
+            "deactivateStates": ["agentic"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "AI Providers" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "agentic-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["agentic"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -273,9 +637,48 @@
         "elements": [{ "textContent": "Self-Healing Configuration" }],
         "isInitial": false,
         "transitions": [
-          { "id": "self-healing-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["self-healing"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "self-healing-to-agentic", "name": "Switch to Advanced AI tab", "activateStates": ["agentic"], "deactivateStates": ["self-healing"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Advanced AI" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "self-healing-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["self-healing"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "self-healing-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["self-healing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "self-healing-to-agentic",
+            "name": "Switch to Advanced AI tab",
+            "activateStates": ["agentic"],
+            "deactivateStates": ["self-healing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Advanced AI" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "self-healing-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["self-healing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -285,8 +688,34 @@
         "elements": [{ "textContent": "Playwright Tests" }],
         "isInitial": false,
         "transitions": [
-          { "id": "playwright-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["playwright"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "playwright-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["playwright"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "playwright-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["playwright"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "playwright-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["playwright"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -296,9 +725,48 @@
         "elements": [{ "textContent": "Mobile Development" }],
         "isInitial": false,
         "transitions": [
-          { "id": "mobile-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["mobile"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "mobile-to-playwright", "name": "Switch to Playwright tab", "activateStates": ["playwright"], "deactivateStates": ["mobile"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Playwright" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "mobile-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["mobile"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "mobile-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["mobile"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "mobile-to-playwright",
+            "name": "Switch to Playwright tab",
+            "activateStates": ["playwright"],
+            "deactivateStates": ["mobile"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Playwright" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "mobile-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["mobile"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -308,9 +776,48 @@
         "elements": [{ "textContent": "MCP Servers" }],
         "isInitial": false,
         "transitions": [
-          { "id": "mcp-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["mcp"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "mcp-to-ai", "name": "Switch to AI Providers tab", "activateStates": ["ai"], "deactivateStates": ["mcp"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "AI Providers" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "mcp-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["mcp"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "mcp-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["mcp"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "mcp-to-ai",
+            "name": "Switch to AI Providers tab",
+            "activateStates": ["ai"],
+            "deactivateStates": ["mcp"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "AI Providers" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "mcp-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["mcp"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -320,8 +827,34 @@
         "elements": [{ "textContent": "Log Sources" }],
         "isInitial": false,
         "transitions": [
-          { "id": "log-sources-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["log-sources"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "log-sources-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["log-sources"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "log-sources-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["log-sources"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "log-sources-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["log-sources"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -331,9 +864,48 @@
         "elements": [{ "textContent": "General" }],
         "isInitial": false,
         "transitions": [
-          { "id": "general-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["general"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "general-to-ai", "name": "Switch to AI Providers tab", "activateStates": ["ai"], "deactivateStates": ["general"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "AI Providers" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "general-to-storage", "name": "Switch to Storage tab", "activateStates": ["storage"], "deactivateStates": ["general"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Storage" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "general-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["general"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "general-to-ai",
+            "name": "Switch to AI Providers tab",
+            "activateStates": ["ai"],
+            "deactivateStates": ["general"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "AI Providers" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "general-to-storage",
+            "name": "Switch to Storage tab",
+            "activateStates": ["storage"],
+            "deactivateStates": ["general"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Storage" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -343,9 +915,48 @@
         "elements": [{ "textContent": "Storage" }],
         "isInitial": false,
         "transitions": [
-          { "id": "storage-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["storage"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "storage-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["storage"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "storage-to-backup", "name": "Switch to Backup tab", "activateStates": ["backup"], "deactivateStates": ["storage"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Backup" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "storage-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["storage"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "storage-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["storage"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "storage-to-backup",
+            "name": "Switch to Backup tab",
+            "activateStates": ["backup"],
+            "deactivateStates": ["storage"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Backup" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -355,9 +966,48 @@
         "elements": [{ "textContent": "Backup & Restore" }],
         "isInitial": false,
         "transitions": [
-          { "id": "backup-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["backup"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "backup-to-storage", "name": "Switch to Storage tab", "activateStates": ["storage"], "deactivateStates": ["backup"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Storage" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "backup-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["backup"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "backup-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["backup"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "backup-to-storage",
+            "name": "Switch to Storage tab",
+            "activateStates": ["storage"],
+            "deactivateStates": ["backup"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Storage" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "backup-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["backup"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -367,8 +1017,34 @@
         "elements": [{ "textContent": "Updates" }],
         "isInitial": false,
         "transitions": [
-          { "id": "updates-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["updates"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "updates-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["updates"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "updates-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["updates"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "updates-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["updates"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -378,8 +1054,34 @@
         "elements": [{ "textContent": "Security & Sandboxing" }],
         "isInitial": false,
         "transitions": [
-          { "id": "security-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["security"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "security-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["security"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "security-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["security"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "security-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["security"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       },
       {
@@ -389,8 +1091,34 @@
         "elements": [{ "textContent": "Advanced" }],
         "isInitial": false,
         "transitions": [
-          { "id": "advanced-to-account", "name": "Switch to Account tab", "activateStates": ["account"], "deactivateStates": ["advanced"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "Account" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
-          { "id": "advanced-to-general", "name": "Switch to General tab", "activateStates": ["general"], "deactivateStates": ["advanced"], "staysVisible": false, "process": [{ "action": "click", "target": { "accessibleName": "General" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+          {
+            "id": "advanced-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["advanced"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "advanced-to-general",
+            "name": "Switch to General tab",
+            "activateStates": ["general"],
+            "deactivateStates": ["advanced"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
         ]
       }
     ]

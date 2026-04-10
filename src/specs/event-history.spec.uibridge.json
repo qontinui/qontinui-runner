@@ -1083,5 +1083,485 @@
         ]
       }
     ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "evh-loading",
+        "name": "Loading",
+        "description": "Page has mounted and the initial API calls for events, queue, circuit breaker, and subscriptions are in flight. A centered loading message is displayed.",
+        "elements": [
+          {
+            "textContent": "Loading event history"
+          }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-populated",
+            "name": "Data loaded successfully",
+            "description": "All API calls return successfully and at least one event exists in the history",
+            "activateStates": ["evh-populated"],
+            "deactivateStates": ["evh-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": {
+                  "textContent": "Workflow Event History"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-empty",
+            "name": "Data loaded but no events",
+            "description": "API calls return successfully but event history is empty",
+            "activateStates": ["evh-empty"],
+            "deactivateStates": ["evh-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": {
+                  "textContent": "No events recorded yet"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-offline",
+            "name": "Runner not reachable",
+            "description": "The runner is not connected, triggering the offline warning banner",
+            "activateStates": ["evh-offline"],
+            "deactivateStates": ["evh-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": {
+                  "textContent": "Runner not connected"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-error",
+            "name": "API error on load",
+            "description": "Runner is connected but an API endpoint returns an error response",
+            "activateStates": ["evh-error"],
+            "deactivateStates": ["evh-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": {
+                  "textContent": "error"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "evh-offline",
+        "name": "Runner Offline",
+        "description": "The runner is not connected. A yellow warning banner tells the user to check if qontinui-runner is running. No data widgets are populated.",
+        "elements": [
+          {
+            "textContent": "Runner not connected"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "offline-to-loading",
+            "name": "Runner reconnects",
+            "description": "The runner comes back online and the page re-fetches data, returning to the loading state briefly",
+            "activateStates": ["evh-loading"],
+            "deactivateStates": ["evh-offline"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": {
+                  "textContent": "Loading event history"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "evh-error",
+        "name": "API Error",
+        "description": "Runner is connected but one or more API endpoints returned an error. A red error banner is displayed with the error message.",
+        "elements": [
+          {
+            "textContent": "Workflow Event History"
+          },
+          {
+            "textContent": "error"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-populated",
+            "name": "Error clears on next poll",
+            "description": "The next auto-refresh poll succeeds, clearing the error state and showing data",
+            "activateStates": ["evh-populated"],
+            "deactivateStates": ["evh-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": {
+                  "textContent": "Timestamp"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 6000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "evh-empty",
+        "name": "Empty History",
+        "description": "Runner is connected and APIs succeed, but no workflow events have been recorded. A centered empty state with Radio icon and message is shown.",
+        "elements": [
+          {
+            "textContent": "Workflow Event History"
+          },
+          {
+            "textContent": "No events recorded yet"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-populated",
+            "name": "First event arrives",
+            "description": "A workflow emits its first event and the next 5-second poll picks it up, populating the table",
+            "activateStates": ["evh-populated"],
+            "deactivateStates": ["evh-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": {
+                  "textContent": "Timestamp"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 6000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "evh-populated",
+        "name": "Populated View",
+        "description": "The main operational state. Event table shows rows in reverse chronological order, queue status dashboard shows pending/running/max-concurrent/max-depth, circuit breaker widget shows state, and subscriptions panel shows active listeners. All widgets auto-refresh.",
+        "elements": [
+          {
+            "textContent": "Workflow Event History"
+          },
+          {
+            "textContent": "Timestamp"
+          },
+          {
+            "textContent": "Event Name"
+          },
+          {
+            "textContent": "Source"
+          },
+          {
+            "textContent": "Pending"
+          },
+          {
+            "textContent": "Circuit"
+          },
+          {
+            "textContent": "Active Subscriptions"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "populated-to-filtered",
+            "name": "Apply event filter",
+            "description": "User types in the filter input, narrowing the event table to matching rows in real time",
+            "activateStates": ["evh-filtered"],
+            "deactivateStates": ["evh-populated"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "textbox"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
+              },
+              {
+                "action": "type",
+                "target": {
+                  "role": "textbox"
+                },
+                "value": "workflow.completed",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "populated-to-row-expanded",
+            "name": "Expand event row",
+            "description": "User clicks an event row to reveal the inline detail panel with full JSON payload and metadata",
+            "activateStates": ["evh-row-expanded"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "row"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "evh-filtered",
+        "name": "Filtered View",
+        "description": "The filter input has text and the event table is narrowed to rows matching the filter pattern against event name and source. Queue, circuit breaker, and subscriptions remain visible.",
+        "elements": [
+          {
+            "textContent": "Workflow Event History"
+          },
+          {
+            "role": "textbox"
+          },
+          {
+            "textContent": "Timestamp"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "filtered-to-populated",
+            "name": "Clear filter",
+            "description": "User clears the filter input, restoring the full unfiltered event table",
+            "activateStates": ["evh-populated"],
+            "deactivateStates": ["evh-filtered"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "clear",
+                "target": {
+                  "role": "textbox"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "filtered-to-no-match",
+            "name": "Filter matches nothing",
+            "description": "User types a filter string that does not match any events, showing a no-results message",
+            "activateStates": ["evh-no-match"],
+            "deactivateStates": ["evh-filtered"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "clear",
+                "target": {
+                  "role": "textbox"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
+              },
+              {
+                "action": "type",
+                "target": {
+                  "role": "textbox"
+                },
+                "value": "zzz_nonexistent_event_pattern",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "filtered-to-row-expanded",
+            "name": "Expand filtered event row",
+            "description": "User clicks an event row in the filtered view to expand its detail panel",
+            "activateStates": ["evh-row-expanded"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "row"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "evh-no-match",
+        "name": "No Filter Results",
+        "description": "The filter input has text but no events match the pattern. A message indicates no results rather than showing an empty table.",
+        "elements": [
+          {
+            "textContent": "Workflow Event History"
+          },
+          {
+            "role": "textbox"
+          },
+          {
+            "textContent": "No events match the filter"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "no-match-to-filtered",
+            "name": "Adjust filter to match",
+            "description": "User changes the filter text to a pattern that matches one or more events",
+            "activateStates": ["evh-filtered"],
+            "deactivateStates": ["evh-no-match"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "clear",
+                "target": {
+                  "role": "textbox"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
+              },
+              {
+                "action": "type",
+                "target": {
+                  "role": "textbox"
+                },
+                "value": "workflow",
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          },
+          {
+            "id": "no-match-to-populated",
+            "name": "Clear filter from no-match",
+            "description": "User clears the filter input entirely, restoring the full event table",
+            "activateStates": ["evh-populated"],
+            "deactivateStates": ["evh-no-match"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "clear",
+                "target": {
+                  "role": "textbox"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "evh-row-expanded",
+        "name": "Event Row Expanded",
+        "description": "An event row has been clicked and the inline detail panel is visible below it, showing the full JSON payload, source metadata (task_run_id, workflow_id, workflow_name), idempotency key, and full timestamp.",
+        "elements": [
+          {
+            "textContent": "Full Payload"
+          },
+          {
+            "textContent": "Task Run ID"
+          }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "row-expanded-to-collapsed",
+            "name": "Collapse event row",
+            "description": "User clicks the expanded row again to collapse the detail panel, returning to the previous view state",
+            "activateStates": ["evh-populated"],
+            "deactivateStates": ["evh-row-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "row"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

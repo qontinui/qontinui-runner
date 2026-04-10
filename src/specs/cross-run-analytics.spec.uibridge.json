@@ -399,5 +399,220 @@
         }
       ]
     }
-  ]
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "cra-loading",
+        "name": "Loading State",
+        "description": "Initial loading state while fetching cross-run patterns and step provenance data from the backend. Loading indicators are visible and no pattern rows or timeline content are rendered yet.",
+        "elements": [{ "textContent": "Loading provenance" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-patterns-empty",
+            "name": "Load completes with no patterns",
+            "description": "Fetched data returns no cross-run patterns, showing the empty state message",
+            "activateStates": ["cra-patterns-empty"],
+            "deactivateStates": ["cra-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "No cross-run patterns detected" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-patterns-loaded",
+            "name": "Load completes with pattern data",
+            "description": "Fetched data returns cross-run patterns, showing pattern rows with type badges, occurrence counts, and status indicators",
+            "activateStates": ["cra-patterns-loaded"],
+            "deactivateStates": ["cra-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Cross-Run Patterns" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cra-patterns-empty",
+        "name": "Empty State — No Patterns",
+        "description": "No cross-run patterns exist. The empty state message is displayed. The provenance timeline and element-detail panels are not visible because no workflow or element context is available.",
+        "elements": [{ "textContent": "No cross-run patterns detected" }],
+        "transitions": [
+          {
+            "id": "empty-to-loading-refresh",
+            "name": "Auto-refresh triggers reload",
+            "description": "The 60-second auto-refresh interval fires and re-fetches pattern data, returning to the loading state",
+            "activateStates": ["cra-loading"],
+            "deactivateStates": ["cra-patterns-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Loading provenance" },
+                "waitAfter": { "type": "idle", "timeout": 60000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cra-patterns-loaded",
+        "name": "Patterns Loaded — Pattern List View",
+        "description": "Cross-run pattern rows are displayed with type badges (Recurring Finding or Fix Oscillation), signature hashes, occurrence counts, last seen dates, and status badges (active/resolved/suppressed). The patterns panel heading with AlertTriangle icon is visible.",
+        "elements": [
+          { "textContent": "Cross-Run Patterns" },
+          { "textContent": "Recurring Finding" },
+          { "textContent": "Fix Oscillation" }
+        ],
+        "transitions": [
+          {
+            "id": "patterns-to-provenance",
+            "name": "Workflow selected shows provenance",
+            "description": "A workflowId is provided or a workflow is selected, causing the StepProvenanceTimeline to load and display",
+            "activateStates": ["cra-provenance-visible"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Step Provenance Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "patterns-to-element-detail",
+            "name": "Element selected shows decay and chain",
+            "description": "An elementId is provided, causing the SelectorDecayChart and FailureChainViewer to load for that element",
+            "activateStates": ["cra-element-detail"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Selector Decay" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cra-provenance-visible",
+        "name": "Provenance Timeline Visible",
+        "description": "The StepProvenanceTimeline is rendered with agent-colored dots, step names, phase badges, agent names, and the 5-agent color legend. The patterns panel remains visible alongside. UI Bridge interaction count badges appear on steps that have non-null ui_bridge_event_ids.",
+        "elements": [{ "textContent": "Step Provenance Timeline" }, { "textContent": "discovery" }],
+        "transitions": [
+          {
+            "id": "provenance-to-provenance-empty",
+            "name": "Workflow with no provenance data",
+            "description": "The selected workflow has no step_provenance records, so the empty state is shown instead of the timeline",
+            "activateStates": ["cra-provenance-empty"],
+            "deactivateStates": ["cra-provenance-visible"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "No step provenance data" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cra-provenance-empty",
+        "name": "Provenance Empty State",
+        "description": "The StepProvenanceTimeline is rendered but shows an empty state message because the selected workflow has no step_provenance records.",
+        "elements": [{ "textContent": "No step provenance data" }],
+        "transitions": [
+          {
+            "id": "provenance-empty-to-provenance",
+            "name": "Different workflow selected with data",
+            "description": "A different workflow is selected that has step_provenance records, populating the timeline",
+            "activateStates": ["cra-provenance-visible"],
+            "deactivateStates": ["cra-provenance-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Step Provenance Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cra-element-detail",
+        "name": "Element Detail — Decay Chart and Failure Chain",
+        "description": "An element is selected, showing the SelectorDecayChart with its line chart (success rate over time windows, 95% reference line) and the FailureChainViewer with graph traversal paths displayed as horizontal node chains. The decay chart heading shows 'Selector Decay:' followed by the element ID. The failure chain heading shows 'Failure Chain:' followed by the element ID.",
+        "elements": [{ "textContent": "Selector Decay" }, { "textContent": "Failure Chain" }],
+        "transitions": [
+          {
+            "id": "element-detail-to-chain-empty",
+            "name": "Element has no failure chains",
+            "description": "The selected element has no causal chain paths in the knowledge graph, showing the empty failure chain state",
+            "activateStates": ["cra-chain-empty"],
+            "deactivateStates": ["cra-element-detail"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "No failure chains found" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "element-detail-to-patterns",
+            "name": "Deselect element returns to patterns view",
+            "description": "The element context is removed, hiding the decay chart and failure chain viewer and returning to the patterns-only view",
+            "activateStates": ["cra-patterns-loaded"],
+            "deactivateStates": ["cra-element-detail"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Cross-Run Patterns" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cra-chain-empty",
+        "name": "Failure Chain Empty State",
+        "description": "The FailureChainViewer is rendered but shows an empty state because no causal chain paths exist for the selected element in the knowledge graph. The SelectorDecayChart may still be visible with decay data.",
+        "elements": [{ "textContent": "No failure chains found" }],
+        "transitions": [
+          {
+            "id": "chain-empty-to-element-detail",
+            "name": "Different element selected with chain data",
+            "description": "A different element is selected that has failure chain paths, restoring the full element detail view",
+            "activateStates": ["cra-element-detail"],
+            "deactivateStates": ["cra-chain-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Failure Chain" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
 }

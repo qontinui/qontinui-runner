@@ -206,9 +206,7 @@ function SyncProgressBanner({
     <div className="border-b border-border bg-teal-500/5 px-4 py-2">
       <div className="flex items-center gap-3">
         {/* Phase label */}
-        <span className="text-xs font-medium text-teal-400 shrink-0">
-          {phaseLabel}
-        </span>
+        <span className="text-xs font-medium text-teal-400 shrink-0">{phaseLabel}</span>
 
         {/* Progress bar */}
         {!isDone && progress.total > 0 && (
@@ -283,7 +281,8 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   useUIComponent({
     id: "specs-page",
     name: "Specs Page",
-    description: "View, edit, and manage project specifications with AI-driven sync and state machine compilation",
+    description:
+      "View, edit, and manage project specifications with AI-driven sync and state machine compilation",
   });
 
   // Spec sync — batch update all stale specs with AI merge mode

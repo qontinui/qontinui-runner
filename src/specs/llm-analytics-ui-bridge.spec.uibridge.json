@@ -259,5 +259,151 @@
         }
       ]
     }
-  ]
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "llm-dashboard-loading",
+        "name": "Dashboard — Loading",
+        "description": "The LLM Observability Dashboard is loading analytics data from the Tauri backend. A spinning refresh icon is displayed in the center of the page.",
+        "elements": [{ "role": "presentation" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-empty",
+            "name": "No data available",
+            "description": "Data loads but total_calls is 0, meaning no LLM usage exists yet",
+            "activateStates": ["llm-dashboard-empty"],
+            "deactivateStates": ["llm-dashboard-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-data",
+            "name": "Data loaded",
+            "description": "Analytics data loads successfully with at least one LLM call recorded",
+            "activateStates": ["llm-dashboard-data-no-uibridge"],
+            "deactivateStates": ["llm-dashboard-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-data-with-uibridge",
+            "name": "Data loaded with UI Bridge cost data",
+            "description": "Analytics data loads with target_app data present, showing all four UI Bridge cost attribution components",
+            "activateStates": ["llm-dashboard-data-with-uibridge"],
+            "deactivateStates": ["llm-dashboard-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Load failed",
+            "description": "Data fetch failed, showing an error message with a Retry button",
+            "activateStates": ["llm-dashboard-error"],
+            "deactivateStates": ["llm-dashboard-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "llm-dashboard-empty",
+        "name": "Dashboard — No Data",
+        "description": "The dashboard loaded but no LLM usage data exists. A centered message with a credit card icon reads 'No LLM usage data available' with guidance to run workflows to start collecting analytics.",
+        "elements": [{ "textContent": "No LLM usage data available" }],
+        "transitions": [
+          {
+            "id": "empty-to-loading",
+            "name": "Refresh",
+            "description": "User triggers a data refresh (e.g., by navigating away and back, or if a workflow completes in the background)",
+            "activateStates": ["llm-dashboard-loading"],
+            "deactivateStates": ["llm-dashboard-empty"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "llm-dashboard-error",
+        "name": "Dashboard — Error",
+        "description": "The dashboard failed to load analytics data. An error message is displayed with the failure reason and a Retry button.",
+        "elements": [
+          { "textContent": "Failed to load LLM analytics" },
+          { "role": "button", "textContent": "Retry" }
+        ],
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "Retry",
+            "description": "User clicks the Retry button to re-attempt loading analytics data",
+            "activateStates": ["llm-dashboard-loading"],
+            "deactivateStates": ["llm-dashboard-error"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "llm-dashboard-data-no-uibridge",
+        "name": "Dashboard — Data Loaded (No UI Bridge)",
+        "description": "The dashboard displays LLM analytics with summary cards, cost-over-time chart, cost-by-model chart, cost trend, cost-by-phase chart, provider latency chart, and task run cost table. No UI Bridge cost attribution components are shown because no target_app data exists in phase_token_usage.",
+        "elements": [
+          { "accessibleName": "Refresh analytics" },
+          { "dataAttributes": { "tutorial-id": "llm-summary-cards" } }
+        ],
+        "transitions": [
+          {
+            "id": "data-to-loading-time-range",
+            "name": "Change time range",
+            "description": "User selects a different time range (1d, 7d, 30d, all) from the dropdown, triggering a data refetch",
+            "activateStates": ["llm-dashboard-loading"],
+            "deactivateStates": ["llm-dashboard-data-no-uibridge"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "data-to-loading-refresh",
+            "name": "Refresh analytics",
+            "description": "User clicks the refresh button to re-fetch analytics data",
+            "activateStates": ["llm-dashboard-loading"],
+            "deactivateStates": ["llm-dashboard-data-no-uibridge"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "llm-dashboard-data-with-uibridge",
+        "name": "Dashboard — Data Loaded (With UI Bridge Cost Attribution)",
+        "description": "The dashboard displays full LLM analytics plus the UI Bridge cost attribution section: Cost by Target App chart, Cost per Successful Interaction chart, Page Complexity table with Avg/Call column, and Model x Action Success Matrix heatmap. These appear because phase_token_usage has rows with non-null target_app values.",
+        "elements": [
+          { "textContains": "Cost by Target App" },
+          { "textContains": "Cost per Successful Interaction" },
+          { "textContains": "Page Complexity" },
+          { "textContains": "Model x Action Success Matrix" }
+        ],
+        "transitions": [
+          {
+            "id": "uibridge-to-loading-time-range",
+            "name": "Change time range",
+            "description": "User selects a different time range from the dropdown, triggering a data refetch for all charts including UI Bridge cost components",
+            "activateStates": ["llm-dashboard-loading"],
+            "deactivateStates": ["llm-dashboard-data-with-uibridge"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "uibridge-to-loading-refresh",
+            "name": "Refresh analytics",
+            "description": "User clicks the refresh button to re-fetch all analytics data",
+            "activateStates": ["llm-dashboard-loading"],
+            "deactivateStates": ["llm-dashboard-data-with-uibridge"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  }
 }

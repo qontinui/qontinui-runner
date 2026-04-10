@@ -245,6 +245,148 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "no-config-loaded",
+        "name": "No Configuration Loaded",
+        "description": "No workflow configuration is loaded. The page displays a message directing the user to load a configuration before viewing statistics.",
+        "elements": [{ "textContains": "Load a configuration" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-config-to-loading",
+            "name": "User loads a workflow configuration",
+            "activateStates": ["loading"],
+            "deactivateStates": ["no-config-loaded"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "loading",
+        "name": "Loading Statistics",
+        "description": "Statistics data is being fetched. A loading spinner or status indicator is displayed while the data loads.",
+        "elements": [{ "role": "status" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "loading-to-overview",
+            "name": "Statistics load successfully with data",
+            "activateStates": ["overview-view"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-no-data",
+            "name": "Statistics load but no data has been collected yet",
+            "activateStates": ["no-data-available"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "no-data-available",
+        "name": "No Statistics Data",
+        "description": "A configuration is loaded but no statistics have been collected. The page shows a message suggesting the user run workflows to generate data.",
+        "elements": [{ "textContains": "No statistics" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "no-data-to-loading",
+            "name": "User refreshes after running workflows",
+            "activateStates": ["loading"],
+            "deactivateStates": ["no-data-available"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "overview-view",
+        "name": "Overview Dashboard Active",
+        "description": "The Overview tab is active. The page displays config health panel, flaky items list, run history panel, and error patterns panel. The view toggle shows Overview as selected.",
+        "elements": [
+          { "textContains": "Health" },
+          { "textContains": "flaky" },
+          { "textContains": "history" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "overview-to-performance",
+            "name": "User clicks the Performance toggle",
+            "activateStates": ["performance-view"],
+            "deactivateStates": ["overview-view"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "overview-to-run-detail",
+            "name": "User clicks a run in the history panel",
+            "activateStates": ["run-detail-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": []
+          },
+          {
+            "id": "overview-to-loading-refresh",
+            "name": "User clicks the Refresh button",
+            "activateStates": ["loading"],
+            "deactivateStates": ["overview-view"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "performance-view",
+        "name": "Performance Dashboard Active",
+        "description": "The Performance tab is active. The page displays detailed timing metrics, success rate trends, and transition reliability data. The view toggle shows Performance as selected.",
+        "elements": [{ "textContains": "timing" }, { "textContains": "Performance" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "performance-to-overview",
+            "name": "User clicks the Overview toggle",
+            "activateStates": ["overview-view"],
+            "deactivateStates": ["performance-view"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "performance-to-loading-refresh",
+            "name": "User clicks the Refresh button",
+            "activateStates": ["loading"],
+            "deactivateStates": ["performance-view"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "run-detail-open",
+        "name": "Run Detail Panel Open",
+        "description": "A slide-out panel is visible showing details for a specific run selected from the history. This state overlays the overview view.",
+        "elements": [{ "textContains": "Close" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "run-detail-to-closed",
+            "name": "User clicks Close to dismiss the detail panel",
+            "activateStates": [],
+            "deactivateStates": ["run-detail-open"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "StatisticsTab",
     "author": "Joshua Spinak",
