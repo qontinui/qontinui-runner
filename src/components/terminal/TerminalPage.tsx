@@ -126,12 +126,7 @@ function TerminalPageInner({
   const transitionEffects = useTransitionEffects();
   const { handleRestartInZone } = transitionEffects;
 
-  const {
-    workflowGen,
-    analysis,
-    findingsActions,
-    sessionManager,
-  } = useAiFeatures();
+  const { workflowGen, sessionManager } = useAiFeatures();
 
   const {
     state: uiState,
