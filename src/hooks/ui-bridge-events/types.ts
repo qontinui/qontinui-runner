@@ -195,6 +195,8 @@ export type UIBridgeRequestType =
   | "wait_for_navigation_complete"
   // Stable ref resolution
   | "resolve_stable_ref"
+  // Element assertion
+  | "assert_element"
   // Runner-specific
   | "navigate_tab"
   | "clear_storage";

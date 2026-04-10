@@ -258,6 +258,50 @@ export function useControlEvents(
           return true;
         }
 
+        case "assert_element": {
+          const assertPayload = payload as unknown as Record<string, unknown>;
+          const assertElementId = (assertPayload.elementId ?? assertPayload.id) as string;
+          const spec = (assertPayload.spec ?? {}) as Record<string, unknown>;
+          if (!assertElementId) {
+            await sendResponse({
+              requestId, type, success: true,
+              data: { passed: false, checked: 0, passedCount: 0, failures: [], error: "ELEMENT_NOT_FOUND", errorMessage: "elementId is required" },
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const reg = currentBridge.elements.find((e) => e.id === assertElementId);
+          if (!reg) {
+            await sendResponse({
+              requestId, type, success: true,
+              data: { passed: false, checked: 0, passedCount: 0, failures: [], error: "ELEMENT_NOT_FOUND", errorMessage: `Element '${assertElementId}' not found` },
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const elState = (reg.getState?.() ?? {}) as unknown as Record<string, unknown>;
+          const htmlEl = reg.element as HTMLElement | null;
+          const failures: Array<{ field: string; expected: unknown; actual: unknown; kind: string }> = [];
+          let checked = 0;
+
+          const es = elState as Record<string, unknown>;
+          if (spec.visible !== undefined) { checked++; if (es.visible !== spec.visible) failures.push({ field: "visible", expected: spec.visible, actual: es.visible, kind: "exact" }); }
+          if (spec.enabled !== undefined) { checked++; if (es.enabled !== spec.enabled) failures.push({ field: "enabled", expected: spec.enabled, actual: es.enabled, kind: "exact" }); }
+          if (spec.text !== undefined) { checked++; const t = (es.text ?? htmlEl?.textContent ?? "") as string; if (t !== spec.text) failures.push({ field: "text", expected: spec.text, actual: t, kind: "exact" }); }
+          if (spec.textContains !== undefined) { checked++; const t = (es.text ?? htmlEl?.textContent ?? "") as string; if (!t.includes(spec.textContains as string)) failures.push({ field: "textContains", expected: spec.textContains, actual: t, kind: "contains" }); }
+          if (spec.value !== undefined) { checked++; if (es.value !== spec.value) failures.push({ field: "value", expected: spec.value, actual: es.value, kind: "exact" }); }
+          if (spec.checked !== undefined) { checked++; if (es.checked !== spec.checked) failures.push({ field: "checked", expected: spec.checked, actual: es.checked, kind: "exact" }); }
+
+          await sendResponse({
+            requestId, type, success: true,
+            data: { passed: failures.length === 0, checked, passedCount: checked - failures.length, failures, elementSnapshot: { id: reg.id, type: reg.type, text: es.text, visible: es.visible, enabled: es.enabled } },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "resolve_stable_ref": {
           const stableRef = (payload as unknown as Record<string, unknown>).stableRef;
           if (!stableRef) {
