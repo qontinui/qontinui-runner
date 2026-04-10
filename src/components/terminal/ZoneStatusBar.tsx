@@ -25,7 +25,8 @@ import {
 } from "lucide-react";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
 import { DocFinderModal } from "./DocFinderModal";
-import type { SessionState } from "./useZoneLayout";
+import type { SessionState, ZoneAssignments } from "./useZoneLayout";
+import type { TerminalTab } from "./useTerminalManager";
 import { instanceStorage } from "@/lib/instance-storage";
 import {
   useTerminalCore,
@@ -875,9 +876,9 @@ function MetricsPopover({
     for (const { zone, tabId } of sortedEntries) {
       const tab = tabs.find((t) => t.id === tabId);
       if (!tab) continue;
-      const state = sessionStates?.[tabId] ?? "idle";
-      const duration = stateDurations?.[tabId] ?? "-";
-      const lineCount = lastOutputLines?.[tabId]?.length ?? 0;
+      const state = (sessionStates as Record<string, string>)?.[tabId] ?? "idle";
+      const duration = (stateDurations as Record<string, string>)?.[tabId] ?? "-";
+      const lineCount = (lastOutputLines as Record<string, unknown[]>)?.[tabId]?.length ?? 0;
       const tags = zoneLabels?.[zone] ?? "-";
       rows.push(`| ${zone + 1} | ${tab.title} | ${state} | ${duration} | ${lineCount} | ${tags} |`);
     }

@@ -292,15 +292,10 @@ export function useNetworkIdleEvents(
             return true;
           }
 
-          // Look up element from the bridge registry via the global
-          const uiBridgeGlobal = getUIBridgeGlobal();
-          const registry = uiBridgeGlobal?.registry as
-            | { getElement?: (id: string) => { element: Element } | null }
-            | undefined;
-          const registered = registry?.getElement?.(elId);
-          const domElement = registered?.element;
+          // Look up element by ID — query DOM for data-ui-bridge-id attribute
+          const domElementOrNull = document.querySelector(`[data-ui-bridge-id="${elId}"]`) as HTMLElement | null;
 
-          if (!domElement || !(domElement instanceof HTMLElement)) {
+          if (!domElementOrNull || !(domElementOrNull instanceof HTMLElement)) {
             await sendResponse({
               requestId,
               type,
@@ -311,21 +306,81 @@ export function useNetworkIdleEvents(
             return true;
           }
 
-          const { waitForElementStable } = await import("ui-bridge/idle");
-          const result = await waitForElementStable(domElement, {
-            quietMs: (payload.params?.quietMs as number) ?? 500,
-            timeout: (payload.params?.timeout as number) ?? 5000,
-            observeAttributes: (payload.params?.observeAttributes as boolean) ?? true,
-            observeSubtree: (payload.params?.observeSubtree as boolean) ?? false,
-          });
+          {
+            const domElement = domElementOrNull;
+            const p = payload as unknown as Record<string, unknown>;
+            const qMs = (p.quietMs as number) ?? (payload.params?.quietMs as number) ?? 500;
+            const tMs = (p.timeout as number) ?? (payload.params?.timeout as number) ?? 5000;
+            const start = Date.now();
 
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: result,
-            timestamp: Date.now(),
-          });
+            // Inline element settling: MutationObserver + rAF bbox polling
+            const result = await new Promise<{ stable: boolean; elapsed: number }>((res) => {
+              let lastActivity = Date.now();
+              let rafId: number | null = null;
+              let quietTimer: ReturnType<typeof setTimeout> | null = null;
+              let prevRect: DOMRect | null = null;
+              let done = false;
+
+              function cleanup() {
+                if (done) return;
+                done = true;
+                obs.disconnect();
+                if (rafId !== null) cancelAnimationFrame(rafId);
+                if (quietTimer !== null) clearTimeout(quietTimer);
+              }
+
+              function bump() {
+                lastActivity = Date.now();
+                scheduleCheck();
+              }
+
+              function scheduleCheck() {
+                if (quietTimer !== null) clearTimeout(quietTimer);
+                quietTimer = setTimeout(() => {
+                  if (Date.now() - lastActivity >= qMs) {
+                    cleanup();
+                    res({ stable: true, elapsed: Date.now() - start });
+                  } else {
+                    scheduleCheck();
+                  }
+                }, qMs - (Date.now() - lastActivity) + 1);
+              }
+
+              const obs = new MutationObserver((mutations) => {
+                for (const m of mutations) {
+                  if (m.type === "childList" || m.type === "attributes" || m.type === "characterData") {
+                    bump();
+                    return;
+                  }
+                }
+              });
+              obs.observe(domElement, { childList: true, attributes: true, characterData: true });
+
+              function pollBBox() {
+                if (done) return;
+                const rect = domElement.getBoundingClientRect();
+                if (prevRect && (Math.abs(rect.x - prevRect.x) > 0.5 || Math.abs(rect.y - prevRect.y) > 0.5 ||
+                    Math.abs(rect.width - prevRect.width) > 0.5 || Math.abs(rect.height - prevRect.height) > 0.5)) {
+                  bump();
+                }
+                prevRect = rect;
+                rafId = requestAnimationFrame(pollBBox);
+              }
+              rafId = requestAnimationFrame(pollBBox);
+
+              // Overall timeout
+              setTimeout(() => { cleanup(); res({ stable: false, elapsed: Date.now() - start }); }, tMs);
+
+              // Start quiet period check
+              scheduleCheck();
+            });
+
+            await sendResponse({
+              requestId, type, success: true,
+              data: result,
+              timestamp: Date.now(),
+            });
+          }
           return true;
         }
 
