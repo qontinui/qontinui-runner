@@ -261,11 +261,281 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "no-run-selected",
+        "name": "No Run Selected",
+        "description": "The RunSelectionContext is present but no run has been chosen. The page shows an Activity icon and guidance text prompting the user to select a run from the Run Dashboard.",
+        "elements": [
+          { "textContains": "No Run Selected" },
+          { "textContains": "Select a run from the Run Dashboard" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-run-selected-to-empty",
+            "name": "User selects a run that has no findings",
+            "activateStates": ["empty"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "no-run-selected-to-findings-displayed",
+            "name": "User selects a run that has findings",
+            "activateStates": ["findings-displayed"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "empty",
+        "name": "Empty — No Findings Yet",
+        "description": "No findings have been detected. The page shows a FileText icon, 'No Findings Yet' heading, and a message encouraging the user to run an AI analysis.",
+        "elements": [
+          { "textContains": "No Findings Yet" },
+          { "textContains": "Run an AI analysis" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-findings-displayed",
+            "name": "Findings arrive from a live analysis or report load",
+            "activateStates": ["findings-displayed"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "empty-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "findings-displayed",
+        "name": "Findings Displayed — Categories and Actions Visible",
+        "description": "Findings are loaded and displayed. The header shows the report title, status badge, summary statistics (Total, Actionable, Needs Input, Resolved, Info), filter dropdowns (mode, severity, category), Auto-Fix toggle, and action buttons. Below, findings are grouped by category sections.",
+        "elements": [
+          { "textContains": "Execution Report" },
+          { "textContains": "Total" },
+          { "textContains": "All Findings" },
+          { "textContains": "Severity" },
+          { "textContains": "Auto-Fix" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "findings-displayed-to-filters-active",
+            "name": "User selects a mode, severity, or category filter",
+            "activateStates": ["filters-active"],
+            "deactivateStates": ["findings-displayed"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Actionable" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "findings-displayed-to-auto-fix-enabled",
+            "name": "User enables the Auto-Fix toggle",
+            "activateStates": ["auto-fix-enabled"],
+            "deactivateStates": ["findings-displayed"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Auto-Fix" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "findings-displayed-to-fixing-in-progress",
+            "name": "User clicks Fix All to bulk-fix auto-fixable findings",
+            "activateStates": ["fixing-in-progress"],
+            "deactivateStates": ["findings-displayed"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Fix All" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "findings-displayed-to-empty",
+            "name": "User clicks Clear to remove all findings",
+            "activateStates": ["empty"],
+            "deactivateStates": ["findings-displayed"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Clear" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "findings-displayed-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["findings-displayed"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "filters-active",
+        "name": "Filters Active — Filtered Findings View",
+        "description": "One or more filters are applied (mode, severity, or category). The active filter count badge and Clear button are visible. Category sections show filtered subsets with 'N of M' counts.",
+        "elements": [
+          { "textContains": "Clear" },
+          { "textContains": "Total" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "filters-active-to-findings-displayed",
+            "name": "User clears all filters",
+            "activateStates": ["findings-displayed"],
+            "deactivateStates": ["filters-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Clear" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "filters-active-to-fixing-in-progress",
+            "name": "User clicks Fix All while filters are active",
+            "activateStates": ["fixing-in-progress"],
+            "deactivateStates": ["filters-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Fix All" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "filters-active-to-empty",
+            "name": "User clears all findings while filters are active",
+            "activateStates": ["empty"],
+            "deactivateStates": ["filters-active"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "filters-active-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["filters-active"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "auto-fix-enabled",
+        "name": "Auto-Fix Enabled",
+        "description": "The Auto-Fix toggle is active. The toggle button shows a blue highlighted state indicating AI will automatically fix eligible issues. The rest of the findings display remains visible.",
+        "elements": [
+          { "textContains": "Auto-Fix" },
+          { "textContains": "Total" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "auto-fix-enabled-to-findings-displayed",
+            "name": "User disables the Auto-Fix toggle",
+            "activateStates": ["findings-displayed"],
+            "deactivateStates": ["auto-fix-enabled"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Auto-Fix" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "auto-fix-enabled-to-fixing-in-progress",
+            "name": "User clicks Fix All while auto-fix is enabled",
+            "activateStates": ["fixing-in-progress"],
+            "deactivateStates": ["auto-fix-enabled"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Fix All" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "auto-fix-enabled-to-no-run-selected",
+            "name": "User deselects the current run",
+            "activateStates": ["no-run-selected"],
+            "deactivateStates": ["auto-fix-enabled"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "fixing-in-progress",
+        "name": "Fixing In Progress — Bulk Fix Running",
+        "description": "The Fix All bulk operation is running. The Fix All button shows a spinner and 'Fixing...' text. The button is disabled to prevent duplicate submissions. Findings remain visible underneath.",
+        "elements": [
+          { "textContains": "Fixing..." }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "fixing-in-progress-to-findings-displayed",
+            "name": "Bulk fix completes successfully or with errors",
+            "activateStates": ["findings-displayed"],
+            "deactivateStates": ["fixing-in-progress"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "fixing-in-progress-to-empty",
+            "name": "Bulk fix resolves all findings",
+            "activateStates": ["empty"],
+            "deactivateStates": ["fixing-in-progress"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ExecutionReport",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/runs/findings",
     "elementSource": "sdk",
     "tags": ["run-findings", "execution-report", "issues", "auto-fix", "observe"]

@@ -1148,11 +1148,122 @@
       ]
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "loading",
+        "name": "Loading",
+        "description": "Dashboard is fetching LLM analytics data. Shows a centered spinning RefreshCw icon with no other content visible.",
+        "elements": [{ "textContains": "animate-spin" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-dashboard",
+            "name": "Data loaded successfully",
+            "activateStates": ["dashboard"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": [{ "action": "wait", "target": { "textContent": "LLM Analytics" }, "waitAfter": { "type": "idle", "timeout": 5000 } }]
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Data fetch failed",
+            "activateStates": ["error"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": [{ "action": "wait", "target": { "textContent": "Failed to load LLM analytics" }, "waitAfter": { "type": "idle", "timeout": 5000 } }]
+          },
+          {
+            "id": "loading-to-empty",
+            "name": "No data exists",
+            "activateStates": ["empty"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": [{ "action": "wait", "target": { "textContent": "No LLM usage data available" }, "waitAfter": { "type": "idle", "timeout": 5000 } }]
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error",
+        "description": "Data fetch failed. Shows AlertTriangle icon, error message, and a Retry button.",
+        "elements": [{ "textContent": "Failed to load LLM analytics" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "Retry loading",
+            "activateStates": ["loading"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": [{ "action": "click", "target": { "role": "button", "textContent": "Retry" }, "waitAfter": { "type": "idle", "timeout": 2000 } }]
+          }
+        ]
+      },
+      {
+        "id": "empty",
+        "name": "Empty",
+        "description": "No LLM usage data available. Shows CreditCard icon and guidance text prompting the user to run workflows.",
+        "elements": [{ "textContent": "No LLM usage data available" }],
+        "isInitial": false,
+        "transitions": []
+      },
+      {
+        "id": "dashboard",
+        "name": "Dashboard",
+        "description": "Full analytics view with summary cards, Cost Over Time chart, Cost by Model chart, Cost Trend chart, Cost by Phase chart, Provider Latency chart, and Task Run Cost table. Time range selector and refresh button in the header.",
+        "elements": [{ "textContent": "LLM Analytics" }, { "accessibleName": "Select time range" }, { "textContent": "Total Cost" }, { "textContent": "Cost Over Time" }, { "textContent": "Task Run Costs" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "dashboard-select-1d",
+            "name": "Select Last 24 hours time range",
+            "activateStates": ["dashboard"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [{ "action": "select", "target": { "accessibleName": "Select time range" }, "value": "1d", "waitAfter": { "type": "idle", "timeout": 3000 } }]
+          },
+          {
+            "id": "dashboard-select-7d",
+            "name": "Select Last 7 days time range",
+            "activateStates": ["dashboard"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [{ "action": "select", "target": { "accessibleName": "Select time range" }, "value": "7d", "waitAfter": { "type": "idle", "timeout": 3000 } }]
+          },
+          {
+            "id": "dashboard-select-30d",
+            "name": "Select Last 30 days time range",
+            "activateStates": ["dashboard"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [{ "action": "select", "target": { "accessibleName": "Select time range" }, "value": "30d", "waitAfter": { "type": "idle", "timeout": 3000 } }]
+          },
+          {
+            "id": "dashboard-select-all",
+            "name": "Select All time range",
+            "activateStates": ["dashboard"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [{ "action": "select", "target": { "accessibleName": "Select time range" }, "value": "all", "waitAfter": { "type": "idle", "timeout": 3000 } }]
+          },
+          {
+            "id": "dashboard-refresh",
+            "name": "Refresh all analytics data",
+            "activateStates": ["dashboard"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [{ "action": "click", "target": { "accessibleName": "Refresh analytics" }, "waitAfter": { "type": "idle", "timeout": 3000 } }]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "LlmObservabilityDashboard",
     "author": "opik-integration",
     "createdAt": "2026-03-26T00:00:00.000Z",
-    "updatedAt": "2026-03-26T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/llm-analytics",
     "elementSource": "sdk",
     "specType": "semantic",

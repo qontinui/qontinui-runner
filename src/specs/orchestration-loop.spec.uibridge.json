@@ -938,6 +938,202 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "idle",
+        "name": "Idle — Config Form Visible",
+        "description": "No loop is running. The config form is displayed with mode selection (Simple/Pipeline), common controls (Between, Max, Target), behavioral checkboxes, and the Run Loop button. The header shows Library and Save buttons. Favorite quick-load buttons may appear below the header if any configs are favorited.",
+        "elements": [
+          { "textContent": "Run Loop" },
+          { "textContent": "Simple" },
+          { "textContent": "Pipeline" },
+          { "textContains": "Between" },
+          { "textContains": "Max" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "idle-to-configuring",
+            "name": "Open saved configurations library",
+            "activateStates": ["configuring"],
+            "deactivateStates": ["idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Library" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "idle-to-running",
+            "name": "Start the orchestration loop",
+            "activateStates": ["running"],
+            "deactivateStates": ["idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Run Loop" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "configuring",
+        "name": "Configuring — Library Panel Open",
+        "description": "The saved configurations library panel is open, showing a 'Saved Configurations' heading with a count and list of saved configs. Each entry shows name, mode, and last updated date. The config form remains visible behind the library panel. Users can load, overwrite, favorite, or delete configs.",
+        "elements": [
+          { "textContent": "Saved Configurations" },
+          { "textContent": "Run Loop" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "configuring-to-idle",
+            "name": "Close the library panel",
+            "activateStates": ["idle"],
+            "deactivateStates": ["configuring"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContains": "Library" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "configuring-to-running",
+            "name": "Start the loop while library is open",
+            "activateStates": ["running"],
+            "deactivateStates": ["configuring"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Run Loop" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "running",
+        "name": "Running — Loop Executing Iterations",
+        "description": "The orchestration loop is actively executing. The config form is hidden and replaced by a progress bar showing iteration count (e.g., '2/5') and a colored fill. A phase badge in the header shows the current sub-phase: running workflow (blue), building workflow (yellow), diagnosing (teal), reflecting (purple), implementing fixes (orange), waiting for fixer (cyan), between iterations (purple), evaluating exit (yellow), or waiting for runner (yellow). The header shows a red Stop button and optionally a yellow Signal button when between-iterations mode is restart_on_signal. The iteration history table accumulates results as iterations complete.",
+        "elements": [
+          { "textContent": "Stop" },
+          { "textContent": "Iteration History" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "running-to-completed",
+            "name": "Loop finishes all iterations or exit condition met (automatic)",
+            "activateStates": ["completed"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "running-to-error",
+            "name": "Loop encounters an unrecoverable error (automatic)",
+            "activateStates": ["error"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "running-to-idle",
+            "name": "User stops the loop manually",
+            "activateStates": ["idle"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Stop" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "completed",
+        "name": "Completed — Loop Finished Successfully",
+        "description": "The loop has completed all iterations or the exit condition was met. The phase badge shows 'complete' in green. The progress bar is at 100% with green fill. The iteration history table shows all completed iteration results. The config form reappears, allowing the user to start a new loop.",
+        "elements": [
+          { "textContent": "Run Loop" },
+          { "textContent": "Iteration History" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "completed-to-idle",
+            "name": "User modifies form to prepare a new loop run",
+            "activateStates": ["idle"],
+            "deactivateStates": ["completed"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "completed-to-running",
+            "name": "Start a new loop run after completion",
+            "activateStates": ["running"],
+            "deactivateStates": ["completed"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Run Loop" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error — Loop Failed",
+        "description": "The loop encountered an error. The phase badge shows 'error' in red. An error message appears in a red-bordered container with the error details. The config form reappears, allowing the user to correct settings and retry.",
+        "elements": [
+          { "textContent": "Run Loop" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-idle",
+            "name": "User modifies form to prepare a retry",
+            "activateStates": ["idle"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "error-to-running",
+            "name": "Retry the loop after fixing configuration",
+            "activateStates": ["running"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Run Loop" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "OrchestrationLoopPanel",
     "pageUrl": "/orchestration-loop",

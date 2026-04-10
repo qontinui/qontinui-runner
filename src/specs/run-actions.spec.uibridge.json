@@ -166,11 +166,145 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "loading",
+        "name": "Loading — Fetching Action Log",
+        "description": "Action log data is being fetched for the selected run. A spinner and 'Loading action log...' text are displayed. No table or empty message is visible.",
+        "elements": [
+          { "textContains": "Loading action log" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-actions-loaded",
+            "name": "Action log data loads with actions present",
+            "activateStates": ["actions-loaded"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-empty",
+            "name": "Action log data loads but contains no actions",
+            "activateStates": ["empty"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Action log data fails to load",
+            "activateStates": ["error"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error — Failed to Load Action Log",
+        "description": "An error occurred while fetching action log data. A red alert icon and the error message are displayed.",
+        "elements": [
+          { "textContains": "Error:" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "User selects a different run, triggering a reload",
+            "activateStates": ["loading"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "empty",
+        "name": "Empty — No Actions Recorded",
+        "description": "The selected run has no GUI actions. A Zap icon and 'No actions recorded for this run' message are displayed.",
+        "elements": [
+          { "textContains": "No actions recorded for this run" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-loading",
+            "name": "User selects a different run, triggering a reload",
+            "activateStates": ["loading"],
+            "deactivateStates": ["empty"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "actions-loaded",
+        "name": "Actions Loaded — Table Visible",
+        "description": "Action log data has loaded with one or more actions. The level filter dropdown, action table with columns (Level, Action Type, Target, Result, Active States, Timestamp, Duration), and action rows are visible. Rows can be expanded or collapsed via toggle buttons.",
+        "elements": [
+          { "textContains": "Max Level:" },
+          { "textContains": "Action Type" },
+          { "textContains": "Target" },
+          { "textContains": "Result" },
+          { "textContains": "Timestamp" },
+          { "textContains": "Duration" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "actions-loaded-to-loading",
+            "name": "User selects a different run, triggering a reload",
+            "activateStates": ["loading"],
+            "deactivateStates": ["actions-loaded"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "actions-loaded-to-action-detail",
+            "name": "User clicks an action row to view its detail",
+            "activateStates": ["action-detail"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "row" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "action-detail",
+        "name": "Action Detail — Modal Open",
+        "description": "A modal is open showing detailed information about a single action, including screenshots, coordinates, and full execution context. The action table remains visible behind the modal.",
+        "elements": [
+          { "role": "dialog" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "action-detail-to-actions-loaded",
+            "name": "User closes the action detail modal",
+            "activateStates": ["actions-loaded"],
+            "deactivateStates": ["action-detail"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "RunActionsTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/runs/actions",
     "elementSource": "sdk",
     "tags": ["run-actions", "gui-automation", "dev-only", "debugging", "observe"]

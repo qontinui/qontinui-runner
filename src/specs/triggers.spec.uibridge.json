@@ -200,11 +200,69 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "trigger-list",
+        "name": "Trigger List",
+        "description": "The All Triggers sub-tab is active showing the list of configured triggers with per-trigger actions (toggle, test, edit, delete, view history). The header displays system status and New Trigger / Refresh buttons.",
+        "elements": [{ "textContent": "No triggers configured" }],
+        "isInitial": true,
+        "transitions": [
+          { "id": "list-to-history", "name": "Switch to History sub-tab", "activateStates": ["trigger-history-no-selection"], "deactivateStates": ["trigger-list"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "History" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
+          { "id": "list-to-editor-create", "name": "Open New Trigger editor", "activateStates": ["trigger-editor"], "deactivateStates": ["trigger-list"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "New Trigger" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
+          { "id": "list-to-test-result", "name": "Test a trigger and view result", "activateStates": ["trigger-test-result"], "deactivateStates": [], "staysVisible": true, "process": [{ "action": "click", "target": { "textContent": "Test" }, "waitAfter": { "type": "idle", "timeout": 3000 } }] },
+          { "id": "list-to-history-for-trigger", "name": "View history for a specific trigger", "activateStates": ["trigger-history-active"], "deactivateStates": ["trigger-list"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "History" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+        ]
+      },
+      {
+        "id": "trigger-history-no-selection",
+        "name": "History (No Selection)",
+        "description": "The History sub-tab is active but no trigger has been selected, showing a prompt to select a trigger first.",
+        "elements": [{ "textContent": "No trigger selected" }],
+        "isInitial": false,
+        "transitions": [
+          { "id": "history-nosel-to-list", "name": "Switch to All Triggers sub-tab", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-history-no-selection"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContains": "All Triggers" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+        ]
+      },
+      {
+        "id": "trigger-history-active",
+        "name": "History (Trigger Selected)",
+        "description": "The History sub-tab shows execution history for a selected trigger with action filter dropdown and timestamped entries.",
+        "elements": [{ "textContent": "Filter:" }],
+        "isInitial": false,
+        "transitions": [
+          { "id": "history-active-to-list", "name": "Switch to All Triggers sub-tab", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-history-active"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContains": "All Triggers" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] }
+        ]
+      },
+      {
+        "id": "trigger-editor",
+        "name": "Trigger Editor",
+        "description": "The trigger editor form is open for creating a new trigger or editing an existing one. Shows form fields for name, description, workflow, trigger type, and type-specific configuration. Cancel and Save/Create/Update buttons in the header.",
+        "elements": [{ "textContent": "Cancel" }, { "textContent": "Name *" }],
+        "isInitial": false,
+        "transitions": [
+          { "id": "editor-to-list-cancel", "name": "Cancel editing and return to list", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-editor"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "Cancel" }, "waitAfter": { "type": "idle", "timeout": 2000 } }] },
+          { "id": "editor-to-list-save", "name": "Save trigger and return to list", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-editor"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "Create" }, "waitAfter": { "type": "idle", "timeout": 3000 } }] }
+        ]
+      },
+      {
+        "id": "trigger-test-result",
+        "name": "Test Result Modal",
+        "description": "A modal overlay showing the dry-run test result for a trigger, including whether it would execute, the action, and target workflow.",
+        "elements": [{ "textContent": "Test Result" }],
+        "isInitial": false,
+        "transitions": [
+          { "id": "test-result-to-list", "name": "Close test result modal", "activateStates": ["trigger-list"], "deactivateStates": ["trigger-test-result"], "staysVisible": false, "process": [{ "action": "click", "target": { "textContent": "Close" }, "waitAfter": { "type": "idle", "timeout": 1000 } }] }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "TriggersTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/triggers",
     "elementSource": "sdk",
     "tags": ["triggers", "event-driven", "automation", "webhooks", "dev-only", "runner-only"]

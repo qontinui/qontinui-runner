@@ -520,5 +520,196 @@
       "Tauri: get_activity_timeline_stats() -> Vec<{sourceType, captureMode, count, latestCapture}>",
       "Tauri: insert_activity_entry(input) -> i64 (called by BackgroundObserver, not by this page)"
     ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "at-idle",
+        "name": "Idle — Ready for Search",
+        "description": "Default state after page load. Search input is visible with placeholder, Search button is disabled (no query text), no results or empty-state message shown. Filter panel is hidden.",
+        "elements": [
+          { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+          { "tagName": "button", "accessibleName": "Load capture statistics" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "idle-to-searching",
+            "name": "Submit a search query",
+            "description": "Type a query into the search input and press Enter or click the Search button",
+            "activateStates": ["at-searching"],
+            "deactivateStates": ["at-idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "params": { "text": "login button", "clear": true }
+              },
+              {
+                "action": "sendKeys",
+                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "params": { "keys": [{ "key": "Enter" }] },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          },
+          {
+            "id": "idle-to-filters-open",
+            "name": "Open filter panel",
+            "description": "Click the filter toggle button to reveal the app name and source type filters",
+            "activateStates": ["at-filters-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "tagName": "button", "accessibleName": "Toggle filter panel" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "idle-to-stats-loaded",
+            "name": "Load capture statistics",
+            "description": "Click the stats button to fetch and display aggregate capture counts",
+            "activateStates": ["at-stats-loaded"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "tagName": "button", "accessibleName": "Load capture statistics" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "at-searching",
+        "name": "Searching — Query In Progress",
+        "description": "A search is in-flight. The Search button shows 'Searching...' and is disabled. Results area may be empty or showing previous results.",
+        "elements": [
+          { "role": "button", "textContent": "Searching..." }
+        ],
+        "transitions": [
+          {
+            "id": "searching-to-results",
+            "name": "Search returns results",
+            "description": "The Tauri IPC call completes with one or more matching entries. Result cards appear.",
+            "activateStates": ["at-results"],
+            "deactivateStates": ["at-searching"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "searching-to-empty",
+            "name": "Search returns no results",
+            "description": "The Tauri IPC call completes with zero matches. The empty-state guidance message appears.",
+            "activateStates": ["at-empty"],
+            "deactivateStates": ["at-searching"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "at-results",
+        "name": "Results Displayed",
+        "description": "Search completed with at least one result. Result cards are shown with source badges, timestamps, text previews, and optional URLs.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "tutorial-id": "timeline-results" } }
+        ],
+        "transitions": [
+          {
+            "id": "results-to-searching",
+            "name": "Perform another search",
+            "description": "Modify the query and press Enter or click Search to run a new query",
+            "activateStates": ["at-searching"],
+            "deactivateStates": ["at-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "params": { "text": "error monitor", "clear": true }
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "at-empty",
+        "name": "Empty Results — No Matches",
+        "description": "Search completed but returned zero results. Shows 'No results found. Try a different query.' guidance message.",
+        "elements": [
+          { "textContent": "No results found. Try a different query." }
+        ],
+        "transitions": [
+          {
+            "id": "empty-to-searching",
+            "name": "Try a different query",
+            "description": "Modify the query text and search again",
+            "activateStates": ["at-searching"],
+            "deactivateStates": ["at-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "params": { "text": "button click", "clear": true }
+              },
+              {
+                "action": "sendKeys",
+                "target": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" },
+                "params": { "keys": [{ "key": "Enter" }] },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "at-filters-open",
+        "name": "Filter Panel Visible",
+        "description": "The collapsible filter row is shown, containing an app name text input and a source type dropdown (All sources, UI Bridge, Accessibility, OCR). This state overlays the current search state.",
+        "elements": [
+          { "placeholder": "App name filter" },
+          { "tagName": "select", "accessibleName": "Filter by capture source type" }
+        ],
+        "transitions": [
+          {
+            "id": "filters-to-closed",
+            "name": "Close filter panel",
+            "description": "Click the filter toggle button again to hide the filter row",
+            "activateStates": ["at-idle"],
+            "deactivateStates": ["at-filters-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "tagName": "button", "accessibleName": "Toggle filter panel" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "at-stats-loaded",
+        "name": "Statistics Displayed",
+        "description": "Capture statistics are loaded and shown as colored badges. Each badge shows '{sourceType} ({captureMode}): {count} entries'. This state overlays the current search state.",
+        "elements": [
+          { "textContains": "entries" }
+        ],
+        "transitions": []
+      }
+    ]
   }
 }

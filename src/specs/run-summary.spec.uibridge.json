@@ -353,11 +353,525 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "loading",
+        "name": "Loading — Fetching Recap Data",
+        "description": "Recap data is being fetched. The page shows a pulsing activity icon and 'Loading recap...' text. No run content or tabs are visible.",
+        "elements": [
+          { "textContains": "Loading recap" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-run-loaded",
+            "name": "Recap data loads successfully",
+            "activateStates": ["run-loaded"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Recap data fails to load",
+            "activateStates": ["error"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-no-data",
+            "name": "No recap data available for the selected run",
+            "activateStates": ["no-data"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error — Failed to Load Recap",
+        "description": "An error occurred while fetching recap data. The page shows a red X icon, 'Failed to load recap' heading, and the error message.",
+        "elements": [
+          { "textContains": "Failed to load recap" }
+        ],
+        "isInitial": false,
+        "transitions": []
+      },
+      {
+        "id": "no-data",
+        "name": "No Data — No Run Selected or No Recap",
+        "description": "No recap data is available. The page shows a guidance message prompting the user to select a run or execute a task first.",
+        "elements": [
+          { "textContains": "No Recap Data" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "no-data-to-loading",
+            "name": "User selects a run from the sidebar",
+            "activateStates": ["loading"],
+            "deactivateStates": ["no-data"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "run-loaded",
+        "name": "Run Loaded — Summary and Tabs Visible",
+        "description": "Recap data has loaded. The page displays the compact status strip, AI summary, run details sidebar, and the tabbed content area. The Timeline tab is active by default. Failure section appears when the run has failed.",
+        "elements": [
+          { "textContains": "Timeline" },
+          { "textContains": "Verification" },
+          { "textContains": "Knowledge" },
+          { "textContains": "Context" },
+          { "textContains": "Canvas" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "run-loaded-to-loading",
+            "name": "User selects a different run, triggering a reload",
+            "activateStates": ["loading"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "run-loaded-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "run-loaded-to-tab-verification",
+            "name": "Switch to Verification tab",
+            "activateStates": ["tab-verification"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Verification" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "run-loaded-to-tab-knowledge",
+            "name": "Switch to Knowledge tab",
+            "activateStates": ["tab-knowledge"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Knowledge" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "run-loaded-to-tab-context",
+            "name": "Switch to Context tab",
+            "activateStates": ["tab-context"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Context" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "run-loaded-to-tab-canvas",
+            "name": "Switch to Canvas tab",
+            "activateStates": ["tab-canvas"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Canvas" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "run-loaded-to-tab-durable",
+            "name": "Switch to Diffs & Replay tab",
+            "activateStates": ["tab-durable"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContains": "Diffs" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "run-loaded-to-tab-feedback",
+            "name": "Switch to Feedback Scores tab",
+            "activateStates": ["tab-feedback"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContains": "Feedback Scores" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "run-loaded-to-tab-llm-costs",
+            "name": "Switch to LLM Costs tab",
+            "activateStates": ["tab-llm-costs"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContains": "LLM Costs" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "run-loaded-to-tab-errors",
+            "name": "Switch to Errors tab",
+            "activateStates": ["tab-errors"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContains": "Errors" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "tab-timeline",
+        "name": "Tab — Timeline Active",
+        "description": "The Timeline tab is selected, showing staged or step-by-step execution history grouped by workflow phase.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Timeline" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-timeline-to-tab-verification",
+            "name": "Switch to Verification tab",
+            "activateStates": ["tab-verification"],
+            "deactivateStates": ["tab-timeline"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Verification" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-timeline-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-timeline"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "tab-verification",
+        "name": "Tab — Verification Active",
+        "description": "The Verification tab is selected, showing the verification plan and iteration results with pass/fail details.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Verification" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-verification-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["tab-verification"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-verification-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-verification"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "tab-knowledge",
+        "name": "Tab — Knowledge Active",
+        "description": "The Knowledge tab is selected, showing findings and knowledge entries generated during execution.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Knowledge" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-knowledge-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["tab-knowledge"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-knowledge-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-knowledge"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "tab-context",
+        "name": "Tab — Context Active",
+        "description": "The Context tab is selected, showing variables, retry history, and contextual data from execution.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Context" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-context-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["tab-context"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-context-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-context"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "tab-canvas",
+        "name": "Tab — Canvas Active",
+        "description": "The Canvas tab is selected, showing visual artifacts and canvas-based recap data.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Canvas" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-canvas-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["tab-canvas"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-canvas-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-canvas"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "tab-durable",
+        "name": "Tab — Diffs & Replay Active",
+        "description": "The Diffs & Replay tab is selected, showing durable execution diffs and replay controls.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Diffs" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-durable-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["tab-durable"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-durable-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-durable"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "tab-feedback",
+        "name": "Tab — Feedback Scores Active",
+        "description": "The Feedback Scores tab is selected, showing feedback scoring panel for the run.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Feedback Scores" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-feedback-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["tab-feedback"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-feedback-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-feedback"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "tab-llm-costs",
+        "name": "Tab — LLM Costs Active",
+        "description": "The LLM Costs tab is selected, showing cost breakdown for the run.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "LLM Costs" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-llm-costs-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["tab-llm-costs"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-llm-costs-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-llm-costs"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "tab-errors",
+        "name": "Tab — Errors Active",
+        "description": "The Errors tab is selected, showing the error monitor with categorized errors and severity badges.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Errors" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-errors-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["tab-errors"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-errors-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-errors"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "RunRecapTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-04-02T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/runs/summary",
     "elementSource": "sdk",
     "tags": ["run-summary", "recap", "post-run-analysis", "observe", "pagination", "memory-protection"]

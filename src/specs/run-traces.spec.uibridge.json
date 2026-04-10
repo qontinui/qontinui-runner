@@ -1559,5 +1559,434 @@
     ],
     "apiEndpoints": ["GET /execution-spans?execution_id={id}&order=asc"],
     "specType": "semantic"
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "no-run-selected",
+        "name": "No Run Selected",
+        "description": "No execution ID is set. The page shows a centered prompt asking the user to select a task run.",
+        "elements": [
+          { "textContains": "Select a task run" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-run-to-loading",
+            "name": "User selects a run from the RunSelector dropdown",
+            "activateStates": ["loading"],
+            "deactivateStates": ["no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "loading",
+        "name": "Loading Trace Data",
+        "description": "Trace data is being fetched from the execution_spans API. A centered 'Loading trace data...' message is shown. No views or toolbars are rendered.",
+        "elements": [
+          { "textContains": "Loading trace data" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "loading-to-waterfall",
+            "name": "Trace data loads successfully with spans",
+            "activateStates": ["waterfall-view"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Trace data fetch fails",
+            "activateStates": ["error"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-empty",
+            "name": "Trace data loads but contains zero spans",
+            "activateStates": ["empty-traces"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error State",
+        "description": "Trace data failed to load. A red error message displays 'Failed to load traces:' followed by the error details.",
+        "elements": [
+          { "textContains": "Failed to load traces" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "User selects a different run, triggering a new fetch",
+            "activateStates": ["loading"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "empty-traces",
+        "name": "Empty Traces",
+        "description": "A run is selected but no execution spans exist. The page shows 'No spans to display'.",
+        "elements": [
+          { "textContains": "No spans" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["empty-traces"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "waterfall-view",
+        "name": "Waterfall View Active",
+        "description": "The default trace visualization. The Waterfall tab is highlighted. The toolbar shows filter controls (search, min duration, phase, status). Spans are displayed as horizontal bars on a timeline. The minimap appears above if 10+ spans exist. The PerformanceInsights footer is visible.",
+        "elements": [
+          { "textContent": "Waterfall" },
+          { "textContains": "Search spans" },
+          { "textContains": "All Phases" },
+          { "textContains": "spans" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "waterfall-to-flamechart",
+            "name": "User clicks the Flamechart tab",
+            "activateStates": ["flamechart-view"],
+            "deactivateStates": ["waterfall-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Flamechart" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "waterfall-to-comparison",
+            "name": "User clicks the Comparison tab",
+            "activateStates": ["comparison-view"],
+            "deactivateStates": ["waterfall-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Comparison" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "waterfall-to-agent-graph",
+            "name": "User clicks the Agent Graph tab (only when agent pipeline spans exist)",
+            "activateStates": ["agent-graph-view"],
+            "deactivateStates": ["waterfall-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Agent Graph" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "waterfall-to-replay",
+            "name": "User clicks the Replay button to enter step-through replay mode",
+            "activateStates": ["replay-active"],
+            "deactivateStates": ["waterfall-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Replay" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "waterfall-to-span-detail",
+            "name": "User clicks a span row to open the detail panel",
+            "activateStates": ["span-detail-open"],
+            "deactivateStates": ["waterfall-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "waterfall-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["waterfall-view"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "flamechart-view",
+        "name": "Flamechart View Active",
+        "description": "The Flamechart tab is highlighted. A canvas-based visualization shows gap-collapsed, duration-proportional spans. The toolbar shows filter controls, depth slider, and zoom controls. The minimap appears above if 10+ spans exist.",
+        "elements": [
+          { "tagName": "canvas" },
+          { "textContains": "Depth" },
+          { "textContains": "All Phases" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "flamechart-to-waterfall",
+            "name": "User clicks the Waterfall tab",
+            "activateStates": ["waterfall-view"],
+            "deactivateStates": ["flamechart-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Waterfall" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "flamechart-to-comparison",
+            "name": "User clicks the Comparison tab",
+            "activateStates": ["comparison-view"],
+            "deactivateStates": ["flamechart-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Comparison" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "flamechart-to-agent-graph",
+            "name": "User clicks the Agent Graph tab (only when agent pipeline spans exist)",
+            "activateStates": ["agent-graph-view"],
+            "deactivateStates": ["flamechart-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Agent Graph" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "flamechart-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["flamechart-view"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "comparison-view",
+        "name": "Comparison View Active",
+        "description": "The Comparison tab is highlighted. Two run selector dropdowns (Run A baseline, Run B current) are visible. The filter toolbar is hidden, replaced by comparison-specific filters (name search, min delta, phase). A summary bar shows overall timing differences. Match rows list aligned span pairs with status badges.",
+        "elements": [
+          { "textContains": "Run A (baseline)" },
+          { "textContains": "overall" },
+          { "textContains": "Slower" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "comparison-to-waterfall",
+            "name": "User clicks the Waterfall tab",
+            "activateStates": ["waterfall-view"],
+            "deactivateStates": ["comparison-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Waterfall" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "comparison-to-flamechart",
+            "name": "User clicks the Flamechart tab",
+            "activateStates": ["flamechart-view"],
+            "deactivateStates": ["comparison-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Flamechart" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "comparison-to-agent-graph",
+            "name": "User clicks the Agent Graph tab (only when agent pipeline spans exist)",
+            "activateStates": ["agent-graph-view"],
+            "deactivateStates": ["comparison-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Agent Graph" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "comparison-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["comparison-view"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "agent-graph-view",
+        "name": "Agent Graph View Active",
+        "description": "The Agent Graph tab is highlighted. A ReactFlow-based directed graph shows agent pipeline topology with nodes representing agent roles and edges showing data flow. Only reachable when the trace contains agent pipeline spans.",
+        "elements": [
+          { "textContent": "Agent Graph" },
+          { "role": "group" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "agent-graph-to-waterfall",
+            "name": "User clicks the Waterfall tab",
+            "activateStates": ["waterfall-view"],
+            "deactivateStates": ["agent-graph-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Waterfall" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "agent-graph-to-flamechart",
+            "name": "User clicks the Flamechart tab",
+            "activateStates": ["flamechart-view"],
+            "deactivateStates": ["agent-graph-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Flamechart" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "agent-graph-to-comparison",
+            "name": "User clicks the Comparison tab",
+            "activateStates": ["comparison-view"],
+            "deactivateStates": ["agent-graph-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Comparison" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "agent-graph-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["agent-graph-view"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "replay-active",
+        "name": "Replay Mode Active",
+        "description": "Step-through replay mode is active on top of the Waterfall view. A ReplayController bar with transport controls (skip start, step back, play/pause, step forward, skip end, scrub slider) replaces the PerformanceInsights footer. The ReplayPanel replaces SpanDetailPanel showing step context. The current span has a blue pulsing ring highlight.",
+        "elements": [
+          { "textContent": "Exit Replay" },
+          { "role": "toolbar" },
+          { "textContains": "Step" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "replay-to-waterfall",
+            "name": "User clicks Exit Replay to return to normal waterfall viewing",
+            "activateStates": ["waterfall-view"],
+            "deactivateStates": ["replay-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Exit Replay" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "span-detail-open",
+        "name": "Span Detail Panel Open",
+        "description": "A 280px-wide detail panel is visible on the right side showing the selected span's name, status, phase badge, duration, timestamps, trace/span/parent IDs, error message (if any), and attributes. When critical path is enabled, shows on/off critical path status with slack. For AI session spans, shows Token Usage grid, Tool Calls list, and GenAI Attributes section.",
+        "elements": [
+          { "textContains": "Status" },
+          { "textContent": "\u2715" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "span-detail-to-waterfall",
+            "name": "User clicks the close button or clicks the same span again to deselect",
+            "activateStates": ["waterfall-view"],
+            "deactivateStates": ["span-detail-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "\u2715" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

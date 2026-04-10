@@ -647,5 +647,214 @@
     "component": "CostControlPanel",
     "pageUrl": "cost-control",
     "tags": ["cost-optimization", "budget-tracking", "circuit-breaker", "anomaly-detection", "real-time", "observability"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "cc-loading",
+        "name": "Loading",
+        "description": "Initial loading state: a spinning RefreshCw icon is displayed centered on the page while cost data is being fetched. No dashboard content is visible.",
+        "elements": [
+          { "tagName": "svg" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-idle",
+            "name": "Data loaded (no active run)",
+            "description": "Cost data finishes loading with no active workflow run. Dashboard renders with 'No active run' in the budget gauge area.",
+            "activateStates": ["cc-dashboard-idle"],
+            "deactivateStates": ["cc-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-active",
+            "name": "Data loaded (active run)",
+            "description": "Cost data finishes loading with an active workflow run and budget. Dashboard renders with live budget gauge.",
+            "activateStates": ["cc-dashboard-active"],
+            "deactivateStates": ["cc-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "cc-dashboard-idle",
+        "name": "Dashboard — No Active Run",
+        "description": "Full dashboard visible: header with 'Cost Control' title, four summary metric cards (Total Cost, Total Tokens, Cache Hit Rate, Cache Savings), budget gauge showing 'No active run', phase breakdown chart, circuit breaker in 'Closed' state with 'No active budget', cost event feed table, and optimization recommendations section. No budget warning banner is shown.",
+        "elements": [
+          { "textContains": "No active run" },
+          { "textContains": "No active budget" }
+        ],
+        "transitions": [
+          {
+            "id": "idle-refresh",
+            "name": "Refresh cost data",
+            "description": "Click the Refresh button to manually reload dashboard summary and budget status queries.",
+            "activateStates": ["cc-dashboard-idle"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh cost data", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "idle-to-active",
+            "name": "Workflow run starts",
+            "description": "A workflow run begins, activating a budget. The budget gauge transitions from 'No active run' to showing utilization percentage and cost amounts.",
+            "activateStates": ["cc-dashboard-active"],
+            "deactivateStates": ["cc-dashboard-idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh cost data", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cc-dashboard-active",
+        "name": "Dashboard — Active Run",
+        "description": "Full dashboard with live budget tracking: header, summary cards updating via events, budget gauge showing utilization percentage with color-coded arc (green <60%, yellow 60-80%, red >80%), cost amounts ('$X.XX / $Y.YY'), remaining percentage, phase breakdown chart, circuit breaker status (Closed), anomaly feed, live cost event feed table with newest events at top, and recommendations.",
+        "elements": [
+          { "textContains": "Anomaly samples" },
+          { "textContent": "Closed" }
+        ],
+        "transitions": [
+          {
+            "id": "active-refresh",
+            "name": "Refresh cost data",
+            "description": "Click the Refresh button to manually reload dashboard and budget data during an active run.",
+            "activateStates": ["cc-dashboard-active"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh cost data", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "active-to-warning",
+            "name": "Budget warning fires",
+            "description": "Budget exceeds 80% utilization, triggering a yellow warning banner at the top of the page with remaining percentage and cost amounts.",
+            "activateStates": ["cc-budget-warning"],
+            "deactivateStates": ["cc-dashboard-active"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "active-to-tripped",
+            "name": "Circuit breaker trips",
+            "description": "Budget exceeded or anomaly detected causes the circuit breaker to trip. The Circuit Breaker card switches from green 'Closed' to red 'Tripped' badge.",
+            "activateStates": ["cc-circuit-tripped"],
+            "deactivateStates": ["cc-dashboard-active"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "active-to-idle",
+            "name": "Run completes",
+            "description": "The active workflow run finishes. Budget gauge reverts to 'No active run' on next refresh.",
+            "activateStates": ["cc-dashboard-idle"],
+            "deactivateStates": ["cc-dashboard-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh cost data", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cc-budget-warning",
+        "name": "Budget Warning Visible",
+        "description": "Active run dashboard with a yellow budget warning banner at the top. Banner shows AlertTriangle icon, 'Budget Warning - N% remaining', warning message, cost display '$X.XX / $Y.YY', and a dismiss button. Multiple warnings show '+N more warnings' text.",
+        "elements": [
+          { "textContains": "Budget Warning" },
+          { "accessibleName": "Dismiss warning", "role": "button" }
+        ],
+        "transitions": [
+          {
+            "id": "warning-dismiss",
+            "name": "Dismiss warning banner",
+            "description": "Click the dismiss button (X icon) to hide the budget warning banner for the current session.",
+            "activateStates": ["cc-dashboard-active"],
+            "deactivateStates": ["cc-budget-warning"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Dismiss warning", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "warning-to-tripped",
+            "name": "Circuit breaker trips while warning visible",
+            "description": "Budget exceeded triggers circuit breaker trip while the warning banner is still visible.",
+            "activateStates": ["cc-circuit-tripped"],
+            "deactivateStates": ["cc-budget-warning"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "cc-circuit-tripped",
+        "name": "Circuit Breaker Tripped",
+        "description": "Dashboard showing a tripped circuit breaker: the Circuit Breaker card displays a red ShieldAlert icon with 'Tripped' danger badge and 'Budget exceeded or anomaly detected' message. Budget gauge shows high utilization (red). Anomaly feed may contain recent entries. Warning banner may also be visible.",
+        "elements": [
+          { "textContent": "Tripped" },
+          { "textContains": "Budget exceeded or anomaly detected" }
+        ],
+        "transitions": [
+          {
+            "id": "tripped-refresh",
+            "name": "Refresh after trip",
+            "description": "Click Refresh to reload data. If the run ended or breaker recovered, state may change.",
+            "activateStates": ["cc-circuit-tripped"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh cost data", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "tripped-to-idle",
+            "name": "Run ends after trip",
+            "description": "The workflow run finishes after a circuit breaker trip. On refresh, the dashboard returns to idle state.",
+            "activateStates": ["cc-dashboard-idle"],
+            "deactivateStates": ["cc-circuit-tripped"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh cost data", "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

@@ -1018,6 +1018,328 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "ke-search-empty",
+        "name": "Search Tab — Empty State",
+        "description": "The Search tab is active with no search performed yet. The mode selector shows three buttons (Web Search active by default), the search input is empty with placeholder text, and the results area displays a centered FileSearch icon with 'Enter a search query to explore knowledge'.",
+        "elements": [
+          { "textContains": "Enter a search query" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "empty-to-loading",
+            "name": "Submit search query",
+            "description": "User types at least 2 characters and clicks Search or presses Enter. The empty state disappears and a loading spinner appears on the Search button.",
+            "activateStates": ["ke-search-loading"],
+            "deactivateStates": ["ke-search-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Web Search" }
+              },
+              {
+                "action": "fill",
+                "target": { "role": "textbox", "placeholder": "Search the web for anything..." },
+                "value": "test query"
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "empty-to-stats",
+            "name": "Switch to Stats tab",
+            "description": "User clicks the Stats tab button. The search content is replaced by the stats dashboard.",
+            "activateStates": ["ke-stats-loading"],
+            "deactivateStates": ["ke-search-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stats" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ke-search-loading",
+        "name": "Search Tab — Loading",
+        "description": "A search request is in progress. The Search button shows a spinning Loader2 icon and is disabled. The results area may still show the previous state (empty, results, or no-results) until the response arrives.",
+        "elements": [
+          { "role": "textbox" }
+        ],
+        "transitions": [
+          {
+            "id": "loading-to-results",
+            "name": "Search returns results",
+            "description": "The API responds with one or more results. Result cards appear with provider badges, relevance scores, and a result count summary line.",
+            "activateStates": ["ke-search-results"],
+            "deactivateStates": ["ke-search-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-no-results",
+            "name": "Search returns zero results",
+            "description": "The API responds successfully but with an empty results array. The 'No results found' message is displayed.",
+            "activateStates": ["ke-search-no-results"],
+            "deactivateStates": ["ke-search-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Search fails",
+            "description": "The API call fails with a network or server error. A red error banner with AlertCircle icon appears at the top of the results area.",
+            "activateStates": ["ke-search-error"],
+            "deactivateStates": ["ke-search-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "ke-search-results",
+        "name": "Search Tab — Results Displayed",
+        "description": "The Search tab shows search results as cards. A summary line above shows the result count and provider attribution (e.g., 'via DuckDuckGo, Tavily'). Each result card has a provider-colored icon, title, provider badge, optional relevance score, optional CVSS badge, and expandable content.",
+        "elements": [
+          { "textContains": "result" },
+          { "textContains": "via" }
+        ],
+        "transitions": [
+          {
+            "id": "results-to-loading",
+            "name": "Submit another search",
+            "description": "User modifies the query or switches mode and submits again. Loading spinner replaces the search icon on the button while the new request is pending.",
+            "activateStates": ["ke-search-loading"],
+            "deactivateStates": ["ke-search-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": { "role": "textbox" },
+                "value": "new query"
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "results-to-stats",
+            "name": "Switch to Stats tab",
+            "description": "User clicks the Stats tab to view updated statistics after a search. Stats should reflect the incremented total_searches count.",
+            "activateStates": ["ke-stats-loading"],
+            "deactivateStates": ["ke-search-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stats" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ke-search-no-results",
+        "name": "Search Tab — No Results",
+        "description": "The Search tab after a search that returned zero results. The results area shows a centered FileSearch icon with 'No results found' text. No error banner is present.",
+        "elements": [
+          { "textContains": "No results found" }
+        ],
+        "transitions": [
+          {
+            "id": "no-results-to-loading",
+            "name": "Submit another search",
+            "description": "User enters a different query and submits. The no-results message is replaced as a new search begins.",
+            "activateStates": ["ke-search-loading"],
+            "deactivateStates": ["ke-search-no-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": { "role": "textbox" },
+                "value": "different query"
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "no-results-to-stats",
+            "name": "Switch to Stats tab",
+            "description": "User clicks the Stats tab.",
+            "activateStates": ["ke-stats-loading"],
+            "deactivateStates": ["ke-search-no-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stats" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ke-search-error",
+        "name": "Search Tab — Error",
+        "description": "The Search tab after a failed search. A red error banner with AlertCircle icon and the error message is displayed at the top of the results area. The results list is empty.",
+        "elements": [
+          { "role": "button", "textContent": "Vuln Search" }
+        ],
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "Retry or submit new search",
+            "description": "User modifies the query and submits again. The error banner remains visible until new results arrive or another error replaces it.",
+            "activateStates": ["ke-search-loading"],
+            "deactivateStates": ["ke-search-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "fill",
+                "target": { "role": "textbox" },
+                "value": "retry query"
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "error-to-stats",
+            "name": "Switch to Stats tab",
+            "description": "User clicks the Stats tab to check provider availability after an error.",
+            "activateStates": ["ke-stats-loading"],
+            "deactivateStates": ["ke-search-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stats" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ke-stats-loading",
+        "name": "Stats Tab — Loading",
+        "description": "The Stats tab is active and knowledge stats are being fetched. The KnowledgeStatsWidget shows a spinning Loader2 icon with 'Loading knowledge stats...' in muted text.",
+        "elements": [
+          { "textContains": "Loading knowledge stats" }
+        ],
+        "transitions": [
+          {
+            "id": "stats-loading-to-loaded",
+            "name": "Stats data loaded",
+            "description": "The stats API responds successfully. The dashboard renders with Knowledge Acquisition header, stat counters, active providers, and the Provider Availability grid.",
+            "activateStates": ["ke-stats-loaded"],
+            "deactivateStates": ["ke-stats-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "stats-loading-to-unavailable",
+            "name": "Stats API unavailable",
+            "description": "The stats API fails. The widget shows 'Knowledge stats unavailable' placeholder. The Provider Availability grid may still load independently.",
+            "activateStates": ["ke-stats-unavailable"],
+            "deactivateStates": ["ke-stats-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "stats-loading-to-search",
+            "name": "Switch to Search tab",
+            "description": "User clicks the Search tab before stats finish loading.",
+            "activateStates": ["ke-search-empty"],
+            "deactivateStates": ["ke-stats-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ke-stats-loaded",
+        "name": "Stats Tab — Dashboard Loaded",
+        "description": "The Stats tab displays the full dashboard: Knowledge Acquisition header with Brain icon and uptime, a 2x2 grid of stat cells (Total Searches, Cache Hit Rate, Results Stored, Cache Hits), Active Providers section with success/query badges, and the Provider Availability grid with green/gray dots for each provider.",
+        "elements": [
+          { "textContains": "Knowledge Acquisition" },
+          { "textContains": "Total Searches" },
+          { "textContains": "Provider Availability" }
+        ],
+        "transitions": [
+          {
+            "id": "stats-to-search",
+            "name": "Switch to Search tab",
+            "description": "User clicks the Search tab. The stats dashboard is hidden and the search interface is shown, preserving any previous search query and results.",
+            "activateStates": ["ke-search-empty"],
+            "deactivateStates": ["ke-stats-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ke-stats-unavailable",
+        "name": "Stats Tab — Unavailable",
+        "description": "The Stats tab when the stats API is unreachable. The KnowledgeStatsWidget shows a Brain icon and 'Knowledge stats unavailable' in muted text. The Provider Availability grid may still be visible if that API responded independently.",
+        "elements": [
+          { "textContains": "stats unavailable" }
+        ],
+        "transitions": [
+          {
+            "id": "unavailable-to-search",
+            "name": "Switch to Search tab",
+            "description": "User clicks the Search tab to try searching despite stats being unavailable.",
+            "activateStates": ["ke-search-empty"],
+            "deactivateStates": ["ke-stats-unavailable"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "KnowledgeExplorerPage",
     "pageUrl": "/knowledge-explorer",

@@ -471,6 +471,261 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "wf-ai-generate",
+        "name": "AI Generate Panel — Default Landing",
+        "description": "The default state when no workflow is loaded. Shows the AI generation panel with a prompt textarea, spec source section, context attachments, provider/model selectors, and Generate / Generate & Run buttons. The phase editor is not visible.",
+        "elements": [
+          { "textContent": "Generate Workflow with AI" },
+          { "role": "button", "textContent": "Generate" },
+          { "textContent": "Generate & Run" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "ai-generate-to-phase-editor",
+            "name": "Generate workflow or create manually",
+            "description": "User clicks Generate, Generate & Run, or Create Manually to produce a workflow with steps, transitioning to the phase editor",
+            "activateStates": ["wf-phase-editor"],
+            "deactivateStates": ["wf-ai-generate"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Generate" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          },
+          {
+            "id": "ai-generate-to-phase-editor-via-sidebar",
+            "name": "Select existing workflow from sidebar",
+            "description": "User clicks a saved workflow in the sidebar library, loading it into the editor",
+            "activateStates": ["wf-phase-editor"],
+            "deactivateStates": ["wf-ai-generate"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "wf-phase-editor",
+        "name": "Phase Editor — Multi-Phase Workflow Editing",
+        "description": "The main editing state when a workflow with steps is loaded. Shows the four phase sections (Setup, Verification, Agentic, Completion), the stage selector tab bar, toolbar with Save/Run/Export, and the sidebar library. Settings and Constraints panels are hidden.",
+        "elements": [
+          { "textContent": "Setup" },
+          { "textContent": "Verification" },
+          { "textContent": "Agentic" },
+          { "textContent": "Completion" },
+          { "role": "button", "textContent": "Save" },
+          { "role": "button", "textContent": "Run" }
+        ],
+        "transitions": [
+          {
+            "id": "phase-editor-to-settings",
+            "name": "Open settings panel",
+            "description": "User clicks the gear icon button in the toolbar to reveal the settings panel above the phase editor",
+            "activateStates": ["wf-settings-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Settings" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "phase-editor-to-constraints",
+            "name": "Open constraints panel",
+            "description": "User clicks the shield icon button in the toolbar to reveal the constraints panel",
+            "activateStates": ["wf-constraints-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Constraints" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "phase-editor-to-step-config",
+            "name": "Select a step to configure",
+            "description": "User clicks on a step within any phase section, opening the step configuration side panel on the right",
+            "activateStates": ["wf-step-config-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": []
+          },
+          {
+            "id": "phase-editor-to-executing",
+            "name": "Run workflow",
+            "description": "User clicks the Run button to execute the workflow, showing the execution status bar",
+            "activateStates": ["wf-executing"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Run" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "phase-editor-to-ai-generate",
+            "name": "Reset to new (empty) workflow",
+            "description": "User clicks New in the sidebar to clear the editor back to the AI generate panel",
+            "activateStates": ["wf-ai-generate"],
+            "deactivateStates": ["wf-phase-editor"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "wf-settings-open",
+        "name": "Settings Panel — Workflow Configuration",
+        "description": "The settings panel is expanded above the phase editor, showing workflow name, description, provider/model selection, max iterations, reflection toggle, and other execution options. The phase editor remains visible beneath. Constraints panel is hidden (mutually exclusive).",
+        "elements": [
+          { "textContent": "Name" },
+          { "textContent": "Max Iterations" },
+          { "textContent": "Reflection" }
+        ],
+        "transitions": [
+          {
+            "id": "settings-to-phase-editor",
+            "name": "Close settings panel",
+            "description": "User clicks the gear icon again to collapse the settings panel, returning to the plain phase editor",
+            "activateStates": ["wf-phase-editor"],
+            "deactivateStates": ["wf-settings-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Settings" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "settings-to-constraints",
+            "name": "Switch to constraints panel",
+            "description": "User clicks the shield icon to close settings and open constraints (mutually exclusive panels)",
+            "activateStates": ["wf-constraints-open"],
+            "deactivateStates": ["wf-settings-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Constraints" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "wf-constraints-open",
+        "name": "Constraints Panel — Execution Constraints",
+        "description": "The constraints panel is expanded, showing constraint configuration for the workflow. Settings panel is hidden (mutually exclusive). The phase editor remains visible beneath.",
+        "elements": [
+          { "role": "button", "accessibleName": "Constraints" }
+        ],
+        "transitions": [
+          {
+            "id": "constraints-to-phase-editor",
+            "name": "Close constraints panel",
+            "description": "User clicks the shield icon again to collapse the constraints panel",
+            "activateStates": ["wf-phase-editor"],
+            "deactivateStates": ["wf-constraints-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Constraints" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "constraints-to-settings",
+            "name": "Switch to settings panel",
+            "description": "User clicks the gear icon to close constraints and open settings (mutually exclusive panels)",
+            "activateStates": ["wf-settings-open"],
+            "deactivateStates": ["wf-constraints-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Settings" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "wf-step-config-open",
+        "name": "Step Configuration Side Panel",
+        "description": "A step is selected and the right-side configuration panel (w-96) is visible, showing type-specific settings for the selected step including command text, working directory, timeout, prompt content, or assertion parameters depending on step type.",
+        "elements": [],
+        "transitions": [
+          {
+            "id": "step-config-to-phase-editor",
+            "name": "Close step config panel",
+            "description": "User closes the step configuration panel by clicking the close button or deselecting the step, returning to the full-width phase editor",
+            "activateStates": ["wf-phase-editor"],
+            "deactivateStates": ["wf-step-config-open"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "wf-executing",
+        "name": "Executing — Workflow Running",
+        "description": "The workflow is currently being executed. A blue status bar is shown below the toolbar indicating the running workflow name with a spinner. The Run button is replaced by a Stop button. The phase editor remains visible underneath.",
+        "elements": [
+          { "role": "button", "textContent": "Stop" }
+        ],
+        "transitions": [
+          {
+            "id": "executing-to-phase-editor",
+            "name": "Execution completes or is stopped",
+            "description": "The workflow finishes execution (success or failure) or the user clicks Stop, returning to the normal phase editor with a success or error banner",
+            "activateStates": ["wf-phase-editor"],
+            "deactivateStates": ["wf-executing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stop" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "WorkflowBuilderTab",
     "author": "Joshua Spinak",

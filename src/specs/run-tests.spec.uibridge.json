@@ -260,6 +260,179 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "rt-no-run-selected",
+        "name": "No Run Selected",
+        "description": "The default state when no workflow run is selected. Shows guidance prompting the user to select a run from the Run Dashboard to view test results.",
+        "elements": [
+          { "textContent": "No Run Selected" },
+          { "textContent": "Select a run" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-run-to-loading",
+            "name": "Select a run",
+            "description": "User selects a workflow run from the Run Dashboard sidebar, triggering a fetch of test results for that run",
+            "activateStates": ["rt-loading"],
+            "deactivateStates": ["rt-no-run-selected"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "rt-loading",
+        "name": "Loading Results",
+        "description": "Test results are being fetched from the backend. A spinner and 'Loading test results...' message are displayed while the data request is in progress.",
+        "elements": [
+          { "textContent": "Loading test results" }
+        ],
+        "transitions": [
+          {
+            "id": "loading-to-results",
+            "name": "Results loaded successfully",
+            "description": "The fetch completes successfully and returns one or more test results, transitioning to the results view with summary and test cards",
+            "activateStates": ["rt-results-loaded"],
+            "deactivateStates": ["rt-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-empty",
+            "name": "No results returned",
+            "description": "The fetch completes successfully but no test results exist for the selected run",
+            "activateStates": ["rt-empty-results"],
+            "deactivateStates": ["rt-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-error",
+            "name": "Fetch fails",
+            "description": "The fetch encounters an error (network failure, backend error), transitioning to the error state with a retry option",
+            "activateStates": ["rt-error"],
+            "deactivateStates": ["rt-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "rt-error",
+        "name": "Error Loading Results",
+        "description": "An error occurred while fetching test results. Shows an amber warning icon, the error message, and a Retry button that re-triggers the fetch.",
+        "elements": [
+          { "textContent": "Error Loading Results" },
+          { "role": "button", "textContent": "Retry" }
+        ],
+        "transitions": [
+          {
+            "id": "error-to-loading",
+            "name": "Retry fetch",
+            "description": "User clicks the Retry button to re-attempt fetching test results for the selected run",
+            "activateStates": ["rt-loading"],
+            "deactivateStates": ["rt-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Retry" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "rt-empty-results",
+        "name": "No Test Results",
+        "description": "The selected run completed but no verification tests were executed. Shows an explanatory message that no verification tests were run during the task run.",
+        "elements": [
+          { "textContent": "No Test Results" },
+          { "textContent": "No verification tests were run" }
+        ],
+        "transitions": [
+          {
+            "id": "empty-to-loading",
+            "name": "Select a different run",
+            "description": "User selects a different workflow run from the sidebar, triggering a new fetch",
+            "activateStates": ["rt-loading"],
+            "deactivateStates": ["rt-empty-results"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "rt-results-loaded",
+        "name": "Test Results Displayed",
+        "description": "Test results are loaded and displayed. The summary header shows total test count, passed count, failed count, and total duration. Below the header is a scrollable list of test result cards, each showing status, name, type, duration, and assertion counts. Cards are collapsed by default.",
+        "elements": [
+          { "textContains": "Tests" },
+          { "textContains": "passed" },
+          { "textContains": "failed" },
+          { "role": "button", "accessibleName": "Refresh results" }
+        ],
+        "transitions": [
+          {
+            "id": "results-to-expanded",
+            "name": "Expand a test result card",
+            "description": "User clicks on a test result card header to expand it, revealing detailed output, error messages, timestamps, and AI analysis",
+            "activateStates": ["rt-result-expanded"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": []
+          },
+          {
+            "id": "results-to-loading-refresh",
+            "name": "Refresh results",
+            "description": "User clicks the refresh button in the summary header to re-fetch test results for the current run",
+            "activateStates": ["rt-loading"],
+            "deactivateStates": ["rt-results-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Refresh results" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "results-to-loading-switch",
+            "name": "Select a different run",
+            "description": "User selects a different workflow run from the sidebar, triggering a new fetch",
+            "activateStates": ["rt-loading"],
+            "deactivateStates": ["rt-results-loaded"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "rt-result-expanded",
+        "name": "Test Result Card Expanded",
+        "description": "One or more test result cards are expanded, revealing detailed content below the card header. Expanded content may include error messages (red panel with error text), output logs (pre-formatted text), start/complete timestamps, and AI analysis. The summary header and other collapsed cards remain visible.",
+        "elements": [
+          { "textContains": "assertions" }
+        ],
+        "transitions": [
+          {
+            "id": "expanded-to-results",
+            "name": "Collapse test result card",
+            "description": "User clicks the expanded card header again to collapse it, hiding the detail content and returning to the collapsed results list",
+            "activateStates": ["rt-results-loaded"],
+            "deactivateStates": ["rt-result-expanded"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "TestResultsTab",
     "author": "Joshua Spinak",
