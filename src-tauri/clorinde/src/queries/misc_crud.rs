@@ -21,6 +21,31 @@ pub struct CreateShellCommandParams<
     pub tags: T7,
     pub enabled: bool,
 }
+#[derive(Debug)]
+pub struct UpdateMcpServerParams<
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+> {
+    pub name: Option<T1>,
+    pub description: Option<T2>,
+    pub transport: Option<T3>,
+    pub stdio_config: Option<T4>,
+    pub http_config: Option<T5>,
+    pub enabled: Option<bool>,
+    pub auto_start: Option<bool>,
+    pub timeout_seconds: Option<i32>,
+    pub id: T6,
+}
+#[derive(Debug)]
+pub struct UpdateMcpServerCachedToolsParams<T1: crate::StringSql, T2: crate::StringSql> {
+    pub cached_tools: Option<T1>,
+    pub tools_cached_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub id: T2,
+}
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetShellCommand {
     pub id: String,
@@ -361,6 +386,72 @@ impl<'a> From<GetMcpServerBorrowed<'a>> for GetMcpServer {
             created_at,
             updated_at,
         }: GetMcpServerBorrowed<'a>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: description.into(),
+            transport: transport.into(),
+            stdio_config: stdio_config.into(),
+            http_config: http_config.into(),
+            enabled,
+            auto_start,
+            timeout_seconds,
+            cached_tools: cached_tools.into(),
+            tools_cached_at: tools_cached_at.into(),
+            created_at,
+            updated_at,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ListAutoStartMcpServers {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub transport: String,
+    pub stdio_config: String,
+    pub http_config: String,
+    pub enabled: bool,
+    pub auto_start: bool,
+    pub timeout_seconds: i32,
+    pub cached_tools: String,
+    pub tools_cached_at: String,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub updated_at: chrono::DateTime<chrono::FixedOffset>,
+}
+pub struct ListAutoStartMcpServersBorrowed<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub transport: &'a str,
+    pub stdio_config: &'a str,
+    pub http_config: &'a str,
+    pub enabled: bool,
+    pub auto_start: bool,
+    pub timeout_seconds: i32,
+    pub cached_tools: &'a str,
+    pub tools_cached_at: &'a str,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub updated_at: chrono::DateTime<chrono::FixedOffset>,
+}
+impl<'a> From<ListAutoStartMcpServersBorrowed<'a>> for ListAutoStartMcpServers {
+    fn from(
+        ListAutoStartMcpServersBorrowed {
+            id,
+            name,
+            description,
+            transport,
+            stdio_config,
+            http_config,
+            enabled,
+            auto_start,
+            timeout_seconds,
+            cached_tools,
+            tools_cached_at,
+            created_at,
+            updated_at,
+        }: ListAutoStartMcpServersBorrowed<'a>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -732,6 +823,74 @@ where
         mapper: fn(GetMcpServerBorrowed) -> R,
     ) -> GetMcpServerQuery<'c, 'a, 's, C, R, N> {
         GetMcpServerQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
+pub struct ListAutoStartMcpServersQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor:
+        fn(&tokio_postgres::Row) -> Result<ListAutoStartMcpServersBorrowed, tokio_postgres::Error>,
+    mapper: fn(ListAutoStartMcpServersBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> ListAutoStartMcpServersQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(ListAutoStartMcpServersBorrowed) -> R,
+    ) -> ListAutoStartMcpServersQuery<'c, 'a, 's, C, R, N> {
+        ListAutoStartMcpServersQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -1217,5 +1376,233 @@ impl GetMcpServerStmt {
                 },
             mapper: |it| GetMcpServer::from(it),
         }
+    }
+}
+pub struct UpdateMcpServerStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn update_mcp_server() -> UpdateMcpServerStmt {
+    UpdateMcpServerStmt(
+        "UPDATE mcp_servers SET name = COALESCE($1, name), description = COALESCE($2, description), transport = COALESCE($3, transport), stdio_config = COALESCE($4, stdio_config), http_config = COALESCE($5, http_config), enabled = COALESCE($6, enabled), auto_start = COALESCE($7, auto_start), timeout_seconds = COALESCE($8, timeout_seconds), updated_at = NOW() WHERE id = $9 RETURNING id",
+        None,
+    )
+}
+impl UpdateMcpServerStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+        T2: crate::StringSql,
+        T3: crate::StringSql,
+        T4: crate::StringSql,
+        T5: crate::StringSql,
+        T6: crate::StringSql,
+    >(
+        &'s self,
+        client: &'c C,
+        name: &'a Option<T1>,
+        description: &'a Option<T2>,
+        transport: &'a Option<T3>,
+        stdio_config: &'a Option<T4>,
+        http_config: &'a Option<T5>,
+        enabled: &'a Option<bool>,
+        auto_start: &'a Option<bool>,
+        timeout_seconds: &'a Option<i32>,
+        id: &'a T6,
+    ) -> StringQuery<'c, 'a, 's, C, String, 9> {
+        StringQuery {
+            client,
+            params: [
+                name,
+                description,
+                transport,
+                stdio_config,
+                http_config,
+                enabled,
+                auto_start,
+                timeout_seconds,
+                id,
+            ],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |row| Ok(row.try_get(0)?),
+            mapper: |it| it.into(),
+        }
+    }
+}
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+>
+    crate::client::async_::Params<
+        'c,
+        'a,
+        's,
+        UpdateMcpServerParams<T1, T2, T3, T4, T5, T6>,
+        StringQuery<'c, 'a, 's, C, String, 9>,
+        C,
+    > for UpdateMcpServerStmt
+{
+    fn params(
+        &'s self,
+        client: &'c C,
+        params: &'a UpdateMcpServerParams<T1, T2, T3, T4, T5, T6>,
+    ) -> StringQuery<'c, 'a, 's, C, String, 9> {
+        self.bind(
+            client,
+            &params.name,
+            &params.description,
+            &params.transport,
+            &params.stdio_config,
+            &params.http_config,
+            &params.enabled,
+            &params.auto_start,
+            &params.timeout_seconds,
+            &params.id,
+        )
+    }
+}
+pub struct DeleteMcpServerStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn delete_mcp_server() -> DeleteMcpServerStmt {
+    DeleteMcpServerStmt("DELETE FROM mcp_servers WHERE id = $1 RETURNING id", None)
+}
+impl DeleteMcpServerStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        id: &'a T1,
+    ) -> StringQuery<'c, 'a, 's, C, String, 1> {
+        StringQuery {
+            client,
+            params: [id],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |row| Ok(row.try_get(0)?),
+            mapper: |it| it.into(),
+        }
+    }
+}
+pub struct ListAutoStartMcpServersStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn list_auto_start_mcp_servers() -> ListAutoStartMcpServersStmt {
+    ListAutoStartMcpServersStmt(
+        "SELECT id, name, COALESCE(description, '') as description, transport, COALESCE(stdio_config, '{}') as stdio_config, COALESCE(http_config, '{}') as http_config, enabled, auto_start, COALESCE(timeout_seconds, 30) as timeout_seconds, COALESCE(cached_tools, '[]') as cached_tools, COALESCE(tools_cached_at::TEXT, '') as tools_cached_at, created_at, updated_at FROM mcp_servers WHERE auto_start = true AND enabled = true ORDER BY name ASC",
+        None,
+    )
+}
+impl ListAutoStartMcpServersStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
+        &'s self,
+        client: &'c C,
+    ) -> ListAutoStartMcpServersQuery<'c, 'a, 's, C, ListAutoStartMcpServers, 0> {
+        ListAutoStartMcpServersQuery {
+            client,
+            params: [],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<ListAutoStartMcpServersBorrowed, tokio_postgres::Error> {
+                Ok(ListAutoStartMcpServersBorrowed {
+                    id: row.try_get(0)?,
+                    name: row.try_get(1)?,
+                    description: row.try_get(2)?,
+                    transport: row.try_get(3)?,
+                    stdio_config: row.try_get(4)?,
+                    http_config: row.try_get(5)?,
+                    enabled: row.try_get(6)?,
+                    auto_start: row.try_get(7)?,
+                    timeout_seconds: row.try_get(8)?,
+                    cached_tools: row.try_get(9)?,
+                    tools_cached_at: row.try_get(10)?,
+                    created_at: row.try_get(11)?,
+                    updated_at: row.try_get(12)?,
+                })
+            },
+            mapper: |it| ListAutoStartMcpServers::from(it),
+        }
+    }
+}
+pub struct UpdateMcpServerCachedToolsStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn update_mcp_server_cached_tools() -> UpdateMcpServerCachedToolsStmt {
+    UpdateMcpServerCachedToolsStmt(
+        "UPDATE mcp_servers SET cached_tools = $1, tools_cached_at = $2::TIMESTAMPTZ, updated_at = NOW() WHERE id = $3 RETURNING id",
+        None,
+    )
+}
+impl UpdateMcpServerCachedToolsStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        cached_tools: &'a Option<T1>,
+        tools_cached_at: &'a Option<chrono::DateTime<chrono::FixedOffset>>,
+        id: &'a T2,
+    ) -> StringQuery<'c, 'a, 's, C, String, 3> {
+        StringQuery {
+            client,
+            params: [cached_tools, tools_cached_at, id],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |row| Ok(row.try_get(0)?),
+            mapper: |it| it.into(),
+        }
+    }
+}
+impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>
+    crate::client::async_::Params<
+        'c,
+        'a,
+        's,
+        UpdateMcpServerCachedToolsParams<T1, T2>,
+        StringQuery<'c, 'a, 's, C, String, 3>,
+        C,
+    > for UpdateMcpServerCachedToolsStmt
+{
+    fn params(
+        &'s self,
+        client: &'c C,
+        params: &'a UpdateMcpServerCachedToolsParams<T1, T2>,
+    ) -> StringQuery<'c, 'a, 's, C, String, 3> {
+        self.bind(
+            client,
+            &params.cached_tools,
+            &params.tools_cached_at,
+            &params.id,
+        )
     }
 }

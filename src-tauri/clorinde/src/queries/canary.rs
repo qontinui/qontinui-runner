@@ -9,7 +9,7 @@ pub struct StartCanaryParams<
 > {
     pub id: T1,
     pub recommendation_id: T2,
-    pub percentage: i32,
+    pub percentage: i64,
     pub baseline_metrics_json: T3,
     pub canary_metrics_json: T4,
 }
@@ -19,8 +19,8 @@ pub struct UpdateCanaryMetricsParams<
     T2: crate::StringSql,
     T3: crate::StringSql,
 > {
-    pub baseline_run_count: i32,
-    pub canary_run_count: i32,
+    pub baseline_run_count: i64,
+    pub canary_run_count: i64,
     pub baseline_metrics_json: T1,
     pub canary_metrics_json: T2,
     pub id: T3,
@@ -64,7 +64,7 @@ pub struct UpdateTemplateCanaryMetricsParams<
 pub struct StartCanary {
     pub id: String,
     pub recommendation_id: String,
-    pub percentage: i32,
+    pub percentage: i64,
     pub status: String,
     pub start_date: chrono::DateTime<chrono::FixedOffset>,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
@@ -72,7 +72,7 @@ pub struct StartCanary {
 pub struct StartCanaryBorrowed<'a> {
     pub id: &'a str,
     pub recommendation_id: &'a str,
-    pub percentage: i32,
+    pub percentage: i64,
     pub status: &'a str,
     pub start_date: chrono::DateTime<chrono::FixedOffset>,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
@@ -102,12 +102,12 @@ impl<'a> From<StartCanaryBorrowed<'a>> for StartCanary {
 pub struct GetActiveCanaries {
     pub id: String,
     pub recommendation_id: String,
-    pub percentage: i32,
+    pub percentage: i64,
     pub status: String,
     pub start_date: chrono::DateTime<chrono::FixedOffset>,
     pub end_date: chrono::DateTime<chrono::FixedOffset>,
-    pub baseline_run_count: i32,
-    pub canary_run_count: i32,
+    pub baseline_run_count: i64,
+    pub canary_run_count: i64,
     pub baseline_metrics_json: String,
     pub canary_metrics_json: String,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
@@ -115,12 +115,12 @@ pub struct GetActiveCanaries {
 pub struct GetActiveCanariesBorrowed<'a> {
     pub id: &'a str,
     pub recommendation_id: &'a str,
-    pub percentage: i32,
+    pub percentage: i64,
     pub status: &'a str,
     pub start_date: chrono::DateTime<chrono::FixedOffset>,
     pub end_date: chrono::DateTime<chrono::FixedOffset>,
-    pub baseline_run_count: i32,
-    pub canary_run_count: i32,
+    pub baseline_run_count: i64,
+    pub canary_run_count: i64,
     pub baseline_metrics_json: &'a str,
     pub canary_metrics_json: &'a str,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
@@ -160,12 +160,12 @@ impl<'a> From<GetActiveCanariesBorrowed<'a>> for GetActiveCanaries {
 pub struct GetCanaryHistory {
     pub id: String,
     pub recommendation_id: String,
-    pub percentage: i32,
+    pub percentage: i64,
     pub status: String,
     pub start_date: chrono::DateTime<chrono::FixedOffset>,
     pub end_date: chrono::DateTime<chrono::FixedOffset>,
-    pub baseline_run_count: i32,
-    pub canary_run_count: i32,
+    pub baseline_run_count: i64,
+    pub canary_run_count: i64,
     pub baseline_metrics_json: String,
     pub canary_metrics_json: String,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
@@ -176,12 +176,12 @@ pub struct GetCanaryHistory {
 pub struct GetCanaryHistoryBorrowed<'a> {
     pub id: &'a str,
     pub recommendation_id: &'a str,
-    pub percentage: i32,
+    pub percentage: i64,
     pub status: &'a str,
     pub start_date: chrono::DateTime<chrono::FixedOffset>,
     pub end_date: chrono::DateTime<chrono::FixedOffset>,
-    pub baseline_run_count: i32,
-    pub canary_run_count: i32,
+    pub baseline_run_count: i64,
+    pub canary_run_count: i64,
     pub baseline_metrics_json: &'a str,
     pub canary_metrics_json: &'a str,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
@@ -229,15 +229,15 @@ impl<'a> From<GetCanaryHistoryBorrowed<'a>> for GetCanaryHistory {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetCanaryMetrics {
     pub id: String,
-    pub baseline_run_count: i32,
-    pub canary_run_count: i32,
+    pub baseline_run_count: i64,
+    pub canary_run_count: i64,
     pub baseline_metrics_json: String,
     pub canary_metrics_json: String,
 }
 pub struct GetCanaryMetricsBorrowed<'a> {
     pub id: &'a str,
-    pub baseline_run_count: i32,
-    pub canary_run_count: i32,
+    pub baseline_run_count: i64,
+    pub canary_run_count: i64,
     pub baseline_metrics_json: &'a str,
     pub canary_metrics_json: &'a str,
 }
@@ -263,13 +263,13 @@ impl<'a> From<GetCanaryMetricsBorrowed<'a>> for GetCanaryMetrics {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateCanaryMetrics {
     pub id: String,
-    pub baseline_run_count: i32,
-    pub canary_run_count: i32,
+    pub baseline_run_count: i64,
+    pub canary_run_count: i64,
 }
 pub struct UpdateCanaryMetricsBorrowed<'a> {
     pub id: &'a str,
-    pub baseline_run_count: i32,
-    pub canary_run_count: i32,
+    pub baseline_run_count: i64,
+    pub canary_run_count: i64,
 }
 impl<'a> From<UpdateCanaryMetricsBorrowed<'a>> for UpdateCanaryMetrics {
     fn from(
@@ -1388,7 +1388,7 @@ impl StartCanaryStmt {
         client: &'c C,
         id: &'a T1,
         recommendation_id: &'a T2,
-        percentage: &'a i32,
+        percentage: &'a i64,
         baseline_metrics_json: &'a T3,
         canary_metrics_json: &'a T4,
     ) -> StartCanaryQuery<'c, 'a, 's, C, StartCanary, 5> {
@@ -1612,8 +1612,8 @@ impl UpdateCanaryMetricsStmt {
     >(
         &'s self,
         client: &'c C,
-        baseline_run_count: &'a i32,
-        canary_run_count: &'a i32,
+        baseline_run_count: &'a i64,
+        canary_run_count: &'a i64,
         baseline_metrics_json: &'a T1,
         canary_metrics_json: &'a T2,
         id: &'a T3,

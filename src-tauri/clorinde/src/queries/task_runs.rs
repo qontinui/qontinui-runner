@@ -78,6 +78,11 @@ pub struct UpdateTaskSummaryParams<T1: crate::StringSql, T2: crate::StringSql, T
     pub id: T3,
 }
 #[derive(Debug)]
+pub struct LeaseTaskForResumeParams<T1: crate::StringSql> {
+    pub id: T1,
+    pub expected_updated_at: chrono::DateTime<chrono::FixedOffset>,
+}
+#[derive(Debug)]
 pub struct AppendTaskOutputParams<T1: crate::StringSql, T2: crate::StringSql> {
     pub output: T1,
     pub id: T2,
@@ -517,6 +522,148 @@ impl<'a> From<GetRunningTaskRunsBorrowed<'a>> for GetRunningTaskRuns {
     }
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetResumableTaskRunsForRunner {
+    pub id: String,
+    pub task_name: String,
+    pub prompt: String,
+    pub task_type: String,
+    pub status: String,
+    pub sessions_count: i32,
+    pub max_sessions: i32,
+    pub error_message: String,
+    pub auto_continue: bool,
+    pub config_id: String,
+    pub workflow_name: String,
+    pub workflow_id: String,
+    pub workflow_type: String,
+    pub workspace_id: String,
+    pub triggered_by: String,
+    pub parent_task_run_id: String,
+    pub root_task_run_id: String,
+    pub depth: i32,
+    pub bridge_id: String,
+    pub is_reflection: bool,
+    pub reflection_source_task_run_id: String,
+    pub is_follow_up: bool,
+    pub follow_up_source_task_run_id: String,
+    pub is_fixer: bool,
+    pub fixer_source_task_run_id: String,
+    pub is_meta_optimizer: bool,
+    pub is_review: bool,
+    pub blocks_parent: bool,
+    pub runner_port: i32,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub updated_at: chrono::DateTime<chrono::FixedOffset>,
+    pub completed_at: chrono::DateTime<chrono::FixedOffset>,
+}
+pub struct GetResumableTaskRunsForRunnerBorrowed<'a> {
+    pub id: &'a str,
+    pub task_name: &'a str,
+    pub prompt: &'a str,
+    pub task_type: &'a str,
+    pub status: &'a str,
+    pub sessions_count: i32,
+    pub max_sessions: i32,
+    pub error_message: &'a str,
+    pub auto_continue: bool,
+    pub config_id: &'a str,
+    pub workflow_name: &'a str,
+    pub workflow_id: &'a str,
+    pub workflow_type: &'a str,
+    pub workspace_id: &'a str,
+    pub triggered_by: &'a str,
+    pub parent_task_run_id: &'a str,
+    pub root_task_run_id: &'a str,
+    pub depth: i32,
+    pub bridge_id: &'a str,
+    pub is_reflection: bool,
+    pub reflection_source_task_run_id: &'a str,
+    pub is_follow_up: bool,
+    pub follow_up_source_task_run_id: &'a str,
+    pub is_fixer: bool,
+    pub fixer_source_task_run_id: &'a str,
+    pub is_meta_optimizer: bool,
+    pub is_review: bool,
+    pub blocks_parent: bool,
+    pub runner_port: i32,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub updated_at: chrono::DateTime<chrono::FixedOffset>,
+    pub completed_at: chrono::DateTime<chrono::FixedOffset>,
+}
+impl<'a> From<GetResumableTaskRunsForRunnerBorrowed<'a>> for GetResumableTaskRunsForRunner {
+    fn from(
+        GetResumableTaskRunsForRunnerBorrowed {
+            id,
+            task_name,
+            prompt,
+            task_type,
+            status,
+            sessions_count,
+            max_sessions,
+            error_message,
+            auto_continue,
+            config_id,
+            workflow_name,
+            workflow_id,
+            workflow_type,
+            workspace_id,
+            triggered_by,
+            parent_task_run_id,
+            root_task_run_id,
+            depth,
+            bridge_id,
+            is_reflection,
+            reflection_source_task_run_id,
+            is_follow_up,
+            follow_up_source_task_run_id,
+            is_fixer,
+            fixer_source_task_run_id,
+            is_meta_optimizer,
+            is_review,
+            blocks_parent,
+            runner_port,
+            created_at,
+            updated_at,
+            completed_at,
+        }: GetResumableTaskRunsForRunnerBorrowed<'a>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            task_name: task_name.into(),
+            prompt: prompt.into(),
+            task_type: task_type.into(),
+            status: status.into(),
+            sessions_count,
+            max_sessions,
+            error_message: error_message.into(),
+            auto_continue,
+            config_id: config_id.into(),
+            workflow_name: workflow_name.into(),
+            workflow_id: workflow_id.into(),
+            workflow_type: workflow_type.into(),
+            workspace_id: workspace_id.into(),
+            triggered_by: triggered_by.into(),
+            parent_task_run_id: parent_task_run_id.into(),
+            root_task_run_id: root_task_run_id.into(),
+            depth,
+            bridge_id: bridge_id.into(),
+            is_reflection,
+            reflection_source_task_run_id: reflection_source_task_run_id.into(),
+            is_follow_up,
+            follow_up_source_task_run_id: follow_up_source_task_run_id.into(),
+            is_fixer,
+            fixer_source_task_run_id: fixer_source_task_run_id.into(),
+            is_meta_optimizer,
+            is_review,
+            blocks_parent,
+            runner_port,
+            created_at,
+            updated_at,
+            completed_at,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetRecentTaskRunsFiltered {
     pub id: String,
     pub task_name: String,
@@ -836,6 +983,75 @@ where
         mapper: fn(GetRunningTaskRunsBorrowed) -> R,
     ) -> GetRunningTaskRunsQuery<'c, 'a, 's, C, R, N> {
         GetRunningTaskRunsQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
+pub struct GetResumableTaskRunsForRunnerQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetResumableTaskRunsForRunnerBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetResumableTaskRunsForRunnerBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetResumableTaskRunsForRunnerQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetResumableTaskRunsForRunnerBorrowed) -> R,
+    ) -> GetResumableTaskRunsForRunnerQuery<'c, 'a, 's, C, R, N> {
+        GetResumableTaskRunsForRunnerQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -1659,6 +1875,122 @@ impl GetRunningTaskRunsStmt {
             },
             mapper: |it| GetRunningTaskRuns::from(it),
         }
+    }
+}
+pub struct GetResumableTaskRunsForRunnerStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_resumable_task_runs_for_runner() -> GetResumableTaskRunsForRunnerStmt {
+    GetResumableTaskRunsForRunnerStmt(
+        "SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type, COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count, COALESCE(max_sessions, 0) as max_sessions, COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue, COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id, COALESCE(workflow_type, 'task') as workflow_type, COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by, COALESCE(parent_task_run_id, '') as parent_task_run_id, COALESCE(root_task_run_id, '') as root_task_run_id, COALESCE(depth, 0) as depth, COALESCE(bridge_id, '') as bridge_id, COALESCE(is_reflection, false) as is_reflection, COALESCE(reflection_source_task_run_id, '') as reflection_source_task_run_id, COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id, COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id, COALESCE(is_meta_optimizer, false) as is_meta_optimizer, COALESCE(is_review, false) as is_review, COALESCE(blocks_parent, false) as blocks_parent, COALESCE(runner_port, 0) as runner_port, COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at FROM task_runs WHERE status = 'running' AND runner_port = $1 ORDER BY created_at DESC",
+        None,
+    )
+}
+impl GetResumableTaskRunsForRunnerStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
+        &'s self,
+        client: &'c C,
+        runner_port: &'a i32,
+    ) -> GetResumableTaskRunsForRunnerQuery<'c, 'a, 's, C, GetResumableTaskRunsForRunner, 1> {
+        GetResumableTaskRunsForRunnerQuery {
+            client,
+            params: [runner_port],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<GetResumableTaskRunsForRunnerBorrowed, tokio_postgres::Error> {
+                Ok(GetResumableTaskRunsForRunnerBorrowed {
+                    id: row.try_get(0)?,
+                    task_name: row.try_get(1)?,
+                    prompt: row.try_get(2)?,
+                    task_type: row.try_get(3)?,
+                    status: row.try_get(4)?,
+                    sessions_count: row.try_get(5)?,
+                    max_sessions: row.try_get(6)?,
+                    error_message: row.try_get(7)?,
+                    auto_continue: row.try_get(8)?,
+                    config_id: row.try_get(9)?,
+                    workflow_name: row.try_get(10)?,
+                    workflow_id: row.try_get(11)?,
+                    workflow_type: row.try_get(12)?,
+                    workspace_id: row.try_get(13)?,
+                    triggered_by: row.try_get(14)?,
+                    parent_task_run_id: row.try_get(15)?,
+                    root_task_run_id: row.try_get(16)?,
+                    depth: row.try_get(17)?,
+                    bridge_id: row.try_get(18)?,
+                    is_reflection: row.try_get(19)?,
+                    reflection_source_task_run_id: row.try_get(20)?,
+                    is_follow_up: row.try_get(21)?,
+                    follow_up_source_task_run_id: row.try_get(22)?,
+                    is_fixer: row.try_get(23)?,
+                    fixer_source_task_run_id: row.try_get(24)?,
+                    is_meta_optimizer: row.try_get(25)?,
+                    is_review: row.try_get(26)?,
+                    blocks_parent: row.try_get(27)?,
+                    runner_port: row.try_get(28)?,
+                    created_at: row.try_get(29)?,
+                    updated_at: row.try_get(30)?,
+                    completed_at: row.try_get(31)?,
+                })
+            },
+            mapper: |it| GetResumableTaskRunsForRunner::from(it),
+        }
+    }
+}
+pub struct LeaseTaskForResumeStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn lease_task_for_resume() -> LeaseTaskForResumeStmt {
+    LeaseTaskForResumeStmt(
+        "UPDATE task_runs SET updated_at = NOW() WHERE id = $1 AND status = 'running' AND updated_at = $2 RETURNING id",
+        None,
+    )
+}
+impl LeaseTaskForResumeStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        id: &'a T1,
+        expected_updated_at: &'a chrono::DateTime<chrono::FixedOffset>,
+    ) -> StringQuery<'c, 'a, 's, C, String, 2> {
+        StringQuery {
+            client,
+            params: [id, expected_updated_at],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |row| Ok(row.try_get(0)?),
+            mapper: |it| it.into(),
+        }
+    }
+}
+impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
+    crate::client::async_::Params<
+        'c,
+        'a,
+        's,
+        LeaseTaskForResumeParams<T1>,
+        StringQuery<'c, 'a, 's, C, String, 2>,
+        C,
+    > for LeaseTaskForResumeStmt
+{
+    fn params(
+        &'s self,
+        client: &'c C,
+        params: &'a LeaseTaskForResumeParams<T1>,
+    ) -> StringQuery<'c, 'a, 's, C, String, 2> {
+        self.bind(client, &params.id, &params.expected_updated_at)
     }
 }
 pub struct AppendTaskOutputStmt(&'static str, Option<tokio_postgres::Statement>);
