@@ -556,56 +556,7 @@ function TerminalPageInner({
 
         {uiState.showControlPanel && zoneLayout.isMultiZone && (
           <ZoneControlPanel
-            tabs={tabs}
-            assignments={zoneLayout.assignments}
-            sessionStates={stateTracking.sessionStates}
-            zoneLabels={labelsAndTags.zoneLabels}
-            zoneNotes={labelsAndTags.zoneNotes}
-            labelColorMap={labelsAndTags.labelColorMap}
-            focusedZone={zoneLayout.focusedZone}
-            zoneCount={zoneLayout.layout.zones.length}
-            lastOutputLines={stateTracking.lastOutputLines}
-            onFocusZone={zoneLayout.setFocusedZone}
-            onSetZoneLabel={labelsAndTags.setZoneLabel}
-            onSetZoneNotes={labelsAndTags.setZoneNote}
-            onClose={() => dispatch({ type: "SET_SHOW_CONTROL_PANEL", payload: false })}
-            collapsed={uiState.controlPanelCollapsed}
-            onToggleCollapsed={() => dispatch({ type: "TOGGLE_CONTROL_PANEL_COLLAPSED" })}
             onCreateTerminal={() => createAndAssignTerminal()}
-            pinnedZones={labelsAndTags.pinnedZones}
-            onTogglePin={labelsAndTags.togglePin}
-            onSwapZones={(src, dst) => {
-              const srcTabId = zoneLayout.assignments[src];
-              const dstTabId = zoneLayout.assignments[dst];
-              if (srcTabId) zoneLayout.assignTabToZone(dst, srcTabId);
-              if (dstTabId) zoneLayout.assignTabToZone(src, dstTabId);
-            }}
-            onLoadWorkspace={async (workspace) => {
-              if (workspace.layoutId !== zoneLayout.layoutId) {
-                zoneLayout.setLayoutId(workspace.layoutId);
-              }
-              for (const session of workspace.sessions) {
-                if (session.zoneIndex < 0) {
-                  await createTerminal(session.title, session.workingDir);
-                  continue;
-                }
-                const tabId = await createTerminal(session.title, session.workingDir);
-                if (tabId) {
-                  zoneLayout.assignTabToZone(session.zoneIndex, tabId);
-                }
-                if (session.label) {
-                  labelsAndTags.setZoneLabel(session.zoneIndex, session.label);
-                }
-                if (session.notes) {
-                  labelsAndTags.setZoneNote(session.zoneIndex, session.notes);
-                }
-                if (session.pinned) {
-                  labelsAndTags.setPinnedZones((prev) => new Set([...prev, session.zoneIndex]));
-                }
-              }
-            }}
-            layoutId={zoneLayout.layoutId}
-            pageId={pageId}
           />
         )}
 
