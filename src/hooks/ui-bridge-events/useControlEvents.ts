@@ -7,7 +7,7 @@ import { serializeElement, serializeComponent } from "./utils";
 
 /**
  * Handles: get_elements, get_element, execute_action, get_components, get_component,
- *          execute_component_action, navigate_tab, clear_storage
+ *          execute_component_action, resolve_stable_ref, navigate_tab, clear_storage
  */
 export function useControlEvents(
   context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">,
@@ -255,6 +255,45 @@ export function useControlEvents(
             data: { navigatedTo: resolved },
             timestamp: Date.now(),
           });
+          return true;
+        }
+
+        case "resolve_stable_ref": {
+          const stableRef = (payload as unknown as Record<string, unknown>).stableRef;
+          if (!stableRef) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "stableRef payload is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          try {
+            const { resolveStableRef } = await import("ui-bridge/core");
+            const resolved = resolveStableRef(
+              stableRef as Parameters<typeof resolveStableRef>[0],
+            );
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: resolved
+                ? { elementId: resolved.id, mounted: resolved.mounted }
+                : { elementId: null },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: Date.now(),
+            });
+          }
           return true;
         }
 

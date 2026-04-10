@@ -86,6 +86,14 @@ export async function handleChangeTrackingCommand(
     }
     case "execute_with_diff":
       return ct.executeWithDiff(payload);
+    case "execute_batch_with_diff": {
+      const operations = (payload.operations ?? []) as Array<Record<string, unknown>>;
+      const results: unknown[] = [];
+      for (const op of operations) {
+        results.push(await ct.executeWithDiff(op));
+      }
+      return { results };
+    }
     case "wait_for_change": {
       const wfcPayload = payload as {
         predicate: unknown;

@@ -4,7 +4,7 @@ import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 
 /**
  * Handles: save_bookmark, get_bookmark, delete_bookmark, list_bookmarks,
- *          diff_from_bookmark, execute_with_diff, wait_for_change, categorize_last_diff,
+ *          diff_from_bookmark, execute_with_diff, execute_batch_with_diff, wait_for_change, categorize_last_diff,
  *          scoped_diff, summarize_diff, structured_changes, enable_change_buffer,
  *          disable_change_buffer, drain_change_buffer, get_change_buffer_size
  */
@@ -25,6 +25,7 @@ export function useChangeTrackingEvents(
         case "list_bookmarks":
         case "diff_from_bookmark":
         case "execute_with_diff":
+        case "execute_batch_with_diff":
         case "wait_for_change":
         case "categorize_last_diff":
         case "scoped_diff":

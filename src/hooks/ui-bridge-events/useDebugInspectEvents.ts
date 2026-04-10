@@ -134,18 +134,43 @@ export function useDebugInspectEvents(
 
           const since = payload.params?.since as number | undefined;
           const limit = payload.params?.limit as number | undefined;
+          const shouldGroup = (payload.params?.group as boolean) ?? false;
           // Use console-specific methods to filter out navigation/long-task events
           const errors = since
             ? capture.getConsoleSince(since)
             : capture.getConsoleRecent(limit ?? 50);
 
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: { errors, count: errors.length },
-            timestamp: Date.now(),
-          });
+          if (shouldGroup) {
+            const { computeFingerprint: fingerprint } = await import("ui-bridge/debug");
+            const groupMap = new Map<string, { fingerprint: string; count: number; first: unknown; last: unknown; samples: unknown[] }>();
+            for (const err of errors) {
+              const fp = fingerprint(err as import("ui-bridge/debug").AnyCapturedEvent);
+              const existing = groupMap.get(fp);
+              if (existing) {
+                existing.count++;
+                existing.last = err;
+                if (existing.samples.length < 3) existing.samples.push(err);
+              } else {
+                groupMap.set(fp, { fingerprint: fp, count: 1, first: err, last: err, samples: [err] });
+              }
+            }
+            const groups = Array.from(groupMap.values());
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { groups, totalErrors: errors.length, totalGroups: groups.length },
+              timestamp: Date.now(),
+            });
+          } else {
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { errors, count: errors.length },
+              timestamp: Date.now(),
+            });
+          }
           return true;
         }
 

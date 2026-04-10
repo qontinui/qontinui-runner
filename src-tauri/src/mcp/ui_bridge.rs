@@ -4855,7 +4855,7 @@ pub async fn ui_bridge_execute_with_diff_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Execute with diff");
-    match ui_bridge_request_sync(&state, "executeWithDiff", body).await {
+    match ui_bridge_request_sync(&state, "execute_with_diff", body).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => {
             error!("UI Bridge API: Execute with diff failed: {}", e);
@@ -4876,7 +4876,7 @@ pub async fn ui_bridge_with_diff_handler(
     // Detect batch vs single based on presence of "operations" array
     if body.get("operations").is_some() {
         info!("UI Bridge API: Batch execute with diff");
-        match ui_bridge_request_sync(&state, "executeBatchWithDiff", body).await {
+        match ui_bridge_request_sync(&state, "execute_batch_with_diff", body).await {
             Ok(data) => Ok(Json(ApiResponse::success(data))),
             Err(e) => {
                 error!("UI Bridge API: Batch execute with diff failed: {}", e);
@@ -4884,14 +4884,14 @@ pub async fn ui_bridge_with_diff_handler(
             }
         }
     } else {
-        // Single operation — wrap into executeWithDiff format
+        // Single operation — wrap into execute_with_diff format
         info!("UI Bridge API: Single execute with diff");
         let payload = serde_json::json!({
             "elementId": body.get("elementId"),
             "action": body.get("operation"),
             "params": body.get("params").unwrap_or(&serde_json::Value::Null),
         });
-        match ui_bridge_request_sync(&state, "executeWithDiff", payload).await {
+        match ui_bridge_request_sync(&state, "execute_with_diff", payload).await {
             Ok(data) => Ok(Json(ApiResponse::success(data))),
             Err(e) => {
                 error!("UI Bridge API: Single execute with diff failed: {}", e);

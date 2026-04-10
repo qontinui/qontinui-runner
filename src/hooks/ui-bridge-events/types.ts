@@ -43,6 +43,7 @@ export type UIBridgeRequestType =
   | "list_bookmarks"
   | "diff_from_bookmark"
   | "execute_with_diff"
+  | "execute_batch_with_diff"
   | "wait_for_change"
   | "categorize_last_diff"
   | "scoped_diff"
@@ -188,6 +189,12 @@ export type UIBridgeRequestType =
   // Navigation adapter
   | "get_routes"
   | "navigate_by_adapter"
+  // Wait for element stability
+  | "wait_for_element_stable"
+  // Wait for navigation complete
+  | "wait_for_navigation_complete"
+  // Stable ref resolution
+  | "resolve_stable_ref"
   // Runner-specific
   | "navigate_tab"
   | "clear_storage";

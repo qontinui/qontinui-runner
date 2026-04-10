@@ -4,7 +4,8 @@ import { getUIBridgeGlobal } from "./utils";
 
 /**
  * Handles: get_network_requests, get_network_requests_in_flight,
- *          get_idle_status, wait_for_idle, diagnose_stuck_screen, get_keyboard_shortcuts
+ *          get_idle_status, wait_for_idle, wait_for_navigation_complete,
+ *          wait_for_element_stable, diagnose_stuck_screen, get_keyboard_shortcuts
  */
 export function useNetworkIdleEvents(
   context: Pick<
@@ -178,6 +179,147 @@ export function useNetworkIdleEvents(
             type,
             success: true,
             data: results,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "wait_for_navigation_complete": {
+          const navTimeout = (payload.params?.timeout as number) ?? 30000;
+          const since = (payload.params?.since as number) ?? 0;
+
+          const uiBridgeGlobalNav = getUIBridgeGlobal();
+          const navTracker = uiBridgeGlobalNav?.navigationTracker as
+            | {
+                lastCompleteNavigation: { completedAt: number; url: string; routeKey: string } | null;
+                onNavigationComplete: (
+                  listener: (data: { completedAt: number; url: string; routeKey: string }) => void,
+                ) => () => void;
+              }
+            | undefined;
+
+          // Check if a navigation already completed since the requested timestamp
+          const lastNav = navTracker?.lastCompleteNavigation;
+          if (lastNav && lastNav.completedAt >= since) {
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { completed: true, ...lastNav },
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          // Wait for a navigation-complete event or fall back to idle at timeout/2
+          const result = await new Promise<Record<string, unknown>>((resolve) => {
+            let settled = false;
+            let unsub: (() => void) | undefined;
+
+            const settle = (data: Record<string, unknown>) => {
+              if (settled) return;
+              settled = true;
+              if (unsub) unsub();
+              resolve(data);
+            };
+
+            // Subscribe to navigation-complete events if tracker is available
+            if (navTracker?.onNavigationComplete) {
+              unsub = navTracker.onNavigationComplete((data) => {
+                settle({ completed: true, ...data });
+              });
+            }
+
+            // Fallback: at timeout/2, try idle-based detection
+            const fallbackId = setTimeout(async () => {
+              if (settled) return;
+              try {
+                const { CompositeIdleDetector } = await import("ui-bridge");
+                if (!idleDetectorRef.current) {
+                  idleDetectorRef.current = CompositeIdleDetector.create();
+                }
+                await idleDetectorRef.current.waitForIdle({
+                  timeout: Math.max(1000, navTimeout / 2),
+                  minStableMs: 500,
+                });
+                settle({
+                  completed: true,
+                  method: "idle-fallback",
+                  url: typeof window !== "undefined" ? window.location.href : "",
+                  completedAt: Date.now(),
+                });
+              } catch {
+                // Let the final timeout handle it
+              }
+            }, navTimeout / 2);
+
+            // Final timeout — give up
+            setTimeout(() => {
+              clearTimeout(fallbackId);
+              settle({
+                completed: false,
+                timedOut: true,
+                url: typeof window !== "undefined" ? window.location.href : "",
+                elapsed: navTimeout,
+              });
+            }, navTimeout);
+          });
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: result,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "wait_for_element_stable": {
+          const elId = (payload.params?.elementId as string) ?? payload.elementId ?? "";
+          if (!elId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "elementId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          // Look up element from the bridge registry via the global
+          const uiBridgeGlobal = getUIBridgeGlobal();
+          const registry = uiBridgeGlobal?.registry as
+            | { getElement?: (id: string) => { element: Element } | null }
+            | undefined;
+          const registered = registry?.getElement?.(elId);
+          const domElement = registered?.element;
+
+          if (!domElement || !(domElement instanceof HTMLElement)) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Element not found or not an HTMLElement: ${elId}`,
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const { waitForElementStable } = await import("ui-bridge/idle");
+          const result = await waitForElementStable(domElement, {
+            quietMs: (payload.params?.quietMs as number) ?? 500,
+            timeout: (payload.params?.timeout as number) ?? 5000,
+            observeAttributes: (payload.params?.observeAttributes as boolean) ?? true,
+            observeSubtree: (payload.params?.observeSubtree as boolean) ?? false,
+          });
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: result,
             timestamp: Date.now(),
           });
           return true;
