@@ -20,6 +20,12 @@ interface InstanceStatus {
   running: boolean;
   pid: number | null;
   api_ready: boolean;
+  /** Source of this instance: "local" = managed by this runner, "registered" = from DB/registry */
+  source?: "local" | "registered";
+  /** Health status from DB registry (starting, healthy, unhealthy, stopped) */
+  registry_status?: string;
+  /** Running task count from heartbeat */
+  running_tasks?: number;
 }
 
 interface RunnerInstancesSettingsProps {
@@ -38,8 +44,47 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
 
   const loadInstances = useCallback(async () => {
     try {
-      const data = await invoke<InstanceStatus[]>("get_runner_instances");
-      setInstances(data);
+      // Fetch locally-managed instances (from settings.json via Tauri command)
+      const local = await invoke<InstanceStatus[]>("get_runner_instances");
+      const localPorts = new Set(local.map((i) => i.port));
+
+      // Mark local instances
+      const merged: InstanceStatus[] = local.map((i) => ({ ...i, source: "local" as const }));
+
+      // Fetch DB-backed registry via HTTP (includes externally-registered instances)
+      try {
+        const port = getApiPort();
+        const resp = await fetch(`http://localhost:${port}/runners`);
+        if (resp.ok) {
+          const runners: Array<{
+            id: string;
+            name: string;
+            port: number;
+            is_primary: boolean;
+            running: boolean;
+            pid: number | null;
+            api_responding: boolean;
+          }> = await resp.json();
+
+          for (const r of runners) {
+            if (r.is_primary || localPorts.has(r.port) || r.port === port) continue;
+            merged.push({
+              id: r.id,
+              name: r.name,
+              port: r.port,
+              running: r.running,
+              pid: r.pid,
+              api_ready: r.api_responding,
+              source: "registered",
+              registry_status: r.running ? "healthy" : "stopped",
+            });
+          }
+        }
+      } catch {
+        // HTTP fetch failed — show local instances only (non-fatal)
+      }
+
+      setInstances(merged);
     } catch (err) {
       onLog("error", `Failed to load instances: ${err}`);
     } finally {
@@ -184,18 +229,30 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
 
             {/* Info */}
             <div className="flex-1 min-w-0">
-              <div className="text-sm font-medium truncate">{instance.name}</div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium truncate">{instance.name}</span>
+                {instance.source === "registered" && (
+                  <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-blue-500/15 text-blue-500">
+                    registered
+                  </span>
+                )}
+              </div>
               <div className="text-xs text-muted-foreground">
                 Port {instance.port}
                 {instance.running && instance.pid && (
                   <span className="ml-2">PID {instance.pid}</span>
+                )}
+                {instance.running_tasks != null && instance.running_tasks > 0 && (
+                  <span className="ml-2">{instance.running_tasks} task{instance.running_tasks !== 1 ? "s" : ""}</span>
                 )}
               </div>
             </div>
 
             {/* Actions */}
             <div className="flex items-center gap-1 shrink-0">
-              {instance.running ? (
+              {instance.source === "registered" ? (
+                <span className="text-[10px] text-muted-foreground px-2">external</span>
+              ) : instance.running ? (
                 <button
                   onClick={() => handleStop(instance)}
                   disabled={actionInProgress === instance.id}

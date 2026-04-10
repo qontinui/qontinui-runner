@@ -319,8 +319,10 @@ pub async fn process_review_outcome(
     if pr_number > 0 && !repo_full_name.is_empty() {
         if let Some((owner, repo)) = repo_full_name.split_once('/') {
             // Get the GitHub token from the parent's PR watch
-            if let Ok(Some(token)) = pg.get_pr_watch_token_for_task(parent_task_run_id).await {
-                if let Ok(client) = crate::trigger_system::github_api::GitHubClient::new(&token) {
+            let token_result = pg.get_pr_watch_token_for_task(parent_task_run_id).await;
+            if let Ok(Some(token)) = token_result {
+                let client_result = crate::trigger_system::github_api::GitHubClient::new(&token);
+                if let Ok(client) = client_result {
                     let (event, body) = match &outcome {
                         ReviewOutcome::Approved => (
                             "APPROVE",
@@ -361,7 +363,19 @@ pub async fn process_review_outcome(
                             event, pr_number, repo_full_name
                         );
                     }
+                } else {
+                    tracing::warn!(
+                        "Failed to create GitHub client for review of PR #{}: {:?}",
+                        pr_number, client_result.err()
+                    );
+                    github_post_failed = true;
                 }
+            } else {
+                tracing::warn!(
+                    "No GitHub token found for parent task {} — cannot post review",
+                    parent_task_run_id
+                );
+                github_post_failed = true;
             }
         }
     }

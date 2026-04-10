@@ -86,24 +86,11 @@ pub fn run_prompt_with_routing(
     let cb_key = circuit_breaker::provider_key(&ai_settings.provider);
     let routing_config = &ai_settings.routing;
 
-    // Check circuit breaker before attempting the call
-    if !circuit_breaker::is_provider_available(&cb_key) {
-        let state = circuit_breaker::provider_state(&cb_key);
-        warn!(
-            "Provider {:?} circuit breaker is {} for routed prompt, failing fast",
-            ai_settings.provider, state
-        );
-        return AiResponse::error(format!(
-            "Provider {:?} circuit breaker is {} — too many recent failures",
-            ai_settings.provider, state
-        ));
-    }
-
-    // Determine the model to use based on routing (bandit + heuristic fallback)
+    // Determine the model to use based on routing (bandit + heuristic fallback).
+    // This is computed once — only the provider call retries on transient errors.
     let model_override = if routing_config.enabled {
         let router = TaskRouter::new(routing_config.clone());
 
-        // Try online learning bandit first, fall back to static heuristic
         let model = if let Some(bandit_mtx) = crate::online_learning::model_router() {
             if let Ok(mut bandit) = bandit_mtx.lock() {
                 let (model, decision) = router.route_task_with_bandit(context, &mut bandit);
@@ -137,66 +124,58 @@ pub fn run_prompt_with_routing(
         model_override.is_some()
     );
 
-    let response = match ai_settings.provider {
-        AiProvider::ClaudeCli => run_claude_cli(
-            prompt,
-            &ai_settings.claude_cli,
-            model_override.as_deref(),
-            doctor_handle,
-        ),
-        AiProvider::ClaudeApi => run_claude_api(
-            prompt,
-            &ai_settings.claude_api,
-            model_override.as_deref(),
-            doctor_handle,
-        ),
-        AiProvider::GeminiCli => {
-            // Gemini routing only works within Gemini models, warn if trying to route to Claude model
-            if let Some(ref model) = model_override {
-                if model.starts_with("claude") {
-                    warn!("Cannot route to Claude model when using Gemini provider, using default Gemini model");
+    // Wrap provider call in retry with account rotation on rate-limit.
+    retry_with_backoff_tracked("AI prompt (routed)", Some(&cb_key), || {
+        let ai_settings = settings::get_ai_settings();
+        match ai_settings.provider {
+            AiProvider::ClaudeCli => run_claude_cli(
+                prompt,
+                &ai_settings.claude_cli,
+                model_override.as_deref(),
+                doctor_handle,
+            ),
+            AiProvider::ClaudeApi => run_claude_api(
+                prompt,
+                &ai_settings.claude_api,
+                model_override.as_deref(),
+                doctor_handle,
+            ),
+            AiProvider::GeminiCli => {
+                if let Some(ref model) = model_override {
+                    if model.starts_with("claude") {
+                        warn!("Cannot route to Claude model when using Gemini provider");
+                        run_gemini_cli(prompt, &ai_settings.gemini_cli, None, doctor_handle)
+                    } else {
+                        run_gemini_cli(
+                            prompt,
+                            &ai_settings.gemini_cli,
+                            model_override.as_deref(),
+                            doctor_handle,
+                        )
+                    }
+                } else {
                     run_gemini_cli(prompt, &ai_settings.gemini_cli, None, doctor_handle)
-                } else {
-                    run_gemini_cli(
-                        prompt,
-                        &ai_settings.gemini_cli,
-                        model_override.as_deref(),
-                        doctor_handle,
-                    )
                 }
-            } else {
-                run_gemini_cli(prompt, &ai_settings.gemini_cli, None, doctor_handle)
             }
-        }
-        AiProvider::GeminiApi => {
-            if let Some(ref model) = model_override {
-                if model.starts_with("claude") {
-                    warn!("Cannot route to Claude model when using Gemini provider, using default Gemini model");
+            AiProvider::GeminiApi => {
+                if let Some(ref model) = model_override {
+                    if model.starts_with("claude") {
+                        warn!("Cannot route to Claude model when using Gemini provider");
+                        run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
+                    } else {
+                        run_gemini_api(
+                            prompt,
+                            &ai_settings.gemini_api,
+                            model_override.as_deref(),
+                            doctor_handle,
+                        )
+                    }
+                } else {
                     run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
-                } else {
-                    run_gemini_api(
-                        prompt,
-                        &ai_settings.gemini_api,
-                        model_override.as_deref(),
-                        doctor_handle,
-                    )
                 }
-            } else {
-                run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
             }
         }
-    };
-
-    // Record result to circuit breaker
-    if response.success {
-        circuit_breaker::record_provider_success(&cb_key);
-    } else if let Some(ref err) = response.error {
-        if super::retry::is_retryable_error(err) {
-            circuit_breaker::record_provider_failure(&cb_key, err);
-        }
-    }
-
-    response
+    })
 }
 
 /// Run an AI prompt with an explicit model/provider override.
