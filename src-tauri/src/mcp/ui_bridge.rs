@@ -4903,11 +4903,21 @@ pub async fn ui_bridge_with_diff_handler(
         }
     } else {
         // Single operation — wrap into execute_with_diff format
+        // ChangeTracker.executeWithDiff expects { elementAction: { elementId, action, params } }
         info!("UI Bridge API: Single execute with diff");
+        let element_id = body.get("elementId").cloned().unwrap_or_default();
+        let operation = body.get("operation").cloned().unwrap_or_default();
+        let params = body.get("params").cloned().unwrap_or(serde_json::Value::Null);
         let payload = serde_json::json!({
-            "elementId": body.get("elementId"),
-            "action": body.get("operation"),
-            "params": body.get("params").unwrap_or(&serde_json::Value::Null),
+            "elementAction": {
+                "elementId": element_id,
+                "action": operation,
+                "params": params,
+            },
+            // Also pass flat fields for commandHandlers.ts compatibility
+            "elementId": element_id,
+            "action": operation,
+            "params": params,
         });
         match ui_bridge_request_sync(&state, "execute_with_diff", payload).await {
             Ok(data) => Ok(Json(ApiResponse::success(data))),
@@ -6616,6 +6626,10 @@ pub async fn ui_bridge_ai_search_handler(
 }
 
 /// Natural language element find.
+///
+/// Callers can pass `"minConfidence": 0.3` in the request body to override
+/// the default threshold. The default (0.5) balances precision and recall
+/// for common queries like "text input" or "search box".
 pub async fn ui_bridge_ai_find_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
@@ -6629,16 +6643,26 @@ pub async fn ui_bridge_ai_find_handler(
             // Confidence gate: if the best match is below threshold, return
             // element: null so callers don't act on a wrong match.  The raw
             // confidence and alternatives are preserved for debugging.
-            const MIN_CONFIDENCE: f64 = 0.75;
+            //
+            // Default 0.5 was chosen empirically: exact-match queries score
+            // 1.0, good partial matches score 0.7-0.9, and reasonable fuzzy
+            // matches (e.g., "search box" → input element) score ~0.5.
+            // Callers can override via "minConfidence" in the request body.
+            let min_confidence = body
+                .get("minConfidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+            let min_confidence = if min_confidence == 0.0 { 0.5 } else { min_confidence };
             let inner = data.get("data").unwrap_or(&data);
             let conf = inner
                 .get("confidence")
                 .and_then(|c| c.as_f64())
                 .unwrap_or(0.0);
-            if conf < MIN_CONFIDENCE && conf > 0.0 {
+            if conf < min_confidence && conf > 0.0 {
                 info!(
                     "UI Bridge API: ai/find below confidence threshold ({:.2} < {:.2}) — returning null element",
-                    conf, MIN_CONFIDENCE
+                    conf, min_confidence
                 );
                 if let Some(obj) = data.as_object_mut() {
                     obj.insert("element".to_string(), serde_json::Value::Null);
@@ -6646,7 +6670,7 @@ pub async fn ui_bridge_ai_find_handler(
                         "belowThreshold".to_string(),
                         serde_json::json!({
                             "originalConfidence": conf,
-                            "threshold": MIN_CONFIDENCE,
+                            "threshold": min_confidence,
                         }),
                     );
                 }
@@ -6659,7 +6683,7 @@ pub async fn ui_bridge_ai_find_handler(
                         "belowThreshold".to_string(),
                         serde_json::json!({
                             "originalConfidence": conf,
-                            "threshold": MIN_CONFIDENCE,
+                            "threshold": min_confidence,
                         }),
                     );
                 }
