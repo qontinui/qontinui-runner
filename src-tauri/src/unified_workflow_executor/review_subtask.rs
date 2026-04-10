@@ -266,8 +266,9 @@ pub fn execute_review_subtask(
 /// Process a completed review subtask: parse the AI output, post a GitHub review,
 /// and determine whether the parent should unblock.
 ///
-/// Returns `true` if the parent should be allowed to complete (approved/inconclusive),
-/// `false` if the review requested changes (parent stays blocked).
+/// Called from `mark_task_completed` BEFORE the status is written. Returns `true`
+/// if the task should complete normally (approved/inconclusive), `false` if the
+/// caller should redirect to `mark_task_failed` (changes requested).
 pub async fn process_review_outcome(
     pg: &Arc<PgDb>,
     review_task_run_id: &str,
@@ -314,6 +315,7 @@ pub async fn process_review_outcome(
     };
 
     // 4. Post GitHub review if we have PR context
+    let mut github_post_failed = false;
     if pr_number > 0 && !repo_full_name.is_empty() {
         if let Some((owner, repo)) = repo_full_name.split_once('/') {
             // Get the GitHub token from the parent's PR watch
@@ -325,9 +327,14 @@ pub async fn process_review_outcome(
                             "Automated review: no issues found. Approving.".to_string(),
                         ),
                         ReviewOutcome::ChangesRequested { feedback } => {
-                            // Truncate feedback to avoid GitHub API limits (64KB)
+                            // Truncate feedback to avoid GitHub API limits (64KB).
+                            // Use char_indices for UTF-8 safe truncation.
                             let truncated = if feedback.len() > 60_000 {
-                                format!("{}...\n\n(truncated)", &feedback[..60_000])
+                                let mut end = 60_000;
+                                while !feedback.is_char_boundary(end) && end > 0 {
+                                    end -= 1;
+                                }
+                                format!("{}...\n\n(truncated)", &feedback[..end])
                             } else {
                                 feedback.clone()
                             };
@@ -347,6 +354,7 @@ pub async fn process_review_outcome(
                             "Failed to post GitHub review for PR #{} in {}: {}",
                             pr_number, repo_full_name, e
                         );
+                        github_post_failed = true;
                     } else {
                         tracing::info!(
                             "Posted {} review on PR #{} in {}",
@@ -358,18 +366,23 @@ pub async fn process_review_outcome(
         }
     }
 
-    // 5. Determine whether parent should unblock
+    // 5. Determine whether parent should unblock.
+    // The caller (mark_task_completed) will redirect to mark_task_failed if false.
     match outcome {
         ReviewOutcome::Approved | ReviewOutcome::Inconclusive => true,
         ReviewOutcome::ChangesRequested { .. } => {
-            // Mark the review as failed so the parent stays blocked
-            if let Err(e) = pg.fail_task_run(review_task_run_id, "changes_requested").await {
+            // If we failed to post the review to GitHub, the PR author has no idea
+            // changes were requested. Don't permanently block the parent in that case.
+            if github_post_failed {
                 tracing::warn!(
-                    "Failed to mark review {} as failed: {}",
-                    review_task_run_id, e
+                    "Review {} requested changes but GitHub posting failed — \
+                     allowing parent to proceed to avoid permanent block",
+                    review_task_run_id
                 );
+                true
+            } else {
+                false
             }
-            false
         }
     }
 }

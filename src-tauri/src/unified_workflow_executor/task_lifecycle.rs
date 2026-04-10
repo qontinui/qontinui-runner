@@ -40,6 +40,32 @@ impl LoopController {
             }
         }
 
+        // If this task is a review subtask, process its outcome before writing status.
+        // The outcome may redirect to mark_task_failed instead of completing.
+        if let Ok(Some(tr)) = self.app_state.pg_db.get_task_run(execution_id).await {
+            if tr.is_review {
+                let parent_id = tr.parent_task_run_id.as_deref().unwrap_or("");
+                if !parent_id.is_empty() {
+                    let should_complete =
+                        super::review_subtask::process_review_outcome(
+                            &self.app_state.pg_db,
+                            execution_id,
+                            parent_id,
+                        )
+                        .await;
+                    if !should_complete {
+                        info!(
+                            "Review {} requested changes, marking as failed instead of completed",
+                            execution_id
+                        );
+                        self.mark_task_failed(execution_id, "changes_requested", workflow_id)
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }
+
         // Release advisory file registry entries on completion
         self.app_state
             .file_registry_manager
@@ -243,26 +269,6 @@ impl LoopController {
                 tokio::spawn(async move {
                     match pg.get_blocking_parent_info(&eid).await {
                         Ok(Some((parent_id, true))) => {
-                            // If the completed child is a review subtask, process its outcome first.
-                            // This may post a GitHub review and decide whether to block the parent.
-                            let should_unblock = match pg.get_task_run(&eid).await {
-                                Ok(Some(tr)) if tr.is_review => {
-                                    super::review_subtask::process_review_outcome(
-                                        &pg, &eid, &parent_id,
-                                    )
-                                    .await
-                                }
-                                _ => true, // Non-review children always unblock
-                            };
-
-                            if !should_unblock {
-                                info!(
-                                    "Review subtask {} requested changes, parent {} stays blocked",
-                                    eid, parent_id
-                                );
-                                return;
-                            }
-
                             // This was a blocking child — check if parent can now complete
                             match pg.has_blocking_incomplete_children(&parent_id).await {
                                 Ok(false) => {
@@ -412,6 +418,45 @@ impl LoopController {
                     .await
                     {
                         tracing::debug!("Ticket sync on-failure hook failed: {}", e);
+                    }
+                });
+            }
+
+            // ── Parent advancement: failed blocking children also unblock parents ──
+            // A failed review (or any blocking child) should let the parent proceed
+            // rather than leaving it permanently blocked.
+            {
+                let pg = self.app_state.pg_db.clone();
+                let eid = execution_id.to_string();
+                let app_handle = self.app_handle.clone();
+                tokio::spawn(async move {
+                    match pg.get_blocking_parent_info(&eid).await {
+                        Ok(Some((parent_id, true))) => {
+                            match pg.has_blocking_incomplete_children(&parent_id).await {
+                                Ok(false) => {
+                                    info!(
+                                        "All blocking children of {} resolved (including failures), advancing parent",
+                                        parent_id
+                                    );
+                                    if let Err(e) = pg.complete_task_run(&parent_id).await {
+                                        warn!("Failed to complete parent task {}: {}", parent_id, e);
+                                    } else {
+                                        let broadcaster = EventBroadcaster::new(app_handle);
+                                        broadcaster.task_run_update(&parent_id, "completed", None, None);
+                                    }
+                                }
+                                Ok(true) => {
+                                    tracing::debug!(
+                                        "Parent {} still has other blocking children after child {} failed",
+                                        parent_id, eid
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Failed to check blocking children for parent {}: {}", parent_id, e);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 });
             }
