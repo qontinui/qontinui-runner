@@ -7,7 +7,7 @@
  * Provides a high-level overview of workflow execution progress.
  */
 
-import React, { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import React, { useState, useCallback, useEffect, useMemo } from "react";
 import {
   Terminal,
   CheckCircle,
@@ -817,7 +817,9 @@ export function ExecutionTimelineWidget({
 
   const expandedIterations = expandedIterationsResult.expanded;
 
-  // Update prevIterationCounts state after render so the next render can detect new iterations
+  // Update prevIterationCounts state after render so the next render can detect new iterations.
+  // This is intentionally syncing derived state to enable new-iteration detection on the next render.
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => {
     setPrevIterationCounts(expandedIterationsResult.nextCounts);
   }, [expandedIterationsResult.nextCounts]);
