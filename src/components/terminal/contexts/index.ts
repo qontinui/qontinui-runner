@@ -17,3 +17,11 @@ export { useTransitionEffects } from "./useTransitionEffects";
 export { AiFeaturesProvider } from "./AiFeaturesContext";
 export type { AiFeaturesContextValue } from "./AiFeaturesContext";
 export { useAiFeatures } from "./useAiFeatures";
+
+export { ShellInfraProvider } from "./ShellInfraContext";
+export type { ShellInfraContextValue } from "./ShellInfraContext";
+export { useShellInfra } from "./useShellInfra";
+
+export { UIStateProvider } from "./UIStateContext";
+export type { UIStateContextValue } from "./UIStateContext";
+export { useUIStateCx } from "./useUIStateCx";

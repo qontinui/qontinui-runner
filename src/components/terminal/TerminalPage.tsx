@@ -4,7 +4,6 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
-import { useFileConflicts } from "./useFileConflicts";
 import { SessionManagerPanel } from "./SessionManagerPanel";
 import { ZoneGrid } from "./ZoneGrid";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
@@ -19,19 +18,18 @@ import {
   ZoneMetadataProvider, useZoneMetadata,
   TransitionEffectsProvider, useTransitionEffects,
   AiFeaturesProvider, useAiFeatures,
+  ShellInfraProvider, useShellInfra,
+  UIStateProvider, useUIStateCx,
 } from "./contexts";
 import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
-import { useSessionPersistence } from "./useSessionPersistence";
 import { OutputSearchBar } from "./OutputSearchBar";
 import { TerminalRightPanel } from "./TerminalRightPanel";
 import { TerminalOverlays } from "./TerminalOverlays";
 
-import { useUIState } from "./useUIState";
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { useTerminalInitialization } from "./useTerminalInitialization";
 import { useZoneActions } from "./useZoneActions";
-import { useFileLockTracking } from "./useFileLockTracking";
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -46,12 +44,16 @@ export function TerminalPage(props: TerminalPageProps) {
       <SessionStateProvider>
         <ZoneMetadataProvider>
           <TransitionEffectsProvider>
-            <AiFeaturesProvider
-              onNavigateToBuilder={props.onNavigateToBuilder}
-              onNavigateToActive={props.onNavigateToActive}
-            >
-              <TerminalPageInner {...props} />
-            </AiFeaturesProvider>
+            <UIStateProvider>
+              <ShellInfraProvider>
+                <AiFeaturesProvider
+                  onNavigateToBuilder={props.onNavigateToBuilder}
+                  onNavigateToActive={props.onNavigateToActive}
+                >
+                  <TerminalPageInner {...props} />
+                </AiFeaturesProvider>
+              </ShellInfraProvider>
+            </UIStateProvider>
           </TransitionEffectsProvider>
         </ZoneMetadataProvider>
       </SessionStateProvider>
@@ -110,8 +112,7 @@ function TerminalPageInner({
     onSessionCountChange?.(tabs.length);
   }, [tabs.length, onSessionCountChange]);
 
-  const fileConflicts = useFileConflicts();
-  const fileLockStates = useFileLockTracking(tabs);
+  const { fileConflicts, fileLockStates, sessionPersistence } = useShellInfra();
   const {
     labelsAndTags,
     eventHistory,
@@ -148,9 +149,7 @@ function TerminalPageInner({
     toggleFocusMode,
     toggleAutoLayout,
     cycleViewMode,
-  } = useUIState();
-
-  const sessionPersistence = useSessionPersistence(pageId);
+  } = useUIStateCx();
 
   useTerminalInitialization({
     tabs,
