@@ -492,46 +492,10 @@ function TerminalPageInner({
         <div className="flex-1 relative overflow-hidden">
           {tabs.length > 0 ? (
             <ZoneGrid
-              layout={zoneLayout.layout}
-              assignments={zoneLayout.assignments}
-              tabs={tabs}
-              focusedZone={zoneLayout.focusedZone}
-              maximizedZone={zoneLayout.maximizedZone}
-              sessionStates={stateTracking.sessionStates}
-              lastOutputLines={stateTracking.lastOutputLines}
-              viewMode={uiState.viewMode}
-              terminalRefs={terminalRefs.current}
               onZoneClick={handleZoneClick}
               onZoneDoubleClick={handleZoneDoubleClick}
               onExit={handleExit}
-              onFirstInput={shellIntegration.handleFirstInput}
-              onShellIntegration={shellIntegration.handleShellIntegration}
-              onOutput={stateTracking.handleOutput}
-              onReconnected={markReconnected}
-              onAssignTab={zoneLayout.assignTabToZone}
-              flashingTabs={transitionEffects.flashingTabs}
-              stateDurations={stateTracking.stateDurations}
-              selectedZones={uiState.selectedZones}
-              staleTabs={stateTracking.staleTabs}
-              pinnedZones={labelsAndTags.pinnedZones}
-              onTogglePin={labelsAndTags.togglePin}
-              outputSearchQuery={uiState.outputSearch || undefined}
-              swapSource={uiState.swapSource}
-              activityData={stateTracking.activityData}
-              zoneLabels={labelsAndTags.zoneLabels}
-              onSetZoneLabel={labelsAndTags.setZoneLabel}
-              onRestartInZone={handleRestartInZone}
-              resetRatiosKey={uiState.resetRatiosKey}
-              labelColorMap={labelsAndTags.labelColorMap}
-              zoneTags={labelsAndTags.zoneTags}
-              commandHistories={shellIntegration.commandHistories}
-              focusMode={uiState.focusMode}
-              zoneNotes={labelsAndTags.zoneNotes}
-              onSetZoneNote={labelsAndTags.setZoneNote}
               onExportZone={handleExportZone}
-              pendingRestarts={transitionEffects.pendingRestarts}
-              onCancelRestart={transitionEffects.cancelPendingRestart}
-              pageId={pageId}
             />
           ) : (
             <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">

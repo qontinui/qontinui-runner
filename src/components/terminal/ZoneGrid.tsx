@@ -1,15 +1,13 @@
-import { useCallback, useReducer, useRef, useEffect, type RefObject } from "react";
+import { useCallback, useReducer, useRef, useEffect } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
 import { Terminal, Filter, RefreshCw } from "lucide-react";
 import {
   TerminalInstance,
-  type TerminalInstanceHandle,
   type ShellIntegrationEvent,
 } from "./TerminalInstance";
 import { PlanViewer } from "./PlanViewer";
-import type { TerminalTab } from "./useTerminalManager";
-import type { LayoutPreset, ZoneAssignments, SessionState } from "./useZoneLayout";
+import type { LayoutPreset } from "./useZoneLayout";
 import {
   STATE_BORDER_COLORS,
   STATE_COLORS,
@@ -22,51 +20,23 @@ import {
   formatUptime,
   countMatches,
 } from "./zone-grid";
+import {
+  useTerminalCore,
+  useSessionState,
+  useZoneMetadata,
+  useTransitionEffects,
+  useAiFeatures,
+  useUIStateCx,
+} from "./contexts";
 
 export type ViewMode = "auto" | "full" | "compact";
 
 interface ZoneGridProps {
-  layout: LayoutPreset;
-  assignments: ZoneAssignments;
-  tabs: TerminalTab[];
-  focusedZone: number;
-  maximizedZone: number | null;
-  sessionStates: Record<string, SessionState>;
-  lastOutputLines: Record<string, string[]>;
-  viewMode: ViewMode;
-  terminalRefs: Map<string, RefObject<TerminalInstanceHandle | null>>;
+  /** Callbacks from useZoneActions — kept as props until that hook moves to context */
   onZoneClick: (zoneIndex: number, ctrlKey?: boolean) => void;
   onZoneDoubleClick: (zoneIndex: number) => void;
   onExit: (terminalId: string, exitCode: number | null) => void;
-  onFirstInput: (terminalId: string, input: string) => void;
-  onShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
-  onOutput: (tabId: string, text: string) => void;
-  onReconnected: (tabId: string) => void;
-  onAssignTab?: (zoneIndex: number, tabId: string) => void;
-  flashingTabs?: Set<string>;
-  stateDurations?: Record<string, string>;
-  selectedZones?: Set<number>;
-  staleTabs?: Set<string>;
-  pinnedZones?: Set<number>;
-  onTogglePin?: (zoneIndex: number) => void;
-  outputSearchQuery?: string;
-  swapSource?: number | null;
-  activityData?: Record<string, number[]>;
-  zoneLabels?: Record<number, string>;
-  onSetZoneLabel?: (zoneIndex: number, label: string) => void;
-  onRestartInZone?: (zoneIndex: number) => void;
-  resetRatiosKey?: number;
-  labelColorMap?: Record<string, string>;
-  zoneTags?: Record<number, string[]>;
-  commandHistories?: Record<string, { command: string; exitCode: number; timestamp: number }[]>;
-  focusMode?: boolean;
-  zoneNotes?: Record<number, string>;
-  onSetZoneNote?: (zoneIndex: number, note: string) => void;
   onExportZone?: (zoneIndex: number, format: "text" | "markdown" | "json") => void;
-  pendingRestarts?: Record<number, number>;
-  onCancelRestart?: (zoneIndex: number) => void;
-  /** Terminal page ID for storage namespacing */
-  pageId?: string;
 }
 
 interface GridState {
@@ -136,47 +106,51 @@ function createInitialGridState(layout: LayoutPreset): GridState {
 }
 
 export function ZoneGrid({
-  layout,
-  assignments,
-  tabs,
-  focusedZone,
-  maximizedZone,
-  sessionStates,
-  lastOutputLines,
-  viewMode,
-  terminalRefs,
   onZoneClick,
   onZoneDoubleClick,
   onExit,
-  onFirstInput,
-  onShellIntegration,
-  onOutput,
-  onReconnected,
-  onAssignTab,
-  flashingTabs,
-  stateDurations,
-  selectedZones,
-  staleTabs,
-  pinnedZones,
-  onTogglePin,
-  outputSearchQuery,
-  swapSource,
-  activityData,
-  zoneLabels,
-  onSetZoneLabel,
-  onRestartInZone,
-  resetRatiosKey,
-  labelColorMap,
-  zoneTags,
-  commandHistories,
-  focusMode,
-  zoneNotes,
-  onSetZoneNote,
   onExportZone,
-  pendingRestarts,
-  onCancelRestart,
-  pageId = "default",
 }: ZoneGridProps) {
+  // Read all data from contexts
+  const { tabs, zoneLayout, terminalRefs, pageId, markReconnected } = useTerminalCore();
+  const layout = zoneLayout.layout;
+  const assignments = zoneLayout.assignments;
+  const focusedZone = zoneLayout.focusedZone;
+  const maximizedZone = zoneLayout.maximizedZone;
+  const onAssignTab = zoneLayout.assignTabToZone;
+  const stateTracking = useSessionState();
+  const sessionStates = stateTracking.sessionStates;
+  const lastOutputLines = stateTracking.lastOutputLines;
+  const stateDurations = stateTracking.stateDurations;
+  const staleTabs = stateTracking.staleTabs;
+  const activityData = stateTracking.activityData;
+  const onOutput = stateTracking.handleOutput;
+  const onReconnected = markReconnected;
+  const { labelsAndTags, incrementMetric: _incrementMetric } = useZoneMetadata();
+  const zoneLabels = labelsAndTags.zoneLabels;
+  const onSetZoneLabel = labelsAndTags.setZoneLabel;
+  const pinnedZones = labelsAndTags.pinnedZones;
+  const onTogglePin = labelsAndTags.togglePin;
+  const labelColorMap = labelsAndTags.labelColorMap;
+  const zoneTags = labelsAndTags.zoneTags;
+  const zoneNotes = labelsAndTags.zoneNotes;
+  const onSetZoneNote = labelsAndTags.setZoneNote;
+  const transitionEffects = useTransitionEffects();
+  const flashingTabs = transitionEffects.flashingTabs;
+  const onRestartInZone = transitionEffects.handleRestartInZone;
+  const pendingRestarts = transitionEffects.pendingRestarts;
+  const onCancelRestart = transitionEffects.cancelPendingRestart;
+  const { shellIntegration } = useAiFeatures();
+  const onFirstInput = shellIntegration.handleFirstInput;
+  const onShellIntegration = shellIntegration.handleShellIntegration;
+  const commandHistories = shellIntegration.commandHistories;
+  const { state: uiState } = useUIStateCx();
+  const viewMode = uiState.viewMode;
+  const selectedZones = uiState.selectedZones;
+  const outputSearchQuery = uiState.outputSearch || undefined;
+  const swapSource = uiState.swapSource;
+  const resetRatiosKey = uiState.resetRatiosKey;
+  const focusMode = uiState.focusMode;
   const pk = (key: string) => pageKey(pageId, key);
   const [gridState, dispatch] = useReducer(gridReducer, layout, createInitialGridState);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -661,7 +635,7 @@ function ZoneCell({
   const tabId = assignments[zoneIdx];
   const tab = tabs.find((t) => t.id === tabId);
   const isFocused = zoneIdx === focusedZone;
-  const state = tab ? (sessionStates[tab.id] ?? "idle") : "idle";
+  const state = (tab ? (sessionStates[tab.id as string] ?? "idle") : "idle") as SessionState;
   const borderColor = isFocused
     ? STATE_BORDER_COLORS[state] === "#2a2d3d"
       ? "#7aa2f7"
