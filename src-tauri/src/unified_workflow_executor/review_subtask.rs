@@ -109,12 +109,18 @@ pub async fn spawn_review_subtask(
         .await
         .map_err(|e| format!("Failed to create review task run: {}", e))?;
 
-    // Store model override in result_data so the executor can read it at run time
-    if let Some(ref model) = config.review_model {
-        let model_json = serde_json::json!({ "model_override": model }).to_string();
-        pg.set_task_run_result_data(&review_id, &model_json)
+    // Store review metadata in result_data: model override + PR context for outcome processing
+    {
+        let mut meta = serde_json::json!({
+            "pr_number": config.pr_number,
+            "repo_full_name": config.repo_full_name,
+        });
+        if let Some(ref model) = config.review_model {
+            meta["model_override"] = serde_json::json!(model);
+        }
+        pg.set_task_run_result_data(&review_id, &meta.to_string())
             .await
-            .map_err(|e| format!("Failed to set review model override: {}", e))?;
+            .map_err(|e| format!("Failed to set review result_data: {}", e))?;
     }
 
     // Set the review-specific columns via raw SQL (not yet in Clorinde schema)
@@ -255,6 +261,117 @@ pub fn execute_review_subtask(
     );
 
     tracing::info!("Review subtask '{}' spawned", review_id);
+}
+
+/// Process a completed review subtask: parse the AI output, post a GitHub review,
+/// and determine whether the parent should unblock.
+///
+/// Returns `true` if the parent should be allowed to complete (approved/inconclusive),
+/// `false` if the review requested changes (parent stays blocked).
+pub async fn process_review_outcome(
+    pg: &Arc<PgDb>,
+    review_task_run_id: &str,
+    parent_task_run_id: &str,
+) -> bool {
+    // 1. Read the review's output
+    let output = match pg.get_task_output(review_task_run_id).await {
+        Ok(o) if !o.is_empty() => o,
+        Ok(_) => {
+            tracing::warn!(
+                "Review subtask {} produced no output, treating as inconclusive",
+                review_task_run_id
+            );
+            return true; // Don't block parent on empty output
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to read review output for {}: {}, allowing parent to proceed",
+                review_task_run_id, e
+            );
+            return true;
+        }
+    };
+
+    // 2. Parse the outcome
+    let outcome = parse_review_outcome(&output);
+    tracing::info!(
+        "Review subtask {} outcome: {:?}",
+        review_task_run_id, outcome
+    );
+
+    // 3. Read PR context from result_data
+    let (pr_number, repo_full_name) = match pg.get_task_run_result_data(review_task_run_id).await {
+        Ok(Some(data)) => {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                let pr = json["pr_number"].as_u64().unwrap_or(0);
+                let repo = json["repo_full_name"].as_str().unwrap_or("").to_string();
+                (pr, repo)
+            } else {
+                (0, String::new())
+            }
+        }
+        _ => (0, String::new()),
+    };
+
+    // 4. Post GitHub review if we have PR context
+    if pr_number > 0 && !repo_full_name.is_empty() {
+        if let Some((owner, repo)) = repo_full_name.split_once('/') {
+            // Get the GitHub token from the parent's PR watch
+            if let Ok(Some(token)) = pg.get_pr_watch_token_for_task(parent_task_run_id).await {
+                if let Ok(client) = crate::trigger_system::github_api::GitHubClient::new(&token) {
+                    let (event, body) = match &outcome {
+                        ReviewOutcome::Approved => (
+                            "APPROVE",
+                            "Automated review: no issues found. Approving.".to_string(),
+                        ),
+                        ReviewOutcome::ChangesRequested { feedback } => {
+                            // Truncate feedback to avoid GitHub API limits (64KB)
+                            let truncated = if feedback.len() > 60_000 {
+                                format!("{}...\n\n(truncated)", &feedback[..60_000])
+                            } else {
+                                feedback.clone()
+                            };
+                            ("REQUEST_CHANGES", truncated)
+                        }
+                        ReviewOutcome::Inconclusive => (
+                            "COMMENT",
+                            "Automated review completed but could not determine a clear verdict. Please review manually.".to_string(),
+                        ),
+                    };
+
+                    if let Err(e) = client
+                        .submit_pr_review(owner, repo, pr_number, event, &body)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to post GitHub review for PR #{} in {}: {}",
+                            pr_number, repo_full_name, e
+                        );
+                    } else {
+                        tracing::info!(
+                            "Posted {} review on PR #{} in {}",
+                            event, pr_number, repo_full_name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Determine whether parent should unblock
+    match outcome {
+        ReviewOutcome::Approved | ReviewOutcome::Inconclusive => true,
+        ReviewOutcome::ChangesRequested { .. } => {
+            // Mark the review as failed so the parent stays blocked
+            if let Err(e) = pg.fail_task_run(review_task_run_id, "changes_requested").await {
+                tracing::warn!(
+                    "Failed to mark review {} as failed: {}",
+                    review_task_run_id, e
+                );
+            }
+            false
+        }
+    }
 }
 
 /// Parse the review outcome from the AI's response text.

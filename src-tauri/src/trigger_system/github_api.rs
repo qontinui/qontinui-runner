@@ -223,7 +223,11 @@ impl GitHubClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.token)).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {}", self.token))
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Invalid GitHub token header value: {e}");
+                    HeaderValue::from_static("Bearer invalid-token")
+                }),
         );
         headers.insert(
             ACCEPT,
@@ -451,6 +455,39 @@ impl GitHubClient {
         if !resp.status().is_success() {
             return Err(format!(
                 "GitHub API returned {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Submit a PR review (APPROVE, REQUEST_CHANGES, or COMMENT).
+    pub async fn submit_pr_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        event: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}/reviews",
+            owner, repo, number
+        );
+        let resp = self
+            .send_with_rate_limit(
+                self.client
+                    .post(&url)
+                    .headers(self.headers())
+                    .json(&serde_json::json!({ "event": event, "body": body })),
+            )
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "GitHub submit_pr_review returned {}: {}",
                 resp.status(),
                 resp.text().await.unwrap_or_default()
             ));

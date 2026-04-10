@@ -153,6 +153,25 @@ impl PgDb {
         Ok(())
     }
 
+    /// Get the GitHub token from the PR watch associated with a task run.
+    pub async fn get_pr_watch_token_for_task(&self, task_run_id: &str) -> Result<Option<String>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                "SELECT github_token FROM pr_watch_state WHERE task_run_id = $1 AND completed_at IS NULL LIMIT 1",
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_pr_watch_token_for_task: {}", e))?;
+
+        Ok(row.map(|r| r.get(0)))
+    }
+
     /// Store CI failure context JSON on a task run for the executor to pick up.
     ///
     /// Atomically merges the CI context into the existing result_data JSON using

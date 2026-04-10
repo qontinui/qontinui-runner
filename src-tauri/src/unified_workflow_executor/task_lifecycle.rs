@@ -243,6 +243,26 @@ impl LoopController {
                 tokio::spawn(async move {
                     match pg.get_blocking_parent_info(&eid).await {
                         Ok(Some((parent_id, true))) => {
+                            // If the completed child is a review subtask, process its outcome first.
+                            // This may post a GitHub review and decide whether to block the parent.
+                            let should_unblock = match pg.get_task_run(&eid).await {
+                                Ok(Some(tr)) if tr.is_review => {
+                                    super::review_subtask::process_review_outcome(
+                                        &pg, &eid, &parent_id,
+                                    )
+                                    .await
+                                }
+                                _ => true, // Non-review children always unblock
+                            };
+
+                            if !should_unblock {
+                                info!(
+                                    "Review subtask {} requested changes, parent {} stays blocked",
+                                    eid, parent_id
+                                );
+                                return;
+                            }
+
                             // This was a blocking child — check if parent can now complete
                             match pg.has_blocking_incomplete_children(&parent_id).await {
                                 Ok(false) => {
