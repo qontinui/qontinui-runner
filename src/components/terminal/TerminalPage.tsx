@@ -15,7 +15,11 @@ import { BatchOperationsBar } from "./BatchOperationsBar";
 import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
 import { useTerminalPageId } from "./TerminalPageContext";
-import { TerminalCoreProvider, useTerminalCore, SessionStateProvider, useSessionState } from "./contexts";
+import {
+  TerminalCoreProvider, useTerminalCore,
+  SessionStateProvider, useSessionState,
+  ZoneMetadataProvider, useZoneMetadata,
+} from "./contexts";
 import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
 import { useSessionPersistence } from "./useSessionPersistence";
@@ -23,10 +27,7 @@ import { OutputSearchBar } from "./OutputSearchBar";
 import { TerminalRightPanel } from "./TerminalRightPanel";
 import { TerminalOverlays } from "./TerminalOverlays";
 
-import { useEventHistory } from "./useEventHistory";
-import { useFocusHistory } from "./useFocusHistory";
 import { useWindowTitle } from "./useWindowTitle";
-import { useZoneLabelsAndTags } from "./useZoneLabelsAndTags";
 import { useStateTransitionEffects } from "./useStateTransitionEffects";
 import { useShellIntegration } from "./useShellIntegration";
 import { useWorkflowGeneration } from "./useWorkflowGeneration";
@@ -50,7 +51,9 @@ export function TerminalPage(props: TerminalPageProps) {
   return (
     <TerminalCoreProvider pageId={pageId}>
       <SessionStateProvider>
-        <TerminalPageInner {...props} />
+        <ZoneMetadataProvider>
+          <TerminalPageInner {...props} />
+        </ZoneMetadataProvider>
       </SessionStateProvider>
     </TerminalCoreProvider>
   );
@@ -109,9 +112,14 @@ function TerminalPageInner({
 
   const fileConflicts = useFileConflicts();
   const fileLockStates = useFileLockTracking(tabs);
-  const { eventHistory, addHistoryEvent, metrics, incrementMetric } = useEventHistory();
-  const focusHistory = useFocusHistory(zoneLayout.focusedZone, zoneLayout.setFocusedZone);
-  const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments, pageId);
+  const {
+    labelsAndTags,
+    eventHistory,
+    addHistoryEvent,
+    metrics,
+    incrementMetric,
+    focusHistory,
+  } = useZoneMetadata();
 
   const sessionState = useSessionState();
   const { snapshots, activeFindings, allFindings } = sessionState;

@@ -5,3 +5,7 @@ export { useTerminalCore } from "./useTerminalCore";
 export { SessionStateProvider } from "./SessionStateContext";
 export type { SessionStateContextValue } from "./SessionStateContext";
 export { useSessionState } from "./useSessionState";
+
+export { ZoneMetadataProvider } from "./ZoneMetadataContext";
+export type { ZoneMetadataContextValue } from "./ZoneMetadataContext";
+export { useZoneMetadata } from "./useZoneMetadata";
