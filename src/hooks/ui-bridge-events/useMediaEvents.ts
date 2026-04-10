@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { compareVisualRegression } from "@qontinui/ui-bridge/ai";
+import { compareVisualRegression, captureElementScreenshot } from "@qontinui/ui-bridge/ai";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 
 /**
@@ -119,27 +119,47 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
                   node = node.parentElement;
                 }
 
-                const canvas = await html2canvas(domElement, {
-                  backgroundColor: bgColor || "#0a0a0b", // fallback to runner's dark bg
-                  scale: 1, // Use CSS pixel resolution — avoids DPI offset/clipping bugs
-                  logging: false,
-                  useCORS: true,
-                  // Explicitly set the capture window to the element's bounds to prevent
-                  // html2canvas from miscalculating the crop area at non-integer DPI scales
-                  x: 0,
-                  y: 0,
-                  width: domElement.scrollWidth,
-                  height: domElement.scrollHeight,
-                });
+                let base64: string;
+                let captureWidth: number;
+                let captureHeight: number;
 
-                const dataUrl = canvas.toDataURL("image/png");
-                const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
+                try {
+                  const canvas = await html2canvas(domElement, {
+                    backgroundColor: bgColor || "#0a0a0b", // fallback to runner's dark bg
+                    scale: 1, // Use CSS pixel resolution — avoids DPI offset/clipping bugs
+                    logging: false,
+                    useCORS: true,
+                    // Explicitly set the capture window to the element's bounds to prevent
+                    // html2canvas from miscalculating the crop area at non-integer DPI scales
+                    x: 0,
+                    y: 0,
+                    width: domElement.scrollWidth,
+                    height: domElement.scrollHeight,
+                  });
+
+                  const dataUrl = canvas.toDataURL("image/png");
+                  base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
+                  captureWidth = canvas.width;
+                  captureHeight = canvas.height;
+                } catch {
+                  // html2canvas fails on modern CSS color functions (oklab/oklch).
+                  // Fall back to SVG foreignObject capture from ui-bridge SDK.
+                  const fallback = await captureElementScreenshot(
+                    domElement as HTMLElement,
+                    el.id,
+                    { background: bgColor || "#0a0a0b" },
+                  );
+                  if (!fallback) return null;
+                  base64 = fallback.data;
+                  captureWidth = fallback.width;
+                  captureHeight = fallback.height;
+                }
 
                 return {
                   id: el.id,
                   base64_png: base64,
-                  width: canvas.width,
-                  height: canvas.height,
+                  width: captureWidth,
+                  height: captureHeight,
                 };
               }),
             );
@@ -354,14 +374,84 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
               },
               timestamp: Date.now(),
             });
-          } catch (e) {
-            await sendResponse({
-              requestId,
-              type,
-              success: false,
-              error: e instanceof Error ? e.message : String(e),
-              timestamp: Date.now(),
-            });
+          } catch (html2canvasError) {
+            // html2canvas cannot parse modern CSS color functions like oklab() / oklch().
+            // Fall back to the SVG foreignObject capture path from ui-bridge SDK.
+            console.warn(
+              `[UIBridgeEventHandler] html2canvas failed for '${elementId}', trying SVG foreignObject fallback:`,
+              html2canvasError instanceof Error ? html2canvasError.message : html2canvasError,
+            );
+            try {
+              const fallbackResult = await captureElementScreenshot(
+                domElement as HTMLElement,
+                elementId,
+                { background: "#0a0a0b" },
+              );
+
+              if (fallbackResult) {
+                await sendResponse({
+                  requestId,
+                  type,
+                  success: true,
+                  data: {
+                    id: elementId,
+                    base64_png: fallbackResult.data,
+                    width: fallbackResult.width,
+                    height: fallbackResult.height,
+                    device_pixel_ratio: window.devicePixelRatio || 1,
+                    capture_method: "svg_foreignobject",
+                  },
+                  timestamp: Date.now(),
+                });
+              } else {
+                // SVG fallback returned null — return a transparent placeholder
+                const rect = (domElement as HTMLElement).getBoundingClientRect();
+                // 1x1 transparent PNG as base64
+                const TRANSPARENT_PNG =
+                  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAAA0lEQVQI12P4z8BQDwAEgAF/QualzQAAAABJRU5ErkJggg==";
+                await sendResponse({
+                  requestId,
+                  type,
+                  success: true,
+                  data: {
+                    id: elementId,
+                    base64_png: TRANSPARENT_PNG,
+                    width: Math.round(rect.width) || 1,
+                    height: Math.round(rect.height) || 1,
+                    device_pixel_ratio: window.devicePixelRatio || 1,
+                    capture_method: "placeholder",
+                    warning:
+                      "Element uses CSS color functions (oklab/oklch) unsupported by html2canvas; SVG fallback also failed. Returning transparent placeholder.",
+                  },
+                  timestamp: Date.now(),
+                });
+              }
+            } catch (fallbackError) {
+              // Both html2canvas and SVG foreignObject failed — return placeholder
+              const rect = (domElement as HTMLElement).getBoundingClientRect();
+              const TRANSPARENT_PNG =
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAAA0lEQVQI12P4z8BQDwAEgAF/QualzQAAAABJRU5ErkJggg==";
+              console.warn(
+                `[UIBridgeEventHandler] SVG foreignObject fallback also failed for '${elementId}':`,
+                fallbackError instanceof Error ? fallbackError.message : fallbackError,
+              );
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: {
+                  id: elementId,
+                  base64_png: TRANSPARENT_PNG,
+                  width: Math.round(rect.width) || 1,
+                  height: Math.round(rect.height) || 1,
+                  device_pixel_ratio: window.devicePixelRatio || 1,
+                  capture_method: "placeholder",
+                  warning:
+                    "Element uses CSS color functions (oklab/oklch) unsupported by html2canvas; SVG fallback also failed. Returning transparent placeholder.",
+                },
+                timestamp: Date.now(),
+              });
+            }
           }
           return true;
         }
