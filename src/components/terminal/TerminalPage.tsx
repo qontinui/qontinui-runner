@@ -19,6 +19,7 @@ import {
   TerminalCoreProvider, useTerminalCore,
   SessionStateProvider, useSessionState,
   ZoneMetadataProvider, useZoneMetadata,
+  TransitionEffectsProvider, useTransitionEffects,
 } from "./contexts";
 import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
@@ -27,8 +28,6 @@ import { OutputSearchBar } from "./OutputSearchBar";
 import { TerminalRightPanel } from "./TerminalRightPanel";
 import { TerminalOverlays } from "./TerminalOverlays";
 
-import { useWindowTitle } from "./useWindowTitle";
-import { useStateTransitionEffects } from "./useStateTransitionEffects";
 import { useShellIntegration } from "./useShellIntegration";
 import { useWorkflowGeneration } from "./useWorkflowGeneration";
 import { useAnalysis } from "./useAnalysis";
@@ -52,7 +51,9 @@ export function TerminalPage(props: TerminalPageProps) {
     <TerminalCoreProvider pageId={pageId}>
       <SessionStateProvider>
         <ZoneMetadataProvider>
-          <TerminalPageInner {...props} />
+          <TransitionEffectsProvider>
+            <TerminalPageInner {...props} />
+          </TransitionEffectsProvider>
         </ZoneMetadataProvider>
       </SessionStateProvider>
     </TerminalCoreProvider>
@@ -126,54 +127,8 @@ function TerminalPageInner({
   // Alias for backward compatibility with existing prop-passing code
   const stateTracking = sessionState;
 
-  const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
-
-  const handleRestartInZone = useCallback(
-    async (zoneIdx: number) => {
-      const oldTabId = zoneLayout.assignments[zoneIdx];
-      const oldTab = tabs.find((t) => t.id === oldTabId);
-      const state = oldTabId ? (stateTracking.sessionStates[oldTabId] ?? "idle") : "idle";
-      if (state !== "completed" && state !== "error") return;
-      const label = labelsAndTags.zoneLabels[zoneIdx];
-      const tabId = await createTerminal(
-        oldTab?.title ? `${oldTab.title} (2)` : undefined,
-        oldTab?.workingDir ?? undefined,
-      );
-      if (tabId) {
-        zoneLayout.assignTabToZone(zoneIdx, tabId);
-        zoneLayout.setFocusedZone(zoneIdx);
-        if (label) {
-          labelsAndTags.setZoneLabel(zoneIdx, label);
-        }
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [
-      zoneLayout.assignments,
-      zoneLayout.assignTabToZone,
-      zoneLayout.setFocusedZone,
-      tabs,
-      stateTracking.sessionStates,
-      labelsAndTags.zoneLabels,
-      labelsAndTags.setZoneLabel,
-      createTerminal,
-    ],
-  );
-  handleRestartInZoneRef.current = handleRestartInZone;
-
-  const transitionEffects = useStateTransitionEffects({
-    sessionStates: stateTracking.sessionStates,
-    prevSessionStatesRef: stateTracking.prevSessionStatesRef,
-    tabs,
-    assignments: zoneLayout.assignments,
-    lastOutputLines: stateTracking.lastOutputLines,
-    terminalRefs: terminalRefs.current,
-    stateEntryTimeRef: stateTracking.stateEntryTimeRef,
-    stateTimeAccumRef: stateTracking.stateTimeAccum,
-    setFocusedZone: zoneLayout.setFocusedZone,
-    handleRestartInZone,
-    addHistoryEvent,
-  });
+  const transitionEffects = useTransitionEffects();
+  const { handleRestartInZone, handleRestartInZoneRef } = transitionEffects;
 
   const rightPanelModeSetterRef = useRef<
     React.Dispatch<React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | null>>
@@ -301,16 +256,6 @@ function TerminalPageInner({
 
   rightPanelModeSetterRef.current = workflowGen.setRightPanelMode;
   selectedSessionSetterRef.current = workflowGen.setSelectedTranscriptSessionId;
-
-  const needsInputCount = Object.values(stateTracking.sessionStates).filter(
-    (s) => s === "needs-input",
-  ).length;
-  const _workingCount = Object.values(stateTracking.sessionStates).filter(
-    (s) => s === "working",
-  ).length;
-  const errorCount = Object.values(stateTracking.sessionStates).filter((s) => s === "error").length;
-
-  useWindowTitle(needsInputCount, errorCount, zoneLayout.isMultiZone);
 
   const {
     state: uiState,
