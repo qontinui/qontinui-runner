@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
@@ -1095,6 +1095,7 @@ pub async fn ui_bridge_execute_action_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(query): Query<ActionQueryParams>,
+    headers: HeaderMap,
     Json(request): Json<UIBridgeActionRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
@@ -1149,13 +1150,15 @@ pub async fn ui_bridge_execute_action_handler(
         Some(serde_json::Value::Object(base))
     };
 
+    let action_obj = serde_json::json!({
+        "action": action_name,
+        "params": merged_params,
+        "waitOptions": request.wait_options
+    });
+
     let payload = serde_json::json!({
         "elementId": id,
-        "action": {
-            "action": action_name,
-            "params": merged_params,
-            "waitOptions": request.wait_options
-        }
+        "action": action_obj.clone()
     });
 
     // ── Issue 2: Disabled-state detection ──────────────────────────────
@@ -1282,6 +1285,102 @@ pub async fn ui_bridge_execute_action_handler(
                         id
                     );
                     // Keep the original `result` — the caller gets the first error
+                }
+            }
+        }
+
+        // ── Stable ref fallback ──────────────────────────────────────────
+        // If the action still failed after discover-retry and the caller
+        // provided a stable ref header, attempt to resolve the element
+        // via the SDK's resolve_stable_ref IPC and retry with the new ID.
+        let still_failed = match &result {
+            Ok(ref resp) if !resp.success => resp
+                .error
+                .as_deref()
+                .map(|e| {
+                    let lower = e.to_lowercase();
+                    lower.contains("never registered or discovered")
+                        || lower.contains("not found")
+                })
+                .unwrap_or(false),
+            Err(_) => true,
+            _ => false,
+        };
+
+        if still_failed {
+            if let Some(stable_ref_b64) = headers
+                .get("X-UI-Bridge-Stable-Ref")
+                .and_then(|v| v.to_str().ok())
+            {
+                // Decode base64 → JSON → send resolve_stable_ref IPC
+                use base64::Engine;
+                if let Ok(decoded_bytes) =
+                    base64::engine::general_purpose::STANDARD.decode(stable_ref_b64)
+                {
+                    if let Ok(stable_ref_json) = serde_json::from_slice::<serde_json::Value>(&decoded_bytes) {
+                        info!(
+                            "execute_action: attempting stable ref resolution for element {}",
+                            id
+                        );
+                        let resolve_payload = serde_json::json!({
+                            "stableRef": stable_ref_json
+                        });
+                        if let Ok(resolve_result) = ui_bridge_request_sync(
+                            &state,
+                            "resolve_stable_ref",
+                            resolve_payload,
+                        )
+                        .await
+                        {
+                            if let Some(new_id) = resolve_result
+                                .get("elementId")
+                                .and_then(|v| v.as_str())
+                            {
+                                info!(
+                                    "execute_action: stable ref resolved {} -> {}",
+                                    id, new_id
+                                );
+                                // Retry with the resolved ID
+                                let retry_payload = serde_json::json!({
+                                    "elementId": new_id,
+                                    "action": action_obj
+                                });
+                                let retry_result = wrap_ipc_result(
+                                    ui_bridge_request_sync(&state, "execute_action", retry_payload).await,
+                                );
+                                match &retry_result {
+                                    Ok(ref resp) if resp.success => {
+                                        info!(
+                                            "execute_action: stable ref retry succeeded for {} (resolved to {})",
+                                            id, new_id
+                                        );
+                                        // Merge the resolved ID into the response
+                                        result = retry_result.map(|mut r| {
+                                            let merged = match r.data.take() {
+                                                Some(serde_json::Value::Object(mut m)) => {
+                                                    m.insert("resolvedId".to_string(), serde_json::Value::String(new_id.to_string()));
+                                                    serde_json::Value::Object(m)
+                                                }
+                                                Some(other) => serde_json::json!({
+                                                    "result": other,
+                                                    "resolvedId": new_id,
+                                                }),
+                                                None => serde_json::json!({ "resolvedId": new_id }),
+                                            };
+                                            r.data = Some(merged);
+                                            r
+                                        });
+                                    }
+                                    _ => {
+                                        warn!(
+                                            "execute_action: stable ref retry also failed for element {}",
+                                            id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2077,17 +2176,27 @@ pub async fn ui_bridge_get_console_errors_handler(
     let payload = serde_json::json!({
         "params": {
             "since": query.since,
-            "limit": query.limit
+            "limit": query.limit,
+            "group": query.group,
+            "groupBy": query.group_by
         }
     });
+
+    let is_grouped = query.group.unwrap_or(false);
 
     match ui_bridge_request_sync(&state, "get_console_errors", payload).await {
         Ok(data) => {
             // Update the console error count for the health endpoint
-            if let Some(errors) = data.get("errors").and_then(|e| e.as_array()) {
+            if !is_grouped {
+                if let Some(errors) = data.get("errors").and_then(|e| e.as_array()) {
+                    state
+                        .ui_bridge_console_error_count
+                        .store(errors.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else if let Some(total) = data.get("totalErrors").and_then(|t| t.as_u64()) {
                 state
                     .ui_bridge_console_error_count
-                    .store(errors.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    .store(total, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(Json(ApiResponse::success(data)))
         }
@@ -2474,6 +2583,10 @@ pub struct ConsoleErrorsQuery {
     since: Option<f64>,
     #[serde(default)]
     limit: Option<u32>,
+    #[serde(default)]
+    group: Option<bool>,
+    #[serde(default)]
+    group_by: Option<String>,
 }
 
 /// Deserialize a timestamp that can be either a number (epoch ms) or an ISO 8601 string.
@@ -4725,11 +4838,48 @@ pub async fn ui_bridge_execute_with_diff_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Execute with diff");
-    match ui_bridge_request_sync(&state, "execute_with_diff", body).await {
+    match ui_bridge_request_sync(&state, "executeWithDiff", body).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => {
             error!("UI Bridge API: Execute with diff failed: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Composite endpoint: execute one or more actions with atomic change-buffer tracking.
+///
+/// Accepts either a single operation `{operation, elementId, params}` or a batch
+/// `{operations: [{operation, elementId, params}, ...]}`. Returns the action
+/// result(s) alongside the DOM changes captured during execution.
+pub async fn ui_bridge_with_diff_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Detect batch vs single based on presence of "operations" array
+    if body.get("operations").is_some() {
+        info!("UI Bridge API: Batch execute with diff");
+        match ui_bridge_request_sync(&state, "executeBatchWithDiff", body).await {
+            Ok(data) => Ok(Json(ApiResponse::success(data))),
+            Err(e) => {
+                error!("UI Bridge API: Batch execute with diff failed: {}", e);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+            }
+        }
+    } else {
+        // Single operation — wrap into executeWithDiff format
+        info!("UI Bridge API: Single execute with diff");
+        let payload = serde_json::json!({
+            "elementId": body.get("elementId"),
+            "action": body.get("operation"),
+            "params": body.get("params").unwrap_or(&serde_json::Value::Null),
+        });
+        match ui_bridge_request_sync(&state, "executeWithDiff", payload).await {
+            Ok(data) => Ok(Json(ApiResponse::success(data))),
+            Err(e) => {
+                error!("UI Bridge API: Single execute with diff failed: {}", e);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+            }
         }
     }
 }
@@ -5469,6 +5619,55 @@ fn extract_get_element_match(data: &serde_json::Value) -> Option<serde_json::Val
     None
 }
 
+/// Wait for a deterministic "navigation complete" signal from the SDK.
+/// Falls back to idle-based detection if no explicit signal arrives.
+pub async fn ui_bridge_wait_for_navigation_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Wait for navigation complete");
+
+    let timeout = body
+        .get("timeout")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(30000);
+
+    let payload = serde_json::json!({
+        "params": {
+            "timeout": timeout,
+            "since": body.get("since"),
+            "urlPattern": body.get("urlPattern")
+        }
+    });
+
+    match ui_bridge_request_sync(&state, "wait_for_navigation_complete", payload).await {
+        Ok(data) => {
+            // Check if navigation completed or timed out
+            let completed = data
+                .get("completed")
+                .or_else(|| data.get("data").and_then(|d| d.get("completed")))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if completed {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                // Return 408 Request Timeout when navigation did not complete
+                Err((
+                    StatusCode::REQUEST_TIMEOUT,
+                    Json(api_error(format!(
+                        "Navigation did not complete within {}ms",
+                        timeout
+                    ))),
+                ))
+            }
+        }
+        Err(e) => {
+            error!("UI Bridge API: Wait for navigation failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Wait for composite idle state.
 pub async fn ui_bridge_wait_for_idle_handler(
     State(state): State<Arc<ApiState>>,
@@ -5488,6 +5687,69 @@ pub async fn ui_bridge_wait_for_idle_handler(
         Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => {
             error!("UI Bridge API: Wait for idle failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Wait for a specific element to become visually and structurally stable.
+///
+/// Relays `wait_for_element_stable` to the frontend SDK which uses a scoped
+/// MutationObserver plus requestAnimationFrame bounding-box polling.
+/// Returns 200 with `{ stable: true, elapsed }` on success, or 408 on timeout.
+pub async fn ui_bridge_wait_for_element_stable_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let element_id = body
+        .get("elementId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    if element_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("wait-for-element-stable: 'elementId' is required")),
+        ));
+    }
+
+    let quiet_ms = body.get("quietMs").and_then(|v| v.as_u64()).unwrap_or(500);
+    let timeout_ms = body.get("timeout").and_then(|v| v.as_u64()).unwrap_or(5000);
+    let observe_attributes = body.get("observeAttributes").and_then(|v| v.as_bool()).unwrap_or(true);
+    let observe_subtree = body.get("observeSubtree").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    info!(
+        "UI Bridge API: wait-for-element-stable elementId={} quietMs={} timeout={}ms",
+        element_id, quiet_ms, timeout_ms
+    );
+
+    let payload = serde_json::json!({
+        "params": {
+            "elementId": element_id,
+            "quietMs": quiet_ms,
+            "timeout": timeout_ms,
+            "observeAttributes": observe_attributes,
+            "observeSubtree": observe_subtree
+        }
+    });
+
+    match ui_bridge_request_sync(&state, "wait_for_element_stable", payload).await {
+        Ok(data) => {
+            let stable = data.get("stable").and_then(|v| v.as_bool()).unwrap_or(false);
+            if stable {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                let elapsed = data.get("elapsed").and_then(|v| v.as_u64()).unwrap_or(0);
+                let msg = format!(
+                    "wait-for-element-stable: element {} did not stabilize within {}ms (elapsed {}ms)",
+                    element_id, timeout_ms, elapsed
+                );
+                info!("UI Bridge API: {}", msg);
+                Err((StatusCode::REQUEST_TIMEOUT, Json(api_error(msg))))
+            }
+        }
+        Err(e) => {
+            error!("UI Bridge API: wait-for-element-stable failed: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
@@ -6503,6 +6765,10 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                     "states/navigate", "state/:id", "state/:id/activate", "state/:id/deactivate",
                     "state-groups", "transitions", "transition/:id/can-execute", "transition/:id/execute"]
             },
+            "navigation": {
+                "description": "Deterministic navigation-complete signal with idle fallback",
+                "endpoints": ["wait-for-navigation"]
+            },
             "idle": {
                 "description": "Composite and per-signal idle detection",
                 "endpoints": ["idle-status", "idle-status/:signal", "wait-for-idle",
@@ -6519,9 +6785,18 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                     "network-requests/wait"]
             },
             "errorTracking": {
-                "description": "Error sessions, baselines, reports",
+                "description": "Error sessions, baselines, reports, console error grouping",
                 "endpoints": ["error-sessions/start", "error-sessions", "error-sessions/end",
-                    "error-baselines/capture", "error-baselines/compare", "error-report", "error-snapshots"]
+                    "error-baselines/capture", "error-baselines/compare", "error-report", "error-snapshots",
+                    "console-errors", "console-errors/clear"],
+                "consoleErrors": {
+                    "queryParams": {
+                        "since": "number (epoch ms)",
+                        "limit": "number (default 50)",
+                        "group": "boolean (default false) — return grouped errors",
+                        "groupBy": "'fingerprint' | 'message' | 'source' (default 'fingerprint')"
+                    }
+                }
             },
             "clipboard": {
                 "description": "System clipboard read/write (OS-level via arboard)",
@@ -6563,6 +6838,14 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                 "parameters": {
                     "operations": "Array of { id, operation, params } objects",
                     "stopOnError": "boolean (default: false) — stop on first failure"
+                }
+            },
+            "withDiff": {
+                "description": "Execute action(s) with atomic change-buffer tracking (enable → act → drain → disable)",
+                "endpoints": ["control/with-diff"],
+                "parameters": {
+                    "single": "{ operation, elementId, params } — returns { result, changes, changeCount }",
+                    "batch": "{ operations: [{ operation, elementId, params }] } — returns { results, changes, changeCount }"
                 }
             }
         }
@@ -9389,6 +9672,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(ui_bridge_get_idle_status_handler),
         )
         .route(
+            "/ui-bridge/control/wait-for-navigation",
+            post(ui_bridge_wait_for_navigation_handler),
+        )
+        .route(
+            "/ui-bridge/ai/wait-for-navigation",
+            post(ui_bridge_wait_for_navigation_handler),
+        )
+        .route(
             "/ui-bridge/control/wait-for-idle",
             post(ui_bridge_wait_for_idle_handler),
         )
@@ -9412,6 +9703,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/ai/wait-for-element",
             post(ui_bridge_wait_for_element_handler),
+        )
+        // Wait for an element to become visually/structurally stable
+        .route(
+            "/ui-bridge/control/wait-for-element-stable",
+            post(ui_bridge_wait_for_element_stable_handler),
         )
         // Wait for a substring to appear in the page text
         .route(
@@ -9487,6 +9783,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         // Batch execution
         .route("/ui-bridge/batch", post(ui_bridge_batch_handler))
+        // Composite: execute action(s) with atomic change-buffer diffing
+        .route("/ui-bridge/control/with-diff", post(ui_bridge_with_diff_handler))
         // Diagnostics & health
         .route("/ui-bridge/diagnostics", get(ui_bridge_diagnostics_handler))
         .route(
