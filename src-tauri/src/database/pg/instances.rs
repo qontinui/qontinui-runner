@@ -187,9 +187,9 @@ impl PgDb {
                 SET status = 'unhealthy'
                 WHERE status = 'healthy'
                   AND is_primary = FALSE
-                  AND last_heartbeat < NOW() - ($1 || ' seconds')::INTERVAL
+                  AND last_heartbeat < NOW() - ($1 * INTERVAL '1 second')
                 "#,
-                &[&stale_threshold_secs.to_string()],
+                &[&stale_threshold_secs],
             )
             .await
             .map_err(|e| format!("PG mark_stale_runner_instances: {}", e))?;
@@ -214,9 +214,9 @@ impl PgDb {
                 r#"
                 DELETE FROM runner_instances
                 WHERE status IN ('stopped', 'unhealthy')
-                  AND last_heartbeat < NOW() - ($1 || ' seconds')::INTERVAL
+                  AND last_heartbeat < NOW() - ($1 * INTERVAL '1 second')
                 "#,
-                &[&dead_threshold_secs.to_string()],
+                &[&dead_threshold_secs],
             )
             .await
             .map_err(|e| format!("PG cleanup_dead_runner_instances: {}", e))?;

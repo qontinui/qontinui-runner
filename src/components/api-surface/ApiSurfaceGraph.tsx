@@ -7,7 +7,7 @@
  * Layer 4 (bottom): Clorinde Queries + DB Tables
  */
 
-import { memo, useMemo, useState, useCallback, useRef, useEffect } from "react";
+import { memo, useMemo, useState, useCallback, useEffect } from "react";
 import {
   ReactFlow,
   MiniMap,

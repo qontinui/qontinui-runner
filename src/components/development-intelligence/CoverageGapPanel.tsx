@@ -6,7 +6,7 @@
  * by coverage score.
  */
 
-import { useState, useMemo, useCallback, Fragment, useRef, useEffect } from "react";
+import { useState, useMemo, useCallback, Fragment, useEffect } from "react";
 import {
   ReactFlow,
   MiniMap,

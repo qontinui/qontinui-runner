@@ -107,6 +107,19 @@ pub async fn plan_intent_handler(
         ));
     }
 
+    // Guard against excessively large prompts (DoS / runaway token cost)
+    const MAX_PROMPT_CHARS: usize = 2000;
+    if request.prompt.len() > MAX_PROMPT_CHARS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "Prompt too long: {} chars (max {})",
+                request.prompt.len(),
+                MAX_PROMPT_CHARS
+            ))),
+        ));
+    }
+
     // Build combined prompt with system instructions + user request
     let system_prompt = if request.explain {
         format!("{}{}", SYSTEM_PROMPT_BASE, EXPLAIN_SUFFIX)
@@ -149,7 +162,8 @@ pub async fn plan_intent_handler(
 
     // Extract JSON from AI output (find outermost braces)
     let json_str = if let Some(start) = output.find('{') {
-        let end = output.rfind('}').unwrap_or(output.len() - 1);
+        // rfind returns None if no closing brace; fall back to end of string
+        let end = output.rfind('}').unwrap_or_else(|| output.len().saturating_sub(1));
         &output[start..=end]
     } else {
         output.as_str()

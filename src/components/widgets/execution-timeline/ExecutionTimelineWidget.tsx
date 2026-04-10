@@ -819,8 +819,8 @@ export function ExecutionTimelineWidget({
 
   // Update prevIterationCounts state after render so the next render can detect new iterations.
   // This is intentionally syncing derived state to enable new-iteration detection on the next render.
-  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setPrevIterationCounts(expandedIterationsResult.nextCounts);
   }, [expandedIterationsResult.nextCounts]);
 

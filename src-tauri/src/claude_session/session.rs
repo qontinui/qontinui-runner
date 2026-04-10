@@ -227,14 +227,15 @@ impl ClaudeSession {
                     .ok();
                 let pg = crate::database::pg::PgDb::try_global();
 
-                if pg.is_none() || pg_rt.is_none() {
-                    warn!("Failed to get PG connection for AI output persistence");
-                    // Drain the channel so senders don't block
-                    while turn_persist_rx.recv().is_ok() {}
-                    return;
-                }
-                let pg = pg.unwrap();
-                let pg_rt = pg_rt.unwrap();
+                let (pg, pg_rt) = match (pg, pg_rt) {
+                    (Some(pg), Some(rt)) => (pg, rt),
+                    _ => {
+                        warn!("Failed to get PG connection or runtime for AI output persistence");
+                        // Drain the channel so senders don't block
+                        while turn_persist_rx.recv().is_ok() {}
+                        return;
+                    }
+                };
 
                 while let Ok(delta) = turn_persist_rx.recv() {
                     if delta.is_empty() {
@@ -845,7 +846,10 @@ impl ClaudeSession {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        let stderr_handle = stderr_handle.expect("stderr handle consumed unexpectedly");
+        // stderr_handle is only consumed in the early-exit error branch above;
+        // reaching this point means initialization succeeded and the handle is still present.
+        let stderr_handle = stderr_handle
+            .ok_or_else(|| "Internal error: stderr handle consumed unexpectedly".to_string())?;
 
         Ok(Self {
             session_id: session_id.to_string(),
