@@ -1,8 +1,13 @@
 import { useState, useCallback, useMemo } from "react";
 import { CheckCheck, X, Send, AlertTriangle, MousePointerClick, HelpCircle } from "lucide-react";
-import type { TerminalTab } from "./useTerminalManager";
-import type { SessionState, ZoneAssignments } from "./useZoneLayout";
-import type { TerminalInstanceHandle } from "./TerminalInstance";
+import type { SessionState } from "./useZoneLayout";
+import {
+  useTerminalCore,
+  useSessionState,
+  useZoneMetadata,
+  useTransitionEffects,
+  useUIStateCx,
+} from "./contexts";
 
 function expandTemplate(
   template: string,
@@ -15,31 +20,39 @@ function expandTemplate(
     .replace(/\{tag\}/g, vars.tag);
 }
 
-interface BatchOperationsBarProps {
-  tabs: TerminalTab[];
-  sessionStates: Record<string, SessionState>;
-  terminalRefs: Map<string, React.RefObject<TerminalInstanceHandle | null>>;
-  onDismiss: () => void;
-  selectedZones?: Set<number>;
-  assignments?: ZoneAssignments;
-  zoneLabels?: Record<number, string>;
-  onSelectAllWaiting?: () => void;
-  onClearSelection?: () => void;
-  onMetrics?: (type: "approve" | "reject" | "broadcast", count: number) => void;
-}
-
-export function BatchOperationsBar({
-  tabs,
-  sessionStates,
-  terminalRefs,
-  onDismiss,
-  selectedZones,
-  assignments,
-  zoneLabels,
-  onSelectAllWaiting,
-  onClearSelection,
-  onMetrics,
-}: BatchOperationsBarProps) {
+export function BatchOperationsBar() {
+  // Read from contexts
+  const { tabs, zoneLayout, terminalRefs } = useTerminalCore();
+  const assignments = zoneLayout.assignments;
+  const { sessionStates } = useSessionState();
+  const { labelsAndTags, incrementMetric, addHistoryEvent } = useZoneMetadata();
+  const zoneLabels = labelsAndTags.zoneLabels;
+  const transitionEffects = useTransitionEffects();
+  const { state: uiState, dispatch } = useUIStateCx();
+  const selectedZones = uiState.selectedZones;
+  const onDismiss = useCallback(() => transitionEffects.setBatchBarDismissed(true), [transitionEffects]);
+  const onSelectAllWaiting = useCallback(() => {
+    const waiting = new Set<number>();
+    for (const [zoneStr, tabId] of Object.entries(assignments)) {
+      if ((sessionStates[tabId] as SessionState) === "needs-input") {
+        waiting.add(Number(zoneStr));
+      }
+    }
+    dispatch({ type: "SET_SELECTED_ZONES", payload: waiting });
+  }, [assignments, sessionStates, dispatch]);
+  const onClearSelection = useCallback(() => dispatch({ type: "CLEAR_SELECTION" }), [dispatch]);
+  const onMetrics = useCallback((type: "approve" | "reject" | "broadcast", count: number) => {
+    if (type === "approve") {
+      incrementMetric("totalApprovals", count);
+      addHistoryEvent("Batch approve", `${count} sessions`, undefined, "#9ece6a");
+    } else if (type === "reject") {
+      incrementMetric("totalRejections", count);
+      addHistoryEvent("Batch reject", `${count} sessions`, undefined, "#f7768e");
+    } else if (type === "broadcast") {
+      incrementMetric("totalBroadcasts", count);
+      addHistoryEvent("Broadcast", `${count} sessions`, undefined, "#7aa2f7");
+    }
+  }, [incrementMetric, addHistoryEvent]);
   const [broadcastInput, setBroadcastInput] = useState("");
   const [showBroadcast, setShowBroadcast] = useState(false);
   const [lastAction, setLastAction] = useState<string | null>(null);

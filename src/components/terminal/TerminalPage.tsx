@@ -520,37 +520,7 @@ function TerminalPageInner({
           )}
 
           {zoneLayout.isMultiZone && !transitionEffects.batchBarDismissed && (
-            <BatchOperationsBar
-              tabs={tabs}
-              sessionStates={stateTracking.sessionStates}
-              terminalRefs={terminalRefs.current}
-              onDismiss={() => transitionEffects.setBatchBarDismissed(true)}
-              selectedZones={uiState.selectedZones}
-              assignments={zoneLayout.assignments}
-              zoneLabels={labelsAndTags.zoneLabels}
-              onSelectAllWaiting={() => {
-                const waiting = new Set<number>();
-                for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
-                  if (stateTracking.sessionStates[tabId] === "needs-input") {
-                    waiting.add(Number(zoneStr));
-                  }
-                }
-                dispatch({ type: "SET_SELECTED_ZONES", payload: waiting });
-              }}
-              onClearSelection={() => dispatch({ type: "CLEAR_SELECTION" })}
-              onMetrics={(type, count) => {
-                if (type === "approve") {
-                  incrementMetric("totalApprovals", count);
-                  addHistoryEvent("Batch approve", `${count} sessions`, undefined, "#9ece6a");
-                } else if (type === "reject") {
-                  incrementMetric("totalRejections", count);
-                  addHistoryEvent("Batch reject", `${count} sessions`, undefined, "#f7768e");
-                } else if (type === "broadcast") {
-                  incrementMetric("totalBroadcasts", count);
-                  addHistoryEvent("Broadcast", `${count} sessions`, undefined, "#7aa2f7");
-                }
-              }}
-            />
+            <BatchOperationsBar />
           )}
         </div>
 
