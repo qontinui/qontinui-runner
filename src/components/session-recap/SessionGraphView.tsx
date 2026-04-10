@@ -1,4 +1,4 @@
-import { useRef, useMemo } from "react";
+import { useRef, useMemo, useEffect } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -77,15 +77,12 @@ export function SessionGraphView({ recap }: Props) {
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  const prevInitialRef = useRef({ nodes: initialNodes, edges: initialEdges });
-  if (
-    prevInitialRef.current.nodes !== initialNodes ||
-    prevInitialRef.current.edges !== initialEdges
-  ) {
-    prevInitialRef.current = { nodes: initialNodes, edges: initialEdges };
+  // Sync flow state when derived graph data changes
+  useEffect(() => {
     setNodes(initialNodes);
     setEdges(initialEdges);
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialNodes, initialEdges]);
 
   if (initialNodes.length === 0) {
     return (

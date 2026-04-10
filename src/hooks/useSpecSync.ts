@@ -210,12 +210,15 @@ export function useSpecSync(
   const totalRef = useRef(0);
 
   // Keep refs in sync to avoid stale closures in processNextSpec/finishSync chains
+  // Update in effects to avoid ref mutation during render
   const specsRef = useRef(specs);
-  specsRef.current = specs;
   const aiRef = useRef(ai);
-  aiRef.current = ai;
   const onSpecUpdatedRef = useRef(onSpecUpdated);
-  onSpecUpdatedRef.current = onSpecUpdated;
+  useEffect(() => {
+    specsRef.current = specs;
+    aiRef.current = ai;
+    onSpecUpdatedRef.current = onSpecUpdated;
+  });
 
   // Track specs updated during the current sync batch (may not yet be in specsRef)
   const updatedSpecsRef = useRef<Map<string, SpecConfig>>(new Map());
@@ -333,7 +336,9 @@ export function useSpecSync(
       `Update spec "${specId}" with state machine generation.\n\n${prompt}`,
     );
   }, []);
-  processNextSpecRef.current = processNextSpec;
+  useEffect(() => {
+    processNextSpecRef.current = processNextSpec;
+  });
 
   const finishSync = useCallback(() => {
     // Compile phase
@@ -388,7 +393,9 @@ export function useSpecSync(
     aiRef.current.close();
     updatedSpecsRef.current.clear();
   }, []);
-  finishSyncRef.current = finishSync;
+  useEffect(() => {
+    finishSyncRef.current = finishSync;
+  });
 
   const startSync = useCallback(async () => {
     // Guard against double-start

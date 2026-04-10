@@ -769,13 +769,12 @@ export function ExecutionTimelineWidget({
   // User-explicit iteration expand/collapse overrides (key -> expanded boolean)
   const [userIterationToggles, setUserIterationToggles] = useState<Map<string, boolean>>(new Map());
 
-  // Track the previous iteration counts to detect new iterations (ref avoids extra re-render)
-  const prevIterationCountsRef = useRef<Map<string, number>>(new Map());
+  // Track the previous iteration counts to detect new iterations (state so useMemo can read it safely)
+  const [prevIterationCounts, setPrevIterationCounts] = useState<Map<string, number>>(new Map());
 
   // Compute expanded iterations during render by merging auto-defaults with user overrides.
   // Auto-default: expand the latest iteration in each phase.
   // When a new iteration appears, user overrides for that phase are ignored so the latest expands.
-  // Also updates prevIterationCountsRef so the next render can detect new iterations.
   const expandedIterationsResult = useMemo(() => {
     const result = new Set<string>();
     const nextCounts = new Map<string, number>();
@@ -784,7 +783,7 @@ export function ExecutionTimelineWidget({
       if (!group.hasIterations || group.iterationGroups.length === 0) continue;
 
       const groupId = `${group.stageIndex}:${group.phase}`;
-      const prevCount = prevIterationCountsRef.current.get(groupId) ?? 0;
+      const prevCount = prevIterationCounts.get(groupId) ?? 0;
       const currentCount = group.iterationGroups.length;
       nextCounts.set(groupId, currentCount);
       const maxIteration = Math.max(...group.iterationGroups.map((g) => g.iteration));
@@ -814,13 +813,13 @@ export function ExecutionTimelineWidget({
     }
 
     return { expanded: result, nextCounts };
-  }, [phaseGroups, userIterationToggles]);
+  }, [phaseGroups, userIterationToggles, prevIterationCounts]);
 
   const expandedIterations = expandedIterationsResult.expanded;
 
-  // Sync the ref after render so the next render can detect new iterations
+  // Update prevIterationCounts state after render so the next render can detect new iterations
   useEffect(() => {
-    prevIterationCountsRef.current = expandedIterationsResult.nextCounts;
+    setPrevIterationCounts(expandedIterationsResult.nextCounts);
   }, [expandedIterationsResult.nextCounts]);
 
   const handleIterationToggle = useCallback((key: string, expanded: boolean) => {

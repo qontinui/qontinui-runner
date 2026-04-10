@@ -105,7 +105,10 @@ export function ZoneProfilePicker({
   const [loaded, setLoaded] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const onLoadProfileRef = useRef(onLoadProfile);
-  onLoadProfileRef.current = onLoadProfile;
+  // Update ref in effect to avoid ref mutation during render
+  useEffect(() => {
+    onLoadProfileRef.current = onLoadProfile;
+  });
 
   // Load profiles and active profile from database on mount, auto-apply if active
   useEffect(() => {

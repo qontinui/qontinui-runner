@@ -33,14 +33,16 @@ export function ErrorContextPanel({
   before = 20,
   after = 20,
 }: ErrorContextPanelProps) {
+  // Track which params the current result belongs to
+  const [resultKey, setResultKey] = useState<string | null>(null);
   const [lines, setLines] = useState<ProcessSessionOutputLine[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+
+  const fetchKey = `${processName}:${timestamp}:${before}:${after}`;
+  const loading = resultKey !== fetchKey;
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
-    setError(null);
     invoke<ProcessSessionOutputLine[]>("get_process_log_context", {
       processName,
       aroundTimestamp: timestamp,
@@ -50,12 +52,14 @@ export function ErrorContextPanel({
       .then((result) => {
         if (cancelled) return;
         setLines(result ?? []);
-        setLoading(false);
+        setError(null);
+        setResultKey(`${processName}:${timestamp}:${before}:${after}`);
       })
       .catch((e) => {
         if (cancelled) return;
         setError(typeof e === "string" ? e : JSON.stringify(e));
-        setLoading(false);
+        setLines(null);
+        setResultKey(`${processName}:${timestamp}:${before}:${after}`);
       });
     return () => {
       cancelled = true;
