@@ -11,6 +11,8 @@ use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::database::types::{CreateEntityProfileInput, ObservationSearchResult};
+use crate::reflection::graph_engine::KnowledgeGraph;
+use crate::reflection::graph_types::GraphNodeKind;
 
 /// Parsed LLM profile response.
 #[derive(Debug, Deserialize)]
@@ -241,6 +243,83 @@ pub async fn refresh_stale_profiles(
 
     info!(count, stale_days, "Refreshed stale entity profiles");
     Ok(count)
+}
+
+/// Scan graph nodes and generate profiles for entities that don't have one yet.
+///
+/// Targets: Component, PipelineAgent, UIElement, Workflow nodes.
+/// Returns the number of profiles successfully generated.
+pub async fn generate_profiles_for_graph_entities(
+    pg: &PgDb,
+    graph: &KnowledgeGraph,
+) -> Result<u32, String> {
+    let target_kinds: &[GraphNodeKind] = &[
+        GraphNodeKind::Component,
+        GraphNodeKind::PipelineAgent,
+        GraphNodeKind::UIElement,
+        GraphNodeKind::Workflow,
+    ];
+
+    let target_strs: Vec<&str> = target_kinds.iter().map(|k| k.as_str()).collect();
+
+    // Collect candidate nodes first (to log total count)
+    let candidates: Vec<(&str, &str, &str)> = graph
+        .iter_node_weights()
+        .filter(|node| target_strs.contains(&node.kind.as_str()))
+        .map(|node| (node.kind.as_str(), node.entity_id.as_str(), node.label.as_str()))
+        .collect();
+
+    info!(
+        candidate_count = candidates.len(),
+        "Scanning graph nodes for missing entity profiles"
+    );
+
+    let mut generated = 0u32;
+    let mut skipped = 0u32;
+
+    for (kind_str, entity_id, label) in &candidates {
+        // Check if profile already exists
+        match pg.get_entity_profile(kind_str, entity_id).await {
+            Ok(Some(_)) => {
+                skipped += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    entity_kind = %kind_str,
+                    entity_id = %entity_id,
+                    error = %e,
+                    "Failed to check existing profile, skipping"
+                );
+                continue;
+            }
+        }
+
+        // Generate profile
+        match generate_entity_profile(pg, kind_str, entity_id, label).await {
+            Ok(_) => {
+                generated += 1;
+            }
+            Err(e) => {
+                warn!(
+                    entity_kind = %kind_str,
+                    entity_id = %entity_id,
+                    error = %e,
+                    "Failed to generate profile for graph entity"
+                );
+            }
+        }
+    }
+
+    info!(
+        generated,
+        skipped,
+        total_candidates = candidates.len(),
+        "Finished generating profiles for graph entities"
+    );
+
+    Ok(generated)
 }
 
 // =============================================================================

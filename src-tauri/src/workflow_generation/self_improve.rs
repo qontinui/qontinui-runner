@@ -334,7 +334,7 @@ pub async fn analyze_generation_patterns_pg(
     // Fixer failures
     let fixer_failures: Vec<(String, i64)> = conn
         .query(
-            r#"SELECT lo.strategy, COUNT(*) as cnt
+            r#"SELECT COALESCE(lo.strategy, 'unknown'), COUNT(*) as cnt
                FROM learning_outcomes lo
                WHERE lo.status = 'failure'
                GROUP BY lo.strategy

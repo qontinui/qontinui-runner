@@ -691,6 +691,165 @@ async fn run_consolidation_inner(
 }
 
 // =============================================================================
+// LLM helpers for inductive / abductive reasoning
+// =============================================================================
+
+/// LLM response for inductive reasoning.
+#[derive(Deserialize)]
+struct LlmInductiveResponse {
+    conclusion: String,
+    confidence: f64,
+}
+
+/// LLM response for abductive reasoning.
+#[derive(Deserialize)]
+struct LlmAbductiveResponse {
+    hypothesis: String,
+    confidence: f64,
+}
+
+/// Strip optional markdown code fences from an LLM response.
+fn strip_markdown_fences(raw: &str) -> &str {
+    let s = raw.trim();
+    if s.starts_with("```") {
+        s.trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+    } else {
+        s
+    }
+}
+
+/// Call the LLM to induce a general rule from a group of observations.
+///
+/// Returns `(conclusion, confidence)` on success.
+async fn try_llm_inductive(
+    obs_type: &str,
+    observations: &[&ConsolidationObservation],
+) -> Result<(String, f64), String> {
+    let count = observations.len();
+    let mut obs_lines = String::new();
+    for obs in observations.iter().take(10) {
+        let preview = if obs.content.len() > 200 {
+            format!("{}...", &obs.content[..200])
+        } else {
+            obs.content.clone()
+        };
+        obs_lines.push_str(&format!("- {}: {}\n", obs.title, preview));
+    }
+    if count > 10 {
+        obs_lines.push_str(&format!("  ... and {} more\n", count - 10));
+    }
+
+    let prompt = format!(
+        "These {count} observations of type \"{obs_type}\" share a common pattern:\n\
+         {obs_lines}\n\
+         What general rule or recurring pattern can be induced from these observations?\n\
+         Respond with ONLY valid JSON (no markdown fences, no extra text):\n\
+         {{\"conclusion\": \"...\", \"confidence\": 0.0-1.0}}",
+        count = count,
+        obs_type = obs_type,
+        obs_lines = obs_lines,
+    );
+
+    let context = TaskContext::from_prompt(&prompt);
+
+    let response = tokio::task::spawn_blocking(move || {
+        ai_provider::run_prompt_with_model_override(
+            &prompt,
+            &context,
+            None,
+            Some("claude-haiku-4-5-20251001"),
+            None,
+            Some(0.3),
+            Some(512),
+            None,
+            None,
+        )
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {}", e))?;
+
+    if !response.success {
+        return Err(format!(
+            "LLM call failed: {}",
+            response.error.unwrap_or_default()
+        ));
+    }
+
+    let json_str = strip_markdown_fences(&response.output);
+    let parsed: LlmInductiveResponse = serde_json::from_str(json_str)
+        .map_err(|e| format!("Failed to parse inductive JSON: {} — raw: {}", e, &json_str[..json_str.len().min(200)]))?;
+
+    Ok((parsed.conclusion, parsed.confidence.clamp(0.0, 1.0)))
+}
+
+/// Call the LLM to hypothesise a common root cause for a cluster of unresolved issues.
+///
+/// Returns `(hypothesis, confidence)` on success.
+async fn try_llm_abductive(
+    area: &str,
+    cluster: &[&ConsolidationObservation],
+) -> Result<(String, f64), String> {
+    let count = cluster.len();
+    let mut issue_lines = String::new();
+    for obs in cluster.iter().take(10) {
+        let preview = if obs.content.len() > 200 {
+            format!("{}...", &obs.content[..200])
+        } else {
+            obs.content.clone()
+        };
+        issue_lines.push_str(&format!("- {}: {}\n", obs.title, preview));
+    }
+    if count > 10 {
+        issue_lines.push_str(&format!("  ... and {} more\n", count - 10));
+    }
+
+    let prompt = format!(
+        "These {count} unresolved issues in area \"{area}\" suggest a common underlying cause:\n\
+         {issue_lines}\n\
+         What is the simplest explanation (hypothesis) for these issues occurring together?\n\
+         Respond with ONLY valid JSON (no markdown fences, no extra text):\n\
+         {{\"hypothesis\": \"...\", \"confidence\": 0.0-1.0}}",
+        count = count,
+        area = area,
+        issue_lines = issue_lines,
+    );
+
+    let context = TaskContext::from_prompt(&prompt);
+
+    let response = tokio::task::spawn_blocking(move || {
+        ai_provider::run_prompt_with_model_override(
+            &prompt,
+            &context,
+            None,
+            Some("claude-haiku-4-5-20251001"),
+            None,
+            Some(0.3),
+            Some(512),
+            None,
+            None,
+        )
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {}", e))?;
+
+    if !response.success {
+        return Err(format!(
+            "LLM call failed: {}",
+            response.error.unwrap_or_default()
+        ));
+    }
+
+    let json_str = strip_markdown_fences(&response.output);
+    let parsed: LlmAbductiveResponse = serde_json::from_str(json_str)
+        .map_err(|e| format!("Failed to parse abductive JSON: {} — raw: {}", e, &json_str[..json_str.len().min(200)]))?;
+
+    Ok((parsed.hypothesis, parsed.confidence.clamp(0.0, 1.0)))
+}
+
+// =============================================================================
 // Phase E: Inductive Reasoning — detect patterns across multiple observations
 // =============================================================================
 
@@ -713,29 +872,53 @@ pub(crate) async fn phase_inductive(
             .push(obs);
     }
 
-    // For groups with 3+ members, create inductive trace
+    // For groups with 3+ members, create inductive trace (LLM-enhanced)
     for (obs_type, group) in &by_type {
         if group.len() >= 3 {
             let premise_ids: Vec<i64> = group.iter().map(|o| o.id).collect();
             let titles: Vec<&str> = group.iter().take(5).map(|o| o.title.as_str()).collect();
 
-            let conclusion = format!(
+            // Heuristic fallback values
+            let heuristic_conclusion = format!(
                 "Recurring {} pattern detected across {} observations: {}",
                 obs_type,
                 group.len(),
                 titles.join(", ")
             );
+            let heuristic_confidence = (group.len() as f64 / 10.0).min(0.9);
+
+            // Try LLM, fall back to heuristic
+            let (conclusion, confidence, source) =
+                match try_llm_inductive(obs_type, group).await {
+                    Ok((c, conf)) => {
+                        debug!(
+                            obs_type,
+                            count = group.len(),
+                            "LLM inductive reasoning succeeded"
+                        );
+                        (c, conf, "llm")
+                    }
+                    Err(e) => {
+                        debug!(
+                            obs_type,
+                            error = %e,
+                            "LLM inductive reasoning unavailable, using heuristic"
+                        );
+                        (heuristic_conclusion, heuristic_confidence, "heuristic")
+                    }
+                };
 
             traces.push(CreateReasoningTraceInput {
                 reasoning_type: "inductive".to_string(),
                 premise_ids,
                 conclusion,
-                confidence: (group.len() as f64 / 10.0).min(0.9),
+                confidence,
                 evidence_json: Some(
                     serde_json::json!({
                         "pattern_type": obs_type,
                         "observation_count": group.len(),
                         "sample_titles": titles,
+                        "reasoning_source": source,
                     })
                     .to_string(),
                 ),
@@ -901,7 +1084,7 @@ pub(crate) async fn phase_deductive(
             let mut premise_ids = vec![model_id];
             premise_ids.extend(&contra_ids);
 
-            traces.push(CreateReasoningTraceInput {
+            let trace_input = CreateReasoningTraceInput {
                 reasoning_type: "deductive".to_string(),
                 premise_ids,
                 conclusion,
@@ -916,7 +1099,35 @@ pub(crate) async fn phase_deductive(
                 ),
                 created_observation_id: None,
                 dreamer_run_id: None,
-            });
+            };
+
+            // Save immediately so we get the trace ID for invalidation
+            match pg.save_reasoning_trace(&trace_input).await {
+                Ok(new_trace_id) => {
+                    // Invalidate any prior valid traces whose premises relied on
+                    // the now-contradicted mental model
+                    if let Ok(recent_traces) = pg.get_recent_traces(None, 100).await {
+                        for trace in &recent_traces {
+                            if trace.is_valid && trace.premise_ids.contains(&model_id) {
+                                let _ = pg
+                                    .invalidate_trace(trace.id, Some(new_trace_id))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to save deductive trace for contradicted model {}: {}",
+                        model_id,
+                        e
+                    );
+                }
+            }
+            // Still push so the caller's stats.deductive_traces count is accurate.
+            // The caller will re-save with dreamer_run_id set; the early save
+            // (without dreamer_run_id) was needed to obtain the ID for invalidation.
+            traces.push(trace_input);
         }
     }
 
@@ -966,7 +1177,8 @@ pub(crate) async fn phase_abductive(
                 let titles: Vec<&str> =
                     cluster.iter().take(4).map(|o| o.title.as_str()).collect();
 
-                let conclusion = format!(
+                // Heuristic fallback values
+                let heuristic_conclusion = format!(
                     "Multiple unresolved issues in area '{}' ({} observations: {}) suggest a common \
                      underlying cause. Hypothesis: there may be a systemic issue in the '{}' domain \
                      that individual fixes are not addressing.",
@@ -975,18 +1187,40 @@ pub(crate) async fn phase_abductive(
                     titles.join("; "),
                     area
                 );
+                let heuristic_confidence = 0.5 + (cluster.len() as f64 * 0.05).min(0.3);
+
+                // Try LLM, fall back to heuristic
+                let (conclusion, confidence, source) =
+                    match try_llm_abductive(area, cluster).await {
+                        Ok((hyp, conf)) => {
+                            debug!(
+                                area,
+                                count = cluster.len(),
+                                "LLM abductive reasoning succeeded"
+                            );
+                            (hyp, conf, "llm")
+                        }
+                        Err(e) => {
+                            debug!(
+                                area,
+                                error = %e,
+                                "LLM abductive reasoning unavailable, using heuristic"
+                            );
+                            (heuristic_conclusion, heuristic_confidence, "heuristic")
+                        }
+                    };
 
                 traces.push(CreateReasoningTraceInput {
                     reasoning_type: "abductive".to_string(),
                     premise_ids,
                     conclusion,
-                    confidence: 0.5 + (cluster.len() as f64 * 0.05).min(0.3),
+                    confidence,
                     evidence_json: Some(
                         serde_json::json!({
                             "area": area,
                             "unresolved_count": cluster.len(),
                             "sample_titles": titles,
-                            "reasoning": "Multiple unresolved issues in same area => common root cause"
+                            "reasoning_source": source,
                         })
                         .to_string(),
                     ),

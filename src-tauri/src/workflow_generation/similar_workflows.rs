@@ -139,9 +139,10 @@ pub async fn find_similar_workflows_pg(
         Some(cat) => {
             conn.query(
                 r#"SELECT id, name, COALESCE(description, '') as description, category,
-                          setup_steps, verification_steps, agentic_steps, completion_steps,
+                          COALESCE(setup_steps, '[]'), COALESCE(verification_steps, '[]'),
+                          COALESCE(agentic_steps, '[]'), COALESCE(completion_steps, '[]'),
                           ts_rank(to_tsvector('english', name || ' ' || COALESCE(description, '')),
-                                  to_tsquery('english', $1)) as rank
+                                  to_tsquery('english', $1))::float4 as rank
                    FROM unified_workflows
                    WHERE category = $2
                      AND category != 'meta'
@@ -156,9 +157,10 @@ pub async fn find_similar_workflows_pg(
         None => {
             conn.query(
                 r#"SELECT id, name, COALESCE(description, '') as description, category,
-                          setup_steps, verification_steps, agentic_steps, completion_steps,
+                          COALESCE(setup_steps, '[]'), COALESCE(verification_steps, '[]'),
+                          COALESCE(agentic_steps, '[]'), COALESCE(completion_steps, '[]'),
                           ts_rank(to_tsvector('english', name || ' ' || COALESCE(description, '')),
-                                  to_tsquery('english', $1)) as rank
+                                  to_tsquery('english', $1))::float4 as rank
                    FROM unified_workflows
                    WHERE category != 'meta'
                      AND to_tsvector('english', name || ' ' || COALESCE(description, ''))
@@ -175,7 +177,7 @@ pub async fn find_similar_workflows_pg(
     Ok(rows
         .iter()
         .map(|r| {
-            let rank: f32 = r.get::<_, f64>(8) as f32;
+            let rank: f32 = r.get::<_, f32>(8);
             SimilarWorkflow {
                 id: r.get(0),
                 name: r.get(1),
@@ -211,7 +213,8 @@ pub async fn find_gt_reference_workflows_pg(
     let rows = conn
         .query(
             r#"SELECT id, name, COALESCE(description, '') as description, category,
-                  setup_steps, verification_steps, agentic_steps, completion_steps
+                  COALESCE(setup_steps, '[]'), COALESCE(verification_steps, '[]'),
+                  COALESCE(agentic_steps, '[]'), COALESCE(completion_steps, '[]')
            FROM unified_workflows
            WHERE category = 'ground_truth'
            ORDER BY updated_at DESC

@@ -34,6 +34,7 @@ pub mod known_issues;
 pub mod learned_patterns_ops;
 pub mod learning;
 pub mod log_sources;
+pub mod memory_query_cache;
 pub mod meta_optimizer;
 pub mod misc_crud;
 pub mod observations;
@@ -1857,9 +1858,9 @@ impl PgDb {
                 skip_if_completed   BOOLEAN NOT NULL DEFAULT FALSE,
                 auto_fix_on_failure BOOLEAN NOT NULL DEFAULT FALSE,
                 success_criteria    TEXT,
-                created_at          TEXT NOT NULL DEFAULT '',
-                modified_at         TEXT NOT NULL DEFAULT '',
-                next_run            TEXT,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                modified_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                next_run            TIMESTAMPTZ,
                 last_run_id         TEXT,
                 condition_status    TEXT
             )",

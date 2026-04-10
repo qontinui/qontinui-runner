@@ -67,6 +67,18 @@ impl WorkingRepresentationCache {
             }
         }
 
+        // Check PG before building fresh (in case of restart)
+        if let Some(global_pg) = crate::database::pg::PgDb::try_global() {
+            if let Ok(Some(persisted)) = global_pg.get_working_representation(task_run_id).await {
+                if !persisted.is_stale {
+                    // Cache it in memory for future hits
+                    let mut cache = self.cache.write().await;
+                    cache.insert(task_run_id.to_string(), persisted.clone());
+                    return Ok(persisted);
+                }
+            }
+        }
+
         // Build fresh
         let wr = build_working_representation(task_run_id, workflow_id, workflow_name, pg).await?;
 
@@ -74,6 +86,16 @@ impl WorkingRepresentationCache {
         {
             let mut cache = self.cache.write().await;
             cache.insert(task_run_id.to_string(), wr.clone());
+        }
+
+        // After caching in memory, persist to PG in background
+        if let Some(global_pg) = crate::database::pg::PgDb::try_global() {
+            let wr_clone = wr.clone();
+            tokio::spawn(async move {
+                if let Err(e) = global_pg.save_working_representation(&wr_clone).await {
+                    tracing::debug!("Failed to persist working representation: {}", e);
+                }
+            });
         }
 
         Ok(wr)

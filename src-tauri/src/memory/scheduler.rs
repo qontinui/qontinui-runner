@@ -80,6 +80,11 @@ pub fn start_memory_scheduler(
                 }
                 Err(e) => warn!("Memory consolidation failed: {}", e),
             }
+
+            // Cleanup expired working representations
+            if let Err(e) = pg.cleanup_expired_representations().await {
+                debug!("WR cleanup failed: {}", e);
+            }
         }
     })
 }

@@ -16,7 +16,7 @@ use crate::reflection::graph_engine::KnowledgeGraph;
 // =============================================================================
 
 /// A single result from any memory store, normalized for fusion.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryResult {
     /// Unique identifier within its source.
     pub id: String,
@@ -74,7 +74,7 @@ impl MemorySource {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalStrategy {
     FullTextSearch,
@@ -119,7 +119,7 @@ impl ReasoningLevel {
 }
 
 /// Response from a reasoned memory query (higher tiers).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReasonedMemoryResponse {
     /// The fused memory results.
     pub results: Vec<MemoryResult>,
@@ -137,7 +137,7 @@ pub struct ReasonedMemoryResponse {
 }
 
 /// A snippet of graph neighborhood context for a result.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeighborhoodSnippet {
     pub result_id: String,
     pub source: MemorySource,
@@ -145,7 +145,7 @@ pub struct NeighborhoodSnippet {
 }
 
 /// Summary of a graph neighbor.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeighborSummary {
     pub label: String,
     pub kind: String,
@@ -155,7 +155,7 @@ pub struct NeighborSummary {
 }
 
 /// A causal chain traced from a result node.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CausalChain {
     pub result_id: String,
     pub source: MemorySource,
@@ -894,16 +894,44 @@ pub async fn query_memory_reasoned(
         });
     }
 
-    // High/Max: LLM synthesis
+    // High/Max: LLM synthesis — check cache first
+    let level_str = match level {
+        ReasoningLevel::High => "high",
+        ReasoningLevel::Max => "max",
+        _ => unreachable!(),
+    };
+
+    let query_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(params.query.as_bytes());
+        hasher.update(level_str.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+
+    // Check cache
+    if let Ok(Some(cached_json)) = pg.get_cached_query(&query_hash, level_str).await {
+        if let Ok(cached) = serde_json::from_str::<ReasonedMemoryResponse>(&cached_json) {
+            return Ok(cached);
+        }
+    }
+
     let synthesis = synthesize_results(&params.query, &results, &neighborhood_context, &causal_context, level).await;
 
-    Ok(ReasonedMemoryResponse {
+    let response = ReasonedMemoryResponse {
         results,
         reasoning_level: level,
         neighborhood_context,
         causal_context,
         synthesis,
-    })
+    };
+
+    // Save to cache (TTL 30 minutes)
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = pg.save_cached_query(&query_hash, level_str, &json, 30).await;
+    }
+
+    Ok(response)
 }
 
 /// Build a graph node key from a memory result's source and id.
