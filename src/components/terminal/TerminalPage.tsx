@@ -136,11 +136,6 @@ function TerminalPageInner({
     analysis,
     findingsActions,
     sessionManager,
-    transcriptSessions,
-    sessionSummary,
-    sessionSummaryLoading,
-    handleSummarizeSession,
-    getScrollback,
   } = useAiFeatures();
 
   const {
@@ -671,44 +666,7 @@ function TerminalPageInner({
           />
         )}
 
-        <TerminalRightPanel
-          rightPanelMode={workflowGen.rightPanelMode}
-          selectedTranscriptSessionId={workflowGen.selectedTranscriptSessionId}
-          transcriptSessions={transcriptSessions}
-          transcriptMessages={workflowGen.transcriptMessages}
-          loadingMessages={workflowGen.loadingMessages}
-          onGenerateFromTranscript={workflowGen.handleGenerateFromTranscript}
-          onGenerateAndRunFromTranscript={workflowGen.handleGenerateAndRunFromTranscript}
-          onBuildPlanWorkflow={workflowGen.handleBuildPlanWorkflow}
-          onBuildPlanImplementationWorkflow={workflowGen.handleBuildPlanImplementationWorkflow}
-          onResumeSession={shellIntegration.handleResumeSession}
-          onSummarizeSession={handleSummarizeSession}
-          sessionSummary={sessionSummary}
-          sessionSummaryLoading={sessionSummaryLoading}
-          onClosePanel={() => {
-            workflowGen.setRightPanelMode(null);
-            workflowGen.setSelectedTranscriptSessionId(null);
-          }}
-          generatedWorkflow={workflowGen.generatedWorkflow}
-          isGenerating={workflowGen.isGenerating}
-          workflowError={workflowGen.workflowError}
-          onExecute={workflowGen.handleExecute}
-          onEditInBuilder={workflowGen.handleEditInBuilder}
-          onRegenerate={workflowGen.handleRegenerate}
-          onSaveWorkflow={workflowGen.handleSaveWorkflow}
-          onCloseWorkflow={() => workflowGen.setRightPanelMode(null)}
-          analysisType={analysis.analysisType}
-          analysisPanels={analysis.analysisPanels}
-          isAnalyzing={analysis.isAnalyzing}
-          analysisError={analysis.analysisError}
-          onCloseAnalysis={() => workflowGen.setRightPanelMode(null)}
-          activeFindings={activeFindings}
-          allFindings={allFindings}
-          onFindingRespond={findingsActions.handleFindingRespond}
-          onFixFinding={findingsActions.handleFixFinding}
-          onGenerateFromFindings={findingsActions.handleGenerateFromFindings}
-          onCloseFindings={() => workflowGen.setRightPanelMode(null)}
-        />
+        <TerminalRightPanel />
       </div>
 
       <TerminalOverlays

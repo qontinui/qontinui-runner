@@ -1,102 +1,47 @@
 import { TranscriptContentPanel } from "./TranscriptContentPanel";
 import { TerminalAnalysisPanel } from "./TerminalAnalysisPanel";
-import type { AnalysisType } from "./TerminalAnalysisPanel";
 import { TerminalFindingsPanel } from "./TerminalFindingsPanel";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
-import type { TranscriptSession, TranscriptMessage } from "./useTranscriptSessions";
-import type { UnifiedWorkflow } from "@qontinui/shared-types";
-import type { CanvasPanel } from "@qontinui/shared-types";
-import type { Finding } from "@/types/findings";
+import { useAiFeatures, useSessionState } from "./contexts";
 
-interface TerminalRightPanelProps {
-  rightPanelMode: "transcript" | "workflow" | "analysis" | "findings" | null;
-  selectedTranscriptSessionId: string | null;
-  transcriptSessions: TranscriptSession[];
-  transcriptMessages: TranscriptMessage[];
-  loadingMessages: boolean;
-  onGenerateFromTranscript: (desc: string, ctx: string) => void;
-  onGenerateAndRunFromTranscript: (desc: string, ctx: string) => void;
-  onBuildPlanWorkflow: (planContent: string) => void;
-  onBuildPlanImplementationWorkflow: (planContent: string) => void;
-  onResumeSession: (session: TranscriptSession) => void;
-  onSummarizeSession?: (messages: TranscriptMessage[]) => void;
-  sessionSummary?: string | null;
-  sessionSummaryLoading?: boolean;
-  onClosePanel: () => void;
-  generatedWorkflow: UnifiedWorkflow | null;
-  isGenerating: boolean;
-  workflowError: string | undefined;
-  onExecute: () => Promise<void>;
-  onEditInBuilder: () => void;
-  onRegenerate: () => Promise<void>;
-  onSaveWorkflow: () => Promise<void>;
-  onCloseWorkflow: () => void;
-  analysisType: AnalysisType;
-  analysisPanels: CanvasPanel[] | null;
-  isAnalyzing: boolean;
-  analysisError: string | undefined;
-  onCloseAnalysis: () => void;
-  activeFindings: Finding[];
-  allFindings: Finding[];
-  onFindingRespond: (findingId: string, text: string) => void;
-  onFixFinding: (finding: Finding) => Promise<void>;
-  onGenerateFromFindings: (findings: Finding[]) => Promise<void>;
-  onCloseFindings: () => void;
-}
+export function TerminalRightPanel() {
+  const {
+    workflowGen,
+    analysis,
+    findingsActions,
+    shellIntegration,
+    transcriptSessions,
+    sessionSummary,
+    sessionSummaryLoading,
+    handleSummarizeSession,
+  } = useAiFeatures();
+  const { activeFindings, allFindings } = useSessionState();
 
-export function TerminalRightPanel({
-  rightPanelMode,
-  selectedTranscriptSessionId,
-  transcriptSessions,
-  transcriptMessages,
-  loadingMessages,
-  onGenerateFromTranscript,
-  onGenerateAndRunFromTranscript,
-  onBuildPlanWorkflow,
-  onBuildPlanImplementationWorkflow,
-  onResumeSession,
-  onSummarizeSession,
-  sessionSummary,
-  sessionSummaryLoading,
-  onClosePanel,
-  generatedWorkflow,
-  isGenerating,
-  workflowError,
-  onExecute,
-  onEditInBuilder,
-  onRegenerate,
-  onSaveWorkflow,
-  onCloseWorkflow,
-  analysisType,
-  analysisPanels,
-  isAnalyzing,
-  analysisError,
-  onCloseAnalysis,
-  activeFindings,
-  allFindings,
-  onFindingRespond,
-  onFixFinding,
-  onGenerateFromFindings,
-  onCloseFindings,
-}: TerminalRightPanelProps) {
-  if (rightPanelMode === "transcript" && selectedTranscriptSessionId) {
+  const rightPanelMode = workflowGen.rightPanelMode;
+
+  if (rightPanelMode === "transcript" && workflowGen.selectedTranscriptSessionId) {
     return (
       <TranscriptContentPanel
-        sessionId={selectedTranscriptSessionId}
+        sessionId={workflowGen.selectedTranscriptSessionId}
         session={
-          transcriptSessions.find((s) => s.session_id === selectedTranscriptSessionId) ?? null
+          transcriptSessions.find(
+            (s) => s.session_id === workflowGen.selectedTranscriptSessionId,
+          ) ?? null
         }
-        messages={transcriptMessages}
-        loading={loadingMessages}
-        onGenerate={onGenerateFromTranscript}
-        onGenerateAndRun={onGenerateAndRunFromTranscript}
-        onBuildPlanWorkflow={onBuildPlanWorkflow}
-        onBuildPlanImplementationWorkflow={onBuildPlanImplementationWorkflow}
-        onResume={onResumeSession}
-        onSummarize={onSummarizeSession}
+        messages={workflowGen.transcriptMessages}
+        loading={workflowGen.loadingMessages}
+        onGenerate={workflowGen.handleGenerateFromTranscript}
+        onGenerateAndRun={workflowGen.handleGenerateAndRunFromTranscript}
+        onBuildPlanWorkflow={workflowGen.handleBuildPlanWorkflow}
+        onBuildPlanImplementationWorkflow={workflowGen.handleBuildPlanImplementationWorkflow}
+        onResume={shellIntegration.handleResumeSession}
+        onSummarize={handleSummarizeSession}
         summaryText={sessionSummary}
         summaryLoading={sessionSummaryLoading}
-        onClose={onClosePanel}
+        onClose={() => {
+          workflowGen.setRightPanelMode(null);
+          workflowGen.setSelectedTranscriptSessionId(null);
+        }}
       />
     );
   }
@@ -105,14 +50,14 @@ export function TerminalRightPanel({
     return (
       <div className="w-[420px] h-full shrink-0">
         <WorkflowPreviewPanel
-          workflow={generatedWorkflow}
-          isLoading={isGenerating}
-          error={workflowError}
-          onExecute={onExecute}
-          onEditInBuilder={onEditInBuilder}
-          onRegenerate={onRegenerate}
-          onSave={onSaveWorkflow}
-          onClose={onCloseWorkflow}
+          workflow={workflowGen.generatedWorkflow}
+          isLoading={workflowGen.isGenerating}
+          error={workflowGen.workflowError}
+          onExecute={workflowGen.handleExecute}
+          onEditInBuilder={workflowGen.handleEditInBuilder}
+          onRegenerate={workflowGen.handleRegenerate}
+          onSave={workflowGen.handleSaveWorkflow}
+          onClose={() => workflowGen.setRightPanelMode(null)}
         />
       </div>
     );
@@ -121,11 +66,11 @@ export function TerminalRightPanel({
   if (rightPanelMode === "analysis") {
     return (
       <TerminalAnalysisPanel
-        analysisType={analysisType}
-        panels={analysisPanels}
-        isAnalyzing={isAnalyzing}
-        error={analysisError}
-        onClose={onCloseAnalysis}
+        analysisType={analysis.analysisType}
+        panels={analysis.analysisPanels}
+        isAnalyzing={analysis.isAnalyzing}
+        error={analysis.analysisError}
+        onClose={() => workflowGen.setRightPanelMode(null)}
       />
     );
   }
@@ -135,10 +80,10 @@ export function TerminalRightPanel({
       <TerminalFindingsPanel
         findings={activeFindings}
         allFindings={allFindings}
-        onClose={onCloseFindings}
-        onRespond={onFindingRespond}
-        onFix={onFixFinding}
-        onGenerateWorkflow={onGenerateFromFindings}
+        onClose={() => workflowGen.setRightPanelMode(null)}
+        onRespond={findingsActions.handleFindingRespond}
+        onFix={findingsActions.handleFixFinding}
+        onGenerateWorkflow={findingsActions.handleGenerateFromFindings}
       />
     );
   }
