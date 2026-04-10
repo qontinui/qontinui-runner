@@ -138,6 +138,13 @@ impl ClaudeSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Set CLAUDE_CONFIG_DIR to the resolved account (for multi-account support)
+        let ai_settings = crate::settings::get_ai_settings();
+        if let Some(config_dir) = crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli) {
+            info!("Setting CLAUDE_CONFIG_DIR={} for session {}", config_dir, session_id);
+            cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
+        }
+
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn Claude CLI: {}", e))?;
@@ -716,11 +723,19 @@ impl ClaudeSession {
             progress_count
         });
 
+        // Shared stderr buffer — stderr thread writes, waiter thread reads after exit
+        let shared_stderr = Arc::new(Mutex::new(String::new()));
+        let shared_stderr_for_reader = shared_stderr.clone();
+
         // Stderr reader thread
         let stderr_handle = thread::spawn(move || {
             let mut output = String::new();
             if let Some(mut stderr) = stderr {
                 let _ = stderr.read_to_string(&mut output);
+            }
+            // Write to shared buffer for waiter thread access
+            if let Ok(mut buf) = shared_stderr_for_reader.lock() {
+                *buf = output.clone();
             }
             output
         });
@@ -732,6 +747,9 @@ impl ClaudeSession {
         let session_id_for_waiter = session_id.to_string();
         let pid_tracker_for_waiter = pid_tracker.clone();
         let child_pid_for_waiter = child_pid;
+        let app_handle_for_waiter = app_handle.clone();
+        let session_ctx_for_waiter = session_ctx.clone();
+        let shared_stderr_for_waiter = shared_stderr;
 
         thread::spawn(move || {
             // Wait for the child process to exit
@@ -748,11 +766,50 @@ impl ClaudeSession {
             // Close stdin
             writer_for_waiter.close();
 
+            // Brief pause to let the stderr reader thread finish
+            thread::sleep(Duration::from_millis(200));
+
+            // Check if the exit was due to rate-limiting
+            let stderr_output = shared_stderr_for_waiter
+                .lock()
+                .ok()
+                .map(|s| s.clone())
+                .unwrap_or_default();
+
+            let is_rate_limited = crate::ai_provider::retry::is_rate_limit_error(&stderr_output);
+
+            if is_rate_limited {
+                warn!(
+                    "Session {} exited due to rate-limit, attempting auto-restart on another account",
+                    session_id_for_waiter
+                );
+
+                // Emit a user-visible notification
+                if let Some(ref ctx) = session_ctx_for_waiter {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        emit_ai_output(
+                            &app_handle_for_waiter,
+                            "Rate limit reached. Switching account and restarting session...",
+                            "status",
+                            None,
+                            Some(ctx),
+                        );
+                    }));
+                }
+
+                // Attempt auto-restart on another account
+                Self::auto_restart_on_rate_limit(
+                    &app_handle_for_waiter,
+                    &session_id_for_waiter,
+                    session_ctx_for_waiter.as_ref(),
+                );
+            }
+
             // Transition to Closed
             state_for_waiter.force_close();
             info!(
-                "Session {} process exited, state -> Closed",
-                session_id_for_waiter
+                "Session {} process exited, state -> Closed (rate_limited={})",
+                session_id_for_waiter, is_rate_limited
             );
         });
 
@@ -1058,6 +1115,184 @@ impl ClaudeSession {
 
         info!("Session {} closed", self.session_id);
         Ok(())
+    }
+
+    /// Auto-restart the session on another account after a rate-limit exit.
+    ///
+    /// Reads conversation history from the DB output_log, rotates the account,
+    /// spawns a new ClaudeSession with a replay prompt, and re-registers it
+    /// in the SessionManager.
+    fn auto_restart_on_rate_limit(
+        app_handle: &tauri::AppHandle,
+        session_id: &str,
+        session_ctx: Option<&AiSessionContext>,
+    ) {
+        use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
+        use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
+        use tauri::Manager;
+
+        // 1. Rotate to another account
+        if !rotate_account_on_rate_limit() {
+            warn!(
+                "Session {}: no alternative account available for restart",
+                session_id
+            );
+            return;
+        }
+
+        let new_config_dir = get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli)
+            .unwrap_or_else(|| "unknown".to_string());
+        let label = std::path::Path::new(&new_config_dir)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&new_config_dir);
+        info!(
+            "Session {}: restarting on account '{}' after rate-limit",
+            session_id, label
+        );
+
+        // 2. Read conversation history from DB
+        let conversation_context = if let Some(ctx) = session_ctx {
+            let task_run_id = ctx.task_run_id();
+            // Use a temporary tokio runtime for the DB call
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    warn!("Failed to create runtime for DB read: {}", e);
+                    return;
+                }
+            };
+
+            let pg = match crate::database::pg::PgDb::try_global() {
+                Some(pg) => pg,
+                None => {
+                    warn!("No PG connection for reading conversation history");
+                    return;
+                }
+            };
+
+            let output_log = rt
+                .block_on(pg.get_task_output(task_run_id))
+                .unwrap_or_default();
+
+            if output_log.is_empty() {
+                info!("No conversation history to replay for session {}", session_id);
+                None
+            } else {
+                let turns = parse_conversation(&output_log);
+                if turns.is_empty() {
+                    None
+                } else {
+                    let replay = build_replay_prompt(&turns, None);
+                    info!(
+                        "Built replay prompt for session {} ({} turns, {} chars)",
+                        session_id,
+                        turns.len(),
+                        replay.len()
+                    );
+                    Some(replay)
+                }
+            }
+        } else {
+            None
+        };
+
+        // 3. Spawn new session
+        let sm = match app_handle.try_state::<Arc<crate::claude_session::manager::SessionManager>>()
+        {
+            Some(sm) => sm.inner().clone(),
+            None => {
+                warn!("SessionManager not available for auto-restart");
+                return;
+            }
+        };
+
+        let working_dir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        // Clone session_ctx for the new session
+        let new_session_ctx = session_ctx.cloned();
+
+        match Self::spawn(
+            &working_dir,
+            session_id,
+            app_handle,
+            new_session_ctx,
+            None, // finding_ctx
+            None, // progress_ctx
+            None, // pid_tracker
+            None, // model_override
+        ) {
+            Ok(new_session) => {
+                let new_session = Arc::new(new_session);
+
+                // Send replay prompt if we have conversation context
+                if let Some(ref replay_prompt) = conversation_context {
+                    if let Err(e) = new_session.send_initial_prompt(replay_prompt) {
+                        warn!("Failed to send replay prompt: {}", e);
+                    }
+                }
+
+                // Remove old session and re-register under the same ID
+                sm.remove(session_id);
+                if let Err(e) = sm.register(session_id, new_session.clone()) {
+                    warn!("Failed to re-register session after restart: {}", e);
+                    return;
+                }
+
+                // Emit state event so frontend knows the session is back
+                crate::commands::ai_session::emit_session_state_ex(
+                    app_handle,
+                    session_id,
+                    session_id,
+                    new_session.state(),
+                    true, // resumed flag
+                );
+
+                // Notify user
+                if let Some(ctx) = session_ctx {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        emit_ai_output(
+                            app_handle,
+                            &format!(
+                                "Session restarted on account '{}'. Conversation context restored.",
+                                label
+                            ),
+                            "status",
+                            None,
+                            Some(ctx),
+                        );
+                    }));
+                }
+
+                info!(
+                    "Session {} successfully restarted on account '{}'",
+                    session_id, label
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to restart session {} on new account: {}",
+                    session_id, e
+                );
+                // Notify user of failure
+                if let Some(ctx) = session_ctx {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        emit_ai_output(
+                            app_handle,
+                            &format!("Failed to restart session on new account: {}", e),
+                            "error",
+                            None,
+                            Some(ctx),
+                        );
+                    }));
+                }
+            }
+        }
     }
 
     /// Internal: wait for child process to exit.

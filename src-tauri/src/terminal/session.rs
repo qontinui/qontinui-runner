@@ -128,6 +128,13 @@ impl TerminalSession {
             crate::mcp::types::get_mcp_api_port().to_string(),
         );
 
+        // Set CLAUDE_CONFIG_DIR so Claude Code uses the resolved account
+        // (multi-account support with auto-rotation on rate-limit).
+        let ai_settings = crate::settings::get_ai_settings();
+        if let Some(config_dir) = crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli) {
+            cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
+        }
+
         // Spawn the child process
         let child = pair
             .slave

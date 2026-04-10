@@ -1,6 +1,7 @@
 {
   "dependencies": {
     "@apollo/client": "^4.1.6",
+    "@dagrejs/dagre": "^3.0.0",
     "@monaco-editor/react": "^4.7.0",
     "@qontinui/design-tokens": "^1.0.0",
     "@qontinui/shared-types": "file:../qontinui-schemas/ts",

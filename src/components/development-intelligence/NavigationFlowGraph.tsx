@@ -21,7 +21,7 @@ import {
   Handle,
   MarkerType,
 } from "@xyflow/react";
-import dagre from "dagre";
+import * as dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import { Navigation, Loader2 } from "lucide-react";
 import { copyMermaidToClipboard } from "@/lib/development-intelligence/mermaid-export";

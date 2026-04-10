@@ -189,6 +189,27 @@ impl InstanceManager {
         registered.values().cloned().collect()
     }
 
+    /// Remove registered instances whose ports are not reachable.
+    /// Returns the number of instances removed.
+    pub async fn purge_unreachable_registered(&self) -> u32 {
+        let registered = self.registered.lock().await;
+        let to_check: Vec<(String, u16)> = registered
+            .values()
+            .map(|r| (r.id.clone(), r.port))
+            .collect();
+        drop(registered);
+
+        let mut removed = 0u32;
+        for (id, port) in &to_check {
+            if !crate::process_capture::health::is_port_in_use(*port) {
+                self.deregister_instance(id).await;
+                info!("Purged unreachable registered instance (port {})", port);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Allocate the next free port in the 9877-9899 range.
     ///
     /// Three-way check: in-memory child processes + DB registry + TCP port probe.

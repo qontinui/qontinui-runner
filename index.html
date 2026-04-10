@@ -29,6 +29,21 @@
         color: #00d9ff;
       }
     </style>
+    <script>
+      // Catch errors during main bundle execution (IIFE runs synchronously).
+      // Must be in <head> BEFORE the main script so it's installed in time.
+      window.__BOOT_ERRORS = [];
+      window.onerror = function (msg, src, line, col, err) {
+        window.__BOOT_ERRORS.push({ msg: String(msg), src: String(src), line: line, col: col, stack: err && err.stack ? err.stack.substring(0, 500) : null });
+        var root = document.getElementById("root");
+        if (root && root.childElementCount === 0) {
+          root.innerHTML = '<pre style="color:#ff6b6b;padding:20px;white-space:pre-wrap">Boot error: ' + msg + '\nat ' + src + ':' + line + ':' + col + (err && err.stack ? '\n\n' + err.stack.substring(0, 1000) : '') + '</pre>';
+        }
+      };
+      window.addEventListener("unhandledrejection", function (e) {
+        window.__BOOT_ERRORS.push({ type: "unhandledrejection", reason: String(e.reason).substring(0, 500) });
+      });
+    </script>
   </head>
 
   <body>

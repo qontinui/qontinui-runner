@@ -20,7 +20,7 @@ import {
   Position,
   Handle,
 } from "@xyflow/react";
-import dagre from "dagre";
+import * as dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import {
   Shield,

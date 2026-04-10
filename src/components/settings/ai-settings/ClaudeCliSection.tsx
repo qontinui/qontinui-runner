@@ -39,6 +39,13 @@ interface ClaudeCliSectionProps {
   setAccountUsages: React.Dispatch<React.SetStateAction<AccountUsageInfo[]>>;
 }
 
+interface LiveAccountInfo {
+  config_dir: string;
+  label: string;
+  is_active: boolean;
+  is_rate_limited: boolean;
+}
+
 export function ClaudeCliSection({
   settings,
   setSettings,
@@ -54,15 +61,8 @@ export function ClaudeCliSection({
 }: ClaudeCliSectionProps) {
   const [checkingUsage, setCheckingUsage] = useState(false);
   const [detectingDirs, setDetectingDirs] = useState(false);
-  const [switching, setSwitching] = useState(false);
+  const [switchingDir, setSwitchingDir] = useState<string | null>(null);
 
-  // Live account state from backend (active account, rate-limit status)
-  interface LiveAccountInfo {
-    config_dir: string;
-    label: string;
-    is_active: boolean;
-    is_rate_limited: boolean;
-  }
   const [liveAccounts, setLiveAccounts] = useState<LiveAccountInfo[]>([]);
 
   // Fetch live account state on mount and after switching
@@ -72,8 +72,8 @@ export function ClaudeCliSection({
       if (result?.success && result.data) {
         setLiveAccounts(result.data);
       }
-    } catch {
-      // Silently fail — this is supplementary info
+    } catch (err) {
+      console.warn("Failed to fetch live accounts:", err);
     }
   }, []);
 
@@ -83,7 +83,7 @@ export function ClaudeCliSection({
 
   const handleSwitchAccount = useCallback(
     async (configDir: string) => {
-      setSwitching(true);
+      setSwitchingDir(configDir);
       try {
         const result = await invoke<TauriResult<null>>("switch_claude_account", {
           configDir,
@@ -97,7 +97,7 @@ export function ClaudeCliSection({
       } catch (err) {
         onLog("error", `Failed to switch account: ${err}`);
       } finally {
-        setSwitching(false);
+        setSwitchingDir(null);
       }
     },
     [onLog, refreshLiveAccounts],
@@ -491,12 +491,14 @@ export function ClaudeCliSection({
                       {!isLiveActive && claudeConfigDirs.length > 1 && (
                         <button
                           onClick={() => handleSwitchAccount(dir)}
-                          disabled={switching}
+                          disabled={switchingDir !== null}
                           className="text-xs px-2 py-0.5 rounded bg-primary/10 hover:bg-primary/20 text-primary transition-colors shrink-0 flex items-center gap-1 disabled:opacity-50"
                           title="Switch to this account"
                         >
-                          <ArrowRightLeft className={`w-3 h-3 ${switching ? "animate-spin" : ""}`} />
-                          Switch
+                          <ArrowRightLeft
+                            className={`w-3 h-3 ${switchingDir === dir ? "animate-spin" : ""}`}
+                          />
+                          {switchingDir === dir ? "Switching..." : "Switch"}
                         </button>
                       )}
 

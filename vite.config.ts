@@ -14,13 +14,17 @@ export default defineConfig({
     // unnecessary. Removing type="module" is critical: it makes the browser
     // use the classic script loader, bypassing WebView2's broken module
     // fetcher on cold custom-protocol profiles.
+    // IMPORTANT: We must add "defer" when stripping type="module", because
+    // type="module" implicitly defers execution until after DOM parsing.
+    // Without defer, the IIFE runs in <head> before <div id="root"> exists,
+    // so React mounts to null and the app shows "Loading..." forever.
     {
       name: "strip-module-attrs",
       enforce: "post" as const,
       transformIndexHtml(html: string) {
         return html
           .replace(/ crossorigin/g, "")
-          .replace(/ type="module"/g, "")
+          .replace(/ type="module"/g, " defer")
           .replace(/<link rel="modulepreload"[^>]*>/g, "");
       },
     },

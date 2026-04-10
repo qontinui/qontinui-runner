@@ -133,26 +133,6 @@ impl PgDb {
         Ok(count > 0)
     }
 
-    /// Remove a runner instance by port.
-    pub async fn remove_runner_instance_by_port(&self, port: u16) -> Result<bool, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-        let port_i32 = port as i32;
-
-        let count = conn
-            .execute(
-                "DELETE FROM runner_instances WHERE port = $1",
-                &[&port_i32],
-            )
-            .await
-            .map_err(|e| format!("PG remove_runner_instance_by_port: {}", e))?;
-
-        Ok(count > 0)
-    }
-
     /// Update heartbeat timestamp and running task count for an instance.
     pub async fn update_runner_instance_heartbeat(
         &self,
@@ -206,6 +186,7 @@ impl PgDb {
                 UPDATE runner_instances
                 SET status = 'unhealthy'
                 WHERE status = 'healthy'
+                  AND is_primary = FALSE
                   AND last_heartbeat < NOW() - ($1 || ' seconds')::INTERVAL
                 "#,
                 &[&stale_threshold_secs.to_string()],

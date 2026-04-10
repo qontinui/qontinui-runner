@@ -1260,6 +1260,7 @@ CREATE INDEX IF NOT EXISTS idx_tk_category ON task_knowledge(category);
 CREATE INDEX IF NOT EXISTS idx_tk_resolved ON task_knowledge(is_resolved) WHERE NOT is_resolved;
 CREATE INDEX IF NOT EXISTS idx_tk_created ON task_knowledge(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tk_project_path ON task_knowledge(project_path) WHERE project_path IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tk_active ON task_knowledge(task_run_id, category) WHERE archived_at IS NULL;
 
 -- ============================================================================
 -- Knowledge Graph Tables (workflow improvement system)
@@ -3619,6 +3620,7 @@ CREATE TABLE IF NOT EXISTS learned_patterns (
 );
 CREATE INDEX IF NOT EXISTS idx_learned_patterns_confidence ON learned_patterns(confidence DESC);
 CREATE INDEX IF NOT EXISTS idx_learned_patterns_workflow ON learned_patterns(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_learned_patterns_keywords_gin ON learned_patterns USING GIN(trigger_keywords);
 
 -- Ticket system integration (external ticket provider mapping)
 CREATE TABLE IF NOT EXISTS ticket_task_mapping (

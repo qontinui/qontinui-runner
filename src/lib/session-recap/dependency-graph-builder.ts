@@ -13,7 +13,7 @@
 
 import type { Node, Edge } from "@xyflow/react";
 import { MarkerType, Position } from "@xyflow/react";
-import dagre from "dagre";
+import * as dagre from "@dagrejs/dagre";
 import type { SessionRecap, FileChange, DependencyEdge } from "./types";
 
 // ============================================================================

@@ -18,7 +18,7 @@ const MAX_RATE_LIMIT_WAITS: u32 = 6;
 ///
 /// This is a subset of retryable errors — used to trigger account rotation
 /// before retrying, so the next attempt uses a different account.
-pub(super) fn is_rate_limit_error(error_msg: &str) -> bool {
+pub fn is_rate_limit_error(error_msg: &str) -> bool {
     let lower = error_msg.to_lowercase();
     lower.contains("(429)")
         || lower.contains("rate limit")
@@ -38,7 +38,7 @@ pub(super) fn is_rate_limit_error(error_msg: &str) -> bool {
 ///
 /// Permanent (non-retryable) errors include:
 /// - HTTP 400 (bad request)
-/// - HTTP 401, 403 (authentication/authorization)
+/// - HTTP 401 (authentication — note: 403 IS retried as it can be transient token refresh)
 /// - Deserialization / JSON parse errors
 /// - Missing API key configuration
 /// - Client construction failures
@@ -184,15 +184,29 @@ where
             return response;
         }
 
-        // Record retryable failure to circuit breaker
-        if let Some(key) = provider_key {
-            circuit_breaker::record_provider_failure(key, error_msg);
-        }
-
         let is_rate_limit = is_rate_limit_error(error_msg);
+
+        // Record retryable failure to circuit breaker — but NOT rate-limit errors,
+        // which are capacity signals handled by account rotation, not provider failures.
+        if !is_rate_limit {
+            if let Some(key) = provider_key {
+                circuit_breaker::record_provider_failure(key, error_msg);
+            }
+        }
 
         // For rate-limit errors: try rotating to another account
         if is_rate_limit {
+            rate_limit_waits += 1;
+
+            // Safety cap: don't spin forever if all accounts are persistently rate-limited
+            if rate_limit_waits > MAX_RATE_LIMIT_WAITS {
+                error!(
+                    "{}: exceeded max rate-limit waits ({}) across all accounts, giving up: {}",
+                    operation_name, MAX_RATE_LIMIT_WAITS, error_msg
+                );
+                return response;
+            }
+
             if super::config::rotate_account_on_rate_limit() {
                 let new_account = super::config::get_resolved_config_dir()
                     .unwrap_or_else(|| "unknown".to_string());
@@ -201,8 +215,8 @@ where
                     .and_then(|n| n.to_str())
                     .unwrap_or(&new_account);
                 info!(
-                    "{}: rate-limit detected, switched to account '{}' for retry",
-                    operation_name, label
+                    "{}: rate-limit detected (cycle {}/{}), switched to account '{}' for retry",
+                    operation_name, rate_limit_waits, MAX_RATE_LIMIT_WAITS, label
                 );
                 // Reset attempt counter — new account gets fresh retries
                 attempt = 0;
@@ -213,45 +227,42 @@ where
 
             // Rotation failed — all accounts are rate-limited.
             // Wait for the earliest cooldown to expire and try again.
-            if rate_limit_waits < MAX_RATE_LIMIT_WAITS {
-                if let Some(wait_duration) = super::config::time_until_next_account_available() {
-                    rate_limit_waits += 1;
-                    let wait_secs = wait_duration.as_secs();
+            if let Some(wait_duration) = super::config::time_until_next_account_available() {
+                let wait_secs = wait_duration.as_secs();
 
-                    // Calculate which account will be used and when
-                    let resume_time = chrono::Local::now()
-                        + chrono::Duration::seconds(wait_secs as i64);
-                    let resume_str = resume_time.format("%H:%M:%S").to_string();
+                // Calculate which account will be used and when
+                let resume_time = chrono::Local::now()
+                    + chrono::Duration::seconds(wait_secs as i64);
+                let resume_str = resume_time.format("%H:%M:%S").to_string();
 
-                    warn!(
-                        "{}: all accounts rate-limited (wait {}/{}). \
-                         Waiting {}s — will retry at {} with next available account.",
-                        operation_name,
-                        rate_limit_waits,
-                        MAX_RATE_LIMIT_WAITS,
-                        wait_secs,
-                        resume_str,
-                    );
+                warn!(
+                    "{}: all accounts rate-limited (cycle {}/{}). \
+                     Waiting {}s — will retry at {} with next available account.",
+                    operation_name,
+                    rate_limit_waits,
+                    MAX_RATE_LIMIT_WAITS,
+                    wait_secs,
+                    resume_str,
+                );
 
-                    std::thread::sleep(wait_duration);
+                std::thread::sleep(wait_duration);
 
-                    // Unlock the account whose cooldown just expired
-                    super::config::force_unlock_earliest_account();
+                // Unlock the account whose cooldown just expired
+                super::config::force_unlock_earliest_account();
 
-                    let new_account = super::config::get_resolved_config_dir()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let label = std::path::Path::new(&new_account)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(&new_account);
-                    info!(
-                        "{}: cooldown expired, resuming with account '{}'",
-                        operation_name, label
-                    );
+                let new_account = super::config::get_resolved_config_dir()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let label = std::path::Path::new(&new_account)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&new_account);
+                info!(
+                    "{}: cooldown expired, resuming with account '{}'",
+                    operation_name, label
+                );
 
-                    attempt = 0;
-                    continue;
-                }
+                attempt = 0;
+                continue;
             }
         }
 

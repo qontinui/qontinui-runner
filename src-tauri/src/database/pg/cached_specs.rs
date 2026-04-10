@@ -3,6 +3,19 @@
 use super::PgDb;
 use crate::database::types::CachedAppSpec;
 
+/// Read `discovered_at` from a PG row, handling both TIMESTAMPTZ (post-migration v10)
+/// and legacy TEXT values gracefully. Uses `chrono::DateTime<chrono::Utc>` for the
+/// native TIMESTAMPTZ path and falls back to raw String for any legacy TEXT rows.
+fn read_discovered_at(row: &tokio_postgres::Row, idx: usize) -> String {
+    // Try TIMESTAMPTZ first (the canonical column type after migration v10)
+    if let Ok(ts) = row.try_get::<_, chrono::DateTime<chrono::Utc>>(idx) {
+        return ts.to_rfc3339();
+    }
+    // Fallback: legacy TEXT (pre-migration rows or if migration hasn't run)
+    row.try_get::<_, String>(idx)
+        .unwrap_or_default()
+}
+
 impl PgDb {
     /// Upsert a cached spec for an external app.
     pub async fn upsert_cached_spec(
@@ -19,7 +32,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         let id = format!("{}:{}", app_url, spec_id);
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now();
 
         conn.execute(
             r#"INSERT INTO cached_app_specs (id, app_url, app_name, spec_id, spec_json, discovered_at, page_url)
@@ -67,7 +80,7 @@ impl PgDb {
                 app_name: r.get(2),
                 spec_id: r.get(3),
                 spec_json: r.get(4),
-                discovered_at: r.get(5),
+                discovered_at: read_discovered_at(r, 5),
                 page_url: r.get(6),
             })
             .collect())
@@ -99,7 +112,7 @@ impl PgDb {
                 app_name: r.get(2),
                 spec_id: r.get(3),
                 spec_json: r.get(4),
-                discovered_at: r.get(5),
+                discovered_at: read_discovered_at(r, 5),
                 page_url: r.get(6),
             })
             .collect())

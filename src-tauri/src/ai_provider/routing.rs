@@ -39,50 +39,29 @@ pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> Ai
     let ai_settings = settings::get_ai_settings();
     let cb_key = circuit_breaker::provider_key(&ai_settings.provider);
 
-    // Check circuit breaker before attempting the call
-    if !circuit_breaker::is_provider_available(&cb_key) {
-        let state = circuit_breaker::provider_state(&cb_key);
-        warn!(
-            "Provider {:?} circuit breaker is {}, failing fast",
-            ai_settings.provider, state
-        );
-        return AiResponse::error(format!(
-            "Provider {:?} circuit breaker is {} — too many recent failures",
-            ai_settings.provider, state
-        ));
-    }
-
     info!(
         "Running AI prompt via {:?} (prompt length: {} chars)",
         ai_settings.provider,
         prompt.len()
     );
 
-    let response = match ai_settings.provider {
-        AiProvider::ClaudeCli => {
-            run_claude_cli(prompt, &ai_settings.claude_cli, None, doctor_handle)
+    retry_with_backoff_tracked("AI prompt (sync)", Some(&cb_key), || {
+        let ai_settings = settings::get_ai_settings();
+        match ai_settings.provider {
+            AiProvider::ClaudeCli => {
+                run_claude_cli(prompt, &ai_settings.claude_cli, None, doctor_handle)
+            }
+            AiProvider::ClaudeApi => {
+                run_claude_api(prompt, &ai_settings.claude_api, None, doctor_handle)
+            }
+            AiProvider::GeminiCli => {
+                run_gemini_cli(prompt, &ai_settings.gemini_cli, None, doctor_handle)
+            }
+            AiProvider::GeminiApi => {
+                run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
+            }
         }
-        AiProvider::ClaudeApi => {
-            run_claude_api(prompt, &ai_settings.claude_api, None, doctor_handle)
-        }
-        AiProvider::GeminiCli => {
-            run_gemini_cli(prompt, &ai_settings.gemini_cli, None, doctor_handle)
-        }
-        AiProvider::GeminiApi => {
-            run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
-        }
-    };
-
-    // Record result to circuit breaker
-    if response.success {
-        circuit_breaker::record_provider_success(&cb_key);
-    } else if let Some(ref err) = response.error {
-        if super::retry::is_retryable_error(err) {
-            circuit_breaker::record_provider_failure(&cb_key, err);
-        }
-    }
-
-    response
+    })
 }
 
 /// Run an AI prompt with intelligent routing based on task complexity.

@@ -20,7 +20,7 @@ mod gemini_cli;
 pub mod middleware;
 pub mod multimodal;
 mod process;
-mod retry;
+pub mod retry;
 pub(crate) mod routing;
 mod types;
 

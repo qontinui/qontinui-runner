@@ -113,15 +113,39 @@ pub async fn purge_stale_instances(
         .await
         .unwrap_or(0);
 
+    // For on-demand purge: first probe unhealthy instances to give them a
+    // chance to respond before deletion.
+    if let Ok(instances) = pg_db.get_all_runner_instances().await {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_default();
+        for inst in &instances {
+            if inst.status != "unhealthy" || inst.is_primary {
+                continue;
+            }
+            let url = format!("http://localhost:{}/health", inst.port);
+            if let Ok(resp) = client.get(&url).send().await {
+                if resp.status().is_success() {
+                    let _ = pg_db
+                        .update_runner_instance_heartbeat(&inst.id, None, "healthy")
+                        .await;
+                }
+            }
+        }
+    }
+
+    // Remove instances that are still unhealthy/stopped after probing
     let cleaned = pg_db
-        .cleanup_dead_runner_instances(0) // immediate cleanup of anything stopped/unhealthy
+        .cleanup_dead_runner_instances(0)
         .await
         .unwrap_or(0);
 
-    // Also clean up in-memory
+    // Also clean up in-memory: remove registered instances whose ports are gone
+    let in_mem_purged = instance_manager.purge_unreachable_registered().await;
     let _ = instance_manager.get_running_ids().await;
 
-    (marked, cleaned)
+    (marked, cleaned + in_mem_purged as u64)
 }
 
 /// Startup cleanup: remove stale DB entries from a previous session.

@@ -14,7 +14,7 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 const SYSTEM_PROMPT_BASE: &str = r#"You are the Qontinui Runner's intent planner. Given a user's request, plan a sequence of UI actions to accomplish it.
 
 The runner has these pages (state machine states):
-- page-gui-automation: Workflows — select and run automation workflows
+- page-workflows: Workflows — select and run automation workflows
 - page-active: Active Dashboard — monitor running executions
 - page-terminal: Terminal — Claude Code sessions, workflow generation, plan implementation
 - page-triggers: Triggers — scheduled task configuration

@@ -1,7 +1,7 @@
 import { useCallback, useMemo } from "react";
 import { ReactFlow, Background, Controls, type Node, type Edge, Position } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import dagre from "dagre";
+import * as dagre from "@dagrejs/dagre";
 import type { TraceSpan } from "./types";
 import { formatDuration } from "./trace-utils";
 

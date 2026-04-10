@@ -22,7 +22,7 @@ import {
   Handle,
   MarkerType,
 } from "@xyflow/react";
-import dagre from "dagre";
+import * as dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import type { ApiSurface, ApiConnection } from "./types";
 import { NODE_COLORS, EDGE_STYLES, type NodeCategory } from "./types";

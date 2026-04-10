@@ -13,7 +13,7 @@ import {
   Handle,
   MarkerType,
 } from "@xyflow/react";
-import dagre from "dagre";
+import * as dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import type { ComponentNode, ComponentEdge } from "@/types/architecture";
 import { copyMermaidToClipboard } from "@/lib/development-intelligence/mermaid-export";

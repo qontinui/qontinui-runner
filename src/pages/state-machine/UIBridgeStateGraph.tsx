@@ -5,7 +5,7 @@
  * to database IDs.
  */
 
-import dagre from "dagre";
+import * as dagre from "@dagrejs/dagre";
 import { StateMachineGraphView } from "@qontinui/workflow-ui/state-machine";
 import "@xyflow/react/dist/style.css";
 import type {

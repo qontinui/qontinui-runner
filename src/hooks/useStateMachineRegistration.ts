@@ -252,15 +252,19 @@ function buildEngineAdapter(engine: AutomationEngine, domExecutor?: DefaultDOMEx
         const transitions = allTransitions();
         const sidebarT = transitions.find((t) => t.id === transitionId);
         if (sidebarT && domExecutor) {
+          if (sidebarT.actions.length === 0) {
+            throw new Error(`Sidebar transition "${transitionId}" has no actions`);
+          }
           // Execute each action in the transition (typically a single sidebar click)
           for (const action of sidebarT.actions) {
             const found = domExecutor.findElement(action.target);
-            if (found) {
-              await domExecutor.executeAction(found.id, action.action, action.params);
-              // Respect waitAfter if defined
-              if (action.waitAfter?.timeout) {
-                await new Promise((r) => setTimeout(r, Math.min(action.waitAfter!.timeout!, 5000)));
-              }
+            if (!found) {
+              throw new Error(`Element not found for sidebar transition "${transitionId}"`);
+            }
+            await domExecutor.executeAction(found.id, action.action, action.params);
+            if (action.waitAfter?.timeout) {
+              const ms = Math.min(action.waitAfter.timeout, 5000);
+              await new Promise((r) => setTimeout(r, ms));
             }
           }
           // Update state machine state
