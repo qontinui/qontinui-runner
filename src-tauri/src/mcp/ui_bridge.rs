@@ -1694,11 +1694,16 @@ pub async fn ui_bridge_get_snapshot_handler(
 
     match snapshot_result {
         Ok(mut data) => {
-            // Enrich snapshot with architecture spec summaries from the database
-            let arch_result = state.app_state.pg_db.get_all_cached_specs().await;
+            // Enrich snapshot with architecture spec summaries from the database.
+            // Wrapped in a timeout so a slow/stuck PG pool never blocks the snapshot response.
+            let enrich_result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                state.app_state.pg_db.get_all_cached_specs(),
+            )
+            .await;
 
-            match arch_result {
-                Ok(specs) => {
+            match enrich_result {
+                Ok(Ok(specs)) => {
                     let summaries: Vec<serde_json::Value> = specs
                         .iter()
                         .filter(|s| crate::spec_utils::is_architecture_spec_str(&s.spec_json))
@@ -1721,10 +1726,15 @@ pub async fn ui_bridge_get_snapshot_handler(
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(
                         "Snapshot enrichment: failed to fetch cached specs from database: {}",
                         e
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "Snapshot enrichment: PG query timed out after 3s, returning snapshot without architecture data"
                     );
                 }
             }
@@ -2929,6 +2939,15 @@ async fn direct_webview_evaluate_with_result(
         .app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
+    if api_port == 0 {
+        // Remove the pending request we just registered
+        let mut pending = state.ui_bridge_pending.lock().await;
+        pending.remove(&request_id);
+        state
+            .ui_bridge_pending_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        return Err("API port not yet bound — direct eval unavailable".to_string());
+    }
 
     // Build JS that evaluates the expression and POSTs the result back
     // via the IPC response HTTP endpoint
