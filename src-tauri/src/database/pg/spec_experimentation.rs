@@ -228,7 +228,7 @@ impl PgDb {
                           info_passed, info_total,
                           assertions_passed, assertions_total,
                           group_scores_json, assertion_details_json,
-                          created_at
+                          created_at::TEXT
                    FROM spec_compliance_results
                    WHERE task_run_id = $1
                    ORDER BY created_at DESC LIMIT 1"#,
@@ -257,7 +257,7 @@ impl PgDb {
                           info_passed, info_total,
                           assertions_passed, assertions_total,
                           group_scores_json, assertion_details_json,
-                          created_at
+                          created_at::TEXT
                    FROM spec_compliance_results
                    WHERE spec_id = $1
                    ORDER BY created_at DESC
@@ -274,7 +274,7 @@ impl PgDb {
                           info_passed, info_total,
                           assertions_passed, assertions_total,
                           group_scores_json, assertion_details_json,
-                          created_at
+                          created_at::TEXT
                    FROM spec_compliance_results
                    ORDER BY created_at DESC
                    LIMIT $1"#,
@@ -377,7 +377,7 @@ impl PgDb {
 
         let rows = conn
             .query(
-                r#"SELECT assertion_details_json, created_at
+                r#"SELECT assertion_details_json, created_at::TEXT
                    FROM spec_compliance_results
                    WHERE spec_id = $1
                    ORDER BY created_at DESC
@@ -554,7 +554,7 @@ impl PgDb {
             .query_opt(
                 r#"SELECT id, spec_id, version_number, content_hash, spec_json,
                           change_summary, change_type, parent_version_id,
-                          assertion_count, group_count, created_at
+                          assertion_count, group_count, created_at::TEXT
                    FROM spec_versions
                    WHERE spec_id = $1
                    ORDER BY version_number DESC
@@ -579,7 +579,7 @@ impl PgDb {
             .query(
                 r#"SELECT id, spec_id, version_number, content_hash, spec_json,
                           change_summary, change_type, parent_version_id,
-                          assertion_count, group_count, created_at
+                          assertion_count, group_count, created_at::TEXT
                    FROM spec_versions
                    WHERE spec_id = $1
                    ORDER BY version_number DESC
@@ -660,25 +660,25 @@ impl PgDb {
         let rows = match (spec_id, analysis_type) {
             (Some(sid), Some(at)) => {
                 conn.query(
-                    "SELECT id, spec_id, analysis_type, score, detail_json, created_at FROM spec_accuracy_results WHERE spec_id = $1 AND analysis_type = $2 ORDER BY created_at DESC LIMIT 100",
+                    "SELECT id, spec_id, analysis_type, score, detail_json, created_at::TEXT FROM spec_accuracy_results WHERE spec_id = $1 AND analysis_type = $2 ORDER BY created_at DESC LIMIT 100",
                     &[&sid, &at],
                 ).await
             }
             (Some(sid), None) => {
                 conn.query(
-                    "SELECT id, spec_id, analysis_type, score, detail_json, created_at FROM spec_accuracy_results WHERE spec_id = $1 ORDER BY created_at DESC LIMIT 100",
+                    "SELECT id, spec_id, analysis_type, score, detail_json, created_at::TEXT FROM spec_accuracy_results WHERE spec_id = $1 ORDER BY created_at DESC LIMIT 100",
                     &[&sid],
                 ).await
             }
             (None, Some(at)) => {
                 conn.query(
-                    "SELECT id, spec_id, analysis_type, score, detail_json, created_at FROM spec_accuracy_results WHERE analysis_type = $1 ORDER BY created_at DESC LIMIT 100",
+                    "SELECT id, spec_id, analysis_type, score, detail_json, created_at::TEXT FROM spec_accuracy_results WHERE analysis_type = $1 ORDER BY created_at DESC LIMIT 100",
                     &[&at],
                 ).await
             }
             (None, None) => {
                 conn.query(
-                    "SELECT id, spec_id, analysis_type, score, detail_json, created_at FROM spec_accuracy_results ORDER BY created_at DESC LIMIT 100",
+                    "SELECT id, spec_id, analysis_type, score, detail_json, created_at::TEXT FROM spec_accuracy_results ORDER BY created_at DESC LIMIT 100",
                     &[],
                 ).await
             }

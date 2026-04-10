@@ -71,22 +71,12 @@ pub fn determine_pr_action(
     }
 
     // Head SHA changed: developer pushed new commits.
-    // Handle state transitions that are invalidated by the new code.
+    // All previously stored CI/review state is for the old SHA and is now stale.
+    // Wait for CI to fully run on the new SHA before taking any action.
     if head_sha_changed {
-        // Previous CI success is stale -- the new SHA hasn't been validated yet.
-        // Reset to no-action so we wait for CI to run on the new commits.
-        if old_checks == "success" {
-            // The stored state will be updated to the new checks (likely "pending"),
-            // so next poll picks up the fresh CI result for the new SHA.
-            return PrAction::NoAction;
-        }
-
-        // Push-after-failure: old checks were "failure" and new checks are "pending".
-        // The developer likely pushed a fix -- wait for CI to complete on the new code
-        // before deciding whether to auto-resume.
-        if old_checks == "failure" && matches!(new_checks, CiStatus::Pending) {
-            return PrAction::NoAction;
-        }
+        // The stored state will be updated to the new SHA's checks/reviews,
+        // so the next poll evaluates the new SHA's results as a fresh baseline.
+        return PrAction::NoAction;
     }
 
     // CI status change
@@ -352,7 +342,13 @@ async fn poll_single_pr(
             );
 
             // Store the CI context as JSON in the task_run's result_data for the executor to pick up
-            let ci_context_json = serde_json::to_string(&ci_context).unwrap_or_default();
+            let ci_context_json = match serde_json::to_string(&ci_context) {
+                Ok(json) => json,
+                Err(e) => {
+                    tracing::warn!("PR watcher: failed to serialize CI context for task {}: {e}", watch.task_run_id);
+                    "{}".to_string()
+                }
+            };
             pg_db
                 .set_task_run_ci_failure_context(&watch.task_run_id, &ci_context_json)
                 .await?;

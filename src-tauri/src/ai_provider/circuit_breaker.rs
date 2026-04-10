@@ -327,12 +327,10 @@ fn breakers() -> &'static DashMap<String, CircuitBreaker> {
 /// Get or create a circuit breaker for a provider.
 fn get_or_create(provider_key: &str) -> dashmap::mapref::one::Ref<'static, String, CircuitBreaker> {
     let map = breakers();
-    if !map.contains_key(provider_key) {
-        map.entry(provider_key.to_string())
-            .or_insert_with(|| {
-                CircuitBreaker::new(provider_key.to_string(), CircuitBreakerConfig::default())
-            });
-    }
+    map.entry(provider_key.to_string())
+        .or_insert_with(|| {
+            CircuitBreaker::new(provider_key.to_string(), CircuitBreakerConfig::default())
+        });
     map.get(provider_key).unwrap()
 }
 
@@ -370,13 +368,18 @@ pub fn all_provider_states() -> Vec<(String, CircuitState)> {
 }
 
 /// Get a snapshot of all provider circuit breaker states as serializable structs.
+/// Uses read-only checks to avoid mutating state (unlike `is_available` which
+/// can transition Open → HalfOpen and consume probe slots).
 pub fn all_provider_circuit_states() -> Vec<ProviderCircuitState> {
     breakers()
         .iter()
-        .map(|entry| ProviderCircuitState {
-            provider_key: entry.key().clone(),
-            state: entry.value().state().to_string(),
-            available: entry.value().is_available(),
+        .map(|entry| {
+            let current_state = entry.value().state();
+            ProviderCircuitState {
+                provider_key: entry.key().clone(),
+                state: current_state.to_string(),
+                available: current_state != CircuitState::Open,
+            }
         })
         .collect()
 }

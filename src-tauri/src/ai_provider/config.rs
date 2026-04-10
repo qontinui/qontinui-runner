@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::settings::{self, AccountSelectionMode};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -135,6 +133,89 @@ pub fn rotate_account_on_rate_limit() -> bool {
     }
 
     false
+}
+
+/// How long until the next account becomes available (cooldown expires).
+///
+/// Returns `None` if any account is already available, or if there are
+/// fewer than 2 accounts configured. Returns `Some(duration)` with the
+/// wait time until the earliest cooldown expires.
+pub fn time_until_next_account_available() -> Option<std::time::Duration> {
+    let config_dirs = settings::get_claude_config_dirs();
+    if config_dirs.len() < 2 {
+        return None;
+    }
+
+    // If any account is not in cooldown, no waiting needed
+    if config_dirs.iter().any(|d| !is_account_cooled_down(d)) {
+        return None;
+    }
+
+    // All accounts are in cooldown — find the one closest to expiry
+    if let Ok(cooldowns) = ACCOUNT_COOLDOWNS.lock() {
+        if let Some(map) = cooldowns.as_ref() {
+            let earliest_remaining = config_dirs
+                .iter()
+                .filter_map(|d| {
+                    map.get(d).map(|marked_at| {
+                        let elapsed = marked_at.elapsed().as_secs();
+                        RATE_LIMIT_COOLDOWN_SECS.saturating_sub(elapsed)
+                    })
+                })
+                .min();
+
+            if let Some(secs) = earliest_remaining {
+                if secs > 0 {
+                    return Some(std::time::Duration::from_secs(secs));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Clear the cooldown for the account that has been cooling the longest,
+/// switch to it, and return true. Returns false if no accounts are configured.
+pub fn force_unlock_earliest_account() -> bool {
+    let config_dirs = settings::get_claude_config_dirs();
+    if config_dirs.is_empty() {
+        return false;
+    }
+
+    let best = if let Ok(mut cooldowns) = ACCOUNT_COOLDOWNS.lock() {
+        if let Some(map) = cooldowns.as_mut() {
+            // Find account with the oldest cooldown (most elapsed time)
+            let best = config_dirs
+                .iter()
+                .max_by_key(|d| {
+                    map.get(*d)
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(u64::MAX)
+                })
+                .cloned();
+            // Clear its cooldown
+            if let Some(ref dir) = best {
+                map.remove(dir);
+                info!(
+                    "Force-unlocked account '{}' after cooldown wait",
+                    short_label(dir)
+                );
+            }
+            best
+        } else {
+            config_dirs.into_iter().next()
+        }
+    } else {
+        return false;
+    };
+
+    if let Some(dir) = best {
+        set_resolved_config_dir(Some(dir));
+        true
+    } else {
+        false
+    }
 }
 
 /// Get a short label for a config dir (last path component).

@@ -435,22 +435,25 @@ impl TicketProvider for GitHubTicketProvider {
                 "https://api.github.com/repos/{}/{}/issues/{}/labels",
                 owner, repo, ticket_id
             );
-            let resp = self
+            let req = self
                 .client
                 .post(&url)
                 .headers(headers.clone())
-                .json(&serde_json::json!({ "labels": add_labels }))
-                .send()
-                .await
-                .map_err(|e| format!("GitHub labels API request failed: {}", e))?;
-            if !resp.status().is_success() {
-                tracing::warn!(
-                    "GitHub: failed to add labels {:?} to issue {}: {} {}",
-                    add_labels,
-                    ticket_id,
-                    resp.status(),
-                    resp.text().await.unwrap_or_default()
-                );
+                .json(&serde_json::json!({ "labels": add_labels }));
+            match self.send_with_rate_limit(req).await {
+                Ok(resp) if !resp.status().is_success() => {
+                    tracing::warn!(
+                        "GitHub: failed to add labels {:?} to issue {}: {} {}",
+                        add_labels,
+                        ticket_id,
+                        resp.status(),
+                        resp.text().await.unwrap_or_default()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("GitHub: labels API error for issue {}: {}", ticket_id, e);
+                }
+                _ => {}
             }
         }
 
@@ -459,22 +462,28 @@ impl TicketProvider for GitHubTicketProvider {
                 "https://api.github.com/repos/{}/{}/issues/{}/labels/{}",
                 owner, repo, ticket_id, label
             );
-            let resp = self
-                .client
-                .delete(&url)
-                .headers(headers.clone())
-                .send()
-                .await
-                .map_err(|e| format!("GitHub labels API request failed: {}", e))?;
-            // 404 is expected when the label isn't present — ignore it.
-            if !resp.status().is_success() && resp.status().as_u16() != 404 {
-                tracing::warn!(
-                    "GitHub: failed to remove label '{}' from issue {}: {} {}",
-                    label,
-                    ticket_id,
-                    resp.status(),
-                    resp.text().await.unwrap_or_default()
-                );
+            let req = self.client.delete(&url).headers(headers.clone());
+            match self.send_with_rate_limit(req).await {
+                Ok(resp)
+                    if !resp.status().is_success() && resp.status().as_u16() != 404 =>
+                {
+                    tracing::warn!(
+                        "GitHub: failed to remove label '{}' from issue {}: {} {}",
+                        label,
+                        ticket_id,
+                        resp.status(),
+                        resp.text().await.unwrap_or_default()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "GitHub: labels API error for issue {} label '{}': {}",
+                        ticket_id,
+                        label,
+                        e,
+                    );
+                }
+                _ => {}
             }
         }
 

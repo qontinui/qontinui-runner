@@ -214,6 +214,15 @@ export function useSpecSync(
   specsRef.current = specs;
   const aiRef = useRef(ai);
   aiRef.current = ai;
+  const onSpecUpdatedRef = useRef(onSpecUpdated);
+  onSpecUpdatedRef.current = onSpecUpdated;
+
+  // Track specs updated during the current sync batch (may not yet be in specsRef)
+  const updatedSpecsRef = useRef<Map<string, SpecConfig>>(new Map());
+
+  // Refs for processNextSpec/finishSync to avoid stale closures
+  const processNextSpecRef = useRef<() => Promise<void>>(async () => {});
+  const finishSyncRef = useRef<() => void>(() => {});
 
   // Watch for AI session state transitions: processing → ready means a turn finished
   useEffect(() => {
@@ -236,8 +245,9 @@ export function useSpecSync(
           ...currentSpec.spec,
           config: parsed,
         } as LoadedSpec;
-        onSpecUpdated(updatedSpec);
+        onSpecUpdatedRef.current(updatedSpec);
         resultsRef.current.updated.push(currentSpec.spec.specId);
+        updatedSpecsRef.current.set(currentSpec.spec.specId, parsed);
       } catch {
         resultsRef.current.failed.push(currentSpec.spec.specId);
         warningsRef.current.push(`Failed to parse JSON for ${currentSpec.spec.specId}`);
@@ -260,9 +270,8 @@ export function useSpecSync(
     }));
 
     // Process next spec or finish
-    processNextSpec();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ai.sessionState, ai.messages.length]);
+    processNextSpecRef.current();
+  }, [ai.sessionState, ai.messages.length, state.phase]);
 
   const processNextSpec = useCallback(async () => {
     const controller = abortRef.current;
@@ -271,7 +280,7 @@ export function useSpecSync(
     const next = syncQueueRef.current.shift();
     if (!next) {
       // All specs processed — move to compile phase
-      finishSync();
+      finishSyncRef.current();
       return;
     }
 
@@ -320,11 +329,11 @@ export function useSpecSync(
       ].join("\n");
     }
 
-    await ai.sendMessage(
+    await aiRef.current.sendMessage(
       `Update spec "${specId}" with state machine generation.\n\n${prompt}`,
     );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  processNextSpecRef.current = processNextSpec;
 
   const finishSync = useCallback(() => {
     // Compile phase
@@ -334,8 +343,13 @@ export function useSpecSync(
       progress: { ...prev.progress, currentSpec: "Compiling state machine..." },
     }));
 
-    // Use ref to get the latest specs (including AI-updated ones)
-    const allSpecs = specsRef.current.map((s) => s.config as SpecConfig);
+    // Merge specs from prop with any that were updated during this sync batch.
+    // React state may not have flushed yet, so updatedSpecsRef ensures we compile
+    // with the freshest versions.
+    const allSpecs = specsRef.current.map((s) => {
+      const updated = updatedSpecsRef.current.get(s.specId);
+      return updated ?? (s.config as SpecConfig);
+    });
     try {
       const { stateMachine, stats } = compileStateMachineFromSpecs(allSpecs);
 
@@ -372,7 +386,9 @@ export function useSpecSync(
 
     // Close AI session via ref to avoid stale closure
     aiRef.current.close();
+    updatedSpecsRef.current.clear();
   }, []);
+  finishSyncRef.current = finishSync;
 
   const startSync = useCallback(async () => {
     // Guard against double-start
@@ -406,12 +422,12 @@ export function useSpecSync(
     if (toSync.length === 0) {
       // Nothing to sync — go straight to compile
       setState((prev) => ({ ...prev, phase: "compiling" }));
-      finishSync();
+      finishSyncRef.current();
       return;
     }
 
     // Create AI session for sync
-    const sessionId = await ai.createSession("Spec Sync");
+    const sessionId = await aiRef.current.createSession("Spec Sync");
     if (!sessionId || controller.signal.aborted) {
       setState((prev) => ({
         ...prev,
@@ -425,8 +441,7 @@ export function useSpecSync(
     syncQueueRef.current = [...toSync];
     setState((prev) => ({ ...prev, phase: "syncing" }));
 
-    processNextSpec();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    processNextSpecRef.current();
   }, [specs]);
 
   const cancel = useCallback(() => {

@@ -1,15 +1,18 @@
-#![allow(dead_code)]
-
 use super::circuit_breaker;
 use super::types::AiResponse;
 use std::time::Duration;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
-/// Maximum number of retry attempts for AI API calls.
+/// Maximum number of retry attempts for AI API calls (non-rate-limit errors).
 pub(super) const MAX_AI_RETRIES: u32 = 3;
 
 /// Base backoff delay in milliseconds (doubles each retry: 2s, 4s, 8s).
 pub(super) const BASE_BACKOFF_MS: u64 = 2000;
+
+/// Maximum number of rate-limit wait cycles before giving up entirely.
+/// Each cycle waits for the earliest account cooldown to expire, so this
+/// caps total wait time at roughly MAX_RATE_LIMIT_WAITS * cooldown_duration.
+const MAX_RATE_LIMIT_WAITS: u32 = 6;
 
 /// Check if an error is specifically a rate-limit / token-exhaustion error.
 ///
@@ -155,7 +158,10 @@ where
         }
     }
 
-    for attempt in 0..=MAX_AI_RETRIES {
+    let mut attempt: u32 = 0;
+    let mut rate_limit_waits: u32 = 0;
+
+    loop {
         let response = operation();
 
         if response.success {
@@ -169,8 +175,6 @@ where
         let error_msg = response.error.as_deref().unwrap_or("");
 
         if !is_retryable_error(error_msg) {
-            // Permanent error — don't count against circuit breaker
-            // (config errors, auth errors are not provider health issues)
             if attempt > 0 {
                 debug!(
                     "{} permanent error after {} retries, not retrying: {}",
@@ -185,26 +189,81 @@ where
             circuit_breaker::record_provider_failure(key, error_msg);
         }
 
-        if attempt == MAX_AI_RETRIES {
-            // Final attempt failed — log and return
+        let is_rate_limit = is_rate_limit_error(error_msg);
+
+        // For rate-limit errors: try rotating to another account
+        if is_rate_limit {
+            if super::config::rotate_account_on_rate_limit() {
+                let new_account = super::config::get_resolved_config_dir()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let label = std::path::Path::new(&new_account)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&new_account);
+                info!(
+                    "{}: rate-limit detected, switched to account '{}' for retry",
+                    operation_name, label
+                );
+                // Reset attempt counter — new account gets fresh retries
+                attempt = 0;
+                // Brief pause before hitting the new account
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+
+            // Rotation failed — all accounts are rate-limited.
+            // Wait for the earliest cooldown to expire and try again.
+            if rate_limit_waits < MAX_RATE_LIMIT_WAITS {
+                if let Some(wait_duration) = super::config::time_until_next_account_available() {
+                    rate_limit_waits += 1;
+                    let wait_secs = wait_duration.as_secs();
+
+                    // Calculate which account will be used and when
+                    let resume_time = chrono::Local::now()
+                        + chrono::Duration::seconds(wait_secs as i64);
+                    let resume_str = resume_time.format("%H:%M:%S").to_string();
+
+                    warn!(
+                        "{}: all accounts rate-limited (wait {}/{}). \
+                         Waiting {}s — will retry at {} with next available account.",
+                        operation_name,
+                        rate_limit_waits,
+                        MAX_RATE_LIMIT_WAITS,
+                        wait_secs,
+                        resume_str,
+                    );
+
+                    std::thread::sleep(wait_duration);
+
+                    // Unlock the account whose cooldown just expired
+                    super::config::force_unlock_earliest_account();
+
+                    let new_account = super::config::get_resolved_config_dir()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let label = std::path::Path::new(&new_account)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&new_account);
+                    info!(
+                        "{}: cooldown expired, resuming with account '{}'",
+                        operation_name, label
+                    );
+
+                    attempt = 0;
+                    continue;
+                }
+            }
+        }
+
+        // Non-rate-limit retryable errors: standard exponential backoff
+        if attempt >= MAX_AI_RETRIES {
             error!(
-                "{} failed after {} retries: {}",
-                operation_name, MAX_AI_RETRIES, error_msg
+                "{} failed after {} retries and {} rate-limit waits: {}",
+                operation_name, attempt, rate_limit_waits, error_msg
             );
             return response;
         }
 
-        // If this is a rate-limit error, try rotating to another account before retrying
-        if is_rate_limit_error(error_msg) {
-            if super::config::rotate_account_on_rate_limit() {
-                warn!(
-                    "{}: rate-limit detected, rotated to next account for retry",
-                    operation_name
-                );
-            }
-        }
-
-        // Calculate backoff: BASE_BACKOFF_MS * 2^attempt (2s, 4s, 8s for base=2000)
         let backoff_ms = BASE_BACKOFF_MS * 2u64.pow(attempt);
         let backoff_secs = backoff_ms as f64 / 1000.0;
 
@@ -217,13 +276,8 @@ where
         );
 
         std::thread::sleep(Duration::from_millis(backoff_ms));
+        attempt += 1;
     }
-
-    // Unreachable, but satisfy the compiler
-    AiResponse::error(format!(
-        "{} failed after exhausting retries",
-        operation_name
-    ))
 }
 
 /// Try the primary operation first; if it fails with a retryable error and a fallback

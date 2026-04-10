@@ -11,6 +11,10 @@ const LINEAR_API_URL: &str = "https://api.linear.app/graphql";
 
 pub struct LinearTicketProvider {
     client: reqwest::Client,
+    /// Cache: team key → team ID (static per Linear workspace, safe to cache for provider lifetime)
+    team_id_cache: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Cache: (team_id, state_type) → workflow state ID
+    workflow_state_cache: std::sync::Mutex<std::collections::HashMap<(String, String), String>>,
 }
 
 impl LinearTicketProvider {
@@ -19,7 +23,11 @@ impl LinearTicketProvider {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            team_id_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            workflow_state_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     fn headers(&self, token: &str) -> HeaderMap {
@@ -74,11 +82,17 @@ impl LinearTicketProvider {
     }
 
     /// Resolve the internal team ID from the team key (e.g., "ENG").
+    /// Results are cached for the lifetime of this provider instance.
     async fn resolve_team_id(
         &self,
         token: &str,
         team_key: &str,
     ) -> Result<String, String> {
+        // Check cache first
+        if let Some(cached) = self.team_id_cache.lock().unwrap().get(team_key) {
+            return Ok(cached.clone());
+        }
+
         let query = r#"
             query($key: String!) {
                 teams(filter: { key: { eq: $key } }) {
@@ -95,19 +109,28 @@ impl LinearTicketProvider {
             .and_then(|a| a.first())
             .ok_or_else(|| format!("Linear team '{}' not found", team_key))?;
 
-        team["id"]
+        let id = team["id"]
             .as_str()
             .map(|s| s.to_string())
-            .ok_or_else(|| "Team ID missing from response".to_string())
+            .ok_or_else(|| "Team ID missing from response".to_string())?;
+
+        self.team_id_cache.lock().unwrap().insert(team_key.to_string(), id.clone());
+        Ok(id)
     }
 
     /// Fetch workflow states for a team and find the state ID matching a given type.
+    /// Results are cached for the lifetime of this provider instance.
     async fn find_workflow_state_id(
         &self,
         token: &str,
         team_id: &str,
         state_type: &str,
     ) -> Result<String, String> {
+        let cache_key = (team_id.to_string(), state_type.to_string());
+        if let Some(cached) = self.workflow_state_cache.lock().unwrap().get(&cache_key) {
+            return Ok(cached.clone());
+        }
+
         let query = r#"
             query($teamId: String!) {
                 workflowStates(filter: { team: { id: { eq: $teamId } } }) {
@@ -122,18 +145,21 @@ impl LinearTicketProvider {
             .as_array()
             .ok_or("Expected workflow states array")?;
 
+        // Cache all states from this response (avoids re-fetching for different state types)
         for state in states {
-            if state["type"].as_str() == Some(state_type) {
-                if let Some(id) = state["id"].as_str() {
-                    return Ok(id.to_string());
-                }
+            if let (Some(sid), Some(stype)) = (state["id"].as_str(), state["type"].as_str()) {
+                self.workflow_state_cache.lock().unwrap()
+                    .insert((team_id.to_string(), stype.to_string()), sid.to_string());
             }
         }
 
-        Err(format!(
-            "No workflow state with type '{}' found for team {}",
-            state_type, team_id
-        ))
+        self.workflow_state_cache.lock().unwrap()
+            .get(&cache_key)
+            .cloned()
+            .ok_or_else(|| format!(
+                "No workflow state with type '{}' found for team {}",
+                state_type, team_id
+            ))
     }
 
     /// Map a TicketState to a Linear workflow state type string.
@@ -173,13 +199,17 @@ impl TicketProvider for LinearTicketProvider {
             .await?;
 
         // Build label filter: if actionable_labels is non-empty, filter by them.
+        // Sanitize label names to prevent GraphQL injection (escape backslashes and quotes).
         let label_filter = if config.actionable_labels.is_empty() {
             String::new()
         } else {
             let labels_json: Vec<String> = config
                 .actionable_labels
                 .iter()
-                .map(|l| format!("\"{}\"", l))
+                .map(|l| {
+                    let escaped = l.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("\"{}\"", escaped)
+                })
                 .collect();
             format!(", labels: {{ name: {{ in: [{}] }} }}", labels_json.join(", "))
         };
