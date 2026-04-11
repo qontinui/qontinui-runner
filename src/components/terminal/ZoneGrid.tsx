@@ -1,9 +1,12 @@
-import { useCallback, useReducer, useRef, useEffect } from "react";
+import { useCallback, useReducer, useRef, useEffect, type RefObject } from "react";
+import type { TerminalTab } from "./useTerminalManager";
+import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
 import { Terminal, Filter, RefreshCw } from "lucide-react";
 import {
   TerminalInstance,
+  type TerminalInstanceHandle,
   type ShellIntegrationEvent,
 } from "./TerminalInstance";
 import { PlanViewer } from "./PlanViewer";
@@ -112,7 +115,8 @@ export function ZoneGrid({
   onExportZone,
 }: ZoneGridProps) {
   // Read all data from contexts
-  const { tabs, zoneLayout, terminalRefs, pageId, markReconnected } = useTerminalCore();
+  const { tabs, zoneLayout, terminalRefs: terminalRefsRef, pageId, markReconnected } = useTerminalCore();
+  const terminalRefs = terminalRefsRef.current;
   const layout = zoneLayout.layout;
   const assignments = zoneLayout.assignments;
   const focusedZone = zoneLayout.focusedZone;

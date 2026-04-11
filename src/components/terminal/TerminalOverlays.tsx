@@ -16,7 +16,8 @@ interface TerminalOverlaysProps {
   onExport?: () => void;
 }
 
-export function TerminalOverlays({ onSortZones, onExport }: TerminalOverlaysProps) {
+const noop = () => {};
+export function TerminalOverlays({ onSortZones = noop, onExport = noop }: TerminalOverlaysProps) {
   const { tabs, zoneLayout, terminalRefs } = useTerminalCore();
   const { sessionStates, lastOutputLines, snapshots } = useSessionState();
   const { labelsAndTags, incrementMetric, addHistoryEvent } = useZoneMetadata();
