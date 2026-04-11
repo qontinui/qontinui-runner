@@ -179,7 +179,7 @@ function convertElementCriteria(criteria: Record<string, unknown>): ElementQuery
 /** Convert a spec transition action to an engine TransitionAction. */
 function convertAction(specAction: SpecTransitionAction): EngineTransitionAction {
   return {
-    target: convertElementCriteria(specAction.target),
+    target: specAction.target ? convertElementCriteria(specAction.target) : {},
     action: specAction.action,
     params: specAction.params,
     waitAfter: specAction.waitAfter as EngineTransitionAction["waitAfter"],
