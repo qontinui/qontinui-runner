@@ -32,6 +32,9 @@ import {
 // its own isolated globalRegistry variable, causing elements to be invisible to the engine.
 import { getGlobalRegistry } from "ui-bridge";
 import { getUIBridgeGlobal } from "./ui-bridge-events/utils";
+import { getAllSpecs } from "@/lib/spec-registry";
+import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
+import type { SpecConfig } from "@/lib/spec-prompt-builder";
 
 const SM_SELECTED_CONFIG_KEY = "qontinui-runner-sm-selected-config";
 
@@ -283,6 +286,23 @@ function buildEngineAdapter(
             strategy: "sidebar-shortcut",
           };
         }
+
+        // Fallback: sidebar transition not compiled — click the nav item directly
+        // by searching for a [data-nav-item="<slug>"] element in the DOM.
+        if (domExecutor) {
+          const navElement = domExecutor.findElement({ attributes: { "data-nav-item": slug } });
+          if (navElement) {
+            await domExecutor.executeAction(navElement.id, "click");
+            await new Promise((r) => setTimeout(r, 2000));
+            return {
+              navigatedTo: targetStateId,
+              path: [],
+              totalCost: 1,
+              activeStates: Array.from(engine.getActiveStates()),
+              strategy: "sidebar-direct-click",
+            };
+          }
+        }
       }
 
       if (!resolved) throw new Error(`State not found: ${targetStateId}`);
@@ -386,7 +406,7 @@ export function useStateMachineRegistration(): void {
     }
   }, []);
 
-  // Load on mount from persisted selection
+  // Load on mount from persisted selection, or auto-compile from bundled specs
   useEffect(() => {
     let configId: string | null = null;
     try {
@@ -396,6 +416,23 @@ export function useStateMachineRegistration(): void {
     }
     if (configId) {
       loadAndRegister(configId);
+    } else {
+      // No persisted config — auto-compile from bundled specs so the engine
+      // is always available (enables prompt-home navigation, loadStateMachine, etc.)
+      try {
+        const allSpecs = getAllSpecs().map((s) => s.config as SpecConfig);
+        const { stateMachine, stats } = compileStateMachineFromSpecs(allSpecs);
+        const states = (stateMachine.states ?? []) as StateDefinition[];
+        const transitions = (stateMachine.transitions ?? []) as TransitionDefinition[];
+        if (states.length > 0) {
+          engineRef.current = createAndRegisterEngine(states, transitions, engineRef.current);
+          console.info(
+            `[StateMachine] Auto-compiled from bundled specs: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions`,
+          );
+        }
+      } catch (e) {
+        console.warn("[StateMachine] Auto-compile from specs failed:", e);
+      }
     }
   }, [loadAndRegister]);
 

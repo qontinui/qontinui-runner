@@ -835,7 +835,7 @@
           { "dataAttributes": { "tutorial-id": "duel_pools-tab" } },
           { "role": "heading", "textContains": "Duel Pools" }
         ],
-        "isInitial": false,
+        "isInitial": true,
         "transitions": [
           {
             "id": "duel-to-beam",
