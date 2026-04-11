@@ -276,6 +276,12 @@ pub enum VerificationStatus {
     Fail,
     /// The goal appears unreachable from the current state.
     Unreachable,
+    /// The verifier determined the worker's action did not interact with
+    /// the intended target — a no-op. Distinct from Fail: the action
+    /// "happened" but was semantically wrong (wrong target, wrong state
+    /// transition). Consumers should retry with a different candidate,
+    /// not advance to unreachable.
+    Refused,
 }
 
 impl std::fmt::Display for VerificationStatus {
@@ -285,6 +291,7 @@ impl std::fmt::Display for VerificationStatus {
             Self::Partial => write!(f, "partial"),
             Self::Fail => write!(f, "fail"),
             Self::Unreachable => write!(f, "unreachable"),
+            Self::Refused => write!(f, "refused"),
         }
     }
 }
@@ -320,6 +327,16 @@ pub struct AgenticVerificationIterationResult {
     pub verifier_duration_ms: u64,
     /// Duration of the worker agent call in ms (0 if worker didn't run).
     pub worker_duration_ms: u64,
+    /// Downsampled pre-action screenshot (base64 PNG, ≤320px wide).
+    /// Populated only when the WSM ran for this iteration AND the
+    /// `show_screenshot_evidence` WSV setting is on. Used by the
+    /// canvas panel renderer to embed visual evidence alongside the verdict.
+    #[serde(default)]
+    pub pre_screenshot_thumb_b64: Option<String>,
+    /// Downsampled post-action screenshot (base64 PNG, ≤320px wide).
+    /// Same population rules as `pre_screenshot_thumb_b64`.
+    #[serde(default)]
+    pub post_screenshot_thumb_b64: Option<String>,
 }
 
 /// Final result of the agentic verification loop.
@@ -375,7 +392,12 @@ impl AgenticVerificationResult {
                     failure_context: ir.verdict.observations.clone(),
                     agentic_phase_ran: ir.worker_ran,
                     agentic_phase_success: if ir.worker_ran {
-                        Some(ir.verdict.status != VerificationStatus::Fail)
+                        // Refused is a semantic failure of the worker action too —
+                        // the action didn't interact with the intended target.
+                        Some(
+                            ir.verdict.status != VerificationStatus::Fail
+                                && ir.verdict.status != VerificationStatus::Refused,
+                        )
                     } else {
                         None
                     },
@@ -638,6 +660,10 @@ pub fn heuristic_verdict(output: &str) -> VerificationVerdict {
         VerificationStatus::Unreachable => 0.5,
         VerificationStatus::Partial => 0.5,
         VerificationStatus::Fail => 0.5,
+        // The text verifier never emits Refused — that's a WSM-only
+        // verdict. If the heuristic ever sees one through an unexpected
+        // code path, treat it like Fail for confidence purposes.
+        VerificationStatus::Refused => 0.5,
     };
 
     VerificationVerdict {

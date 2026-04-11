@@ -4,6 +4,7 @@
 //! providing a live execution dashboard in the Canvas widget.
 
 mod builders;
+pub mod screenshot_embed;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -628,6 +629,9 @@ impl CanvasPanelManager {
     /// Called after each iteration of the agentic verification loop.
     ///
     /// Emits an iteration digest panel (Markdown) and updates the Mission Brief progress.
+    /// When both `pre_thumb_b64` and `post_thumb_b64` are provided (WSM ran for this
+    /// iteration + show_screenshot_evidence setting is on), a Visual Evidence section
+    /// with side-by-side thumbnails is appended to the Markdown body.
     pub async fn on_agentic_verification_iteration(
         &mut self,
         iteration: u32,
@@ -635,6 +639,8 @@ impl CanvasPanelManager {
         worker_summary: Option<&str>,
         verifier_duration_ms: u64,
         worker_duration_ms: u64,
+        pre_thumb_b64: Option<&str>,
+        post_thumb_b64: Option<&str>,
     ) {
         // Build status emoji/indicator
         let status_indicator = match verdict.status {
@@ -644,6 +650,7 @@ impl CanvasPanelManager {
             crate::agentic_verification::VerificationStatus::Unreachable => {
                 "UNREACHABLE"
             }
+            crate::agentic_verification::VerificationStatus::Refused => "REFUSED",
         };
 
         // Build iteration digest as Markdown
@@ -676,6 +683,21 @@ impl CanvasPanelManager {
 
         if let Some(summary) = worker_summary {
             md.push_str(&format!("\n**Worker:** {}\n", truncate_str(summary, 300),));
+        }
+
+        // Visual Evidence section: side-by-side pre/post thumbnails from
+        // the WSM call. Only emitted when both thumbs are present (the
+        // WSM ran for this iteration AND show_screenshot_evidence is on).
+        if let (Some(pre), Some(post)) = (pre_thumb_b64, post_thumb_b64) {
+            if !pre.is_empty() && !post.is_empty() {
+                md.push_str(
+                    "\n\n### Visual Evidence\n\n| **Before worker action** | **After worker action** |\n| --- | --- |\n",
+                );
+                md.push_str(&format!(
+                    "| ![pre](data:image/png;base64,{}) | ![post](data:image/png;base64,{}) |\n",
+                    pre, post,
+                ));
+            }
         }
 
         md.push_str(&format!(

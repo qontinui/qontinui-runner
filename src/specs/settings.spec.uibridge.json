@@ -712,6 +712,20 @@
             ]
           },
           {
+            "id": "account-to-world-state-verifier",
+            "name": "Switch to World State Verifier tab",
+            "activateStates": ["world-state-verifier"],
+            "deactivateStates": ["account"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "World State Verifier" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
             "id": "account-to-playwright",
             "name": "Switch to Playwright tab",
             "activateStates": ["playwright"],
@@ -1000,6 +1014,127 @@
               {
                 "action": "click",
                 "target": { "accessibleName": "General" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "self-healing-to-world-state-verifier",
+            "name": "Switch to World State Verifier tab",
+            "activateStates": ["world-state-verifier"],
+            "deactivateStates": ["self-healing"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "World State Verifier" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "world-state-verifier",
+        "name": "World State Verifier",
+        "description": "Configure the VLM-based World State Verifier (CUA-WSM / SEAgent judge) for runtime agentic action verification. Exposes mode (disabled/enabled/shadow), endpoint, model, screenshot-evidence toggle, and a shadow-mode calibration view listing recent WSM vs text verifier disagreements.",
+        "elements": [{ "textContent": "World State Verifier" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "world-state-verifier-to-account",
+            "name": "Switch to Account tab",
+            "activateStates": ["account"],
+            "deactivateStates": ["world-state-verifier"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Account" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "world-state-verifier-to-self-healing",
+            "name": "Switch to Self-Healing tab",
+            "activateStates": ["self-healing"],
+            "deactivateStates": ["world-state-verifier"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Self-Healing" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "world-state-verifier-to-playwright",
+            "name": "Switch to Playwright tab",
+            "activateStates": ["playwright"],
+            "deactivateStates": ["world-state-verifier"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Playwright" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "world-state-verifier-save",
+            "name": "Save WSV settings",
+            "activateStates": ["world-state-verifier"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataContentLabel": "save wsv settings" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "world-state-verifier-test-connection",
+            "name": "Test WSV endpoint connection",
+            "activateStates": ["world-state-verifier"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataContentLabel": "test wsv connection" },
+                "waitAfter": { "type": "idle", "timeout": 6000 }
+              }
+            ]
+          },
+          {
+            "id": "world-state-verifier-reset-defaults",
+            "name": "Reset WSV settings to defaults",
+            "activateStates": ["world-state-verifier"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataContentLabel": "reset wsv defaults" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "world-state-verifier-refresh-calibration",
+            "name": "Refresh shadow-mode calibration disagreements",
+            "activateStates": ["world-state-verifier"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataContentLabel": "refresh wsv calibration" },
                 "waitAfter": { "type": "idle", "timeout": 2000 }
               }
             ]

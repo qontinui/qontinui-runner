@@ -242,10 +242,68 @@ function MarkdownDiv({ className, ...props }: Record<string, unknown>) {
   );
 }
 
+/**
+ * Renderer for embedded images. Caps width so runner-emitted data-URI
+ * thumbnails (e.g. World State Verifier visual-evidence embeds) don't
+ * blow out iteration panel layouts. Falls back to `max-w-full` for any
+ * linked image.
+ */
+function MarkdownImg({
+  src,
+  alt,
+  ...rest
+}: React.ImgHTMLAttributes<HTMLImageElement>) {
+  return (
+    // eslint-disable-next-line @next/next/no-img-element, jsx-a11y/alt-text
+    <img
+      src={src}
+      alt={alt ?? ""}
+      loading="lazy"
+      className="max-w-[240px] rounded border border-border/50 my-1"
+      {...rest}
+    />
+  );
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const MARKDOWN_COMPONENTS: Record<string, React.ComponentType<any>> = {
   ...SHARED_MARKDOWN_COMPONENTS,
   div: MarkdownDiv,
+  img: MarkdownImg,
+};
+
+/**
+ * URL transform that allows `data:image/*` URIs through while still
+ * blocking dangerous schemes like `javascript:` and `vbscript:`.
+ *
+ * react-markdown's default `defaultUrlTransform` drops `data:` URIs
+ * entirely for security, which would break runner-emitted base64
+ * thumbnails (visual-evidence embeds from the WSM verifier). But we
+ * can't just use an identity transform — MarkdownViewer is a shared
+ * component used to render LLM output (AiMessageDisplay, SpecChatPanel,
+ * HookGenerationPanel, AiDataViewerTab). A malicious prompt could coax
+ * the model into emitting `[click](javascript:...)` which the identity
+ * transform would let through.
+ *
+ * This transform whitelists:
+ * - `data:image/*` (runner-emitted thumbnails)
+ * - http/https/mailto/tel (standard link schemes)
+ * - relative URLs (no scheme)
+ *
+ * Everything else — javascript:, vbscript:, file:, data:text/html, etc. —
+ * is dropped to an empty string, matching the intent of react-markdown's
+ * default safety behavior for hostile schemes.
+ */
+const SAFE_URL_TRANSFORM = (url: string): string => {
+  // Runner-emitted visual-evidence thumbnails.
+  if (url.startsWith("data:image/")) return url;
+  // Relative URLs (no `scheme:` prefix) are always safe.
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) return url;
+  // Whitelisted schemes. Case-insensitive match at start.
+  if (/^(https?:|mailto:|tel:)/i.test(url)) return url;
+  // Everything else (javascript:, vbscript:, data:text/html, file:, ...)
+  // is dropped.
+  return "";
 };
 
 export function MarkdownViewer({ content, className, isAnimated = false }: MarkdownViewerProps) {
@@ -279,6 +337,7 @@ export function MarkdownViewer({ content, className, isAnimated = false }: Markd
         remarkPlugins={REMARK_PLUGINS}
         rehypePlugins={REHYPE_PLUGINS}
         components={MARKDOWN_COMPONENTS}
+        urlTransform={SAFE_URL_TRANSFORM}
       >
         {processedContent}
       </ReactMarkdown>

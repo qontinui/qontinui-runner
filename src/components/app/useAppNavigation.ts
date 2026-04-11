@@ -62,6 +62,7 @@ const PAGE_TO_TAB: Record<string, MainTabId> = {
   settings: "settings",
   "settings-ai": "settings-ai",
   "settings-agentic": "settings-agentic",
+  "settings-world-state-verifier": "settings-world-state-verifier",
   "settings-general": "settings-general",
   "config-findings": "config-findings",
   "config-hooks": "config-hooks",

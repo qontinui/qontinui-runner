@@ -907,6 +907,83 @@ pub struct Settings {
     /// Restate durable execution settings (journal replay, exactly-once, saga compensation)
     #[serde(default)]
     pub restate: crate::restate::config::RestateSettings,
+    /// World State Verifier (CUA-WSM / SEAgent judge) configuration.
+    /// Controls whether the runtime agentic loop consults a VLM judge
+    /// to compare pre/post screenshots against declared intent.
+    #[serde(default)]
+    pub world_state_verifier: WorldStateVerifierSettings,
+}
+
+// ============================================================================
+// World State Verifier Settings
+// ============================================================================
+
+/// Tri-state mode for the World State Verifier.
+///
+/// - `Disabled`: WSM never runs; the text verifier agent is the sole path.
+/// - `Enabled`: WSM runs first; its verdict wins when successful, falling
+///   back to the text verifier on error.
+/// - `Shadow`: Both run; text verifier decides, WSM disagreements are logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WsvMode {
+    Disabled,
+    Enabled,
+    Shadow,
+}
+
+impl Default for WsvMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+/// World State Verifier settings persisted to the settings file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldStateVerifierSettings {
+    /// Tri-state mode selector.
+    #[serde(default)]
+    pub mode: WsvMode,
+    /// llama-swap (or compatible) endpoint base URL.
+    #[serde(default = "default_wsv_endpoint")]
+    pub endpoint: String,
+    /// Model alias or HuggingFace id to request.
+    #[serde(default = "default_wsv_model")]
+    pub model: String,
+    /// When true, append downsampled pre/post thumbnails to agentic
+    /// iteration canvas panels. Phase 3 of the WSV UI rollout.
+    #[serde(default = "default_wsv_show_screenshot_evidence")]
+    pub show_screenshot_evidence: bool,
+    /// True once the user has saved these settings at least once via
+    /// the Settings UI. Used at startup to distinguish "never
+    /// configured" from "explicitly saved as Disabled" so the env var
+    /// is honored only when the user hasn't expressed an opinion yet.
+    #[serde(default)]
+    pub ever_saved: bool,
+}
+
+fn default_wsv_endpoint() -> String {
+    "http://127.0.0.1:8100".to_string()
+}
+
+fn default_wsv_model() -> String {
+    "cua-wsm".to_string()
+}
+
+fn default_wsv_show_screenshot_evidence() -> bool {
+    true
+}
+
+impl Default for WorldStateVerifierSettings {
+    fn default() -> Self {
+        Self {
+            mode: WsvMode::default(),
+            endpoint: default_wsv_endpoint(),
+            model: default_wsv_model(),
+            show_screenshot_evidence: true,
+            ever_saved: false,
+        }
+    }
 }
 
 // ============================================================================
@@ -1167,6 +1244,18 @@ pub fn get_ai_settings() -> AiSettings {
 /// Save AI settings
 pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
     crate::config_facade::save_setting(ai_settings)
+}
+
+/// Get the World State Verifier settings.
+pub fn get_world_state_verifier_settings() -> WorldStateVerifierSettings {
+    crate::config_facade::get_setting::<WorldStateVerifierSettings>()
+}
+
+/// Save World State Verifier settings.
+pub fn save_world_state_verifier_settings(
+    wsv: WorldStateVerifierSettings,
+) -> Result<(), String> {
+    crate::config_facade::save_setting(wsv)
 }
 
 /// Get the interactive sessions enabled setting

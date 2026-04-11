@@ -3019,6 +3019,27 @@ CREATE TABLE IF NOT EXISTS entailment_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_entailment_cache_cached_at ON entailment_cache(cached_at);
 
+-- World State Verifier shadow-mode disagreements.
+-- Populated when the agentic loop runs with QONTINUI_WORLD_STATE_VERIFIER=shadow
+-- (or the equivalent persisted setting) and the WSM/text verifier verdicts differ.
+-- Consumed by the Settings → World State Verifier calibration view.
+CREATE TABLE IF NOT EXISTS wsv_shadow_disagreements (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    text_status TEXT NOT NULL,
+    wsm_status TEXT NOT NULL,
+    text_confidence DOUBLE PRECISION NOT NULL,
+    wsm_confidence DOUBLE PRECISION NOT NULL,
+    intent TEXT NOT NULL,
+    wsm_observations TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_wsv_disagreements_task_run
+    ON wsv_shadow_disagreements(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_wsv_disagreements_created_at
+    ON wsv_shadow_disagreements(created_at DESC);
+
 -- PRM Training Exports
 CREATE TABLE IF NOT EXISTS prm_training_exports (
     id TEXT PRIMARY KEY,

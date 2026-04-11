@@ -908,6 +908,7 @@ export function TabContent({
     case "settings-ai":
     case "settings-agentic":
     case "settings-self-healing":
+    case "settings-world-state-verifier":
     case "settings-playwright":
     case "settings-mobile":
     case "settings-cloud-relay":
@@ -927,6 +928,7 @@ export function TabContent({
         "settings-ai": "ai",
         "settings-agentic": "agentic",
         "settings-self-healing": "self-healing",
+        "settings-world-state-verifier": "world-state-verifier",
         "settings-playwright": "playwright",
         "settings-mobile": "mobile",
         "settings-cloud-relay": "cloud-relay",

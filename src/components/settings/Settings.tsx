@@ -18,6 +18,7 @@ import { AgenticSettings } from "./AgenticSettings";
 import { BackupSettings } from "./BackupSettings";
 import { PlaywrightSettings } from "./PlaywrightSettings";
 import { SelfHealingSettings } from "./SelfHealingSettings";
+import { WorldStateVerifierSettings } from "./WorldStateVerifierSettings";
 import { MobileSettings } from "./MobileSettings";
 import { CloudRelaySettings } from "./CloudRelaySettings";
 import { LogSourcesSettings } from "./LogSourcesSettings";
@@ -56,6 +57,7 @@ type SettingsTab =
   | "ai"
   | "agentic"
   | "self-healing"
+  | "world-state-verifier"
   | "playwright"
   | "mobile"
   | "cloud-relay"
@@ -80,6 +82,7 @@ const VALID_TABS = [
   "ai",
   "agentic",
   "self-healing",
+  "world-state-verifier",
   "playwright",
   "mobile",
   "cloud-relay",
@@ -187,6 +190,8 @@ export function Settings({
         return <AgenticSettings onLog={onLog} />;
       case "self-healing":
         return <SelfHealingSettings onLog={onLog} />;
+      case "world-state-verifier":
+        return <WorldStateVerifierSettings onLog={onLog} />;
       case "playwright":
         return <PlaywrightSettings onLog={onLog} />;
       case "mobile":

@@ -218,3 +218,42 @@ export interface SelfHealingSettings {
   /** API provider (used when llm_mode is RemoteApi) */
   api_provider: SelfHealingApiProvider;
 }
+
+// World State Verifier Settings Types
+
+/** Tri-state mode selector for the VLM-based World State Verifier. */
+export type WsvMode = "disabled" | "enabled" | "shadow";
+
+/** Settings for the VLM-based World State Verifier (CUA-WSM / SEAgent judge). */
+export interface WorldStateVerifierSettings {
+  /** Tri-state mode: disabled, enabled (WSM wins), or shadow (log disagreements only). */
+  mode: WsvMode;
+  /** llama-swap (or compatible) endpoint base URL. */
+  endpoint: string;
+  /** Model alias or HuggingFace id to request. */
+  model: string;
+  /** When true, append pre/post screenshot thumbnails to agentic iteration canvas panels. */
+  show_screenshot_evidence: boolean;
+}
+
+/** Result shape returned by the `test_wsv_connection` Tauri command. */
+export interface WsvConnectionTestResult {
+  ok: boolean;
+  error: string | null;
+  models_available: string[];
+  latency_ms: number;
+}
+
+/** One row from the shadow-mode disagreements calibration log. */
+export interface WsvDisagreementRow {
+  id: number;
+  task_run_id: string;
+  iteration: number;
+  text_status: string;
+  wsm_status: string;
+  text_confidence: number;
+  wsm_confidence: number;
+  intent: string;
+  wsm_observations: string;
+  created_at: string;
+}

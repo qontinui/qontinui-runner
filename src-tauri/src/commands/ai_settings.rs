@@ -1327,3 +1327,185 @@ pub async fn reset_provider_circuit(provider_key: String) -> Result<(), String> 
     crate::ai_provider::circuit_breaker::reset_provider(&provider_key);
     Ok(())
 }
+
+// ============================================================================
+// World State Verifier Settings
+// ============================================================================
+
+use crate::settings::{WorldStateVerifierSettings, WsvMode};
+
+/// Get the persisted World State Verifier settings.
+#[tauri::command]
+pub fn get_wsv_settings() -> Result<CommandResponse, String> {
+    let settings = settings::get_world_state_verifier_settings();
+    let data = serde_json::json!({
+        "mode": settings.mode,
+        "endpoint": settings.endpoint,
+        "model": settings.model,
+        "show_screenshot_evidence": settings.show_screenshot_evidence,
+    });
+    Ok(CommandResponse {
+        success: true,
+        message: Some("WSV settings retrieved".to_string()),
+        data: Some(data),
+    })
+}
+
+/// Save World State Verifier settings.
+///
+/// Persists to the runner settings file AND updates the in-process live
+/// config so the next agentic verification iteration picks up the change
+/// without a restart.
+#[tauri::command]
+pub fn save_wsv_settings(
+    mode: String,
+    endpoint: String,
+    model: String,
+    show_screenshot_evidence: bool,
+) -> Result<CommandResponse, String> {
+    let parsed_mode = match mode.to_lowercase().as_str() {
+        "disabled" => WsvMode::Disabled,
+        "enabled" => WsvMode::Enabled,
+        "shadow" => WsvMode::Shadow,
+        other => return Err(format!("Invalid mode: {}", other)),
+    };
+
+    let trimmed_endpoint = endpoint.trim().to_string();
+    let trimmed_model = model.trim().to_string();
+    if trimmed_endpoint.is_empty() {
+        return Err("Endpoint cannot be empty".to_string());
+    }
+    if trimmed_model.is_empty() {
+        return Err("Model cannot be empty".to_string());
+    }
+
+    info!(
+        "Saving WSV settings: mode={:?} endpoint={} model={} show_evidence={}",
+        parsed_mode, trimmed_endpoint, trimmed_model, show_screenshot_evidence
+    );
+
+    let new_settings = WorldStateVerifierSettings {
+        mode: parsed_mode,
+        endpoint: trimmed_endpoint,
+        model: trimmed_model,
+        show_screenshot_evidence,
+        // Mark that the user has explicitly expressed an opinion so
+        // the env-var fallback in init_from_persisted won't override
+        // this on the next startup.
+        ever_saved: true,
+    };
+
+    settings::save_world_state_verifier_settings(new_settings.clone())
+        .map_err(|e| format!("Failed to save WSV settings: {}", e))?;
+
+    // Update in-process live config so the next iteration picks it up.
+    crate::verification::WsvConfig::set_global(
+        crate::verification::WsvConfig::from_settings(&new_settings),
+    );
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("WSV settings saved".to_string()),
+        data: None,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct WsvConnectionTestResult {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub models_available: Vec<String>,
+    pub latency_ms: u64,
+}
+
+/// Test connectivity to the WSV endpoint by hitting `/v1/models`.
+///
+/// Uses a 5s timeout — cold-start first-request weight downloads will
+/// exceed this and return a failure, which is the desired behavior for
+/// the settings UI's "Test connection" button: we want a fast yes/no
+/// signal, not a blocking 5-minute download.
+#[tauri::command]
+pub async fn test_wsv_connection(endpoint: String) -> Result<WsvConnectionTestResult, String> {
+    let url = format!("{}/v1/models", endpoint.trim().trim_end_matches('/'));
+    info!("Testing WSV connection: GET {}", url);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let start = std::time::Instant::now();
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(WsvConnectionTestResult {
+                ok: false,
+                error: Some(format!("HTTP error: {}", e)),
+                models_available: vec![],
+                latency_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+    };
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    if !resp.status().is_success() {
+        return Ok(WsvConnectionTestResult {
+            ok: false,
+            error: Some(format!("HTTP {}", resp.status().as_u16())),
+            models_available: vec![],
+            latency_ms,
+        });
+    }
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(WsvConnectionTestResult {
+                ok: false,
+                error: Some(format!("Invalid JSON response: {}", e)),
+                models_available: vec![],
+                latency_ms,
+            });
+        }
+    };
+
+    // Parse `{data: [{id: "...", ...}, ...]}` — the standard OpenAI
+    // /v1/models format that llama-swap emits.
+    let models_available = body
+        .get("data")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(WsvConnectionTestResult {
+        ok: true,
+        error: None,
+        models_available,
+        latency_ms,
+    })
+}
+
+/// List recent shadow-mode disagreements for the calibration UI.
+///
+/// Called by the Settings → World State Verifier calibration section.
+/// Returns rows most-recent-first. Limit clamped to [1, 1000] via
+/// `wsv_disagreements::normalize_limit`.
+#[tauri::command]
+pub async fn list_wsv_disagreements(
+    state: tauri::State<'_, std::sync::Arc<crate::commands::AppState>>,
+    task_run_id: Option<String>,
+    limit: Option<i64>,
+) -> Result<
+    Vec<crate::database::pg::wsv_disagreements::WsvDisagreementRow>,
+    String,
+> {
+    let limit = crate::database::pg::wsv_disagreements::normalize_limit(limit);
+    state
+        .pg_db
+        .list_wsv_disagreements(task_run_id.as_deref(), limit)
+        .await
+}

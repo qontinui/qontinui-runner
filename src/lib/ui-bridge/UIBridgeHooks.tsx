@@ -76,6 +76,7 @@ const TAB_GROUPS = {
     "settings-ai",
     "settings-agentic",
     "settings-self-healing",
+    "settings-world-state-verifier",
     "settings-playwright",
     "settings-mobile",
     "settings-cloud-relay",

@@ -3,12 +3,17 @@
 //! Runs a Verification Agent → Worker Agent loop where verification is performed
 //! by an AI agent rather than deterministic steps.
 
+use std::time::Duration;
+
 use tracing::{debug, info, warn};
 
 use crate::orchestrator::brain_actor::{BrainActorConfig, BrainActorOrchestrator, BrainOutput};
 use crate::orchestrator::structured_output::StructuredSignal;
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
+use crate::verification::{
+    parse_mode, RefusalRetryTracker, RetryDecision, WorldStateVerifier, WsvMode,
+};
 
 use super::health_monitor::fetch_verifier_ui_context;
 use super::loop_controller::LoopController;
@@ -377,6 +382,25 @@ impl LoopController {
         let mut iteration_history = IterationHistory::new();
         let mut prev_confidence: f64 = 0.0;
 
+        // ── World State Verifier state ─────────────────────────────────────
+        // WSM compares pre/post screenshots to judge whether a worker action
+        // actually achieved its intent. Gated by QONTINUI_WORLD_STATE_VERIFIER.
+        let wsv_mode = parse_mode();
+        let wsm: Option<WorldStateVerifier> = if wsv_mode.is_active() {
+            info!("AGENTIC-VERIFICATION: World State Verifier active (mode={:?})", wsv_mode);
+            Some(WorldStateVerifier::from_env())
+        } else {
+            None
+        };
+        // Pre-worker screenshot from the previous iteration — fed as WSM's
+        // "pre" image on the next iteration's verify phase.
+        let mut prev_pre_screenshot: Option<String> = None;
+        // Intent string describing what the worker attempted in the previous
+        // iteration — fed to WSM so it can judge against the declared goal.
+        let mut prev_worker_intent: String = goal.clone();
+        // Consecutive-refusal tracker with retry cap + backoff.
+        let mut refusal_tracker = RefusalRetryTracker::default();
+
         // Brain/Actor orchestrator (opt-in: enabled via agentic_verification_config)
         let brain_actor_config = BrainActorConfig {
             enabled: av_config.brain_actor_enabled.unwrap_or(false),
@@ -461,7 +485,68 @@ impl LoopController {
 
             let should_verify = iteration > 1 || av_config.verify_first;
 
-            let verdict = if should_verify {
+            // ── STEP 1a: World State Verifier (VLM judge) ───────────────
+            // When enabled and we have a prior-iteration pre-screenshot, call
+            // the WSM to judge whether the previous worker action achieved its
+            // intent. In Enabled mode, a successful WSM verdict skips the text
+            // verifier agent below. In Shadow mode, both run and disagreements
+            // are logged for calibration.
+            // Hoisted so the iter_result builder below can attach the
+            // pre/post pair to the canvas panel when show_screenshot_evidence
+            // is on. Captured once per iteration; both are `None` when WSM
+            // didn't run this round.
+            let mut wsm_pre_for_panel: Option<String> = None;
+            let mut wsm_post_for_panel: Option<String> = None;
+            let wsm_verdict: Option<(VerificationVerdict, u64)> =
+                if should_verify && wsm.is_some() && prev_pre_screenshot.is_some() {
+                    let wsm_start = std::time::Instant::now();
+                    let post_screenshot = self.try_capture_raw_screenshot().await;
+                    match (post_screenshot, prev_pre_screenshot.as_ref()) {
+                        (Some(post), Some(pre)) => {
+                            // Stash the pair for the canvas panel builder.
+                            wsm_pre_for_panel = Some(pre.clone());
+                            wsm_post_for_panel = Some(post.clone());
+                            let result = wsm
+                                .as_ref()
+                                .unwrap()
+                                .verify(pre, &post, &prev_worker_intent, Some(&goal))
+                                .await;
+                            let dur = wsm_start.elapsed().as_millis() as u64;
+                            match result {
+                                Ok(v) => {
+                                    info!(
+                                        "WSM: status={} confidence={:.2} ({}ms)",
+                                        v.status, v.confidence, dur
+                                    );
+                                    Some((v, dur))
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "WSM: verify failed ({}); falling back to text verifier",
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        _ => {
+                            debug!("WSM: skipping — no POST screenshot available");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+            // In Enabled mode with a valid WSM verdict, skip the text verifier
+            // agent entirely. In Shadow mode, always run the text verifier
+            // regardless of whether WSM returned something.
+            let skip_text_verifier =
+                wsv_mode == WsvMode::Enabled && wsm_verdict.is_some();
+
+            let text_verdict: Option<(VerificationVerdict, u64)> = if should_verify
+                && !skip_text_verifier
+            {
                 info!(
                     "AGENTIC-VERIFICATION: Running verification agent (iteration {})",
                     iteration
@@ -620,6 +705,97 @@ impl LoopController {
                 None
             };
 
+            // ── Merge WSM and text verdicts based on mode ────────────────
+            // Shadow mode: log disagreements between WSM and text verifier,
+            // and persist them to PG so the calibration UI can aggregate.
+            if wsv_mode == WsvMode::Shadow {
+                if let (Some((ref wv, _)), Some((ref tv, _))) =
+                    (wsm_verdict.as_ref(), text_verdict.as_ref())
+                {
+                    if wv.status != tv.status {
+                        info!(
+                            "WSM-SHADOW-DISAGREE: text={} wsm={} intent=\"{}\" wsm_obs=\"{}\"",
+                            tv.status,
+                            wv.status,
+                            prev_worker_intent.chars().take(80).collect::<String>(),
+                            wv.observations.chars().take(120).collect::<String>(),
+                        );
+                        // Fire-and-forget PG insert. Never block the loop
+                        // on a telemetry write — log and continue on error.
+                        let insert = crate::database::pg::wsv_disagreements::WsvDisagreementInsert {
+                            task_run_id: &config.execution_id,
+                            iteration: iteration as i32,
+                            text_status: &tv.status.to_string(),
+                            wsm_status: &wv.status.to_string(),
+                            text_confidence: tv.confidence,
+                            wsm_confidence: wv.confidence,
+                            intent: &prev_worker_intent,
+                            wsm_observations: &wv.observations,
+                        };
+                        if self
+                            .app_state
+                            .pg_db
+                            .insert_wsv_disagreement(insert)
+                            .await
+                            .is_none()
+                        {
+                            warn!("WSM-SHADOW-DISAGREE: PG insert failed (telemetry dropped)");
+                        }
+                    } else {
+                        debug!(
+                            "WSM-SHADOW-AGREE: status={} (text_conf={:.2} wsm_conf={:.2})",
+                            tv.status, tv.confidence, wv.confidence
+                        );
+                    }
+                }
+            }
+
+            // Enabled mode: WSM verdict wins when present; otherwise fall
+            // through to the text verifier (fallback path).
+            // Shadow / Disabled modes: always use the text verdict.
+            let mut verdict: Option<(VerificationVerdict, u64)> = match wsv_mode {
+                WsvMode::Enabled => wsm_verdict.clone().or_else(|| text_verdict.clone()),
+                WsvMode::Shadow | WsvMode::Disabled => text_verdict.clone(),
+            };
+
+            // ── Refused-verdict retry policy ─────────────────────────────
+            // A Refused verdict means the WSM judged the previous worker
+            // action as a no-op on the intended target. Retry with backoff;
+            // escalate to Fail if the cap is hit (guards against infinite
+            // no-op loops).
+            if let Some((ref v, _)) = verdict {
+                if v.status == VerificationStatus::Refused {
+                    match refusal_tracker.record_refusal() {
+                        RetryDecision::Retry { wait_ms } => {
+                            info!(
+                                "WSM-REFUSED: retry #{} (backoff {}ms) — worker will be reprompted to try a different candidate",
+                                refusal_tracker.consecutive(),
+                                wait_ms,
+                            );
+                            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                            // Verdict stays Refused — worker_context_from_verdict
+                            // will surface the "try a different candidate"
+                            // suggestion from verdict.issues to the worker.
+                        }
+                        RetryDecision::EscalateToFail => {
+                            warn!(
+                                "WSM-REFUSED: refusal cap reached ({} consecutive), escalating to Fail",
+                                refusal_tracker.cap()
+                            );
+                            if let Some((ref mut vm, _)) = verdict {
+                                vm.status = VerificationStatus::Fail;
+                                vm.observations = format!(
+                                    "World State Verifier refused {} consecutive actions as no-ops. Escalated to Fail so the worker can try a wholly different approach.",
+                                    refusal_tracker.cap()
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    refusal_tracker.record_non_refusal();
+                }
+            }
+
             // ── STEP 2: Check if goal achieved ──────────────────────────
             if let Some((ref v, _)) = verdict {
                 if v.status == VerificationStatus::Pass
@@ -638,6 +814,8 @@ impl LoopController {
                             worker_summary: None,
                             verifier_duration_ms: verdict.as_ref().map(|(_, d)| *d).unwrap_or(0),
                             worker_duration_ms: 0,
+                            pre_screenshot_thumb_b64: None,
+                            post_screenshot_thumb_b64: None,
                         });
                         // Canvas: emit iteration panel and exit summary
                         {
@@ -651,6 +829,8 @@ impl LoopController {
                                     None,
                                     verifier_ms,
                                     0,
+                                    None,
+                                    None,
                                 )
                                 .await;
                         }
@@ -699,7 +879,15 @@ impl LoopController {
                         self.canvas_manager
                             .lock()
                             .await
-                            .on_agentic_verification_iteration(iteration, v, None, verifier_ms, 0)
+                            .on_agentic_verification_iteration(
+                                iteration,
+                                v,
+                                None,
+                                verifier_ms,
+                                0,
+                                None,
+                                None,
+                            )
                             .await;
                     }
                     iteration_results.push(AgenticVerificationIterationResult {
@@ -709,6 +897,8 @@ impl LoopController {
                         worker_summary: None,
                         verifier_duration_ms: verdict.as_ref().map(|(_, d)| *d).unwrap_or(0),
                         worker_duration_ms: 0,
+                        pre_screenshot_thumb_b64: None,
+                        post_screenshot_thumb_b64: None,
                     });
                     let av_result = AgenticVerificationResult {
                         iterations_run: iteration,
@@ -902,6 +1092,22 @@ impl LoopController {
                 }
             }
 
+            // ── Stash pre-worker screenshot for next iteration's WSM ─────
+            // WSM needs a "before" image to compare against the "after" it
+            // captures on the next verify phase. Skip when WSM is inactive
+            // so we don't pay UI-Bridge cost for nothing.
+            if wsm.is_some() {
+                prev_pre_screenshot = self.try_capture_raw_screenshot().await;
+                // Derive intent from the verdict's next_priority when
+                // available, else fall back to the overall goal. This is
+                // what WSM will be asked to judge against.
+                prev_worker_intent = verdict
+                    .as_ref()
+                    .and_then(|(v, _)| v.next_priority.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| goal.clone());
+            }
+
             let (worker_outcome, _injected_steps) = self
                 .agentic_executor
                 .run_agentic(
@@ -956,6 +1162,31 @@ impl LoopController {
             }
 
             // ── Record iteration result ─────────────────────────────────
+            // Build visual-evidence thumbnails only when WSM ran for this
+            // iteration AND the user has the show_screenshot_evidence toggle on.
+            // Downsampling degrades gracefully to the original string on
+            // any error, so we can always unwrap into the optional fields.
+            let embed_evidence = wsm_verdict.is_some()
+                && crate::verification::mode::show_screenshot_evidence();
+            let (pre_thumb, post_thumb) = if embed_evidence {
+                use crate::unified_workflow_executor::canvas_panels::screenshot_embed::{
+                    downsample_screenshot_for_embed, THUMBNAIL_TARGET_WIDTH,
+                };
+                // `.and_then`: downsample returns None on failure, and we
+                // propagate that so the panel skips the embed entirely
+                // rather than ballooning the payload with the full-size
+                // original.
+                let pre = wsm_pre_for_panel
+                    .as_deref()
+                    .and_then(|s| downsample_screenshot_for_embed(s, THUMBNAIL_TARGET_WIDTH));
+                let post = wsm_post_for_panel
+                    .as_deref()
+                    .and_then(|s| downsample_screenshot_for_embed(s, THUMBNAIL_TARGET_WIDTH));
+                (pre, post)
+            } else {
+                (None, None)
+            };
+
             let iter_result = AgenticVerificationIterationResult {
                 iteration,
                 verdict: verdict
@@ -974,6 +1205,8 @@ impl LoopController {
                 worker_summary,
                 verifier_duration_ms: verdict.as_ref().map(|(_, d)| *d).unwrap_or(0),
                 worker_duration_ms: worker_duration,
+                pre_screenshot_thumb_b64: pre_thumb,
+                post_screenshot_thumb_b64: post_thumb,
             };
             // Build compressed iteration summary for cross-iteration context
             {
@@ -998,6 +1231,8 @@ impl LoopController {
                     last.worker_summary.as_deref(),
                     last.verifier_duration_ms,
                     last.worker_duration_ms,
+                    last.pre_screenshot_thumb_b64.as_deref(),
+                    last.post_screenshot_thumb_b64.as_deref(),
                 )
                 .await;
                 cm.on_agentic_verification_tracker(&iteration_results).await;
@@ -1017,6 +1252,33 @@ impl LoopController {
                 warn!("PG append_task_output_ex (session increment) failed: {}", e);
             }
         }
+    }
+
+    /// Try to capture a raw (un-annotated) screenshot from UI Bridge.
+    ///
+    /// Used by the World State Verifier, which needs to compare raw pre/post
+    /// visual state without annotation overlays that would confuse the VLM judge.
+    /// Returns base64-encoded PNG bytes (no `data:` prefix), or None on failure.
+    async fn try_capture_raw_screenshot(&self) -> Option<String> {
+        let port = crate::mcp::types::get_mcp_api_port();
+        let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/control/screenshot", port);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+
+        let resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let body: serde_json::Value = resp.json().await.ok()?;
+        body.get("data")
+            .and_then(|d| d.get("screenshot"))
+            .or_else(|| body.get("screenshot"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 
     /// Try to capture a screenshot and annotate it with element markers.

@@ -131,6 +131,7 @@ mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
 mod validation;
+mod verification;
 mod video_recorder;
 mod vision;
 mod workflow_event_bus;
@@ -601,6 +602,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_settings::refresh_claude_cli_auth,
             commands::ai_settings::get_agentic_settings,
             commands::ai_settings::save_agentic_settings,
+            // World State Verifier settings commands
+            commands::ai_settings::get_wsv_settings,
+            commands::ai_settings::save_wsv_settings,
+            commands::ai_settings::test_wsv_connection,
+            commands::ai_settings::list_wsv_disagreements,
             // AI provider circuit breaker commands
             commands::ai_settings::get_provider_circuit_states,
             commands::ai_settings::reset_provider_circuit,
@@ -1806,6 +1812,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             });
+
+            // Bootstrap World State Verifier live config from persisted
+            // settings. Must run before any agentic verification iteration
+            // so the loop picks up the persisted mode/endpoint/model.
+            // Falls back to env vars when no persisted settings exist.
+            verification::WsvConfig::init_from_persisted();
 
             // Restore previously-running instances (primary instance only).
             // The session file only exists if the previous process was killed

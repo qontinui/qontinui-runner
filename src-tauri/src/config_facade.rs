@@ -33,7 +33,7 @@ use crate::settings::{
     CloudRelaySettings, DebugSettings, ExecutionVariablesSettings, GlobalLogSource,
     GlobalLogSourceSettings, LogSourceAiSelectionMode, LogSourceCategory, MobileSettings,
     PathSettings, PlaywrightSettings, RunnerInstanceConfig, SelfHealingSettings, Settings,
-    VariableSource,
+    VariableSource, WorldStateVerifierSettings,
 };
 
 // ============================================================================
@@ -210,6 +210,20 @@ impl SettingsField for crate::otel::OtelConfig {
 
     fn field_name() -> &'static str {
         "otel"
+    }
+}
+
+impl SettingsField for WorldStateVerifierSettings {
+    fn get_from(settings: &Settings) -> &Self {
+        &settings.world_state_verifier
+    }
+
+    fn set_in(settings: &mut Settings, value: Self) {
+        settings.world_state_verifier = value;
+    }
+
+    fn field_name() -> &'static str {
+        "world_state_verifier"
     }
 }
 
