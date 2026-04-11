@@ -329,8 +329,28 @@ pub fn create_router(
             let pending = pending_for_listener.clone();
             let pending_count = pending_count_for_listener.clone();
 
-            // Parse the response payload
-            if let Ok(response) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+            // Parse the response payload.
+            // Tauri 2.x may double-serialize: emit(name, obj) serializes obj to JSON,
+            // but event.payload() can return a JSON string that itself contains a
+            // JSON-encoded string (e.g., "\"{ ... }\""). Try direct parse first,
+            // then unwrap one layer of string quoting if needed.
+            let payload_str = event.payload();
+            let response: Option<serde_json::Value> =
+                serde_json::from_str::<serde_json::Value>(payload_str)
+                    .ok()
+                    .and_then(|v| {
+                        if v.is_object() {
+                            Some(v) // Direct parse succeeded as an object — good
+                        } else if let Some(s) = v.as_str() {
+                            // Payload was double-stringified: outer parse gave us a
+                            // JSON string, inner content is the actual JSON object
+                            serde_json::from_str::<serde_json::Value>(s).ok()
+                        } else {
+                            Some(v)
+                        }
+                    });
+
+            if let Some(response) = response {
                 // Spawn a task to handle the response since we need async
                 let runtime = tokio::runtime::Handle::try_current();
                 if let Ok(rt) = runtime {
@@ -348,7 +368,7 @@ pub fn create_router(
             } else {
                 warn!(
                     "UI Bridge: Failed to parse response payload: {}",
-                    event.payload()
+                    &payload_str[..payload_str.len().min(200)]
                 );
             }
         });
