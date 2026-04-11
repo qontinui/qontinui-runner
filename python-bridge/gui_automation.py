@@ -93,6 +93,9 @@ class GUIAutomation:
         # Activity timeline capture callback (set by executor, optional)
         self._emit_timeline_capture: Callable[[dict], None] | None = None
 
+        # Pre-action callback for trajectory logging (set by executor, optional)
+        self._pre_action_callback: Callable[[str], None] | None = None
+
         # Initialize accessibility capture service for ref-based actions
         self._accessibility_service: AccessibilityCaptureService | None = None
 
@@ -338,6 +341,13 @@ class GUIAutomation:
                 workflow_id=hierarchy_context["workflow_id"],
                 nesting_level=hierarchy_context["nesting_level"],
             )
+
+        # Notify trajectory logger (captures pre-action screenshot)
+        if self._pre_action_callback:
+            try:
+                self._pre_action_callback(action_id)
+            except Exception:
+                logger.debug("Pre-action callback failed", exc_info=True)
 
         # Start action in execution tree with metadata
         node = self.execution_tree.start_action(

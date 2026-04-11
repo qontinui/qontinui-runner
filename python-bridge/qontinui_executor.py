@@ -239,6 +239,9 @@ class QontinuiExecutor:
         # Initialize TrainingExportCoordinator
         self.training_export = TrainingExportCoordinator(emit_log_fn=self.event_manager.emit_log)
 
+        # Trajectory logger (initialised later if QONTINUI_TRAJECTORY_LOGGER=on)
+        self._trajectory_logger = None
+
         # Initialize ExecutorCore
         self.executor_core = ExecutorCore(
             emit_log_fn=self.event_manager.emit_log,
@@ -553,14 +556,73 @@ class QontinuiExecutor:
             # Initialize TrainingExportService
             self.training_export.initialize(run_dir)
 
+            # Initialize TrajectoryLogger if opted in
+            if os.getenv("QONTINUI_TRAJECTORY_LOGGER", "").lower() == "on":
+                try:
+                    from services.trajectory_logger import TrajectoryLogger
+
+                    trajectory_output = Path(
+                        os.getenv("QONTINUI_EXPORT_DIR", str(run_dir / "dataset"))
+                    )
+                    max_records = int(
+                        os.getenv("QONTINUI_TRAJECTORY_MAX_RECORDS", "500")
+                    )
+
+                    # Optional WSM client
+                    wsm_client = None
+                    try:
+                        wsm_endpoint = os.getenv("QONTINUI_WORLD_STATE_VERIFIER_ENDPOINT")
+                        if wsm_endpoint:
+                            from tests.e2e.broken_accessibility._wsm_client import (
+                                WorldStateVerifierClient,
+                            )
+                            wsm_client = WorldStateVerifierClient(endpoint=wsm_endpoint)
+                    except ImportError:
+                        pass
+
+                    # Optional OmniParser detector
+                    omniparser = None
+                    if os.getenv("QONTINUI_OMNIPARSER_ENABLED", "").lower() == "true":
+                        try:
+                            from qontinui.discovery.element_detection.omniparser_detector import (
+                                OmniParserDetector,
+                            )
+                            omniparser = OmniParserDetector()
+                        except ImportError:
+                            pass
+
+                    self._trajectory_logger = TrajectoryLogger(
+                        output_dir=trajectory_output,
+                        max_records_per_session=max_records,
+                        wsm_client=wsm_client,
+                        omniparser_detector=omniparser,
+                    )
+                    self.event_manager.emit_log(
+                        "info",
+                        f"TrajectoryLogger enabled: {trajectory_output} "
+                        f"(max_records={max_records})",
+                    )
+                except Exception as tl_err:
+                    self.event_manager.emit_log(
+                        "warning", f"TrajectoryLogger init failed (non-fatal): {tl_err}"
+                    )
+                    self._trajectory_logger = None
+
             # Initialize UnifiedDataCollector with combined callback
             training_callback = self.training_export.get_record_callback()
 
             def combined_record_callback(record):
-                """Callback that reports to training export and test results handler."""
+                """Callback that reports to training export, trajectory logger, and test results."""
                 # Call training export callback
                 if training_callback:
                     training_callback(record)
+
+                # Call trajectory logger callback
+                if self._trajectory_logger:
+                    try:
+                        self._trajectory_logger.on_record_created(record)
+                    except Exception:
+                        pass
 
                 # Report action data for historical indexing (Config Testing)
                 if self.test_results_handler and self.test_results_handler.is_enabled():
@@ -686,6 +748,12 @@ class QontinuiExecutor:
             self.gui_automation.set_timeline_capture_fn(
                 self.event_manager.emit_timeline_capture
             )
+
+            # Wire trajectory logger pre-action callback
+            if self._trajectory_logger:
+                self.gui_automation._pre_action_callback = (
+                    self._trajectory_logger.on_action_start
+                )
 
             # Inject self as workflow executor for navigation
             if QONTINUI_AVAILABLE:
