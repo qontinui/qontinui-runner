@@ -73,7 +73,7 @@ export function BatchOperationsBar() {
 
   const writeToTab = useCallback(
     (tabId: string, text: string) => {
-      const ref = terminalRefs.get(tabId);
+      const ref = terminalRefs.current.get(tabId);
       ref?.current?.writeToTerminal(text);
     },
     [terminalRefs],

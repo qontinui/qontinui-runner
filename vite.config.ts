@@ -28,6 +28,88 @@ export default defineConfig({
           .replace(/<link rel="modulepreload"[^>]*>/g, "");
       },
     },
+    // Extract CSS from the JS bundle and inline it into index.html.
+    //
+    // Problem: The IIFE rollup format with @tailwindcss/vite causes Tailwind
+    // CSS to be embedded in the JS bundle as runtime-injected styles. This
+    // is unreliable — the injection can fail or arrive late, leaving the app
+    // with no Tailwind utilities (display:block instead of display:flex).
+    //
+    // Solution: After the bundle is generated, scan the JS chunk for CSS
+    // strings (they're in __vite_style__ or injectStyle calls), extract them,
+    // and write them as a <style> tag in index.html. This guarantees styles
+    // are available before any JS executes.
+    {
+      name: "extract-css-from-bundle",
+      enforce: "post" as const,
+      generateBundle(_options, bundle) {
+        // First check if there are any CSS asset files (normal extraction path)
+        let cssContent = "";
+        const cssAssetNames: string[] = [];
+        for (const [fileName, chunk] of Object.entries(bundle)) {
+          if (fileName.endsWith(".css") && chunk.type === "asset") {
+            cssContent +=
+              typeof chunk.source === "string"
+                ? chunk.source
+                : new TextDecoder().decode(chunk.source as Uint8Array);
+            cssAssetNames.push(fileName);
+          }
+        }
+
+        // If no CSS assets, try extracting from the JS bundle
+        if (!cssContent) {
+          for (const chunk of Object.values(bundle)) {
+            if (chunk.type === "chunk" && chunk.code) {
+              // Look for large CSS strings in __vite_style__ or injectStyle calls
+              // Pattern: __vite_style__("...css...") or injectStyle("...css...")
+              const re = /(?:__vite_style__|injectStyle(?:s)?)\s*\(\s*["'`]([\s\S]*?)["'`]\s*\)/g;
+              let match;
+              while ((match = re.exec(chunk.code)) !== null) {
+                if (match[1].length > 500) {
+                  const css = match[1]
+                    .replace(/\\n/g, "\n")
+                    .replace(/\\t/g, "\t")
+                    .replace(/\\"/g, '"')
+                    .replace(/\\\\/g, "\\");
+                  cssContent += css + "\n";
+                }
+              }
+            }
+          }
+        }
+
+        if (!cssContent) {
+          console.log("[extract-css] No CSS found in bundle — Tailwind may not be generating output");
+          return;
+        }
+
+        console.log(`[extract-css] Extracted ${(cssContent.length / 1024).toFixed(0)}KB of CSS`);
+
+        // Inject into index.html
+        for (const [fileName, chunk] of Object.entries(bundle)) {
+          if (fileName === "index.html" && chunk.type === "asset") {
+            let html =
+              typeof chunk.source === "string"
+                ? chunk.source
+                : new TextDecoder().decode(chunk.source as Uint8Array);
+
+            // Remove any <link> tags pointing to CSS assets we're inlining
+            for (const cssName of cssAssetNames) {
+              const pattern = new RegExp(
+                `<link[^>]*href="[^"]*${cssName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"]*"[^>]*>`,
+                "g"
+              );
+              html = html.replace(pattern, "");
+              delete bundle[cssName];
+            }
+
+            html = html.replace("</head>", `<style>${cssContent}</style>\n</head>`);
+            chunk.source = html;
+            break;
+          }
+        }
+      },
+    },
   ],
   define: {
     __APP_VERSION__: JSON.stringify(version),
@@ -65,6 +147,10 @@ export default defineConfig({
     // dynamic imports produces a single classic <script> that bypasses the
     // module loader entirely. All assets are embedded in the binary anyway,
     // so code-splitting provides no network benefit.
+    // Force CSS to be emitted as a separate asset (not absorbed into the JS
+    // IIFE bundle). The extract-css-from-bundle plugin then inlines it into
+    // index.html as a <style> tag for reliable synchronous loading.
+    cssCodeSplit: false,
     rollupOptions: {
       output: {
         format: "iife" as const,

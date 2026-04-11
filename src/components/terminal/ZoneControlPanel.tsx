@@ -12,6 +12,7 @@
  */
 
 import React, { useMemo, useState, useCallback, useRef, useEffect } from "react";
+import type { TerminalTab } from "./useTerminalManager";
 import { instanceStorage } from "@/lib/instance-storage";
 import {
   useTerminalCore,
@@ -472,7 +473,7 @@ function WorkspacesSection({
 interface ZoneRowProps {
   zoneIndex: number;
   tabId: string | undefined;
-  tab: ZoneControlPanelProps["tabs"][number] | undefined;
+  tab: TerminalTab | undefined;
   state: SessionState;
   label: string;
   notes: string;

@@ -82,22 +82,26 @@ export function useUIBridgeEventHandler(): void {
    * Send a response back to the Rust backend
    */
   const sendResponse = useCallback(async (response: UIBridgeResponsePayload) => {
-    // Send via both Tauri emit AND HTTP fallback simultaneously.
-    // Tauri emit may hang if the IPC channel is broken (WebView2 issue),
-    // so the HTTP fallback ensures the response always reaches the Rust backend.
-    const httpPromise = httpSendResponse(response).then((ok) => {
-      if (ok) {
-        log.debug(`HTTP sent response for ${response.type}:`, response.requestId);
-      }
-    });
-    const emitPromise = emit("ui-bridge-response", response)
-      .then(() => {
-        log.debug(`Tauri emit sent response for ${response.type}:`, response.requestId);
-      })
-      .catch(() => {
-        // Tauri emit failed — HTTP fallback already running
-      });
-    await Promise.allSettled([httpPromise, emitPromise]);
+    // Send via HTTP first (primary). The Tauri emit path suffers from
+    // double-serialization: Tauri serializes the payload to JSON for IPC,
+    // then the Rust listener deserializes via serde_json::from_str(event.payload()).
+    // This can mangle nested data structures (elements arrays become empty
+    // or truncated). The HTTP path sends raw JSON directly, avoiding this issue.
+    //
+    // Only fall back to Tauri emit if HTTP fails (e.g., API port not bound yet).
+    const httpOk = await httpSendResponse(response);
+    if (httpOk) {
+      log.debug(`HTTP sent response for ${response.type}:`, response.requestId);
+      return;
+    }
+    // HTTP failed — fall back to Tauri emit
+    try {
+      await emit("ui-bridge-response", response);
+      log.debug(`Tauri emit sent response for ${response.type}:`, response.requestId);
+    } catch {
+      // Both channels failed — response is lost
+      console.error(`[UIBridgeEventHandler] Both HTTP and Tauri emit failed for ${response.type}:`, response.requestId);
+    }
   }, []);
 
   // Build the shared context for sub-hooks
