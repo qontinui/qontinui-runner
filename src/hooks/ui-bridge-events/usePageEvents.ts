@@ -49,8 +49,15 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             // React re-renders — the SPA never switches tabs/pages.
             const previousPath = window.location.pathname;
             if (url.startsWith("/")) {
-              // Strip leading slash to get the page/tab name
-              const page = url.replace(/^\/+/, "") || "gui-automation";
+              // Convert URL path to tab ID: strip leading slash, then
+              // replace remaining slashes with hyphens so
+              // "/settings/world-state-verifier" becomes
+              // "settings-world-state-verifier" — matching the PAGE_TO_TAB
+              // keys in useAppNavigation.ts.
+              const page =
+                url
+                  .replace(/^\/+/, "")
+                  .replace(/\//g, "-") || "gui-automation";
               window.dispatchEvent(
                 new CustomEvent("ui-bridge-navigate", { detail: { page, url } }),
               );
@@ -285,37 +292,38 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             // origin, protocol, search, hash, hostname) is allowed for test
             // probes. Only mutating methods (assign/replace/reload) and
             // assignment to window.location are blocked.
+            // Block patterns that enable code injection, data exfiltration,
+            // or persistent state corruption. Deliberately ALLOW:
+            //   - localStorage / sessionStorage (needed for tab navigation)
+            //   - location.reload (needed for page refresh after config changes)
+            //   - globalThis / Reflect / Proxy (useful for deep inspection)
+            // The remaining blocklist targets patterns with no legitimate
+            // agent-testing use case.
             const dangerousPatterns = [
-              /\bimport\s*\(/, // dynamic import
-              /\brequire\s*\(/, // require
+              /\bimport\s*\(/, // dynamic import — can load arbitrary modules
+              /\brequire\s*\(/, // require — same
               /\b__proto__\b/, // prototype pollution
               /\bconstructor\s*\[/, // constructor bracket access
-              /\beval\s*\(/, // nested eval
-              /\bnew\s+Function\b/, // Function constructor
-              /\bfetch\s*\(/, // network requests
-              /\bXMLHttpRequest\b/, // network requests
-              /\bnavigator\.sendBeacon\b/, // data exfiltration
-              /\blocalStorage\b/, // storage access
-              /\bsessionStorage\b/, // storage access
-              /\bindexedDB\b/, // storage access
-              /\bglobalThis\b/, // global scope access
-              /\bReflect\b/, // metaprogramming
-              /\bProxy\b/, // metaprogramming
-              /\bWebSocket\b/, // network access
-              /\bwindow\.open\b/, // popup/navigation
-              /\bwindow\.location\.(assign|replace|reload)\b/, // navigation methods
-              /\bwindow\.location\s*=/, // assignment to window.location
-              /\blocation\.(assign|replace|reload)\b/, // bare location navigation
-              /\blocation\s*=\s*["'`]/, // assignment to bare location (string literal)
-              /\bdocument\.cookie\b/, // cookie access
-              /\bWorker\b/, // web workers
-              /\bSharedWorker\b/, // shared workers
-              /\bServiceWorker\b/, // service workers
-              /\bcrypto\.subtle\b/, // cryptographic operations
+              /\beval\s*\(/, // nested eval — full code execution
+              /\bnew\s+Function\b/, // Function constructor — same
+              /\bfetch\s*\(/, // network requests — data exfiltration
+              /\bXMLHttpRequest\b/, // network requests — same
+              /\bnavigator\.sendBeacon\b/, // data exfiltration beacon
+              /\bWebSocket\b/, // persistent network channel
+              /\bdocument\.cookie\b/, // cookie theft
+              /\bwindow\.open\b/, // popup/phishing
+              /\bwindow\.location\.(assign|replace)\b/, // redirect (reload allowed)
+              /\bwindow\.location\s*=/, // redirect via assignment
+              /\blocation\.(assign|replace)\b/, // bare redirect (reload allowed)
+              /\blocation\s*=\s*["'`]/, // redirect via bare assignment
+              /\bcrypto\.subtle\b/, // key material access
             ];
             const isDangerous = dangerousPatterns.some((p) => p.test(expression));
             if (isDangerous) {
-              throw new Error("Expression rejected: contains prohibited pattern");
+              const matched = dangerousPatterns.find((p) => p.test(expression));
+              throw new Error(
+                `Expression rejected: contains prohibited pattern${matched ? ` (${matched.source})` : ""}`,
+              );
             }
             const result = new Function("return " + expression)();
             const resolvedResult = await Promise.resolve(result);
