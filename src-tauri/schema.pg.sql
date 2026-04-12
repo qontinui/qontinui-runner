@@ -3682,3 +3682,22 @@ CREATE TABLE IF NOT EXISTS ui_bridge_baselines (
     ttl_days        INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_ui_bridge_baselines_target ON ui_bridge_baselines(target_scope);
+
+-- Breakpoint snapshots for step-level debugging
+CREATE TABLE IF NOT EXISTS breakpoint_snapshots (
+    id                  TEXT PRIMARY KEY,
+    execution_id        TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    step_index          INTEGER NOT NULL,
+    step_name           TEXT,
+    phase               TEXT,
+    iteration           INTEGER,
+    variables_json      TEXT NOT NULL,
+    last_screenshot_ref TEXT,
+    pending_steps_json  TEXT NOT NULL,
+    freshness_ts        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status              TEXT NOT NULL DEFAULT 'waiting',
+    resumed_at          TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bps_execution ON breakpoint_snapshots(execution_id);
+CREATE INDEX IF NOT EXISTS idx_bps_status ON breakpoint_snapshots(status);

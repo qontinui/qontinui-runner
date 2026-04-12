@@ -20,6 +20,7 @@ import { CompletionSummary } from "./CompletionSummary";
 import { ApprovalDialog } from "./ApprovalDialog";
 import { OrchestrationLoopBanner } from "./OrchestrationLoopBanner";
 import { TopPatternsWidget } from "./TopPatternsWidget";
+import { BreakpointInspector } from "./BreakpointInspector";
 import { registerAllWidgets } from "@/components/widgets";
 import { useFlowExecutionData } from "@/components/widgets/flow-execution";
 import { windowManager } from "../../managers";
@@ -27,7 +28,8 @@ import type { ActivityType } from "../../types/dashboard/activity-types";
 import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
 import type { StepStats } from "@/components/widgets/shared/types";
 import type { CommandResponse } from "../../types/displayProfile";
-import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import type { BreakpointSnapshot } from "./types";
+import { getApiBase, tracedFetch, fetchBreakpoints, resumeBreakpoint } from "@/lib/runner-api";
 import { useTaskRunControls } from "@/hooks/graphql";
 import { createLogger } from "@/lib/logger";
 
@@ -206,6 +208,69 @@ export function DashboardPage({
 
   const handleDismissCompletion = useCallback(() => {
     setShowCompletion(false);
+  }, []);
+
+  // --- Breakpoint state ---
+  const [breakpointSnapshot, setBreakpointSnapshot] = useState<BreakpointSnapshot | null>(null);
+  const [showBreakpointInspector, setShowBreakpointInspector] = useState(false);
+  const breakpointPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Poll for active breakpoints while a task is running
+  useEffect(() => {
+    const taskId = state.taskInfo?.taskId;
+    if (!taskId || !state.isRunning) {
+      setBreakpointSnapshot(null);
+      if (breakpointPollRef.current) {
+        clearInterval(breakpointPollRef.current);
+        breakpointPollRef.current = null;
+      }
+      return;
+    }
+
+    const pollBreakpoints = async () => {
+      try {
+        const snapshots = await fetchBreakpoints(taskId);
+        const waiting = snapshots.find((s) => s.status === "waiting") ?? null;
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- polling callback
+        setBreakpointSnapshot(waiting);
+      } catch {
+        // Endpoint may not exist yet or task has no breakpoints - ignore
+      }
+    };
+
+    // Initial poll
+    pollBreakpoints();
+    // Poll every 3 seconds
+    breakpointPollRef.current = setInterval(pollBreakpoints, 3000);
+
+    return () => {
+      if (breakpointPollRef.current) {
+        clearInterval(breakpointPollRef.current);
+        breakpointPollRef.current = null;
+      }
+    };
+  }, [state.taskInfo?.taskId, state.isRunning]);
+
+  const handleResumeBreakpoint = useCallback(async () => {
+    const taskId = state.taskInfo?.taskId;
+    if (!taskId || !breakpointSnapshot) return;
+
+    try {
+      await resumeBreakpoint(taskId, breakpointSnapshot.id);
+      setBreakpointSnapshot(null);
+      setShowBreakpointInspector(false);
+      log.debug(`Resumed breakpoint ${breakpointSnapshot.id}`);
+    } catch (error) {
+      console.error("[Dashboard] Failed to resume breakpoint:", error);
+    }
+  }, [state.taskInfo?.taskId, breakpointSnapshot]);
+
+  const handleInspectBreakpoint = useCallback(() => {
+    setShowBreakpointInspector(true);
+  }, []);
+
+  const handleCloseBreakpointInspector = useCallback(() => {
+    setShowBreakpointInspector(false);
   }, []);
 
   // Determine if a flow is currently active and should receive control commands
@@ -493,6 +558,9 @@ export function DashboardPage({
             totalStages={state.totalStages}
             onPlayPause={handlePlayPause}
             onStop={handleStop}
+            breakpointSnapshot={breakpointSnapshot}
+            onResumeBreakpoint={handleResumeBreakpoint}
+            onInspectBreakpoint={handleInspectBreakpoint}
           />
 
           {/* Orchestration Loop Banner - shown when this runner is orchestrating */}
@@ -531,6 +599,14 @@ export function DashboardPage({
 
           {/* Shortcuts Modal */}
           <ShortcutsModal isOpen={showShortcuts} onClose={() => setShowShortcuts(false)} />
+
+          {/* Breakpoint Inspector Panel */}
+          {showBreakpointInspector && (
+            <BreakpointInspector
+              snapshot={breakpointSnapshot}
+              onClose={handleCloseBreakpointInspector}
+            />
+          )}
 
           {/* Approval Dialog Overlay - shown when workflow is paused for human review */}
           {state.taskInfo?.taskId && (

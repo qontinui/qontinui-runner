@@ -293,6 +293,23 @@ export interface BottomBarProps {
   maxIterations?: number;
 }
 
+/** Breakpoint snapshot captured during execution */
+export interface BreakpointSnapshot {
+  id: string;
+  execution_id: string;
+  step_index: number;
+  step_name: string | null;
+  phase: string | null;
+  iteration: number | null;
+  variables_json: string;
+  last_screenshot_ref: string | null;
+  pending_steps_json: string;
+  freshness_ts: string;
+  status: "waiting" | "resumed" | "expired";
+  resumed_at: string | null;
+  created_at: string;
+}
+
 /** Props for IdleState component */
 export interface IdleStateProps {
   /** Callback to navigate to Recap page and set session workflow */

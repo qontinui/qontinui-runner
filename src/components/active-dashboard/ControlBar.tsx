@@ -6,10 +6,10 @@
  * and execution statistics.
  */
 
-import { Play, Pause, Square, RotateCcw, ToggleRight, ToggleLeft, Loader2 } from "lucide-react";
+import { Play, Pause, Square, RotateCcw, ToggleRight, ToggleLeft, Loader2, CircleDot, Eye } from "lucide-react";
 import { useAutoContinue } from "../../contexts";
 import { Button, Badge } from "../ui";
-import type { ExecutionStatus } from "./types";
+import type { ExecutionStatus, BreakpointSnapshot } from "./types";
 import type { TaskPhase, WorkflowStage } from "../../types/dashboard/activity-types";
 import { PHASE_DISPLAY_CONFIG, WORKFLOW_STAGE_CONFIG } from "../../types/dashboard/activity-types";
 import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
@@ -78,6 +78,12 @@ export interface ControlBarProps {
   onPlayPause?: () => void;
   /** Callback for stop button */
   onStop?: () => void;
+  /** Active breakpoint snapshot (if paused at a breakpoint) */
+  breakpointSnapshot?: BreakpointSnapshot | null;
+  /** Callback to resume from a breakpoint */
+  onResumeBreakpoint?: () => void;
+  /** Callback to open the breakpoint inspector panel */
+  onInspectBreakpoint?: () => void;
 }
 
 // Phase configuration using design system colors
@@ -334,6 +340,9 @@ export function ControlBar({
   showPhaseStepCounts = true,
   onPlayPause,
   onStop,
+  breakpointSnapshot,
+  onResumeBreakpoint,
+  onInspectBreakpoint,
 }: ControlBarProps) {
   const phaseInfo = PHASE_DISPLAY_CONFIG[phase];
   const phaseStyle = getPhaseConfig(phase);
@@ -413,6 +422,43 @@ export function ControlBar({
           >
             RUNNING
           </Badge>
+        )}
+        {/* Breakpoint indicator and controls */}
+        {breakpointSnapshot && breakpointSnapshot.status === "waiting" && (
+          <div className="flex items-center gap-2">
+            <Badge
+              className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium ${getAccentColors("amber").bg} ${getAccentColors("amber").text} ${getAccentColors("amber").border} border animate-phase-glow`}
+            >
+              <CircleDot className="w-3 h-3" />
+              Breakpoint
+            </Badge>
+            {breakpointSnapshot.step_name && (
+              <span
+                data-content-role="label"
+                data-content-label="breakpoint step"
+                className="text-xs font-mono text-muted-foreground truncate max-w-[180px]"
+                title={breakpointSnapshot.step_name}
+              >
+                {breakpointSnapshot.step_name}
+              </span>
+            )}
+            <button
+              onClick={onInspectBreakpoint}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${getAccentColors("blue").bg} ${getAccentColors("blue").text} hover:opacity-80`}
+              title="Inspect breakpoint state"
+            >
+              <Eye className="w-3 h-3" />
+              Inspect
+            </button>
+            <button
+              onClick={onResumeBreakpoint}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${getAccentColors("green").bg} ${getAccentColors("green").text} hover:opacity-80`}
+              title="Resume execution from breakpoint"
+            >
+              <Play className="w-3 h-3" />
+              Resume
+            </button>
+          </div>
         )}
         {/* Inline execution stats (compact mode) */}
         {showInlineStats && statsData && (isRunning || status === "completed") && (

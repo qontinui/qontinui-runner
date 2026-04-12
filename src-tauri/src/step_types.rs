@@ -147,6 +147,12 @@ pub enum StepType {
     Watcher,
 
     // ========================================================================
+    // Code Execution Steps
+    // ========================================================================
+    /// Execute inline Python code or a Python file in an optional sandbox.
+    CodeExecution,
+
+    // ========================================================================
     // Visual Assertion Steps
     // ========================================================================
     /// Visual assertion via UI Bridge auto module: text assertions (DOM/OCR),
@@ -268,6 +274,9 @@ impl StepType {
             // Watcher
             StepType::Watcher => Some(120_000), // 120 seconds (includes AI reasoning)
 
+            // Code Execution
+            StepType::CodeExecution => Some(10_000), // 10 seconds
+
             // Visual Assertion
             StepType::UiBridgeVisualAssertion => Some(5_000), // 5 seconds
         }
@@ -341,6 +350,9 @@ impl StepType {
             // Watcher
             "watcher" => Some(StepType::Watcher),
 
+            // Code Execution
+            "code_execution" | "codeexecution" | "code" => Some(StepType::CodeExecution),
+
             // Visual Assertion
             "ui_bridge_visual_assertion" | "uibridgevisualassertion" | "visual_assertion"
             | "visualassertion" => Some(StepType::UiBridgeVisualAssertion),
@@ -380,6 +392,7 @@ impl StepType {
             StepType::SaveWorkflowArtifact => "save_workflow_artifact",
             StepType::Macro => "macro",
             StepType::Watcher => "watcher",
+            StepType::CodeExecution => "code_execution",
             StepType::UiBridgeVisualAssertion => "ui_bridge_visual_assertion",
         }
     }
@@ -538,6 +551,7 @@ mod tests {
             StepType::AwasListActions,
             StepType::AwasExtractElements,
             StepType::NativeAccessibility,
+            StepType::CodeExecution,
             StepType::Macro,
             StepType::Watcher,
         ];

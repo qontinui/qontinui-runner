@@ -32,6 +32,7 @@
 //! See `handlers/mod.rs` for details on adding new step types.
 
 // Core executor and extracted submodules
+pub mod breakpoint;
 pub mod dag;
 #[allow(clippy::module_inception)]
 mod executor;

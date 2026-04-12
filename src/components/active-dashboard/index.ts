@@ -32,6 +32,7 @@ export { NewRunDialog } from "./NewRunDialog";
 export { ShortcutsModal } from "./ShortcutsModal";
 export { CompletionSummary } from "./CompletionSummary";
 export { ApprovalDialog } from "./ApprovalDialog";
+export { BreakpointInspector } from "./BreakpointInspector";
 
 // Legacy components (may be deprecated in future)
 export { LiveExecutionView } from "./LiveExecutionView";
@@ -95,6 +96,7 @@ export type {
   StatusPanelProps,
   BottomBarProps as LegacyBottomBarProps,
   IdleStateProps,
+  BreakpointSnapshot,
 } from "./types";
 
 // Constants

@@ -94,6 +94,27 @@ pub struct ExecutionStepConfig {
     #[serde(alias = "devModeOnly", alias = "dev_mode_only", default)]
     pub dev_mode_only: Option<bool>,
 
+    /// Pause execution AFTER this step completes, capture a snapshot, and wait for resume.
+    /// When true, the executor captures workflow state and suspends until an explicit
+    /// resume signal is received via the API.
+    #[serde(alias = "breakpoint", default)]
+    pub breakpoint: Option<bool>,
+
+    // ========================================================================
+    // Code Execution Step Fields
+    // ========================================================================
+    /// Inline Python code to execute in the sandbox
+    #[serde(alias = "code", default)]
+    pub code: Option<String>,
+
+    /// Path to a Python file to execute in the sandbox
+    #[serde(alias = "code_file", alias = "codeFile", default)]
+    pub code_file: Option<String>,
+
+    /// Sandbox mode: "enforce" (block on violation) or "warn" (log and continue)
+    #[serde(alias = "sandbox_mode", alias = "sandboxMode", default)]
+    pub sandbox_mode: Option<String>,
+
     // ========================================================================
     // Data Flow (NEW - replaces gates)
     // ========================================================================

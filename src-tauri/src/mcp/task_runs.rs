@@ -2840,6 +2840,115 @@ pub async fn bulk_review_deferred_questions(
 }
 
 // ============================================================================
+// Breakpoint API Handlers
+// ============================================================================
+
+/// List breakpoint snapshots for a task run.
+pub async fn list_breakpoint_snapshots(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let snapshots = state
+        .app_state
+        .pg_db
+        .list_breakpoint_snapshots(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "snapshots": snapshots,
+        "count": snapshots.len(),
+    })))
+}
+
+/// Get a specific breakpoint snapshot.
+pub async fn get_breakpoint_snapshot(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path((id, snapshot_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let snapshot = state
+        .app_state
+        .pg_db
+        .get_breakpoint_snapshot(&snapshot_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Breakpoint snapshot not found: {}", snapshot_id),
+            )
+        })?;
+
+    // Verify it belongs to the given task run
+    if snapshot.execution_id != id {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Snapshot {} does not belong to task run {}", snapshot_id, id),
+        ));
+    }
+
+    Ok(Json(serde_json::to_value(&snapshot).unwrap_or_default()))
+}
+
+/// Resume a breakpoint snapshot.
+pub async fn resume_breakpoint_snapshot(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path((id, snapshot_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify snapshot exists and belongs to this task run
+    let snapshot = state
+        .app_state
+        .pg_db
+        .get_breakpoint_snapshot(&snapshot_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Breakpoint snapshot not found: {}", snapshot_id),
+            )
+        })?;
+
+    if snapshot.execution_id != id {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Snapshot {} does not belong to task run {}", snapshot_id, id),
+        ));
+    }
+
+    if snapshot.status != "waiting" {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Snapshot {} is not waiting (current status: {})",
+                snapshot_id, snapshot.status
+            ),
+        ));
+    }
+
+    let resumed = state
+        .app_state
+        .pg_db
+        .resume_breakpoint_snapshot(&snapshot_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if resumed {
+        info!("Breakpoint snapshot {} resumed via API", snapshot_id);
+        Ok(Json(serde_json::json!({
+            "snapshot_id": snapshot_id,
+            "status": "resumed",
+        })))
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            format!("Failed to resume snapshot {} — may already be resumed", snapshot_id),
+        ))
+    }
+}
+
+// ============================================================================
 // End Task Run HTTP API Handlers
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
@@ -2877,6 +2986,18 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/execution-spans", get(get_execution_spans))
         .route("/task-runs/{id}/migrate-logs", post(migrate_task_run_logs))
         .route("/task-runs/{id}/checkpoints", get(get_task_run_checkpoints))
+        .route(
+            "/task-runs/{id}/breakpoints",
+            get(list_breakpoint_snapshots),
+        )
+        .route(
+            "/task-runs/{id}/breakpoints/{snapshot_id}",
+            get(get_breakpoint_snapshot),
+        )
+        .route(
+            "/task-runs/{id}/breakpoints/{snapshot_id}/resume",
+            post(resume_breakpoint_snapshot),
+        )
         .route(
             "/task-runs/{id}/verification-results",
             get(get_task_run_verification_results),

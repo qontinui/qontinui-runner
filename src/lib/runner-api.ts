@@ -29,3 +29,31 @@ export function getWsBase(): string {
 }
 
 export { tracedFetch } from "./traced-fetch";
+
+import { tracedFetch } from "./traced-fetch";
+import type { BreakpointSnapshot } from "../components/active-dashboard/types";
+
+/**
+ * Fetch all breakpoint snapshots for a task run.
+ */
+export async function fetchBreakpoints(taskRunId: string): Promise<BreakpointSnapshot[]> {
+  const response = await tracedFetch(`${getApiBase()}/task-runs/${encodeURIComponent(taskRunId)}/breakpoints`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch breakpoints: ${response.status}`);
+  }
+  const data = await response.json();
+  return data.snapshots ?? [];
+}
+
+/**
+ * Resume a paused breakpoint, allowing execution to continue.
+ */
+export async function resumeBreakpoint(taskRunId: string, snapshotId: string): Promise<void> {
+  const response = await tracedFetch(
+    `${getApiBase()}/task-runs/${encodeURIComponent(taskRunId)}/breakpoints/${encodeURIComponent(snapshotId)}/resume`,
+    { method: "POST" },
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to resume breakpoint: ${response.status}`);
+  }
+}

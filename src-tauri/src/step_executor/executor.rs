@@ -46,6 +46,7 @@ use crate::str_utils::truncate_str;
 use crate::unified_workflow_executor::get_parent_task_id;
 
 // Handler system imports
+use super::breakpoint::{BreakpointManager, StalenessCheck};
 use super::handlers::{HandlerContext, HandlerRegistry};
 use serde_json::json;
 use std::collections::HashMap;
@@ -719,6 +720,121 @@ impl StepExecutor {
                 failure_category: None,
                 interrupted: None,
             });
+
+            // ================================================================
+            // Breakpoint: pause execution after this step if annotated
+            // ================================================================
+            if step.breakpoint.unwrap_or(false) && success {
+                let bp_step_name = step.name.clone().unwrap_or_else(|| step.step_type.clone());
+                info!(
+                    "Breakpoint hit after step {}/{}: {} — pausing execution",
+                    index + 1,
+                    steps.len(),
+                    bp_step_name
+                );
+
+                // Serialize runtime context and remaining steps for the snapshot
+                let variables_json = serde_json::to_string(&json!({
+                    "runtime_context": serde_json::to_value(&self.runtime_context).unwrap_or(json!(null)),
+                    "shared_variables": self.shared_variables.get_all(),
+                }))
+                .unwrap_or_else(|_| "{}".to_string());
+
+                let pending_steps_json = if index + 1 < steps.len() {
+                    serde_json::to_string(&steps[index + 1..]).unwrap_or_else(|_| "[]".to_string())
+                } else {
+                    "[]".to_string()
+                };
+
+                let snapshot = BreakpointManager::build_snapshot(
+                    execution_id,
+                    index,
+                    step.name.clone(),
+                    step.phase.clone(),
+                    None, // iteration set by caller if needed
+                    variables_json,
+                    results.last().and_then(|r| r.screenshot_path.clone()),
+                    pending_steps_json,
+                );
+
+                let bp_manager = BreakpointManager::new(self.app_state.clone());
+
+                // Log breakpoint event
+                self.log_step_event(
+                    &log_task_run_id,
+                    step,
+                    index,
+                    "breakpoint_hit",
+                    &format!(
+                        "Breakpoint hit after step {}/{}: {} — waiting for resume",
+                        index + 1,
+                        steps.len(),
+                        bp_step_name
+                    ),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+
+                // Save snapshot and wait for resume
+                match bp_manager.save_snapshot(&snapshot).await {
+                    Ok(_) => {
+                        info!("Breakpoint snapshot {} saved, waiting for resume", snapshot.id);
+
+                        // Set task status to paused
+                        let parent_id = get_parent_task_id(execution_id);
+                        let _ = self
+                            .app_state
+                            .pg_db
+                            .update_task_run_status(&parent_id, "paused")
+                            .await;
+
+                        // Block until resumed
+                        if let Err(e) = bp_manager.wait_for_resume(&snapshot.id, execution_id).await
+                        {
+                            warn!("Breakpoint wait error: {} — continuing execution", e);
+                        }
+
+                        // Check staleness and warn
+                        match bp_manager.check_staleness(&snapshot) {
+                            StalenessCheck::Stale(age) => {
+                                let stale_msg = format!(
+                                    "Breakpoint snapshot is stale ({} minutes old) — state may have changed",
+                                    age.num_minutes()
+                                );
+                                warn!("{}", stale_msg);
+                                self.log_step_event(
+                                    &log_task_run_id,
+                                    step,
+                                    index,
+                                    "breakpoint_stale",
+                                    &stale_msg,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                );
+                            }
+                            StalenessCheck::Fresh => {}
+                        }
+
+                        // Restore task status to running
+                        let _ = self
+                            .app_state
+                            .pg_db
+                            .update_task_run_status(&parent_id, "running")
+                            .await;
+
+                        info!("Breakpoint {} resumed — continuing execution", snapshot.id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to save breakpoint snapshot: {} — continuing without pause", e);
+                    }
+                }
+            }
         }
 
         let successful_steps = results.iter().filter(|r| r.success).count();

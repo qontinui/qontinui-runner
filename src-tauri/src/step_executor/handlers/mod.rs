@@ -79,6 +79,7 @@ pub(super) mod check_group;
 pub(crate) mod shell_command;
 pub(super) mod test;
 // Active handlers
+mod code_execution;
 mod command;
 mod execute_playbook;
 mod native_accessibility;
@@ -92,6 +93,7 @@ mod workflow_fixup;
 mod workflow_ref;
 
 // Re-export handlers for registration
+use code_execution::CodeExecutionHandler;
 use command::CommandHandler;
 use execute_playbook::ExecutePlaybookHandler;
 use native_accessibility::NativeAccessibilityHandler;
@@ -479,6 +481,7 @@ impl HandlerRegistry {
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 
+        registry.register(CodeExecutionHandler);
         registry.register(CommandHandler);
         registry.register(ExecutePlaybookHandler);
         registry.register(NativeAccessibilityHandler);

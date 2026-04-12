@@ -8,6 +8,7 @@ pub mod adaptive_learning;
 pub mod agentic_metrics;
 pub mod ai_sessions;
 pub mod approval_gates;
+pub mod breakpoints;
 pub mod cached_specs;
 pub mod canary;
 pub mod canvas;
@@ -755,6 +756,29 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_ri_port ON runner_instances(port);
             CREATE INDEX IF NOT EXISTS idx_ri_status ON runner_instances(status);
             CREATE INDEX IF NOT EXISTS idx_ri_heartbeat ON runner_instances(last_heartbeat);
+        "#,
+    },
+    Migration {
+        version: 16,
+        description: "Add breakpoint_snapshots table for step-level debugging",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS breakpoint_snapshots (
+                id                  TEXT PRIMARY KEY,
+                execution_id        TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+                step_index          INTEGER NOT NULL,
+                step_name           TEXT,
+                phase               TEXT,
+                iteration           INTEGER,
+                variables_json      TEXT NOT NULL,
+                last_screenshot_ref TEXT,
+                pending_steps_json  TEXT NOT NULL,
+                freshness_ts        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status              TEXT NOT NULL DEFAULT 'waiting',
+                resumed_at          TIMESTAMPTZ,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_bps_execution ON breakpoint_snapshots(execution_id);
+            CREATE INDEX IF NOT EXISTS idx_bps_status ON breakpoint_snapshots(status);
         "#,
     },
 ];
