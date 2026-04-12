@@ -270,6 +270,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
       }
       devLoginRetryCount.current = 0;
       devLoginFailed.current = false;
+
+      // Signal UI Bridge to re-discover elements now that the
+      // authenticated page is rendered. Without this, the auto-register's
+      // initial scan captures login-page DOM and agents only see the
+      // login form elements in /control/snapshot.
+      window.dispatchEvent(new CustomEvent("ui-bridge-auth-complete"));
+
       return;
     }
 
