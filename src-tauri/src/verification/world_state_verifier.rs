@@ -77,8 +77,13 @@ impl WorldStateVerifier {
         }
     }
 
-    /// Build a verifier configured from QONTINUI_WORLD_STATE_VERIFIER_*
-    /// env vars. Pairs with `verification::mode::parse_mode`.
+    /// Build a verifier from the live in-process config (backed by
+    /// `WsvConfig::global()`). The config is seeded from env vars at
+    /// startup and overridden by persisted settings / the Settings UI.
+    ///
+    /// Named `from_env` for back-compat with call sites that predate
+    /// the live-config refactor — it reads from the global, not raw
+    /// env vars.
     pub fn from_env() -> Self {
         Self::new(super::mode::endpoint(), super::mode::model_name())
     }
