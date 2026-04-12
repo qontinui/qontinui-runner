@@ -410,7 +410,7 @@ mod tests {
             dynamic_steps: Vec::new(),
             pending_health_regression: None,
             compensation_manager: CompensationManager::new(
-                crate::database::pg::PgDb::new_blocking_for_test(),
+                crate::database::pg::PgDb::new_noop_for_test(),
             ),
             accumulated_diffs: Vec::new(),
             initial_source_commit: None,

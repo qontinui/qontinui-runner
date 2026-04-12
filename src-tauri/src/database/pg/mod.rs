@@ -2361,6 +2361,24 @@ impl PgDb {
                 .expect("PgDb connection for test"),
         )
     }
+
+    /// Test-only: create a PgDb with a pool that will error on any actual
+    /// query. Use this for unit tests that need a `LoopContext` or
+    /// `CompensationManager` but never actually call database methods.
+    /// Any attempt to `pool.get()` returns an immediate error because
+    /// the underlying manager has an unreachable host.
+    #[cfg(test)]
+    pub fn new_noop_for_test() -> std::sync::Arc<Self> {
+        use deadpool_postgres::{Config, Runtime};
+
+        let mut cfg = Config::new();
+        cfg.host = Some("__noop_test_host_that_does_not_exist__".to_string());
+        cfg.dbname = Some("noop".to_string());
+        let pool = cfg
+            .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
+            .expect("noop pool creation should not fail (no connection attempted)");
+        std::sync::Arc::new(Self { pool })
+    }
 }
 
 // ============================================================================
