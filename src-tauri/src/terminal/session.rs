@@ -241,7 +241,7 @@ impl TerminalSession {
                                 );
                             }
                             // Broadcast to backend relay for remote mobile access
-                            crate::event_system::broadcaster::broadcast_ws_notification(
+                            crate::event_system::broadcast_ws_notification(
                                 &reader_app,
                                 "terminal-output",
                                 &serde_json::json!({
@@ -310,7 +310,7 @@ impl TerminalSession {
                     );
                 }
                 // Broadcast to backend relay for remote mobile access
-                crate::event_system::broadcaster::broadcast_ws_notification(
+                crate::event_system::broadcast_ws_notification(
                     &waiter_app,
                     "terminal-exit",
                     &serde_json::json!({
