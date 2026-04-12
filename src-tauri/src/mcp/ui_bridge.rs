@@ -1108,6 +1108,115 @@ fn snapshot_signature(snapshot: &serde_json::Value) -> (usize, u64) {
     (elements.len(), hasher.finish())
 }
 
+/// Execute multiple element actions in a single HTTP round-trip.
+///
+/// Each step is forwarded to the frontend's `execute_action` handler
+/// sequentially. Supports `stopOnFailure` (default true) and
+/// `delayBetweenMs` (default 0). Returns per-step results + aggregate
+/// counts.
+pub async fn ui_bridge_batch_actions_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let steps = request
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let stop_on_failure = request
+        .get("stopOnFailure")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let delay_between_ms = request
+        .get("delayBetweenMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    info!(
+        "UI Bridge API: Batch actions ({} steps, stopOnFailure={}, delay={}ms)",
+        steps.len(),
+        stop_on_failure,
+        delay_between_ms
+    );
+
+    let start = std::time::Instant::now();
+    let mut results = Vec::new();
+    let mut succeeded = 0u32;
+    let mut failed = 0u32;
+    let mut skipped = 0u32;
+    let mut stopped = false;
+
+    for (i, step) in steps.iter().enumerate() {
+        if stopped {
+            skipped += 1;
+            results.push(serde_json::json!({
+                "index": i,
+                "label": step.get("label"),
+                "elementId": step.get("elementId"),
+                "response": {"success": false, "error": "Skipped (previous step failed)"},
+            }));
+            continue;
+        }
+
+        if i > 0 && delay_between_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_between_ms)).await;
+        }
+
+        let element_id = step
+            .get("elementId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let action = step.get("action").cloned().unwrap_or(serde_json::json!({}));
+
+        let payload = serde_json::json!({
+            "id": element_id,
+            "action": action.get("action").and_then(|v| v.as_str()).unwrap_or("click"),
+            "params": action.get("params"),
+        });
+
+        let result =
+            ui_bridge_request_sync(&state, "execute_action", payload).await;
+
+        let (success, response) = match result {
+            Ok(data) => (
+                data.get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                data,
+            ),
+            Err(e) => (false, serde_json::json!({"success": false, "error": e})),
+        };
+
+        results.push(serde_json::json!({
+            "index": i,
+            "label": step.get("label"),
+            "elementId": element_id,
+            "response": response,
+        }));
+
+        if success {
+            succeeded += 1;
+        } else {
+            failed += 1;
+            if stop_on_failure {
+                stopped = true;
+            }
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "success": failed == 0,
+        "results": results,
+        "succeededCount": succeeded,
+        "failedCount": failed,
+        "skippedCount": skipped,
+        "durationMs": duration_ms,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))))
+}
+
 pub async fn ui_bridge_execute_action_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -9460,6 +9569,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/element/{id}/action",
             post(ui_bridge_execute_action_handler),
+        )
+        .route(
+            "/ui-bridge/control/batch-actions",
+            post(ui_bridge_batch_actions_handler),
         )
         .route(
             "/ui-bridge/control/components",
