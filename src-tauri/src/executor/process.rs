@@ -120,6 +120,27 @@ impl ProcessManager {
         // Set environment variable as backup
         cmd.env("QONTINUI_DISABLE_CONSOLE_LOGGING", "1");
 
+        // ── OpenCV DLL hardening (Windows) ─────────────────────────────
+        // On Windows, cv2 (opencv-python-headless) loads native DLLs at
+        // import time. Some backends (MSMF, Intel MFX, OpenCL) require
+        // system DLLs that may be absent, mismatched, or trigger CUDA
+        // version conflicts (RTX 5090 / Blackwell sm_120). If any of
+        // these backends fail to initialize, the entire cv2 import
+        // crashes with "DLL load failed: Invalid access to memory
+        // location" — killing the Python executor and cascading to a
+        // runner crash-loop via the watchdog.
+        //
+        // Since qontinui is a machine-vision library (not a video
+        // capture tool), we don't need MSMF or Intel MFX video I/O.
+        // Disabling these backends at the env level prevents the
+        // problematic DLL loads entirely.
+        cmd.env("OPENCV_VIDEOIO_PRIORITY_MSMF", "0");
+        cmd.env("OPENCV_VIDEOIO_PRIORITY_INTEL_MFX", "0");
+        // Disable OpenCL runtime probing — avoids GPU driver DLL
+        // conflicts when CUDA and integrated GPU coexist.
+        cmd.env("OPENCV_OPENCL_RUNTIME", "");
+        cmd.env("OPENCV_OPENCL_DEVICE", "disabled");
+
         // Inject trace context for cross-service correlation
         {
             let trace_id = uuid::Uuid::new_v4().to_string();
@@ -168,6 +189,12 @@ impl ProcessManager {
 
         // Set environment variable as backup
         cmd.env("QONTINUI_DISABLE_CONSOLE_LOGGING", "1");
+
+        // OpenCV DLL hardening — same rationale as spawn_process().
+        cmd.env("OPENCV_VIDEOIO_PRIORITY_MSMF", "0");
+        cmd.env("OPENCV_VIDEOIO_PRIORITY_INTEL_MFX", "0");
+        cmd.env("OPENCV_OPENCL_RUNTIME", "");
+        cmd.env("OPENCV_OPENCL_DEVICE", "disabled");
 
         // Inject trace context for cross-service correlation
         {
