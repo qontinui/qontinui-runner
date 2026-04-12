@@ -18,6 +18,7 @@ pub enum WorkflowEventType {
     RunCompleted,
     RunFailed,
     SessionCompleted,
+    TerminalExited,
     StepCompleted,
     HitlQuestionPending,
     RunnerCrashed,
@@ -219,6 +220,40 @@ pub fn emit_session_completed(
     tokio::spawn(post_workflow_event(event));
 }
 
+/// Emit a "terminal_exited" event. Call from the terminal waiter thread when a PTY exits.
+///
+/// Uses `tauri::async_runtime::spawn` instead of `tokio::spawn` because the
+/// terminal waiter runs on a plain `std::thread`, not a tokio task.
+pub fn emit_terminal_exited(terminal_id: &str, title: &str, exit_code: Option<i32>) {
+    let auth_manager = AuthManager::new();
+    let device_id = match auth_manager.get_device_id() {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    let exit_str = match exit_code {
+        Some(0) => "exited successfully".to_string(),
+        Some(c) => format!("exited with code {}", c),
+        None => "exited".to_string(),
+    };
+
+    let event = WorkflowEventPayload {
+        event_type: WorkflowEventType::TerminalExited,
+        device_id,
+        runner_name: get_runner_name(),
+        run_id: None,
+        summary: format!("Terminal '{}' {}", title, exit_str),
+        payload: Some(serde_json::json!({
+            "terminal_id": terminal_id,
+            "title": title,
+            "exit_code": exit_code,
+        })),
+        timestamp: now_iso(),
+    };
+
+    tauri::async_runtime::spawn(post_workflow_event(event));
+}
+
 /// Emit a generic workflow event via Tauri command.
 ///
 /// This allows the frontend to trigger events for lifecycle points it manages
@@ -242,6 +277,7 @@ pub async fn emit_workflow_event(
         "run_completed" => WorkflowEventType::RunCompleted,
         "run_failed" => WorkflowEventType::RunFailed,
         "session_completed" => WorkflowEventType::SessionCompleted,
+        "terminal_exited" => WorkflowEventType::TerminalExited,
         "step_completed" => WorkflowEventType::StepCompleted,
         "hitl_question_pending" => WorkflowEventType::HitlQuestionPending,
         "runner_crashed" => WorkflowEventType::RunnerCrashed,

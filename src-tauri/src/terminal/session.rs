@@ -240,6 +240,15 @@ impl TerminalSession {
                                     "Failed to emit terminal output event"
                                 );
                             }
+                            // Broadcast to backend relay for remote mobile access
+                            crate::event_system::broadcaster::broadcast_ws_notification(
+                                &reader_app,
+                                "terminal-output",
+                                &serde_json::json!({
+                                    "terminal_id": &reader_id,
+                                    "data": &event.data,
+                                }),
+                            );
                             reader_bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                         }
                         Err(e) => {
@@ -255,6 +264,7 @@ impl TerminalSession {
 
         // Spawn waiter thread: detects process exit
         let waiter_id = id.clone();
+        let waiter_title = title.clone();
         let waiter_alive = is_alive.clone();
         let waiter_exit = exit_code.clone();
         let waiter_app = app_handle;
@@ -299,6 +309,22 @@ impl TerminalSession {
                         "Failed to emit terminal exit event"
                     );
                 }
+                // Broadcast to backend relay for remote mobile access
+                crate::event_system::broadcaster::broadcast_ws_notification(
+                    &waiter_app,
+                    "terminal-exit",
+                    &serde_json::json!({
+                        "terminal_id": &waiter_id,
+                        "exit_code": code,
+                    }),
+                );
+
+                // Push notification for mobile (fire-and-forget)
+                crate::commands::workflow_events::emit_terminal_exited(
+                    &waiter_id,
+                    &waiter_title,
+                    code,
+                );
             })
             .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
 
