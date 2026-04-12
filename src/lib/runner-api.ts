@@ -46,6 +46,19 @@ export async function fetchBreakpoints(taskRunId: string): Promise<BreakpointSna
 }
 
 /**
+ * Fetch a single breakpoint snapshot by ID.
+ */
+export async function fetchBreakpointDetail(taskRunId: string, snapshotId: string): Promise<BreakpointSnapshot> {
+  const response = await tracedFetch(
+    `${getApiBase()}/task-runs/${encodeURIComponent(taskRunId)}/breakpoints/${encodeURIComponent(snapshotId)}`,
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to fetch breakpoint detail: ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
  * Resume a paused breakpoint, allowing execution to continue.
  */
 export async function resumeBreakpoint(taskRunId: string, snapshotId: string): Promise<void> {
