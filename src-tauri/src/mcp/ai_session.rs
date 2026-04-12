@@ -242,6 +242,9 @@ pub async fn stop_ai_analysis(
             warn!("MCP API: Failed to stop task run {}: {}", task.id, e);
         }
 
+        // Expire any waiting breakpoint snapshots for this task (cleanup)
+        let _ = pg.expire_breakpoint_snapshots(&task.id).await;
+
         // Release URL locks, file registry entries, and exclusive file locks
         state.app_state.url_lock_manager.release_all(&task.id).await;
         state

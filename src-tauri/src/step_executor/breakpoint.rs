@@ -138,9 +138,106 @@ impl BreakpointManager {
             .map_err(|e| format!("Failed to save breakpoint snapshot: {}", e))
     }
 
+    /// Check whether Restate durable execution is enabled and healthy.
+    ///
+    /// Uses the same `should_use_restate` check as the rest of the runner.
+    /// Returns `false` if settings cannot be loaded or Restate is down.
+    async fn should_use_restate(&self) -> bool {
+        let settings = crate::settings::load_settings().restate;
+        crate::restate::launch::should_use_restate(&settings).await
+    }
+
+    /// Wait for resume using the Restate awakeable mechanism.
+    ///
+    /// 1. Creates an awakeable row in `restate_awakeables` with
+    ///    `awakeable_type = "breakpoint"` and `type_data = snapshot_id`.
+    /// 2. Polls the awakeable status until it is resolved (or the task is
+    ///    stopped/cancelled).
+    /// 3. On resolution, also updates the `breakpoint_snapshots` status to
+    ///    `resumed` for consistency.
+    async fn wait_for_resume_restate(
+        &self,
+        snapshot_id: &str,
+        execution_id: &str,
+    ) -> Result<(), String> {
+        // Generate a stable awakeable ID derived from the snapshot so the resume
+        // endpoint can locate it.  Format: "bp-<snapshot_id>"
+        let awakeable_id = format!("bp-{}", snapshot_id);
+
+        // Persist the awakeable row.
+        self.app_state
+            .pg_db
+            .save_restate_awakeable(&awakeable_id, execution_id, "breakpoint", Some(snapshot_id))
+            .await
+            .map_err(|e| format!("Failed to create breakpoint awakeable: {}", e))?;
+
+        info!(
+            awakeable_id = %awakeable_id,
+            snapshot_id = %snapshot_id,
+            execution_id = %execution_id,
+            "Breakpoint awakeable created — polling for resolution"
+        );
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+            // Check if task was stopped (takes priority)
+            match self.app_state.pg_db.get_task_run(execution_id).await {
+                Ok(Some(task)) if task.status == "stopped" || task.status == "cancelled" => {
+                    info!("Task {} stopped while at breakpoint (restate path)", execution_id);
+                    return Ok(());
+                }
+                _ => {}
+            }
+
+            // Check if the awakeable has been resolved
+            match self
+                .app_state
+                .pg_db
+                .find_pending_awakeable_by_type_data(execution_id, "breakpoint", snapshot_id)
+                .await
+            {
+                Ok(Some(_)) => {
+                    // Still pending — keep polling
+                    continue;
+                }
+                Ok(None) => {
+                    // No pending awakeable found — it was resolved (or never existed).
+                    // Ensure the breakpoint snapshot is marked resumed too.
+                    if let Err(e) = self
+                        .app_state
+                        .pg_db
+                        .resume_breakpoint_snapshot(snapshot_id)
+                        .await
+                    {
+                        // Best-effort: the snapshot may already be resumed via the
+                        // normal API path, which is fine.
+                        warn!(
+                            "Could not mark breakpoint snapshot {} as resumed: {} (may already be resumed)",
+                            snapshot_id, e
+                        );
+                    }
+                    info!("Breakpoint {} resumed via Restate awakeable", snapshot_id);
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        "Error checking awakeable status: {} — continuing to poll",
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+    }
+
     /// Wait for a resume signal by polling the snapshot status in PG.
     /// Returns when status changes from Waiting to Resumed.
     /// Also returns if the task is stopped (caller should handle).
+    ///
+    /// When Restate durable execution is enabled and healthy, delegates to
+    /// the awakeable-based path (`wait_for_resume_restate`). Otherwise falls
+    /// back to direct PG polling of the `breakpoint_snapshots` table.
     pub async fn wait_for_resume(
         &self,
         snapshot_id: &str,
@@ -152,6 +249,13 @@ impl BreakpointManager {
             "Breakpoint hit — waiting for resume signal"
         );
 
+        // Delegate to Restate awakeable path when available.
+        if self.should_use_restate().await {
+            info!("Restate enabled — using awakeable path for breakpoint {}", snapshot_id);
+            return self.wait_for_resume_restate(snapshot_id, execution_id).await;
+        }
+
+        // Fallback: PG polling
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
@@ -295,5 +399,80 @@ mod tests {
         // Can't easily test with real AppState, but we can test the check logic directly
         let age = Utc::now() - snapshot.freshness_ts;
         assert!(age < Duration::minutes(1));
+    }
+
+    #[test]
+    fn test_staleness_stale() {
+        let mut snapshot = BreakpointManager::build_snapshot(
+            "test-stale",
+            0,
+            None,
+            None,
+            None,
+            "{}".to_string(),
+            None,
+            "[]".to_string(),
+        );
+        // Backdate the freshness timestamp to 30 minutes ago (well past the 10-min threshold)
+        snapshot.freshness_ts = Utc::now() - Duration::minutes(30);
+
+        // Manually replicate check_staleness logic (we can't construct BreakpointManager
+        // without AppState, but the logic is purely timestamp-based)
+        let threshold = Duration::minutes(DEFAULT_STALENESS_THRESHOLD_MINUTES);
+        let age = Utc::now() - snapshot.freshness_ts;
+        assert!(
+            age > threshold,
+            "Expected stale: age {:?} should exceed threshold {:?}",
+            age,
+            threshold
+        );
+    }
+
+    #[test]
+    fn test_build_snapshot_fields() {
+        let snapshot = BreakpointManager::build_snapshot(
+            "exec-42",
+            3,
+            Some("Verify login".to_string()),
+            Some("verification".to_string()),
+            Some(2),
+            r#"{"user": "admin"}"#.to_string(),
+            Some("/tmp/screenshot.png".to_string()),
+            r#"[{"name": "next_step"}]"#.to_string(),
+        );
+
+        assert_eq!(snapshot.execution_id, "exec-42");
+        assert_eq!(snapshot.step_index, 3);
+        assert_eq!(snapshot.step_name.as_deref(), Some("Verify login"));
+        assert_eq!(snapshot.phase.as_deref(), Some("verification"));
+        assert_eq!(snapshot.iteration, Some(2));
+        assert_eq!(snapshot.variables_json, r#"{"user": "admin"}"#);
+        assert_eq!(
+            snapshot.last_screenshot_ref.as_deref(),
+            Some("/tmp/screenshot.png")
+        );
+        assert_eq!(snapshot.pending_steps_json, r#"[{"name": "next_step"}]"#);
+        assert_eq!(snapshot.status, BreakpointStatus::Waiting);
+        assert!(snapshot.resumed_at.is_none());
+        // ID should be a valid UUID (36 chars with hyphens)
+        assert_eq!(snapshot.id.len(), 36);
+        // freshness_ts and created_at should be very recent
+        let age = Utc::now() - snapshot.freshness_ts;
+        assert!(age < Duration::seconds(5));
+        assert_eq!(snapshot.freshness_ts, snapshot.created_at);
+    }
+
+    #[test]
+    fn test_breakpoint_status_display() {
+        assert_eq!(BreakpointStatus::Waiting.to_string(), "waiting");
+        assert_eq!(BreakpointStatus::Resumed.to_string(), "resumed");
+        assert_eq!(BreakpointStatus::Expired.to_string(), "expired");
+    }
+
+    #[test]
+    fn test_breakpoint_status_parse_invalid() {
+        let result: Result<BreakpointStatus, _> = "invalid".parse();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown breakpoint status"));
     }
 }

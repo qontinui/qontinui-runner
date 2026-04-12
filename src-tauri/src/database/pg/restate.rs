@@ -249,6 +249,58 @@ impl PgDb {
         Ok(())
     }
 
+    /// Find a pending awakeable by type and type_data.
+    ///
+    /// Used to locate the awakeable associated with a specific breakpoint snapshot
+    /// (where `awakeable_type = "breakpoint"` and `type_data = snapshot_id`).
+    pub async fn find_pending_awakeable_by_type_data(
+        &self,
+        execution_id: &str,
+        awakeable_type: &str,
+        type_data: &str,
+    ) -> Result<Option<RestateAwakeable>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                r#"SELECT awakeable_id,
+                          execution_id,
+                          awakeable_type,
+                          type_data,
+                          status,
+                          created_at::TEXT,
+                          resolved_at::TEXT
+                   FROM restate_awakeables
+                   WHERE execution_id = $1
+                     AND awakeable_type = $2
+                     AND type_data = $3
+                     AND status = 'pending'
+                   ORDER BY created_at DESC
+                   LIMIT 1"#,
+                &[
+                    &execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &awakeable_type,
+                    &type_data,
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG find_pending_awakeable_by_type_data: {}", e))?;
+
+        Ok(row.map(|r| RestateAwakeable {
+            awakeable_id: r.get(0),
+            execution_id: r.get(1),
+            awakeable_type: r.get(2),
+            type_data: r.get(3),
+            status: r.get(4),
+            created_at: r.get(5),
+            resolved_at: r.get(6),
+        }))
+    }
+
     /// Get all pending awakeables for a given execution.
     pub async fn get_pending_awakeables(
         &self,

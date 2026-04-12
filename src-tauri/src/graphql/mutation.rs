@@ -317,6 +317,13 @@ impl MutationRoot {
             }
         }
 
+        // Expire any waiting breakpoint snapshots for this task (cleanup)
+        let _ = state
+            .app_state
+            .pg_db
+            .expire_breakpoint_snapshots(&id)
+            .await;
+
         // Release URL locks
         state.app_state.url_lock_manager.release_all(&id).await;
 

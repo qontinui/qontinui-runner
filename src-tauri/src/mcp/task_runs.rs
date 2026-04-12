@@ -223,6 +223,13 @@ pub async fn stop_task_run(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    // Expire any waiting breakpoint snapshots for this task (cleanup)
+    let _ = state
+        .app_state
+        .pg_db
+        .expire_breakpoint_snapshots(&id)
+        .await;
+
     // Explicitly release URL locks for this task (don't rely solely on
     // WorkflowDropGuard's sync release, which can fail under contention)
     state.app_state.url_lock_manager.release_all(&id).await;
@@ -2936,6 +2943,42 @@ pub async fn resume_breakpoint_snapshot(
 
     if resumed {
         info!("Breakpoint snapshot {} resumed via API", snapshot_id);
+
+        // Best-effort: if a Restate awakeable exists for this breakpoint, resolve it
+        // so the durable execution framework also unblocks.
+        let awakeable_id = format!("bp-{}", snapshot_id);
+        if let Ok(()) = state
+            .app_state
+            .pg_db
+            .resolve_restate_awakeable(&awakeable_id)
+            .await
+        {
+            info!(
+                "Resolved Restate awakeable {} for breakpoint {}",
+                awakeable_id, snapshot_id
+            );
+
+            // Also call the Restate ingress resolve endpoint so the durable
+            // invocation resumes server-side.
+            let restate_settings = crate::settings::load_settings().restate;
+            if crate::restate::launch::should_use_restate(&restate_settings).await {
+                if let Err(e) = crate::restate::launch::resolve_awakeable(
+                    &awakeable_id,
+                    &serde_json::json!({ "snapshot_id": snapshot_id, "status": "resumed" }),
+                    &restate_settings.ingress_url(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "Failed to resolve Restate awakeable via ingress: {} (polling fallback will catch it)",
+                        e
+                    );
+                }
+            }
+        }
+        // If resolve_restate_awakeable returns Err, there was no pending awakeable —
+        // that's expected when Restate is not in use.
+
         Ok(Json(serde_json::json!({
             "snapshot_id": snapshot_id,
             "status": "resumed",
