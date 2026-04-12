@@ -17,6 +17,7 @@ pub enum WorkflowEventType {
     RunStarted,
     RunCompleted,
     RunFailed,
+    SessionCompleted,
     StepCompleted,
     HitlQuestionPending,
     RunnerCrashed,
@@ -177,6 +178,47 @@ pub fn emit_run_failed(run_id: &str, error_message: &str) {
     tokio::spawn(post_workflow_event(event));
 }
 
+/// Emit a "session_completed" event. Call after an AI session finishes within a run.
+pub fn emit_session_completed(
+    run_id: &str,
+    session_number: u32,
+    duration_seconds: i64,
+    workflow_name: &str,
+) {
+    let auth_manager = AuthManager::new();
+    let device_id = match auth_manager.get_device_id() {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    let duration_str = if duration_seconds < 60 {
+        format!("{}s", duration_seconds)
+    } else {
+        let mins = duration_seconds / 60;
+        let secs = duration_seconds % 60;
+        format!("{}m {}s", mins, secs)
+    };
+
+    let event = WorkflowEventPayload {
+        event_type: WorkflowEventType::SessionCompleted,
+        device_id,
+        runner_name: get_runner_name(),
+        run_id: Some(run_id.to_string()),
+        summary: format!(
+            "Session {} of '{}' completed in {}",
+            session_number, workflow_name, duration_str
+        ),
+        payload: Some(serde_json::json!({
+            "session_number": session_number,
+            "duration_seconds": duration_seconds,
+            "workflow_name": workflow_name,
+        })),
+        timestamp: now_iso(),
+    };
+
+    tokio::spawn(post_workflow_event(event));
+}
+
 /// Emit a generic workflow event via Tauri command.
 ///
 /// This allows the frontend to trigger events for lifecycle points it manages
@@ -199,6 +241,7 @@ pub async fn emit_workflow_event(
         "run_started" => WorkflowEventType::RunStarted,
         "run_completed" => WorkflowEventType::RunCompleted,
         "run_failed" => WorkflowEventType::RunFailed,
+        "session_completed" => WorkflowEventType::SessionCompleted,
         "step_completed" => WorkflowEventType::StepCompleted,
         "hitl_question_pending" => WorkflowEventType::HitlQuestionPending,
         "runner_crashed" => WorkflowEventType::RunnerCrashed,

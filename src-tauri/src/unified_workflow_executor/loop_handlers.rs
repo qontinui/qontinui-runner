@@ -2130,6 +2130,14 @@ impl LoopController {
             });
         }
 
+        // Emit session_completed workflow event for mobile push notifications.
+        crate::commands::workflow_events::emit_session_completed(
+            &config.execution_id,
+            ctx.iteration,
+            (agentic_duration_ms / 1000) as i64,
+            &config.workflow_name,
+        );
+
         // Record findings from AI output as knowledge entries
         let parsed_findings = if let Some(output) = agentic_outcome.output() {
             let findings = parse_findings_from_output(output);
