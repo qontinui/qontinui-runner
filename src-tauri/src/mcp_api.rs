@@ -641,6 +641,7 @@ pub fn create_router(
         .merge(crate::mcp::dom_capture::routes())
         .merge(crate::mcp::error_monitor::routes())
         .merge(crate::mcp::extraction::routes())
+        .merge(crate::mcp::file_browser::routes())
         .merge(crate::mcp::file_registry::routes())
         .merge(crate::mcp::findings_api::routes())
         .merge(crate::mcp::generation_rules_api::routes())
@@ -718,6 +719,7 @@ pub fn create_router(
         .merge(crate::mcp::streaming::routes())
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
+        .route("/cloud-relay/login", post(cloud_relay_login))
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))
@@ -734,6 +736,31 @@ async fn cloud_relay_start(
 ) -> axum::Json<serde_json::Value> {
     crate::mcp::backend_relay::commands::auto_start_cloud_relay(state).await;
     axum::Json(serde_json::json!({"status": "started"}))
+}
+
+/// HTTP endpoint to login and refresh stored auth tokens, then restart relay
+async fn cloud_relay_login(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    let email = body["email"].as_str().unwrap_or_default().to_string();
+    let password = body["password"].as_str().unwrap_or_default().to_string();
+
+    if email.is_empty() || password.is_empty() {
+        return axum::Json(serde_json::json!({"error": "email and password required"}));
+    }
+
+    match crate::commands::auth::login(email, password).await {
+        Ok(resp) => {
+            // Restart relay with fresh tokens
+            crate::mcp::backend_relay::commands::auto_start_cloud_relay(state).await;
+            axum::Json(serde_json::json!({
+                "status": "logged_in",
+                "user": resp.user.email,
+            }))
+        }
+        Err(e) => axum::Json(serde_json::json!({"error": e})),
+    }
 }
 
 /// HTTP endpoint to check cloud relay status

@@ -42,6 +42,7 @@ pub mod dom_capture;
 pub mod entity_profiles_api;
 pub mod error_monitor;
 pub mod extraction;
+pub mod file_browser;
 pub mod file_registry;
 pub mod findings_api;
 pub mod generation_rules_api;
