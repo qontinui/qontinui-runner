@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tauri::Manager;
@@ -309,21 +310,31 @@ async fn handle_outbound<S>(
             Ok(event) => {
                 let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("");
 
-                // Only forward ai-output and session-state events
-                if channel != "ai-output" && channel != "session-state" {
-                    continue;
-                }
-
+                // Forward ai-output, session-state, and terminal events
                 let relay_msg = if channel == "ai-output" {
                     serde_json::json!({
                         "type": "chat_response",
                         "data": event.get("payload"),
                     })
-                } else {
+                } else if channel == "session-state" {
                     serde_json::json!({
                         "type": "chat_session_state",
                         "data": event.get("payload"),
                     })
+                } else if channel == "terminal-output" {
+                    serde_json::json!({
+                        "type": "terminal_output",
+                        "terminal_id": event.get("payload").and_then(|p| p.get("terminal_id")),
+                        "data": event.get("payload").and_then(|p| p.get("data")),
+                    })
+                } else if channel == "terminal-exit" {
+                    serde_json::json!({
+                        "type": "terminal_exit",
+                        "terminal_id": event.get("payload").and_then(|p| p.get("terminal_id")),
+                        "exit_code": event.get("payload").and_then(|p| p.get("exit_code")),
+                    })
+                } else {
+                    continue;
                 };
 
                 let text = serde_json::to_string(&relay_msg).unwrap_or_default();
@@ -902,6 +913,210 @@ async fn handle_relay_command(
             }
         }
 
+        // ====================================================================
+        // Terminal relay commands (from mobile via backend)
+        // ====================================================================
+        "terminal_list" => {
+            let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
+                .app_handle
+                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                .map(|s| s.inner().clone());
+
+            if let Some(tm) = terminal_manager {
+                let terminals = tm.list();
+                Some(serde_json::json!({
+                    "type": "terminal_sessions",
+                    "terminals": terminals,
+                    "request_id": data.get("request_id"),
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "type": "error",
+                    "message": "TerminalManager not available",
+                    "request_id": data.get("request_id"),
+                }))
+            }
+        }
+
+        "terminal_create" => {
+            let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
+                .app_handle
+                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                .map(|s| s.inner().clone());
+
+            if let Some(tm) = terminal_manager {
+                let title = data.get("title").and_then(|v| v.as_str()).map(String::from);
+                let working_dir = data
+                    .get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let cols = data.get("cols").and_then(|v| v.as_u64()).map(|v| v as u16);
+                let rows = data.get("rows").and_then(|v| v.as_u64()).map(|v| v as u16);
+
+                match tm.create(
+                    title,
+                    working_dir,
+                    None, // page_id
+                    cols,
+                    rows,
+                    api_state.app_handle.clone(),
+                ) {
+                    Ok(info) => Some(serde_json::json!({
+                        "type": "terminal_created",
+                        "terminal": info,
+                        "request_id": data.get("request_id"),
+                    })),
+                    Err(e) => Some(serde_json::json!({
+                        "type": "error",
+                        "message": format!("Failed to create terminal: {}", e),
+                        "request_id": data.get("request_id"),
+                    })),
+                }
+            } else {
+                Some(serde_json::json!({
+                    "type": "error",
+                    "message": "TerminalManager not available",
+                    "request_id": data.get("request_id"),
+                }))
+            }
+        }
+
+        "terminal_input" => {
+            let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
+                .app_handle
+                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                .map(|s| s.inner().clone());
+
+            if let Some(tm) = terminal_manager {
+                let terminal_id = data
+                    .get("terminal_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let input_data = data.get("data").and_then(|v| v.as_str()).unwrap_or("");
+
+                if let Some(session) = tm.get(terminal_id) {
+                    match STANDARD.decode(input_data) {
+                        Ok(bytes) => {
+                            let _ = session.write(&bytes);
+                        }
+                        Err(e) => {
+                            warn!("Invalid base64 terminal input: {}", e);
+                        }
+                    }
+                }
+            }
+            // Fire-and-forget, no response
+            None
+        }
+
+        "terminal_resize" => {
+            let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
+                .app_handle
+                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                .map(|s| s.inner().clone());
+
+            if let Some(tm) = terminal_manager {
+                let terminal_id = data
+                    .get("terminal_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let cols = data.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                let rows = data.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+
+                if let Some(session) = tm.get(terminal_id) {
+                    let _ = session.resize(cols, rows);
+                }
+            }
+            // Fire-and-forget, no response
+            None
+        }
+
+        "terminal_close" => {
+            let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
+                .app_handle
+                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                .map(|s| s.inner().clone());
+
+            if let Some(tm) = terminal_manager {
+                let terminal_id = data
+                    .get("terminal_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let request_id = data.get("request_id").cloned();
+
+                let tm_clone = tm.clone();
+                let id_clone = terminal_id.clone();
+                match tokio::task::spawn_blocking(move || tm_clone.close(&id_clone)).await {
+                    Ok(Ok(())) => Some(serde_json::json!({
+                        "type": "terminal_closed",
+                        "terminal_id": terminal_id,
+                        "request_id": request_id,
+                    })),
+                    Ok(Err(e)) => Some(serde_json::json!({
+                        "type": "error",
+                        "message": format!("Failed to close terminal: {}", e),
+                        "terminal_id": terminal_id,
+                        "request_id": request_id,
+                    })),
+                    Err(e) => Some(serde_json::json!({
+                        "type": "error",
+                        "message": format!("Join error: {}", e),
+                        "terminal_id": terminal_id,
+                        "request_id": request_id,
+                    })),
+                }
+            } else {
+                Some(serde_json::json!({
+                    "type": "error",
+                    "message": "TerminalManager not available",
+                    "request_id": data.get("request_id"),
+                }))
+            }
+        }
+
+        "terminal_buffer" => {
+            let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
+                .app_handle
+                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                .map(|s| s.inner().clone());
+
+            if let Some(tm) = terminal_manager {
+                let terminal_id = data
+                    .get("terminal_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if let Some(session) = tm.get(terminal_id) {
+                    let (buf_data, start_offset) = session.get_scrollback_buffer();
+                    let total_bytes = session.info().total_bytes_produced;
+                    session.reset_flow_control();
+                    let encoded = STANDARD.encode(&buf_data);
+
+                    Some(serde_json::json!({
+                        "type": "terminal_buffer_response",
+                        "terminal_id": terminal_id,
+                        "data": encoded,
+                        "start_offset": start_offset,
+                        "total_bytes_produced": total_bytes,
+                        "request_id": data.get("request_id"),
+                    }))
+                } else {
+                    Some(serde_json::json!({
+                        "type": "error",
+                        "message": format!("Terminal not found: {}", terminal_id),
+                        "request_id": data.get("request_id"),
+                    }))
+                }
+            } else {
+                Some(serde_json::json!({
+                    "type": "error",
+                    "message": "TerminalManager not available",
+                    "request_id": data.get("request_id"),
+                }))
+            }
+        }
+
         "heartbeat" => Some(serde_json::json!({"type": "heartbeat_ack"})),
 
         _ => {
@@ -925,13 +1140,27 @@ pub mod commands {
         RELAY_STATE.get_or_init(|| tokio::sync::Mutex::new(None))
     }
 
-    /// Auto-start the cloud relay if enabled and auto_connect is set.
+    /// Auto-start the cloud relay if enabled and auto_connect is set,
+    /// or if a local backend is detected on localhost:8000.
     /// Called from mcp_api.rs where ApiState is available.
     pub async fn auto_start_cloud_relay(api_state: Arc<ApiState>) {
         let settings = settings::load_settings();
-        if !settings.cloud_relay.enabled || !settings.cloud_relay.auto_connect {
+
+        // Determine backend URL: use explicit config, or auto-detect local backend
+        let backend_url = if settings.cloud_relay.enabled && settings.cloud_relay.auto_connect {
+            settings.cloud_relay.backend_url.clone()
+        } else if !settings.cloud_relay.enabled {
+            // Auto-detect local backend for local dev
+            match detect_local_backend().await {
+                Some(url) => {
+                    info!("Local backend detected at {}, auto-connecting cloud relay", url);
+                    url
+                }
+                None => return,
+            }
+        } else {
             return;
-        }
+        };
 
         let mut guard = get_relay_holder().lock().await;
 
@@ -951,11 +1180,27 @@ pub mod commands {
             *guard = None;
         }
 
-        let backend_url = &settings.cloud_relay.backend_url;
         info!("Auto-starting cloud relay to {}", backend_url);
 
-        let relay = start_relay(api_state, backend_url).await;
+        let relay = start_relay(api_state, &backend_url).await;
         *guard = Some(relay);
+    }
+
+    /// Probe localhost:8000 to see if a local backend is running.
+    /// Returns the URL if reachable, None otherwise.
+    async fn detect_local_backend() -> Option<String> {
+        let url = "http://localhost:8000";
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        match client.get(format!("{}/health", url)).send().await {
+            Ok(resp) if resp.status().is_success() => Some(url.to_string()),
+            _ => None,
+        }
     }
 
     #[tauri::command]
