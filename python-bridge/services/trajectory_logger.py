@@ -27,7 +27,7 @@ from __future__ import annotations
 import io
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -207,7 +207,7 @@ class TrajectoryLogger:
             elements=elements,
             action=action,
             source="dynamic",
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=datetime.now(UTC).isoformat(),
             session_id=self._session_id,
         )
 

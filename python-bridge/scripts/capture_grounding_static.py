@@ -24,12 +24,13 @@ Requires: requests, mss, Pillow, numpy
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -250,7 +251,7 @@ def run_capture(
                     elements=elements,
                     action=None,
                     source="static",
-                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    timestamp=datetime.now(UTC).isoformat(),
                 )
 
                 written = writer.write(record, png_bytes)
@@ -269,10 +270,8 @@ def run_capture(
 
             finally:
                 # Restore viewport
-                try:
+                with contextlib.suppress(Exception):
                     client.restore_viewport()
-                except Exception:
-                    pass
 
     logger.info("Done. %d records written to %s", total_written, output_dir / "grounding.jsonl")
 
