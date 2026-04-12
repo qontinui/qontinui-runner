@@ -658,6 +658,330 @@
         }
       ],
       "source": "ai-generated"
+    },
+    {
+      "id": "settings-wsv-mode",
+      "name": "World State Verifier — Mode & Connection",
+      "description": "The WSV tab allows configuring the VLM-based World State Verifier (CUA-WSM / SEAgent 7B judge). The mode dropdown selects between Disabled (default), Enabled (WSM verdict wins), and Shadow (both run, text verifier decides, disagreements logged). Changes take effect on the next agentic verification iteration without a runner restart.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "wsv-header-present",
+          "description": "The page heading 'World State Verifier' is visible with a description mentioning VLM-based judge and CUA-WSM",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "World State Verifier" },
+            "label": "WSV section header"
+          },
+          "assertionType": "exists",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-mode-dropdown",
+          "description": "A mode dropdown with data-content-label 'wsv mode' offers three options: Disabled, Enabled, and Shadow. Each option shows a one-sentence description below the dropdown when selected.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "wsv mode" } },
+            "label": "WSV mode dropdown"
+          },
+          "assertionType": "exists",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-shadow-hint-banner",
+          "description": "When mode is set to Shadow, a blue info banner appears recommending to 'run 10-20 agentic workflows' before flipping to Enabled. When mode is Disabled or Enabled, this banner does not appear.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Shadow mode is the recommended" },
+            "label": "Shadow mode recommendation banner"
+          },
+          "assertionType": "behavior",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-endpoint-field",
+          "description": "An endpoint text input with data-content-label 'wsv endpoint' shows the llama-swap base URL, defaulting to http://127.0.0.1:8100",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "wsv endpoint" } },
+            "label": "WSV endpoint input"
+          },
+          "assertionType": "exists",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-model-field",
+          "description": "A model text input with data-content-label 'wsv model' shows the model alias, defaulting to 'cua-wsm'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "wsv model" } },
+            "label": "WSV model input"
+          },
+          "assertionType": "exists",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-test-connection",
+          "description": "Clicking the 'Test Connection' button (data-content-label 'test wsv connection') pings the configured endpoint at /v1/models with a 5-second timeout. On success, a green status shows latency and available model count. On failure, a red status shows the HTTP error. If the configured model isn't in the server's model list, a yellow warning appears.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "test wsv connection" } },
+            "label": "Test Connection button"
+          },
+          "assertionType": "behavior",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-save-settings",
+          "description": "Clicking 'Save WSV Settings' (data-content-label 'save wsv settings') persists mode, endpoint, model, and screenshot-evidence toggle via the save_wsv_settings Tauri command. The button text transiently changes to 'Saved!' with a green check icon for 3 seconds. A green banner 'Settings saved — changes take effect on the next verification iteration, no restart required' appears. Settings are also updated in-process via WsvConfig::set_global so the next agentic loop iteration picks them up without restart.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "save wsv settings" } },
+            "label": "Save WSV Settings button"
+          },
+          "assertionType": "behavior",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "settings-wsv-evidence",
+      "name": "World State Verifier — Screenshot Evidence Toggle",
+      "description": "A toggle controls whether downsampled pre/post screenshot thumbnails are embedded in the agentic verification iteration canvas panels when the WSM verdict is used.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "wsv-evidence-toggle-present",
+          "description": "A toggle switch for 'Screenshot Evidence in Iteration Panels' exists in the Evidence section, with a description about embedding downsampled pre/post thumbnails",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Screenshot Evidence" },
+            "label": "Screenshot evidence section"
+          },
+          "assertionType": "exists",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-evidence-info-text",
+          "description": "A purple info banner explains thumbnails are capped at 320px wide (~20KB each) and that the toggle can be turned off to save DB space",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "320px wide" },
+            "label": "Thumbnail size info"
+          },
+          "assertionType": "exists",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "settings-wsv-calibration",
+      "name": "World State Verifier — Shadow-Mode Calibration View",
+      "description": "A calibration section shows recent disagreements between the WSM (VLM judge) and the text verifier agent from shadow-mode runs. Users review these to decide whether to flip from Shadow to Enabled mode. The section auto-polls every 10 seconds and supports filtering by status-pair pattern.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "wsv-calibration-heading",
+          "description": "The calibration section has heading 'Shadow-Mode Calibration' with a BarChart3 icon and a refresh button (data-content-label 'refresh wsv calibration')",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Shadow-Mode Calibration" },
+            "label": "Calibration section heading"
+          },
+          "assertionType": "exists",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-calibration-not-shadow-hint",
+          "description": "When mode is NOT Shadow, a yellow warning banner says 'Enable Shadow mode above and run a workflow to start collecting disagreement data'. When mode IS Shadow, this banner disappears.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Enable Shadow mode above" },
+            "label": "Shadow mode hint banner"
+          },
+          "assertionType": "behavior",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-calibration-filter-chips",
+          "description": "Four filter chips exist: 'Any mismatch' (data-content-label 'filter-any'), 'Text pass / WSM refused' (data-content-label 'filter-text_pass_wsm_refused'), 'Text pass / WSM fail' (data-content-label 'filter-text_pass_wsm_fail'), and 'Text fail / WSM pass' (data-content-label 'filter-text_fail_wsm_pass'). Each shows a count badge. Clicking a chip filters the table below to show only matching disagreements.",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "filter-any" } },
+            "label": "Any mismatch filter chip"
+          },
+          "assertionType": "behavior",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-calibration-empty-state",
+          "description": "When no shadow-mode disagreements exist, the table area shows 'No shadow-mode disagreements recorded yet.' with a data-content-label 'wsv calibration empty'. When mode is Shadow, an additional hint 'Run an agentic workflow to populate this view.' appears.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "wsv calibration empty" } },
+            "label": "Calibration empty state"
+          },
+          "assertionType": "exists",
+          "precondition": "World State Verifier tab is selected and no disagreements exist",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-calibration-table-columns",
+          "description": "When disagreement rows exist, a table (data-content-label 'wsv disagreements') renders columns: Time (relative, e.g. '2m ago'), Task Run (ID truncated to 10 chars), Iter (iteration number), Text (status badge with confidence %), WSM (status badge with confidence %), Intent (truncated to 80 chars), and WSM Observations (truncated to 120 chars). Status badges use color coding: green for pass, yellow for partial, red for fail/unreachable, purple for refused.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "wsv disagreements" } },
+            "label": "Disagreements data table"
+          },
+          "assertionType": "semantic",
+          "precondition": "World State Verifier tab is selected and at least one disagreement row exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-calibration-auto-refresh",
+          "description": "The calibration section auto-refreshes every 10 seconds. A footer line shows 'N row(s) loaded · auto-refresh every 10s'. The refresh button (data-content-label 'refresh wsv calibration') triggers an immediate reload.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "auto-refresh every 10s" },
+            "label": "Auto-refresh indicator"
+          },
+          "assertionType": "behavior",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "settings-wsv-reset",
+      "name": "World State Verifier — Reset & Validation",
+      "description": "Edge cases and the Reset to Defaults flow.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "wsv-reset-defaults",
+          "description": "Clicking 'Reset to Defaults' (data-content-label 'reset wsv defaults') sets mode to Disabled, endpoint to http://127.0.0.1:8100, model to cua-wsm, and screenshot evidence toggle to on. Changes are local until Save is clicked.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "reset wsv defaults" } },
+            "label": "Reset to Defaults button"
+          },
+          "assertionType": "behavior",
+          "precondition": "World State Verifier tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-empty-endpoint-validation",
+          "description": "If the endpoint field is cleared (empty string), the Save button is disabled or clicking it shows an error 'Endpoint cannot be empty'. The page does not crash.",
+          "category": "form-validation",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "save wsv settings" } },
+            "label": "Save button (validation)"
+          },
+          "assertionType": "behavior",
+          "precondition": "World State Verifier tab is selected and endpoint field is empty",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wsv-empty-model-validation",
+          "description": "If the model field is cleared (empty string), the Save button is disabled or clicking it shows an error 'Model cannot be empty'. The page does not crash.",
+          "category": "form-validation",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "save wsv settings" } },
+            "label": "Save button (model validation)"
+          },
+          "assertionType": "behavior",
+          "precondition": "World State Verifier tab is selected and model field is empty",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "stateMachine": {
