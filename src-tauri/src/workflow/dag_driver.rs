@@ -167,6 +167,36 @@ pub async fn execute_dag_workflow(
                         continue;
                     }
 
+                    // ── Sub-workflow depth validation ────────────────────────
+                    // Validate workflow_ref nodes before dispatching to prevent
+                    // recursive sub-workflow chains that exceed the depth limit.
+                    // Top-level DAG executions always start at depth 0.
+                    if let Some(node_def) = def.nodes.get(&node_id) {
+                        if let Err(e) = crate::workflow::dag_context::validate_node_sub_workflow(
+                            node_def,
+                            0, // top-level DAG execution depth
+                        ) {
+                            warn!(
+                                node_id = %node_id,
+                                error = %e,
+                                "Sub-workflow depth validation failed — marking node failed"
+                            );
+                            let _ = pg
+                                .event_log_append(
+                                    &exec_id,
+                                    &node_id,
+                                    &EventType::Failed,
+                                    Some(&json!({ "error": e, "reason": "sub_workflow_depth_exceeded" })),
+                                )
+                                .await;
+                            node_futures.push(Box::pin(async move {
+                                (node_id, NodeOutcome::Failed, None, 0u64)
+                            })
+                                as std::pin::Pin<Box<dyn std::future::Future<Output = (String, NodeOutcome, Option<serde_json::Value>, u64)> + Send>>);
+                            continue;
+                        }
+                    }
+
                     // ── Look up the pre-computed step config ─────────────────
                     let step_config = match config_map.get(&node_id) {
                         Some(cfg) => cfg.clone(),
