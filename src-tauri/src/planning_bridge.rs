@@ -87,15 +87,26 @@ pub async fn request_htn_plan(
     // Build a Python script that creates the planner, runs it, and prints
     // JSON to stdout. We pass state and task as escaped JSON strings inside
     // the script.
+    let multistate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../multistate/src");
+    let multistate_src_str = multistate_src.display().to_string().replace('\\', "\\\\");
+
     let python_script = format!(
         r#"
-import json, sys
+import sys; sys.path.insert(0, r'{multistate_src_str}')
+import json
 from multistate.planning.planner import HTNPlanner, WorldState
 from multistate.planning.operators import STANDARD_OPERATORS
 from multistate.planning.methods.generic import GENERIC_METHODS
 
 state_data = json.loads({state_json_py})
-task_tuple = tuple(json.loads({task_json_py}))
+task_raw = json.loads({task_json_py})
+if isinstance(task_raw, str):
+    task_tuple = (task_raw,)
+elif isinstance(task_raw, list):
+    task_tuple = tuple(task_raw)
+else:
+    task_tuple = (str(task_raw),)
 
 state = WorldState(
     active_states=set(state_data['active_states']),
@@ -121,6 +132,7 @@ print(json.dumps({{
     'error': result.error,
 }}))
 "#,
+        multistate_src_str = multistate_src_str,
         state_json_py = serde_json::to_string(&state_json)
             .map_err(|e| format!("Failed to double-serialize state: {}", e))?,
         task_json_py = serde_json::to_string(&task_json)
@@ -131,15 +143,42 @@ print(json.dumps({{
 
     debug!("Running HTN planner via: {} -c <script>", python);
 
-    let output = tokio::time::timeout(
+    let mut child = tokio::process::Command::new(python)
+        .args(["-c", &python_script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn Python planner: {}", e))?;
+
+    let output = match tokio::time::timeout(
         std::time::Duration::from_millis(config.planning_timeout_ms),
-        tokio::process::Command::new(python)
-            .args(["-c", &python_script])
-            .output(),
+        async {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let status = child.wait().await?;
+            let mut stdout_bytes = Vec::new();
+            if let Some(mut out) = stdout {
+                tokio::io::AsyncReadExt::read_to_end(&mut out, &mut stdout_bytes).await?;
+            }
+            let mut stderr_bytes = Vec::new();
+            if let Some(mut err) = stderr {
+                tokio::io::AsyncReadExt::read_to_end(&mut err, &mut stderr_bytes).await?;
+            }
+            Ok::<std::process::Output, std::io::Error>(std::process::Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            })
+        },
     )
     .await
-    .map_err(|_| "HTN planning timed out".to_string())?
-    .map_err(|e| format!("Failed to run Python planner: {}", e))?;
+    {
+        Ok(result) => result.map_err(|e| format!("Python planner failed: {}", e))?,
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err("HTN planning timed out".to_string());
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -147,22 +186,24 @@ print(json.dumps({{
         return Err(format!("HTN planner failed: {}", stderr));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let json_line = stdout_str.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
 
     // Parse the raw JSON into an intermediate structure first, since the
     // Python planner returns actions as arrays [name, arg1, arg2, ...]
     // rather than {name, args} objects.
-    let raw: serde_json::Value = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Failed to parse planner output: {} (raw: {})", e, stdout))?;
+    let raw: serde_json::Value = serde_json::from_str(json_line)
+        .map_err(|e| format!("Failed to parse planner output: {} (raw: {})", e, stdout_str))?;
 
     let success = raw["success"].as_bool().unwrap_or(false);
     let planning_time_ms = raw["planning_time_ms"].as_f64().unwrap_or(0.0);
     let nodes_explored = raw["nodes_explored"].as_u64().unwrap_or(0) as u32;
     let error = raw["error"].as_str().map(String::from);
 
+    let empty_actions = vec![];
     let actions = raw["actions"]
         .as_array()
-        .unwrap_or(&vec![])
+        .unwrap_or(&empty_actions)
         .iter()
         .filter_map(|a| {
             let arr = a.as_array()?;
