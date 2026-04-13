@@ -399,6 +399,305 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "active-breakpoint-indicator",
+      "name": "Breakpoint Indicator in Control Bar",
+      "description": "When a workflow step with breakpoint: true completes, the control bar shows a breakpoint indicator. An amber 'Breakpoint' badge with animated glow appears alongside the paused step name, an Inspect button (blue), and a Resume button (green). This is the primary breakpoint awareness surface — users must see at a glance that execution is paused at a breakpoint.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "bp-amber-badge-visible",
+          "description": "An amber 'Breakpoint' badge is visible in the control bar center section when execution is paused at a breakpoint. The badge has an animated glow effect (animate-phase-glow class) to draw attention.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Breakpoint" },
+            "label": "Amber breakpoint badge"
+          },
+          "precondition": "A workflow is paused at a breakpoint (breakpoint snapshot with status 'waiting' exists)",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-step-name-shown",
+          "description": "The name of the step where the breakpoint fired is shown in the control bar in monospace font, truncated if too long. This gives users immediate context about where execution paused.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "content-label": "breakpoint step" } },
+            "label": "Breakpoint step name label"
+          },
+          "precondition": "A workflow is paused at a breakpoint",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-inspect-button-exists",
+          "description": "A blue 'Inspect' button with an Eye icon is visible in the control bar when paused at a breakpoint. It opens the BreakpointInspector side panel.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "accessibleName": "Inspect breakpoint state" },
+            "label": "Inspect breakpoint button"
+          },
+          "precondition": "A workflow is paused at a breakpoint",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-resume-button-exists",
+          "description": "A green 'Resume' button with a Play icon is visible in the control bar when paused at a breakpoint. Clicking it sends a resume signal and continues workflow execution from the step after the breakpoint.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "accessibleName": "Resume execution from breakpoint" },
+            "label": "Resume breakpoint button"
+          },
+          "precondition": "A workflow is paused at a breakpoint",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-no-indicator-when-running",
+          "description": "When no breakpoint is active (workflow running normally or no workflow), the breakpoint badge, Inspect button, and Resume button are not visible in the control bar.",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Breakpoint" },
+            "label": "Breakpoint badge (should be absent)"
+          },
+          "precondition": "A workflow is running normally without hitting a breakpoint",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "active-breakpoint-inspector",
+      "name": "Breakpoint Inspector Panel",
+      "description": "A fixed right-side panel (384px wide, z-40) that opens when the user clicks Inspect on a breakpoint. Shows captured workflow state: variables tree, last screenshot, pending steps, and freshness indicator. This is the debugging surface where users examine why execution paused and what the current state looks like before deciding to resume.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "bp-inspector-panel-layout",
+          "description": "The inspector panel is a fixed overlay on the right side of the screen, spanning full height. It has a white/card background, left border, and shadow. Width is 384px (w-96). The panel does not push dashboard content — it overlays on top.",
+          "category": "layout",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "div" },
+            "label": "Breakpoint inspector panel"
+          },
+          "precondition": "Inspector panel is open (user clicked Inspect)",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-inspector-header",
+          "description": "The inspector header shows an Eye icon, 'Breakpoint Inspector' heading, and a close button (X icon) with aria-label 'Close inspector'. The header has a bottom border separating it from content.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Breakpoint Inspector" },
+            "label": "Inspector panel heading"
+          },
+          "precondition": "Inspector panel is open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-inspector-close-button",
+          "description": "The inspector panel has a close button (X icon) in the header with aria-label 'Close inspector'. Clicking it closes the panel.",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "accessibleName": "Close inspector" },
+            "label": "Close inspector button"
+          },
+          "precondition": "Inspector panel is open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-inspector-step-info",
+          "description": "The info bar shows the breakpoint step index as an amber badge (e.g., 'Step 5'), the step name in monospace font, the workflow phase as a muted badge, and optionally the iteration number.",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Step" },
+            "label": "Step index badge in inspector"
+          },
+          "precondition": "Inspector panel is open with a valid snapshot",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-inspector-freshness",
+          "description": "A freshness indicator shows how long ago the snapshot was captured. Green text for <10 minutes ('3m ago'), amber text with AlertTriangle icon for 10-30 minutes ('15m ago (stale)'), red text for >30 minutes ('35m ago (expired)'). This warns users that resumed state may be outdated.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "ago" },
+            "label": "Freshness timestamp indicator"
+          },
+          "precondition": "Inspector panel is open with a valid snapshot",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-inspector-variables-tree",
+          "description": "The Variables section displays a collapsible tree view of the captured runtime context and shared variables. Top-level keys are auto-expanded (depth < 2). Objects show {N} count, arrays show [N] count. Leaf values display as monospace text. The tree is built from the snapshot's variables_json field.",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Variables" },
+            "label": "Variables section heading"
+          },
+          "precondition": "Inspector panel is open with a snapshot containing variables",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-inspector-pending-steps",
+          "description": "The Pending Steps section lists the remaining workflow steps that will execute after resume. Each step shows its index number and name in monospace font. If no steps remain, the section shows 'No pending steps'.",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Pending Steps" },
+            "label": "Pending steps section heading"
+          },
+          "precondition": "Inspector panel is open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-inspector-screenshot",
+          "description": "If the snapshot includes a last_screenshot_ref, the Last Screenshot section displays the captured screenshot as a thumbnail in aspect-video ratio. If the image fails to load, the section is hidden gracefully (no broken image icon).",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Last Screenshot" },
+            "label": "Screenshot section heading"
+          },
+          "precondition": "Inspector panel is open and snapshot has a screenshot reference",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "active-breakpoint-behavior",
+      "name": "Breakpoint Resume and Inspect Behavior",
+      "description": "Behavioral flows for breakpoint interaction: resuming execution, opening/closing the inspector, and the polling mechanism that detects breakpoints.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "bp-resume-continues-execution",
+          "description": "Clicking the Resume button in the control bar sends POST /task-runs/{id}/breakpoints/{snapshotId}/resume to the runner API. The breakpoint indicator disappears, the task status changes from 'paused' back to 'running', and the workflow continues executing from the step AFTER the breakpoint (not at the breakpoint, which would re-pause). The inspector panel closes if it was open.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "accessibleName": "Resume execution from breakpoint" },
+            "label": "Resume button"
+          },
+          "precondition": "Workflow is paused at a breakpoint with inspector optionally open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-inspect-opens-panel",
+          "description": "Clicking the Inspect button in the control bar opens the BreakpointInspector panel on the right side of the screen. The panel shows the captured snapshot data. The dashboard remains visible behind/beside the panel.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "accessibleName": "Inspect breakpoint state" },
+            "label": "Inspect button"
+          },
+          "precondition": "Workflow is paused at a breakpoint and inspector is not yet open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-close-inspector",
+          "description": "Clicking the X close button in the inspector header closes the panel. The breakpoint indicator remains in the control bar (closing the inspector does not resume execution).",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "accessibleName": "Close inspector" },
+            "label": "Close inspector button"
+          },
+          "precondition": "Inspector panel is open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bp-polling-detects-breakpoint",
+          "description": "The dashboard polls GET /task-runs/{id}/breakpoints every 3 seconds while a workflow is running. When a snapshot with status 'waiting' is found, the breakpoint indicator appears in the control bar within 3 seconds of the breakpoint being hit. When the task stops running, polling stops.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Breakpoint" },
+            "label": "Breakpoint indicator"
+          },
+          "precondition": "A workflow is running and hits a breakpoint-annotated step",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "stateMachine": {
@@ -632,6 +931,86 @@
             ]
           }
         ]
+      },
+      {
+        "id": "breakpoint-paused",
+        "name": "Breakpoint Paused — Execution Suspended at Step",
+        "description": "A workflow step with breakpoint: true has completed. The control bar shows an amber Breakpoint badge, step name, Inspect and Resume buttons. Execution is suspended until the user clicks Resume.",
+        "elements": [
+          { "textContent": "Breakpoint" },
+          { "role": "button", "accessibleName": "Resume execution from breakpoint" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "bp-open-inspector",
+            "name": "Open Breakpoint Inspector panel",
+            "activateStates": ["breakpoint-inspector-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Inspect breakpoint state" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "bp-resume-execution",
+            "name": "Resume workflow execution from breakpoint",
+            "activateStates": ["running"],
+            "deactivateStates": ["breakpoint-paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Resume execution from breakpoint" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "breakpoint-inspector-open",
+        "name": "Breakpoint Inspector Panel Open",
+        "description": "The BreakpointInspector side panel is visible on the right side of the screen, showing captured snapshot data: variables tree, screenshot, pending steps, and freshness indicator. The dashboard remains visible behind the panel.",
+        "elements": [
+          { "textContent": "Breakpoint Inspector" },
+          { "role": "button", "accessibleName": "Close inspector" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "bp-close-inspector",
+            "name": "Close the inspector panel",
+            "activateStates": [],
+            "deactivateStates": ["breakpoint-inspector-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Close inspector" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "bp-resume-from-inspector",
+            "name": "Resume execution while inspector is open",
+            "activateStates": ["running"],
+            "deactivateStates": ["breakpoint-inspector-open", "breakpoint-paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Resume execution from breakpoint" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
       }
     ]
   },
@@ -639,7 +1018,7 @@
     "component": "ActiveDashboardPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-04-09T00:00:00.000Z",
+    "updatedAt": "2026-04-13T00:00:00.000Z",
     "pageUrl": "/runs/active",
     "elementSource": "sdk",
     "tags": [
@@ -649,7 +1028,9 @@
       "widgets",
       "multi-run",
       "run-group",
-      "tier-1"
+      "tier-1",
+      "breakpoints",
+      "debugging"
     ],
     "specType": "semantic"
   }
