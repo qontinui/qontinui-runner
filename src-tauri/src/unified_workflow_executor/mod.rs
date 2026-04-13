@@ -79,7 +79,7 @@ mod phases;
 pub mod replay;
 mod resume;
 pub mod review_subtask;
-mod startup_resume;
+pub(crate) mod startup_resume;
 pub mod states;
 mod step_conversion;
 mod task_lifecycle;

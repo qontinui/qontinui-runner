@@ -996,6 +996,53 @@ pub async fn generate_unified_workflow_async_handler(
         });
     }
 
+    // Check for DAG workflow routing — if source_yaml exists, use DAG driver
+    if let Some(dag_def) = crate::workflow::dag_routing::check_dag_routing(
+        &saved_workflow.id,
+        &state.app_state.pg_db,
+    )
+    .await
+    {
+        let dag_deps = crate::workflow::dag_driver::DagDriverDeps {
+            app_state: state.app_state.clone(),
+            config_storage: state.config_storage.clone(),
+            app_handle: Some(state.app_handle.clone()),
+            execution_id: task_run_id.clone(),
+            task_run_id: Some(task_run_id.clone()),
+        };
+
+        let exec_id = task_run_id.clone();
+        let pg = state.app_state.pg_db.clone();
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let result =
+                crate::workflow::dag_driver::execute_dag_workflow(dag_def, dag_deps).await;
+            let duration = start.elapsed().as_millis() as u64;
+            let status = match &result {
+                Ok(r) if r.success => "completed",
+                Ok(_) => "failed",
+                Err(_) => "failed",
+            };
+            let _ = pg.update_task_run_status(&exec_id, status).await;
+            if let Ok(ref r) = result {
+                if let Ok(metrics_json) = serde_json::to_string(&r.node_metrics) {
+                    let _ = pg
+                        .set_task_run_result_data(
+                            &exec_id,
+                            &serde_json::json!({ "dag_node_metrics": metrics_json }).to_string(),
+                        )
+                        .await;
+                }
+            }
+            tracing::info!(execution_id = %exec_id, ?duration, ?status, "DAG workflow finished");
+        });
+
+        return Ok(Json(ApiResponse::success(GenerateWorkflowAsyncResponse {
+            task_run_id,
+            meta_workflow_id: saved_workflow.id.clone(),
+        })));
+    }
+
     // Normalize to stages — all workflows are now multi-stage
     {
         use crate::unified_workflow_executor::{LoopConfig, LoopController};
@@ -1296,6 +1343,66 @@ pub async fn run_unified_workflow(
     // This is separate from GUI automation configs to avoid confusion
     if let Ok(workflow_json) = serde_json::to_value(&workflow) {
         crate::executor::file_logger::save_unified_workflow_config(&workflow_json, &workflow.name);
+    }
+
+    // Check for DAG workflow routing — if source_yaml exists, use DAG driver
+    if let Some(dag_def) = crate::workflow::dag_routing::check_dag_routing(
+        &id,
+        &state.app_state.pg_db,
+    )
+    .await
+    {
+        let execution_id = format!(
+            "unified-workflow-{}-{}",
+            id,
+            chrono::Utc::now().timestamp_millis()
+        );
+
+        let input = CreateTaskRunInput::new(&execution_id, &workflow.name)
+            .with_prompt(&format!("DAG workflow: {}", dag_def.name))
+            .with_task_type("ai")
+            .with_workflow_name(&workflow.name)
+            .with_workflow_id(&workflow.id)
+            .with_workflow_type("dag");
+        let _ = state.app_state.pg_db.create_task_run(&input).await;
+
+        let dag_deps = crate::workflow::dag_driver::DagDriverDeps {
+            app_state: state.app_state.clone(),
+            config_storage: state.config_storage.clone(),
+            app_handle: Some(state.app_handle.clone()),
+            execution_id: execution_id.clone(),
+            task_run_id: Some(execution_id.clone()),
+        };
+
+        let exec_id = execution_id.clone();
+        let pg = state.app_state.pg_db.clone();
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let result =
+                crate::workflow::dag_driver::execute_dag_workflow(dag_def, dag_deps).await;
+            let duration = start.elapsed().as_millis() as u64;
+            let status = match &result {
+                Ok(r) if r.success => "completed",
+                Ok(_) => "failed",
+                Err(_) => "failed",
+            };
+            let _ = pg.update_task_run_status(&exec_id, status).await;
+            if let Ok(ref r) = result {
+                if let Ok(metrics_json) = serde_json::to_string(&r.node_metrics) {
+                    let _ = pg
+                        .set_task_run_result_data(
+                            &exec_id,
+                            &serde_json::json!({ "dag_node_metrics": metrics_json }).to_string(),
+                        )
+                        .await;
+                }
+            }
+            tracing::info!(execution_id = %exec_id, ?duration, ?status, "DAG workflow finished");
+        });
+
+        return Ok(Json(ApiResponse::success(RunUnifiedWorkflowResponse {
+            task_run_id: execution_id,
+        })));
     }
 
     // Normalize to stages — all workflows are now multi-stage

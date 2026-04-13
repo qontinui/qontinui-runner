@@ -68,6 +68,79 @@ pub fn launch_generated_workflow(
         generated_workflow_id, meta_task_run_id
     );
 
+    // 2b. Check for DAG workflow routing
+    {
+        let pg = pg_db.clone();
+        let wf_id = generated_workflow_id.clone();
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| "No tokio runtime".to_string())?;
+        let dag_def = handle.block_on(async move {
+            crate::workflow::dag_routing::check_dag_routing(&wf_id, &pg).await
+        });
+
+        if let Some(dag_def) = dag_def {
+            let execution_id = format!(
+                "unified-workflow-{}-{}",
+                generated_workflow_id,
+                chrono::Utc::now().timestamp_millis()
+            );
+
+            let input =
+                crate::database::CreateTaskRunInput::new(&execution_id, &dag_def.name)
+                    .with_prompt(&format!("DAG workflow: {}", dag_def.name))
+                    .with_task_type("ai")
+                    .with_workflow_name(&dag_def.name)
+                    .with_workflow_id(&generated_workflow_id)
+                    .with_workflow_type("dag")
+                    .with_parent_task_run_id(meta_task_run_id);
+
+            let pg_create = pg_db.clone();
+            let input_clone = input.clone();
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| "No tokio runtime".to_string())?;
+            handle
+                .block_on(async move { pg_create.create_task_run(&input_clone).await })
+                .map_err(|e| format!("Failed to create task run: {}", e))?;
+
+            let dag_deps = crate::workflow::dag_driver::DagDriverDeps {
+                app_state: deps.app_state.clone(),
+                config_storage: deps.config_storage.clone(),
+                app_handle: Some(deps.app_handle.clone()),
+                execution_id: execution_id.clone(),
+                task_run_id: Some(execution_id.clone()),
+            };
+
+            let exec_id = execution_id.clone();
+            let pg_spawn = pg_db.clone();
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let result =
+                    crate::workflow::dag_driver::execute_dag_workflow(dag_def, dag_deps).await;
+                let duration = start.elapsed().as_millis() as u64;
+                let status = match &result {
+                    Ok(r) if r.success => "completed",
+                    Ok(_) => "failed",
+                    Err(_) => "failed",
+                };
+                let _ = pg_spawn.update_task_run_status(&exec_id, status).await;
+                if let Ok(ref r) = result {
+                    if let Ok(metrics_json) = serde_json::to_string(&r.node_metrics) {
+                        let _ = pg_spawn
+                            .set_task_run_result_data(
+                                &exec_id,
+                                &serde_json::json!({ "dag_node_metrics": metrics_json })
+                                    .to_string(),
+                            )
+                            .await;
+                    }
+                }
+                tracing::info!(execution_id = %exec_id, ?duration, ?status, "DAG workflow finished");
+            });
+
+            return Ok(execution_id);
+        }
+    }
+
     // 3. Load the generated workflow (via PG)
     let workflow = {
         let pg = pg_db.clone();

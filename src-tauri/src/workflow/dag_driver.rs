@@ -290,6 +290,29 @@ pub async fn execute_dag_workflow(
     Ok(result)
 }
 
+/// Convert a `DagWorkflowResult` into the `WorkflowResult` expected by
+/// `spawn_workflow_with_panic_guard`.
+///
+/// This bridges the DAG execution system with the existing workflow lifecycle
+/// (task_run completion, learning_outcomes, etc.).
+pub fn dag_result_to_workflow_result(
+    dag_result: &DagWorkflowResult,
+    duration_ms: u64,
+) -> crate::unified_workflow_executor::WorkflowResult {
+    crate::unified_workflow_executor::WorkflowResult {
+        success: dag_result.success,
+        verification_passed: dag_result.success,
+        step_results: Vec::new(),
+        duration_ms,
+        loop_result: None,
+        worktree_path: None,
+        worktree_branch: None,
+        workflow_architecture: None,
+        agentic_verification_config: None,
+        multi_agent_pipeline_config: None,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────

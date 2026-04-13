@@ -56,6 +56,65 @@ pub async fn execute_triggered_workflow(
         trigger_name, workflow.name, chain_depth
     );
 
+    // 1b. Check for DAG workflow routing
+    if let Some(dag_def) =
+        crate::workflow::dag_routing::check_dag_routing(workflow_id, db).await
+    {
+        let execution_id = format!(
+            "trigger-{}-{}-{}",
+            workflow_id,
+            chrono::Utc::now().timestamp_millis(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+
+        let input = crate::database::CreateTaskRunInput::new(&execution_id, &workflow.name)
+            .with_prompt(&format!("DAG workflow: {}", dag_def.name))
+            .with_task_type("ai")
+            .with_workflow_name(&workflow.name)
+            .with_workflow_id(&workflow.id)
+            .with_workflow_type("dag");
+
+        db.create_task_run(&input)
+            .await
+            .map_err(|e| format!("Failed to create task run: {}", e))?;
+
+        let dag_deps = crate::workflow::dag_driver::DagDriverDeps {
+            app_state: deps.app_state.clone(),
+            config_storage: deps.config_storage.clone(),
+            app_handle: Some(deps.app_handle.clone()),
+            execution_id: execution_id.clone(),
+            task_run_id: Some(execution_id.clone()),
+        };
+
+        let exec_id = execution_id.clone();
+        let pg = db.clone();
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let result = crate::workflow::dag_driver::execute_dag_workflow(dag_def, dag_deps).await;
+            let duration = start.elapsed().as_millis() as u64;
+            let status = match &result {
+                Ok(r) if r.success => "completed",
+                Ok(_) => "failed",
+                Err(_) => "failed",
+            };
+            if let Err(e) = pg.update_task_run_status(&exec_id, status).await {
+                tracing::error!("Failed to update DAG task run status: {}", e);
+            }
+            // Store dag_node_metrics if available
+            if let Ok(ref r) = result {
+                if let Ok(metrics_json) = serde_json::to_string(&r.node_metrics) {
+                    let _ = pg.set_task_run_result_data(
+                        &exec_id,
+                        &serde_json::json!({ "dag_node_metrics": metrics_json }).to_string(),
+                    ).await;
+                }
+            }
+            tracing::info!(execution_id = %exec_id, ?duration, ?status, "DAG workflow finished");
+        });
+
+        return Ok(execution_id);
+    }
+
     // 2. Normalize to stages
     let normalized_stages = workflow.normalize_to_stages();
     let total_stages = normalized_stages.len();
