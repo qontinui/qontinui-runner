@@ -79,6 +79,7 @@ mod orchestration_loop_configs;
 mod orchestrator;
 mod otel;
 mod paths;
+mod planning_bridge;
 mod playwright;
 mod process_capture;
 mod process_helpers;
