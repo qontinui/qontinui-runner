@@ -102,18 +102,15 @@ fn default_trigger_rule() -> TriggerRule {
 /// Determines when a node should fire relative to its dependencies.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TriggerRule {
+    #[default]
     AllSuccess,
     OneSuccess,
     AllDone,
     NoneFailedMinOneSuccess,
 }
 
-impl Default for TriggerRule {
-    fn default() -> Self {
-        Self::AllSuccess
-    }
-}
 
 /// Context isolation mode for a node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

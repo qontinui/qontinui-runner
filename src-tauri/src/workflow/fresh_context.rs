@@ -86,12 +86,21 @@ pub struct IterationDiffSummary {
     pub summary: String,
 }
 
-/// Truncate a string to max_chars, appending "..." if truncated.
+/// Truncate a string to approximately max_chars, appending "..." if truncated.
+/// Uses char boundaries to avoid panicking on multi-byte UTF-8.
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_chars.saturating_sub(3)])
+        let limit = max_chars.saturating_sub(3);
+        // Find a valid UTF-8 char boundary at or before `limit`
+        let boundary = s
+            .char_indices()
+            .take_while(|(i, _)| *i < limit)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        format!("{}...", &s[..boundary])
     }
 }
 
