@@ -1899,7 +1899,7 @@ pub async fn ui_bridge_get_snapshot_handler(
                 let elements_empty = data
                     .get("elements")
                     .and_then(|e| e.as_array())
-                    .map_or(true, |a| a.is_empty());
+                    .is_none_or(|a| a.is_empty());
                 if elements_empty {
                     info!("UI Bridge API: snapshot returned 0 elements — auto-discovering");
                     let _ = ui_bridge_request_sync(

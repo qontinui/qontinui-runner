@@ -6,7 +6,17 @@
  * and execution statistics.
  */
 
-import { Play, Pause, Square, RotateCcw, ToggleRight, ToggleLeft, Loader2, CircleDot, Eye } from "lucide-react";
+import {
+  Play,
+  Pause,
+  Square,
+  RotateCcw,
+  ToggleRight,
+  ToggleLeft,
+  Loader2,
+  CircleDot,
+  Eye,
+} from "lucide-react";
 import { useAutoContinue } from "../../contexts";
 import { Button, Badge } from "../ui";
 import type { ExecutionStatus, BreakpointSnapshot } from "./types";

@@ -248,11 +248,7 @@ function MarkdownDiv({ className, ...props }: Record<string, unknown>) {
  * blow out iteration panel layouts. Falls back to `max-w-full` for any
  * linked image.
  */
-function MarkdownImg({
-  src,
-  alt,
-  ...rest
-}: React.ImgHTMLAttributes<HTMLImageElement>) {
+function MarkdownImg({ src, alt, ...rest }: React.ImgHTMLAttributes<HTMLImageElement>) {
   return (
     // eslint-disable-next-line @next/next/no-img-element, jsx-a11y/alt-text
     <img

@@ -33,23 +33,11 @@ interface ZoneMetadataProviderProps {
 export function ZoneMetadataProvider({ children }: ZoneMetadataProviderProps) {
   const { pageId, zoneLayout } = useTerminalCore();
 
-  const labelsAndTags = useZoneLabelsAndTags(
-    zoneLayout.layoutId,
-    zoneLayout.assignments,
-    pageId,
-  );
+  const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments, pageId);
 
-  const {
-    eventHistory,
-    addHistoryEvent,
-    metrics,
-    incrementMetric,
-  } = useEventHistory();
+  const { eventHistory, addHistoryEvent, metrics, incrementMetric } = useEventHistory();
 
-  const focusHistory = useFocusHistory(
-    zoneLayout.focusedZone,
-    zoneLayout.setFocusedZone,
-  );
+  const focusHistory = useFocusHistory(zoneLayout.focusedZone, zoneLayout.setFocusedZone);
 
   const value = useMemo<ZoneMetadataContextValue>(
     () => ({

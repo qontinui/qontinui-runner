@@ -1,6 +1,13 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { BarChart3, RefreshCw, AlertTriangle, CheckCircle, XCircle, HelpCircle } from "lucide-react";
+import {
+  BarChart3,
+  RefreshCw,
+  AlertTriangle,
+  CheckCircle,
+  XCircle,
+  HelpCircle,
+} from "lucide-react";
 import { getAccentColors } from "@/design-system";
 import type { WsvDisagreementRow, WsvMode, LogFunction } from "./types";
 
@@ -10,11 +17,7 @@ interface WsvCalibrationSectionProps {
   onLog: LogFunction;
 }
 
-type FilterKey =
-  | "any"
-  | "text_pass_wsm_refused"
-  | "text_pass_wsm_fail"
-  | "text_fail_wsm_pass";
+type FilterKey = "any" | "text_pass_wsm_refused" | "text_pass_wsm_fail" | "text_fail_wsm_pass";
 
 const FILTER_OPTIONS: { key: FilterKey; label: string; description: string }[] = [
   {
@@ -46,17 +49,11 @@ function applyFilter(rows: WsvDisagreementRow[], filter: FilterKey): WsvDisagree
     case "any":
       return rows;
     case "text_pass_wsm_refused":
-      return rows.filter(
-        (r) => r.text_status === "pass" && r.wsm_status === "refused",
-      );
+      return rows.filter((r) => r.text_status === "pass" && r.wsm_status === "refused");
     case "text_pass_wsm_fail":
-      return rows.filter(
-        (r) => r.text_status === "pass" && r.wsm_status === "fail",
-      );
+      return rows.filter((r) => r.text_status === "pass" && r.wsm_status === "fail");
     case "text_fail_wsm_pass":
-      return rows.filter(
-        (r) => r.text_status === "fail" && r.wsm_status === "pass",
-      );
+      return rows.filter((r) => r.text_status === "fail" && r.wsm_status === "pass");
   }
 }
 
@@ -200,9 +197,7 @@ export function WsvCalibrationSection({ mode, onLog }: WsvCalibrationSectionProp
 
       {!isShadow && (
         <div className={`p-3 ${getAccentColors("yellow").bg} rounded-lg flex gap-2`}>
-          <AlertTriangle
-            className={`w-4 h-4 ${getAccentColors("yellow").text} shrink-0 mt-0.5`}
-          />
+          <AlertTriangle className={`w-4 h-4 ${getAccentColors("yellow").text} shrink-0 mt-0.5`} />
           <p className={`text-xs ${getAccentColors("yellow").text}`}>
             Enable <strong>Shadow</strong> mode above and run a workflow to start collecting
             disagreement data. Existing rows from previous shadow sessions are still shown below.
@@ -282,10 +277,7 @@ export function WsvCalibrationSection({ mode, onLog }: WsvCalibrationSectionProp
             </thead>
             <tbody>
               {filtered.map((row) => (
-                <tr
-                  key={row.id}
-                  className="border-b border-border/30 hover:bg-muted/20"
-                >
+                <tr key={row.id} className="border-b border-border/30 hover:bg-muted/20">
                   <td className="py-1 pr-2 text-muted-foreground whitespace-nowrap">
                     {formatRelativeTime(row.created_at)}
                   </td>
@@ -294,21 +286,12 @@ export function WsvCalibrationSection({ mode, onLog }: WsvCalibrationSectionProp
                   </td>
                   <td className="py-1 pr-2">{row.iteration}</td>
                   <td className="py-1 pr-2">
-                    <StatusBadge
-                      status={row.text_status}
-                      confidence={row.text_confidence}
-                    />
+                    <StatusBadge status={row.text_status} confidence={row.text_confidence} />
                   </td>
                   <td className="py-1 pr-2">
-                    <StatusBadge
-                      status={row.wsm_status}
-                      confidence={row.wsm_confidence}
-                    />
+                    <StatusBadge status={row.wsm_status} confidence={row.wsm_confidence} />
                   </td>
-                  <td
-                    className="py-1 pr-2 max-w-[280px] text-muted-foreground"
-                    title={row.intent}
-                  >
+                  <td className="py-1 pr-2 max-w-[280px] text-muted-foreground" title={row.intent}>
                     {truncate(row.intent, 80)}
                   </td>
                   <td

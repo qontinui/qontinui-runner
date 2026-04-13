@@ -30,7 +30,10 @@ export function BatchOperationsBar() {
   const transitionEffects = useTransitionEffects();
   const { state: uiState, dispatch } = useUIStateCx();
   const selectedZones = uiState.selectedZones;
-  const onDismiss = useCallback(() => transitionEffects.setBatchBarDismissed(true), [transitionEffects]);
+  const onDismiss = useCallback(
+    () => transitionEffects.setBatchBarDismissed(true),
+    [transitionEffects],
+  );
   const onSelectAllWaiting = useCallback(() => {
     const waiting = new Set<number>();
     for (const [zoneStr, tabId] of Object.entries(assignments)) {
@@ -41,18 +44,21 @@ export function BatchOperationsBar() {
     dispatch({ type: "SET_SELECTED_ZONES", payload: waiting });
   }, [assignments, sessionStates, dispatch]);
   const onClearSelection = useCallback(() => dispatch({ type: "CLEAR_SELECTION" }), [dispatch]);
-  const onMetrics = useCallback((type: "approve" | "reject" | "broadcast", count: number) => {
-    if (type === "approve") {
-      incrementMetric("totalApprovals", count);
-      addHistoryEvent("Batch approve", `${count} sessions`, undefined, "#9ece6a");
-    } else if (type === "reject") {
-      incrementMetric("totalRejections", count);
-      addHistoryEvent("Batch reject", `${count} sessions`, undefined, "#f7768e");
-    } else if (type === "broadcast") {
-      incrementMetric("totalBroadcasts", count);
-      addHistoryEvent("Broadcast", `${count} sessions`, undefined, "#7aa2f7");
-    }
-  }, [incrementMetric, addHistoryEvent]);
+  const onMetrics = useCallback(
+    (type: "approve" | "reject" | "broadcast", count: number) => {
+      if (type === "approve") {
+        incrementMetric("totalApprovals", count);
+        addHistoryEvent("Batch approve", `${count} sessions`, undefined, "#9ece6a");
+      } else if (type === "reject") {
+        incrementMetric("totalRejections", count);
+        addHistoryEvent("Batch reject", `${count} sessions`, undefined, "#f7768e");
+      } else if (type === "broadcast") {
+        incrementMetric("totalBroadcasts", count);
+        addHistoryEvent("Broadcast", `${count} sessions`, undefined, "#7aa2f7");
+      }
+    },
+    [incrementMetric, addHistoryEvent],
+  );
   const [broadcastInput, setBroadcastInput] = useState("");
   const [showBroadcast, setShowBroadcast] = useState(false);
   const [lastAction, setLastAction] = useState<string | null>(null);

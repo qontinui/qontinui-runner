@@ -231,7 +231,7 @@ export function DashboardPage({
       try {
         const snapshots = await fetchBreakpoints(taskId);
         const waiting = snapshots.find((s) => s.status === "waiting") ?? null;
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- polling callback
+
         setBreakpointSnapshot(waiting);
       } catch {
         // Endpoint may not exist yet or task has no breakpoints - ignore

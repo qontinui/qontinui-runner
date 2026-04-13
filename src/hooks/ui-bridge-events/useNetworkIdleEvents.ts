@@ -293,7 +293,9 @@ export function useNetworkIdleEvents(
           }
 
           // Look up element by ID — query DOM for data-ui-bridge-id attribute
-          const domElementOrNull = document.querySelector(`[data-ui-bridge-id="${elId}"]`) as HTMLElement | null;
+          const domElementOrNull = document.querySelector(
+            `[data-ui-bridge-id="${elId}"]`,
+          ) as HTMLElement | null;
 
           if (!domElementOrNull || !(domElementOrNull instanceof HTMLElement)) {
             await sendResponse({
@@ -336,19 +338,26 @@ export function useNetworkIdleEvents(
 
               function scheduleCheck() {
                 if (quietTimer !== null) clearTimeout(quietTimer);
-                quietTimer = setTimeout(() => {
-                  if (Date.now() - lastActivity >= qMs) {
-                    cleanup();
-                    res({ stable: true, elapsed: Date.now() - start });
-                  } else {
-                    scheduleCheck();
-                  }
-                }, qMs - (Date.now() - lastActivity) + 1);
+                quietTimer = setTimeout(
+                  () => {
+                    if (Date.now() - lastActivity >= qMs) {
+                      cleanup();
+                      res({ stable: true, elapsed: Date.now() - start });
+                    } else {
+                      scheduleCheck();
+                    }
+                  },
+                  qMs - (Date.now() - lastActivity) + 1,
+                );
               }
 
               const obs = new MutationObserver((mutations) => {
                 for (const m of mutations) {
-                  if (m.type === "childList" || m.type === "attributes" || m.type === "characterData") {
+                  if (
+                    m.type === "childList" ||
+                    m.type === "attributes" ||
+                    m.type === "characterData"
+                  ) {
                     bump();
                     return;
                   }
@@ -359,8 +368,13 @@ export function useNetworkIdleEvents(
               function pollBBox() {
                 if (done) return;
                 const rect = domElement.getBoundingClientRect();
-                if (prevRect && (Math.abs(rect.x - prevRect.x) > 0.5 || Math.abs(rect.y - prevRect.y) > 0.5 ||
-                    Math.abs(rect.width - prevRect.width) > 0.5 || Math.abs(rect.height - prevRect.height) > 0.5)) {
+                if (
+                  prevRect &&
+                  (Math.abs(rect.x - prevRect.x) > 0.5 ||
+                    Math.abs(rect.y - prevRect.y) > 0.5 ||
+                    Math.abs(rect.width - prevRect.width) > 0.5 ||
+                    Math.abs(rect.height - prevRect.height) > 0.5)
+                ) {
                   bump();
                 }
                 prevRect = rect;
@@ -369,14 +383,19 @@ export function useNetworkIdleEvents(
               rafId = requestAnimationFrame(pollBBox);
 
               // Overall timeout
-              setTimeout(() => { cleanup(); res({ stable: false, elapsed: Date.now() - start }); }, tMs);
+              setTimeout(() => {
+                cleanup();
+                res({ stable: false, elapsed: Date.now() - start });
+              }, tMs);
 
               // Start quiet period check
               scheduleCheck();
             });
 
             await sendResponse({
-              requestId, type, success: true,
+              requestId,
+              type,
+              success: true,
               data: result,
               timestamp: Date.now(),
             });

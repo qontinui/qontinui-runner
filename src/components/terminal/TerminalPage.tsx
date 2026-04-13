@@ -13,13 +13,20 @@ import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
 import { useTerminalPageId } from "./TerminalPageContext";
 import {
-  TerminalCoreProvider, useTerminalCore,
-  SessionStateProvider, useSessionState,
-  ZoneMetadataProvider, useZoneMetadata,
-  TransitionEffectsProvider, useTransitionEffects,
-  AiFeaturesProvider, useAiFeatures,
-  ShellInfraProvider, useShellInfra,
-  UIStateProvider, useUIStateCx,
+  TerminalCoreProvider,
+  useTerminalCore,
+  SessionStateProvider,
+  useSessionState,
+  ZoneMetadataProvider,
+  useZoneMetadata,
+  TransitionEffectsProvider,
+  useTransitionEffects,
+  AiFeaturesProvider,
+  useAiFeatures,
+  ShellInfraProvider,
+  useShellInfra,
+  UIStateProvider,
+  useUIStateCx,
 } from "./contexts";
 import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
@@ -112,14 +119,8 @@ function TerminalPageInner({
   }, [tabs.length, onSessionCountChange]);
 
   const { fileConflicts, fileLockStates, sessionPersistence } = useShellInfra();
-  const {
-    labelsAndTags,
-    eventHistory,
-    addHistoryEvent,
-    metrics,
-    incrementMetric,
-    focusHistory,
-  } = useZoneMetadata();
+  const { labelsAndTags, eventHistory, addHistoryEvent, metrics, incrementMetric, focusHistory } =
+    useZoneMetadata();
 
   const stateTracking = useSessionState();
 
@@ -502,28 +503,19 @@ function TerminalPageInner({
             </div>
           )}
 
-          {zoneLayout.isMultiZone && (
-            <ZoneMinimap />
-          )}
+          {zoneLayout.isMultiZone && <ZoneMinimap />}
 
-          {zoneLayout.isMultiZone && !transitionEffects.batchBarDismissed && (
-            <BatchOperationsBar />
-          )}
+          {zoneLayout.isMultiZone && !transitionEffects.batchBarDismissed && <BatchOperationsBar />}
         </div>
 
         {uiState.showControlPanel && zoneLayout.isMultiZone && (
-          <ZoneControlPanel
-            onCreateTerminal={() => createAndAssignTerminal()}
-          />
+          <ZoneControlPanel onCreateTerminal={() => createAndAssignTerminal()} />
         )}
 
         <TerminalRightPanel />
       </div>
 
-      <TerminalOverlays
-        onSortZones={handleSortZones}
-        onExport={handleExportOutput}
-      />
+      <TerminalOverlays onSortZones={handleSortZones} onExport={handleExportOutput} />
     </div>
   );
 }

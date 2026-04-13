@@ -100,7 +100,10 @@ export function useUIBridgeEventHandler(): void {
       log.debug(`Tauri emit sent response for ${response.type}:`, response.requestId);
     } catch {
       // Both channels failed — response is lost
-      console.error(`[UIBridgeEventHandler] Both HTTP and Tauri emit failed for ${response.type}:`, response.requestId);
+      console.error(
+        `[UIBridgeEventHandler] Both HTTP and Tauri emit failed for ${response.type}:`,
+        response.requestId,
+      );
     }
   }, []);
 

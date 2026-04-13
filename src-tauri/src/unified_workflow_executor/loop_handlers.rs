@@ -1674,7 +1674,7 @@ impl LoopController {
                 && !ctx
                     .iteration_results
                     .last()
-                    .map_or(false, |r| r.verification_passed);
+                    .is_some_and(|r| r.verification_passed);
             let signals =
                 RoutingSignals::extract(&failure_context, ctx.iteration, previous_failed);
             config.routing_context.word_count = signals.word_count;

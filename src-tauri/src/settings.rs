@@ -926,17 +926,14 @@ pub struct Settings {
 /// - `Shadow`: Both run; text verifier decides, WSM disagreements are logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum WsvMode {
+    #[default]
     Disabled,
     Enabled,
     Shadow,
 }
 
-impl Default for WsvMode {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
 
 /// World State Verifier settings persisted to the settings file.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -14,12 +14,7 @@
 import React, { useMemo, useState, useCallback, useRef, useEffect } from "react";
 import type { TerminalTab } from "./useTerminalManager";
 import { instanceStorage } from "@/lib/instance-storage";
-import {
-  useTerminalCore,
-  useSessionState,
-  useZoneMetadata,
-  useUIStateCx,
-} from "./contexts";
+import { useTerminalCore, useSessionState, useZoneMetadata, useUIStateCx } from "./contexts";
 import {
   LayoutGrid,
   ChevronLeft,
@@ -722,38 +717,52 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
   const onTogglePin = labelsAndTags.togglePin;
   const { state: uiState, dispatch } = useUIStateCx();
   const collapsed = uiState.controlPanelCollapsed;
-  const onClose = useCallback(() => dispatch({ type: "SET_SHOW_CONTROL_PANEL", payload: false }), [dispatch]);
-  const onToggleCollapsed = useCallback(() => dispatch({ type: "TOGGLE_CONTROL_PANEL_COLLAPSED" }), [dispatch]);
-  const onSwapZones = useCallback((src: number, dst: number) => {
-    const srcTabId = zoneLayout.assignments[src];
-    const dstTabId = zoneLayout.assignments[dst];
-    if (srcTabId) zoneLayout.assignTabToZone(dst, srcTabId);
-    if (dstTabId) zoneLayout.assignTabToZone(src, dstTabId);
-  }, [zoneLayout]);
-  const onLoadWorkspace = useCallback(async (workspace: SavedWorkspace) => {
-    if (workspace.layoutId !== zoneLayout.layoutId) {
-      zoneLayout.setLayoutId(workspace.layoutId);
-    }
-    for (const session of workspace.sessions) {
-      if (session.zoneIndex < 0) {
-        await createTerminal(session.title, session.workingDir);
-        continue;
+  const onClose = useCallback(
+    () => dispatch({ type: "SET_SHOW_CONTROL_PANEL", payload: false }),
+    [dispatch],
+  );
+  const onToggleCollapsed = useCallback(
+    () => dispatch({ type: "TOGGLE_CONTROL_PANEL_COLLAPSED" }),
+    [dispatch],
+  );
+  const onSwapZones = useCallback(
+    (src: number, dst: number) => {
+      const srcTabId = zoneLayout.assignments[src];
+      const dstTabId = zoneLayout.assignments[dst];
+      if (srcTabId) zoneLayout.assignTabToZone(dst, srcTabId);
+      if (dstTabId) zoneLayout.assignTabToZone(src, dstTabId);
+    },
+    [zoneLayout],
+  );
+  const onLoadWorkspace = useCallback(
+    async (workspace: SavedWorkspace) => {
+      if (workspace.layoutId !== zoneLayout.layoutId) {
+        zoneLayout.setLayoutId(workspace.layoutId);
       }
-      const tabId = await createTerminal(session.title, session.workingDir);
-      if (tabId) {
-        zoneLayout.assignTabToZone(session.zoneIndex, tabId);
+      for (const session of workspace.sessions) {
+        if (session.zoneIndex < 0) {
+          await createTerminal(session.title, session.workingDir);
+          continue;
+        }
+        const tabId = await createTerminal(session.title, session.workingDir);
+        if (tabId) {
+          zoneLayout.assignTabToZone(session.zoneIndex, tabId);
+        }
+        if (session.label) {
+          labelsAndTags.setZoneLabel(session.zoneIndex, session.label);
+        }
+        if (session.notes) {
+          labelsAndTags.setZoneNote(session.zoneIndex, session.notes);
+        }
+        if (session.pinned) {
+          labelsAndTags.setPinnedZones(
+            (prev: Set<number>) => new Set([...prev, session.zoneIndex]),
+          );
+        }
       }
-      if (session.label) {
-        labelsAndTags.setZoneLabel(session.zoneIndex, session.label);
-      }
-      if (session.notes) {
-        labelsAndTags.setZoneNote(session.zoneIndex, session.notes);
-      }
-      if (session.pinned) {
-        labelsAndTags.setPinnedZones((prev: Set<number>) => new Set([...prev, session.zoneIndex]));
-      }
-    }
-  }, [zoneLayout, createTerminal, labelsAndTags]);
+    },
+    [zoneLayout, createTerminal, labelsAndTags],
+  );
   // -----------------------------------------------------------------------
   // Drag-and-drop state
   // -----------------------------------------------------------------------

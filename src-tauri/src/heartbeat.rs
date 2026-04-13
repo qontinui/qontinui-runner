@@ -105,7 +105,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             };
 
             // Send to web backend every 30s (every other tick)
-            if tick_count % 2 == 0 {
+            if tick_count.is_multiple_of(2) {
                 let ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
                 let payload = HeartbeatPayload {
                     hostname: hostname.clone(),

@@ -87,16 +87,31 @@ export function useDiscoveryEvents(
           // Enrich elements with stableRef if createStableRef is available
           try {
             const { createStableRef } = await import("ui-bridge/core");
-            const registry = (currentBridge as { registry?: { getElement?: (id: string) => unknown } }).registry;
+            const registry = (
+              currentBridge as { registry?: { getElement?: (id: string) => unknown } }
+            ).registry;
             if (result?.elements && registry?.getElement && createStableRef) {
               for (const el of result.elements as unknown as Array<Record<string, unknown>>) {
-                const reg = registry.getElement(el.id as string) as { element?: Element; id?: string; type?: string; label?: string; actions?: unknown[]; getState?: () => unknown } | null;
+                const reg = registry.getElement(el.id as string) as {
+                  element?: Element;
+                  id?: string;
+                  type?: string;
+                  label?: string;
+                  actions?: unknown[];
+                  getState?: () => unknown;
+                } | null;
                 if (reg) {
-                  try { el.stableRef = createStableRef(reg as never); } catch { /* skip */ }
+                  try {
+                    el.stableRef = createStableRef(reg as never);
+                  } catch {
+                    /* skip */
+                  }
                 }
               }
             }
-          } catch { /* createStableRef not available */ }
+          } catch {
+            /* createStableRef not available */
+          }
 
           await sendResponse({
             requestId,

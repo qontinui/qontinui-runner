@@ -40,7 +40,15 @@ function getFreshnessStatus(freshnessTs: string): {
 /**
  * Recursive variable tree renderer. Renders objects/arrays as nested lists.
  */
-function VariableNode({ name, value, depth = 0 }: { name: string; value: unknown; depth?: number }) {
+function VariableNode({
+  name,
+  value,
+  depth = 0,
+}: {
+  name: string;
+  value: unknown;
+  depth?: number;
+}) {
   const isObject = value !== null && typeof value === "object";
   const isArray = Array.isArray(value);
 
@@ -63,9 +71,7 @@ function VariableNode({ name, value, depth = 0 }: { name: string; value: unknown
     return (
       <div className="flex items-baseline gap-2 py-0.5" style={{ paddingLeft: `${depth * 16}px` }}>
         <span className="text-xs font-mono text-muted-foreground">{name}:</span>
-        <span className="text-xs font-mono text-muted-foreground/60">
-          {isArray ? "[]" : "{}"}
-        </span>
+        <span className="text-xs font-mono text-muted-foreground/60">{isArray ? "[]" : "{}"}</span>
       </div>
     );
   }

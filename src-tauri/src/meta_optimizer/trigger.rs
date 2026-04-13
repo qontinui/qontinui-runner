@@ -276,7 +276,7 @@ fn should_run_pattern_distiller(
         return false;
     }
     let sum: u32 = bytes.iter().map(|b| *b as u32).sum();
-    sum % 5 == 0
+    sum.is_multiple_of(5)
 }
 
 /// Re-evaluate applied recommendations whose outcome is still "insufficient_data"

@@ -37,7 +37,9 @@ import type { BreakpointSnapshot } from "../components/active-dashboard/types";
  * Fetch all breakpoint snapshots for a task run.
  */
 export async function fetchBreakpoints(taskRunId: string): Promise<BreakpointSnapshot[]> {
-  const response = await tracedFetch(`${getApiBase()}/task-runs/${encodeURIComponent(taskRunId)}/breakpoints`);
+  const response = await tracedFetch(
+    `${getApiBase()}/task-runs/${encodeURIComponent(taskRunId)}/breakpoints`,
+  );
   if (!response.ok) {
     throw new Error(`Failed to fetch breakpoints: ${response.status}`);
   }
@@ -48,7 +50,10 @@ export async function fetchBreakpoints(taskRunId: string): Promise<BreakpointSna
 /**
  * Fetch a single breakpoint snapshot by ID.
  */
-export async function fetchBreakpointDetail(taskRunId: string, snapshotId: string): Promise<BreakpointSnapshot> {
+export async function fetchBreakpointDetail(
+  taskRunId: string,
+  snapshotId: string,
+): Promise<BreakpointSnapshot> {
   const response = await tracedFetch(
     `${getApiBase()}/task-runs/${encodeURIComponent(taskRunId)}/breakpoints/${encodeURIComponent(snapshotId)}`,
   );

@@ -81,15 +81,17 @@ const STATE_LABELS: Record<SessionState, string> = {
   error: "error",
 };
 
-export function ZoneStatusBar({
-  onExport,
-  onSortZones,
-  onOpenDocFile,
-}: ZoneStatusBarProps) {
+export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStatusBarProps) {
   // Read all data from contexts instead of props
   const { tabs, zoneLayout } = useTerminalCore();
   const assignments = zoneLayout.assignments;
-  const { sessionStates, stateDurations, lastOutputLines, stateTimeAccum: stateTimeAccumRef, activeFindings } = useSessionState();
+  const {
+    sessionStates,
+    stateDurations,
+    lastOutputLines,
+    stateTimeAccum: stateTimeAccumRef,
+    activeFindings,
+  } = useSessionState();
   const { labelsAndTags, eventHistory, metrics: metricsRef } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;
   const labelColorMap = labelsAndTags.labelColorMap;

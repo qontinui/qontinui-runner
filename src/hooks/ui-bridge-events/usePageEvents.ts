@@ -54,10 +54,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               // "/settings/world-state-verifier" becomes
               // "settings-world-state-verifier" — matching the PAGE_TO_TAB
               // keys in useAppNavigation.ts.
-              const page =
-                url
-                  .replace(/^\/+/, "")
-                  .replace(/\//g, "-") || "gui-automation";
+              const page = url.replace(/^\/+/, "").replace(/\//g, "-") || "gui-automation";
               window.dispatchEvent(
                 new CustomEvent("ui-bridge-navigate", { detail: { page, url } }),
               );

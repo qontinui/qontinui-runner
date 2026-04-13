@@ -86,8 +86,10 @@ pub enum RetrievalStrategy {
 /// Reasoning depth for tiered memory queries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ReasoningLevel {
     /// Raw RRF-fused results, no enrichment.
+    #[default]
     Minimal,
     /// + graph neighborhood enrichment for top results.
     Low,
@@ -99,11 +101,6 @@ pub enum ReasoningLevel {
     Max,
 }
 
-impl Default for ReasoningLevel {
-    fn default() -> Self {
-        Self::Minimal
-    }
-}
 
 impl ReasoningLevel {
     pub fn from_str_opt(s: &str) -> Self {
@@ -640,7 +637,7 @@ pub fn reciprocal_rank_fusion(result_sets: Vec<Vec<MemoryResult>>, k: f64) -> Ve
 
 /// Helper: check if a source is enabled in the query params.
 fn source_enabled(sources: &Option<Vec<MemorySource>>, s: MemorySource) -> bool {
-    sources.as_ref().map_or(true, |list| list.contains(&s))
+    sources.as_ref().is_none_or(|list| list.contains(&s))
 }
 
 /// Query all memory stores in parallel, fuse with RRF, and return ranked results.
@@ -743,10 +740,10 @@ pub async fn query_memory(
 
     // Apply temporal filters
     if let Some(from) = params.from {
-        fused.retain(|r| r.timestamp.map_or(true, |t| t >= from));
+        fused.retain(|r| r.timestamp.is_none_or(|t| t >= from));
     }
     if let Some(to) = params.to {
-        fused.retain(|r| r.timestamp.map_or(true, |t| t <= to));
+        fused.retain(|r| r.timestamp.is_none_or(|t| t <= to));
     }
 
     // Apply min_score filter

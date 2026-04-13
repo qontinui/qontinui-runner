@@ -84,9 +84,7 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
   const needsInputCount = Object.values(stateTracking.sessionStates).filter(
     (s) => s === "needs-input",
   ).length;
-  const errorCount = Object.values(stateTracking.sessionStates).filter(
-    (s) => s === "error",
-  ).length;
+  const errorCount = Object.values(stateTracking.sessionStates).filter((s) => s === "error").length;
   useWindowTitle(needsInputCount, errorCount, zoneLayout.isMultiZone);
 
   const value = useMemo<TransitionEffectsContextValue>(

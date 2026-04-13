@@ -108,14 +108,15 @@ function createInitialGridState(layout: LayoutPreset): GridState {
   };
 }
 
-export function ZoneGrid({
-  onZoneClick,
-  onZoneDoubleClick,
-  onExit,
-  onExportZone,
-}: ZoneGridProps) {
+export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone }: ZoneGridProps) {
   // Read all data from contexts
-  const { tabs, zoneLayout, terminalRefs: terminalRefsRef, pageId, markReconnected } = useTerminalCore();
+  const {
+    tabs,
+    zoneLayout,
+    terminalRefs: terminalRefsRef,
+    pageId,
+    markReconnected,
+  } = useTerminalCore();
   const terminalRefs = terminalRefsRef.current;
   const layout = zoneLayout.layout;
   const assignments = zoneLayout.assignments;

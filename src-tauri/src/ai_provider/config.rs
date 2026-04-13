@@ -103,9 +103,8 @@ pub fn rotate_account_on_rate_limit() -> bool {
         // Find the first account that is not in cooldown
         let available = config_dirs.iter().find(|d| {
             current.as_ref() != Some(*d)
-                && !map
-                    .get(*d)
-                    .is_some_and(|t| t.elapsed().as_secs() < RATE_LIMIT_COOLDOWN_SECS)
+                && map
+                    .get(*d).is_none_or(|t| t.elapsed().as_secs() >= RATE_LIMIT_COOLDOWN_SECS)
         });
 
         if let Some(dir) = available {
@@ -163,10 +162,7 @@ pub fn time_until_next_account_available() -> Option<std::time::Duration> {
     }
 
     if let Ok(cooldowns) = ACCOUNT_COOLDOWNS.lock() {
-        let map = match cooldowns.as_ref() {
-            Some(m) => m,
-            None => return None, // No cooldowns tracked yet — all available
-        };
+        let map = cooldowns.as_ref()?;
 
         // Check all accounts under one lock: compute remaining cooldown per account
         let mut all_in_cooldown = true;

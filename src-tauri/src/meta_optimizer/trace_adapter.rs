@@ -72,7 +72,7 @@ impl TraceToMessages {
         let default_reward = rewards
             .iter()
             .map(|(_, v)| *v)
-            .last()
+            .next_back()
             .unwrap_or(0.0);
 
         for step in 0..=max_step {

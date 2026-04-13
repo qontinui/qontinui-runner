@@ -1,16 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  Eye,
-  Check,
-  X,
-  Zap,
-  Server,
-  Cpu,
-  Image as ImageIcon,
-  Info,
-  Activity,
-} from "lucide-react";
+import { Eye, Check, X, Zap, Server, Cpu, Image as ImageIcon, Info, Activity } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { WsvCalibrationSection } from "./WsvCalibrationSection";
 import { getAccentColors } from "@/design-system";
@@ -69,9 +59,7 @@ type TestState =
   | { kind: "success"; latencyMs: number; models: string[] }
   | { kind: "error"; message: string; latencyMs: number };
 
-export function WorldStateVerifierSettings({
-  onLog,
-}: WorldStateVerifierSettingsProps) {
+export function WorldStateVerifierSettings({ onLog }: WorldStateVerifierSettingsProps) {
   const [settings, setSettings] = useState<WsvSettingsType>(DEFAULT_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -156,10 +144,7 @@ export function WorldStateVerifierSettings({
           message: result.error || "Unknown error",
           latencyMs: result.latency_ms,
         });
-        onLog(
-          "warning",
-          `WSV connection failed: ${result.error || "Unknown error"}`,
-        );
+        onLog("warning", `WSV connection failed: ${result.error || "Unknown error"}`);
       }
     } catch (err) {
       setTestState({
@@ -211,12 +196,11 @@ export function WorldStateVerifierSettings({
       )}
 
       {saveSuccess && (
-        <div
-          className={`p-3 ${getAccentColors("green").bg} rounded-lg flex items-start gap-2`}
-        >
+        <div className={`p-3 ${getAccentColors("green").bg} rounded-lg flex items-start gap-2`}>
           <Check className={`w-4 h-4 ${getAccentColors("green").text} shrink-0 mt-0.5`} />
           <span className={`${getAccentColors("green").text} text-xs`}>
-            Settings saved — changes take effect on the next verification iteration, no restart required.
+            Settings saved — changes take effect on the next verification iteration, no restart
+            required.
           </span>
         </div>
       )}
@@ -236,9 +220,7 @@ export function WorldStateVerifierSettings({
         <div className="space-y-1.5">
           <select
             value={settings.mode}
-            onChange={(e) =>
-              setSettings((prev) => ({ ...prev, mode: e.target.value as WsvMode }))
-            }
+            onChange={(e) => setSettings((prev) => ({ ...prev, mode: e.target.value as WsvMode }))}
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             data-content-role="select"
             data-content-label="wsv mode"
@@ -258,8 +240,8 @@ export function WorldStateVerifierSettings({
           <div className={`p-3 ${getAccentColors("blue").bg} rounded-lg flex gap-2`}>
             <Info className={`w-4 h-4 ${getAccentColors("blue").text} shrink-0 mt-0.5`} />
             <p className={`text-xs ${getAccentColors("blue").text}`}>
-              Shadow mode is the recommended first step. Run 10-20 agentic workflows, then
-              review disagreements before flipping to Enabled.
+              Shadow mode is the recommended first step. Run 10-20 agentic workflows, then review
+              disagreements before flipping to Enabled.
             </p>
           </div>
         )}
@@ -285,17 +267,15 @@ export function WorldStateVerifierSettings({
           <input
             type="text"
             value={settings.endpoint}
-            onChange={(e) =>
-              setSettings((prev) => ({ ...prev, endpoint: e.target.value }))
-            }
+            onChange={(e) => setSettings((prev) => ({ ...prev, endpoint: e.target.value }))}
             placeholder="http://127.0.0.1:8100"
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             data-content-role="textbox"
             data-content-label="wsv endpoint"
           />
           <p className="text-[10px] text-muted-foreground">
-            OpenAI-compatible base URL. llama-swap's primary API port is 8100
-            (see <code>qontinui/docker/llama-swap/README.md</code>).
+            OpenAI-compatible base URL. llama-swap's primary API port is 8100 (see{" "}
+            <code>qontinui/docker/llama-swap/README.md</code>).
           </p>
         </div>
 
@@ -315,8 +295,7 @@ export function WorldStateVerifierSettings({
           />
           <p className="text-[10px] text-muted-foreground">
             Use the llama-swap alias <code>cua-wsm</code> or the full HuggingFace id{" "}
-            <code>Zery/CUA_World_State_Model</code>. First request triggers a ~14GB weight
-            download.
+            <code>Zery/CUA_World_State_Model</code>. First request triggers a ~14GB weight download.
           </p>
         </div>
 
@@ -347,9 +326,7 @@ export function WorldStateVerifierSettings({
               data-content-role="status"
               data-content-label="wsv connection success"
             >
-              <Check
-                className={`w-3.5 h-3.5 ${getAccentColors("green").text} shrink-0 mt-0.5`}
-              />
+              <Check className={`w-3.5 h-3.5 ${getAccentColors("green").text} shrink-0 mt-0.5`} />
               <div className={`text-xs ${getAccentColors("green").text}`}>
                 Connected ({testState.latencyMs}ms) —{" "}
                 {testState.models.length > 0
@@ -357,9 +334,8 @@ export function WorldStateVerifierSettings({
                   : "no models listed"}
                 {!testState.models.includes(settings.model) && testState.models.length > 0 && (
                   <div className={`mt-1 ${getAccentColors("yellow").text}`}>
-                    Warning: your configured model{" "}
-                    <code>{settings.model}</code> isn't in the server's model list. The
-                    first request may trigger a weight download.
+                    Warning: your configured model <code>{settings.model}</code> isn't in the
+                    server's model list. The first request may trigger a weight download.
                   </div>
                 )}
               </div>
@@ -389,8 +365,8 @@ export function WorldStateVerifierSettings({
             <div>
               <h4 className="font-medium text-sm">Screenshot Evidence in Iteration Panels</h4>
               <p className="text-xs text-muted-foreground">
-                Embed downsampled pre/post thumbnails in the agentic verification canvas
-                panels when the WSM verdict is used
+                Embed downsampled pre/post thumbnails in the agentic verification canvas panels when
+                the WSM verdict is used
               </p>
             </div>
           </div>
@@ -404,9 +380,9 @@ export function WorldStateVerifierSettings({
         <div className={`p-3 ${getAccentColors("purple").bg} rounded-lg flex gap-2`}>
           <Info className={`w-4 h-4 ${getAccentColors("purple").text} shrink-0 mt-0.5`} />
           <p className={`text-xs ${getAccentColors("purple").text}`}>
-            Thumbnails are capped at 320px wide (~20KB each) before embedding, so payload
-            bloat is limited even on long runs. Turn off to save DB space when you don't need
-            visual debugging.
+            Thumbnails are capped at 320px wide (~20KB each) before embedding, so payload bloat is
+            limited even on long runs. Turn off to save DB space when you don't need visual
+            debugging.
           </p>
         </div>
       </div>
