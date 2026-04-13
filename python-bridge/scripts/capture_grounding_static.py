@@ -47,12 +47,26 @@ _TRAIN_ROOT = _ROOT / "qontinui-train"
 
 if str(_TRAIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_TRAIN_ROOT))
+if str(_BRIDGE_DIR) not in sys.path:
+    sys.path.insert(0, str(_BRIDGE_DIR))
 
-from qontinui_train.export.grounding_record import (  # noqa: E402
-    GroundingElement,
-    GroundingJSONLWriter,
-    GroundingRecord,
+# Import grounding_record directly to avoid __init__.py pulling in unrelated
+# modules (training_data_exporter, training_export_service) that depend on
+# packages only available inside the runner's full Poetry environment.
+import importlib.util as _ilu  # noqa: E402
+
+_gr_spec = _ilu.spec_from_file_location(
+    "qontinui_train.export.grounding_record",
+    _TRAIN_ROOT / "qontinui_train" / "export" / "grounding_record.py",
 )
+_gr_mod = _ilu.module_from_spec(_gr_spec)
+_gr_mod.__package__ = "qontinui_train.export"
+sys.modules[_gr_spec.name] = _gr_mod
+_gr_spec.loader.exec_module(_gr_mod)
+
+GroundingElement = _gr_mod.GroundingElement  # noqa: E402
+GroundingJSONLWriter = _gr_mod.GroundingJSONLWriter  # noqa: E402
+GroundingRecord = _gr_mod.GroundingRecord  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
