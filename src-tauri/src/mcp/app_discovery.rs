@@ -399,7 +399,7 @@ async fn check_device_ui_bridge(device_id: &str) -> Option<DiscoveredApp> {
 
 /// Full scan -- web + desktop + mobile
 async fn scan_all(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<DiscoveryResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     let start = std::time::Instant::now();
 
@@ -414,6 +414,41 @@ async fn scan_all(
     for device in &mut mobile_devices {
         if device.status == "online" {
             device.ui_bridge = check_device_ui_bridge(&device.device_id).await;
+        }
+    }
+
+    // Merge physical device registry entries (LAN/Cloud devices not found by ADB scan)
+    let registry_devices = state.physical_device_registry.list_all().await;
+    for registry_device in registry_devices {
+        // Skip if already in the ADB list
+        let already_present = mobile_devices
+            .iter()
+            .any(|m| m.device_id == registry_device.info.id);
+        if already_present {
+            continue;
+        }
+        // Only include devices with an active transport
+        if let Some(proxy_url) = registry_device.active_proxy_url() {
+            let device_type = registry_device.info.device_kind.clone();
+            let model = registry_device.info.model.clone();
+            let transport_kind = registry_device
+                .transports
+                .first()
+                .map(|t| format!("{}", t.kind))
+                .unwrap_or_else(|| "unknown".to_string());
+            let status = match registry_device.health_state {
+                crate::mcp::physical_device::HealthState::Healthy => "online",
+                crate::mcp::physical_device::HealthState::Degraded(_) => "degraded",
+                crate::mcp::physical_device::HealthState::Unreachable => "offline",
+            }
+            .to_string();
+            mobile_devices.push(MobileDevice {
+                device_id: registry_device.info.id.clone(),
+                device_type: format!("{}-{}", transport_kind.to_lowercase(), device_type),
+                model,
+                status,
+                ui_bridge: None, // populated lazily; proxy_url available separately
+            });
         }
     }
 

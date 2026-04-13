@@ -379,10 +379,38 @@ pub struct MobileSettings {
     /// If None, uses the project's screenshot/log directory
     #[serde(default)]
     pub output_dir: Option<String>,
+
+    /// Default remote port that UI Bridge listens on mobile devices (default: 8087)
+    #[serde(default = "default_ui_bridge_port")]
+    pub ui_bridge_port: u16,
+
+    /// Enable LAN (Wi-Fi) discovery via mDNS
+    #[serde(default = "default_true")]
+    pub lan_discovery_enabled: bool,
+
+    /// Allow plain HTTP for LAN connections (default: false, requires TLS)
+    #[serde(default)]
+    pub lan_allow_plaintext: bool,
+
+    /// Pairing timeout in seconds (default: 600)
+    #[serde(default = "default_pairing_timeout")]
+    pub pairing_timeout_secs: u64,
+
+    /// Known/paired physical devices
+    #[serde(default)]
+    pub paired_devices: Vec<crate::mcp::transport::pairing::PairedDeviceRecord>,
 }
 
 fn default_logcat_lines() -> u32 {
     500
+}
+
+fn default_ui_bridge_port() -> u16 {
+    8087
+}
+
+fn default_pairing_timeout() -> u64 {
+    600
 }
 
 impl Default for MobileSettings {
@@ -394,6 +422,11 @@ impl Default for MobileSettings {
             logcat_lines: default_logcat_lines(),
             filter_react_native: false,
             output_dir: None,
+            ui_bridge_port: default_ui_bridge_port(),
+            lan_discovery_enabled: default_true(),
+            lan_allow_plaintext: false,
+            pairing_timeout_secs: default_pairing_timeout(),
+            paired_devices: Vec::new(),
         }
     }
 }
@@ -742,10 +775,20 @@ pub struct CloudRelaySettings {
     /// Auto-connect on app startup
     #[serde(default)]
     pub auto_connect: bool,
+    /// Enable device bridging via cloud relay
+    #[serde(default)]
+    pub device_bridge_enabled: bool,
+    /// Poll interval for cloud device registry in seconds (default: 30)
+    #[serde(default = "default_cloud_poll_secs")]
+    pub cloud_registry_poll_secs: u64,
 }
 
 fn default_backend_url() -> String {
     "https://qontinui.io".to_string()
+}
+
+fn default_cloud_poll_secs() -> u64 {
+    30
 }
 
 impl Default for CloudRelaySettings {
@@ -754,6 +797,8 @@ impl Default for CloudRelaySettings {
             enabled: false,
             backend_url: default_backend_url(),
             auto_connect: false,
+            device_bridge_enabled: false,
+            cloud_registry_poll_secs: default_cloud_poll_secs(),
         }
     }
 }

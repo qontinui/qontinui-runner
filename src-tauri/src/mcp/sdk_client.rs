@@ -53,6 +53,10 @@ pub struct SdkConnection {
     pub app_info: SdkAppInfo,
     pub client: reqwest::Client,
     pub connected_at: i64,
+    /// Transport kind if connected via physical device registry
+    pub transport_kind: Option<crate::mcp::transport::TransportKind>,
+    /// Physical device ID if connected via physical device registry
+    pub physical_device_id: Option<String>,
 }
 
 /// Manages multiple simultaneous SDK connections with one active connection
@@ -460,6 +464,8 @@ pub async fn connect_sdk_app(
             app_info,
             client,
             connected_at,
+            transport_kind: None,
+            physical_device_id: None,
         },
     );
     manager.active_url = Some(url.to_string());

@@ -308,6 +308,10 @@ pub fn create_router(
         accessibility_manager: Arc::new(tokio::sync::Mutex::new(
             qontinui_runner_lib::accessibility::AccessibilityManager::new(),
         )),
+        physical_device_registry: Arc::new(
+            crate::mcp::physical_device::PhysicalDeviceRegistry::new(),
+        ),
+        pairing_manager: Arc::new(crate::mcp::transport::pairing::PairingManager::new()),
     });
 
     // Set up UI Bridge response listener
@@ -631,6 +635,7 @@ pub fn create_router(
         .merge(crate::mcp::ai_generation::routes())
         .merge(crate::mcp::api_requests::routes())
         .merge(crate::mcp::app_discovery::routes())
+        .merge(crate::mcp::physical_device_api::routes())
         .merge(crate::mcp::automation_runs::routes())
         .merge(crate::mcp::comparison_api::routes())
         .merge(crate::mcp::checks::routes())

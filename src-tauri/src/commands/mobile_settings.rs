@@ -70,6 +70,8 @@ pub fn save_mobile_settings(
         logcat_lines,
         filter_react_native,
         output_dir,
+        // New fields use their defaults when saving via legacy command
+        ..MobileSettings::default()
     };
 
     settings::save_mobile_settings(mobile_settings)

@@ -144,6 +144,11 @@ pub struct ApiState {
     /// Used by MCP API accessibility endpoints and Tauri commands.
     pub accessibility_manager:
         Arc<tokio::sync::Mutex<qontinui_runner_lib::accessibility::AccessibilityManager>>,
+    /// Registry of physical mobile devices across all transports
+    pub physical_device_registry:
+        Arc<crate::mcp::physical_device::PhysicalDeviceRegistry>,
+    /// Pairing manager for LAN and Cloud device authentication
+    pub pairing_manager: Arc<crate::mcp::transport::pairing::PairingManager>,
 }
 
 /// Response for API endpoints
