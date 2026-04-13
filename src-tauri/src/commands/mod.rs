@@ -70,6 +70,7 @@ pub mod file_browser; // Safe read-only filesystem browsing for mobile
 pub mod container_settings;
 pub mod context;
 pub mod cost_dashboard; // Cost dashboard with cache efficiency and phase breakdowns
+pub mod dag_workflows; // DAG workflow import, export, and validation
 pub mod database; // Database maintenance and optimization
 pub mod dataset;
 pub mod debug;

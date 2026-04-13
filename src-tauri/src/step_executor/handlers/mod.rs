@@ -14,7 +14,7 @@
 //!             └── handler.execute(step, context)
 //! ```
 //!
-//! ## Available Handlers (9 active)
+//! ## Available Handlers (12 active)
 //!
 //! | Category | Handlers |
 //! |----------|----------|
@@ -26,6 +26,7 @@
 //! | **Process** | restart_process |
 //! | **Playbook** | execute_playbook (drives state machine through recorded transitions) |
 //! | **Composition** | workflow (runs a saved workflow inline), workflow_ref |
+//! | **DAG Nodes** | dag_cancel, dag_approval, dag_loop |
 //!
 //! ## Adding a New Step Type
 //!
@@ -81,6 +82,7 @@ pub(super) mod test;
 // Active handlers
 mod code_execution;
 mod command;
+pub mod dag_nodes;
 mod execute_playbook;
 mod native_accessibility;
 pub mod restart_process;
@@ -477,7 +479,7 @@ impl HandlerRegistry {
     /// Create a registry pre-populated with all standard handlers.
     ///
     /// This is the recommended way to create a registry for production use.
-    /// 9 active handlers: command, execute_playbook, ui_bridge, prompt, restart_process, save_workflow_artifact, workflow_fixup, workflow, workflow_ref
+    /// 12 active handlers: command, execute_playbook, ui_bridge, prompt, restart_process, save_workflow_artifact, workflow_fixup, workflow, workflow_ref, dag_cancel, dag_approval, dag_loop
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 
@@ -494,6 +496,9 @@ impl HandlerRegistry {
         registry.register(UiBridgeVisualAssertionHandler);
         registry.register(WorkflowStepHandler);
         registry.register(WorkflowRefHandler);
+        registry.register(dag_nodes::DagCancelHandler);
+        registry.register(dag_nodes::DagApprovalHandler);
+        registry.register(dag_nodes::DagLoopHandler);
 
         registry
     }
