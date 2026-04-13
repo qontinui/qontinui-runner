@@ -137,6 +137,9 @@ const AccessibilityExplorer = lazy(
 const PromptHomePage = lazy(() =>
   import("../prompt-home/PromptHomePage").then((m) => ({ default: m.PromptHomePage })),
 );
+const DagWorkflowEditor = lazy(() =>
+  import("../dag-workflow-editor").then((m) => ({ default: m.DagWorkflowEditor })),
+);
 
 /** Register the active page with UI Bridge for AI discoverability */
 function PageRegistration({
@@ -825,6 +828,20 @@ export function TabContent({
             editWorkflowId={editWorkflowId}
             onNavigateToActive={() => setActiveTab("active")}
           />
+        </div>
+      );
+
+    case "dag-workflow-editor":
+      return (
+        <div data-page-id="dag-workflow-editor" className="h-full overflow-hidden">
+          <PageRegistration
+            id="dag-workflow-editor"
+            name="DAG Workflow Editor"
+            description="Visual DAG workflow editor with YAML syntax and graph visualization"
+          />
+          <Suspense fallback={<LazyFallback />}>
+            <DagWorkflowEditor />
+          </Suspense>
         </div>
       );
 

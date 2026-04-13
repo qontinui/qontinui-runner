@@ -62,6 +62,11 @@ export function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
         section: "build",
         breadcrumb: ["Build", "Workflow Builder"],
       },
+      "dag-workflow-editor": {
+        name: "DAG Workflow Editor",
+        section: "build",
+        breadcrumb: ["Build", "DAG Workflow Editor"],
+      },
       library: { name: "Library", section: "build", breadcrumb: ["Build", "Library"] },
       "step-builders": { name: "Library", section: "build", breadcrumb: ["Build", "Library"] },
       capture: { name: "Capture", section: "build", breadcrumb: ["Build", "Capture"] },
