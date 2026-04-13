@@ -242,7 +242,14 @@ impl DagRuntime {
     }
 
     /// Build the final result summary.
-    pub fn build_result(&self, node_durations: &HashMap<String, u64>) -> DagWorkflowResult {
+    ///
+    /// `node_retry_counts` maps node_id → number of retries (attempts - 1).
+    /// Pass an empty map if retry tracking is not needed.
+    pub fn build_result(
+        &self,
+        node_durations: &HashMap<String, u64>,
+        node_retry_counts: &HashMap<String, u32>,
+    ) -> DagWorkflowResult {
         let total_nodes = self.definition.nodes.len();
         let mut completed = 0;
         let mut failed = 0;
@@ -260,7 +267,7 @@ impl DagRuntime {
                 node_id: node_id.clone(),
                 outcome: outcome_str.to_string(),
                 duration_ms: node_durations.get(node_id).copied(),
-                retry_count: 0, // TODO: track retries in future
+                retry_count: node_retry_counts.get(node_id).copied().unwrap_or(0),
                 was_skipped,
             });
         }
@@ -367,7 +374,7 @@ nodes:
                     }
                 }
                 LayerAdvance::Complete { .. } | LayerAdvance::Cancelled { .. } => {
-                    return runtime.build_result(&HashMap::new());
+                    return runtime.build_result(&HashMap::new(), &HashMap::new());
                 }
             }
         }
@@ -526,7 +533,7 @@ nodes:
         durations.insert("nodeA".to_string(), 150u64);
         durations.insert("nodeB".to_string(), 200u64);
 
-        let result = runtime.build_result(&durations);
+        let result = runtime.build_result(&durations, &HashMap::new());
 
         assert_eq!(result.node_metrics.len(), 2);
         for metric in &result.node_metrics {

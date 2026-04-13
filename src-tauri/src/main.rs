@@ -657,6 +657,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::dag_workflows::import_dag_workflow,
             commands::dag_workflows::import_dag_workflows_from_project,
             commands::dag_workflows::export_dag_workflow,
+            commands::dag_workflows::respond_dag_approval,
             // Checkpoint/session commands (PostgreSQL)
             commands::checkpoints::checkpoint_get,
             commands::checkpoints::checkpoint_save,

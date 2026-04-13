@@ -99,3 +99,17 @@ pub async fn export_dag_workflow(
     use crate::workflow::dag_sync::export_workflow_as_yaml;
     export_workflow_as_yaml(&workflow_id, &state.pg_db).await
 }
+
+/// Respond to a pending DAG approval gate.
+///
+/// The frontend invokes this command from the `ApprovalDialog` component after
+/// the user clicks Approve or Reject. The approval_id matches the one emitted
+/// with the `dag:approval-requested` event.
+#[tauri::command]
+pub async fn respond_dag_approval(
+    approval_id: String,
+    approved: bool,
+    _state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    crate::step_executor::handlers::dag_nodes::resolve_approval(&approval_id, approved)
+}

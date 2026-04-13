@@ -47,6 +47,7 @@ import { useErrorNotifications } from "./hooks/useErrorNotifications";
 import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration";
 
 import { ToastContainer } from "./components/ToastContainer";
+import { ApprovalDialog } from "./components/dag-workflow-editor";
 import StatusIndicator from "./components/StatusIndicator";
 import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
@@ -588,6 +589,7 @@ function AppContent() {
             </div>
           ))}
 
+          <ApprovalDialog />
           <ToastContainer toasts={toasts} onDismiss={dismissToast} />
           <PerformanceOverlay position="bottom-right" />
           <CommandPalette />
