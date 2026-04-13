@@ -504,19 +504,67 @@ fn detect_framework(path: &str, generic_type: &str) -> String {
     }
 }
 
+/// Extract the port from a package.json script string.
+///
+/// Parses common `--port N`, `-p N`, and `--port=N` patterns from npm scripts
+/// like `"next dev --port 3001"` or `"vite --port 4000"`.
+fn detect_port_from_script(script: &str) -> Option<u16> {
+    let parts: Vec<&str> = script.split_whitespace().collect();
+    for (i, part) in parts.iter().enumerate() {
+        // --port=N or -p=N
+        if let Some(val) = part.strip_prefix("--port=").or_else(|| part.strip_prefix("-p=")) {
+            if let Ok(port) = val.parse::<u16>() {
+                return Some(port);
+            }
+        }
+        // --port N or -p N
+        if (*part == "--port" || *part == "-p") && i + 1 < parts.len() {
+            if let Ok(port) = parts[i + 1].parse::<u16>() {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+/// Read the port from a Node project's dev or start script in package.json.
+///
+/// Checks the `dev` script first, then `start`. Returns the framework default
+/// if no explicit port is found.
+fn detect_node_port(path: &str, script_name: &str, default_port: u16) -> u16 {
+    let pkg_path = std::path::Path::new(path).join("package.json");
+    if let Ok(contents) = std::fs::read_to_string(&pkg_path) {
+        if let Ok(pkg) = serde_json::from_str::<Value>(&contents) {
+            if let Some(script) = pkg
+                .get("scripts")
+                .and_then(|s| s.get(script_name))
+                .and_then(|v| v.as_str())
+            {
+                if let Some(port) = detect_port_from_script(script) {
+                    return port;
+                }
+            }
+        }
+    }
+    default_port
+}
+
 /// Generate process configs for a detected framework.
 fn configs_for_framework(name: &str, path: &str, framework: &str) -> Vec<Value> {
     match framework {
-        "nextjs" => vec![build_process_config(
-            name,
-            "Next.js",
-            "npm",
-            &["run", "dev"],
-            path,
-            Some(3000),
-            "javascript",
-            "frontend",
-        )],
+        "nextjs" => {
+            let port = detect_node_port(path, "dev", 3000);
+            vec![build_process_config(
+                name,
+                "Next.js",
+                "npm",
+                &["run", "dev"],
+                path,
+                Some(port),
+                "javascript",
+                "frontend",
+            )]
+        }
         "fastapi" => vec![build_process_config(
             name,
             "FastAPI",
@@ -527,26 +575,32 @@ fn configs_for_framework(name: &str, path: &str, framework: &str) -> Vec<Value> 
             "python",
             "backend",
         )],
-        "express" => vec![build_process_config(
-            name,
-            "Express",
-            "npm",
-            &["start"],
-            path,
-            Some(3000),
-            "javascript",
-            "backend",
-        )],
-        "nestjs" => vec![build_process_config(
-            name,
-            "NestJS",
-            "npm",
-            &["run", "start:dev"],
-            path,
-            Some(3000),
-            "javascript",
-            "backend",
-        )],
+        "express" => {
+            let port = detect_node_port(path, "start", 3000);
+            vec![build_process_config(
+                name,
+                "Express",
+                "npm",
+                &["start"],
+                path,
+                Some(port),
+                "javascript",
+                "backend",
+            )]
+        }
+        "nestjs" => {
+            let port = detect_node_port(path, "start:dev", 3000);
+            vec![build_process_config(
+                name,
+                "NestJS",
+                "npm",
+                &["run", "start:dev"],
+                path,
+                Some(port),
+                "javascript",
+                "backend",
+            )]
+        }
         "django" => vec![build_process_config(
             name,
             "Django",
@@ -557,16 +611,19 @@ fn configs_for_framework(name: &str, path: &str, framework: &str) -> Vec<Value> 
             "python",
             "backend",
         )],
-        "vite" => vec![build_process_config(
-            name,
-            "Vite",
-            "npm",
-            &["run", "dev"],
-            path,
-            Some(5173),
-            "javascript",
-            "frontend",
-        )],
+        "vite" => {
+            let port = detect_node_port(path, "dev", 5173);
+            vec![build_process_config(
+                name,
+                "Vite",
+                "npm",
+                &["run", "dev"],
+                path,
+                Some(port),
+                "javascript",
+                "frontend",
+            )]
+        }
         "rust" => vec![build_process_config(
             name,
             "Cargo",
@@ -627,16 +684,19 @@ fn configs_for_framework(name: &str, path: &str, framework: &str) -> Vec<Value> 
             "javascript",
             "mobile",
         )],
-        "docusaurus" => vec![build_process_config(
-            name,
-            "Docusaurus",
-            "npm",
-            &["start"],
-            path,
-            Some(3000),
-            "javascript",
-            "frontend",
-        )],
+        "docusaurus" => {
+            let port = detect_node_port(path, "start", 3000);
+            vec![build_process_config(
+                name,
+                "Docusaurus",
+                "npm",
+                &["start"],
+                path,
+                Some(port),
+                "javascript",
+                "frontend",
+            )]
+        }
         "flutter" => vec![build_process_config(
             name,
             "Flutter",

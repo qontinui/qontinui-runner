@@ -46,6 +46,43 @@ impl ProcessCaptureManager {
     pub async fn start_process(&self, id: &str) -> Result<(), String> {
         // Take the process out to start it (need mutable access)
         let mut processes = self.processes.write().await;
+
+        // Check for CWD + command conflicts with already-running processes.
+        // Two configs pointing at the same directory with the same command
+        // (e.g. duplicate scan + dev-service entries) would fight over the port.
+        {
+            let target = processes
+                .get(id)
+                .ok_or_else(|| format!("Process '{}' not found", id))?;
+            let target_cwd = target.config.cwd.replace('\\', "/").to_lowercase();
+            let target_cmd = target.config.command.to_lowercase();
+
+            for (other_id, other) in processes.iter() {
+                if other_id == id {
+                    continue;
+                }
+                let is_active = matches!(
+                    other.runtime.state,
+                    ProcessState::Starting
+                        | ProcessState::Running
+                        | ProcessState::Healthy
+                        | ProcessState::Building
+                );
+                if !is_active {
+                    continue;
+                }
+                let other_cwd = other.config.cwd.replace('\\', "/").to_lowercase();
+                let other_cmd = other.config.command.to_lowercase();
+                if other_cwd == target_cwd && other_cmd == target_cmd {
+                    return Err(format!(
+                        "Another process ('{}') is already running in the same directory with the same command. \
+                         Stop it first or remove the duplicate configuration.",
+                        other.config.name
+                    ));
+                }
+            }
+        }
+
         let process = processes
             .get_mut(id)
             .ok_or_else(|| format!("Process '{}' not found", id))?;
