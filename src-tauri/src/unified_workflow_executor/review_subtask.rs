@@ -217,6 +217,7 @@ pub fn execute_review_subtask(
         max_fix_attempts: 0,
         max_ci_auto_resumes: 0,
         ci_failure_context: None,
+        htn_config: crate::planning_bridge::HtnConfig::default(),
     };
 
     let mut controller = super::LoopController::new(

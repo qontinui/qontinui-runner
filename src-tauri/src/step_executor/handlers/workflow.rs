@@ -194,6 +194,7 @@ impl StepHandler for WorkflowStepHandler {
             max_fix_attempts: workflow.max_fix_attempts,
             max_ci_auto_resumes: workflow.max_ci_auto_resumes,
             ci_failure_context: None,
+            htn_config: crate::planning_bridge::HtnConfig::default(),
         };
 
         // 8. Create LoopController and get session manager

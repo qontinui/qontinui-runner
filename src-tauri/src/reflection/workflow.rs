@@ -499,6 +499,7 @@ pub fn build_reflection_config(
         max_fix_attempts: 3,
         max_ci_auto_resumes: 10,
         ci_failure_context: None,
+        htn_config: crate::planning_bridge::HtnConfig::default(),
     }
 }
 
@@ -1121,6 +1122,7 @@ pub fn build_project_reflection_config(
         max_fix_attempts: 3,
         max_ci_auto_resumes: 10,
         ci_failure_context: None,
+        htn_config: crate::planning_bridge::HtnConfig::default(),
     }
 }
 
@@ -1534,6 +1536,7 @@ pub fn build_ui_bridge_reflection_config(
         max_fix_attempts: 3,
         max_ci_auto_resumes: 10,
         ci_failure_context: None,
+        htn_config: crate::planning_bridge::HtnConfig::default(),
     }
 }
 

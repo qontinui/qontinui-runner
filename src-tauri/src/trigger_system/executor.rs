@@ -191,6 +191,7 @@ pub async fn execute_triggered_workflow(
         max_fix_attempts: workflow.max_fix_attempts,
         max_ci_auto_resumes: workflow.max_ci_auto_resumes,
         ci_failure_context: None,
+        htn_config: crate::planning_bridge::HtnConfig::default(),
     };
 
     // 7. Spawn the workflow

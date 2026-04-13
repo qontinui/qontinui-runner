@@ -222,6 +222,7 @@ impl Executor for AgenticExecutor {
             max_fix_attempts: 3,
             max_ci_auto_resumes: 10,
             ci_failure_context: None,
+            htn_config: crate::planning_bridge::HtnConfig::default(),
         };
 
         let (outcome, _injected_steps) = self

@@ -1986,6 +1986,7 @@ pub async fn execute_inline_workflow(
             max_fix_attempts: workflow.max_fix_attempts,
             max_ci_auto_resumes: workflow.max_ci_auto_resumes,
             ci_failure_context: None,
+            htn_config: crate::planning_bridge::HtnConfig::default(),
         };
 
         // Apply overrides if present (same logic as run_unified_workflow)
@@ -2493,6 +2494,7 @@ pub async fn run_composed_workflow(
                 max_fix_attempts: 3,
                 max_ci_auto_resumes: 10,
                 ci_failure_context: None,
+                htn_config: crate::planning_bridge::HtnConfig::default(),
             };
 
             // Run the LoopController once with all stages

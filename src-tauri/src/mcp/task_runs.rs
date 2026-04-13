@@ -666,6 +666,7 @@ pub async fn resume_task_run(
         max_fix_attempts: workflow.max_fix_attempts,
         max_ci_auto_resumes: workflow.max_ci_auto_resumes,
         ci_failure_context: None,
+        htn_config: crate::planning_bridge::HtnConfig::default(),
     };
 
     // Spawn the workflow execution in background with panic protection

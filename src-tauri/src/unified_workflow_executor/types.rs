@@ -438,6 +438,9 @@ pub struct LoopConfig {
     /// CI failure context injected by the PR watcher when auto-resuming after CI failure.
     /// When present, failed check names and logs are prepended to the failure context.
     pub ci_failure_context: Option<CiFailureContext>,
+    /// HTN planning configuration. When enabled, the loop attempts structured
+    /// plan-based fixes before falling back to AI agentic sessions.
+    pub htn_config: crate::planning_bridge::HtnConfig,
 }
 
 impl LoopConfig {
@@ -513,6 +516,7 @@ impl LoopConfig {
             max_fix_attempts: workflow.max_fix_attempts,
             max_ci_auto_resumes: workflow.max_ci_auto_resumes,
             ci_failure_context: None,
+            htn_config: crate::planning_bridge::HtnConfig::default(),
         }
     }
 

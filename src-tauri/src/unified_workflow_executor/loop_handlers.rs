@@ -1723,6 +1723,68 @@ impl LoopController {
 
         ctx.agentic_phase_start = Some(Instant::now());
 
+        // ── HTN Planning Attempt ───────────────────────────────────────────
+        // Before launching the AI agent, check if a structured HTN plan can
+        // address the failure. This is faster and more deterministic than
+        // a full AI session. Falls back to AI if HTN is disabled, no plan
+        // is found, or the plan fails.
+        let htn_world = crate::planning_bridge::HtnWorldState {
+            active_states: vec![],         // TODO: populate from runtime state
+            available_transitions: vec![], // TODO: populate from runtime state
+            element_visible: std::collections::HashMap::new(),
+            element_values: std::collections::HashMap::new(),
+        };
+
+        if crate::planning_bridge::should_attempt_htn(&config.htn_config, &htn_world) {
+            info!(
+                "HTN: Attempting structured plan before AI agent (iteration {})",
+                ctx.iteration
+            );
+
+            match crate::planning_bridge::request_htn_plan(
+                failure_context,
+                &htn_world,
+                &config.htn_config,
+            )
+            .await
+            {
+                Ok(plan_result) if plan_result.success && !plan_result.actions.is_empty() => {
+                    info!(
+                        "HTN: Plan found with {} actions in {:.1}ms — plan execution handled by Python side",
+                        plan_result.actions.len(),
+                        plan_result.planning_time_ms,
+                    );
+                    // Report outcome — plan was found, execution happens Python-side.
+                    // For now, we still proceed to AI agentic phase since Python-side
+                    // execution isn't wired into the verification loop yet.
+                    // When full integration is complete, a successful plan execution
+                    // would skip directly to PostAgentic with a synthetic outcome.
+                    crate::planning_bridge::report_plan_outcome(
+                        &crate::planning_bridge::HtnPlanOutcome {
+                            plan_id: format!("htn_iter_{}", ctx.iteration),
+                            success: plan_result.success,
+                            steps_executed: plan_result.actions.len() as u32,
+                            steps_succeeded: 0, // Not executed yet
+                            replans: 0,
+                            total_time_ms: plan_result.planning_time_ms,
+                            error: None,
+                        },
+                    );
+                }
+                Ok(plan_result) => {
+                    debug!(
+                        "HTN: No applicable plan found (success={}, actions={}), falling back to AI",
+                        plan_result.success,
+                        plan_result.actions.len(),
+                    );
+                }
+                Err(e) => {
+                    warn!("HTN: Planning failed ({}), falling back to AI agent", e);
+                }
+            }
+        }
+        // ── End HTN Planning Attempt ──────────────────────────────────────
+
         // Build verification steps for multi-agent (needs all_verification_steps)
         let all_verification_steps = ctx.effective_verification_steps(verification_steps);
 

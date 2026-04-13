@@ -1262,6 +1262,7 @@ impl LoopController {
                     max_fix_attempts: config.max_fix_attempts,
                     max_ci_auto_resumes: config.max_ci_auto_resumes,
                     ci_failure_context: config.ci_failure_context.clone(),
+                    htn_config: config.htn_config.clone(),
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
