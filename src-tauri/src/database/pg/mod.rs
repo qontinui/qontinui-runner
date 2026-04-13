@@ -21,6 +21,7 @@ pub mod deferred_questions;
 pub mod entailment_cache;
 pub mod entity_profiles;
 pub mod error_monitor;
+pub mod event_log;
 pub mod export;
 pub mod findings;
 pub mod flows;
@@ -779,6 +780,31 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS idx_bps_execution ON breakpoint_snapshots(execution_id);
             CREATE INDEX IF NOT EXISTS idx_bps_status ON breakpoint_snapshots(status);
+        "#,
+    },
+    Migration {
+        version: 17,
+        description: "Add source_yaml and dag_node_metrics columns for DAG workflows",
+        sql: r#"
+            ALTER TABLE unified_workflows ADD COLUMN IF NOT EXISTS source_yaml TEXT;
+            ALTER TABLE learning_outcomes ADD COLUMN IF NOT EXISTS dag_node_metrics TEXT;
+        "#,
+    },
+    Migration {
+        version: 18,
+        description: "Add workflow_event_log table for DAG durable execution",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS workflow_event_log (
+                id              BIGSERIAL PRIMARY KEY,
+                execution_id    TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+                node_id         TEXT NOT NULL,
+                event_type      TEXT NOT NULL,
+                event_data      TEXT,
+                cursor          BIGINT NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_event_log_execution ON workflow_event_log(execution_id, cursor);
+            CREATE INDEX IF NOT EXISTS idx_event_log_node ON workflow_event_log(execution_id, node_id);
         "#,
     },
 ];

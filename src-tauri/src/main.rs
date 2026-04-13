@@ -139,6 +139,7 @@ mod workflow_event_bus;
 mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
+mod workflow;
 mod worktree;
 mod zombie_sweep;
 

@@ -775,6 +775,43 @@ pub struct AccountUsageInfo {
     pub resets_at: Option<u64>,
     pub status: Option<String>,
     pub error: Option<String>,
+    /// Expected utilization at this point in the billing period (0.0–1.0).
+    /// E.g. if 3 of 7 days have elapsed, expected = 3/7 ≈ 0.4286.
+    pub expected_utilization: Option<f64>,
+    /// Actual minus expected utilization. Negative = under budget, positive = over.
+    pub usage_delta: Option<f64>,
+    /// Fraction of the billing period that has elapsed (0.0–1.0).
+    pub period_elapsed_fraction: Option<f64>,
+    /// Days remaining until the billing period resets.
+    pub period_remaining_days: Option<f64>,
+}
+
+/// Compute expected usage fields from the reset timestamp.
+///
+/// The Anthropic 7-day window resets at `resets_at`. We compute how far
+/// through the current 7-day period we are and derive expected linear usage.
+fn compute_expected_usage(utilization: f64, resets_at: Option<u64>) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    let Some(reset_ts) = resets_at else {
+        return (None, None, None, None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now == 0 || reset_ts <= now {
+        // Period already expired or clock issue
+        return (None, None, None, None);
+    }
+    const PERIOD_SECS: f64 = 7.0 * 24.0 * 3600.0; // 7 days in seconds
+    let remaining_secs = (reset_ts - now) as f64;
+    let elapsed_secs = PERIOD_SECS - remaining_secs;
+    // Clamp: if elapsed_secs < 0 the period just started fresh
+    let elapsed_secs = elapsed_secs.max(0.0);
+    let elapsed_fraction = (elapsed_secs / PERIOD_SECS).clamp(0.0, 1.0);
+    let remaining_days = remaining_secs / 86400.0;
+    let expected = elapsed_fraction; // linear expectation
+    let delta = utilization - expected;
+    (Some(expected), Some(delta), Some(elapsed_fraction), Some(remaining_days))
 }
 
 /// Read the OAuth access token from a Claude config directory's credentials file.
@@ -795,7 +832,7 @@ fn read_oauth_token(config_dir: &str) -> Result<String, String> {
 /// Makes a minimal API call (1 token, cheapest model) and reads the
 /// `anthropic-ratelimit-unified-7d-utilization` response header, which
 /// always contains the exact weekly usage fraction regardless of threshold.
-async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
+pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
     let label = std::path::Path::new(&config_dir)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -812,6 +849,10 @@ async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
                 resets_at: None,
                 status: None,
                 error: Some(e),
+                expected_utilization: None,
+                usage_delta: None,
+                period_elapsed_fraction: None,
+                period_remaining_days: None,
             };
         }
     };
@@ -874,6 +915,9 @@ async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
                 Some(format!("API error ({}): {}", status_code, body))
             };
 
+            let (expected, delta, elapsed_frac, remaining_days) =
+                compute_expected_usage(utilization_7d, resets_at_7d);
+
             AccountUsageInfo {
                 config_dir,
                 label,
@@ -882,6 +926,10 @@ async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
                 resets_at: resets_at_7d,
                 status: status_7d,
                 error,
+                expected_utilization: expected,
+                usage_delta: delta,
+                period_elapsed_fraction: elapsed_frac,
+                period_remaining_days: remaining_days,
             }
         }
         Err(e) => AccountUsageInfo {
@@ -892,6 +940,10 @@ async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
             resets_at: None,
             status: None,
             error: Some(format!("Network error: {}", e)),
+            expected_utilization: None,
+            usage_delta: None,
+            period_elapsed_fraction: None,
+            period_remaining_days: None,
         },
     }
 }

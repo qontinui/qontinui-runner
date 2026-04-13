@@ -19,6 +19,7 @@ import { CostTrendChart } from "./CostTrendChart";
 import { ProviderLatencyChart } from "./ProviderLatencyChart";
 import { TaskRunCostTable } from "./TaskRunCostTable";
 import { CostByTargetAppChart } from "./CostByTargetAppChart";
+import { AccountUsageCard } from "./AccountUsageCard";
 
 const TIME_RANGE_OPTIONS: LlmTimeRange[] = ["1d", "7d", "30d", "all"];
 
@@ -123,6 +124,9 @@ export default function LlmObservabilityDashboard() {
       <div data-tutorial-id="llm-summary-cards">
         <SummaryCards summary={summary} />
       </div>
+
+      {/* Account Usage vs Expected */}
+      <AccountUsageCard />
 
       {/* Charts Row 1 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

@@ -115,6 +115,14 @@ export interface AccountUsageInfo {
   resets_at: number | null;
   status: string | null;
   error: string | null;
+  /** Expected utilization at this point in the billing period (0.0–1.0) */
+  expected_utilization: number | null;
+  /** Actual minus expected utilization. Negative = under budget */
+  usage_delta: number | null;
+  /** Fraction of the billing period elapsed (0.0–1.0) */
+  period_elapsed_fraction: number | null;
+  /** Days remaining until reset */
+  period_remaining_days: number | null;
 }
 
 export interface ClaudeApiSettings {

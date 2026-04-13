@@ -278,8 +278,44 @@ pub async fn get_model_action_matrix(
     ))
 }
 
+/// GET /analytics/account-usage
+///
+/// Probes all configured Claude accounts for their 7-day utilization and
+/// returns each account's actual usage, expected usage at this point in the
+/// billing period, and the delta between them.
+pub async fn get_account_usage(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let config_dirs = crate::settings::get_claude_config_dirs();
+    if config_dirs.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "data": [],
+            "count": 0,
+        })));
+    }
+
+    let futures: Vec<_> = config_dirs
+        .into_iter()
+        .map(|dir| crate::commands::ai_settings::probe_account_usage(dir))
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+    let count = results.len();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": results,
+        "count": count,
+    })))
+}
+
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
+        .route(
+            "/analytics/account-usage",
+            get(get_account_usage),
+        )
         .route(
             "/analytics/token-usage/summary",
             get(get_token_usage_summary),

@@ -421,6 +421,9 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     flow_control_json TEXT,
     phase_timeouts_json TEXT,
 
+    -- DAG workflows (v17)
+    source_yaml TEXT,
+
     -- Timestamps
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -462,6 +465,8 @@ CREATE TABLE IF NOT EXISTS learning_outcomes (
     technology_tags TEXT,
     domain_tags TEXT,
     complexity_tier TEXT,
+    -- DAG workflows (v17)
+    dag_node_metrics TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -3700,4 +3705,17 @@ CREATE TABLE IF NOT EXISTS breakpoint_snapshots (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_bps_execution ON breakpoint_snapshots(execution_id);
+
+-- Workflow event log — lightweight event-sourced execution log for DAG durable execution (Plan 08 Phase 3)
+CREATE TABLE IF NOT EXISTS workflow_event_log (
+    id              BIGSERIAL PRIMARY KEY,
+    execution_id    TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    node_id         TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    event_data      TEXT,
+    cursor          BIGINT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_event_log_execution ON workflow_event_log(execution_id, cursor);
+CREATE INDEX IF NOT EXISTS idx_event_log_node ON workflow_event_log(execution_id, node_id);
 CREATE INDEX IF NOT EXISTS idx_bps_status ON breakpoint_snapshots(status);

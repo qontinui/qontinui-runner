@@ -455,7 +455,7 @@ export function ClaudeCliSection({
 
                       {usage && !usage.error && (
                         <div className="flex items-center gap-1.5 shrink-0">
-                          <div className="w-16 h-1.5 bg-muted/50 rounded-full overflow-hidden">
+                          <div className="relative w-16 h-1.5 bg-muted/50 rounded-full overflow-hidden">
                             <div
                               className={`h-full rounded-full transition-all ${
                                 usage.utilization >= 0.8
@@ -468,6 +468,13 @@ export function ClaudeCliSection({
                                 width: `${Math.max(Math.round(usage.utilization * 100), 2)}%`,
                               }}
                             />
+                            {usage.expected_utilization != null && (
+                              <div
+                                className="absolute top-0 h-full w-0.5 bg-foreground/60"
+                                style={{ left: `${Math.round(usage.expected_utilization * 100)}%` }}
+                                title={`Expected: ${Math.round(usage.expected_utilization * 100)}%`}
+                              />
+                            )}
                           </div>
                           <span
                             className={`text-[10px] font-mono w-8 text-right ${
@@ -514,6 +521,24 @@ export function ClaudeCliSection({
                     {usage?.resets_at && !usage.error && (
                       <div className="text-[10px] text-muted-foreground mt-1 ml-6">
                         Weekly limit resets {new Date(usage.resets_at * 1000).toLocaleString()}
+                        {usage.expected_utilization != null && usage.usage_delta != null && (
+                          <span className="ml-2">
+                            &middot; Expected {Math.round(usage.expected_utilization * 100)}%
+                            {" "}
+                            <span className={
+                              usage.usage_delta > 0.02
+                                ? getAccentColors("red").text
+                                : usage.usage_delta < -0.02
+                                  ? getAccentColors("green").text
+                                  : "text-muted-foreground"
+                            }>
+                              ({usage.usage_delta > 0 ? "+" : ""}{Math.round(usage.usage_delta * 100)}pp {usage.usage_delta > 0.02 ? "over" : usage.usage_delta < -0.02 ? "under" : "on track"})
+                            </span>
+                          </span>
+                        )}
+                        {usage.period_remaining_days != null && (
+                          <span className="ml-2">&middot; {usage.period_remaining_days.toFixed(1)}d left</span>
+                        )}
                       </div>
                     )}
                     {usage?.error && (
