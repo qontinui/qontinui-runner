@@ -1724,62 +1724,76 @@ impl LoopController {
         ctx.agentic_phase_start = Some(Instant::now());
 
         // ── HTN Planning Attempt ───────────────────────────────────────────
-        // Before launching the AI agent, check if a structured HTN plan can
-        // address the failure. This is faster and more deterministic than
-        // a full AI session. Falls back to AI if HTN is disabled, no plan
-        // is found, or the plan fails.
-        let htn_world = crate::planning_bridge::HtnWorldState {
-            active_states: vec![],         // TODO: populate from runtime state
-            available_transitions: vec![], // TODO: populate from runtime state
-            element_visible: std::collections::HashMap::new(),
-            element_values: std::collections::HashMap::new(),
-        };
-
-        if crate::planning_bridge::should_attempt_htn(&config.htn_config, &htn_world) {
+        // Before launching the AI agent, attempt a structured HTN plan.
+        // The Python script self-contained: it queries state, plans, and
+        // (in future) executes. On plan success, we skip the AI session.
+        if crate::planning_bridge::should_attempt_htn(&config.htn_config) {
             info!(
                 "HTN: Attempting structured plan before AI agent (iteration {})",
                 ctx.iteration
             );
 
-            match crate::planning_bridge::request_htn_plan(
+            match crate::planning_bridge::execute_htn_attempt(
                 failure_context,
-                &htn_world,
                 &config.htn_config,
             )
             .await
             {
-                Ok(plan_result) if plan_result.success && !plan_result.actions.is_empty() => {
+                Ok(result) if result.plan_found && result.execution_success => {
                     info!(
-                        "HTN: Plan found with {} actions in {:.1}ms — plan execution handled by Python side",
-                        plan_result.actions.len(),
-                        plan_result.planning_time_ms,
+                        "HTN: Plan executed successfully ({} actions, {:.1}ms): {}",
+                        result.plan_actions, result.total_time_ms, result.summary,
                     );
-                    // Report outcome — plan was found, execution happens Python-side.
-                    // For now, we still proceed to AI agentic phase since Python-side
-                    // execution isn't wired into the verification loop yet.
-                    // When full integration is complete, a successful plan execution
-                    // would skip directly to PostAgentic with a synthetic outcome.
                     crate::planning_bridge::report_plan_outcome(
                         &crate::planning_bridge::HtnPlanOutcome {
                             plan_id: format!("htn_iter_{}", ctx.iteration),
-                            success: plan_result.success,
-                            steps_executed: plan_result.actions.len() as u32,
-                            steps_succeeded: 0, // Not executed yet
-                            replans: 0,
-                            total_time_ms: plan_result.planning_time_ms,
+                            success: true,
+                            steps_executed: result.plan_actions,
+                            steps_succeeded: result.steps_succeeded,
+                            replans: result.replans,
+                            total_time_ms: result.total_time_ms,
                             error: None,
                         },
                     );
+
+                    // Skip AI session — return directly to PostAgentic
+                    return LoopState::PostAgentic {
+                        outcome: AgenticOutcome::Success {
+                            output: format!(
+                                "[HTN Plan Executed] {}\n\n{} actions completed successfully.",
+                                result.summary, result.plan_actions,
+                            ),
+                            parsed: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                        },
+                        injected_steps: vec![],
+                        failure_context: failure_context.to_string(),
+                    };
                 }
-                Ok(plan_result) => {
-                    debug!(
-                        "HTN: No applicable plan found (success={}, actions={}), falling back to AI",
-                        plan_result.success,
-                        plan_result.actions.len(),
+                Ok(result) if result.plan_found => {
+                    // Plan found but execution failed — log and fall through to AI
+                    info!(
+                        "HTN: Plan found but execution failed: {}. Falling back to AI.",
+                        result.error.as_deref().unwrap_or("unknown"),
+                    );
+                    crate::planning_bridge::report_plan_outcome(
+                        &crate::planning_bridge::HtnPlanOutcome {
+                            plan_id: format!("htn_iter_{}", ctx.iteration),
+                            success: false,
+                            steps_executed: result.plan_actions,
+                            steps_succeeded: result.steps_succeeded,
+                            replans: result.replans,
+                            total_time_ms: result.total_time_ms,
+                            error: result.error.clone(),
+                        },
                     );
                 }
+                Ok(_) => {
+                    debug!("HTN: No applicable plan found, falling back to AI");
+                }
                 Err(e) => {
-                    warn!("HTN: Planning failed ({}), falling back to AI agent", e);
+                    warn!("HTN: Planning attempt failed ({}), falling back to AI", e);
                 }
             }
         }

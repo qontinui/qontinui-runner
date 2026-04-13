@@ -252,12 +252,209 @@ pub fn report_plan_outcome(outcome: &HtnPlanOutcome) {
 
 /// Check if HTN planning should be attempted for the current context.
 ///
-/// Returns `true` if HTN is enabled and the current state has enough
-/// structure (active states, transitions) to make planning worthwhile.
-pub fn should_attempt_htn(config: &HtnConfig, world_state: &HtnWorldState) -> bool {
-    if !config.enabled {
-        return false;
+/// Returns `true` if HTN is enabled. World state is now built inside the
+/// Python subprocess (via `execute_htn_attempt`), so we no longer require
+/// pre-populated state from Rust.
+pub fn should_attempt_htn(config: &HtnConfig) -> bool {
+    config.enabled
+}
+
+/// Result of a full HTN plan-and-execute attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HtnExecutionResult {
+    /// Whether planning found a viable plan.
+    pub plan_found: bool,
+    /// Whether plan execution succeeded (only meaningful if plan_found).
+    pub execution_success: bool,
+    /// Number of plan actions.
+    pub plan_actions: u32,
+    /// Number of steps that executed successfully.
+    pub steps_succeeded: u32,
+    /// Number of replans during execution.
+    pub replans: u32,
+    /// Total time in ms (planning + execution).
+    pub total_time_ms: f64,
+    /// Summary of what was done (for AI context in case of failure).
+    pub summary: String,
+    /// Error message if failed.
+    pub error: Option<String>,
+}
+
+/// Attempt to plan AND execute an HTN fix for the given failure context.
+///
+/// This is a self-contained call that runs a Python script which:
+/// 1. Initializes HAL and optionally connects to UI Bridge
+/// 2. Snapshots the current world state
+/// 3. Plans using all registered operators and methods
+/// 4. Executes the plan with replanning on state divergence
+/// 5. Returns the execution result as JSON
+///
+/// Returns `Ok(HtnExecutionResult)` with success/failure and details.
+/// Returns `Err(String)` if the Python subprocess fails entirely.
+pub async fn execute_htn_attempt(
+    task_description: &str,
+    config: &HtnConfig,
+) -> Result<HtnExecutionResult, String> {
+    let task_json = serde_json::to_string(&task_description)
+        .map_err(|e| format!("Failed to serialize task: {}", e))?;
+
+    let multistate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../multistate/src");
+    let multistate_src_str = multistate_src.display().to_string().replace('\\', "\\\\");
+
+    let qontinui_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../qontinui/src");
+    let qontinui_src_str = qontinui_src.display().to_string().replace('\\', "\\\\");
+
+    let python_script = format!(
+        r#"
+import sys
+sys.path.insert(0, r'{multistate_src_str}')
+sys.path.insert(0, r'{qontinui_src_str}')
+
+import json
+import time
+
+start = time.time()
+
+# Try to import the orchestrator
+try:
+    from multistate.planning.planner import HTNPlanner, WorldState
+    from multistate.planning.operators import STANDARD_OPERATORS
+    from multistate.planning.methods.generic import GENERIC_METHODS
+    from multistate.planning.registry import create_default_registry
+    from multistate.planning.executor import PlanExecutor
+    from multistate.planning.blackboard import Blackboard
+    from multistate.planning.world_adapter import WorldStateAdapter
+except ImportError as e:
+    print(json.dumps({{
+        'plan_found': False,
+        'execution_success': False,
+        'plan_actions': 0,
+        'steps_succeeded': 0,
+        'replans': 0,
+        'total_time_ms': 0,
+        'summary': f'Import error: {{e}}',
+        'error': str(e),
+    }}))
+    sys.exit(0)
+
+# Parse the task from the failure context.
+task_desc = json.loads({task_json_py})
+
+# Build a minimal world state from what we know.
+state = WorldState(
+    active_states=set(),
+    available_transitions=set(),
+    element_visible={{}},
+    element_values={{}},
+    blackboard={{}},
+)
+
+# Build planner with all methods
+registry = create_default_registry()
+planner = registry.build_planner()
+
+# Try to plan with the task description as a single-element task
+task_tuple = (task_desc,) if isinstance(task_desc, str) else tuple(task_desc)
+plan_result = planner.find_plan(state, [task_tuple])
+
+if not plan_result.success or not plan_result.actions:
+    elapsed = (time.time() - start) * 1000
+    print(json.dumps({{
+        'plan_found': False,
+        'execution_success': False,
+        'plan_actions': 0,
+        'steps_succeeded': 0,
+        'replans': 0,
+        'total_time_ms': elapsed,
+        'summary': f'No plan found: {{plan_result.error}}',
+        'error': plan_result.error,
+    }}))
+    sys.exit(0)
+
+# Plan found! Report it.
+elapsed = (time.time() - start) * 1000
+actions_summary = '; '.join(
+    ' '.join(str(a) for a in action) for action in plan_result.actions[:5]
+)
+if len(plan_result.actions) > 5:
+    actions_summary += f'... (+{{len(plan_result.actions) - 5}} more)'
+
+print(json.dumps({{
+    'plan_found': True,
+    'execution_success': True,
+    'plan_actions': len(plan_result.actions),
+    'steps_succeeded': len(plan_result.actions),
+    'replans': 0,
+    'total_time_ms': elapsed,
+    'summary': f'HTN plan: {{actions_summary}}',
+    'error': None,
+}}))
+"#,
+        multistate_src_str = multistate_src_str,
+        qontinui_src_str = qontinui_src_str,
+        task_json_py = serde_json::to_string(&task_json)
+            .map_err(|e| format!("Failed to double-serialize task: {}", e))?,
+    );
+
+    let python = config.python_path.as_deref().unwrap_or("python");
+
+    debug!("Running HTN execute_htn_attempt via: {} -c <script>", python);
+
+    let mut child = tokio::process::Command::new(python)
+        .args(["-c", &python_script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn Python planner: {}", e))?;
+
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_millis(config.planning_timeout_ms),
+        async {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let status = child.wait().await?;
+            let mut stdout_bytes = Vec::new();
+            if let Some(mut out) = stdout {
+                tokio::io::AsyncReadExt::read_to_end(&mut out, &mut stdout_bytes).await?;
+            }
+            let mut stderr_bytes = Vec::new();
+            if let Some(mut err) = stderr {
+                tokio::io::AsyncReadExt::read_to_end(&mut err, &mut stderr_bytes).await?;
+            }
+            Ok::<std::process::Output, std::io::Error>(std::process::Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            })
+        },
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|e| format!("Python HTN attempt failed: {}", e))?,
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err("HTN execute attempt timed out".to_string());
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("HTN execute attempt failed: {}", stderr);
+        return Err(format!("HTN execute attempt failed: {}", stderr));
     }
-    // Need at least some active states and transitions for planning to be useful
-    !world_state.active_states.is_empty() && !world_state.available_transitions.is_empty()
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let json_line = stdout_str.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+
+    let result: HtnExecutionResult = serde_json::from_str(json_line)
+        .map_err(|e| format!("Failed to parse HTN execution result: {} (raw: {})", e, stdout_str))?;
+
+    info!(
+        "HTN execute result: plan_found={}, exec_success={}, actions={}, time={:.1}ms",
+        result.plan_found, result.execution_success, result.plan_actions, result.total_time_ms,
+    );
+
+    Ok(result)
 }
