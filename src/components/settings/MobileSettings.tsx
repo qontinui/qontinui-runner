@@ -9,6 +9,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Smartphone, FolderOpen, RefreshCw } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { PhysicalDeviceManager } from "./PhysicalDeviceManager";
 import type { LogFunction } from "./types";
 
 interface TauriResult<T> {
@@ -325,6 +326,11 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
           logcat captures are used to provide visual feedback during autonomous mobile development.
           Make sure you have the Android SDK installed and USB debugging enabled on your device.
         </div>
+      </div>
+
+      {/* Physical Device Manager */}
+      <div className="mt-8 border-t border-border/50 pt-6">
+        <PhysicalDeviceManager />
       </div>
     </div>
   );

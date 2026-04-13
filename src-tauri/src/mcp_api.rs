@@ -583,6 +583,340 @@ pub fn create_router(
         });
     }
 
+    // Physical device USB scanner (30-second interval)
+    // Discovers ADB-attached Android devices and registers them with PhysicalDeviceRegistry.
+    {
+        let state = api_state.clone();
+        tokio::spawn(async move {
+            // Wait for ADB and other services to initialize
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            let mobile_settings = crate::settings::get_mobile_settings();
+
+            // Resolve ADB path: prefer custom setting, then fall back to auto-detection
+            let adb_path = if let Some(custom) = &mobile_settings.adb_path {
+                std::path::PathBuf::from(custom)
+            } else {
+                // Mirror the find_adb() logic from app_discovery.rs
+                let adb_name = if cfg!(windows) { "adb.exe" } else { "adb" };
+                let mut resolved = std::path::PathBuf::from(adb_name);
+                if let Ok(android_home) = std::env::var("ANDROID_HOME") {
+                    let p = std::path::PathBuf::from(android_home)
+                        .join("platform-tools")
+                        .join(adb_name);
+                    if p.exists() {
+                        resolved = p;
+                    }
+                } else if let Ok(sdk_root) = std::env::var("ANDROID_SDK_ROOT") {
+                    let p = std::path::PathBuf::from(sdk_root)
+                        .join("platform-tools")
+                        .join(adb_name);
+                    if p.exists() {
+                        resolved = p;
+                    }
+                } else if cfg!(windows) {
+                    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                        let p = std::path::PathBuf::from(local_app_data)
+                            .join("Android")
+                            .join("Sdk")
+                            .join("platform-tools")
+                            .join(adb_name);
+                        if p.exists() {
+                            resolved = p;
+                        }
+                    }
+                }
+                resolved
+            };
+
+            let usb_transport = crate::mcp::transport::usb::UsbTransport::new(adb_path);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+            loop {
+                interval.tick().await;
+
+                let devices = usb_transport.scan_devices().await;
+                let registry = &state.physical_device_registry;
+
+                // Register newly connected physical devices
+                for (device_id, status, model) in &devices {
+                    if status != "device" {
+                        continue;
+                    }
+                    if device_id.starts_with("emulator-") {
+                        continue; // Skip emulators — handled by app_discovery
+                    }
+
+                    // Skip already-registered devices
+                    if registry.get_device(device_id).await.is_some() {
+                        continue;
+                    }
+
+                    // Attempt ADB port forward to the UI Bridge port
+                    match usb_transport
+                        .establish_forward(device_id, mobile_settings.ui_bridge_port)
+                        .await
+                    {
+                        Ok(local_port) => {
+                            // Quick health check
+                            let client = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(2))
+                                .build()
+                                .unwrap_or_else(|_| reqwest::Client::new());
+                            let url = format!(
+                                "http://127.0.0.1:{}/ui-bridge/health",
+                                local_port
+                            );
+                            if client.get(&url).send().await.is_ok() {
+                                let now = chrono::Utc::now().timestamp_millis();
+                                let info = crate::mcp::physical_device::PhysicalDeviceInfo {
+                                    id: device_id.clone(),
+                                    os: crate::mcp::transport::DeviceOs::Android,
+                                    device_kind: "physical".to_string(),
+                                    model: model.clone(),
+                                    app_id: None,
+                                    ui_bridge_version: None,
+                                    first_seen_at: now,
+                                    pairing_token: None,
+                                };
+                                let transport = crate::mcp::physical_device::ActiveTransport {
+                                    kind: crate::mcp::transport::TransportKind::Usb,
+                                    proxy_url: format!("http://127.0.0.1:{}", local_port),
+                                    established_at: now,
+                                    last_healthy_at: now,
+                                    fail_count: 0,
+                                };
+                                registry.register(info, transport).await;
+                                tracing::info!(
+                                    "USB device registered: {} (local port {})",
+                                    device_id,
+                                    local_port
+                                );
+                            } else {
+                                // No UI Bridge on device — release the forward
+                                let _ = usb_transport.release_forward(device_id).await;
+                                tracing::debug!(
+                                    "USB device {} reachable via ADB but no UI Bridge (port {})",
+                                    device_id,
+                                    local_port
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Failed to establish ADB forward for {}: {}",
+                                device_id,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Clean up devices that are no longer connected via USB
+                let registered = registry.list_all().await;
+                for device in registered {
+                    let has_usb = device
+                        .transports
+                        .iter()
+                        .any(|t| t.kind == crate::mcp::transport::TransportKind::Usb);
+                    if !has_usb {
+                        continue;
+                    }
+                    let still_connected = devices
+                        .iter()
+                        .any(|(id, status, _)| id == &device.info.id && status == "device");
+                    if !still_connected {
+                        registry
+                            .remove_transport(
+                                &device.info.id,
+                                crate::mcp::transport::TransportKind::Usb,
+                            )
+                            .await;
+                        let _ = usb_transport.release_forward(&device.info.id).await;
+                        tracing::info!("USB device disconnected: {}", device.info.id);
+                    }
+                }
+            }
+        });
+    }
+
+    // Physical device health monitor (15-second interval)
+    // Checks liveness of registered devices and removes unhealthy transports.
+    {
+        let registry = api_state.physical_device_registry.clone();
+        tokio::spawn(async move {
+            // Wait for USB scanner to do its first pass
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            // Intentionally leaked — monitor runs for the entire app lifetime
+            std::mem::forget(shutdown_tx);
+
+            registry.start_health_monitor(client, shutdown_rx);
+        });
+    }
+
+    // Cloud device registry poller (if cloud device bridge is enabled)
+    // Polls the qontinui.io backend for remotely registered devices.
+    {
+        let state = api_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+
+            let cloud_settings = crate::config_facade::get_setting::<
+                crate::settings::CloudRelaySettings,
+            >();
+            if !cloud_settings.device_bridge_enabled {
+                tracing::debug!("Cloud device bridge disabled, skipping registry poller");
+                return;
+            }
+
+            let poller = crate::mcp::discovery::cloud_registry::CloudRegistryPoller::new(
+                cloud_settings.backend_url.clone(),
+                cloud_settings.cloud_registry_poll_secs,
+            );
+
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                cloud_settings.cloud_registry_poll_secs,
+            ));
+
+            let _registry = &state.physical_device_registry;
+
+            loop {
+                interval.tick().await;
+
+                // Refresh auth token on each poll cycle
+                let token = crate::auth::AuthManager::new().get_access_token().ok();
+                if let Some(token) = token {
+                    match poller.poll(&token).await {
+                        Ok(devices) => {
+                            for device in devices {
+                                tracing::debug!(
+                                    "Cloud device available: {} ({})",
+                                    device.device_id,
+                                    device.display_name
+                                );
+                                // Cloud device registration via LAN/relay transport
+                                // is handled by cloud relay session logic; here we
+                                // only log presence so the operator can see what is
+                                // available in the fleet.
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Cloud registry poll failed: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // mDNS LAN discovery (if enabled)
+    // Discovers UI Bridge instances advertising themselves on the local network.
+    {
+        let state = api_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+            let mobile_settings = crate::settings::get_mobile_settings();
+            if !mobile_settings.lan_discovery_enabled {
+                tracing::debug!("LAN discovery disabled, skipping mDNS scanner");
+                return;
+            }
+
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<
+                crate::mcp::discovery::mdns_scanner::MdnsEvent,
+            >(32);
+            let scanner = crate::mcp::discovery::mdns_scanner::MdnsScanner::new();
+            scanner.start(event_tx);
+
+            // Keep the scanner alive for the duration of the task
+            let _scanner = scanner;
+
+            // Process mDNS discovery events
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    crate::mcp::discovery::mdns_scanner::MdnsEvent::Discovered(info) => {
+                        if let Some(&addr) = info.addresses.first() {
+                            let socket_addr =
+                                std::net::SocketAddr::new(addr, info.port);
+                            tracing::info!(
+                                "mDNS device found: {} at {}",
+                                info.device_id,
+                                socket_addr
+                            );
+
+                            // Register as a LAN transport in the physical device registry.
+                            // We proxy directly to the device's IP/port; no local TCP proxy
+                            // is needed for same-LAN connections.
+                            let now = chrono::Utc::now().timestamp_millis();
+                            // Determine OS from the "platform" TXT record if present
+                            let os = match info
+                                .txt_records
+                                .get("platform")
+                                .map(|s| s.to_lowercase())
+                                .as_deref()
+                            {
+                                Some("ios") | Some("iphone") | Some("ipad") => {
+                                    crate::mcp::transport::DeviceOs::Ios
+                                }
+                                _ => crate::mcp::transport::DeviceOs::Android,
+                            };
+                            let device_info =
+                                crate::mcp::physical_device::PhysicalDeviceInfo {
+                                    id: info.device_id.clone(),
+                                    os,
+                                    device_kind: "physical".to_string(),
+                                    model: info
+                                        .txt_records
+                                        .get("model")
+                                        .cloned(),
+                                    app_id: info
+                                        .txt_records
+                                        .get("app_id")
+                                        .cloned(),
+                                    ui_bridge_version: info
+                                        .txt_records
+                                        .get("version")
+                                        .cloned(),
+                                    first_seen_at: now,
+                                    pairing_token: info
+                                        .txt_records
+                                        .get("pairing_token")
+                                        .cloned(),
+                                };
+                            let transport =
+                                crate::mcp::physical_device::ActiveTransport {
+                                    kind: crate::mcp::transport::TransportKind::Lan,
+                                    proxy_url: format!(
+                                        "http://{}",
+                                        socket_addr
+                                    ),
+                                    established_at: now,
+                                    last_healthy_at: now,
+                                    fail_count: 0,
+                                };
+                            state
+                                .physical_device_registry
+                                .register(device_info, transport)
+                                .await;
+                        }
+                    }
+                    crate::mcp::discovery::mdns_scanner::MdnsEvent::Removed(name) => {
+                        tracing::debug!("mDNS device removed: {}", name);
+                        // The health monitor will evict the transport when health
+                        // checks start failing; no immediate action needed here.
+                    }
+                }
+            }
+        });
+    }
+
     // Start cascade event buffer (collects cascade detection events for /cascade/events)
     crate::mcp::cascade::start_buffer_task(&api_state);
 
