@@ -614,17 +614,36 @@ def run_capture_host(
             time.sleep(0.25)
             client.element_action("capture-advance", "click")
 
-            # Wait for the iframe to postMessage its bbox back to the host,
-            # which mirrors the JSON into the `capture-last-bbox` input's
-            # value.  We poll the snapshot until we see a bbox whose
-            # sampleIndex matches the one we just advanced to.
+            # Wait for the iframe's measurement to arrive. We try two
+            # channels in order of reliability:
+            #   1) Server-side signal channel at /api/grounding-isolated/bbox
+            #      — the iframe POSTs its bbox here on load. Works regardless
+            #      of browser tab focus (fetch() runs even in backgrounded
+            #      tabs; postMessage doesn't always).
+            #   2) Echo-input via UI Bridge snapshot (capture-last-bbox /
+            #      capture-last-echo). Works when the host tab is focused.
             bbox: dict | None = None
+            base_origin = ui_bridge_url.split("/api/ui-bridge")[0]
+            bbox_endpoint = f"{base_origin}/api/grounding-isolated/bbox?sampleIndex={idx}"
             deadline = time.time() + 6.0
             while time.time() < deadline:
+                # Channel 1: server-side signal (works regardless of focus).
+                try:
+                    resp = requests.get(bbox_endpoint, timeout=3)
+                    payload = resp.json() if resp.ok else {}
+                    if (
+                        payload.get("found")
+                        and (b := payload.get("bbox"))
+                        and int(b.get("width", 0)) > 0
+                        and int(b.get("height", 0)) > 0
+                    ):
+                        bbox = b
+                        break
+                except Exception:
+                    pass
+                # Channel 2: echo input via UI Bridge snapshot.
                 try:
                     snap = client.get_control_snapshot()
-                    # SDK default id is "capture-last-echo"; legacy custom
-                    # hosts may use "capture-last-bbox".
                     for el in snap.get("elements", []):
                         if el.get("id") not in (
                             "capture-last-echo", "capture-last-bbox",
