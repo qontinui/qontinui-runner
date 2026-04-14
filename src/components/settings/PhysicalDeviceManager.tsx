@@ -7,7 +7,18 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { Smartphone, Tablet, RefreshCw, Plus, Plug, Unplug, Wifi, Usb, Cloud, AlertCircle } from "lucide-react";
+import {
+  Smartphone,
+  Tablet,
+  RefreshCw,
+  Plus,
+  Plug,
+  Unplug,
+  Wifi,
+  Usb,
+  Cloud,
+  AlertCircle,
+} from "lucide-react";
 import { getApiBase } from "@/lib/runner-api";
 import { tracedFetch } from "@/lib/runner-api";
 
@@ -181,9 +192,12 @@ export function PhysicalDeviceManager() {
   const connectDevice = async (id: string) => {
     setConnectingDeviceId(id);
     try {
-      const res = await tracedFetch(`${getApiBase()}/ui-bridge/devices/${encodeURIComponent(id)}/connect`, {
-        method: "POST",
-      });
+      const res = await tracedFetch(
+        `${getApiBase()}/ui-bridge/devices/${encodeURIComponent(id)}/connect`,
+        {
+          method: "POST",
+        },
+      );
       const json: ApiResponse<unknown> = await res.json();
       if (!json.success) {
         throw new Error(json.error ?? "Connect failed");
@@ -199,9 +213,12 @@ export function PhysicalDeviceManager() {
   const disconnectDevice = async (id: string) => {
     setConnectingDeviceId(id);
     try {
-      const res = await tracedFetch(`${getApiBase()}/ui-bridge/devices/${encodeURIComponent(id)}/disconnect`, {
-        method: "POST",
-      });
+      const res = await tracedFetch(
+        `${getApiBase()}/ui-bridge/devices/${encodeURIComponent(id)}/disconnect`,
+        {
+          method: "POST",
+        },
+      );
       const json: ApiResponse<unknown> = await res.json();
       if (!json.success) {
         throw new Error(json.error ?? "Disconnect failed");
@@ -304,7 +321,10 @@ export function PhysicalDeviceManager() {
           )}
         </div>
         <button
-          onClick={() => { setLoading(true); fetchDevices(); }}
+          onClick={() => {
+            setLoading(true);
+            fetchDevices();
+          }}
           disabled={loading}
           className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted rounded transition-colors"
           title="Refresh device list"
@@ -370,7 +390,9 @@ export function PhysicalDeviceManager() {
                   </div>
 
                   {/* Health indicator */}
-                  <div className={`flex items-center gap-1 shrink-0 text-[10px] font-medium ${healthTextClass(device.healthState)}`}>
+                  <div
+                    className={`flex items-center gap-1 shrink-0 text-[10px] font-medium ${healthTextClass(device.healthState)}`}
+                  >
                     <div className={`w-2 h-2 rounded-full ${healthDotClass(device.healthState)}`} />
                     {healthLabel(device.healthState)}
                   </div>
@@ -379,7 +401,9 @@ export function PhysicalDeviceManager() {
                 {/* Transport row */}
                 <div className="flex items-center gap-2 flex-wrap">
                   {activeTransport ? (
-                    <span className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${transportBadgeClass(activeTransport.kind)}`}>
+                    <span
+                      className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${transportBadgeClass(activeTransport.kind)}`}
+                    >
                       {transportIcon(activeTransport.kind)}
                       {activeTransport.kind.toUpperCase()} active
                     </span>
@@ -388,18 +412,19 @@ export function PhysicalDeviceManager() {
                   )}
 
                   {/* Available transports */}
-                  {device.transports.length > 1 && device.transports.map((t, idx) => {
-                    if (idx === device.activeTransportIdx) return null;
-                    return (
-                      <span
-                        key={idx}
-                        className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-muted-foreground border border-border/40"
-                      >
-                        {transportIcon(t.kind)}
-                        {t.kind}
-                      </span>
-                    );
-                  })}
+                  {device.transports.length > 1 &&
+                    device.transports.map((t, idx) => {
+                      if (idx === device.activeTransportIdx) return null;
+                      return (
+                        <span
+                          key={idx}
+                          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-muted-foreground border border-border/40"
+                        >
+                          {transportIcon(t.kind)}
+                          {t.kind}
+                        </span>
+                      );
+                    })}
                 </div>
 
                 {/* App ID / version if present */}
@@ -450,7 +475,10 @@ export function PhysicalDeviceManager() {
           </div>
           {!showPairSection && (
             <button
-              onClick={() => { setShowPairSection(true); initiatePairing(); }}
+              onClick={() => {
+                setShowPairSection(true);
+                initiatePairing();
+              }}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
             >
               <Plus className="w-3 h-3" />
@@ -538,7 +566,11 @@ export function PhysicalDeviceManager() {
                   id="lan-ip"
                   type="text"
                   value={lanIp}
-                  onChange={(e) => { setLanIp(e.target.value); setLanError(null); setLanSuccess(null); }}
+                  onChange={(e) => {
+                    setLanIp(e.target.value);
+                    setLanError(null);
+                    setLanSuccess(null);
+                  }}
                   placeholder="192.168.1.100"
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
                 />

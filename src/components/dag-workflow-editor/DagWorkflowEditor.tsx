@@ -350,10 +350,7 @@ export function DagWorkflowEditor() {
         </div>
 
         {/* Right: DAG graph */}
-        <div
-          style={{ width: `${100 - leftWidth}%` }}
-          className="flex flex-col min-w-0 h-full"
-        >
+        <div style={{ width: `${100 - leftWidth}%` }} className="flex flex-col min-w-0 h-full">
           <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-muted/20 flex-shrink-0">
             <GitBranch className="w-3.5 h-3.5 text-muted-foreground" />
             <span className="text-xs font-medium text-muted-foreground">DAG Graph</span>
@@ -364,10 +361,7 @@ export function DagWorkflowEditor() {
             )}
           </div>
           <div className="flex-1 min-h-0">
-            <DagGraphPanel
-              yamlContent={yamlContent}
-              validationResult={validationResult}
-            />
+            <DagGraphPanel yamlContent={yamlContent} validationResult={validationResult} />
           </div>
         </div>
       </div>

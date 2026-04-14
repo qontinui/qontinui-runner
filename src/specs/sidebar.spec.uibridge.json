@@ -30,12 +30,7 @@
   "metadata": {
     "component": "Sidebar",
     "pageUrl": "*",
-    "tags": [
-      "runner",
-      "navigation",
-      "sidebar",
-      "global"
-    ]
+    "tags": ["runner", "navigation", "sidebar", "global"]
   },
   "stateMachine": {
     "states": [
@@ -184,9 +179,7 @@
           {
             "id": "sidebar-to-workflows",
             "name": "Navigate to Workflows",
-            "activateStates": [
-              "tab-gui-automation"
-            ],
+            "activateStates": ["tab-gui-automation"],
             "deactivateStates": [
               "tab-active",
               "tab-terminal",
@@ -217,9 +210,7 @@
           {
             "id": "sidebar-to-active",
             "name": "Navigate to Active Dashboard",
-            "activateStates": [
-              "tab-active"
-            ],
+            "activateStates": ["tab-active"],
             "deactivateStates": [
               "tab-gui-automation",
               "tab-terminal",
@@ -250,9 +241,7 @@
           {
             "id": "sidebar-to-terminal",
             "name": "Navigate to Terminal",
-            "activateStates": [
-              "tab-terminal"
-            ],
+            "activateStates": ["tab-terminal"],
             "deactivateStates": [
               "tab-gui-automation",
               "tab-active",
@@ -283,9 +272,7 @@
           {
             "id": "sidebar-to-runs",
             "name": "Navigate to History",
-            "activateStates": [
-              "tab-runs"
-            ],
+            "activateStates": ["tab-runs"],
             "deactivateStates": [
               "tab-gui-automation",
               "tab-active",
@@ -316,9 +303,7 @@
           {
             "id": "sidebar-to-error-monitor",
             "name": "Navigate to Error Monitor",
-            "activateStates": [
-              "tab-error-monitor"
-            ],
+            "activateStates": ["tab-error-monitor"],
             "deactivateStates": [
               "tab-gui-automation",
               "tab-active",
@@ -349,9 +334,7 @@
           {
             "id": "sidebar-to-processes",
             "name": "Navigate to Processes",
-            "activateStates": [
-              "tab-processes"
-            ],
+            "activateStates": ["tab-processes"],
             "deactivateStates": [
               "tab-gui-automation",
               "tab-active",
@@ -382,9 +365,7 @@
           {
             "id": "sidebar-to-library",
             "name": "Navigate to Library",
-            "activateStates": [
-              "tab-library"
-            ],
+            "activateStates": ["tab-library"],
             "deactivateStates": [
               "tab-gui-automation",
               "tab-active",
@@ -415,9 +396,7 @@
           {
             "id": "sidebar-to-state-machine",
             "name": "Navigate to State Machine",
-            "activateStates": [
-              "tab-state-machine"
-            ],
+            "activateStates": ["tab-state-machine"],
             "deactivateStates": [
               "tab-gui-automation",
               "tab-active",
@@ -448,9 +427,7 @@
           {
             "id": "sidebar-to-settings",
             "name": "Navigate to Settings",
-            "activateStates": [
-              "tab-settings"
-            ],
+            "activateStates": ["tab-settings"],
             "deactivateStates": [
               "tab-gui-automation",
               "tab-active",
@@ -481,9 +458,7 @@
           {
             "id": "sidebar-to-reflection",
             "name": "Navigate to Reflection",
-            "activateStates": [
-              "tab-reflection"
-            ],
+            "activateStates": ["tab-reflection"],
             "deactivateStates": [
               "tab-gui-automation",
               "tab-active",

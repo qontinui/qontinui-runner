@@ -86,7 +86,8 @@ function getNodeTypeConfig(nodeData: Record<string, unknown>) {
   if ("command" in nodeData || nodeData.type === "command") return NODE_TYPE_CONFIG.command;
   if ("prompt" in nodeData || nodeData.type === "prompt") return NODE_TYPE_CONFIG.prompt;
   if ("check" in nodeData || nodeData.type === "check") return NODE_TYPE_CONFIG.check;
-  if ("ui_bridge" in nodeData || nodeData.type === "ui-bridge") return NODE_TYPE_CONFIG["ui-bridge"];
+  if ("ui_bridge" in nodeData || nodeData.type === "ui-bridge")
+    return NODE_TYPE_CONFIG["ui-bridge"];
   if ("approval" in nodeData || nodeData.type === "approval") return NODE_TYPE_CONFIG.approval;
   if ("cancel" in nodeData || nodeData.type === "cancel") return NODE_TYPE_CONFIG.cancel;
   if ("workflow_ref" in nodeData || nodeData.type === "workflow-ref")
@@ -137,7 +138,9 @@ function DagNode({ data }: NodeProps) {
           >
             <Icon className="w-3 h-3" />
           </div>
-          <span className="text-xs font-semibold text-slate-100 truncate leading-tight">{label}</span>
+          <span className="text-xs font-semibold text-slate-100 truncate leading-tight">
+            {label}
+          </span>
         </div>
 
         {triggerRule && triggerRule !== "all_success" && (
@@ -229,7 +232,8 @@ function parseYamlToGraph(yamlContent: string): {
     for (const dep of node.depends_on) {
       if (rawNodes[dep] !== undefined) {
         g.setEdge(dep, node.id);
-        const typeConfig = (node as ParsedNode & { _typeConfig: typeof NODE_TYPE_CONFIG.default })._typeConfig;
+        const typeConfig = (node as ParsedNode & { _typeConfig: typeof NODE_TYPE_CONFIG.default })
+          ._typeConfig;
         edges.push({
           id: `${dep}->${node.id}`,
           source: dep,
@@ -247,7 +251,8 @@ function parseYamlToGraph(yamlContent: string): {
 
   const nodes: Node[] = parsedNodes.map((node) => {
     const pos = g.node(node.id);
-    const typeConfig = (node as ParsedNode & { _typeConfig: typeof NODE_TYPE_CONFIG.default })._typeConfig;
+    const typeConfig = (node as ParsedNode & { _typeConfig: typeof NODE_TYPE_CONFIG.default })
+      ._typeConfig;
 
     return {
       id: node.id,
@@ -290,8 +295,7 @@ export function DagGraphPanel({ yamlContent, validationResult }: DagGraphPanelPr
     }
   }, [graph, setNodes, setEdges]);
 
-  const hasValidationErrors =
-    validationResult !== null && !validationResult.valid;
+  const hasValidationErrors = validationResult !== null && !validationResult.valid;
   const isEmpty = !yamlContent.trim();
   const hasNoNodes = graph !== null && graph.nodes.length === 0;
 
@@ -309,12 +313,7 @@ export function DagGraphPanel({ yamlContent, validationResult }: DagGraphPanelPr
         maxZoom={2}
         proOptions={{ hideAttribution: true }}
       >
-        <Background
-          variant={BackgroundVariant.Dots}
-          gap={20}
-          size={1}
-          color="#1e293b"
-        />
+        <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#1e293b" />
         <Controls
           className="!bottom-4 !left-4 !bg-slate-800 !border-slate-700 !rounded-lg"
           showInteractive={false}
@@ -341,7 +340,9 @@ export function DagGraphPanel({ yamlContent, validationResult }: DagGraphPanelPr
             {!isEmpty && hasValidationErrors && (
               <>
                 <AlertTriangle className="w-10 h-10 text-yellow-500/70" />
-                <p className="text-sm text-slate-300 font-medium">Fix YAML errors to see the graph</p>
+                <p className="text-sm text-slate-300 font-medium">
+                  Fix YAML errors to see the graph
+                </p>
                 {validationResult?.errors?.slice(0, 3).map((err, i) => (
                   <p key={i} className="text-xs text-red-400 max-w-xs">
                     {err}

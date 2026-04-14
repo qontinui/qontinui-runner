@@ -424,10 +424,7 @@ function TerminalPageInner({
                   ? `$env:CLAUDE_CONFIG_DIR="${configDirs[i]}"; claude`
                   : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
               // Stagger launch commands across accounts
-              setTimeout(
-                () => writeWhenReady(tabId, `${cmd}\r`),
-                i * 300,
-              );
+              setTimeout(() => writeWhenReady(tabId, `${cmd}\r`), i * 300);
             }
           }
           // Type initial instructions after Claude starts (stagger per session)
@@ -435,10 +432,7 @@ function TerminalPageInner({
             const safeContext = context.replace(/\n/g, " ");
             for (let j = 0; j < createdTabIds.length; j++) {
               const tabId = createdTabIds[j];
-              setTimeout(
-                () => writeWhenReady(tabId, `${safeContext}\r`),
-                j * 300 + 8000,
-              );
+              setTimeout(() => writeWhenReady(tabId, `${safeContext}\r`), j * 300 + 8000);
             }
           }
         }}

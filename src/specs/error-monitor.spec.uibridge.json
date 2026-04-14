@@ -771,7 +771,16 @@
     "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/tools/error-monitor",
     "elementSource": "sdk",
-    "tags": ["error-monitor", "error-tracking", "triage", "observability", "browser-errors", "patterns", "fix-workflow", "run-scope"]
+    "tags": [
+      "error-monitor",
+      "error-tracking",
+      "triage",
+      "observability",
+      "browser-errors",
+      "patterns",
+      "fix-workflow",
+      "run-scope"
+    ]
   },
   "stateMachine": {
     "states": [

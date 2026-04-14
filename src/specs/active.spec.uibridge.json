@@ -965,7 +965,10 @@
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "accessibleName": "Resume execution from breakpoint" },
+                "target": {
+                  "role": "button",
+                  "accessibleName": "Resume execution from breakpoint"
+                },
                 "waitAfter": { "type": "idle", "timeout": 3000 }
               }
             ]
@@ -1005,7 +1008,10 @@
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "accessibleName": "Resume execution from breakpoint" },
+                "target": {
+                  "role": "button",
+                  "accessibleName": "Resume execution from breakpoint"
+                },
                 "waitAfter": { "type": "idle", "timeout": 3000 }
               }
             ]

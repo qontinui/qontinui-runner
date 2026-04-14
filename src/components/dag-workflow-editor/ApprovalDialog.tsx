@@ -87,28 +87,17 @@ export function ApprovalDialog() {
         {/* Task run context */}
         {request.task_run_id && (
           <p className="text-xs text-zinc-500 mb-4">
-            Run:{" "}
-            <span className="font-mono">{request.task_run_id.slice(0, 12)}…</span>
+            Run: <span className="font-mono">{request.task_run_id.slice(0, 12)}…</span>
           </p>
         )}
 
         {/* Actions */}
         <div className="flex gap-3 justify-end">
-          <Button
-            variant="danger"
-            size="sm"
-            onClick={() => respond(false)}
-            disabled={responding}
-          >
+          <Button variant="danger" size="sm" onClick={() => respond(false)} disabled={responding}>
             <ShieldX className="w-4 h-4" />
             Reject
           </Button>
-          <Button
-            variant="success"
-            size="sm"
-            onClick={() => respond(true)}
-            disabled={responding}
-          >
+          <Button variant="success" size="sm" onClick={() => respond(true)} disabled={responding}>
             <ShieldCheck className="w-4 h-4" />
             Approve
           </Button>

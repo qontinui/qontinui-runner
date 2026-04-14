@@ -167,23 +167,26 @@ const NODE_TYPE_FIELDS = [
 
 type NodeTypeField = (typeof NODE_TYPE_FIELDS)[number];
 
-function validateRetryConfig(
-  retry: unknown,
-  path: string,
-  errors: DagValidationError[]
-): void {
+function validateRetryConfig(retry: unknown, path: string, errors: DagValidationError[]): void {
   if (typeof retry !== "object" || retry === null) {
     errors.push({ path, message: "must be an object" });
     return;
   }
   const r = retry as Record<string, unknown>;
-  if (typeof r.max_attempts !== "number" || !Number.isInteger(r.max_attempts) || r.max_attempts < 1) {
+  if (
+    typeof r.max_attempts !== "number" ||
+    !Number.isInteger(r.max_attempts) ||
+    r.max_attempts < 1
+  ) {
     errors.push({ path: `${path}.max_attempts`, message: "must be a positive integer" });
   }
   if (r.delay_ms !== undefined && (typeof r.delay_ms !== "number" || r.delay_ms < 0)) {
     errors.push({ path: `${path}.delay_ms`, message: "must be a non-negative number" });
   }
-  if (r.backoff_multiplier !== undefined && (typeof r.backoff_multiplier !== "number" || r.backoff_multiplier < 1)) {
+  if (
+    r.backoff_multiplier !== undefined &&
+    (typeof r.backoff_multiplier !== "number" || r.backoff_multiplier < 1)
+  ) {
     errors.push({ path: `${path}.backoff_multiplier`, message: "must be a number >= 1" });
   }
 }
@@ -191,7 +194,7 @@ function validateRetryConfig(
 function validateApprovalConfig(
   approval: unknown,
   path: string,
-  errors: DagValidationError[]
+  errors: DagValidationError[],
 ): void {
   if (typeof approval !== "object" || approval === null) {
     errors.push({ path, message: "must be an object" });
@@ -204,16 +207,15 @@ function validateApprovalConfig(
   if (a.on_reject !== undefined && typeof a.on_reject !== "string") {
     errors.push({ path: `${path}.on_reject`, message: "must be a string" });
   }
-  if (a.timeout_seconds !== undefined && (typeof a.timeout_seconds !== "number" || a.timeout_seconds <= 0)) {
+  if (
+    a.timeout_seconds !== undefined &&
+    (typeof a.timeout_seconds !== "number" || a.timeout_seconds <= 0)
+  ) {
     errors.push({ path: `${path}.timeout_seconds`, message: "must be a positive number" });
   }
 }
 
-function validateNode(
-  nodeId: string,
-  node: unknown,
-  errors: DagValidationError[]
-): void {
+function validateNode(nodeId: string, node: unknown, errors: DagValidationError[]): void {
   const path = `nodes.${nodeId}`;
 
   if (typeof node !== "object" || node === null) {
@@ -262,13 +264,16 @@ function validateNode(
   }
 
   // Validate timeout_seconds if present
-  if (n.timeout_seconds !== undefined && (typeof n.timeout_seconds !== "number" || n.timeout_seconds <= 0)) {
+  if (
+    n.timeout_seconds !== undefined &&
+    (typeof n.timeout_seconds !== "number" || n.timeout_seconds <= 0)
+  ) {
     errors.push({ path: `${path}.timeout_seconds`, message: "must be a positive number" });
   }
 
   // Ensure at least one type-discriminating field is set
   const presentTypeFields = NODE_TYPE_FIELDS.filter(
-    (f) => n[f as string] !== undefined
+    (f) => n[f as string] !== undefined,
   ) as NodeTypeField[];
 
   if (presentTypeFields.length === 0) {
@@ -292,10 +297,7 @@ function validateNode(
   }
 }
 
-function validateNodeDefaults(
-  defaults: unknown,
-  errors: DagValidationError[]
-): void {
+function validateNodeDefaults(defaults: unknown, errors: DagValidationError[]): void {
   if (defaults === undefined || defaults === null) return;
   if (typeof defaults !== "object") {
     errors.push({ path: "defaults", message: "must be an object" });
@@ -306,9 +308,15 @@ function validateNodeDefaults(
     validateRetryConfig(d.retry, "defaults.retry", errors);
   }
   if (d.context !== undefined && !CONTEXT_MODES.includes(d.context as ContextMode)) {
-    errors.push({ path: "defaults.context", message: `must be one of: ${CONTEXT_MODES.join(", ")}` });
+    errors.push({
+      path: "defaults.context",
+      message: `must be one of: ${CONTEXT_MODES.join(", ")}`,
+    });
   }
-  if (d.timeout_seconds !== undefined && (typeof d.timeout_seconds !== "number" || d.timeout_seconds <= 0)) {
+  if (
+    d.timeout_seconds !== undefined &&
+    (typeof d.timeout_seconds !== "number" || d.timeout_seconds <= 0)
+  ) {
     errors.push({ path: "defaults.timeout_seconds", message: "must be a positive number" });
   }
 }
