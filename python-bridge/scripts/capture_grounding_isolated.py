@@ -43,7 +43,10 @@ import requests
 from PIL import Image
 
 # ---------------------------------------------------------------------------
-# Path setup — add qontinui-train to sys.path for grounding_record imports
+# Path setup — add qontinui-train to sys.path for grounding_record imports.
+# This script uses its own lightweight requests-based UI Bridge client to
+# avoid a heavy httpx dependency; the equivalent pattern is also available
+# via `ui_bridge.CaptureHostDriver` for users who prefer the official SDK.
 # ---------------------------------------------------------------------------
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _BRIDGE_DIR = _SCRIPT_DIR.parent  # python-bridge/
@@ -602,11 +605,13 @@ def run_capture_host(
         sample_url = build_api_isolated_url(params, sample_index=idx)
 
         try:
-            # Drive the outer page: setValue on the URL input + click advance
+            # Drive the outer page: setValue on the URL input + click advance.
+            # The delay between the two commands lets React's controlled-input
+            # onChange propagate before the button handler reads the state.
             client.element_action(
                 "capture-next-url", "setValue", {"value": sample_url},
             )
-            time.sleep(0.05)
+            time.sleep(0.25)
             client.element_action("capture-advance", "click")
 
             # Wait for the iframe to postMessage its bbox back to the host,
@@ -618,25 +623,29 @@ def run_capture_host(
             while time.time() < deadline:
                 try:
                     snap = client.get_control_snapshot()
+                    # SDK default id is "capture-last-echo"; legacy custom
+                    # hosts may use "capture-last-bbox".
                     for el in snap.get("elements", []):
-                        if el.get("id") == "capture-last-bbox":
-                            raw = (
-                                (el.get("state") or {}).get("value")
-                                or el.get("value")
-                                or ""
-                            )
-                            if raw:
-                                try:
-                                    candidate = json.loads(raw)
-                                except Exception:
-                                    candidate = None
-                                if (
-                                    candidate
-                                    and int(candidate.get("sampleIndex", -1))
-                                    == idx
-                                ):
-                                    bbox = candidate
-                                    break
+                        if el.get("id") not in (
+                            "capture-last-echo", "capture-last-bbox",
+                        ):
+                            continue
+                        raw = (
+                            (el.get("state") or {}).get("value")
+                            or el.get("value")
+                            or ""
+                        )
+                        if raw:
+                            try:
+                                candidate = json.loads(raw)
+                            except Exception:
+                                candidate = None
+                            if (
+                                candidate
+                                and int(candidate.get("sampleIndex", -1)) == idx
+                            ):
+                                bbox = candidate
+                                break
                     if bbox:
                         break
                 except Exception:
