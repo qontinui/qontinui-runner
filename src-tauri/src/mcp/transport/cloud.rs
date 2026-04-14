@@ -130,15 +130,45 @@ impl CloudTransport {
         // Task: drive the WebSocket — receive responses and forward requests
         let task_handle = tokio::spawn(async move {
             let mut ws_tx_opt = Some(ws_tx);
+            // Heartbeat every 30s to keep the Redis TTL fresh on the backend
+            let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            heartbeat_interval.tick().await; // fire first tick immediately (ignored)
             loop {
                 tokio::select! {
+                    // Periodic heartbeat to keep the relay alive
+                    _ = heartbeat_interval.tick() => {
+                        if let Some(ref mut tx) = ws_tx_opt {
+                            let hb = serde_json::json!({ "type": "heartbeat" });
+                            if let Err(e) = tx.send(Message::Text(hb.to_string().into())).await {
+                                warn!("[cloud-transport] Heartbeat send failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+
                     // Forward outbound tunnel requests to the WebSocket
                     req = req_rx.recv() => {
                         match req {
                             None => break,
                             Some(tunnel_req) => {
                                 if let Some(ref mut tx) = ws_tx_opt {
-                                    match serde_json::to_string(&tunnel_req) {
+                                    // Wrap as { "type": "tunnel_request", ...fields } to match
+                                    // the backend device_bridge_ws.py message discriminator.
+                                    let wrapped = match serde_json::to_value(&tunnel_req) {
+                                        Ok(serde_json::Value::Object(mut map)) => {
+                                            map.insert(
+                                                "type".to_string(),
+                                                serde_json::Value::String("tunnel_request".to_string()),
+                                            );
+                                            serde_json::Value::Object(map)
+                                        }
+                                        Ok(other) => other,
+                                        Err(e) => {
+                                            error!("[cloud-transport] Serialization error: {e}");
+                                            continue;
+                                        }
+                                    };
+                                    match serde_json::to_string(&wrapped) {
                                         Ok(json) => {
                                             if let Err(e) = tx.send(Message::Text(json.into())).await {
                                                 error!("[cloud-transport] WS send error: {e}");
@@ -162,20 +192,48 @@ impl CloudTransport {
                                 break;
                             }
                             Some(Ok(Message::Text(text))) => {
-                                match serde_json::from_str::<TunnelResponse>(&text) {
-                                    Ok(resp) => {
-                                        let mut pending_map = pending_for_rx.lock().await;
-                                        if let Some(tx) = pending_map.remove(&resp.id) {
-                                            let _ = tx.send(resp);
-                                        } else {
-                                            warn!(
-                                                "[cloud-transport] No pending request for response id {}",
-                                                resp.id
-                                            );
+                                // Parse as generic JSON first, then dispatch on `type` field.
+                                let value: serde_json::Value = match serde_json::from_str(&text) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        warn!("[cloud-transport] Failed to parse WS message: {e}");
+                                        continue;
+                                    }
+                                };
+                                let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                match msg_type {
+                                    "tunnel_response" => {
+                                        match serde_json::from_value::<TunnelResponse>(value) {
+                                            Ok(resp) => {
+                                                let mut pending_map = pending_for_rx.lock().await;
+                                                if let Some(tx) = pending_map.remove(&resp.id) {
+                                                    let _ = tx.send(resp);
+                                                } else {
+                                                    warn!(
+                                                        "[cloud-transport] No pending request for response id {}",
+                                                        resp.id
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("[cloud-transport] Failed to parse tunnel response: {e}");
+                                            }
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!("[cloud-transport] Failed to parse tunnel response: {e}");
+                                    "tunnel_connected" => {
+                                        info!("[cloud-transport] Tunnel handshake confirmed by backend");
+                                    }
+                                    "heartbeat_ack" => {
+                                        debug!("[cloud-transport] Heartbeat ack received");
+                                    }
+                                    "error" => {
+                                        let msg = value.get("message")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown error");
+                                        error!("[cloud-transport] Backend error: {msg}");
+                                    }
+                                    other => {
+                                        debug!("[cloud-transport] Unknown message type: {other}");
                                     }
                                 }
                             }
