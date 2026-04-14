@@ -93,10 +93,10 @@ REQUEST_TIMEOUT = 20
 # Settle time after navigation (seconds)
 SETTLE_DELAY = 0.5
 
-# Isolated component page base route.
-# Uses the API route (not the App Router page) to bypass the UIBridgeProvider
-# layout which causes a circular-JSON crash in Next.js's scroll handler.
-ISOLATED_ROUTE = "/api/grounding-isolated"
+# Isolated component page base route — the App Router page renders via the
+# real design-system components (not hand-written HTML).  Capture uses
+# hard navigation (full reload) so the UI Bridge SDK re-initialises per sample.
+ISOLATED_ROUTE = "/dev/grounding/isolated"
 
 # ---------------------------------------------------------------------------
 # Component combinatorial matrix
@@ -199,9 +199,28 @@ class UIBridgeClient:
         except Exception:
             return False
 
-    def navigate(self, url: str) -> dict:
-        """Navigate the connected browser to a URL path."""
-        return self._post("/control/page/navigate", {"url": url})
+    def navigate(self, url: str, hard: bool = False) -> dict:
+        """Navigate the connected browser to a URL path.
+
+        When *hard* is True the SDK bypasses client-side (router.push)
+        navigation and does a full page reload via ``window.location.href``.
+        This re-initialises the UI Bridge provider tree, which is necessary
+        on pages that unmount the SDK (e.g. the isolated component renderer).
+        """
+        return self._post("/control/page/navigate", {"url": url, "hard": hard})
+
+    def wait_for_tab(self, timeout_s: float = 10.0) -> bool:
+        """Poll /health until a connected tab appears or *timeout_s* elapses."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                h = self._get("/health").get("data", {})
+                if h.get("connectedTabs"):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.3)
+        return False
 
     def set_viewport_constraints(self, width: int) -> dict:
         """Apply CSS viewport width constraints."""
@@ -221,12 +240,23 @@ class UIBridgeClient:
 # Screenshot capture (mss — same pattern as trajectory_logger.py)
 # ---------------------------------------------------------------------------
 
-def capture_screen() -> tuple[bytes, int, int]:
-    """Capture the primary monitor as PNG bytes. Returns (png_bytes, width, height)."""
+def capture_screen(monitor_index: int = 1) -> tuple[bytes, int, int]:
+    """Capture a monitor as PNG bytes. Returns (png_bytes, width, height).
+
+    ``monitor_index`` is the mss monitor index:
+      * 0 = all monitors combined (virtual bounding box)
+      * 1 = primary monitor (default)
+      * 2+ = additional monitors, in order reported by the OS
+    """
     import mss
 
     with mss.mss() as sct:
-        mon = sct.monitors[1]
+        if monitor_index < 0 or monitor_index >= len(sct.monitors):
+            raise ValueError(
+                f"monitor_index={monitor_index} out of range; "
+                f"available: 0..{len(sct.monitors) - 1}"
+            )
+        mon = sct.monitors[monitor_index]
         shot = sct.grab(mon)
         arr = np.array(shot)[:, :, :3]  # BGRA → BGR
 
@@ -393,6 +423,7 @@ def run_capture(
     output_dir: Path,
     num_samples: int,
     seed: int,
+    monitor_index: int = 1,
 ) -> None:
     client = UIBridgeClient(ui_bridge_url)
     writer = GroundingJSONLWriter(output_dir)
@@ -422,13 +453,20 @@ def run_capture(
         nav_url = build_isolated_url(params)
 
         try:
-            client.navigate(nav_url)
+            # Hard navigation: full page reload so the UI Bridge SDK
+            # re-initialises cleanly on every sample. The isolated page's
+            # component tree has been observed to drop the SSE listener
+            # during React's client-side transitions; a hard reload avoids
+            # the problem entirely.
+            client.navigate(nav_url, hard=True)
+            # Wait for the browser to reconnect to UI Bridge before snapshotting
+            if not client.wait_for_tab(timeout_s=8.0):
+                logger.debug("Sample %d: UI Bridge tab did not reconnect", idx)
             time.sleep(SETTLE_DELAY)
 
-            png_bytes, screen_w, screen_h = capture_screen()
+            png_bytes, screen_w, screen_h = capture_screen(monitor_index)
 
-            # Try UI Bridge snapshot first; fall back to estimated bbox
-            # (the API route page runs without the SDK, so snapshots are empty).
+            # Try UI Bridge snapshot first; fall back to estimated bbox.
             try:
                 snapshot = client.get_control_snapshot()
                 target_el = find_target_element(snapshot)
@@ -523,6 +561,15 @@ def main() -> None:
         default=DEFAULT_SEED,
         help=f"Random seed for reproducibility (default: {DEFAULT_SEED})",
     )
+    parser.add_argument(
+        "--monitor",
+        type=int,
+        default=int(os.getenv("QONTINUI_CAPTURE_MONITOR", "1")),
+        help=(
+            "Monitor index to capture: 0=all, 1=primary, 2+=secondary "
+            "(default: 1; env QONTINUI_CAPTURE_MONITOR)"
+        ),
+    )
     args = parser.parse_args()
 
     run_capture(
@@ -530,6 +577,7 @@ def main() -> None:
         output_dir=Path(args.output_dir),
         num_samples=args.num_samples,
         seed=args.seed,
+        monitor_index=args.monitor,
     )
 
 
