@@ -189,8 +189,6 @@ impl KnowledgeGraph {
         }
     }
 
-    /// Link task runs to UI elements via InteractedWith edges.
-
     // =========================================================================
     // UI Bridge failure chain tracing
     // =========================================================================
@@ -322,9 +320,6 @@ impl KnowledgeGraph {
     // =========================================================================
     // Incremental update
     // =========================================================================
-
-    /// Ingest a single task run and its related entities into the graph.
-    /// Returns the count of new nodes added.
 
     // =========================================================================
     // Summary

@@ -1359,7 +1359,7 @@ pub async fn run_unified_workflow(
         );
 
         let input = CreateTaskRunInput::new(&execution_id, &workflow.name)
-            .with_prompt(&format!("DAG workflow: {}", dag_def.name))
+            .with_prompt(format!("DAG workflow: {}", dag_def.name))
             .with_task_type("ai")
             .with_workflow_name(&workflow.name)
             .with_workflow_id(&workflow.id)

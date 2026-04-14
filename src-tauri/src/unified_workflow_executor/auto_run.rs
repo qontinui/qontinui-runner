@@ -87,7 +87,7 @@ pub fn launch_generated_workflow(
 
             let input =
                 crate::database::CreateTaskRunInput::new(&execution_id, &dag_def.name)
-                    .with_prompt(&format!("DAG workflow: {}", dag_def.name))
+                    .with_prompt(format!("DAG workflow: {}", dag_def.name))
                     .with_task_type("ai")
                     .with_workflow_name(&dag_def.name)
                     .with_workflow_id(&generated_workflow_id)
