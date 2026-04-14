@@ -64,7 +64,7 @@ export function startBackgroundObserver(): void {
       const workflows = registry.getAllWorkflows();
       return {
         timestamp: Date.now(),
-        elements: elements.map((el) => ({
+        elements: elements.map((el: any) => ({
           id: el.id,
           type: el.type,
           label: el.label,
@@ -74,12 +74,12 @@ export function startBackgroundObserver(): void {
           contentMetadata: el.contentMetadata,
           mediaMetadata: el.mediaMetadata,
         })),
-        components: components.map((comp) => ({
+        components: components.map((comp: any) => ({
           id: comp.id,
           name: comp.name,
-          actions: comp.actions.map((a) => a.id),
+          actions: comp.actions.map((a: any) => a.id),
         })),
-        workflows: workflows.map((wf) => ({
+        workflows: workflows.map((wf: any) => ({
           id: wf.id,
           name: wf.name,
           stepCount: wf.steps.length,

@@ -1209,7 +1209,7 @@ pub async fn navigate_to_page(
 // RAG handler functions removed — see crate::mcp::rag
 // Model handler functions removed — see crate::mcp::models
 
-pub fn default_true() -> bool {
+fn default_true() -> bool {
     true
 }
 

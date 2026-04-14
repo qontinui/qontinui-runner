@@ -950,8 +950,8 @@ async fn handle_relay_command(
                     .get("working_dir")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let cols = data.get("cols").and_then(|v| v.as_u64()).map(|v| v as u16);
-                let rows = data.get("rows").and_then(|v| v.as_u64()).map(|v| v as u16);
+                let cols = data.get("cols").and_then(|v| v.as_u64()).map(|v| v.min(u16::MAX as u64) as u16);
+                let rows = data.get("rows").and_then(|v| v.as_u64()).map(|v| v.min(u16::MAX as u64) as u16);
 
                 match tm.create(
                     title,
@@ -997,7 +997,9 @@ async fn handle_relay_command(
                 if let Some(session) = tm.get(terminal_id) {
                     match STANDARD.decode(input_data) {
                         Ok(bytes) => {
-                            let _ = session.write(&bytes);
+                            if let Err(e) = session.write(&bytes) {
+                                warn!("Relay: failed to write to terminal {}: {}", terminal_id, e);
+                            }
                         }
                         Err(e) => {
                             warn!("Invalid base64 terminal input: {}", e);
@@ -1020,11 +1022,13 @@ async fn handle_relay_command(
                     .get("terminal_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let cols = data.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
-                let rows = data.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+                let cols = data.get("cols").and_then(|v| v.as_u64()).unwrap_or(80).min(u16::MAX as u64) as u16;
+                let rows = data.get("rows").and_then(|v| v.as_u64()).unwrap_or(24).min(u16::MAX as u64) as u16;
 
                 if let Some(session) = tm.get(terminal_id) {
-                    let _ = session.resize(cols, rows);
+                    if let Err(e) = session.resize(cols, rows) {
+                        warn!("Relay: failed to resize terminal {}: {}", terminal_id, e);
+                    }
                 }
             }
             // Fire-and-forget, no response

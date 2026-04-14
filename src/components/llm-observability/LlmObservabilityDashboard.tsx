@@ -66,11 +66,14 @@ export default function LlmObservabilityDashboard() {
 
   if (!summary || summary.total_calls === 0) {
     return (
-      <div className="h-full flex items-center justify-center text-muted-foreground">
-        <div className="text-center">
-          <CreditCard className="w-12 h-12 mx-auto mb-4 opacity-50" />
-          <p>No LLM usage data available</p>
-          <p className="text-sm mt-2">Run some workflows to start collecting LLM analytics</p>
+      <div className="h-full overflow-auto p-4 space-y-6">
+        <AccountUsageCard />
+        <div className="flex items-center justify-center text-muted-foreground pt-8">
+          <div className="text-center">
+            <CreditCard className="w-12 h-12 mx-auto mb-4 opacity-50" />
+            <p>No LLM usage data available</p>
+            <p className="text-sm mt-2">Run some workflows to start collecting LLM analytics</p>
+          </div>
         </div>
       </div>
     );

@@ -188,6 +188,7 @@ pub async fn get_buffer_handler(
 
     let (data, start_offset) = session.get_scrollback_buffer();
     let total_bytes_produced = session.info().total_bytes_produced;
+    session.reset_flow_control();
     let encoded = STANDARD.encode(&data);
 
     Ok(Json(ApiResponse::success(serde_json::json!({

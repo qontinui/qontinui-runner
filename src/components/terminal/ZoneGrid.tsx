@@ -253,9 +253,15 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
     const tab = tabs.find((t) => t.id === tabId);
 
     return (
-      <div className="h-full w-full relative">
+      <div
+        className="h-full w-full relative"
+        onDoubleClickCapture={() => onZoneDoubleClick(singleViewZone)}
+      >
         {tab && (
-          <div className="absolute top-0 left-0 right-0 flex items-center gap-2 px-3 py-1 bg-[#13141f]/90 backdrop-blur-sm z-20">
+          <div
+            className="absolute top-0 left-0 right-0 flex items-center gap-2 px-3 py-1 bg-[#13141f]/90 backdrop-blur-sm z-20 cursor-pointer"
+            onDoubleClick={() => onZoneDoubleClick(singleViewZone)}
+          >
             <span className="text-[10px] text-[#7aa2f7] font-medium">Maximized</span>
             <span className="text-[10px] text-[#a9b1d6]">{tab.title}</span>
             <span className="text-[9px] text-[#565f89] ml-auto">
@@ -277,7 +283,6 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
               key={zoneTab.id}
               className={isVisible ? "h-full w-full" : "hidden"}
               onMouseDown={(e) => handleZoneMouseDown(zoneIdx, e)}
-              onDoubleClick={() => onZoneDoubleClick(zoneIdx)}
             >
               {zoneTab.type === "plan" && zoneTab.planFilePath ? (
                 <PlanViewer filePath={zoneTab.planFilePath} visible={isVisible} />

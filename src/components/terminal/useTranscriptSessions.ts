@@ -63,6 +63,12 @@ export function useTranscriptSessions(): UseTranscriptSessionsResult {
     }
   }, [fetchSessions]);
 
+  // Auto-refresh every 30 seconds to pick up newly created sessions
+  useEffect(() => {
+    const interval = setInterval(fetchSessions, 30_000);
+    return () => clearInterval(interval);
+  }, [fetchSessions]);
+
   const loadMessages = useCallback(async (sessionId: string): Promise<TranscriptMessage[]> => {
     try {
       const result = await invoke<CommandResponse>("transcript_read_session", {

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 use tracing::debug;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -50,6 +52,18 @@ pub struct SessionDigest {
     pub likely_frozen: bool, // heuristic: recent + mid-task + not completed
     pub work_summary_hint: String, // "Task: {first} — Last: {last_snippet}"
 }
+
+// ── Session Cache ───────────────────────────────────────────────────────────
+
+/// Cached session entry: stores parsed metadata alongside the file's mtime
+/// so we can skip re-reading files whose content hasn't changed.
+struct CachedSession {
+    mtime: SystemTime,
+    session: Option<TranscriptSession>, // None = workflow or empty session (filtered)
+}
+
+static SESSION_CACHE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, CachedSession>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
 // ── Config Dir Discovery ─────────────────────────────────────────────────────
 
@@ -155,73 +169,116 @@ pub fn list_sessions(
     let entries = fs::read_dir(&project_dir)
         .map_err(|e| format!("Failed to read project directory {:?}: {}", project_dir, e))?;
 
+    let mut cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                let session_id = stem.to_string();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
 
-                // Get file metadata for last_modified and approximate message count
-                let metadata = fs::metadata(&path);
-                let last_modified = metadata
-                    .as_ref()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .map(|t| {
-                        chrono::DateTime::<chrono::Utc>::from(t)
-                            .format("%Y-%m-%dT%H:%M:%SZ")
-                            .to_string()
-                    })
-                    .unwrap_or_default();
+        // Get file mtime
+        let metadata = fs::metadata(&path);
+        let mtime = metadata
+            .as_ref()
+            .ok()
+            .and_then(|m| m.modified().ok());
 
-                // Read file content for line count, preview, and plan detection
-                let content = fs::read_to_string(&path).unwrap_or_default();
-
-                // Skip workflow-spawned sessions (they use bypassPermissions)
-                if is_workflow_session(&content) {
+        // Check cache: if we've seen this file with the same mtime, reuse the result
+        if let Some(mtime) = mtime {
+            if let Some(cached) = cache.get(&path) {
+                if cached.mtime == mtime {
+                    if let Some(ref session) = cached.session {
+                        // Update project_path/config_dir in case they differ
+                        let mut s = session.clone();
+                        s.project_path = project_path.to_string();
+                        s.config_dir = config_dir.to_string_lossy().to_string();
+                        sessions.push(s);
+                    }
+                    // else: cached as filtered (workflow/empty) — skip
                     continue;
                 }
-
-                // Count actual user/assistant messages (cheap substring check)
-                let message_count = content
-                    .lines()
-                    .filter(|l| {
-                        l.contains("\"type\":\"user\"")
-                            || l.contains("\"type\": \"user\"")
-                            || l.contains("\"type\":\"assistant\"")
-                            || l.contains("\"type\": \"assistant\"")
-                    })
-                    .count();
-
-                // Skip sessions with no real messages
-                if message_count == 0 {
-                    continue;
-                }
-
-                // Substring check for plans (cheap — no JSON parse needed)
-                let has_plans = content.contains("\"planContent\"");
-
-                // Extract first user message preview (scan first ~20 lines)
-                let first_message_preview = extract_first_user_preview(&content);
-                let display_name = generate_display_name(&first_message_preview, &last_modified);
-
-                // Extract started_at from first record's timestamp
-                let started_at = extract_first_timestamp(&content);
-
-                sessions.push(TranscriptSession {
-                    session_id,
-                    project_path: project_path.to_string(),
-                    config_dir: config_dir.to_string_lossy().to_string(),
-                    message_count,
-                    last_modified,
-                    started_at,
-                    first_message_preview,
-                    has_plans,
-                    display_name,
-                });
             }
         }
+
+        let session_id = stem.to_string();
+        let last_modified = mtime
+            .map(|t| {
+                chrono::DateTime::<chrono::Utc>::from(t)
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string()
+            })
+            .unwrap_or_default();
+
+        // Read file content for line count, preview, and plan detection
+        let content = fs::read_to_string(&path).unwrap_or_default();
+
+        // Skip workflow-spawned sessions (they use bypassPermissions)
+        if is_workflow_session(&content) {
+            if let Some(mt) = mtime {
+                cache.insert(path.clone(), CachedSession { mtime: mt, session: None });
+            }
+            continue;
+        }
+
+        // Count actual user/assistant messages (cheap substring check)
+        let message_count = content
+            .lines()
+            .filter(|l| {
+                l.contains("\"type\":\"user\"")
+                    || l.contains("\"type\": \"user\"")
+                    || l.contains("\"type\":\"assistant\"")
+                    || l.contains("\"type\": \"assistant\"")
+            })
+            .count();
+
+        // Skip sessions with no real messages
+        if message_count == 0 {
+            if let Some(mt) = mtime {
+                cache.insert(path.clone(), CachedSession { mtime: mt, session: None });
+            }
+            continue;
+        }
+
+        // Substring check for plans (cheap — no JSON parse needed)
+        let has_plans = content.contains("\"planContent\"");
+
+        // Extract first user message preview (scan first ~20 lines)
+        let first_message_preview = extract_first_user_preview(&content);
+        let display_name = generate_display_name(&first_message_preview, &last_modified);
+
+        // Extract started_at from first record's timestamp
+        let started_at = extract_first_timestamp(&content);
+
+        let session = TranscriptSession {
+            session_id,
+            project_path: project_path.to_string(),
+            config_dir: config_dir.to_string_lossy().to_string(),
+            message_count,
+            last_modified,
+            started_at,
+            first_message_preview,
+            has_plans,
+            display_name,
+        };
+
+        if let Some(mt) = mtime {
+            cache.insert(
+                path.clone(),
+                CachedSession {
+                    mtime: mt,
+                    session: Some(session.clone()),
+                },
+            );
+        }
+
+        sessions.push(session);
     }
+
+    drop(cache);
 
     // Sort by last_modified descending (newest first)
     sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));

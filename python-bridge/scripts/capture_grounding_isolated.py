@@ -93,8 +93,10 @@ REQUEST_TIMEOUT = 20
 # Settle time after navigation (seconds)
 SETTLE_DELAY = 0.5
 
-# Isolated component page base route
-ISOLATED_ROUTE = "/dev/grounding/isolated"
+# Isolated component page base route.
+# Uses the API route (not the App Router page) to bypass the UIBridgeProvider
+# layout which causes a circular-JSON crash in Next.js's scroll handler.
+ISOLATED_ROUTE = "/api/grounding-isolated"
 
 # ---------------------------------------------------------------------------
 # Component combinatorial matrix
@@ -236,52 +238,94 @@ def capture_screen() -> tuple[bytes, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Target element extraction
+# Estimated component sizes (pixels) — used when UI Bridge snapshot is
+# unavailable (the API route page runs without the UI Bridge SDK).
+# Values are approximate defaults at 1920×1080 with default browser zoom.
 # ---------------------------------------------------------------------------
+
+COMPONENT_SIZES: dict[str, tuple[int, int]] = {
+    "Button": (120, 40),
+    "Badge": (80, 24),
+    "Input": (256, 40),
+    "Textarea": (256, 80),
+    "Checkbox": (120, 24),
+    "Switch": (120, 24),
+    "Toggle": (72, 40),
+    "Select": (192, 40),
+    "Slider": (256, 20),
+    "Progress": (256, 16),
+    "Tabs": (288, 80),
+    "Card": (288, 200),
+    "Separator": (256, 50),
+    "Label": (256, 56),
+}
+
+
+def estimate_target_bbox(
+    params: dict, screen_w: int, screen_h: int,
+) -> GroundingElement:
+    """Estimate the bounding box of the rendered component.
+
+    The isolated page positions the component at ``(left%, top%)`` of the
+    viewport with ``transform: translate(-50%, -50%)``.  We combine the
+    known position with an approximate component size to produce a bbox.
+    """
+    component = params["component"]
+    est_w, est_h = COMPONENT_SIZES.get(component, (120, 40))
+
+    # Center of the component in pixels
+    cx = screen_w * params["left"] / 100.0
+    cy = screen_h * params["top"] / 100.0
+
+    # Bbox top-left
+    x = max(0, int(cx - est_w / 2))
+    y = max(0, int(cy - est_h / 2))
+    w = min(est_w, screen_w - x)
+    h = min(est_h, screen_h - y)
+
+    variant = params.get("variant", "default")
+    state_str = params.get("state", "enabled")
+    label = f"{variant.title()} {component}"
+    if state_str == "disabled":
+        label = f"Disabled {label}"
+
+    return GroundingElement(
+        role=component.lower(),
+        text=label,
+        bbox=(x, y, w, h),
+        interactable=state_str != "disabled",
+    )
+
 
 def find_target_element(snapshot: dict) -> GroundingElement | None:
     """Find the grounding-target element in the UI Bridge snapshot.
 
-    Looks first for an element whose attributes include
-    ``data-grounding-target="true"``, then falls back to any element that
-    carries the ``data-grounding-target`` key regardless of value.
-
-    Returns ``None`` if no target element is found.
+    Returns ``None`` if no target element is found (e.g. the page is
+    served without the UI Bridge SDK).
     """
     for el in snapshot.get("elements", []):
         attrs: dict = el.get("attributes", {}) or {}
         val = attrs.get("data-grounding-target")
         if val is None:
-            # Some snapshots store custom data-* keys at the top level
             val = el.get("data-grounding-target")
         if val is not None and str(val).lower() not in ("false", "0", ""):
-            return _snapshot_el_to_grounding(el)
-
+            state = el.get("state", {})
+            rect = state.get("rect", {})
+            x = int(rect.get("x", 0))
+            y = int(rect.get("y", 0))
+            w = int(rect.get("width", 0))
+            h = int(rect.get("height", 0))
+            if w <= 0 or h <= 0:
+                return None
+            category = el.get("category")
+            interactable = category == "interactive" or bool(el.get("actions"))
+            return GroundingElement(
+                role=el.get("type", "unknown"),
+                text=el.get("label"),
+                bbox=(x, y, w, h),
+                interactable=interactable,
+            )
     return None
-
-
-def _snapshot_el_to_grounding(el: dict) -> GroundingElement | None:
-    """Convert a single snapshot element dict to a GroundingElement."""
-    state = el.get("state", {})
-    rect = state.get("rect", {})
-
-    x = int(rect.get("x", 0))
-    y = int(rect.get("y", 0))
-    w = int(rect.get("width", 0))
-    h = int(rect.get("height", 0))
-
-    if w <= 0 or h <= 0:
-        return None
-
-    category = el.get("category")
-    interactable = category == "interactive" or bool(el.get("actions"))
-
-    return GroundingElement(
-        role=el.get("type", "unknown"),
-        text=el.get("label"),
-        bbox=(x, y, w, h),
-        interactable=interactable,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -381,19 +425,18 @@ def run_capture(
             client.navigate(nav_url)
             time.sleep(SETTLE_DELAY)
 
-            snapshot = client.get_control_snapshot()
-            target_el = find_target_element(snapshot)
+            png_bytes, screen_w, screen_h = capture_screen()
+
+            # Try UI Bridge snapshot first; fall back to estimated bbox
+            # (the API route page runs without the SDK, so snapshots are empty).
+            try:
+                snapshot = client.get_control_snapshot()
+                target_el = find_target_element(snapshot)
+            except Exception:
+                target_el = None
 
             if target_el is None:
-                logger.debug(
-                    "Sample %d: no grounding target found in snapshot — skipping (%s)",
-                    idx,
-                    nav_url,
-                )
-                total_skipped += 1
-                continue
-
-            png_bytes, screen_w, screen_h = capture_screen()
+                target_el = estimate_target_bbox(params, screen_w, screen_h)
 
             record = GroundingRecord(
                 image_hash="",  # computed by writer

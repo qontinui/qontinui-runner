@@ -29,6 +29,8 @@ interface ZoneProfilePickerProps {
   tabs?: Array<{ id: string; claudeSessionId?: string; claudeConfigDir?: string }>;
   /** Terminal page ID for storage namespacing */
   pageId?: string;
+  /** Whether terminal initialization (reconnection) has completed */
+  initialized?: boolean;
   onLoadProfile: (profile: ZoneProfile) => void;
 }
 
@@ -95,6 +97,7 @@ export function ZoneProfilePicker({
   zoneAssignments,
   tabs,
   pageId = "default",
+  initialized = false,
   onLoadProfile,
 }: ZoneProfilePickerProps) {
   const [open, setOpen] = useState(false);
@@ -110,7 +113,7 @@ export function ZoneProfilePicker({
     onLoadProfileRef.current = onLoadProfile;
   });
 
-  // Load profiles and active profile from database on mount, auto-apply if active
+  // Load profiles and active profile from database on mount
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -122,15 +125,25 @@ export function ZoneProfilePicker({
       setProfiles(profs);
       setActiveProfileName(active);
       setLoaded(true);
-      // Auto-apply the saved active profile on mount
-      if (active && profs[active]) {
-        onLoadProfileRef.current(profs[active]);
-      }
     })();
     return () => {
       cancelled = true;
     };
   }, [pageId]);
+
+  // Auto-apply active profile only after terminal initialization completes
+  // and only when no sessions were reconnected (tabs is empty).
+  // When sessions were reconnected, useTerminalInitialization already restores
+  // labels, notes, claude sessions from the saved layout — applying the profile
+  // on top would create duplicate terminals and lose session state.
+  const didAutoApply = useRef(false);
+  useEffect(() => {
+    if (!initialized || !loaded || didAutoApply.current) return;
+    didAutoApply.current = true;
+    if (activeProfileName && profiles[activeProfileName] && (!tabs || tabs.length === 0)) {
+      onLoadProfileRef.current(profiles[activeProfileName]);
+    }
+  }, [initialized, loaded, activeProfileName, profiles, tabs]);
 
   useEffect(() => {
     if (!open) return;

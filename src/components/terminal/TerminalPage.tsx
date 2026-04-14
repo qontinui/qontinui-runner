@@ -214,6 +214,37 @@ function TerminalPageInner({
     },
   });
 
+  /** Pick the smallest layout preset that fits `totalTabs` tabs. */
+  const pickLayout = (totalTabs: number): string => {
+    if (totalTabs >= 7) return "full-grid";
+    if (totalTabs >= 5) return "six-pack";
+    if (totalTabs >= 3) return "quad";
+    if (totalTabs >= 2) return "split";
+    return "single";
+  };
+
+  /**
+   * Wait until a terminal ref is ready, then write text to it.
+   * Polls every 200ms for up to 5 seconds — handles the gap between
+   * tab creation and TerminalInstance mount / xterm.js init.
+   */
+  const writeWhenReady = (tabId: string, text: string, maxWaitMs = 5000) => {
+    const start = Date.now();
+    const poll = () => {
+      const handle = terminalRefs.current.get(tabId)?.current;
+      if (handle) {
+        handle.writeToTerminal(text);
+        return;
+      }
+      if (Date.now() - start < maxWaitMs) {
+        setTimeout(poll, 200);
+      } else {
+        console.warn(`[LaunchAI] terminal ref for ${tabId} never became ready`);
+      }
+    };
+    poll();
+  };
+
   if (!initialized) {
     return (
       <div className="h-full flex items-center justify-center bg-[#1a1b26]">
@@ -287,6 +318,7 @@ function TerminalPageInner({
               pageId={pageId}
               zoneAssignments={zoneLayout.assignments}
               tabs={tabs}
+              initialized={initialized}
               onLoadProfile={async (profile) => {
                 zoneLayout.setLayoutId(profile.layoutId);
                 labelsAndTags.setZoneLabels(profile.labels);
@@ -318,14 +350,9 @@ function TerminalPageInner({
         zoneLabels={labelsAndTags.zoneLabels}
         labelColorMap={labelsAndTags.labelColorMap}
         onQuickLaunch={async (count, autoCommand) => {
-          const layoutMap: Record<number, string> = {
-            2: "split",
-            4: "quad",
-            6: "six-pack",
-            9: "full-grid",
-          };
-          const layoutId = layoutMap[count];
-          if (layoutId) zoneLayout.setLayoutId(layoutId);
+          const totalTabs = tabs.length + count;
+          const layoutId = pickLayout(totalTabs);
+          zoneLayout.setLayoutId(layoutId);
           const title = autoCommand ? autoCommand.slice(0, 20) : undefined;
           const createdTabIds: string[] = [];
           for (let i = 0; i < count; i++) {
@@ -333,24 +360,16 @@ function TerminalPageInner({
             if (tabId) createdTabIds.push(tabId);
           }
           if (autoCommand && createdTabIds.length > 0) {
-            setTimeout(() => {
-              for (const tabId of createdTabIds) {
-                terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${autoCommand}\r`);
-              }
-            }, 1500);
+            for (const tabId of createdTabIds) {
+              writeWhenReady(tabId, `${autoCommand}\r`);
+            }
           }
         }}
         onLaunchAiSession={async (count, configDir, context) => {
-          const layoutMap: Record<number, string> = {
-            2: "split",
-            4: "quad",
-            6: "six-pack",
-            9: "full-grid",
-          };
-          if (count > 1) {
-            const layoutId = layoutMap[count] ?? "full-grid";
-            zoneLayout.setLayoutId(layoutId);
-          }
+          const totalTabs = tabs.length + count;
+          const layoutId = pickLayout(totalTabs);
+          zoneLayout.setLayoutId(layoutId);
+
           const isWindows = navigator.platform.startsWith("Win");
           const customCmd = sessionManager.launchCommands?.[configDir];
           const cmd = customCmd
@@ -367,35 +386,27 @@ function TerminalPageInner({
             if (tabId) createdTabIds.push(tabId);
           }
           if (createdTabIds.length > 0) {
-            // Type the launch command
-            setTimeout(() => {
-              for (const tabId of createdTabIds) {
-                terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${cmd}\r`);
-              }
-            }, 1500);
+            // Type the launch command once the terminal ref is mounted
+            for (const tabId of createdTabIds) {
+              writeWhenReady(tabId, `${cmd}\r`);
+            }
             // Type the initial instructions after Claude starts
             if (context) {
               const safeContext = context.replace(/\n/g, " ");
               setTimeout(() => {
                 for (const tabId of createdTabIds) {
-                  terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${safeContext}\r`);
+                  writeWhenReady(tabId, `${safeContext}\r`);
                 }
               }, 8000);
             }
           }
         }}
         onLaunchMultiAiSessions={async (configDirs, context) => {
-          const layoutMap: Record<number, string> = {
-            2: "split",
-            4: "quad",
-            6: "six-pack",
-            9: "full-grid",
-          };
           const count = configDirs.length;
-          if (count > 1) {
-            const layoutId = layoutMap[count] ?? "full-grid";
-            zoneLayout.setLayoutId(layoutId);
-          }
+          const totalTabs = tabs.length + count;
+          const layoutId = pickLayout(totalTabs);
+          zoneLayout.setLayoutId(layoutId);
+
           const isWindows = navigator.platform.startsWith("Win");
           const cmds = sessionManager.launchCommands ?? {};
           const createdTabIds: string[] = [];
@@ -412,11 +423,10 @@ function TerminalPageInner({
                 : isWindows
                   ? `$env:CLAUDE_CONFIG_DIR="${configDirs[i]}"; claude`
                   : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
+              // Stagger launch commands across accounts
               setTimeout(
-                () => {
-                  terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${cmd}\r`);
-                },
-                1500 + i * 300,
+                () => writeWhenReady(tabId, `${cmd}\r`),
+                i * 300,
               );
             }
           }
@@ -426,10 +436,8 @@ function TerminalPageInner({
             for (let j = 0; j < createdTabIds.length; j++) {
               const tabId = createdTabIds[j];
               setTimeout(
-                () => {
-                  terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${safeContext}\r`);
-                },
-                1500 + j * 300 + 8000,
+                () => writeWhenReady(tabId, `${safeContext}\r`),
+                j * 300 + 8000,
               );
             }
           }
