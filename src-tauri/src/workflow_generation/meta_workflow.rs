@@ -319,7 +319,7 @@ pub fn build_meta_workflow_template(
             }),
         ],
 
-        max_iterations: if is_simple { 1 } else { max_fix_iterations },
+        max_iterations: if is_simple { None } else { Some(max_fix_iterations) },
         timeout_seconds: None,
         provider: request.provider.clone(),
         model: request.model.clone(),

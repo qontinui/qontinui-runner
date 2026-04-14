@@ -5,7 +5,11 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps,
        COALESCE(verification_steps, '[]') as verification_steps,
        COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps,
-       COALESCE(max_iterations, 10) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
+       -- 0 at the SQL boundary means "no cap" and is translated to None in
+       -- Rust; any positive value is the concrete cap. Clorinde's type
+       -- inference wants a non-null i64 here, which is why we use COALESCE
+       -- instead of exposing the raw nullable column.
+       COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
        skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '"default"') as log_source_selection,
        COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids,
        COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template,
@@ -34,7 +38,11 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps,
        COALESCE(verification_steps, '[]') as verification_steps,
        COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps,
-       COALESCE(max_iterations, 10) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
+       -- 0 at the SQL boundary means "no cap" and is translated to None in
+       -- Rust; any positive value is the concrete cap. Clorinde's type
+       -- inference wants a non-null i64 here, which is why we use COALESCE
+       -- instead of exposing the raw nullable column.
+       COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
        skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '"default"') as log_source_selection,
        COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids,
        COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template,
@@ -63,7 +71,11 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps,
        COALESCE(verification_steps, '[]') as verification_steps,
        COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps,
-       COALESCE(max_iterations, 10) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
+       -- 0 at the SQL boundary means "no cap" and is translated to None in
+       -- Rust; any positive value is the concrete cap. Clorinde's type
+       -- inference wants a non-null i64 here, which is why we use COALESCE
+       -- instead of exposing the raw nullable column.
+       COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
        skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '"default"') as log_source_selection,
        COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids,
        COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template,
@@ -88,7 +100,7 @@ FROM unified_workflows
 WHERE name = :name
 LIMIT 1;
 
---! create_unified_workflow (description?, provider?, model?, timeout_seconds?, prompt_template?, generated_by_task_run_id?, dependency_graph?, cost_annotations?, quality_report?, acceptance_criteria?, workflow_architecture?, rollback_policy?, flow_control_json?, phase_timeouts_json?)
+--! create_unified_workflow (max_iterations?, description?, provider?, model?, timeout_seconds?, prompt_template?, generated_by_task_run_id?, dependency_graph?, cost_annotations?, quality_report?, acceptance_criteria?, workflow_architecture?, rollback_policy?, flow_control_json?, phase_timeouts_json?)
 INSERT INTO unified_workflows (
     id, name, description, category, tags, setup_steps, verification_steps,
     agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model,
@@ -116,7 +128,7 @@ INSERT INTO unified_workflows (
 )
 RETURNING id;
 
---! update_unified_workflow (description?, provider?, model?, timeout_seconds?, prompt_template?, dependency_graph?, cost_annotations?, quality_report?, acceptance_criteria?, workflow_architecture?, rollback_policy?, flow_control_json?, phase_timeouts_json?)
+--! update_unified_workflow (max_iterations?, description?, provider?, model?, timeout_seconds?, prompt_template?, dependency_graph?, cost_annotations?, quality_report?, acceptance_criteria?, workflow_architecture?, rollback_policy?, flow_control_json?, phase_timeouts_json?)
 UPDATE unified_workflows SET
     name = :name,
     description = :description,
@@ -173,7 +185,11 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps,
        COALESCE(verification_steps, '[]') as verification_steps,
        COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps,
-       COALESCE(max_iterations, 10) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
+       -- 0 at the SQL boundary means "no cap" and is translated to None in
+       -- Rust; any positive value is the concrete cap. Clorinde's type
+       -- inference wants a non-null i64 here, which is why we use COALESCE
+       -- instead of exposing the raw nullable column.
+       COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
        skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '"default"') as log_source_selection,
        COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids,
        COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template,
@@ -211,7 +227,11 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps,
        COALESCE(verification_steps, '[]') as verification_steps,
        COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps,
-       COALESCE(max_iterations, 10) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
+       -- 0 at the SQL boundary means "no cap" and is translated to None in
+       -- Rust; any positive value is the concrete cap. Clorinde's type
+       -- inference wants a non-null i64 here, which is why we use COALESCE
+       -- instead of exposing the raw nullable column.
+       COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model,
        skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '"default"') as log_source_selection,
        COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids,
        COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template,
@@ -246,11 +266,14 @@ SELECT id, name, COALESCE(source_file_path, '') as source_file_path FROM unified
 WHERE source_file_path IS NOT NULL;
 
 --! upsert_slash_command_workflow (description?, source_content_hash?)
+-- Slash-command workflows default to NULL max_iterations (unlimited). The
+-- previous hardcoded `1` was the root cause of Improve-All-style workflows
+-- failing after a single verification attempt.
 INSERT INTO unified_workflows (
     id, name, description, category, setup_steps, agentic_steps, max_iterations,
     source_file_path, source_content_hash
 ) VALUES (
-    :id, :name, :description, 'slash-command', '[]', :agentic_steps, 1,
+    :id, :name, :description, 'slash-command', '[]', :agentic_steps, NULL,
     :source_file_path, :source_content_hash
 )
 ON CONFLICT(id) DO UPDATE SET

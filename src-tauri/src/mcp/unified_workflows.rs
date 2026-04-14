@@ -965,7 +965,7 @@ pub async fn generate_unified_workflow_async_handler(
         .with_workflow_type("unified")
         .with_workflow_name(&saved_workflow.name)
         .with_workflow_id(&saved_workflow.id)
-        .with_max_sessions(saved_workflow.max_iterations)
+        .with_max_sessions(saved_workflow.iter_cap())
         .with_auto_continue(true)
         .with_runner_port(port);
 
@@ -1237,9 +1237,10 @@ pub struct ExecuteInlineWorkflowRequest {
     /// Completion phase steps
     #[serde(default)]
     completion_steps: Vec<serde_json::Value>,
-    /// Maximum iterations for agentic phase
-    #[serde(default = "default_max_iterations")]
-    max_iterations: u32,
+    /// Maximum iterations for agentic phase.
+    /// `None` (omitted) means no cap — loop until success or explicit stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_iterations: Option<u32>,
     /// Timeout in seconds
     #[serde(default)]
     timeout_seconds: Option<u64>,
@@ -1261,10 +1262,6 @@ pub struct ExecuteInlineWorkflowRequest {
     /// Optional config overrides (workflow_architecture, use_worktree, etc.)
     #[serde(default)]
     overrides: Option<serde_json::Value>,
-}
-
-pub fn default_max_iterations() -> u32 {
-    10
 }
 
 /// Run a unified workflow by ID
@@ -1513,7 +1510,7 @@ pub async fn run_unified_workflow(
             .with_task_type("ai")
             .with_workflow_name(&workflow.name)
             .with_workflow_id(&workflow.id)
-            .with_max_sessions(workflow.max_iterations)
+            .with_max_sessions(workflow.iter_cap())
             .with_auto_continue(true)
             .with_workflow_type("unified");
         let create_err = state.app_state.pg_db.create_task_run(&input).await.err();
@@ -2028,7 +2025,7 @@ pub async fn execute_inline_workflow(
             .with_task_type("ai")
             .with_workflow_name(format!("[Inline] {}", workflow.name))
             .with_workflow_id(&workflow.id)
-            .with_max_sessions(workflow.max_iterations)
+            .with_max_sessions(workflow.iter_cap())
             .with_auto_continue(true)
             .with_workflow_type(wf_type);
         let cr_err = state.app_state.pg_db.create_task_run(&input).await.err();
@@ -2043,7 +2040,7 @@ pub async fn execute_inline_workflow(
         let run_agentic_first = !workflow.targeted_error_ids.is_empty();
 
         let mut loop_config = crate::unified_workflow_executor::LoopConfig {
-            max_iterations: workflow.max_iterations,
+            max_iterations: workflow.iter_cap(),
             base_prompt: combined_prompt,
             workflow_name: workflow.name.clone(),
             workflow_id: workflow.id.clone(),
@@ -2063,7 +2060,7 @@ pub async fn execute_inline_workflow(
             model_override: None,
             model_overrides: workflow.model_overrides.clone(),
             stage_index: None,
-            max_sessions: Some(workflow.max_iterations),
+            max_sessions: workflow.max_iterations,
             auto_run_generated: false,
             multi_agent_mode: workflow.multi_agent_mode,
             strict_cwd: workflow.strict_cwd,

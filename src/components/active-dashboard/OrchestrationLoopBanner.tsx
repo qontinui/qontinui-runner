@@ -17,7 +17,8 @@ interface OrchestrationLoopStatus {
   running: boolean;
   phase: string;
   current_iteration: number;
-  max_iterations: number;
+  /** `null` means unlimited — display as "∞" and skip the progress bar. */
+  max_iterations: number | null;
   workflow_id: string;
   target_runner_port: number;
   target_runner_id: string | null;
@@ -68,7 +69,7 @@ interface MultiLoopStatus {
       running: boolean;
       phase: string;
       current_iteration: number;
-      max_iterations: number;
+      max_iterations: number | null;
     };
   }[];
   all_complete: boolean;
@@ -170,8 +171,11 @@ export function OrchestrationLoopBanner() {
   const phase = status.phase;
   const phaseColor = PHASE_COLORS[phase] || "text-muted-foreground";
   const phaseLabel = PHASE_LABELS[phase] || phase.replace(/_/g, " ");
+  // Unlimited runs (max_iterations == null) have no ceiling, so the progress
+  // bar is rendered as "indeterminate" (always 0%) — callers can show a
+  // spinner or activity indicator instead.
   const progressPct =
-    status.max_iterations > 0
+    status.max_iterations != null && status.max_iterations > 0
       ? Math.min(100, Math.round((status.current_iteration / status.max_iterations) * 100))
       : 0;
   const lastResult = status.iteration_results[status.iteration_results.length - 1];
@@ -211,9 +215,9 @@ export function OrchestrationLoopBanner() {
       {/* Phase */}
       <span className={cn("font-mono font-semibold", phaseColor)}>{phaseLabel}</span>
 
-      {/* Iteration */}
+      {/* Iteration — "∞" for unlimited runs. */}
       <span className="text-muted-foreground">
-        {status.current_iteration}/{status.max_iterations}
+        {status.current_iteration}/{status.max_iterations ?? "∞"}
       </span>
 
       {/* Progress bar */}

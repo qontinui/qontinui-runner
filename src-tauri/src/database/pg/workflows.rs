@@ -51,7 +51,13 @@ macro_rules! row_to_workflow {
             verification_steps: json_or_default(&$r.verification_steps),
             agentic_steps: json_or_default(&$r.agentic_steps),
             completion_steps: json_or_default(&$r.completion_steps),
-            max_iterations: ($r.max_iterations as u32).max(1),
+            // 0 from the DB means "no cap" (see COALESCE in workflows.sql);
+            // any positive value is the explicit cap the user set.
+            max_iterations: if $r.max_iterations <= 0 {
+                None
+            } else {
+                Some($r.max_iterations as u32)
+            },
             provider: non_empty($r.provider),
             model: non_empty($r.model),
             skip_ai_summary: $r.skip_ai_summary,
@@ -224,7 +230,8 @@ impl PgDb {
         let tool_tags_json =
             serde_json::to_string(&request.tool_tags).unwrap_or_else(|_| "[]".to_string());
         let timeout_secs: Option<i64> = request.timeout_seconds.map(|t| t as i64);
-        let max_iters = request.max_iterations as i64;
+        // None → NULL in DB (= unlimited); Some(n) → n as i64.
+        let max_iters: Option<i64> = request.max_iterations.map(|n| n as i64);
         let max_sweep = request.max_sweep_iterations.unwrap_or(5) as i64;
         let dep_graph_str = request.dependency_graph.as_ref().map(|v| v.to_string());
         let cost_ann_str = request.cost_annotations.as_ref().map(|v| v.to_string());
@@ -337,7 +344,13 @@ impl PgDb {
             .completion_steps
             .as_ref()
             .unwrap_or(&existing.completion_steps);
-        let max_iterations = request.max_iterations.unwrap_or(existing.max_iterations);
+        // UpdateUnifiedWorkflowRequest uses Option<u32> as a partial-update
+        // marker (`None` = "don't touch this field"), but the stored value is
+        // also Option<u32> with `None` meaning "unlimited". That makes the
+        // update API unable to express "remove the cap" — users must use a
+        // full PUT/replace for that. Here we just layer the two: a Some in
+        // the request overrides, otherwise keep the existing value.
+        let max_iterations = request.max_iterations.map(Some).unwrap_or(existing.max_iterations);
         let timeout_seconds: Option<u64> = match &request.timeout_seconds {
             Some(val) => *val,
             None => existing.timeout_seconds,
@@ -466,7 +479,7 @@ impl PgDb {
             serde_json::to_string(constraint_overrides).unwrap_or_else(|_| "{}".to_string());
         let tool_tags_json = serde_json::to_string(tool_tags).unwrap_or_else(|_| "[]".to_string());
         let timeout_secs: Option<i64> = timeout_seconds.map(|v| v as i64);
-        let max_iters = max_iterations as i64;
+        let max_iters: Option<i64> = max_iterations.map(|n| n as i64);
         let max_sweep = max_sweep_iterations as i64;
         let dep_graph_str = dependency_graph.map(|v| v.to_string());
         let cost_ann_str = cost_annotations.map(|v| v.to_string());
@@ -784,7 +797,7 @@ impl PgDb {
         name: &str,
         description: &str,
         source_yaml: &str,
-        max_iterations: i64,
+        max_iterations: Option<i64>,
     ) -> Result<bool, String> {
         let conn = self
             .pool

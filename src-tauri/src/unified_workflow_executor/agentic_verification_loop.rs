@@ -365,11 +365,9 @@ impl LoopController {
             av_config.goal.clone()
         };
 
-        let max_iterations = if av_config.max_iterations > 0 {
-            av_config.max_iterations
-        } else {
-            config.max_iterations
-        };
+        // Stage's agentic_verification_config may specify its own cap;
+        // otherwise fall through to the enclosing LoopConfig's cap.
+        let max_iterations = av_config.max_iterations.unwrap_or(config.max_iterations);
 
         info!(
             "AGENTIC-VERIFICATION: Starting loop (max_iterations={}, confidence_threshold={}, consecutive_passes_required={})",

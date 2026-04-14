@@ -86,7 +86,7 @@ impl LoopState {
             running: self.running,
             phase: self.phase.clone(),
             current_iteration: self.current_iteration,
-            max_iterations: config.map(|c| c.max_iterations).unwrap_or(0),
+            max_iterations: config.and_then(|c| c.max_iterations),
             workflow_id: config.map(|c| c.workflow_id.clone()).unwrap_or_default(),
             target_runner_port: port,
             target_runner_id: config.and_then(|c| c.target_runner_id.clone()),
@@ -535,7 +535,7 @@ async fn run_loop(
 
     info!(
         "Orchestration loop starting: workflow={}, target=:{}, max_iterations={}",
-        config.workflow_id, target_port, config.max_iterations
+        config.workflow_id, target_port, config.iter_cap_display()
     );
 
     // Wait for target runner to be healthy before starting
@@ -623,7 +623,7 @@ async fn run_loop(
         }
     }
 
-    for iteration in 1..=config.max_iterations {
+    for iteration in 1..=config.iter_cap() {
         // Check stop signal
         if *stop_rx.borrow() {
             info!("Orchestration loop stopped by user");
@@ -642,7 +642,7 @@ async fn run_loop(
             state.restart_signaled = false; // Reset for this iteration
         }
 
-        info!("=== Iteration {}/{} ===", iteration, config.max_iterations);
+        info!("=== Iteration {}/{} ===", iteration, config.iter_cap_display());
 
         // --- Phase 1: Execute workflow ---
         info!(
@@ -873,7 +873,7 @@ async fn run_loop(
                 }
 
                 // Between iterations before retry
-                if iteration < config.max_iterations {
+                if iteration < config.iter_cap() {
                     if let Err(e) = handle_between_iterations(
                         &runner,
                         &supervisor,
@@ -951,8 +951,8 @@ async fn run_loop(
             }
             ExitStrategy::FixedIterations => Ok((
                 ExitCheckResult {
-                    should_exit: iteration >= config.max_iterations,
-                    reason: format!("Iteration {}/{}", iteration, config.max_iterations),
+                    should_exit: iteration >= config.iter_cap(),
+                    reason: format!("Iteration {}/{}", iteration, config.iter_cap_display()),
                 },
                 None,
                 None,
@@ -1066,7 +1066,7 @@ async fn run_loop(
         }
 
         // --- Phase 3: Between iterations ---
-        if iteration < config.max_iterations {
+        if iteration < config.iter_cap() {
             if let Err(e) = handle_between_iterations(
                 &runner,
                 &supervisor,
@@ -1086,7 +1086,7 @@ async fn run_loop(
     // Reached max iterations
     info!(
         "Orchestration loop completed after {} iterations",
-        config.max_iterations
+        config.iter_cap_display()
     );
     let mut state = loop_state.lock().await;
     state.phase = LoopPhase::Complete;
@@ -1429,12 +1429,12 @@ async fn run_pipeline_loop(
 
     info!(
         "Pipeline loop starting: max_iterations={}, has_build={}, has_fixes={}",
-        config.max_iterations,
+        config.iter_cap_display(),
         pipeline.build.is_some(),
         pipeline.implement_fixes.is_some()
     );
 
-    for iteration in 1..=config.max_iterations {
+    for iteration in 1..=config.iter_cap() {
         // Check stop signal
         if *stop_rx.borrow() {
             info!("Pipeline loop stopped by user");
@@ -1457,7 +1457,7 @@ async fn run_pipeline_loop(
 
         info!(
             "=== Pipeline Iteration {}/{} ===",
-            iteration, config.max_iterations
+            iteration, config.iter_cap_display()
         );
 
         // --- Phase 1: Build (conditional) ---
@@ -1899,11 +1899,11 @@ async fn run_pipeline_loop(
         }
 
         // Record iteration result
-        let should_exit = iteration >= config.max_iterations;
+        let should_exit = iteration >= config.iter_cap();
         let reason = if should_exit {
             format!(
                 "Reached max iterations ({}/{})",
-                iteration, config.max_iterations
+                iteration, config.iter_cap_display()
             )
         } else {
             format!("{} fixes found — continuing", fix_count)
@@ -1932,7 +1932,7 @@ async fn run_pipeline_loop(
         }
 
         // --- Phase 5: Between iterations ---
-        if iteration < config.max_iterations {
+        if iteration < config.iter_cap() {
             if let Err(e) = handle_between_iterations(
                 &runner,
                 &supervisor,

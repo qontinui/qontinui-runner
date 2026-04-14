@@ -103,8 +103,12 @@ export interface BuildPlanWorkflowInput {
   phases: PlanPhase[];
   /** Custom agentic prompt (default: auto-generated from task descriptions) */
   agenticPrompt?: string;
-  /** Global max iterations fallback (default: 3) */
-  maxIterations?: number;
+  /**
+   * Global max iterations fallback. `null` (or omitted) means unlimited —
+   * the loop exits on success, explicit stop, or fix-attempt exhaustion
+   * rather than a fixed iteration count.
+   */
+  maxIterations?: number | null;
   /** Workflow name override */
   workflowName?: string;
   /** Snapshot target for UI checks (default: "sdk") */
@@ -236,7 +240,7 @@ export function buildVerificationStep(
  *   - completion_steps: empty (summary is at workflow level)
  */
 export function buildPlanWorkflow(input: BuildPlanWorkflowInput): UnifiedWorkflow {
-  const { phases, agenticPrompt, maxIterations = 3, workflowName, snapshotTarget = "sdk" } = input;
+  const { phases, agenticPrompt, maxIterations = null, workflowName, snapshotTarget = "sdk" } = input;
 
   const now = new Date().toISOString();
 

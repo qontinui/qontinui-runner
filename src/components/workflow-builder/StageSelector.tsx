@@ -308,7 +308,8 @@ function StageSettings({
 }: {
   stage: {
     description?: string;
-    max_iterations?: number;
+    /** `null` = unlimited; a positive value caps the verification-agentic loop. */
+    max_iterations?: number | null;
     provider?: string;
     model?: string;
     model_overrides?: ModelOverrides;
@@ -375,11 +376,27 @@ function StageSettings({
               />
             </div>
             <div>
-              <label className="text-[10px] text-zinc-500">Max iterations</label>
+              <label className="text-[10px] text-zinc-500">
+                Max iterations{" "}
+                <span className="text-zinc-600">
+                  (blank = unlimited)
+                </span>
+              </label>
               <input
                 type="number"
-                value={stage.max_iterations ?? 10}
-                onChange={(e) => onUpdate({ max_iterations: parseInt(e.target.value) || 10 })}
+                value={stage.max_iterations ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  if (raw === "") {
+                    onUpdate({ max_iterations: null });
+                  } else {
+                    const parsed = parseInt(raw, 10);
+                    onUpdate({
+                      max_iterations: Number.isFinite(parsed) && parsed >= 1 ? parsed : null,
+                    });
+                  }
+                }}
+                placeholder="Unlimited"
                 className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-hidden focus:ring-1 focus:ring-zinc-600"
                 min={1}
                 max={100}

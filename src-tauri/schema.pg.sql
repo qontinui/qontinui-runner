@@ -342,7 +342,11 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     completion_steps TEXT DEFAULT '[]',
 
     -- Agentic configuration
-    max_iterations BIGINT DEFAULT 10,
+    -- NULL = unlimited iterations (no cap). A positive value sets a hard cap;
+    -- any workflow with a stored value of 0 or 1 was almost certainly created
+    -- by a buggy generator and is treated as NULL at read time (see
+    -- migration v19).
+    max_iterations BIGINT,
     provider TEXT,
     model TEXT,
     skip_ai_summary BOOLEAN NOT NULL DEFAULT false,

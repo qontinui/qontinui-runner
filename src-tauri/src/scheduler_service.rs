@@ -49,8 +49,12 @@ impl SchedulerService {
             .ok_or_else(|| "PostgreSQL database not configured for scheduler".to_string())
     }
 
-    /// Start the scheduler loop (runs in background)
-    pub async fn start(&self) {
+    /// Start the scheduler loop (runs in background).
+    ///
+    /// Takes `Arc<Self>` rather than `&self` because the tick loop spawns
+    /// background polling tasks for asynchronously-launched workflows, and
+    /// those tasks need to outlive the tick frame they were created in.
+    pub async fn start(self: Arc<Self>) {
         info!("Starting scheduler service");
 
         // Update all next_run times on startup
@@ -60,7 +64,7 @@ impl SchedulerService {
 
         while !self.stop_signal.load(Ordering::SeqCst) {
             // tick() checks enabled status internally to avoid double-loading state
-            self.tick().await;
+            self.clone().tick().await;
 
             // Wait for next check interval
             tokio::time::sleep(tokio::time::Duration::from_secs(self.check_interval_secs)).await;
@@ -94,7 +98,7 @@ impl SchedulerService {
     }
 
     /// Check and execute due tasks
-    async fn tick(&self) {
+    async fn tick(self: Arc<Self>) {
         let pg = match self.pg() {
             Ok(pg) => pg,
             Err(e) => {
@@ -258,7 +262,7 @@ impl SchedulerService {
             }
 
             info!("Scheduler: Executing task '{}'", task.name);
-            self.execute_task(task).await;
+            self.clone().execute_task(task).await;
         }
     }
 
@@ -289,35 +293,63 @@ impl SchedulerService {
         self.update_task_next_run_db(&task.id).await;
     }
 
-    /// Execute a scheduled task
-    async fn execute_task(&self, task: ScheduledTask) {
+    /// Execute a scheduled task.
+    ///
+    /// For unified workflows (the `Workflow { workflow_id: Some(_) }` case)
+    /// the launch is non-blocking — we insert an initial `Running`
+    /// `scheduler_history` row, kick off the workflow via HTTP, then spawn a
+    /// background poller that waits for the underlying `task_run` to leave
+    /// its `running` state before recording the true outcome. This preserves
+    /// scheduler throughput (tick is not blocked on hour-long workflows) and
+    /// ensures `scheduler_history` reflects real success/failure rather than
+    /// whether the launch call returned 200.
+    ///
+    /// For other task types (prompt, auto-fix, legacy config-path workflow,
+    /// watcher) the launch is assumed to be blocking-until-complete and the
+    /// original synchronous recording flow is used.
+    async fn execute_task(self: Arc<Self>, task: ScheduledTask) {
         let task_id = task.id.clone();
         let task_name = task.name.clone();
         let auto_fix_on_failure = task.auto_fix_on_failure;
 
-        // Mark as running
+        // Mark as running (stays marked until the spawned poller completes
+        // for async workflows; until the sync execute_* returns otherwise).
         {
             let mut running = self.running_tasks.write().await;
             running.push(task_id.clone());
         }
 
-        // Create execution record
+        // Unified-workflow async launch path
+        if let ScheduledTaskType::Workflow {
+            workflow_id: Some(workflow_id),
+            monitor_index,
+            ..
+        } = &task.task
+        {
+            self.clone()
+                .launch_and_poll_unified_workflow(
+                    task_id,
+                    task_name,
+                    workflow_id.clone(),
+                    *monitor_index,
+                    auto_fix_on_failure,
+                )
+                .await;
+            return;
+        }
+
+        // Synchronous path (legacy workflow, prompt, auto-fix, watcher, capture)
         let mut record = TaskExecutionRecord::new();
 
-        // Execute based on task type
         let result = match &task.task {
             ScheduledTaskType::Workflow {
                 workflow_name,
                 config_path,
                 monitor_index,
-                workflow_id,
+                workflow_id: _, // handled above
             } => {
-                if let Some(id) = workflow_id {
-                    self.execute_unified_workflow(id, *monitor_index).await
-                } else {
-                    self.execute_workflow(workflow_name, config_path.as_deref(), *monitor_index)
-                        .await
-                }
+                self.execute_workflow(workflow_name, config_path.as_deref(), *monitor_index)
+                    .await
             }
             ScheduledTaskType::Prompt {
                 prompt_id,
@@ -329,9 +361,9 @@ impl SchedulerService {
             } => self.execute_auto_fix(*check_findings, *force_run).await,
             ScheduledTaskType::Watcher { watcher_id } => self.execute_watcher(watcher_id).await,
             ScheduledTaskType::BackgroundCapture {
-                monitor_index,
+                monitor_index: _,
                 capture_interval_secs,
-                capture_on_focus_change,
+                capture_on_focus_change: _,
             } => {
                 // BackgroundCapture is a long-running service, not a one-shot task.
                 // The scheduler creates and starts it; it runs until stopped.
@@ -344,7 +376,25 @@ impl SchedulerService {
             }
         };
 
-        // Update record with result
+        self.finalize_sync_execution(
+            &task_id,
+            &task_name,
+            auto_fix_on_failure,
+            &mut record,
+            result,
+        )
+        .await;
+    }
+
+    /// Shared post-processing for synchronous task-type executions.
+    async fn finalize_sync_execution(
+        &self,
+        task_id: &str,
+        task_name: &str,
+        auto_fix_on_failure: bool,
+        record: &mut TaskExecutionRecord,
+        result: Result<(bool, Option<String>), String>,
+    ) {
         match result {
             Ok((success, session_id)) => {
                 record.session_id = session_id;
@@ -354,7 +404,6 @@ impl SchedulerService {
                     task_name, success
                 );
 
-                // Trigger auto-fix if failed and configured
                 if !success && auto_fix_on_failure {
                     info!(
                         "Scheduler: Triggering auto-fix for failed task '{}'",
@@ -369,7 +418,6 @@ impl SchedulerService {
                 record.complete(false, Some(e.clone()));
                 error!("Scheduler: Task '{}' failed: {}", task_name, e);
 
-                // Trigger auto-fix if configured
                 if auto_fix_on_failure {
                     info!(
                         "Scheduler: Triggering auto-fix for failed task '{}'",
@@ -382,13 +430,12 @@ impl SchedulerService {
             }
         }
 
-        // Record the execution
         if let Ok(pg) = self.pg() {
-            if let Err(e) = pg.insert_execution_record(&task_id, &record).await {
+            if let Err(e) = pg.insert_execution_record(task_id, record).await {
                 error!("Failed to record execution: {}", e);
             }
             if let Err(e) = pg
-                .update_task_last_run(&task_id, Some(&record.execution_id))
+                .update_task_last_run(task_id, Some(&record.execution_id))
                 .await
             {
                 error!("Failed to update task last_run: {}", e);
@@ -397,14 +444,220 @@ impl SchedulerService {
             error!("PG not configured, cannot record execution for {}", task_id);
         }
 
-        // Update next_run
-        self.update_task_next_run_db(&task_id).await;
+        self.update_task_next_run_db(task_id).await;
 
-        // Remove from running
         {
             let mut running = self.running_tasks.write().await;
-            running.retain(|id| id != &task_id);
+            running.retain(|id| id != task_id);
         }
+    }
+
+    /// Launch a unified workflow, insert a `Running` history row, then spawn
+    /// a background poller that will update the row with the final outcome
+    /// when the underlying `task_run` finishes. Returns once the launch call
+    /// itself has returned (typically a few hundred milliseconds); the
+    /// scheduler tick can proceed without blocking on the workflow.
+    async fn launch_and_poll_unified_workflow(
+        self: Arc<Self>,
+        task_id: String,
+        task_name: String,
+        workflow_id: String,
+        monitor_index: Option<i32>,
+        auto_fix_on_failure: bool,
+    ) {
+        let mut record = TaskExecutionRecord::new();
+        let execution_id = record.execution_id.clone();
+
+        // 1. Launch the workflow. Returns a task_run_id on success.
+        let launch = self.launch_unified_workflow(&workflow_id, monitor_index).await;
+
+        match launch {
+            Ok(task_run_id) => {
+                record.session_id = Some(task_run_id.clone());
+                info!(
+                    "Scheduler: launched unified workflow '{}' (task_run_id={})",
+                    task_name, task_run_id
+                );
+
+                // Persist a "running" row so the UI can see the execution in
+                // progress. We'll UPDATE this row once the poller finishes.
+                if let Ok(pg) = self.pg() {
+                    if let Err(e) = pg.insert_execution_record(&task_id, &record).await {
+                        error!("Failed to insert initial running execution record: {}", e);
+                    }
+                    if let Err(e) = pg
+                        .update_task_last_run(&task_id, Some(&record.execution_id))
+                        .await
+                    {
+                        error!("Failed to update task last_run: {}", e);
+                    }
+                }
+
+                let service = self.clone();
+                tokio::spawn(async move {
+                    service
+                        .poll_task_run_to_completion(
+                            task_id,
+                            task_name,
+                            execution_id,
+                            task_run_id,
+                            record,
+                            auto_fix_on_failure,
+                        )
+                        .await;
+                });
+            }
+            Err(e) => {
+                // Launch itself failed — record failure immediately.
+                record.complete(false, Some(e.clone()));
+                error!(
+                    "Scheduler: unified workflow '{}' failed to launch: {}",
+                    task_name, e
+                );
+
+                if auto_fix_on_failure {
+                    if let Ok((_, Some(session_id))) = self.execute_auto_fix(true, false).await {
+                        record.mark_auto_fix_triggered(session_id);
+                    }
+                }
+
+                if let Ok(pg) = self.pg() {
+                    if let Err(err) = pg.insert_execution_record(&task_id, &record).await {
+                        error!("Failed to record launch-failure execution: {}", err);
+                    }
+                    if let Err(err) = pg
+                        .update_task_last_run(&task_id, Some(&record.execution_id))
+                        .await
+                    {
+                        error!("Failed to update task last_run: {}", err);
+                    }
+                }
+
+                self.update_task_next_run_db(&task_id).await;
+
+                let mut running = self.running_tasks.write().await;
+                running.retain(|id| id != &task_id);
+            }
+        }
+    }
+
+    /// Poll `task_runs` until the given workflow leaves the `running` state,
+    /// then UPDATE the scheduler_history row with the real outcome. Runs in
+    /// a detached tokio task so the scheduler tick loop is not blocked.
+    async fn poll_task_run_to_completion(
+        self: Arc<Self>,
+        task_id: String,
+        task_name: String,
+        execution_id: String,
+        task_run_id: String,
+        mut record: TaskExecutionRecord,
+        auto_fix_on_failure: bool,
+    ) {
+        // Poll every 30s. Hard-cap matches MAX_RUNTIME_AUTO_STOP in the
+        // zombie sweep — after 24h we stop polling and let the sweep
+        // eventually fail the task_run itself.
+        const POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+        const MAX_POLL_DURATION: tokio::time::Duration =
+            tokio::time::Duration::from_secs(60 * 60 * 24);
+
+        let start = tokio::time::Instant::now();
+
+        let (success, error_message) = loop {
+            if self.stop_signal.load(Ordering::SeqCst) {
+                break (
+                    false,
+                    Some("Scheduler stopped while workflow was in-flight".to_string()),
+                );
+            }
+
+            if start.elapsed() >= MAX_POLL_DURATION {
+                warn!(
+                    "Scheduler: task_run {} still running after 24h — giving up on polling",
+                    task_run_id
+                );
+                break (
+                    false,
+                    Some("Polling timed out after 24h; see zombie sweep".to_string()),
+                );
+            }
+
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            let pg = match self.pg() {
+                Ok(pg) => pg,
+                Err(e) => {
+                    error!("Scheduler poller: {}", e);
+                    break (false, Some(e));
+                }
+            };
+
+            match pg.get_task_run(&task_run_id).await {
+                Ok(Some(tr)) => match tr.status.as_str() {
+                    "running" | "pending" => continue,
+                    "complete" | "completed" => {
+                        break (true, None);
+                    }
+                    other => {
+                        let err = if tr.error_message.is_some() {
+                            tr.error_message
+                        } else {
+                            Some(format!("task_run ended in status '{}'", other))
+                        };
+                        break (false, err);
+                    }
+                },
+                Ok(None) => {
+                    warn!(
+                        "Scheduler poller: task_run {} disappeared from DB",
+                        task_run_id
+                    );
+                    break (
+                        false,
+                        Some(format!(
+                            "task_run {} not found — may have been deleted",
+                            task_run_id
+                        )),
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Scheduler poller: transient error reading task_run {}: {}",
+                        task_run_id, e
+                    );
+                    // Don't terminate on transient DB errors — just retry.
+                    continue;
+                }
+            }
+        };
+
+        record.complete(success, error_message.clone());
+        info!(
+            "Scheduler: task '{}' finished (success: {}, took: {:?})",
+            task_name,
+            success,
+            start.elapsed()
+        );
+
+        if !success && auto_fix_on_failure {
+            info!(
+                "Scheduler: Triggering auto-fix for failed task '{}'",
+                task_name
+            );
+            if let Ok((_, Some(session_id))) = self.execute_auto_fix(true, false).await {
+                record.mark_auto_fix_triggered(session_id);
+            }
+        }
+
+        if let Ok(pg) = self.pg() {
+            if let Err(e) = pg.update_execution_record(&execution_id, &record).await {
+                error!("Failed to update execution record on completion: {}", e);
+            }
+        }
+
+        self.update_task_next_run_db(&task_id).await;
+
+        let mut running = self.running_tasks.write().await;
+        running.retain(|id| id != &task_id);
     }
 
     /// Update the next_run time for a task (DB-backed)
@@ -512,14 +765,19 @@ impl SchedulerService {
         Ok((success, session_id))
     }
 
-    /// Execute a unified workflow by ID
-    async fn execute_unified_workflow(
+    /// Launch a unified workflow via HTTP and return its `task_run_id`.
+    ///
+    /// The endpoint is non-blocking: it spawns the workflow in the
+    /// background and returns immediately with a `task_run_id`. Callers that
+    /// need the final outcome must poll the task_run's status afterwards
+    /// (see `poll_task_run_to_completion`).
+    async fn launch_unified_workflow(
         &self,
         workflow_id: &str,
         monitor_index: Option<i32>,
-    ) -> Result<(bool, Option<String>), String> {
+    ) -> Result<String, String> {
         info!(
-            "Executing unified workflow '{}' (monitor: {:?})",
+            "Launching unified workflow '{}' (monitor: {:?})",
             workflow_id, monitor_index
         );
 
@@ -551,20 +809,26 @@ impl SchedulerService {
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        let task_run_id = response_json
-            .get("data")
-            .and_then(|d| d.get("task_run_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        // Unified workflows are non-blocking (they return a task_run_id).
-        // Return success=true to indicate the workflow was launched successfully.
         let launched = response_json
             .get("success")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        Ok((launched, task_run_id))
+        if !launched {
+            return Err(format!(
+                "Launch endpoint reported failure: {}",
+                response_json
+            ));
+        }
+
+        response_json
+            .get("data")
+            .and_then(|d| d.get("task_run_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| {
+                "Launch endpoint reported success but omitted task_run_id".to_string()
+            })
     }
 
     /// Execute a prompt task

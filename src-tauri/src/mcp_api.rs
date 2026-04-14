@@ -519,7 +519,12 @@ pub fn create_router(
             .state::<Arc<crate::claude_session::SessionManager>>()
             .inner()
             .clone();
-        crate::zombie_sweep::start_zombie_sweep(sweep_sm, sweep_handle);
+        let sweep_pg = api_state.app_state.pg_db.clone();
+        let sweep_port = api_state
+            .app_state
+            .api_port
+            .load(std::sync::atomic::Ordering::Relaxed);
+        crate::zombie_sweep::start_zombie_sweep(sweep_pg, sweep_sm, sweep_handle, sweep_port);
     }
 
     // Periodic file registry cleanup (sweep stale entries every 60s)

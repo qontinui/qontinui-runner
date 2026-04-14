@@ -87,8 +87,9 @@ pub struct OrchestrationLoopConfig {
     pub workflow_id: String,
 
     /// Maximum number of iterations.
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
+    /// `None` (omitted) means no cap — loop until success or explicit stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
 
     /// How to decide when to stop.
     #[serde(default)]
@@ -118,6 +119,24 @@ pub struct OrchestrationLoopConfig {
     pub summarization: Option<SummarizationConfig>,
     #[serde(default)]
     pub decomposition: Option<DecomposerConfig>,
+}
+
+impl OrchestrationLoopConfig {
+    /// Resolve the iteration cap for loop bounds: `None` means unlimited,
+    /// which we represent internally as `u32::MAX` so loops still have a
+    /// concrete bound (2^32 iterations is effectively unbounded for any
+    /// real workflow — the loop will always exit on success, failure, or
+    /// external stop well before approaching this value).
+    pub fn iter_cap(&self) -> u32 {
+        self.max_iterations.unwrap_or(u32::MAX)
+    }
+
+    /// Human-readable iteration cap for logs and UI copy.
+    pub fn iter_cap_display(&self) -> String {
+        self.max_iterations
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "∞".to_string())
+    }
 }
 
 /// Pipeline mode configuration for build → execute → reflect → fix cycle.
@@ -254,10 +273,6 @@ pub enum BetweenIterations {
     None,
 }
 
-fn default_max_iterations() -> u32 {
-    5
-}
-
 fn default_supervisor_port() -> u16 {
     9875
 }
@@ -296,7 +311,9 @@ pub struct OrchestrationLoopStatus {
     pub running: bool,
     pub phase: LoopPhase,
     pub current_iteration: u32,
-    pub max_iterations: u32,
+    /// Iteration cap for this run. `None` renders as "∞/unlimited" in the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
     pub workflow_id: String,
     pub target_runner_port: u16,
     pub target_runner_id: Option<String>,

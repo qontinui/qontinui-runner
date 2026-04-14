@@ -492,7 +492,8 @@ pub struct GqlWorkflowSummary {
     pub description: String,
     pub category: String,
     pub tags: Vec<String>,
-    pub max_iterations: i32,
+    /// `None` is rendered as "unlimited" in clients; a positive value is the cap.
+    pub max_iterations: Option<i32>,
     pub timeout_seconds: Option<i64>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -516,7 +517,8 @@ pub struct GqlWorkflow {
     pub verification_steps: Json<serde_json::Value>,
     pub agentic_steps: Json<serde_json::Value>,
     pub completion_steps: Json<serde_json::Value>,
-    pub max_iterations: i32,
+    /// `None` is rendered as "unlimited" in clients; a positive value is the cap.
+    pub max_iterations: Option<i32>,
     pub timeout_seconds: Option<i64>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -737,7 +739,8 @@ pub struct GqlLoopInstanceStatus {
     pub running: bool,
     pub phase: String,
     pub current_iteration: i32,
-    pub max_iterations: i32,
+    /// `None` means the loop has no iteration cap (unlimited).
+    pub max_iterations: Option<i32>,
     pub workflow_id: String,
     pub target_runner_port: i32,
     pub target_runner_id: Option<String>,

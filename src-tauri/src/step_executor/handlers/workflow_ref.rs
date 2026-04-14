@@ -193,7 +193,7 @@ impl StepHandler for WorkflowRefHandler {
         };
 
         let loop_config = LoopConfig {
-            max_iterations: workflow.max_iterations,
+            max_iterations: workflow.iter_cap(),
             base_prompt,
             workflow_name: workflow.name.clone(),
             workflow_id: workflow.id.clone(),
@@ -213,7 +213,7 @@ impl StepHandler for WorkflowRefHandler {
             model_override,
             model_overrides,
             stage_index: None,
-            max_sessions: Some(workflow.max_iterations),
+            max_sessions: workflow.max_iterations,
             auto_run_generated: false,
             approval_gate: false,
             blocking_approval: false,

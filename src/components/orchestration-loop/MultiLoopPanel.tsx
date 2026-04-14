@@ -20,7 +20,8 @@ interface MultiLoopEntry {
     target_runner_id: string | null;
     supervisor_port: number;
     workflow_id: string;
-    max_iterations: number;
+    /** `null` means unlimited iterations. */
+    max_iterations: number | null;
     exit_strategy: { type: string };
     between_iterations: { type: string; rebuild?: boolean };
     retry_on_failure: boolean;
@@ -43,7 +44,8 @@ interface LoopInstanceStatus {
     running: boolean;
     phase: string;
     current_iteration: number;
-    max_iterations: number;
+    /** `null` = unlimited cap. */
+    max_iterations: number | null;
     workflow_id: string;
     target_runner_port: number;
     target_runner_id: string | null;
@@ -160,7 +162,8 @@ export function MultiLoopPanel() {
 
   // Form: assignment of runners to workflows
   const [assignments, setAssignments] = useState<LoopAssignment[]>([]);
-  const [maxIter, setMaxIter] = useState(5);
+  // null = unlimited (loop exits on success/stop, not iteration count).
+  const [maxIter, setMaxIter] = useState<number | null>(null);
   const [exitStrategy, setExitStrategy] = useState("reflection");
   const [between, setBetween] = useState("restart_on_signal");
   const [stopAllOnError, setStopAllOnError] = useState(false);
@@ -406,8 +409,12 @@ export function MultiLoopPanel() {
           </div>
           {visibleLoops.map((loop) => {
             const s = loop.status;
+            // Progress bar is indeterminate for unlimited (null) runs — no
+            // ceiling to divide by.
             const pct =
-              s.max_iterations > 0 ? Math.round((s.current_iteration / s.max_iterations) * 100) : 0;
+              s.max_iterations != null && s.max_iterations > 0
+                ? Math.round((s.current_iteration / s.max_iterations) * 100)
+                : 0;
             const totalFixes = s.iteration_results.reduce((sum, r) => sum + (r.fix_count ?? 0), 0);
             return (
               <div
@@ -575,13 +582,25 @@ export function MultiLoopPanel() {
           {/* Shared settings */}
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className={labelCls}>Max Iterations</label>
+              <label className={labelCls}>
+                Max Iterations{" "}
+                <span className="text-muted-foreground/60">(blank = unlimited)</span>
+              </label>
               <input
                 type="number"
                 min={1}
                 max={50}
-                value={maxIter}
-                onChange={(e) => setMaxIter(parseInt(e.target.value) || 5)}
+                value={maxIter ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  if (raw === "") {
+                    setMaxIter(null);
+                    return;
+                  }
+                  const parsed = parseInt(raw, 10);
+                  setMaxIter(Number.isFinite(parsed) && parsed >= 1 ? parsed : null);
+                }}
+                placeholder="Unlimited"
                 className={cn(inputCls, "w-full mt-0.5")}
               />
             </div>

@@ -271,7 +271,7 @@ impl SubscriptionRoot {
                         running: ls.status.running,
                         phase: format!("{:?}", ls.status.phase),
                         current_iteration: ls.status.current_iteration as i32,
-                        max_iterations: ls.status.max_iterations as i32,
+                        max_iterations: ls.status.max_iterations.map(|n| n as i32),
                         workflow_id: ls.status.workflow_id,
                         target_runner_port: ls.status.target_runner_port as i32,
                         target_runner_id: ls.status.target_runner_id,

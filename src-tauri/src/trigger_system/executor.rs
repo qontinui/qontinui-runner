@@ -148,11 +148,13 @@ pub async fn execute_triggered_workflow(
         substitute_variables(&raw_prompt, variables)
     };
 
-    // 4. Apply overrides
-    let max_iterations = workflow_overrides
+    // 4. Apply overrides. `max_iterations` is Option<u32> throughout:
+    //    - None (on either override or workflow) means "unlimited"
+    //    - Override wins when present; falls back to workflow default
+    let max_iterations: Option<u32> = workflow_overrides
         .and_then(|o| o.get("max_iterations"))
         .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
+        .map(|v| Some(v as u32))
         .unwrap_or(workflow.max_iterations);
 
     let reflection_mode = workflow_overrides
@@ -190,7 +192,7 @@ pub async fn execute_triggered_workflow(
         .with_task_type("ai")
         .with_workflow_name(&workflow.name)
         .with_workflow_id(&workflow.id)
-        .with_max_sessions(max_iterations)
+        .with_max_sessions(max_iterations.unwrap_or(u32::MAX))
         .with_auto_continue(true)
         .with_workflow_type("unified");
 
@@ -200,7 +202,7 @@ pub async fn execute_triggered_workflow(
 
     // 6. Build LoopConfig
     let loop_config = LoopConfig {
-        max_iterations,
+        max_iterations: max_iterations.unwrap_or(u32::MAX),
         base_prompt: combined_prompt,
         workflow_name: workflow.name.clone(),
         workflow_id: workflow.id.clone(),
@@ -220,7 +222,7 @@ pub async fn execute_triggered_workflow(
         model_override,
         model_overrides: workflow.model_overrides.clone(),
         stage_index: None,
-        max_sessions: Some(max_iterations),
+        max_sessions: max_iterations,
         auto_run_generated: false,
         approval_gate: workflow.approval_gate,
         blocking_approval: false,

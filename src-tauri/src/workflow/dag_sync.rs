@@ -142,11 +142,9 @@ pub async fn import_workflow_file(file_path: &Path, pg_db: &Arc<PgDb>) -> Import
     //    For pure DAG workflows imported from YAML the "phases" don't map cleanly,
     //    so we store an empty JSON array and rely on source_yaml for re-execution.
     let description = dag_def.description.clone().unwrap_or_default();
-    let max_iterations = dag_def
-        .settings
-        .max_iterations
-        .map(|v| v as i64)
-        .unwrap_or(10);
+    // YAML-imported DAG workflows keep whatever cap the YAML specified;
+    // missing = unlimited (None) to match the wider convention.
+    let max_iterations: Option<i64> = dag_def.settings.max_iterations.map(|v| v as i64);
 
     // 6. Upsert via raw SQL (pool is public via PgDb::pool())
     let upsert_result = pg_db

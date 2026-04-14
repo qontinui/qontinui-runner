@@ -10,8 +10,9 @@ import { Bot, Monitor, Globe } from "lucide-react";
 interface AgenticPromptEditorProps {
   prompt: string;
   onPromptChange: (prompt: string) => void;
-  maxIterations: number;
-  onMaxIterationsChange: (max: number) => void;
+  /** `null` = unlimited (loop terminates on success/stop, not iteration count). */
+  maxIterations: number | null;
+  onMaxIterationsChange: (max: number | null) => void;
   elementSource?: "control" | "external";
   onElementSourceChange?: (source: "control" | "external") => void;
 }
@@ -96,14 +97,27 @@ export function AgenticPromptEditor({
         <label className="text-xs text-muted-foreground">Max Iterations</label>
         <input
           type="number"
-          value={maxIterations}
-          onChange={(e) => onMaxIterationsChange(Number(e.target.value))}
+          value={maxIterations ?? ""}
+          onChange={(e) => {
+            const raw = e.target.value.trim();
+            if (raw === "") {
+              onMaxIterationsChange(null);
+              return;
+            }
+            const parsed = parseInt(raw, 10);
+            onMaxIterationsChange(
+              Number.isFinite(parsed) && parsed >= 1 ? parsed : null,
+            );
+          }}
+          placeholder="Unlimited"
           min={1}
           max={20}
-          className="w-20 px-2 py-1 text-sm bg-card border border-border rounded text-foreground focus:outline-hidden focus:border-purple-500"
+          className="w-24 px-2 py-1 text-sm bg-card border border-border rounded text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:border-purple-500"
         />
         <span className="text-xs text-muted-foreground">
-          verification-agentic loops before stopping
+          {maxIterations == null
+            ? "no cap — loop exits on success or explicit stop"
+            : "verification-agentic loops before stopping"}
         </span>
       </div>
     </div>

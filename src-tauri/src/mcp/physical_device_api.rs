@@ -448,24 +448,24 @@ async fn register_lan_device(
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/ui-bridge/devices", get(list_devices))
-        .route("/ui-bridge/devices/:id", get(get_device))
-        .route("/ui-bridge/devices/:id/connect", post(connect_device))
+        .route("/ui-bridge/devices/{id}", get(get_device))
+        .route("/ui-bridge/devices/{id}/connect", post(connect_device))
         .route(
-            "/ui-bridge/devices/:id/disconnect",
+            "/ui-bridge/devices/{id}/disconnect",
             post(disconnect_device),
         )
         .route(
-            "/ui-bridge/devices/:id/transport",
+            "/ui-bridge/devices/{id}/transport",
             get(get_transport_info),
         )
         .route(
-            "/ui-bridge/devices/:id/transport/prefer",
+            "/ui-bridge/devices/{id}/transport/prefer",
             post(prefer_transport),
         )
         .route("/ui-bridge/devices/pair/initiate", post(initiate_pairing))
         .route("/ui-bridge/devices/pair/confirm", post(confirm_pairing))
         .route(
-            "/ui-bridge/devices/:id/pairing",
+            "/ui-bridge/devices/{id}/pairing",
             delete(revoke_pairing),
         )
         .route(

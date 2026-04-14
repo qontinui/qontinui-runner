@@ -181,8 +181,9 @@ pub struct AgenticVerificationConfig {
     pub worker: WorkerAgentConfig,
 
     /// Maximum iterations (worker + verifier = 1 iteration).
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
+    /// `None` (omitted) means fall back to the enclosing LoopConfig's cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
 
     /// Whether to run the verification agent first (before any worker action).
     /// Useful to establish a baseline understanding of the current state.
@@ -208,10 +209,6 @@ pub struct AgenticVerificationConfig {
     pub brain_actor_enabled: Option<bool>,
 }
 
-fn default_max_iterations() -> u32 {
-    10
-}
-
 fn default_confidence_threshold() -> f64 {
     0.6
 }
@@ -226,7 +223,7 @@ impl Default for AgenticVerificationConfig {
             goal: String::new(),
             verifier: VerificationAgentConfig::default(),
             worker: WorkerAgentConfig::default(),
-            max_iterations: default_max_iterations(),
+            max_iterations: None,
             verify_first: true,
             confidence_threshold: default_confidence_threshold(),
             required_consecutive_passes: default_consecutive_passes(),

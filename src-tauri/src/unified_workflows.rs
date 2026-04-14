@@ -226,9 +226,13 @@ pub struct WorkflowStage {
     /// Completion phase steps for this stage
     #[serde(default)]
     pub completion_steps: Vec<Value>,
-    /// Maximum iterations for this stage's verification-agentic loop
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
+    /// Maximum iterations for this stage's verification-agentic loop.
+    ///
+    /// `None` (omitted in JSON) means no iteration cap — the loop terminates
+    /// on success, explicit stop, or fix-attempt exhaustion. Users may set a
+    /// concrete cap to limit runtime or spend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
     /// Optional inactivity timeout in seconds for this stage's AI sessions
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
@@ -295,9 +299,12 @@ pub struct UnifiedWorkflow {
     #[serde(default)]
     pub completion_steps: Vec<Value>,
 
-    /// Maximum iterations for agentic phase
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
+    /// Maximum iterations for agentic phase.
+    ///
+    /// `None` means no iteration cap — the loop terminates on success,
+    /// explicit stop, or fix-attempt exhaustion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
 
     /// Maximum consecutive non-improving fix attempts before escalating.
     /// When the verification check count does not improve across this many iterations,
@@ -535,7 +542,35 @@ pub struct UnifiedWorkflow {
     pub updated_at: String,
 }
 
+impl WorkflowStage {
+    /// Resolve the iteration cap for internal loop bounds.
+    /// `None` → `u32::MAX` (effectively unlimited).
+    pub fn iter_cap(&self) -> u32 {
+        self.max_iterations.unwrap_or(u32::MAX)
+    }
+
+    /// Human-readable iteration cap for logs and UI (`"∞"` for unlimited).
+    pub fn iter_cap_display(&self) -> String {
+        self.max_iterations
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "∞".to_string())
+    }
+}
+
 impl UnifiedWorkflow {
+    /// Resolve the iteration cap for internal loop bounds.
+    /// `None` → `u32::MAX` (effectively unlimited for any real workflow).
+    pub fn iter_cap(&self) -> u32 {
+        self.max_iterations.unwrap_or(u32::MAX)
+    }
+
+    /// Human-readable iteration cap for logs and UI (`"∞"` for unlimited).
+    pub fn iter_cap_display(&self) -> String {
+        self.max_iterations
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "∞".to_string())
+    }
+
     /// Normalize any workflow to its stages representation.
     /// If stages is non-empty, return them as-is.
     /// If stages is empty, wrap top-level steps into a single stage.
@@ -602,10 +637,6 @@ fn default_category() -> String {
     "general".to_string()
 }
 
-fn default_max_iterations() -> u32 {
-    10
-}
-
 fn default_max_fix_attempts() -> u32 {
     3
 }
@@ -648,8 +679,8 @@ pub struct CreateUnifiedWorkflowRequest {
     pub agentic_steps: Vec<Value>,
     #[serde(default)]
     pub completion_steps: Vec<Value>,
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
     /// Optional inactivity timeout in seconds for AI sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
@@ -1083,7 +1114,7 @@ pub fn workflow_to_stage_config(
         agentic_steps: agentic,
         completion_automation_steps: comp_auto,
         completion_prompt_steps: comp_prompt,
-        max_iterations: workflow.max_iterations,
+        max_iterations: workflow.iter_cap(),
         provider: workflow.provider.clone(),
         model: workflow.model.clone(),
         model_overrides: workflow.model_overrides.clone(),
@@ -1140,7 +1171,7 @@ pub fn stage_to_stage_config(
         agentic_steps: agentic,
         completion_automation_steps: comp_auto,
         completion_prompt_steps: comp_prompt,
-        max_iterations: stage.max_iterations,
+        max_iterations: stage.iter_cap(),
         provider: stage.provider.clone(),
         model: stage.model.clone(),
         model_overrides: stage.model_overrides.clone(),

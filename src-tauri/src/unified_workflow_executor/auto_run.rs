@@ -194,7 +194,7 @@ pub fn launch_generated_workflow(
         .with_task_type("ai")
         .with_workflow_name(&workflow.name)
         .with_workflow_id(&workflow.id)
-        .with_max_sessions(workflow.max_iterations)
+        .with_max_sessions(workflow.iter_cap())
         .with_auto_continue(true)
         .with_workflow_type("unified")
         .with_parent_task_run_id(meta_task_run_id);
@@ -210,7 +210,7 @@ pub fn launch_generated_workflow(
     }
 
     let loop_config = LoopConfig {
-        max_iterations: workflow.max_iterations,
+        max_iterations: workflow.iter_cap(),
         base_prompt: combined_prompt,
         workflow_name: workflow.name.clone(),
         workflow_id: workflow.id.clone(),
@@ -230,7 +230,7 @@ pub fn launch_generated_workflow(
         model_override: None,
         model_overrides: workflow.model_overrides.clone(),
         stage_index: None,
-        max_sessions: Some(workflow.max_iterations),
+        max_sessions: workflow.max_iterations,
         auto_run_generated: false, // Don't cascade auto-run
         approval_gate: workflow.approval_gate,
         blocking_approval: false,

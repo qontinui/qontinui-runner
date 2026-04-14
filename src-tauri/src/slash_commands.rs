@@ -193,7 +193,9 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
             "content": parsed.full_content
         })],
         completion_steps: vec![],
-        max_iterations: 1,
+        // Slash-command runs are uncapped — the command itself decides when
+        // it's done. Was previously `1`, which caused early termination.
+        max_iterations: None,
         timeout_seconds: None,
         provider: None,
         model: None,

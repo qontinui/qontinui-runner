@@ -40,7 +40,8 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
   const [fileName, setFileName] = useState<string>("");
   const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
   const [agenticPrompt, setAgenticPrompt] = useState("");
-  const [maxIterations, setMaxIterations] = useState(3);
+  // null = unlimited; users may optionally cap (see AgenticPromptEditor).
+  const [maxIterations, setMaxIterations] = useState<number | null>(null);
   const [elementSource, setElementSource] = useState<"control" | "external">("control");
   const [workflowMode, setWorkflowMode] = useState<WorkflowMode>("verify");
 

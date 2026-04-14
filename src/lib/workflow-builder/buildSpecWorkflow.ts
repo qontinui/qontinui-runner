@@ -84,8 +84,8 @@ export interface BuildSpecWorkflowInput {
   agenticPrompt?: string;
   /** Additional instructions appended to the agentic prompt (preserves default context) */
   additionalInstructions?: string;
-  /** Max verification/agentic iterations (default: 3) */
-  maxIterations?: number;
+  /** Max verification/agentic iterations. `null` (or omitted) = unlimited. */
+  maxIterations?: number | null;
   /** Element source: "control" (runner UI) or "external" (browser tab).
    *  Falls back to specConfig.metadata.elementSource, then "control". */
   elementSource?: "control" | "external";
@@ -262,7 +262,7 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     selectedGroupIds,
     agenticPrompt,
     additionalInstructions,
-    maxIterations = 3,
+    maxIterations = null,
     pageUrl,
     workflowName,
     forcePromptOnly = false,

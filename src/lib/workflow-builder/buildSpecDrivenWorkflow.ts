@@ -27,8 +27,11 @@ export interface SpecDrivenWorkflowInput {
   pageUrl?: string;
   /** Additional project context for agentic prompts */
   projectContext?: string;
-  /** Max iterations per phase (default: 5 for implement, 3 for update/verify) */
-  maxIterations?: number;
+  /**
+   * Max iterations per phase. `null` (or omitted) means unlimited — the
+   * plan exits on success or explicit stop rather than an iteration count.
+   */
+  maxIterations?: number | null;
   /** Workflow name override */
   workflowName?: string;
 }
@@ -59,7 +62,7 @@ function buildImplementWorkflow(input: SpecDrivenWorkflowInput): UnifiedWorkflow
 
   const workflow = buildPlanWorkflow({
     phases,
-    maxIterations: input.maxIterations ?? 5,
+    maxIterations: input.maxIterations ?? null,
     workflowName:
       input.workflowName ??
       `Spec Implementation — ${input.specConfig.description?.slice(0, 60) ?? "page"}`,
@@ -94,7 +97,7 @@ function buildUpdateWorkflow(input: SpecDrivenWorkflowInput): UnifiedWorkflow {
 
   const workflow = buildPlanWorkflow({
     phases,
-    maxIterations: input.maxIterations ?? 3,
+    maxIterations: input.maxIterations ?? null,
     workflowName: input.workflowName ?? `Spec Update — ${diff.summary}`,
     snapshotTarget: input.elementSource === "external" ? "sdk" : "control",
   });
@@ -110,7 +113,7 @@ function buildVerifyWorkflow(input: SpecDrivenWorkflowInput): UnifiedWorkflow {
     specConfig: input.specConfig,
     elementSource: input.elementSource,
     pageUrl: input.pageUrl,
-    maxIterations: input.maxIterations ?? 3,
+    maxIterations: input.maxIterations ?? null,
     workflowName: input.workflowName,
   });
 }

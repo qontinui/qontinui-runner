@@ -418,7 +418,7 @@ pub async fn resume_interrupted_workflows(
                                 !workflow.targeted_error_ids.is_empty() && starting_iteration == 0;
 
                             let loop_config = super::types::LoopConfig {
-                                max_iterations: workflow.max_iterations,
+                                max_iterations: workflow.iter_cap(),
                                 base_prompt: combined_prompt,
                                 workflow_name: task_name.clone(),
                                 workflow_id: wf_id_for_spawn.to_string(),
@@ -438,7 +438,7 @@ pub async fn resume_interrupted_workflows(
                                 model_override: None,
                                 model_overrides: workflow.model_overrides.clone(),
                                 stage_index: None,
-                                max_sessions: Some(workflow.max_iterations),
+                                max_sessions: workflow.max_iterations,
                                 auto_run_generated: false,
                                 approval_gate: workflow.approval_gate,
                                 blocking_approval: false,
@@ -638,7 +638,7 @@ pub async fn resume_interrupted_workflows(
                                 !workflow.targeted_error_ids.is_empty() && starting_iteration == 0;
 
                             let loop_config = super::types::LoopConfig {
-                                max_iterations: workflow.max_iterations,
+                                max_iterations: workflow.iter_cap(),
                                 base_prompt: combined_prompt,
                                 workflow_name: task_name.clone(),
                                 workflow_id: wf_id.to_string(),
@@ -658,7 +658,7 @@ pub async fn resume_interrupted_workflows(
                                 model_override: None,
                                 model_overrides: workflow.model_overrides.clone(),
                                 stage_index: None,
-                                max_sessions: Some(workflow.max_iterations),
+                                max_sessions: workflow.max_iterations,
                                 auto_run_generated: false,
                                 approval_gate: workflow.approval_gate,
                                 blocking_approval: false,

@@ -192,7 +192,7 @@ fn build_calculator_workflow(
             )
         })],
         completion_steps: vec![],
-        max_iterations: 3,
+        max_iterations: Some(3),
         timeout_seconds: None,
         provider: None,
         model: None,
@@ -285,7 +285,7 @@ fn build_tdd_workflow(
             )
         })],
         completion_steps: vec![],
-        max_iterations: 3,
+        max_iterations: Some(3),
         timeout_seconds: None,
         provider: None,
         model: None,
@@ -379,7 +379,7 @@ fn build_pipeline_workflow(
             )
         })],
         completion_steps: vec![],
-        max_iterations: 5,
+        max_iterations: Some(5),
         timeout_seconds: None,
         provider: None,
         model: None,

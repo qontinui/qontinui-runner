@@ -3198,7 +3198,7 @@ fn apply_request_options(workflow: &mut UnifiedWorkflow, request: &GenerateWorkf
         workflow.tags = tags.clone();
     }
     if let Some(max_iterations) = request.max_iterations {
-        workflow.max_iterations = max_iterations;
+        workflow.max_iterations = Some(max_iterations);
     }
     if let Some(ref provider) = request.provider {
         workflow.provider = Some(provider.clone());

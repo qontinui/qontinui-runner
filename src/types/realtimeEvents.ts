@@ -85,8 +85,8 @@ export interface TaskStatusChangePayload {
   status: TaskStatus;
   /** Current iteration number */
   iteration: number;
-  /** Maximum iterations allowed */
-  max_iterations: number;
+  /** Maximum iterations allowed. `null` means unlimited. */
+  max_iterations: number | null;
   /** Optional task name */
   task_name: string | null;
   /** Optional reason for status change */

@@ -23,7 +23,8 @@ interface LoopResult {
   running: boolean;
   phase: string;
   current_iteration: number;
-  max_iterations: number;
+  /** `null` = unlimited cap. */
+  max_iterations: number | null;
   workflow_id: string;
   target_runner_port: number;
   target_runner_id: string | null;

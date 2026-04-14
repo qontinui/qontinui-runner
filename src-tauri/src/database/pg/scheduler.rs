@@ -439,6 +439,67 @@ impl PgDb {
         Ok(())
     }
 
+    /// Update an existing execution record with a final outcome.
+    ///
+    /// Used by the scheduler after polling an asynchronously-launched workflow
+    /// to backfill the real success/error/ended_at values once the underlying
+    /// task_run leaves the `running` state. Before this method existed, the
+    /// scheduler only ever wrote a single "launched successfully" row, which
+    /// lied about the true outcome for any workflow whose launch endpoint was
+    /// non-blocking.
+    pub async fn update_execution_record(
+        &self,
+        execution_id: &str,
+        record: &TaskExecutionRecord,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let status = match &record.status {
+            ScheduledTaskStatus::Pending => "pending",
+            ScheduledTaskStatus::Running => "running",
+            ScheduledTaskStatus::Completed => "completed",
+            ScheduledTaskStatus::Failed => "failed",
+            ScheduledTaskStatus::Skipped => "skipped",
+            ScheduledTaskStatus::Cancelled => "cancelled",
+        };
+
+        let ended: Option<DateTime<Utc>> = record
+            .ended_at
+            .as_deref()
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+
+        conn.execute(
+            r#"
+            UPDATE scheduler_history
+            SET ended_at = $2,
+                status = $3,
+                success = $4,
+                error_message = $5,
+                triggered_auto_fix = $6,
+                auto_fix_session_id = $7,
+                session_id = COALESCE($8, session_id)
+            WHERE execution_id = $1
+            "#,
+            &[
+                &execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &ended,
+                &status.to_string(),
+                &record.success,
+                &record.error_message,
+                &record.triggered_auto_fix,
+                &record.auto_fix_session_id,
+                &record.session_id,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG update_execution_record: {}", e))?;
+
+        Ok(())
+    }
+
     /// Get execution history for a task, most recent first, limited to `limit` rows.
     pub async fn get_execution_history(
         &self,

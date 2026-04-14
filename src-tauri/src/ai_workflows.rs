@@ -85,9 +85,10 @@ pub struct AiWorkflow {
     /// The goal/objective for this workflow
     #[serde(default)]
     pub goal: String,
-    /// Maximum iterations for the AI loop
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
+    /// Maximum iterations for the AI loop.
+    /// `None` (omitted) means no cap — loop until success or explicit stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
     /// Whether to capture input for coordinate validation
     #[serde(default)]
     pub capture_input_validation: bool,
@@ -116,10 +117,6 @@ fn default_auto_include_contexts() -> bool {
     true
 }
 
-fn default_max_iterations() -> u32 {
-    10
-}
-
 impl AiWorkflow {
     /// Create a new workflow with all fields specified
     #[allow(clippy::too_many_arguments)]
@@ -128,7 +125,7 @@ impl AiWorkflow {
         description: String,
         steps: Vec<ExecutionStep>,
         goal: String,
-        max_iterations: u32,
+        max_iterations: Option<u32>,
         capture_input_validation: bool,
         category: String,
         tags: Vec<String>,
@@ -225,7 +222,7 @@ pub fn create_workflow(
     description: String,
     steps: Vec<ExecutionStep>,
     goal: String,
-    max_iterations: u32,
+    max_iterations: Option<u32>,
     capture_input_validation: bool,
     category: String,
     tags: Vec<String>,
@@ -298,7 +295,11 @@ pub fn update_workflow(
         workflow.goal = g;
     }
     if let Some(m) = max_iterations {
-        workflow.max_iterations = m;
+        // NOTE: the legacy update API can't express "set to unlimited" (None)
+        // because `Option<u32>` here means "partial update" rather than the
+        // stored value. Callers wanting unlimited must use the newer
+        // unified_workflows update path.
+        workflow.max_iterations = Some(m);
     }
     if let Some(c) = capture_input_validation {
         workflow.capture_input_validation = c;

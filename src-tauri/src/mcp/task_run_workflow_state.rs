@@ -114,7 +114,10 @@ pub async fn get_workflow_state(
     } else {
         None
     };
-    let max_iterations = workflow_def.as_ref().map(|w| w.max_iterations);
+    // `max_iterations` is already `Option<u32>` on UnifiedWorkflow (None =
+    // unlimited). The outer `map` adds a "workflow not found" case, giving
+    // `Option<Option<u32>>`. Flatten so the caller sees a single Option.
+    let max_iterations = workflow_def.as_ref().and_then(|w| w.max_iterations);
 
     // Check if a verification plan exists:
     // 1. Unified workflows: check if verification_steps is non-empty
@@ -1010,7 +1013,7 @@ pub async fn resume_task_run(
     let run_agentic_first = !workflow.targeted_error_ids.is_empty() && starting_iteration == 0;
 
     let loop_config = LoopConfig {
-        max_iterations: workflow.max_iterations,
+        max_iterations: workflow.iter_cap(),
         base_prompt: combined_prompt,
         workflow_name: task_run.task_name.clone(),
         workflow_id: workflow_id.clone(),
@@ -1030,7 +1033,7 @@ pub async fn resume_task_run(
         model_override: None,
         model_overrides: workflow.model_overrides.clone(),
         stage_index: None,
-        max_sessions: Some(workflow.max_iterations),
+        max_sessions: workflow.max_iterations,
         auto_run_generated: false,
         approval_gate: workflow.approval_gate,
         blocking_approval: false,

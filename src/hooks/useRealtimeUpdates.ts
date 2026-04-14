@@ -66,7 +66,8 @@ export interface CurrentTaskInfo {
   taskRunId: string;
   status: TaskStatus;
   iteration: number;
-  maxIterations: number;
+  /** `null` indicates the loop has no iteration cap. */
+  maxIterations: number | null;
   taskName: string | null;
   startedAt: number;
 }

@@ -468,7 +468,7 @@ impl MutationRoot {
             .with_workflow_name(&workflow.name)
             .with_workflow_id(&workflow_id)
             .with_workflow_type("unified")
-            .with_max_sessions(workflow.max_iterations);
+            .with_max_sessions(workflow.iter_cap());
         input.runner_port = Some(port);
         if let Some(ref p) = prompt {
             input = input.with_prompt(p);

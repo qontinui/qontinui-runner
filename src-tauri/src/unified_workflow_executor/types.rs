@@ -459,7 +459,7 @@ impl LoopConfig {
         auto_run_generated: bool,
     ) -> Self {
         Self {
-            max_iterations: workflow.max_iterations,
+            max_iterations: workflow.iter_cap(),
             base_prompt,
             workflow_name: workflow.name.clone(),
             workflow_id: workflow.id.clone(),
@@ -479,7 +479,10 @@ impl LoopConfig {
             model_override: None,
             model_overrides: workflow.model_overrides.clone(),
             stage_index: None,
-            max_sessions: Some(workflow.max_iterations),
+            // max_sessions is a separate concept from max_iterations but has
+            // historically tracked it — if the user asked for unlimited
+            // iterations, let the session count be unlimited too.
+            max_sessions: workflow.max_iterations,
             auto_run_generated,
             approval_gate: workflow.approval_gate,
             blocking_approval: false,

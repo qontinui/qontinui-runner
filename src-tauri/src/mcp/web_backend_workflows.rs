@@ -270,7 +270,13 @@ pub async fn sync_workflows_from_backend(db: &crate::database::pg::PgDb) -> Resu
                     verification_steps: Some(workflow.verification_steps.clone()),
                     agentic_steps: Some(workflow.agentic_steps.clone()),
                     completion_steps: Some(workflow.completion_steps.clone()),
-                    max_iterations: Some(workflow.max_iterations),
+                    // NOTE: UpdateUnifiedWorkflowRequest's Option is a
+                    // partial-update marker, so we can't sync a source
+                    // workflow with `max_iterations = None` (unlimited)
+                    // through this path. In practice web-backend syncs
+                    // always carry a concrete cap, and full replaces use a
+                    // different route.
+                    max_iterations: workflow.max_iterations,
                     timeout_seconds: Some(workflow.timeout_seconds),
                     provider: workflow.provider.clone(),
                     model: workflow.model.clone(),

@@ -807,6 +807,26 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_event_log_node ON workflow_event_log(execution_id, node_id);
         "#,
     },
+    Migration {
+        version: 19,
+        description: "max_iterations default = unlimited (NULL); backfill 0/1 values to NULL",
+        // `NULL` in unified_workflows.max_iterations now means "unlimited" —
+        // the executor translates that to u32::MAX at the LoopConfig boundary.
+        // Previously the column defaulted to 10, and many AI-generated workflows
+        // landed with max_iterations = 1, causing them to fail after a single
+        // verification attempt. Drop the default and clear rows whose stored
+        // value would force the loop to exit before any meaningful iteration.
+        // ai_workflows stores its payload in a single `config` TEXT column
+        // (JSON blob) so migrating that table requires a JSON surgical
+        // update. Legacy ai_workflows are rarely edited; leave existing rows
+        // alone — the Rust serde default (`None`) handles new writes. Only
+        // unified_workflows.max_iterations is a real column and gets the
+        // schema change.
+        sql: r#"
+            ALTER TABLE unified_workflows ALTER COLUMN max_iterations DROP DEFAULT;
+            UPDATE unified_workflows SET max_iterations = NULL WHERE max_iterations IS NOT NULL AND max_iterations <= 1;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.

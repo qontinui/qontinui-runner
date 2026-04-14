@@ -141,7 +141,7 @@ impl StepHandler for WorkflowStepHandler {
 
         // 7. Build LoopConfig with the single stage
         let loop_config = LoopConfig {
-            max_iterations: workflow.max_iterations,
+            max_iterations: workflow.iter_cap(),
             base_prompt: format!(
                 "Execute nested workflow: {} - {}",
                 workflow.name, workflow.description
@@ -164,7 +164,7 @@ impl StepHandler for WorkflowStepHandler {
             model_override: workflow.model.clone(),
             model_overrides: workflow.model_overrides.clone(),
             stage_index: None,
-            max_sessions: Some(workflow.max_iterations),
+            max_sessions: workflow.max_iterations,
             auto_run_generated: false,
             approval_gate: false,
             blocking_approval: false,

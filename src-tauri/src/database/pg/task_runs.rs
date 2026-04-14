@@ -905,6 +905,41 @@ impl PgDb {
             .collect())
     }
 
+    /// Assign `runner_port` to every `running` task_run row that currently
+    /// has `runner_port IS NULL`.
+    ///
+    /// NULL-port rows are created by scheduler-triggered workflow launches
+    /// (which have no specific runner context) and by legacy code paths that
+    /// predate the per-runner ownership tagging. Once a runner starts, it
+    /// calls this to take ownership of all such orphans so the zombie sweep
+    /// and startup-resume paths treat them uniformly.
+    ///
+    /// Returns the IDs of rows that were claimed.
+    pub async fn claim_orphaned_task_runs(
+        &self,
+        runner_port: u16,
+    ) -> Result<Vec<String>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let port = runner_port as i32;
+
+        let rows = conn
+            .query(
+                r#"UPDATE task_runs
+                   SET runner_port = $1, updated_at = NOW()
+                   WHERE status = 'running' AND runner_port IS NULL
+                   RETURNING id"#,
+                &[&port],
+            )
+            .await
+            .map_err(|e| format!("PG claim_orphaned_task_runs: {}", e))?;
+
+        Ok(rows.into_iter().map(|r| r.get::<_, String>("id")).collect())
+    }
+
     /// Stricter variant of `get_running_task_runs` used by the startup-resume
     /// path: returns only rows whose `runner_port` exactly matches the caller.
     /// Excludes NULL-port rows so multiple runners can't both claim the same
