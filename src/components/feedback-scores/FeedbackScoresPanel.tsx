@@ -6,7 +6,7 @@
  * colored progress bars and expandable reason text.
  */
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import {
   BarChart3,
   ChevronDown,
@@ -274,7 +274,7 @@ export function FeedbackScoresPanel({ runId }: FeedbackScoresPanelProps) {
   const { scores, summary, loading, error, refetch, createScore } = useFeedbackScores(runId);
   const [showForm, setShowForm] = useState(false);
 
-  const memoizedSummary = useMemo(() => summary, [summary]);
+  const memoizedSummary = summary;
 
   // Loading
   if (loading) {

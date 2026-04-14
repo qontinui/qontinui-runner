@@ -32,7 +32,7 @@ export function ExportConfigDialog({
   cooccurrenceData,
   discoveryResult,
 }: ExportConfigDialogProps) {
-  const [options, setOptions] = useState<StateExportOptions>(getDefaultExportOptions());
+  const [options, setOptions] = useState<StateExportOptions>(() => getDefaultExportOptions());
   const [showPreview, setShowPreview] = useState(false);
   const [copied, setCopied] = useState(false);
   const [downloadSuccess, setDownloadSuccess] = useState(false);

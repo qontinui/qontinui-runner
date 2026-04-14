@@ -181,7 +181,7 @@ export function SchedulerTaskForm({
     initConditions?.require_repo_inactive?.enabled ?? false,
   );
   const [repositories, setRepositories] = useState<RepositoryWatchWithId[]>(
-    (initConditions?.require_repo_inactive?.repositories ?? []).map((r) => ({
+    () => (initConditions?.require_repo_inactive?.repositories ?? []).map((r) => ({
       ...r,
       _formId: crypto.randomUUID(),
     })),

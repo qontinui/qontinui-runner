@@ -85,7 +85,7 @@ export function ExecutionStatsCard({
   compact = false,
   className,
 }: ExecutionStatsCardProps) {
-  const [elapsedDisplay, setElapsedDisplay] = useState(formatElapsedTime(startTime));
+  const [elapsedDisplay, setElapsedDisplay] = useState(() => formatElapsedTime(startTime));
 
   // Update elapsed time every second while running
   useEffect(() => {

@@ -39,7 +39,7 @@ export function HookEditor({ hook, onSave, onCancel, loading }: HookEditorProps)
   const [description, setDescription] = useState("");
   const [trigger, setTrigger] = useState<HookTrigger>("pre_execution");
   const [actionType, setActionType] = useState<HookActionType>("log");
-  const [actionConfig, setActionConfig] = useState<HookAction>(createDefaultAction("log"));
+  const [actionConfig, setActionConfig] = useState<HookAction>(() => createDefaultAction("log"));
   const [enabled, setEnabled] = useState(true);
   const [executionOrder, setExecutionOrder] = useState(0);
   const [continueOnFailure, setContinueOnFailure] = useState(true);

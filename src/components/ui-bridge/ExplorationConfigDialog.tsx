@@ -113,10 +113,10 @@ export function ExplorationConfigDialog({
   const [config, setConfig] = useState<ExplorationConfig>(DEFAULT_CONFIG);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [blockedKeywordsInput, setBlockedKeywordsInput] = useState(
-    DEFAULT_CONFIG.blockedKeywords.join(", "),
+    () => DEFAULT_CONFIG.blockedKeywords.join(", "),
   );
   const [safeKeywordsInput, setSafeKeywordsInput] = useState(
-    DEFAULT_CONFIG.safeKeywords.join(", "),
+    () => DEFAULT_CONFIG.safeKeywords.join(", "),
   );
   const [showErrors, setShowErrors] = useState(false);
   const [showStates, setShowStates] = useState(false);
