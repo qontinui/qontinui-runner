@@ -23,7 +23,8 @@ interface OrchestrationLoopConfig {
   target_runner_id: string | null;
   supervisor_port: number;
   workflow_id: string;
-  max_iterations: number;
+  /** `null` indicates no iteration cap (unlimited). */
+  max_iterations: number | null;
   exit_strategy: { type: string };
   between_iterations: { type: string; rebuild?: boolean };
   retry_on_failure: boolean;
@@ -60,7 +61,8 @@ interface OrchestrationLoopStatus {
   running: boolean;
   phase: string;
   current_iteration: number;
-  max_iterations: number;
+  /** `null` = unlimited. Renders as "∞" and disables the progress bar. */
+  max_iterations: number | null;
   workflow_id: string;
   target_runner_port: number;
   target_runner_id: string | null;
@@ -108,7 +110,8 @@ interface OrchestrationLoopFormState {
   targetPort: string;
   targetRunnerId: string;
   supervisorPort: string;
-  maxIter: number;
+  /** `null` means no iteration cap. */
+  maxIter: number | null;
   exitStrategy: string;
   between: string;
   buildDesc: string;
@@ -201,7 +204,8 @@ export function OrchestrationLoopPanel() {
   const [targetPort, setTargetPort] = useState("");
   const [targetRunnerId, setTargetRunnerId] = useState("");
   const [supervisorPort, setSupervisorPort] = useState("9875");
-  const [maxIter, setMaxIter] = useState(5);
+  // null = unlimited; loop exits on success/stop, not iteration count.
+  const [maxIter, setMaxIter] = useState<number | null>(null);
   const [exitStrategy, setExitStrategy] = useState("reflection");
   const [between, setBetween] = useState("restart_on_signal");
   const [buildDesc, setBuildDesc] = useState("");
@@ -260,7 +264,7 @@ export function OrchestrationLoopPanel() {
     setTargetPort(s.targetPort || "");
     setTargetRunnerId(s.targetRunnerId || "");
     setSupervisorPort(s.supervisorPort || "9875");
-    setMaxIter(s.maxIter || 5);
+    setMaxIter(s.maxIter ?? null);
     setExitStrategy(s.exitStrategy || "reflection");
     setBetween(s.between || "restart_on_signal");
     setBuildDesc(s.buildDesc || "");
@@ -502,9 +506,12 @@ export function OrchestrationLoopPanel() {
 
   const running = status?.running ?? false;
   const phase = status?.phase || "idle";
+  // `cfgMax` is the effective cap (server-reported preferred, falls back to
+  // the form field). `null` means the loop is uncapped and the progress bar
+  // is rendered as 0% (indeterminate).
   const cfgMax = status?.max_iterations ?? maxIter;
   const progressPct =
-    running && cfgMax > 0
+    running && cfgMax != null && cfgMax > 0
       ? Math.min(100, Math.round(((status?.current_iteration ?? 0) / cfgMax) * 100))
       : phase === "complete"
         ? 100
@@ -808,11 +815,23 @@ export function OrchestrationLoopPanel() {
                     <span className={labelCls}>Max</span>
                     <input
                       type="number"
-                      value={maxIter}
-                      onChange={(e) => setMaxIter(Number(e.target.value))}
+                      value={maxIter ?? ""}
+                      onChange={(e) => {
+                        const raw = e.target.value.trim();
+                        if (raw === "") {
+                          setMaxIter(null);
+                          return;
+                        }
+                        const parsed = parseInt(raw, 10);
+                        setMaxIter(
+                          Number.isFinite(parsed) && parsed >= 1 ? parsed : null,
+                        );
+                      }}
+                      placeholder="∞"
+                      title="Blank = unlimited iterations"
                       min={1}
                       max={50}
-                      className={cn(inputCls, "w-12 text-center")}
+                      className={cn(inputCls, "w-14 text-center")}
                     />
                   </div>
                   <div className="flex items-center gap-1.5">

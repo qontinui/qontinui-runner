@@ -39,7 +39,8 @@ export interface OrchestratorStateResult {
   workflowStage: WorkflowStage | null;
   workflowStageDisplay: string | null;
   iteration: number;
-  maxIterations: number;
+  /** `null` indicates an unlimited iteration budget. */
+  maxIterations: number | null;
   hasVerificationPlan: boolean;
   isComplete: boolean;
   isPaused: boolean;
@@ -222,7 +223,8 @@ export interface WorkflowStatusSummary {
   status: "idle" | "running" | "completed" | "failed" | "stopped";
   workflowStage: WorkflowStage | null;
   iteration: number;
-  maxIterations: number;
+  /** `null` indicates an unlimited iteration budget. */
+  maxIterations: number | null;
   isComplete: boolean;
   isStopped: boolean;
   elapsedTime: number;

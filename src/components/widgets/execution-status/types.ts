@@ -33,7 +33,8 @@ export interface IterationResult {
 export interface IterationTrend {
   results: IterationResult[];
   currentIteration: number;
-  maxIterations: number;
+  /** `null` indicates an unlimited cap. */
+  maxIterations: number | null;
 }
 
 export interface WorkflowTiming {

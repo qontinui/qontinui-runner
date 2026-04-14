@@ -60,8 +60,8 @@ export interface ControlBarProps {
   isOrchestrated?: boolean;
   /** Current iteration */
   iteration?: number;
-  /** Max iterations */
-  maxIterations?: number;
+  /** Max iterations. `null` means no cap (unlimited). */
+  maxIterations?: number | null;
   /** Whether this is a plan workflow */
   isPlan?: boolean;
   /** Plan phase name */
@@ -128,22 +128,24 @@ function IterationBadge({
   isRunning,
 }: {
   iteration: number;
-  maxIterations: number;
+  /** `null` means no cap — rendered as "∞". */
+  maxIterations: number | null;
   isRunning: boolean;
 }) {
   const colors = getAccentColors("orange");
+  const maxLabel = maxIterations ?? "∞";
 
   return (
     <div
       data-content-role="badge"
-      data-content-label={`Iteration ${iteration}/${maxIterations}`}
+      data-content-label={`Iteration ${iteration}/${maxLabel}`}
       className={`flex items-center gap-1.5 px-2 py-1 text-xs font-medium rounded-md ${colors.bg} ${colors.text} ${colors.border} border ${isRunning ? "animate-phase-glow" : ""}`}
-      title={`Iteration ${iteration} of ${maxIterations}`}
+      title={`Iteration ${iteration} of ${maxLabel}`}
     >
       <span>Iteration</span>
       <span className="font-mono">{iteration}</span>
       <span className="opacity-60">/</span>
-      <span className="font-mono opacity-80">{maxIterations}</span>
+      <span className="font-mono opacity-80">{maxLabel}</span>
     </div>
   );
 }
@@ -164,7 +166,8 @@ function WorkflowStageIndicator({
   phaseStepCounts?: PhaseStepCounts;
   showStepCounts?: boolean;
   iteration?: number;
-  maxIterations?: number;
+  /** `null` = unlimited; show badge regardless of value (renders "∞"). */
+  maxIterations?: number | null;
 }) {
   // Use the stage from the API. Don't default to "setup" when data isn't available yet,
   // as this causes UI inconsistency when the actual stage is different (e.g., verification).
@@ -172,8 +175,12 @@ function WorkflowStageIndicator({
   const effectiveStage = currentStage;
   return (
     <div className="flex items-center gap-2">
-      {/* Iteration counter - show when in verification or agentic loop */}
-      {iteration !== undefined && maxIterations !== undefined && maxIterations > 1 && (
+      {/* Iteration counter - show when in verification or agentic loop. Show
+          for uncapped runs too (maxIterations === null), since "Iteration N/∞"
+          is more informative than hiding the counter entirely. */}
+      {iteration !== undefined &&
+        maxIterations !== undefined &&
+        (maxIterations === null || maxIterations > 1) && (
         <>
           <IterationBadge
             iteration={iteration}

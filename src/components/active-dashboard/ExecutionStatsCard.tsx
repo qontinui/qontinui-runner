@@ -41,8 +41,8 @@ export interface ExecutionStatsCardProps {
   startTime?: number | null;
   /** Current iteration (1-based) */
   iteration?: number;
-  /** Maximum iterations */
-  maxIterations?: number;
+  /** Maximum iterations. `null` means no cap (unlimited). */
+  maxIterations?: number | null;
   /** Whether to show in compact mode */
   compact?: boolean;
   /** Additional CSS classes */
@@ -167,19 +167,21 @@ export function ExecutionStatsCard({
           </span>
         </div>
 
-        {/* Iteration */}
-        {iteration !== undefined && maxIterations !== undefined && maxIterations > 1 && (
-          <div className="flex items-center gap-1.5">
-            <RefreshCw className="h-3.5 w-3.5 text-muted-foreground" />
-            <span
-              data-content-role="metric"
-              data-content-label="iteration progress"
-              className="font-mono"
-            >
-              {iteration}/{maxIterations}
-            </span>
-          </div>
-        )}
+        {/* Iteration. Show for capped (>1) and uncapped (null) runs. */}
+        {iteration !== undefined &&
+          maxIterations !== undefined &&
+          (maxIterations === null || maxIterations > 1) && (
+            <div className="flex items-center gap-1.5">
+              <RefreshCw className="h-3.5 w-3.5 text-muted-foreground" />
+              <span
+                data-content-role="metric"
+                data-content-label="iteration progress"
+                className="font-mono"
+              >
+                {iteration}/{maxIterations ?? "∞"}
+              </span>
+            </div>
+          )}
       </div>
     );
   }
@@ -305,8 +307,10 @@ export function ExecutionStatsCard({
           </div>
         </div>
 
-        {/* Iteration Progress */}
-        {iteration !== undefined && maxIterations !== undefined && maxIterations > 1 ? (
+        {/* Iteration Progress. Show for capped (>1) and uncapped (null) runs. */}
+        {iteration !== undefined &&
+        maxIterations !== undefined &&
+        (maxIterations === null || maxIterations > 1) ? (
           <div className="space-y-1">
             <div className="flex items-center gap-1.5 text-muted-foreground">
               <RefreshCw className="h-3.5 w-3.5" />
@@ -322,7 +326,7 @@ export function ExecutionStatsCard({
               >
                 {iteration}
               </span>
-              <span className="text-xs text-muted-foreground">/ {maxIterations}</span>
+              <span className="text-xs text-muted-foreground">/ {maxIterations ?? "∞"}</span>
             </div>
           </div>
         ) : (

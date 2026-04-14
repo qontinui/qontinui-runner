@@ -201,7 +201,8 @@ export interface WorkflowExecutionState {
   stateName: string | null;
   isOrchestrated: boolean;
   iteration: number;
-  maxIterations: number;
+  /** `null` indicates an unlimited iteration budget. */
+  maxIterations: number | null;
   hasVerificationPlan: boolean;
   isComplete: boolean;
   isPaused: boolean;
@@ -300,7 +301,8 @@ const DEFAULT_STATE: WorkflowExecutionState = {
   stateName: null,
   isOrchestrated: false,
   iteration: 1,
-  maxIterations: 10,
+  // null = unlimited (matches the new server-side default).
+  maxIterations: null,
   hasVerificationPlan: false,
   isComplete: false,
   isPaused: false,
@@ -913,7 +915,9 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         isOrchestrated:
           data.task_run.workflow_type === "unified" || data.task_run.workflow_type === "plan",
         iteration: data.orchestrator_state?.iteration ?? 1,
-        maxIterations: workflowStateData?.max_iterations ?? 10,
+        // Pass the server's value through verbatim — null means unlimited
+        // and must not be silently mapped to a number like 10.
+        maxIterations: workflowStateData?.max_iterations ?? null,
         hasVerificationPlan: workflowStateData?.has_verification_plan ?? false,
         isComplete,
         isPaused: false,

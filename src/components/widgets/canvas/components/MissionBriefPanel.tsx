@@ -32,7 +32,8 @@ import type { CanvasPanelComponentProps } from "./types";
 interface StageInfo {
   name: string;
   index: number;
-  max_iterations: number;
+  /** `null` indicates an unlimited cap. */
+  max_iterations: number | null;
 }
 
 interface ProgressInfo {
@@ -139,7 +140,7 @@ function StageFlow({
                 isDone && "bg-emerald-500/15 border-emerald-500/30 text-emerald-400",
                 isPending && "border-border/50 text-muted-foreground",
               )}
-              title={`${stage.name} — max ${stage.max_iterations} iterations`}
+              title={`${stage.name} — max ${stage.max_iterations ?? "∞"} iterations`}
             >
               {stage.name}
             </span>
@@ -158,18 +159,21 @@ function ProgressIndicator({
 }: {
   stages: StageInfo[];
   progress: ProgressInfo;
-  maxIterations: number;
+  /** `null` = unlimited; the inner progress bar becomes indeterminate. */
+  maxIterations: number | null;
 }) {
   const phase = progress.phase ?? "setup";
   const colors = PHASE_COLORS[phase] ?? DEFAULT_PHASE;
-  const stageMaxIter =
+  const stageMaxIter: number | null =
     progress.current_stage_index !== null && stages[progress.current_stage_index]
       ? stages[progress.current_stage_index].max_iterations
       : maxIterations;
 
-  // Calculate iteration progress bar width
+  // Calculate iteration progress bar width. Uncapped → 0% (indeterminate).
   const iterProgress =
-    stageMaxIter > 0 ? Math.min((progress.current_iteration / stageMaxIter) * 100, 100) : 0;
+    stageMaxIter != null && stageMaxIter > 0
+      ? Math.min((progress.current_iteration / stageMaxIter) * 100, 100)
+      : 0;
 
   return (
     <div className="space-y-1.5">
@@ -236,7 +240,8 @@ export function MissionBriefPanel({ data }: CanvasPanelComponentProps) {
   const reflection = (data.reflection as boolean) ?? false;
   const approvalGate = (data.approval_gate as boolean) ?? false;
   const stages = useMemo(() => (data.stages as StageInfo[] | undefined) ?? [], [data.stages]);
-  const maxIterations = (data.max_iterations as number) ?? 5;
+  // Pull through nullable: server may emit null/undefined to signal unlimited.
+  const maxIterations = (data.max_iterations as number | null | undefined) ?? null;
   const progress = useMemo(
     () =>
       (data.progress as ProgressInfo | undefined) ?? {

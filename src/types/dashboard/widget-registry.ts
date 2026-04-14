@@ -31,8 +31,8 @@ export interface TaskActivityInfo {
   workflowName: string | null;
   /** Current iteration (1-based) */
   iteration: number;
-  /** Maximum iterations */
-  maxIterations: number;
+  /** Maximum iterations. `null` means no cap (unlimited). */
+  maxIterations: number | null;
   /** Explicitly detected activity types */
   activities: ActivityType[];
   /** Task start time (ms since epoch) - used for filtering AI output to current task */

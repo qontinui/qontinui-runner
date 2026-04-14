@@ -295,18 +295,26 @@ impl SchedulerService {
 
     /// Execute a scheduled task.
     ///
-    /// For unified workflows (the `Workflow { workflow_id: Some(_) }` case)
-    /// the launch is non-blocking — we insert an initial `Running`
-    /// `scheduler_history` row, kick off the workflow via HTTP, then spawn a
-    /// background poller that waits for the underlying `task_run` to leave
-    /// its `running` state before recording the true outcome. This preserves
-    /// scheduler throughput (tick is not blocked on hour-long workflows) and
-    /// ensures `scheduler_history` reflects real success/failure rather than
-    /// whether the launch call returned 200.
+    /// Task types fall into two categories based on whether their launch
+    /// HTTP call is blocking-until-complete or non-blocking-spawn-and-return:
     ///
-    /// For other task types (prompt, auto-fix, legacy config-path workflow,
-    /// watcher) the launch is assumed to be blocking-until-complete and the
-    /// original synchronous recording flow is used.
+    /// **Async (launch-and-poll)**: unified workflows, prompts, auto-fix.
+    /// These spawn an AI session or background workflow that runs for
+    /// minutes-to-hours, with the launch endpoint returning a `task_run_id`
+    /// (or `session_id` — same thing for prompts) almost immediately. We
+    /// insert a `Running` `scheduler_history` row right after launch and
+    /// spawn a background poller that updates the row when the underlying
+    /// `task_run` exits its `running` state.
+    ///
+    /// **Sync (launch-and-record)**: legacy config-path workflows, watchers,
+    /// background-capture. These either run to completion in the launch call
+    /// (legacy workflow via `action_service`) or are pure one-shot operations
+    /// (watcher AI evaluation). The original synchronous record-after-launch
+    /// flow applies.
+    ///
+    /// Splitting on this axis matters because tick() must not block on
+    /// long-running tasks — async tasks must hand off to a spawned poller
+    /// so the next tick can fire on schedule.
     async fn execute_task(self: Arc<Self>, task: ScheduledTask) {
         let task_id = task.id.clone();
         let task_name = task.name.clone();
@@ -319,26 +327,65 @@ impl SchedulerService {
             running.push(task_id.clone());
         }
 
-        // Unified-workflow async launch path
-        if let ScheduledTaskType::Workflow {
-            workflow_id: Some(workflow_id),
-            monitor_index,
-            ..
-        } = &task.task
-        {
-            self.clone()
-                .launch_and_poll_unified_workflow(
-                    task_id,
-                    task_name,
-                    workflow_id.clone(),
-                    *monitor_index,
-                    auto_fix_on_failure,
-                )
-                .await;
-            return;
+        // === Async launch-and-poll paths ===
+        match &task.task {
+            ScheduledTaskType::Workflow {
+                workflow_id: Some(workflow_id),
+                monitor_index,
+                ..
+            } => {
+                let workflow_id = workflow_id.clone();
+                let monitor_index = *monitor_index;
+                self.clone()
+                    .launch_and_poll(
+                        task_id,
+                        task_name,
+                        auto_fix_on_failure,
+                        Box::pin(async move {
+                            self.launch_unified_workflow(&workflow_id, monitor_index).await
+                        }),
+                    )
+                    .await;
+                return;
+            }
+            ScheduledTaskType::Prompt {
+                prompt_id,
+                max_sessions,
+            } => {
+                let prompt_id = prompt_id.clone();
+                let max_sessions = *max_sessions;
+                self.clone()
+                    .launch_and_poll(
+                        task_id,
+                        task_name,
+                        auto_fix_on_failure,
+                        Box::pin(async move { self.launch_prompt(&prompt_id, max_sessions).await }),
+                    )
+                    .await;
+                return;
+            }
+            ScheduledTaskType::AutoFix {
+                check_findings,
+                force_run,
+            } => {
+                let check_findings = *check_findings;
+                let force_run = *force_run;
+                self.clone()
+                    .launch_and_poll(
+                        task_id,
+                        task_name,
+                        auto_fix_on_failure,
+                        Box::pin(async move {
+                            self.launch_auto_fix(check_findings, force_run).await
+                        }),
+                    )
+                    .await;
+                return;
+            }
+            _ => {}
         }
 
-        // Synchronous path (legacy workflow, prompt, auto-fix, watcher, capture)
+        // === Sync (launch-blocks-until-complete) paths ===
         let mut record = TaskExecutionRecord::new();
 
         let result = match &task.task {
@@ -351,14 +398,6 @@ impl SchedulerService {
                 self.execute_workflow(workflow_name, config_path.as_deref(), *monitor_index)
                     .await
             }
-            ScheduledTaskType::Prompt {
-                prompt_id,
-                max_sessions,
-            } => self.execute_prompt(prompt_id, *max_sessions).await,
-            ScheduledTaskType::AutoFix {
-                check_findings,
-                force_run,
-            } => self.execute_auto_fix(*check_findings, *force_run).await,
             ScheduledTaskType::Watcher { watcher_id } => self.execute_watcher(watcher_id).await,
             ScheduledTaskType::BackgroundCapture {
                 monitor_index: _,
@@ -374,6 +413,12 @@ impl SchedulerService {
                 );
                 Ok((true, None))
             }
+            // Async task types are handled by the launch_and_poll branch above
+            // and return early; the compiler still needs them in this match.
+            ScheduledTaskType::Prompt { .. }
+            | ScheduledTaskType::AutoFix { .. } => unreachable!(
+                "Async task types must be handled by the launch_and_poll dispatch above"
+            ),
         };
 
         self.finalize_sync_execution(
@@ -409,7 +454,7 @@ impl SchedulerService {
                         "Scheduler: Triggering auto-fix for failed task '{}'",
                         task_name
                     );
-                    if let Ok((_, Some(session_id))) = self.execute_auto_fix(true, false).await {
+                    if let Ok(session_id) = self.launch_auto_fix(true, false).await {
                         record.mark_auto_fix_triggered(session_id);
                     }
                 }
@@ -423,7 +468,7 @@ impl SchedulerService {
                         "Scheduler: Triggering auto-fix for failed task '{}'",
                         task_name
                     );
-                    if let Ok((_, Some(session_id))) = self.execute_auto_fix(true, false).await {
+                    if let Ok(session_id) = self.launch_auto_fix(true, false).await {
                         record.mark_auto_fix_triggered(session_id);
                     }
                 }
@@ -452,35 +497,40 @@ impl SchedulerService {
         }
     }
 
-    /// Launch a unified workflow, insert a `Running` history row, then spawn
-    /// a background poller that will update the row with the final outcome
-    /// when the underlying `task_run` finishes. Returns once the launch call
-    /// itself has returned (typically a few hundred milliseconds); the
-    /// scheduler tick can proceed without blocking on the workflow.
-    async fn launch_and_poll_unified_workflow(
+    /// Generic launch-and-poll for async task types.
+    ///
+    /// Drives the lifecycle:
+    /// 1. Run the provided launch future, which kicks off the underlying
+    ///    work (via HTTP) and returns a `task_run_id`.
+    /// 2. INSERT a `Running` `scheduler_history` row immediately so the UI
+    ///    reflects the in-flight execution.
+    /// 3. Spawn a detached poller that watches `task_runs.status` and
+    ///    UPDATEs the row when the run leaves `running`. The poller also
+    ///    fires `auto_fix_on_failure` if configured and clears the entry
+    ///    from `running_tasks` so concurrent-task quotas stay accurate.
+    ///
+    /// If the launch itself fails, the lifecycle short-circuits to a failed
+    /// row (no poller is spawned).
+    async fn launch_and_poll(
         self: Arc<Self>,
         task_id: String,
         task_name: String,
-        workflow_id: String,
-        monitor_index: Option<i32>,
         auto_fix_on_failure: bool,
+        launch_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>,
     ) {
         let mut record = TaskExecutionRecord::new();
         let execution_id = record.execution_id.clone();
 
-        // 1. Launch the workflow. Returns a task_run_id on success.
-        let launch = self.launch_unified_workflow(&workflow_id, monitor_index).await;
+        let launch = launch_fut.await;
 
         match launch {
             Ok(task_run_id) => {
                 record.session_id = Some(task_run_id.clone());
                 info!(
-                    "Scheduler: launched unified workflow '{}' (task_run_id={})",
+                    "Scheduler: launched task '{}' (task_run_id={})",
                     task_name, task_run_id
                 );
 
-                // Persist a "running" row so the UI can see the execution in
-                // progress. We'll UPDATE this row once the poller finishes.
                 if let Ok(pg) = self.pg() {
                     if let Err(e) = pg.insert_execution_record(&task_id, &record).await {
                         error!("Failed to insert initial running execution record: {}", e);
@@ -508,15 +558,11 @@ impl SchedulerService {
                 });
             }
             Err(e) => {
-                // Launch itself failed — record failure immediately.
                 record.complete(false, Some(e.clone()));
-                error!(
-                    "Scheduler: unified workflow '{}' failed to launch: {}",
-                    task_name, e
-                );
+                error!("Scheduler: task '{}' failed to launch: {}", task_name, e);
 
                 if auto_fix_on_failure {
-                    if let Ok((_, Some(session_id))) = self.execute_auto_fix(true, false).await {
+                    if let Ok(session_id) = self.launch_auto_fix(true, false).await {
                         record.mark_auto_fix_triggered(session_id);
                     }
                 }
@@ -643,7 +689,11 @@ impl SchedulerService {
                 "Scheduler: Triggering auto-fix for failed task '{}'",
                 task_name
             );
-            if let Ok((_, Some(session_id))) = self.execute_auto_fix(true, false).await {
+            // Fire-and-forget: we just record that auto-fix was triggered.
+            // The auto-fix run itself will be tracked as its own task_run if
+            // it's a primary scheduled AutoFix task; here it's a side effect
+            // so we don't poll for its completion.
+            if let Ok(session_id) = self.launch_auto_fix(true, false).await {
                 record.mark_auto_fix_triggered(session_id);
             }
         }
@@ -831,18 +881,20 @@ impl SchedulerService {
             })
     }
 
-    /// Execute a prompt task
-    async fn execute_prompt(
+    /// Launch a prompt and return the resulting `session_id` (which is also
+    /// the `task_run_id` — see `mcp/ai_session.rs`'s `run_prompt` handler).
+    /// The actual prompt execution runs in the background; callers must poll
+    /// `task_runs.status` to learn the real outcome.
+    async fn launch_prompt(
         &self,
         prompt_id: &str,
         max_sessions: Option<u32>,
-    ) -> Result<(bool, Option<String>), String> {
+    ) -> Result<String, String> {
         info!(
-            "Executing prompt '{}' (max_sessions: {:?})",
+            "Launching prompt '{}' (max_sessions: {:?})",
             prompt_id, max_sessions
         );
 
-        // Run prompt via HTTP API
         let client = reqwest::Client::new();
         let base_url = crate::mcp::types::get_self_base_url_from_env();
 
@@ -866,42 +918,30 @@ impl SchedulerService {
             return Err(format!("Failed to run prompt: {}", error_text));
         }
 
-        // Parse response
         let response_json: serde_json::Value = response
             .json()
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        let session_id = response_json
+        response_json
             .get("session_id")
             .and_then(|v| v.as_str())
-            .map(String::from);
-
-        // Success is determined by checkpoint completion
-        let success = response_json
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        Ok((success, session_id))
+            .map(String::from)
+            .ok_or_else(|| "Prompt run endpoint omitted session_id".to_string())
     }
 
-    /// Execute an auto-fix task
-    async fn execute_auto_fix(
+    /// Launch an auto-fix run via the ad-hoc prompts endpoint and return the
+    /// `session_id`. Same non-blocking semantics as `launch_prompt`.
+    async fn launch_auto_fix(
         &self,
         check_findings: bool,
-        force_run: bool,
-    ) -> Result<(bool, Option<String>), String> {
-        info!(
-            "Executing auto-fix (check_findings: {}, force_run: {})",
-            check_findings, force_run
-        );
+        _force_run: bool,
+    ) -> Result<String, String> {
+        info!("Launching auto-fix (check_findings: {})", check_findings);
 
-        // Trigger auto-fix via HTTP API
         let client = reqwest::Client::new();
         let base_url = crate::mcp::types::get_self_base_url_from_env();
 
-        // Build the auto-fix prompt (similar to handleAnalyzeAll in ExecutionReport.tsx)
         let prompt = if check_findings {
             r#"You are in auto-fix mode. Check for any auto-fixable findings (code_bug, security, test_issue, documentation) and fix them.
 
@@ -943,19 +983,16 @@ After making fixes, run tests if applicable to verify the fixes work."#
             return Err(format!("Failed to trigger auto-fix: {}", error_text));
         }
 
-        // Parse response
         let response_json: serde_json::Value = response
             .json()
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        let success = response_json
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-
-        // Auto-fix doesn't have a session ID in the traditional sense
-        Ok((success, None))
+        response_json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| "Auto-fix run endpoint omitted session_id".to_string())
     }
 
     /// Check if a specific task is currently running

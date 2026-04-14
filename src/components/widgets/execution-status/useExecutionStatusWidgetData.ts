@@ -28,7 +28,8 @@ function deriveCurrentActivity(
   workflowStage: string | null,
   currentStepName: string | null,
   iteration: number,
-  maxIterations: number,
+  /** `null` = unlimited; rendered as "∞" in iteration counters. */
+  maxIterations: number | null,
   stepStats: { total: number; completed: number; failed: number } | null,
   currentStageIndex: number | null,
   totalStages: number | null,
@@ -64,7 +65,7 @@ function deriveCurrentActivity(
       if (failedCount > 0) {
         return `AI fixing ${failedCount} failed check${failedCount !== 1 ? "s" : ""}`;
       }
-      return `AI session (iteration ${iteration}/${maxIterations})`;
+      return `AI session (iteration ${iteration}/${maxIterations ?? "∞"})`;
     }
 
     case "completion":
@@ -162,7 +163,8 @@ export function useExecutionStatusWidgetData(): ExecutionStatusWidgetData {
         isComplete: r.isComplete,
       })),
       currentIteration: context?.iteration ?? 0,
-      maxIterations: context?.maxIterations ?? 0,
+      // null = unlimited; pass through verbatim so trend charts can render "∞".
+      maxIterations: context?.maxIterations ?? null,
     };
   }, [context]);
 
@@ -187,9 +189,12 @@ export function useExecutionStatusWidgetData(): ExecutionStatusWidgetData {
     const avgIterMs = context?.timelineStats?.avgIterationDurationMs ?? null;
     let etaSeconds: number | null = null;
 
+    // ETA is only meaningful when the loop has a known upper bound. For
+    // uncapped runs (`maxIterations == null`) the ETA stays null.
     if (
       context?.status === "running" &&
       avgIterMs &&
+      context.maxIterations != null &&
       context.maxIterations > 0 &&
       context.iteration > 0
     ) {

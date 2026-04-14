@@ -76,7 +76,8 @@ interface OrchestratorStateResponse {
   workflow_stage: WorkflowStage;
   workflow_stage_display: string;
   iteration: number;
-  max_iterations: number;
+  /** `null` indicates an unlimited cap. */
+  max_iterations: number | null;
   has_verification_plan: boolean;
   is_complete: boolean;
   is_paused: boolean;

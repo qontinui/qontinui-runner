@@ -187,9 +187,11 @@ export const CompactRunCard = forwardRef<HTMLButtonElement, CompactRunCardProps>
           <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
             <span className={colors.text}>{statusDisplay.label}</span>
             {elapsed && <span className="font-mono">{elapsed}</span>}
-            {run.maxIterations > 1 && (
+            {/* Show iteration counter when there's a meaningful cap (>1) or
+                when the run is uncapped (null = unlimited, render as ∞). */}
+            {(run.maxIterations == null || run.maxIterations > 1) && (
               <span>
-                {run.iteration}/{run.maxIterations}
+                {run.iteration}/{run.maxIterations ?? "∞"}
               </span>
             )}
           </div>

@@ -29,7 +29,8 @@ export interface MultiRunnerSpecWorkflowInput {
   partitionStrategy?: PartitionStrategy;
   /** Shared loop settings applied to every loop entry. */
   loopSettings?: {
-    maxIterations?: number;
+    /** `null` (or omitted) = unlimited iterations. */
+    maxIterations?: number | null;
     supervisorPort?: number;
     exitStrategy?:
       | { type: "reflection" }
@@ -81,7 +82,8 @@ export interface MultiLoopEntry {
     target_runner_id: string | null;
     supervisor_port: number;
     workflow_id: string;
-    max_iterations: number;
+    /** `null` indicates an unlimited cap. */
+    max_iterations: number | null;
     exit_strategy: { type: string };
     between_iterations: { type: string; rebuild?: boolean };
     retry_on_failure: boolean;
@@ -182,7 +184,9 @@ export function buildMultiRunnerSpecWorkflow(
         target_runner_id: runner.runnerId,
         supervisor_port: loopSettings.supervisorPort ?? 9875,
         workflow_id: workflow.id ?? "",
-        max_iterations: loopSettings.maxIterations ?? 5,
+        // null = unlimited (matches the new convention); only fall back to a
+        // concrete cap if the caller explicitly opts in via loopSettings.
+        max_iterations: loopSettings.maxIterations ?? null,
         exit_strategy: loopSettings.exitStrategy ?? { type: "reflection" },
         between_iterations: loopSettings.betweenIterations ?? { type: "none" },
         retry_on_failure: loopSettings.retryOnFailure ?? false,

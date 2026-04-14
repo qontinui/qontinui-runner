@@ -121,6 +121,37 @@ export function useChangeTrackingEvents(
           }
 
           const ct = changeTrackerRef.current;
+
+          // P1.3 — Wire SPA route changes into the change buffer. The
+          // NavigationTracker dispatches `navigation:change` on the
+          // registry; we relay each one as a route-change buffer entry so
+          // `/ai/change-buffer/drain` returns SPA navigations interleaved
+          // with DOM mutations. Subscription is idempotent: we attach once
+          // per ChangeTracker instance and store the unsubscribe on the
+          // tracker so a future `disable_change_buffer` doesn't leak it.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- introspection on bridge for backward compat
+          const ctAny = ct as any;
+          if (!ctAny.__routeSubscribed) {
+            ctAny.__routeSubscribed = true;
+            const bridgeWithRegistry = currentBridge as {
+              registry?: {
+                on?: (
+                  type: string,
+                  cb: (event: { data?: { from?: { url?: string }; to?: { url?: string } } }) => void,
+                ) => () => void;
+              };
+            };
+            const reg = bridgeWithRegistry.registry;
+            if (reg?.on) {
+              reg.on("navigation:change", (event) => {
+                if (typeof ct.pushRouteChange !== "function") return;
+                const fromUrl = event?.data?.from?.url ?? "";
+                const toUrl = event?.data?.to?.url ?? "";
+                ct.pushRouteChange(fromUrl, toUrl, Date.now());
+              });
+            }
+          }
+
           const ctResult = await handleChangeTrackingCommand(
             ct,
             type,

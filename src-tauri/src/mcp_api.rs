@@ -314,6 +314,10 @@ pub fn create_router(
         pairing_manager: Arc::new(crate::mcp::transport::pairing::PairingManager::new()),
     });
 
+    // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
+    // `State<'_, Arc<ApiState>>` (e.g. start_cloud_relay) can resolve it.
+    app_handle.manage(api_state.clone());
+
     // Set up UI Bridge response listener
     // This listens for "ui-bridge-response" events from the React frontend
     // and delivers responses to waiting HTTP handlers

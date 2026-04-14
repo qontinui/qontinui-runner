@@ -141,7 +141,11 @@ export function ExecutionStatusSummary({ data }: ExecutionStatusSummaryProps) {
       {iterationTrend.currentIteration > 0 && (
         <div className="text-[10px] text-muted-foreground text-center pt-1 border-t border-border/30">
           Iteration {iterationTrend.currentIteration}
-          {iterationTrend.maxIterations > 0 ? ` / ${iterationTrend.maxIterations}` : ""}
+          {iterationTrend.maxIterations == null
+            ? " / ∞"
+            : iterationTrend.maxIterations > 0
+              ? ` / ${iterationTrend.maxIterations}`
+              : ""}
         </div>
       )}
     </div>

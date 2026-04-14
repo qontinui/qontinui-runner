@@ -956,14 +956,34 @@ fn wrap_ipc_result(
 /// Get all registered UI elements from the React UI Bridge.
 pub async fn ui_bridge_get_elements_handler(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Query(query): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    (HeaderMap, Json<ApiResponse<serde_json::Value>>),
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let refresh = query
         .get("refresh")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    info!("UI Bridge API: Getting all elements (refresh={})", refresh);
+    // P3.2: opt-in legacy shape via `?v=1` query or `X-Api-Version: 1` header.
+    // Default (no opt-in) returns the v2 wrapped object; the deprecation header
+    // is attached only when v1 is in effect so v2 callers don't see noise.
+    let api_version_v1 = query
+        .get("v")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+        || headers
+            .get("x-api-version")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+
+    info!(
+        "UI Bridge API: Getting all elements (refresh={}, v1={})",
+        refresh, api_version_v1
+    );
 
     // Optional pre-fetch discover to defeat the well-known
     // "stale registry after navigation" gotcha. Without `?refresh=true`,
@@ -988,7 +1008,38 @@ pub async fn ui_bridge_get_elements_handler(
     }
 
     match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(data) => {
+            let mut resp_headers = HeaderMap::new();
+            // The IPC response is either a raw array or `{ elements: [...] }`.
+            // Normalize to a Vec<Value> we can re-wrap in either shape.
+            let elements_array: Vec<serde_json::Value> = if data.is_array() {
+                data.as_array().cloned().unwrap_or_default()
+            } else if let Some(arr) = data.get("elements").and_then(|v| v.as_array()) {
+                arr.clone()
+            } else {
+                Vec::new()
+            };
+
+            let payload = if api_version_v1 {
+                // Legacy shape: data: [...] (raw list).
+                resp_headers.insert(
+                    "X-Api-Deprecation",
+                    "data shape changed in v2; use ?v=1 for old shape"
+                        .parse()
+                        .unwrap(),
+                );
+                serde_json::Value::Array(elements_array)
+            } else {
+                // v2: wrapped object with elements/count/timestamp.
+                let count = elements_array.len();
+                serde_json::json!({
+                    "elements": elements_array,
+                    "count": count,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            };
+            Ok((resp_headers, Json(ApiResponse::success(payload))))
+        }
         Err(e) => {
             error!("UI Bridge API: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
@@ -996,21 +1047,140 @@ pub async fn ui_bridge_get_elements_handler(
     }
 }
 
+/// Allowed top-level field names for the `?fields=` filter on
+/// `GET /control/element/{id}`. Unknown names are silently dropped to keep
+/// callers forward-compatible if the element schema gains fields later.
+///
+/// `state.computedStyles` is special-cased: when requested, the entire `state`
+/// object is filtered down to only `{computedStyles: ...}` rather than being
+/// returned in full.
+const ELEMENT_ALLOWED_FIELDS: &[&str] = &[
+    "id",
+    "type",
+    "label",
+    "text",
+    "value",
+    "visible",
+    "enabled",
+    "focused",
+    "rect",
+    "normalizedRect",
+    "ariaLabel",
+    "actions",
+    "state",
+    "state.computedStyles",
+    // Common related fields that callers also rely on; cheap to include.
+    "category",
+    "identifier",
+    "registeredAt",
+    "mounted",
+    "customActions",
+];
+
+/// Filter an element JSON object down to a requested subset of top-level
+/// fields. The `fields` parameter is a comma-separated list parsed from the
+/// `?fields=` query string. Unknown names are dropped silently.
+///
+/// Special handling: when `state.computedStyles` (or `state` itself) appears
+/// in the requested list, only the matching nested keys are kept inside
+/// `state`.
+fn filter_element_fields(element: &serde_json::Value, fields_csv: &str) -> serde_json::Value {
+    let requested: Vec<&str> = fields_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| ELEMENT_ALLOWED_FIELDS.contains(s))
+        .collect();
+
+    if requested.is_empty() {
+        // No allowed fields after filtering — return an empty object instead
+        // of the full payload so callers get a consistent "you asked for
+        // nothing useful" response.
+        return serde_json::json!({});
+    }
+
+    let Some(obj) = element.as_object() else {
+        return element.clone();
+    };
+
+    let want_state_full = requested.contains(&"state");
+    let want_state_styles = requested.contains(&"state.computedStyles");
+
+    let mut out = serde_json::Map::new();
+    for &name in &requested {
+        if name == "state.computedStyles" {
+            // Handled below in the state composition step.
+            continue;
+        }
+        if name == "state" {
+            // Will be filled in below.
+            continue;
+        }
+        if let Some(v) = obj.get(name) {
+            out.insert(name.to_string(), v.clone());
+        }
+    }
+
+    if want_state_full {
+        if let Some(state) = obj.get("state") {
+            out.insert("state".to_string(), state.clone());
+        }
+    } else if want_state_styles {
+        if let Some(state_obj) = obj.get("state").and_then(|v| v.as_object()) {
+            let mut sub = serde_json::Map::new();
+            if let Some(cs) = state_obj.get("computedStyles") {
+                sub.insert("computedStyles".to_string(), cs.clone());
+            }
+            out.insert("state".to_string(), serde_json::Value::Object(sub));
+        }
+    }
+
+    serde_json::Value::Object(out)
+}
+
 /// Get a specific element by ID.
+///
+/// Optional query param `?fields=id,label,rect,...` returns only the listed
+/// top-level fields (server-side filter — the IPC fetches the full element
+/// either way). Unknown field names are silently dropped. See
+/// `ELEMENT_ALLOWED_FIELDS` for the supported list.
 pub async fn ui_bridge_get_element_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting element {}", id);
 
-    wrap_ipc_result(
-        ui_bridge_request_sync(
-            &state,
-            "get_element",
-            serde_json::json!({ "elementId": id }),
-        )
-        .await,
+    let fields_csv = query.get("fields").cloned();
+
+    let result = ui_bridge_request_sync(
+        &state,
+        "get_element",
+        serde_json::json!({ "elementId": id }),
     )
+    .await;
+
+    // Apply field filtering up-front, then delegate to wrap_ipc_result so we
+    // preserve the same success/failure envelope as before (including the
+    // `success: false` detection for IPC-layer errors).
+    let filtered_result = result.map(|mut data| {
+        if let Some(csv) = fields_csv {
+            // Frontend wraps the element either at top level or under
+            // `data.element`. Filter both possible shapes in place so
+            // callers get the same envelope they already use.
+            if let Some(el) = data.get("element").cloned() {
+                let filtered = filter_element_fields(&el, &csv);
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("element".to_string(), filtered);
+                }
+            } else if data.is_object() {
+                data = filter_element_fields(&data, &csv);
+            }
+        }
+        data
+    });
+
+    wrap_ipc_result(filtered_result)
 }
 
 /// Declarative element assertion — check multiple predicates against a registered element.
@@ -9543,9 +9713,737 @@ pub async fn ui_bridge_page_summary_handler(
     }
 }
 
+/// POST /ui-bridge/control/wait-for-element-state
+///
+/// Convenience wrapper around `wait_for_element` for the common case of
+/// "wait until element <id> is visible / enabled / focused". Polls the
+/// element registry every ~100ms until the state matches or the timeout
+/// elapses.
+///
+/// Body: `{ "id": "button-x", "state": "visible" | "enabled" | "focused",
+///          "timeout_ms": 5000 }`
+///
+/// Returns 200 with `{found: true, elapsed_ms, state: {...}}` on match or
+/// `{found: false, elapsed_ms}` on timeout.
+pub async fn ui_bridge_wait_for_element_state_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let id = body
+        .get("id")
+        .or_else(|| body.get("elementId"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let state_name = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("visible")
+        .to_string();
+    let timeout_ms = body
+        .get("timeout_ms")
+        .or_else(|| body.get("timeout"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5000);
+
+    let id = match id {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error("wait-for-element-state: 'id' is required")),
+            ));
+        }
+    };
+
+    // Map the simple state name to the field on the registered element that
+    // we're polling. The registry exposes these as booleans on the element
+    // object's `state` block.
+    let state_field = match state_name.as_str() {
+        "visible" => "visible",
+        "enabled" => "enabled",
+        "focused" => "focused",
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "wait-for-element-state: unknown state '{other}', expected visible|enabled|focused"
+                ))),
+            ));
+        }
+    };
+
+    let poll_interval_ms = 100u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let start = std::time::Instant::now();
+
+    info!(
+        "UI Bridge API: wait-for-element-state id={} state={} timeout={}ms",
+        id, state_name, timeout_ms
+    );
+
+    loop {
+        let lookup = ui_bridge_request_sync(
+            &state,
+            "get_element",
+            serde_json::json!({ "elementId": id }),
+        )
+        .await;
+
+        if let Ok(data) = lookup {
+            // Element returned — extract the state block (either nested at
+            // `data.element.state` or at `data.state` depending on shape).
+            let element = data
+                .get("element")
+                .cloned()
+                .unwrap_or_else(|| data.clone());
+            let matched = element
+                .get("state")
+                .and_then(|s| s.get(state_field))
+                .and_then(|v| v.as_bool())
+                .or_else(|| {
+                    // Some shapes expose `visible`/`enabled`/`focused` at the
+                    // top level rather than under `state`.
+                    element.get(state_field).and_then(|v| v.as_bool())
+                })
+                .unwrap_or(false);
+            if matched {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                return Ok(Json(ApiResponse::success(serde_json::json!({
+                    "found": true,
+                    "elapsed_ms": elapsed_ms,
+                    "state": element.get("state").cloned().unwrap_or(serde_json::Value::Null),
+                }))));
+            }
+        }
+
+        if std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms) > deadline
+        {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            return Ok(Json(ApiResponse::success(serde_json::json!({
+                "found": false,
+                "elapsed_ms": elapsed_ms,
+            }))));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+    }
+}
+
+/// Match a path string against a glob pattern. `*` matches a single path
+/// segment (no `/`); `**` matches any sequence of characters including `/`.
+/// All other characters match literally.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    fn helper(p: &[u8], s: &[u8]) -> bool {
+        let mut pi = 0usize;
+        let mut si = 0usize;
+        let mut star: Option<(usize, usize)> = None; // (pattern_idx_after_*, source_idx_when_started)
+        let mut star_is_double = false;
+
+        while si < s.len() {
+            if pi < p.len() && p[pi] == b'*' {
+                let double = pi + 1 < p.len() && p[pi + 1] == b'*';
+                if double {
+                    pi += 2;
+                } else {
+                    pi += 1;
+                }
+                star = Some((pi, si));
+                star_is_double = double;
+                continue;
+            }
+            if pi < p.len() && p[pi] == s[si] {
+                pi += 1;
+                si += 1;
+                continue;
+            }
+            // Mismatch — backtrack to last star, advance source by one char.
+            if let Some((p_after, s_start)) = star {
+                // Single-star can't cross a path separator.
+                if !star_is_double && s[s_start] == b'/' {
+                    return false;
+                }
+                if !star_is_double {
+                    // Walk forward but stop if we'd consume a '/'.
+                    let next = s_start + 1;
+                    if next > s.len() {
+                        return false;
+                    }
+                    if s_start < s.len() && s[s_start] == b'/' {
+                        return false;
+                    }
+                    star = Some((p_after, next));
+                    si = next;
+                    pi = p_after;
+                    continue;
+                } else {
+                    let next = s_start + 1;
+                    star = Some((p_after, next));
+                    si = next;
+                    pi = p_after;
+                    continue;
+                }
+            }
+            return false;
+        }
+        // Trailing stars in the pattern still match.
+        while pi < p.len() && p[pi] == b'*' {
+            pi += 1;
+            if pi < p.len() && p[pi] == b'*' {
+                pi += 1;
+            }
+        }
+        pi == p.len()
+    }
+    helper(pattern.as_bytes(), path.as_bytes())
+}
+
+/// POST /ui-bridge/control/wait-for-route
+///
+/// Wait until the current page route matches the given glob pattern.
+/// Polls `page.route.pattern` (falling back to `page.pathname`) on the
+/// snapshot every ~100ms.
+///
+/// Body: `{ "pattern": "/settings*", "timeout_ms": 5000 }`
+///
+/// Returns 200 with `{matched: true, route, elapsed_ms}` on match or
+/// `{matched: false, route, elapsed_ms}` on timeout.
+pub async fn ui_bridge_wait_for_route_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+    let pattern = match body.get("pattern").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error("wait-for-route: 'pattern' is required")),
+            ));
+        }
+    };
+    let timeout_ms = body
+        .get("timeout_ms")
+        .or_else(|| body.get("timeout"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5000);
+
+    let poll_interval_ms = 100u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let start = std::time::Instant::now();
+    let mut last_route: serde_json::Value = serde_json::Value::Null;
+
+    info!(
+        "UI Bridge API: wait-for-route pattern={} timeout={}ms",
+        pattern, timeout_ms
+    );
+
+    loop {
+        let snap = ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await;
+        if let Ok(data) = snap {
+            // Snapshot exposes `page.route.pattern`, `page.pathname`,
+            // `page.url`. We try them in order so this works for apps that
+            // haven't called `setRouteInfo` yet.
+            let page = data
+                .get("page")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let route_pattern = page
+                .get("route")
+                .and_then(|r| r.get("pattern"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let pathname = page
+                .get("pathname")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let candidate = route_pattern
+                .clone()
+                .or_else(|| pathname.clone())
+                .unwrap_or_default();
+            last_route = serde_json::json!({
+                "pattern": route_pattern,
+                "pathname": pathname,
+                "url": page.get("url").cloned().unwrap_or(serde_json::Value::Null),
+            });
+            if glob_match(&pattern, &candidate) {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                return Ok(Json(ApiResponse::success(serde_json::json!({
+                    "matched": true,
+                    "route": last_route,
+                    "elapsed_ms": elapsed_ms,
+                }))));
+            }
+        }
+
+        if std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms) > deadline
+        {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            return Ok(Json(ApiResponse::success(serde_json::json!({
+                "matched": false,
+                "route": last_route,
+                "elapsed_ms": elapsed_ms,
+            }))));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+    }
+}
+
+/// POST /ui-bridge/control/batch
+///
+/// Execute a sequence of element actions and report per-step timing plus a
+/// snapshot diff (element ids added / removed) between pre- and post-batch.
+///
+/// Body: `{ "steps": [{"action": "click", "elementId": "button-x"},
+///                    {"action": "type", "elementId": "input-y",
+///                     "params": {"text": "hello"}}],
+///          "stopOnError": true }`
+///
+/// Returns:
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "results": [{"step": 0, "success": true, "durationMs": 68.5}, ...],
+///     "totalMs": 142.3,
+///     "snapshotDiff": {"addedIds": [...], "removedIds": [...], ...}
+///   }
+/// }
+/// ```
+///
+/// On first failure with `stopOnError: true`, stops and returns the partial
+/// results with `success: false` at the top level. With `stopOnError: false`,
+/// continues through all steps regardless of failures.
+pub async fn ui_bridge_control_batch_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let steps = request
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let stop_on_error = request
+        .get("stopOnError")
+        .or_else(|| request.get("stopOnFailure"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    info!(
+        "UI Bridge API: control batch ({} steps, stopOnError={})",
+        steps.len(),
+        stop_on_error
+    );
+
+    // Pre-snapshot for diffing. Best-effort — if it fails we report a null
+    // diff but still execute the batch.
+    let pre_snapshot =
+        ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({}))
+            .await
+            .ok();
+
+    let total_start = std::time::Instant::now();
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(steps.len());
+    let mut all_succeeded = true;
+    let mut stopped_early = false;
+
+    for (i, step) in steps.iter().enumerate() {
+        let element_id = step
+            .get("elementId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let action = step
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("click");
+        let params = step.get("params").cloned();
+
+        let payload = serde_json::json!({
+            "elementId": element_id,
+            "action": {
+                "action": action,
+                "params": params,
+            },
+        });
+
+        let step_start = std::time::Instant::now();
+        let res = ui_bridge_request_sync(&state, "execute_action", payload).await;
+        let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+
+        let (ok, response_value) = match res {
+            Ok(data) => {
+                let success = data
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                (success, data)
+            }
+            Err(e) => (false, serde_json::json!({"success": false, "error": e})),
+        };
+
+        results.push(serde_json::json!({
+            "step": i,
+            "success": ok,
+            "durationMs": duration_ms,
+            "elementId": element_id,
+            "action": action,
+            "response": response_value,
+        }));
+
+        if !ok {
+            all_succeeded = false;
+            if stop_on_error {
+                stopped_early = true;
+                break;
+            }
+        }
+    }
+
+    let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Post-snapshot for diffing.
+    let post_snapshot =
+        ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({}))
+            .await
+            .ok();
+    let snapshot_diff = compute_snapshot_diff(pre_snapshot.as_ref(), post_snapshot.as_ref());
+
+    let payload = serde_json::json!({
+        "results": results,
+        "totalMs": total_ms,
+        "snapshotDiff": snapshot_diff,
+        "stoppedEarly": stopped_early,
+    });
+
+    // Top-level success bit reflects whether every executed step passed —
+    // matches the contract in the task spec.
+    if all_succeeded {
+        Ok(Json(ApiResponse::success(payload)))
+    } else {
+        Ok(Json(ApiResponse {
+            success: false,
+            data: Some(payload),
+            error: Some("One or more batch steps failed".to_string()),
+            error_detail: None,
+        }))
+    }
+}
+
+/// Compute a minimal id-set diff between two snapshot JSON values.
+/// Returns counts plus the actual id arrays so callers can react to specific
+/// elements that appeared/disappeared. Falls back to an empty diff if either
+/// snapshot is missing.
+fn compute_snapshot_diff(
+    pre: Option<&serde_json::Value>,
+    post: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    fn extract_ids(snap: Option<&serde_json::Value>) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        if let Some(s) = snap {
+            if let Some(arr) = s.get("elements").and_then(|e| e.as_array()) {
+                for el in arr {
+                    if let Some(id) = el.get("id").and_then(|v| v.as_str()) {
+                        out.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    let pre_ids = extract_ids(pre);
+    let post_ids = extract_ids(post);
+    let added: Vec<String> = post_ids.difference(&pre_ids).cloned().collect();
+    let removed: Vec<String> = pre_ids.difference(&post_ids).cloned().collect();
+
+    serde_json::json!({
+        "addedIds": added,
+        "removedIds": removed,
+        "addedCount": added.len(),
+        "removedCount": removed.len(),
+        "preCount": pre_ids.len(),
+        "postCount": post_ids.len(),
+    })
+}
+
+/// GET /ui-bridge/_routes
+///
+/// Returns the list of registered UI Bridge routes (method + path) sorted by
+/// path. Used by SDKs and tests to discover what the runner exposes without
+/// having to read the source.
+///
+/// The list is generated by walking the static manifest in `route_manifest()`
+/// — kept in sync with the actual `routes()` registrations by hand. A unit
+/// test in this module asserts that every entry resolves to a known handler.
+pub async fn ui_bridge_routes_manifest_handler()
+-> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut entries: Vec<(String, String)> = route_manifest()
+        .iter()
+        .map(|(m, p)| (m.to_string(), p.to_string()))
+        .collect();
+    // Sort by path first, then method, so paths with multiple methods stay
+    // adjacent in the output.
+    entries.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+
+    let routes_json: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(method, path)| serde_json::json!({"method": method, "path": path}))
+        .collect();
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "routes": routes_json,
+        "count": routes_json.len(),
+    }))))
+}
+
+/// Static manifest of every UI Bridge route registered by `routes()`. Kept
+/// in sync by hand — adding a new `.route(...)` call below should be paired
+/// with a new `(method, path)` entry here. The `_routes` endpoint reads from
+/// this list.
+///
+/// When a path supports multiple methods (e.g. GET+POST on the same URL),
+/// list each method as a separate tuple.
+fn route_manifest() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("GET", "/ui-bridge/_routes"),
+        ("GET", "/ui-bridge/control/elements"),
+        ("GET", "/ui-bridge/control/elements/last-discovered"),
+        ("GET", "/ui-bridge/ai/elements/last-discovered"),
+        ("GET", "/ui-bridge/control/element/{id}"),
+        ("POST", "/ui-bridge/control/element/{id}/assert"),
+        ("POST", "/ui-bridge/control/element/{id}/action"),
+        ("POST", "/ui-bridge/control/batch-actions"),
+        ("POST", "/ui-bridge/control/batch"),
+        ("GET", "/ui-bridge/control/components"),
+        ("GET", "/ui-bridge/control/component/{id}"),
+        ("POST", "/ui-bridge/control/component/{id}/action/{action_id}"),
+        ("POST", "/ui-bridge/control/discover"),
+        ("GET", "/ui-bridge/control/snapshot"),
+        ("GET", "/ui-bridge/control/windows"),
+        ("GET", "/ui-bridge/control/annotated-screenshot"),
+        ("GET", "/ui-bridge/control/console-errors"),
+        ("POST", "/ui-bridge/control/console-errors/clear"),
+        ("GET", "/ui-bridge/control/browser-events"),
+        ("GET", "/ui-bridge/control/timeline"),
+        ("GET", "/ui-bridge/control/network-chains"),
+        ("GET", "/ui-bridge/control/error-snapshots"),
+        ("GET", "/ui-bridge/control/error-report"),
+        ("POST", "/ui-bridge/control/error-sessions/start"),
+        ("POST", "/ui-bridge/control/error-sessions/end"),
+        ("GET", "/ui-bridge/control/error-sessions"),
+        ("GET", "/ui-bridge/control/forms"),
+        ("POST", "/ui-bridge/control/fill"),
+        ("POST", "/ui-bridge/control/forms/snapshot"),
+        ("POST", "/ui-bridge/control/forms/diff"),
+        ("GET", "/ui-bridge/ai/forms"),
+        ("POST", "/ui-bridge/ai/fill-form"),
+        ("POST", "/ui-bridge/ai/design-audit"),
+        ("GET", "/ui-bridge/control/clipboard"),
+        ("POST", "/ui-bridge/control/clipboard"),
+        ("GET", "/ui-bridge/control/network-requests"),
+        ("GET", "/ui-bridge/control/network-requests/in-flight"),
+        ("POST", "/ui-bridge/control/network-requests/wait"),
+        ("GET", "/ui-bridge/control/network-request/{id}"),
+        ("GET", "/ui-bridge/control/specs"),
+        ("GET", "/ui-bridge/control/spec/{id}"),
+        ("POST", "/ui-bridge/control/page/refresh"),
+        ("POST", "/ui-bridge/control/page/hard-refresh"),
+        ("POST", "/ui-bridge/control/page/navigate"),
+        ("POST", "/ui-bridge/control/page/back"),
+        ("POST", "/ui-bridge/control/page/forward"),
+        ("POST", "/ui-bridge/control/query-selector"),
+        ("POST", "/ui-bridge/control/page/evaluate"),
+        ("POST", "/ui-bridge/control/page/evaluate-raw"),
+        ("POST", "/ui-bridge/control/page/evaluate-safe"),
+        ("POST", "/ui-bridge/control/page/evaluate-batch"),
+        ("POST", "/ui-bridge/control/page/find-by-text"),
+        ("POST", "/ui-bridge/control/page/click-by-text"),
+        ("POST", "/ui-bridge/control/page/click-by-selector"),
+        ("POST", "/ui-bridge/control/page/read-value"),
+        ("POST", "/ui-bridge/control/page/type-into"),
+        ("POST", "/ui-bridge/control/page/summary"),
+        ("POST", "/ui-bridge/ai/page-summary"),
+        ("POST", "/ui-bridge/control/assert"),
+        ("GET", "/ui-bridge/control/design/element/{id}/styles"),
+        ("POST", "/ui-bridge/control/design/element/{id}/state-styles"),
+        ("POST", "/ui-bridge/control/design/snapshot"),
+        ("POST", "/ui-bridge/control/design/responsive"),
+        ("POST", "/ui-bridge/control/design/audit"),
+        ("POST", "/ui-bridge/control/design/style-guide/load"),
+        ("GET", "/ui-bridge/control/design/style-guide"),
+        ("POST", "/ui-bridge/control/design/style-guide/clear"),
+        ("GET", "/ui-bridge/control/ai/bookmarks"),
+        ("POST", "/ui-bridge/control/ai/bookmarks"),
+        ("GET", "/ui-bridge/control/ai/bookmark/{name}"),
+        ("DELETE", "/ui-bridge/control/ai/bookmark/{name}"),
+        ("GET", "/ui-bridge/control/ai/bookmark/{name}/diff"),
+        ("POST", "/ui-bridge/control/ai/execute-with-diff"),
+        ("POST", "/ui-bridge/control/ai/wait-for-change"),
+        ("GET", "/ui-bridge/control/ai/categorize-last-diff"),
+        ("POST", "/ui-bridge/control/ai/scoped-diff"),
+        ("POST", "/ui-bridge/control/ai/summarize-diff"),
+        ("POST", "/ui-bridge/control/ai/structured-changes"),
+        ("POST", "/ui-bridge/control/ai/change-buffer/enable"),
+        ("POST", "/ui-bridge/control/ai/change-buffer/disable"),
+        ("POST", "/ui-bridge/control/ai/change-buffer/drain"),
+        ("GET", "/ui-bridge/control/ai/change-buffer/size"),
+        ("GET", "/ui-bridge/control/keyboard-shortcuts"),
+        ("GET", "/ui-bridge/control/idle-status"),
+        ("POST", "/ui-bridge/control/wait-for-navigation"),
+        ("POST", "/ui-bridge/ai/wait-for-navigation"),
+        ("POST", "/ui-bridge/control/wait-for-idle"),
+        ("GET", "/ui-bridge/ai/idle-status"),
+        ("POST", "/ui-bridge/ai/wait-for-idle"),
+        ("POST", "/ui-bridge/control/wait-for-element"),
+        ("POST", "/ui-bridge/ai/wait-for-element"),
+        ("POST", "/ui-bridge/control/wait-for-element-state"),
+        ("POST", "/ui-bridge/control/wait-for-element-stable"),
+        ("POST", "/ui-bridge/control/wait-for-route"),
+        ("POST", "/ui-bridge/ai/wait-for-route"),
+        ("POST", "/ui-bridge/ai/expect"),
+        ("POST", "/ui-bridge/control/diagnose-stuck"),
+        ("POST", "/ui-bridge/control/page-health"),
+        ("POST", "/ui-bridge/control/ai/search"),
+        ("POST", "/ui-bridge/control/ai/find"),
+        ("POST", "/ui-bridge/control/capture-element-images"),
+        ("POST", "/ui-bridge/control/get-element-images"),
+        ("POST", "/ui-bridge/control/find"),
+        ("GET", "/ui-bridge/control/workflows"),
+        ("POST", "/ui-bridge/control/workflow/{id}/run"),
+        ("GET", "/ui-bridge/control/workflow/{run_id}/status"),
+        ("GET", "/ui-bridge/control/element/{id}/state"),
+        ("GET", "/ui-bridge/control/render-log"),
+        ("POST", "/ui-bridge/control/render-log"),
+        ("GET", "/ui-bridge/render-log"),
+        ("POST", "/ui-bridge/render-log"),
+        ("POST", "/ui-bridge/control/action-plan"),
+        ("GET", "/ui-bridge/control/action-plan/cache"),
+        ("GET", "/ui-bridge/control/action-plan/cache/stats"),
+        ("POST", "/ui-bridge/batch"),
+        ("POST", "/ui-bridge/control/with-diff"),
+        ("GET", "/ui-bridge/diagnostics"),
+        ("GET", "/ui-bridge/diagnostics/readiness"),
+        ("POST", "/ui-bridge/circuit-breaker/reset"),
+        ("POST", "/ui-bridge/pong"),
+        ("POST", "/ui-bridge/ipc-response"),
+        ("POST", "/ui-bridge/explore"),
+        ("GET", "/ui-bridge/explore/status"),
+        ("GET", "/ui-bridge/explore/results"),
+        ("POST", "/ui-bridge/explore/stop"),
+        ("POST", "/ui-bridge/discover-states"),
+        ("GET", "/ui-bridge/ai/bookmarks"),
+        ("POST", "/ui-bridge/ai/bookmarks"),
+        ("GET", "/ui-bridge/ai/bookmark/{name}"),
+        ("DELETE", "/ui-bridge/ai/bookmark/{name}"),
+        ("GET", "/ui-bridge/ai/bookmark/{name}/diff"),
+        ("POST", "/ui-bridge/ai/execute-with-diff"),
+        ("POST", "/ui-bridge/ai/wait-for-change"),
+        ("GET", "/ui-bridge/ai/categorize-last-diff"),
+        ("POST", "/ui-bridge/ai/scoped-diff"),
+        ("POST", "/ui-bridge/ai/summarize-diff"),
+        ("POST", "/ui-bridge/ai/structured-changes"),
+        ("POST", "/ui-bridge/ai/change-buffer/enable"),
+        ("POST", "/ui-bridge/ai/change-buffer/disable"),
+        ("POST", "/ui-bridge/ai/change-buffer/drain"),
+        ("GET", "/ui-bridge/ai/change-buffer/size"),
+        ("POST", "/ui-bridge/ai/search"),
+        ("POST", "/ui-bridge/ai/find"),
+        ("POST", "/ui-bridge/ai/execute"),
+        ("POST", "/ui-bridge/ai/assert"),
+        ("POST", "/ui-bridge/ai/assert-batch"),
+        ("GET", "/ui-bridge/ai/snapshot"),
+        ("GET", "/ui-bridge/ai/summary"),
+        ("GET", "/ui-bridge/capabilities"),
+        ("GET", "/ui-bridge/control/idle-status/{signal}"),
+        ("POST", "/ui-bridge/control/wait-for-idle/{signal}"),
+        ("POST", "/ui-bridge/control/wait-for-targets"),
+        ("GET", "/ui-bridge/control/action-history"),
+        ("GET", "/ui-bridge/control/metrics"),
+        ("GET", "/ui-bridge/control/annotations"),
+        ("POST", "/ui-bridge/control/annotations"),
+        ("GET", "/ui-bridge/control/annotation/{id}"),
+        ("PUT", "/ui-bridge/control/annotation/{id}"),
+        ("DELETE", "/ui-bridge/control/annotation/{id}"),
+        ("GET", "/ui-bridge/control/annotations/coverage"),
+        ("GET", "/ui-bridge/control/annotations/export"),
+        ("POST", "/ui-bridge/ai/media/find"),
+        ("POST", "/ui-bridge/ai/media/audit/{audit_type}"),
+        ("POST", "/ui-bridge/ai/media/snapshot"),
+        ("POST", "/ui-bridge/ai/media/analyze"),
+        ("POST", "/ui-bridge/ai/media/analyze/batch"),
+        ("POST", "/ui-bridge/ai/media/analyze/page"),
+        ("GET", "/ui-bridge/control/states"),
+        ("GET", "/ui-bridge/control/states/active"),
+        ("GET", "/ui-bridge/control/states/snapshot"),
+        ("POST", "/ui-bridge/control/states/find-path"),
+        ("POST", "/ui-bridge/control/states/navigate"),
+        ("GET", "/ui-bridge/control/state/{id}"),
+        ("POST", "/ui-bridge/control/state/{id}/activate"),
+        ("POST", "/ui-bridge/control/state/{id}/deactivate"),
+        ("GET", "/ui-bridge/control/state-groups"),
+        ("POST", "/ui-bridge/control/state-group/{id}/activate"),
+        ("POST", "/ui-bridge/control/state-group/{id}/deactivate"),
+        ("GET", "/ui-bridge/control/transitions"),
+        ("GET", "/ui-bridge/control/transition/{id}/can-execute"),
+        ("POST", "/ui-bridge/control/transition/{id}/execute"),
+        ("POST", "/ui-bridge/ai/semantic-search"),
+        ("GET", "/ui-bridge/ai/diff"),
+        ("GET", "/ui-bridge/control/intents"),
+        ("POST", "/ui-bridge/control/intents"),
+        ("POST", "/ui-bridge/control/intents/find"),
+        ("POST", "/ui-bridge/control/intents/execute"),
+        ("GET", "/ui-bridge/control/component/{id}/state"),
+        ("POST", "/ui-bridge/control/page/scroll"),
+        ("GET", "/ui-bridge/control/performance-entries"),
+        ("POST", "/ui-bridge/control/performance-entries/clear"),
+        ("POST", "/ui-bridge/ai/analyze/data"),
+        ("POST", "/ui-bridge/ai/analyze/regions"),
+        ("POST", "/ui-bridge/ai/analyze/structured-data"),
+        ("POST", "/ui-bridge/ai/analyze/cross-app-compare"),
+        ("POST", "/ui-bridge/ai/recovery/attempt"),
+        ("POST", "/ui-bridge/control/design/evaluate"),
+        ("POST", "/ui-bridge/control/design/evaluate/baseline"),
+        ("GET", "/ui-bridge/control/design/evaluate/contexts"),
+        ("POST", "/ui-bridge/control/design/evaluate/diff"),
+        ("POST", "/ui-bridge/ai/media/compare"),
+        ("POST", "/ui-bridge/ai/image-diff"),
+        ("POST", "/ui-bridge/control/ai/image-diff"),
+        ("GET", "/ui-bridge/control/element-screenshot"),
+        ("GET", "/ui-bridge/ai/element-screenshot"),
+        ("POST", "/ui-bridge/control/annotations/import"),
+        ("POST", "/ui-bridge/control/intents/execute-from-query"),
+        ("GET", "/ui-bridge/debug/element-tree"),
+        ("POST", "/ui-bridge/debug/highlight/{id}"),
+        ("GET", "/ui-bridge/control/health-signals"),
+        ("GET", "/ui-bridge/history/elements"),
+        ("GET", "/ui-bridge/history/element/{id}"),
+        ("GET", "/ui-bridge/history/flaky"),
+        ("GET", "/ui-bridge/graph/element-reliability"),
+        ("GET", "/ui-bridge/analytics/decay-curve"),
+        ("GET", "/ui-bridge/analytics/action-baselines"),
+        ("GET", "/ui-bridge/analytics/failure-taxonomy"),
+        ("GET", "/ui-bridge/analytics/fragility-heatmap"),
+        ("GET", "/ui-bridge/analytics/regressions"),
+        ("GET", "/ui-bridge/analytics/stall-frequency"),
+        ("GET", "/ui-bridge/analytics/intervention-effectiveness"),
+        ("GET", "/ui-bridge/analytics/state-coverage"),
+        ("GET", "/ui-bridge/analytics/annotation-gaps"),
+        ("GET", "/ui-bridge/analytics/health-score"),
+        ("GET", "/ui-bridge/analytics/recommendations"),
+        ("POST", "/ui-bridge/control/navigate-tab"),
+        ("POST", "/ui-bridge/control/clear-storage"),
+        ("POST", "/ui-bridge/control/navigate-and-wait"),
+        ("POST", "/ui-bridge/control/wait-for-network-idle"),
+    ]
+}
+
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
+        // P2.2 — Endpoint discovery
+        .route("/ui-bridge/_routes", get(ui_bridge_routes_manifest_handler))
         .route(
             "/ui-bridge/control/elements",
             get(ui_bridge_get_elements_handler),
@@ -9573,6 +10471,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/batch-actions",
             post(ui_bridge_batch_actions_handler),
+        )
+        // P3.4 — Sequential step execution with snapshot diffing
+        .route(
+            "/ui-bridge/control/batch",
+            post(ui_bridge_control_batch_handler),
         )
         .route(
             "/ui-bridge/control/components",
@@ -9680,6 +10583,19 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/forms/diff",
             post(ui_bridge_diff_forms_handler),
+        )
+        // P1.2 — `/ai/*` aliases for endpoints documented in the manual-test
+        // skill. Previously these returned 404 because the runner only
+        // exposed them under `/control/*` while callers (and the skill docs)
+        // used the `/ai/*` namespace.
+        .route("/ui-bridge/ai/forms", get(ui_bridge_get_forms_handler))
+        .route(
+            "/ui-bridge/ai/fill-form",
+            post(ui_bridge_fill_form_handler),
+        )
+        .route(
+            "/ui-bridge/ai/design-audit",
+            post(ui_bridge_design_audit_handler),
         )
         // Clipboard
         .route(
@@ -9910,6 +10826,20 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/ai/wait-for-element",
             post(ui_bridge_wait_for_element_handler),
+        )
+        // P3.3 — Convenience wait-for-element-state (simple id+state form)
+        .route(
+            "/ui-bridge/control/wait-for-element-state",
+            post(ui_bridge_wait_for_element_state_handler),
+        )
+        // P3.3 — Wait for the page route to match a glob pattern
+        .route(
+            "/ui-bridge/control/wait-for-route",
+            post(ui_bridge_wait_for_route_handler),
+        )
+        .route(
+            "/ui-bridge/ai/wait-for-route",
+            post(ui_bridge_wait_for_route_handler),
         )
         // Wait for an element to become visually/structurally stable
         .route(

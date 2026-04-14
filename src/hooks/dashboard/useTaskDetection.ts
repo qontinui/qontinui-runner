@@ -308,7 +308,8 @@ function buildTaskActivityInfo(task: RunningTaskData): TaskActivityInfo {
     hasVerificationTests: hasVerification,
     workflowName: task.workflow_name ?? null,
     iteration: task.current_iteration ?? 1,
-    maxIterations: task.max_iterations ?? 1,
+    // null = unlimited; preserve so display can show "∞" rather than misleading "1".
+    maxIterations: task.max_iterations ?? null,
     activities,
     startTime,
   };

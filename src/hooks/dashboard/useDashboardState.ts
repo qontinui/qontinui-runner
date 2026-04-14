@@ -64,8 +64,8 @@ export interface DashboardState {
   isOrchestrated: boolean;
   /** Current iteration number */
   iteration: number;
-  /** Maximum iterations */
-  maxIterations: number;
+  /** Maximum iterations. `null` means no cap (unlimited). */
+  maxIterations: number | null;
   /** Plan phase name (only for plan workflows) */
   planPhaseName: string | null;
   /** Plan phase index (only for plan workflows) */

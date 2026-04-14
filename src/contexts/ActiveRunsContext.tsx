@@ -40,8 +40,8 @@ export interface ActiveRun {
   workflowName: string | null;
   /** Current iteration */
   iteration: number;
-  /** Max iterations */
-  maxIterations: number;
+  /** Max iterations. `null` indicates no cap (unlimited). */
+  maxIterations: number | null;
   /** Full task activity info for dashboard use */
   taskInfo: TaskActivityInfo;
 }
@@ -139,7 +139,8 @@ function taskToActiveRun(task: RunningTaskData, hasGuiLock: boolean, mode: Bridg
     hasVerificationTests: false,
     workflowName: task.workflow_name ?? null,
     iteration: task.current_iteration ?? 1,
-    maxIterations: task.max_iterations ?? 1,
+    // null = unlimited; preserve so display can show "∞" rather than "1".
+    maxIterations: task.max_iterations ?? null,
     activities: [],
     startTime: task.created_at ? new Date(task.created_at).getTime() : null,
   };
@@ -155,7 +156,8 @@ function taskToActiveRun(task: RunningTaskData, hasGuiLock: boolean, mode: Bridg
     startTime: taskInfo.startTime,
     workflowName: task.workflow_name ?? null,
     iteration: task.current_iteration ?? 1,
-    maxIterations: task.max_iterations ?? 1,
+    // null = unlimited; preserve so display can show "∞" rather than "1".
+    maxIterations: task.max_iterations ?? null,
     taskInfo,
   };
 }

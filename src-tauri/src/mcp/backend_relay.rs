@@ -1247,9 +1247,7 @@ pub mod commands {
     }
 
     #[tauri::command]
-    pub async fn stop_cloud_relay(
-        _state: tauri::State<'_, Arc<ApiState>>,
-    ) -> Result<String, String> {
+    pub async fn stop_cloud_relay() -> Result<String, String> {
         let mut holder = get_relay_holder().lock().await;
         if let Some(relay) = holder.take() {
             relay.stop().await;
@@ -1283,30 +1281,12 @@ pub mod commands {
     /// Bug #12 fix: Also checks if the underlying task is still alive, not just
     /// whether the state struct exists.
     #[tauri::command]
-    pub async fn get_cloud_relay_status(
-        _state: tauri::State<'_, Arc<ApiState>>,
-    ) -> Result<serde_json::Value, String> {
-        let settings = settings::load_settings();
-        let holder = get_relay_holder().lock().await;
-
-        let is_running = if let Some(ref relay) = *holder {
-            let handle_guard = relay.task_handle.lock().await;
-            handle_guard.as_ref().is_some_and(|h| !h.is_finished())
-        } else {
-            false
-        };
-
-        Ok(serde_json::json!({
-            "enabled": settings.cloud_relay.enabled,
-            "backend_url": settings.cloud_relay.backend_url,
-            "auto_connect": settings.cloud_relay.auto_connect,
-            "is_running": is_running
-        }))
+    pub async fn get_cloud_relay_status() -> Result<serde_json::Value, String> {
+        Ok(get_cloud_relay_status_internal().await)
     }
 
     #[tauri::command]
     pub async fn save_cloud_relay_settings(
-        _state: tauri::State<'_, Arc<ApiState>>,
         enabled: bool,
         backend_url: String,
         auto_connect: bool,

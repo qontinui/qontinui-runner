@@ -71,8 +71,8 @@ export interface OrchestratorStateResult {
   workflowStageDisplay: string | null;
   /** Current iteration */
   iteration: number;
-  /** Maximum iterations */
-  maxIterations: number;
+  /** Maximum iterations. `null` indicates no cap (unlimited). */
+  maxIterations: number | null;
   /** Whether the task has a verification plan */
   hasVerificationPlan: boolean;
   /** Whether the task is complete */
@@ -260,7 +260,8 @@ export function useOrchestratorState(
     workflowStage: state?.workflow_stage ?? null,
     workflowStageDisplay: state?.workflow_stage_display ?? null,
     iteration: state?.iteration ?? 1,
-    maxIterations: state?.max_iterations ?? 10,
+    // null = unlimited; do not silently default to 10.
+    maxIterations: state?.max_iterations ?? null,
     hasVerificationPlan: state?.has_verification_plan ?? false,
     isComplete: state?.is_complete ?? false,
     isPaused: state?.is_paused ?? false,

@@ -32,6 +32,8 @@ export interface ChangeTrackerLike {
   drainBuffer(): unknown;
   getBufferSize(): number;
   isBufferEnabled(): boolean;
+  /** P1.3 — push a SPA route-change entry into the change buffer. */
+  pushRouteChange?(from: string, to: string, at?: number): void;
 }
 
 /** Dependencies needed only for the `structured_changes` command. */

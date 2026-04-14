@@ -116,7 +116,8 @@ function IterationTrendSection({
 }: {
   results: IterationResult[];
   currentIteration: number;
-  maxIterations: number;
+  /** `null` indicates an unlimited cap (rendered as "∞"). */
+  maxIterations: number | null;
 }) {
   if (results.length === 0 && currentIteration === 0) {
     return (
@@ -147,7 +148,7 @@ function IterationTrendSection({
             </span>
           )}
           <Badge variant="muted" size="sm">
-            {currentIteration} / {maxIterations}
+            {currentIteration} / {maxIterations ?? "∞"}
           </Badge>
         </div>
       </div>
@@ -183,12 +184,14 @@ function IterationTrendSection({
             </div>
           );
         })}
-        {/* Placeholder bars for remaining iterations */}
-        {Array.from({ length: Math.max(0, maxIterations - results.length) }).map((_, i) => (
-          <div key={`placeholder-${i}`} className="flex-1">
-            <div className="w-full h-[2px] rounded-t-sm bg-muted/30" />
-          </div>
-        ))}
+        {/* Placeholder bars for remaining iterations. Skip entirely for
+            uncapped runs since there's no fixed total to fill toward. */}
+        {maxIterations != null &&
+          Array.from({ length: Math.max(0, maxIterations - results.length) }).map((_, i) => (
+            <div key={`placeholder-${i}`} className="flex-1">
+              <div className="w-full h-[2px] rounded-t-sm bg-muted/30" />
+            </div>
+          ))}
       </div>
 
       {/* Pass rate trend indicator */}
