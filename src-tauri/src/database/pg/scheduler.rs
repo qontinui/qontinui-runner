@@ -6,8 +6,8 @@
 use super::PgDb;
 use chrono::{DateTime, Utc};
 use crate::scheduler::{
-    ConditionScheduleConfig, ScheduleExpression, ScheduledTask, ScheduledTaskStatus,
-    ScheduledTaskType, SchedulerSettings, TaskExecutionRecord,
+    scheduled_task_type_default, ConditionScheduleConfig, ScheduleExpression, ScheduledTask,
+    ScheduledTaskStatus, ScheduledTaskType, SchedulerSettings, TaskExecutionRecord,
 };
 use tracing::warn;
 
@@ -63,7 +63,7 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
                 "Failed to deserialize task config '{}': {}; using default",
                 task_config_json, e
             );
-            ScheduledTaskType::default()
+            scheduled_task_type_default()
         }
     };
 

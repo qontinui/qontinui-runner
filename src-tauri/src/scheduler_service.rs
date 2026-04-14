@@ -6,8 +6,9 @@
 
 use crate::database::pg::PgDb;
 use crate::scheduler::{
-    compute_next_run, ConditionStatus, RepositoryWatch, ScheduledTask, ScheduledTaskStatus,
-    ScheduledTaskType, TaskExecutionRecord,
+    compute_next_run, condition_status_default, ConditionStatus, RepositoryWatch, ScheduledTask,
+    ScheduledTaskExt, ScheduledTaskStatus, ScheduledTaskType, TaskExecutionRecord,
+    TaskExecutionRecordExt,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -275,7 +276,7 @@ impl SchedulerService {
                 return;
             }
         };
-        let mut record = TaskExecutionRecord::new();
+        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
         record.status = ScheduledTaskStatus::Skipped;
         record.ended_at = Some(chrono::Utc::now().to_rfc3339());
 
@@ -386,7 +387,7 @@ impl SchedulerService {
         }
 
         // === Sync (launch-blocks-until-complete) paths ===
-        let mut record = TaskExecutionRecord::new();
+        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
 
         let result = match &task.task {
             ScheduledTaskType::Workflow {
@@ -518,7 +519,7 @@ impl SchedulerService {
         auto_fix_on_failure: bool,
         launch_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>,
     ) {
-        let mut record = TaskExecutionRecord::new();
+        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
         let execution_id = record.execution_id.clone();
 
         let launch = launch_fut.await;
@@ -1171,12 +1172,12 @@ impl SchedulerService {
     async fn check_conditions(&self, task: &ScheduledTask) -> (bool, ConditionStatus) {
         let conditions = match &task.conditions {
             Some(c) => c,
-            None => return (true, ConditionStatus::default()),
+            None => return (true, condition_status_default()),
         };
 
         // Check if any conditions are actually enabled
         if !task.has_conditions() {
-            return (true, ConditionStatus::default());
+            return (true, condition_status_default());
         }
 
         // Use existing status or create new one
@@ -1293,7 +1294,7 @@ impl SchedulerService {
                 return;
             }
         };
-        let mut record = TaskExecutionRecord::new();
+        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
         record.status = ScheduledTaskStatus::Skipped;
         record.ended_at = Some(chrono::Utc::now().to_rfc3339());
         record.error_message = Some("Condition timeout exceeded".to_string());

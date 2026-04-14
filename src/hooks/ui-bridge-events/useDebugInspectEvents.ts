@@ -424,28 +424,118 @@ export function useDebugInspectEvents(
         }
 
         case "fill_form": {
-          const fillParams = payload.params ?? payload.body ?? {};
-          try {
-            const result = await currentBridge.executeAction(
-              (fillParams.elementId as string) ?? "",
-              { action: "fill", params: fillParams as Record<string, unknown> },
-            );
-            await sendResponse({
-              requestId,
-              type,
-              success: true,
-              data: result,
-              timestamp: Date.now(),
-            });
-          } catch (err) {
-            await sendResponse({
-              requestId,
-              type,
-              success: false,
-              error: err instanceof Error ? err.message : String(err),
-              timestamp: Date.now(),
-            });
+          // The HTTP body is merged into the IPC payload at the top level
+          // (see ui_bridge_request_sync in Rust), so `fields` lives directly
+          // on `payload`. Older SDK callers may nest under `params`/`body`.
+          // Both shapes accepted, plus both array and record forms for fields:
+          //   { fields: [{elementId, value}, ...] }   (manual-test/HTTP convention)
+          //   { fields: { fieldId: value, ... } }     (SDK fillFormFields convention)
+          const fillParams = (
+            (payload.params as Record<string, unknown> | undefined) ??
+            (payload.body as Record<string, unknown> | undefined) ??
+            (payload as unknown as Record<string, unknown>)
+          ) as Record<string, unknown>;
+          const rawFields = fillParams.fields;
+          const triggerValidation = fillParams.triggerValidation as boolean | undefined;
+          const clearFirst = fillParams.clearFirst as boolean | undefined;
+
+          let fieldsRecord: Record<string, string | boolean | string[]> = {};
+          if (Array.isArray(rawFields)) {
+            for (const entry of rawFields) {
+              if (entry && typeof entry === "object" && "elementId" in entry) {
+                const e = entry as { elementId?: string; value?: unknown };
+                if (e.elementId) {
+                  fieldsRecord[e.elementId] = e.value as string | boolean | string[];
+                }
+              }
+            }
+          } else if (rawFields && typeof rawFields === "object") {
+            fieldsRecord = rawFields as Record<string, string | boolean | string[]>;
           }
+
+          // Iterate fields and dispatch the appropriate action per element
+          // through the bridge registry. The SDK's fillFormFields() resolves
+          // by raw DOM id/selector, which doesn't work for synthetic
+          // registry IDs (e.g. "input-my-runner"). Going through the
+          // registry's executeAction handles both naming schemes and runs
+          // the proper type/check/select action based on element type.
+          const perField: Record<
+            string,
+            { success: boolean; error?: string; action?: string }
+          > = {};
+          let filledCount = 0;
+          let errorCount = 0;
+
+          for (const [fieldId, value] of Object.entries(fieldsRecord)) {
+            const el = currentBridge.elements.find((e) => e.id === fieldId);
+            const elType = el?.type ?? "input";
+            let action = "type";
+            let params: Record<string, unknown> = { text: String(value), clear: clearFirst !== false };
+
+            if (elType === "checkbox" || elType === "radio") {
+              const checked = typeof value === "boolean" ? value : value === "true";
+              action = checked ? "check" : "uncheck";
+              params = {};
+            } else if (elType === "select") {
+              action = "select";
+              params = { value: Array.isArray(value) ? value[0] : String(value) };
+            } else if (Array.isArray(value)) {
+              params = { text: value.join(","), clear: clearFirst !== false };
+            }
+
+            try {
+              const r = await currentBridge.executeAction(fieldId, { action, params });
+              const ok = !r || (r as { success?: boolean }).success !== false;
+              if (ok) {
+                perField[fieldId] = { success: true, action };
+                filledCount++;
+              } else {
+                perField[fieldId] = {
+                  success: false,
+                  action,
+                  error: (r as { error?: string }).error ?? "action returned non-success",
+                };
+                errorCount++;
+              }
+            } catch (err) {
+              perField[fieldId] = {
+                success: false,
+                action,
+                error: err instanceof Error ? err.message : String(err),
+              };
+              errorCount++;
+            }
+          }
+
+          // Optional post-fill validation pass — best-effort, matches SDK
+          // semantics where triggerValidation kicks reportValidity per field.
+          if (triggerValidation) {
+            for (const fieldId of Object.keys(perField)) {
+              if (!perField[fieldId].success) continue;
+              try {
+                const node = document.querySelector<HTMLElement>(
+                  `[data-ui-bridge-id="${fieldId}"]`,
+                );
+                if (node && "reportValidity" in node) {
+                  const isValid = (node as HTMLInputElement).reportValidity();
+                  if (!isValid) {
+                    perField[fieldId].error =
+                      (node as HTMLInputElement).validationMessage || "validation failed";
+                  }
+                }
+              } catch {
+                // best-effort — ignore
+              }
+            }
+          }
+
+          await sendResponse({
+            requestId,
+            type,
+            success: errorCount === 0,
+            data: { success: errorCount === 0, filledCount, errorCount, fields: perField },
+            timestamp: Date.now(),
+          });
           return true;
         }
 

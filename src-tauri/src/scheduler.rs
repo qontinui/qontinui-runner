@@ -2,250 +2,89 @@
 //!
 //! This module provides scheduling functionality for workflows and prompts,
 //! enabling automated execution at specified times with completion tracking.
+//!
+//! The DTO shape of the scheduler types lives in the `qontinui-types` crate
+//! (`qontinui_types::scheduler`) and is re-exported via `pub use` below.
+//! Runner-specific behavior (constructors, condition evaluation, rearm checks,
+//! `Default` impls that need a timestamp, next-run computation) stays here.
+//! Because of Rust's orphan rule we can't define inherent `impl` blocks or
+//! `impl Default` on the foreign types, so the methods/defaults are exposed
+//! through extension traits (`ScheduledTaskExt`, `TaskExecutionRecordExt`)
+//! and free `*_default` helpers. The traits are re-exported so callers can
+//! keep using `ScheduledTask::new(...)`, `task.should_skip()`, etc. verbatim
+//! as long as the scheduler module's contents are brought into scope.
 
 // Allow dead code - these are public API functions that may not be called yet
 // but are part of the complete scheduler interface
 #![allow(dead_code)]
 
-use serde::{Deserialize, Serialize};
+pub use qontinui_types::scheduler::*;
+
 use tracing::{error, info};
 use uuid::Uuid;
 
 // ============================================================================
-// Schedule Expression Types
+// Default helpers (orphan rule prevents `impl Default` for foreign types)
 // ============================================================================
 
-/// How a task should be scheduled
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
-pub enum ScheduleExpression {
-    /// Run once at a specific datetime (ISO 8601)
-    Once(String),
-    /// Cron expression (e.g., "0 9 * * *" for 9 AM daily)
-    Cron(String),
-    /// Interval in seconds (for testing/debugging)
-    Interval(u64),
-    /// Condition-only: no time trigger, runs when conditions are met.
-    Condition(ConditionScheduleConfig),
+/// Default [`ScheduleExpression`] — a one-shot run scheduled for "now".
+///
+/// Previously `impl Default for ScheduleExpression`. Moved to a free helper
+/// because `ScheduleExpression` is now defined in `qontinui-types` and Rust's
+/// orphan rule forbids an `impl Default` here. Use this helper everywhere the
+/// old `ScheduleExpression::default()` was used.
+pub fn schedule_expression_default() -> ScheduleExpression {
+    ScheduleExpression::Once(chrono::Utc::now().to_rfc3339())
 }
 
-/// Configuration for condition-only schedules
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConditionScheduleConfig {
-    #[serde(default = "default_rearm_delay")]
-    pub rearm_delay_minutes: u32,
-}
-
-impl Default for ConditionScheduleConfig {
-    fn default() -> Self {
-        Self {
-            rearm_delay_minutes: default_rearm_delay(),
-        }
+/// Default [`ConditionStatus`] — waiting as of right now, no sub-conditions
+/// evaluated yet, not timed out.
+pub fn condition_status_default() -> ConditionStatus {
+    ConditionStatus {
+        waiting_since: chrono::Utc::now().to_rfc3339(),
+        idle_met: None,
+        repo_inactive_met: None,
+        timed_out: false,
     }
 }
 
-fn default_rearm_delay() -> u32 {
-    60
-}
-
-impl Default for ScheduleExpression {
-    fn default() -> Self {
-        ScheduleExpression::Once(chrono::Utc::now().to_rfc3339())
+/// Default [`ScheduledTaskType`] — a no-op AutoFix with `check_findings=true`.
+pub fn scheduled_task_type_default() -> ScheduledTaskType {
+    ScheduledTaskType::AutoFix {
+        check_findings: true,
+        force_run: false,
     }
 }
 
 // ============================================================================
-// Schedule Conditions
+// TaskExecutionRecord behavior (extension trait)
 // ============================================================================
 
-/// Condition that requires the runner to be idle (not executing workflows or AI tasks)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct IdleCondition {
-    pub enabled: bool,
-}
-
-/// A single repository to monitor for inactivity
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepositoryWatch {
-    /// Path to the repository directory
-    pub path: String,
-    /// Minutes of inactivity required before condition is met
-    pub inactive_minutes: u32,
-}
-
-/// Condition that requires repositories to have no file modifications for a period
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RepositoryInactiveCondition {
-    pub enabled: bool,
-    /// List of repositories to watch (ALL must be inactive for condition to be met)
-    #[serde(default)]
-    pub repositories: Vec<RepositoryWatch>,
-}
-
-/// Conditions that must ALL be met before task execution
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ScheduleConditions {
-    /// Require runner to be idle (not executing workflows or AI tasks)
-    #[serde(default)]
-    pub require_idle: Option<IdleCondition>,
-    /// Require repository file inactivity
-    #[serde(default)]
-    pub require_repo_inactive: Option<RepositoryInactiveCondition>,
-    /// Maximum time to wait for conditions (minutes). None = wait indefinitely
-    #[serde(default)]
-    pub timeout_minutes: Option<u32>,
-}
-
-/// Status of condition checking for a deferred task
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConditionStatus {
-    /// Time when conditions started being checked (ISO 8601)
-    pub waiting_since: String,
-    /// Current idle condition status (None if not checked, Some(true) if idle, Some(false) if busy)
-    #[serde(default)]
-    pub idle_met: Option<bool>,
-    /// Current repo inactive status per repository: (path, is_inactive)
-    #[serde(default)]
-    pub repo_inactive_met: Option<Vec<(String, bool)>>,
-    /// Whether timeout has been exceeded
-    #[serde(default)]
-    pub timed_out: bool,
-}
-
-impl Default for ConditionStatus {
-    fn default() -> Self {
-        Self {
-            waiting_since: chrono::Utc::now().to_rfc3339(),
-            idle_met: None,
-            repo_inactive_met: None,
-            timed_out: false,
-        }
+/// Runner-side behavior for [`TaskExecutionRecord`].
+///
+/// Exposed as a trait because `TaskExecutionRecord` is defined in
+/// `qontinui-types` and we cannot add inherent methods to it here. Import this
+/// trait (or use `crate::scheduler::*`) to call these methods exactly as if
+/// they were inherent.
+pub trait TaskExecutionRecordExt: Sized {
+    /// Create a new execution record stamped with the current time and a
+    /// fresh UUID v4 for `execution_id`.
+    fn new() -> Self;
+    /// Mark execution as completed, setting `ended_at`, `success`,
+    /// `error_message`, and `status` accordingly.
+    fn complete(&mut self, success: bool, error_message: Option<String>);
+    /// Mark that auto-fix was triggered for this execution, recording the
+    /// auto-fix session id.
+    fn mark_auto_fix_triggered(&mut self, session_id: String);
+    /// Runner-side default that matches the pre-refactor `Default` impl
+    /// (delegates to [`TaskExecutionRecordExt::new`]).
+    fn runner_default() -> Self {
+        Self::new()
     }
 }
 
-// ============================================================================
-// Task Type Definitions
-// ============================================================================
-
-/// Type of task to schedule
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "task_type")]
-pub enum ScheduledTaskType {
-    /// Run a workflow from loaded config or unified workflow by ID
-    Workflow {
-        workflow_name: String,
-        #[serde(default)]
-        config_path: Option<String>,
-        #[serde(default)]
-        monitor_index: Option<i32>,
-        /// If set, run unified workflow by ID instead of legacy workflow by name
-        #[serde(default)]
-        workflow_id: Option<String>,
-    },
-    /// Run a prompt from Prompt Library
-    Prompt {
-        prompt_id: String,
-        /// Optional override for max_sessions (None = use prompt's setting)
-        #[serde(default)]
-        max_sessions: Option<u32>,
-    },
-    /// Trigger auto-fix (check findings and fix auto-fixable items)
-    AutoFix {
-        #[serde(default = "default_true")]
-        check_findings: bool,
-        #[serde(default)]
-        force_run: bool,
-    },
-    /// Execute a watcher (screenpipe-inspired reactive AI agent).
-    /// Queries the activity timeline, reasons with AI, and triggers an action.
-    Watcher {
-        /// ID of the watcher definition in PostgreSQL.
-        watcher_id: String,
-    },
-    /// Continuous background capture (screenpipe-style).
-    /// Periodically captures screen state and stores in activity timeline.
-    BackgroundCapture {
-        #[serde(default)]
-        monitor_index: Option<i32>,
-        #[serde(default = "default_capture_interval")]
-        capture_interval_secs: u64,
-        #[serde(default = "default_true")]
-        capture_on_focus_change: bool,
-    },
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_capture_interval() -> u64 {
-    30
-}
-
-impl Default for ScheduledTaskType {
-    fn default() -> Self {
-        ScheduledTaskType::AutoFix {
-            check_findings: true,
-            force_run: false,
-        }
-    }
-}
-
-// ============================================================================
-// Task Status
-// ============================================================================
-
-/// Status of a scheduled task execution
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum ScheduledTaskStatus {
-    #[default]
-    Pending,
-    Running,
-    Completed,
-    Failed,
-    /// Skipped because already completed and skip_if_completed=true
-    Skipped,
-    Cancelled,
-}
-
-// ============================================================================
-// Execution Record
-// ============================================================================
-
-/// Record of a single task execution
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskExecutionRecord {
-    /// Unique ID for this execution
-    pub execution_id: String,
-    /// Session ID if this triggered an AI session (for success tracking)
-    #[serde(default)]
-    pub session_id: Option<String>,
-    /// ISO 8601 timestamp when execution started
-    pub started_at: String,
-    /// ISO 8601 timestamp when execution ended
-    #[serde(default)]
-    pub ended_at: Option<String>,
-    /// Current status
-    pub status: ScheduledTaskStatus,
-    /// Whether the task succeeded (read from session checkpoint)
-    #[serde(default)]
-    pub success: bool,
-    /// Error message if failed
-    #[serde(default)]
-    pub error_message: Option<String>,
-    /// Whether auto-fix was triggered after this execution
-    #[serde(default)]
-    pub triggered_auto_fix: bool,
-    /// Session ID of the auto-fix session if triggered
-    #[serde(default)]
-    pub auto_fix_session_id: Option<String>,
-}
-
-impl TaskExecutionRecord {
-    /// Create a new execution record
-    pub fn new() -> Self {
+impl TaskExecutionRecordExt for TaskExecutionRecord {
+    fn new() -> Self {
         Self {
             execution_id: Uuid::new_v4().to_string(),
             session_id: None,
@@ -259,8 +98,7 @@ impl TaskExecutionRecord {
         }
     }
 
-    /// Mark execution as completed
-    pub fn complete(&mut self, success: bool, error_message: Option<String>) {
+    fn complete(&mut self, success: bool, error_message: Option<String>) {
         self.ended_at = Some(chrono::Utc::now().to_rfc3339());
         self.success = success;
         self.error_message = error_message;
@@ -271,70 +109,49 @@ impl TaskExecutionRecord {
         };
     }
 
-    /// Mark that auto-fix was triggered
-    pub fn mark_auto_fix_triggered(&mut self, session_id: String) {
+    fn mark_auto_fix_triggered(&mut self, session_id: String) {
         self.triggered_auto_fix = true;
         self.auto_fix_session_id = Some(session_id);
     }
 }
 
-impl Default for TaskExecutionRecord {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ============================================================================
-// Scheduled Task
+// ScheduledTask behavior (extension trait)
 // ============================================================================
 
-/// A scheduled task definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduledTask {
-    /// Unique identifier (UUID v4)
-    pub id: String,
-    /// Display name for the task
-    pub name: String,
-    /// Optional description
-    #[serde(default)]
-    pub description: Option<String>,
-    /// Whether the task is enabled
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Schedule configuration
-    pub schedule: ScheduleExpression,
-    /// Task type and configuration
-    pub task: ScheduledTaskType,
-    /// Whether to skip if task has already succeeded
-    #[serde(default)]
-    pub skip_if_completed: bool,
-    /// Auto-trigger auto-fix on failure
-    #[serde(default)]
-    pub auto_fix_on_failure: bool,
-    /// Success criteria description (for reference)
-    #[serde(default)]
-    pub success_criteria: Option<String>,
-    /// ISO 8601 timestamp of creation
-    pub created_at: String,
-    /// ISO 8601 timestamp of last modification
-    pub modified_at: String,
-    /// Last execution record
-    #[serde(default)]
-    pub last_run: Option<TaskExecutionRecord>,
-    /// Next scheduled run time (computed)
-    #[serde(default)]
-    pub next_run: Option<String>,
-    /// Optional conditions that must be met before execution
-    #[serde(default)]
-    pub conditions: Option<ScheduleConditions>,
-    /// Status when task is waiting for conditions to be met
-    #[serde(default)]
-    pub condition_status: Option<ConditionStatus>,
+/// Runner-side behavior for [`ScheduledTask`].
+///
+/// Exposed as a trait for the same orphan-rule reason as
+/// [`TaskExecutionRecordExt`]. Import this trait (or `crate::scheduler::*`)
+/// to call `ScheduledTask::new(...)`, `task.should_skip()`, etc. exactly as
+/// if they were inherent.
+pub trait ScheduledTaskExt: Sized {
+    /// Create a new scheduled task with default flags, a fresh UUID, and
+    /// `created_at`/`modified_at` stamped to now.
+    fn new(
+        name: String,
+        description: Option<String>,
+        schedule: ScheduleExpression,
+        task: ScheduledTaskType,
+    ) -> Self;
+    /// Whether the task has at least one active condition that needs to be
+    /// evaluated before it can run.
+    fn has_conditions(&self) -> bool;
+    /// Whether the task is currently parked waiting for conditions to be
+    /// met (i.e. has a non-`None` `condition_status`).
+    fn is_waiting_for_conditions(&self) -> bool;
+    /// Whether the task should be skipped this cycle because it has already
+    /// succeeded and `skip_if_completed` is `true`.
+    fn should_skip(&self) -> bool;
+    /// For `Condition`-scheduled tasks: whether the rearm delay has elapsed
+    /// since the last execution completed.
+    fn is_rearm_ready(&self) -> bool;
+    /// Update the `modified_at` timestamp to "now".
+    fn touch(&mut self);
 }
 
-impl ScheduledTask {
-    /// Create a new scheduled task
-    pub fn new(
+impl ScheduledTaskExt for ScheduledTask {
+    fn new(
         name: String,
         description: Option<String>,
         schedule: ScheduleExpression,
@@ -360,8 +177,7 @@ impl ScheduledTask {
         }
     }
 
-    /// Check if task has conditions that need to be evaluated
-    pub fn has_conditions(&self) -> bool {
+    fn has_conditions(&self) -> bool {
         match &self.conditions {
             Some(cond) => {
                 let idle_enabled = cond
@@ -380,21 +196,18 @@ impl ScheduledTask {
         }
     }
 
-    /// Check if task is currently waiting for conditions
-    pub fn is_waiting_for_conditions(&self) -> bool {
+    fn is_waiting_for_conditions(&self) -> bool {
         self.condition_status.is_some()
     }
 
-    /// Check if task should be skipped (completed and skip_if_completed is true)
-    pub fn should_skip(&self) -> bool {
+    fn should_skip(&self) -> bool {
         if !self.skip_if_completed {
             return false;
         }
         self.last_run.as_ref().map(|r| r.success).unwrap_or(false)
     }
 
-    /// For Condition schedule tasks, check if the rearm delay has elapsed since last execution
-    pub fn is_rearm_ready(&self) -> bool {
+    fn is_rearm_ready(&self) -> bool {
         match &self.schedule {
             ScheduleExpression::Condition(config) => match &self.last_run {
                 Some(record) => match &record.ended_at {
@@ -413,69 +226,12 @@ impl ScheduledTask {
         }
     }
 
-    /// Update the modified timestamp
-    pub fn touch(&mut self) {
+    fn touch(&mut self) {
         self.modified_at = chrono::Utc::now().to_rfc3339();
     }
 }
 
-// ============================================================================
-// Scheduler Settings
-// ============================================================================
-
-/// Global scheduler settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchedulerSettings {
-    /// Scheduler enabled globally
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Maximum concurrent scheduled tasks
-    #[serde(default = "default_max_concurrent")]
-    pub max_concurrent: u32,
-    /// Default auto-fix on failure setting for new tasks
-    #[serde(default)]
-    pub default_auto_fix_on_failure: bool,
-    /// Timezone for schedule interpretation (default: local)
-    #[serde(default)]
-    pub timezone: Option<String>,
-}
-
-fn default_max_concurrent() -> u32 {
-    1
-}
-
-impl Default for SchedulerSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_concurrent: 1,
-            default_auto_fix_on_failure: false,
-            timezone: None,
-        }
-    }
-}
-
 // SchedulerState was removed — all persistence is now handled by CheckpointDb.
-
-// ============================================================================
-// Scheduler Status (for API responses)
-// ============================================================================
-
-/// Current scheduler status
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchedulerStatus {
-    pub enabled: bool,
-    pub running_tasks: u32,
-    pub pending_tasks: u32,
-    pub next_task: Option<NextTaskInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NextTaskInfo {
-    pub id: String,
-    pub name: String,
-    pub next_run: String,
-}
 
 // ============================================================================
 // Schedule Computation
@@ -579,8 +335,8 @@ mod tests {
         let mut task = ScheduledTask::new(
             "Test".to_string(),
             None,
-            ScheduleExpression::default(),
-            ScheduledTaskType::default(),
+            schedule_expression_default(),
+            scheduled_task_type_default(),
         );
 
         // No skip when skip_if_completed is false

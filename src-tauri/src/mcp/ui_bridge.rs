@@ -10435,7 +10435,12 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/navigate-tab"),
         ("POST", "/ui-bridge/control/clear-storage"),
         ("POST", "/ui-bridge/control/navigate-and-wait"),
-        ("POST", "/ui-bridge/control/wait-for-network-idle"),
+        ("GET", "/ui-bridge/control/health"),
+        ("POST", "/ui-bridge/control/undo"),
+        ("POST", "/ui-bridge/control/redo"),
+        ("GET", "/ui-bridge/control/undo-state"),
+        ("POST", "/ui-bridge/control/error-baselines/capture"),
+        ("POST", "/ui-bridge/control/error-baselines/compare"),
     ]
 }
 
@@ -11338,4 +11343,95 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/control/clear-storage",
             post(ui_bridge_clear_storage_handler),
         )
+}
+
+#[cfg(test)]
+mod manifest_drift_tests {
+    use super::route_manifest;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    /// Verify `route_manifest()` matches the actual `.route(...)` calls in
+    /// this file. Catches the common drift bug where someone adds a new
+    /// endpoint but forgets to register it in the manifest (or the reverse).
+    ///
+    /// This is a stop-gap for the manual maintenance burden — axum 0.8
+    /// doesn't expose `Router::routes()`, so we can't introspect the live
+    /// router at runtime. Re-evaluate if axum adds router introspection.
+    #[test]
+    fn manifest_matches_route_calls() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let src_path = PathBuf::from(manifest_dir).join("src/mcp/ui_bridge.rs");
+        let src = std::fs::read_to_string(&src_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", src_path.display(), e));
+
+        // For each route registration, extract every HTTP method present
+        // (axum allows chaining like get(h).delete(h2) on the same route).
+        // Two passes: find each .route call, then within its body grep for
+        // method-constructor calls.
+        let route_open_re = regex::Regex::new(
+            r#"(?s)\.route\(\s*"(/ui-bridge/[^"]+)"\s*,"#,
+        )
+        .unwrap();
+        let method_re = regex::Regex::new(r#"\b(get|post|put|delete|patch)\("#).unwrap();
+
+        let mut source_routes: HashSet<(String, String)> = HashSet::new();
+        for cap in route_open_re.captures_iter(&src) {
+            let path = cap[1].to_string();
+            // Body starts at end of the matched prefix; scan forward up to
+            // 400 bytes (largest known route body has 3 chained methods).
+            let body_start = cap.get(0).unwrap().end();
+            let body_end = (body_start + 400).min(src.len());
+            let body = &src[body_start..body_end];
+            // Stop at first balanced ")" — for our purposes, the next ".route("
+            // delimiter is a safe upper bound, and we only care about methods
+            // before the first newline followed by ".route(" or "}\n".
+            let scan_end = body.find("\n        .route(")
+                .or_else(|| body.find("\n    }"))
+                .unwrap_or(body.len());
+            let scan = &body[..scan_end];
+
+            for m in method_re.captures_iter(scan) {
+                source_routes.insert((m[1].to_uppercase(), path.clone()));
+            }
+        }
+
+        let manifest_routes: HashSet<(String, String)> = route_manifest()
+            .iter()
+            .map(|(m, p)| ((*m).to_string(), (*p).to_string()))
+            .collect();
+
+        let registered_but_missing: Vec<&(String, String)> =
+            source_routes.difference(&manifest_routes).collect();
+        let in_manifest_but_unregistered: Vec<&(String, String)> =
+            manifest_routes.difference(&source_routes).collect();
+
+        if !registered_but_missing.is_empty() || !in_manifest_but_unregistered.is_empty() {
+            panic!(
+                "route_manifest() drift detected.\n\
+                 Add the missing entries to route_manifest() (or remove unregistered ones).\n\n\
+                 Registered via .route() but missing from manifest ({}):\n  {}\n\n\
+                 In manifest but not actually registered ({}):\n  {}",
+                registered_but_missing.len(),
+                registered_but_missing
+                    .iter()
+                    .map(|(m, p)| format!("{} {}", m, p))
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+                in_manifest_but_unregistered.len(),
+                in_manifest_but_unregistered
+                    .iter()
+                    .map(|(m, p)| format!("{} {}", m, p))
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+            );
+        }
+
+        // Sanity floor: catch a regex regression that silently matches nothing.
+        assert!(
+            source_routes.len() > 100,
+            "regex extracted only {} routes — likely broken",
+            source_routes.len()
+        );
+    }
 }

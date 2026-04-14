@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::scheduler::{ScheduledTaskExt, TaskExecutionRecordExt};
 
 // ============================================================================
 // Types
