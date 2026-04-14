@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import logging
 import os
 import random
@@ -230,6 +231,32 @@ class UIBridgeClient:
         """Remove CSS viewport constraints."""
         return self._post("/control/viewport-constraints", {"restore": True})
 
+    def element_action(
+        self, element_id: str, action: str, params: dict | None = None,
+    ) -> dict:
+        """Invoke an action on a registered element (click, setValue, etc.)."""
+        body: dict = {"action": action}
+        if params:
+            body["params"] = params
+        return self._post(f"/control/element/{element_id}/action", body)
+
+    def get_body_attributes(self) -> dict:
+        """Return the `<body>` element attributes from the latest snapshot.
+
+        Used by the capture-host loop to read the current sample's bbox
+        (rendered by the iframe and relayed via postMessage → body data-attrs).
+        """
+        snap = self.get_control_snapshot()
+        # Search for the body-level attributes if the snapshot exposes them,
+        # otherwise scan element list for a root element.
+        attrs = snap.get("bodyAttributes") or snap.get("body")
+        if isinstance(attrs, dict):
+            return attrs
+        for el in snap.get("elements", []):
+            if el.get("type") == "body" or el.get("tag", "").lower() == "body":
+                return el.get("attributes") or {}
+        return {}
+
     def get_control_snapshot(self) -> dict:
         """Get full control snapshot with elements and viewport."""
         body = self._get("/control/snapshot")
@@ -397,26 +424,176 @@ def draw_samples(num_samples: int, seed: int) -> list[dict]:
     return samples
 
 
-def build_isolated_url(params: dict) -> str:
+def build_isolated_url(params: dict, sample_index: int | None = None) -> str:
     """Construct the isolated component page URL from sample params."""
-    qs = urlencode(
-        {
-            "component": params["component"],
-            "variant": params["variant"],
-            "size": params["size"],
-            "state": params["state"],
-            "theme": params["theme"],
-            "bg": params["bg"],
-            "left": params["left"],
-            "top": params["top"],
-        }
-    )
-    return f"{ISOLATED_ROUTE}?{qs}"
+    qs_params = {
+        "component": params["component"],
+        "variant": params["variant"],
+        "size": params["size"],
+        "state": params["state"],
+        "theme": params["theme"],
+        "bg": params["bg"],
+        "left": params["left"],
+        "top": params["top"],
+    }
+    if sample_index is not None:
+        qs_params["sampleIndex"] = sample_index
+    return f"{ISOLATED_ROUTE}?{urlencode(qs_params)}"
+
+
+def build_api_isolated_url(params: dict, sample_index: int | None = None) -> str:
+    """Construct the /api/grounding-isolated URL (SDK-less standalone HTML)."""
+    qs_params = {
+        "component": params["component"],
+        "variant": params["variant"],
+        "size": params["size"],
+        "state": params["state"],
+        "theme": params["theme"],
+        "bg": params["bg"],
+        "left": params["left"],
+        "top": params["top"],
+    }
+    if sample_index is not None:
+        qs_params["sampleIndex"] = sample_index
+    return f"/api/grounding-isolated?{urlencode(qs_params)}"
 
 
 # ---------------------------------------------------------------------------
 # Main capture loop
 # ---------------------------------------------------------------------------
+
+def run_capture_host(
+    ui_bridge_url: str,
+    output_dir: Path,
+    num_samples: int,
+    seed: int,
+    monitor_index: int = 1,
+) -> None:
+    """Capture via the `/dev/grounding/capture-host` outer page.
+
+    The outer page keeps a stable UI Bridge SDK connection while cycling
+    an inner iframe through isolated-sample URLs.  This avoids the
+    SDK-unmount issue observed when navigating directly to the isolated
+    page with position:fixed backdrop.
+    """
+    client = UIBridgeClient(ui_bridge_url)
+    writer = GroundingJSONLWriter(output_dir)
+
+    logger.info("UI Bridge: %s", ui_bridge_url)
+    logger.info("Output:    %s", output_dir)
+    logger.info("Samples:   %d  (seed=%d, capture-host mode)", num_samples, seed)
+
+    if not client.health_check():
+        logger.error("UI Bridge not reachable at %s", ui_bridge_url)
+        sys.exit(1)
+
+    # Navigate to the capture host (hard reload to guarantee a clean state)
+    logger.info("Navigating to capture-host page...")
+    client.navigate("/dev/grounding/capture-host", hard=True)
+    if not client.wait_for_tab(timeout_s=12.0):
+        logger.error("Capture host did not connect to UI Bridge")
+        sys.exit(1)
+    time.sleep(1.0)  # let React hydrate, register ui-bridge elements
+
+    samples = draw_samples(num_samples, seed)
+    total_written = 0
+    total_skipped = 0
+    total_errors = 0
+
+    for idx, params in enumerate(samples):
+        sample_url = build_api_isolated_url(params, sample_index=idx)
+
+        try:
+            # Drive the outer page: setValue on the URL input + click advance
+            client.element_action(
+                "capture-next-url", "setValue", {"value": sample_url},
+            )
+            time.sleep(0.05)
+            client.element_action("capture-advance", "click")
+
+            # Wait for the iframe to load + postMessage the bbox back
+            bbox: dict | None = None
+            deadline = time.time() + 6.0
+            while time.time() < deadline:
+                attrs = client.get_body_attributes()
+                raw = attrs.get("data-grounding-bbox")
+                cur_idx = attrs.get("data-current-sample-index")
+                if raw and str(cur_idx) == str(idx):
+                    try:
+                        bbox = json.loads(raw) if isinstance(raw, str) else raw
+                    except Exception:
+                        bbox = None
+                    if bbox:
+                        break
+                time.sleep(0.1)
+
+            # Settle before screenshot
+            time.sleep(SETTLE_DELAY)
+            png_bytes, screen_w, screen_h = capture_screen(monitor_index)
+
+            # Build GroundingElement from reported bbox, falling back to estimate
+            if bbox and int(bbox.get("width", 0)) > 0 and int(bbox.get("height", 0)) > 0:
+                target_el = GroundingElement(
+                    role=params["component"].lower(),
+                    text=f"{params['variant'].title()} {params['component']}",
+                    bbox=(
+                        int(bbox["x"]),
+                        int(bbox["y"]),
+                        int(bbox["width"]),
+                        int(bbox["height"]),
+                    ),
+                    interactable=params["state"] != "disabled",
+                )
+            else:
+                target_el = estimate_target_bbox(params, screen_w, screen_h)
+
+            record = GroundingRecord(
+                image_hash="",
+                image_path="",
+                viewport_width=screen_w,
+                viewport_height=screen_h,
+                elements=[target_el],
+                action=None,
+                source="static",
+                timestamp=datetime.now(UTC).isoformat(),
+                metadata={
+                    "component": params["component"],
+                    "variant": params["variant"],
+                    "size": params["size"],
+                    "state": params["state"],
+                    "theme": params["theme"],
+                    "bg": params["bg"],
+                    "left": params["left"],
+                    "top": params["top"],
+                    "seed": seed,
+                    "sample_index": idx,
+                    "capture_mode": "host",
+                    "bbox_source": "iframe" if bbox else "estimate",
+                },
+            )
+
+            if writer.write(record, png_bytes):
+                total_written += 1
+            else:
+                total_skipped += 1
+
+        except Exception as exc:
+            logger.warning("Sample %d error: %s", idx, exc)
+            total_errors += 1
+            continue
+
+        if (idx + 1) % 50 == 0:
+            logger.info(
+                "Progress: %d/%d — written=%d skipped=%d errors=%d",
+                idx + 1, num_samples, total_written, total_skipped, total_errors,
+            )
+
+    logger.info(
+        "Done. written=%d skipped=%d errors=%d → %s",
+        total_written, total_skipped, total_errors,
+        output_dir / "grounding.jsonl",
+    )
+
 
 def run_capture(
     ui_bridge_url: str,
@@ -570,9 +747,20 @@ def main() -> None:
             "(default: 1; env QONTINUI_CAPTURE_MONITOR)"
         ),
     )
+    parser.add_argument(
+        "--mode",
+        choices=("host", "direct"),
+        default="host",
+        help=(
+            "Capture strategy: 'host' drives an outer /dev/grounding/capture-host "
+            "page with an inner iframe (stable SDK), 'direct' navigates the tab "
+            "to each isolated URL with hard reloads. (default: host)"
+        ),
+    )
     args = parser.parse_args()
 
-    run_capture(
+    runner = run_capture_host if args.mode == "host" else run_capture
+    runner(
         ui_bridge_url=args.ui_bridge_url,
         output_dir=Path(args.output_dir),
         num_samples=args.num_samples,
