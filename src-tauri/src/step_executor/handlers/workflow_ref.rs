@@ -21,6 +21,7 @@ use tracing::{info, warn};
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::step_executor::ExecutionStepConfig;
 use crate::unified_workflow_executor::{LoopConfig, LoopController};
+use crate::unified_workflows::UnifiedWorkflowExt;
 
 /// Handler for workflow_ref steps — runs a saved workflow inline with input substitution.
 pub struct WorkflowRefHandler;

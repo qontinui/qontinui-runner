@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { LayoutGrid } from "lucide-react";
 import { LAYOUT_PRESETS, type LayoutPreset } from "./useZoneLayout";
+import { useUIComponent } from "ui-bridge";
 
 interface ZoneLayoutPickerProps {
   currentLayoutId: string;
@@ -70,6 +71,58 @@ export function ZoneLayoutPicker({
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
   }, [open]);
+
+  // ── UI Bridge registration ──────────────────────────────────────────────
+  useUIComponent({
+    id: "zone-layout-picker",
+    name: "Zone Layout Picker",
+    description:
+      "Selects the multi-zone terminal layout preset. Use select-layout to switch layouts " +
+      "or list-layouts to enumerate available options.",
+    actions: [
+      {
+        id: "open",
+        label: "Open dropdown",
+        handler: () => {
+          setOpen(true);
+        },
+      },
+      {
+        id: "close",
+        label: "Close dropdown",
+        handler: () => {
+          setOpen(false);
+        },
+      },
+      {
+        id: "select-layout",
+        label: "Select Layout",
+        handler: (params?: unknown) => {
+          const { layoutId } = (params ?? {}) as { layoutId?: string };
+          if (!layoutId) throw new Error("select-layout requires { layoutId: string }");
+          const preset = LAYOUT_PRESETS.find((l) => l.id === layoutId);
+          if (!preset) {
+            throw new Error(
+              `Unknown layoutId: "${layoutId}". Valid options: ${LAYOUT_PRESETS.map((l) => l.id).join(", ")}`,
+            );
+          }
+          onSelectLayout(layoutId);
+          setOpen(false);
+        },
+      },
+      {
+        id: "list-layouts",
+        label: "List Layouts",
+        handler: () =>
+          LAYOUT_PRESETS.map((l) => ({
+            id: l.id,
+            name: l.name,
+            zones: l.zones.length,
+            shortcutKey: l.shortcutKey ?? null,
+          })),
+      },
+    ],
+  });
 
   const currentLayout = LAYOUT_PRESETS.find((l) => l.id === currentLayoutId);
 

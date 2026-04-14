@@ -1,9 +1,10 @@
-import { useState, useRef, useEffect, useMemo, type ReactNode } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback, type ReactNode } from "react";
 import { Terminal, X, Plus, List, ChevronDown, FileText, Lock } from "lucide-react";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { AccountUsageInfo } from "./useSessionManager";
 import { LaunchMenu } from "./LaunchMenu";
+import { useUIComponent } from "ui-bridge";
 
 interface TerminalTabBarProps {
   tabs: TerminalTab[];
@@ -233,6 +234,109 @@ export function TerminalTabBar({
   function isTabAssigned(tabId: string): boolean {
     return tabId in tabIdToZone;
   }
+
+  // ── UI Bridge: terminal-launch-menu registration ─────────────────────────
+  // LaunchMenu only mounts while showQuickLaunch=true, so we register from
+  // TerminalTabBar (always mounted) to ensure agents can invoke actions at
+  // any time.
+
+  const sortedAccountsForBridge = useMemo(
+    () => [...(accountUsage ?? [])].sort((a, b) => (a.utilization ?? 0) - (b.utilization ?? 0)),
+    [accountUsage],
+  );
+
+  const openLaunchMenu = useCallback(() => setShowQuickLaunch(true), []);
+  const closeLaunchMenu = useCallback(() => setShowQuickLaunch(false), []);
+
+  useUIComponent({
+    id: "terminal-launch-menu",
+    name: "Terminal Launch Menu",
+    description:
+      "Creates plain terminals and AI sessions. Use create-plain, create-ai-session, " +
+      "create-best-account, or create-with-command to launch terminals programmatically.",
+    actions: [
+      {
+        id: "open",
+        label: "Open launch menu",
+        handler: openLaunchMenu,
+      },
+      {
+        id: "close",
+        label: "Close launch menu",
+        handler: closeLaunchMenu,
+      },
+      {
+        id: "create-plain",
+        label: "Create Plain Terminal",
+        handler: (params?: unknown) => {
+          const { count = 1 } = (params ?? {}) as { count?: number };
+          if (typeof count !== "number" || count < 1) {
+            throw new Error("create-plain requires { count: number } where count >= 1");
+          }
+          onQuickLaunch?.(count);
+          closeLaunchMenu();
+        },
+      },
+      {
+        id: "create-ai-session",
+        label: "Create AI Session",
+        handler: (params?: unknown) => {
+          const {
+            count = 1,
+            configDir,
+            context,
+          } = (params ?? {}) as {
+            count?: number;
+            configDir?: string;
+            context?: string;
+          };
+          if (!configDir)
+            throw new Error(
+              "create-ai-session requires { count?: number, configDir: string, context?: string }",
+            );
+          if (typeof count !== "number" || count < 1) {
+            throw new Error("create-ai-session: count must be a positive number");
+          }
+          onLaunchAiSession?.(count, configDir, context);
+          closeLaunchMenu();
+        },
+      },
+      {
+        id: "create-best-account",
+        label: "Create AI Session with Best Account",
+        handler: (params?: unknown) => {
+          const { count = 1, context } = (params ?? {}) as {
+            count?: number;
+            context?: string;
+          };
+          if (typeof count !== "number" || count < 1) {
+            throw new Error("create-best-account: count must be a positive number");
+          }
+          const best = sortedAccountsForBridge[0];
+          if (!best) throw new Error("No AI accounts available");
+          onLaunchAiSession?.(count, best.config_dir, context);
+          closeLaunchMenu();
+        },
+      },
+      {
+        id: "create-with-command",
+        label: "Create Terminal with Command",
+        handler: (params?: unknown) => {
+          const { count = 1, command } = (params ?? {}) as {
+            count?: number;
+            command?: string;
+          };
+          if (!command)
+            throw new Error("create-with-command requires { count?: number, command: string }");
+          if (typeof count !== "number" || count < 1) {
+            throw new Error("create-with-command: count must be a positive number");
+          }
+          onQuickLaunch?.(count, command);
+          closeLaunchMenu();
+        },
+      },
+    ],
+  });
 
   // ── Render ───────────────────────────────────────────────────────────────
 

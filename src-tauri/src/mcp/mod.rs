@@ -115,6 +115,7 @@ pub mod token_analytics;
 pub mod trace_verification;
 pub mod triggers;
 pub mod types;
+pub mod tauri_proxy;
 pub mod ui_bridge;
 pub mod ui_bridge_integration;
 pub mod unified_workflows;

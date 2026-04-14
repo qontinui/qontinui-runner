@@ -11,6 +11,7 @@ use tracing::info;
 
 use crate::mcp::types::ApiState;
 use crate::mcp::ui_bridge;
+use crate::unified_workflows::UnifiedWorkflowExt;
 
 use super::types::{ActionResult, GqlFindingStatus, GqlTaskRun};
 

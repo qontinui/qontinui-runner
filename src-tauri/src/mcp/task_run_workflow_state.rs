@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use crate::database::TaskRun;
 use crate::mcp::types::ApiState;
+use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::unified_workflow_executor::extract_workflow_id_from_task_id;
 use tauri::Manager;
 

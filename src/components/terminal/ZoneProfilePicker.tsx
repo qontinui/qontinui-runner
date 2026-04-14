@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Save, FolderOpen, Trash2, ChevronDown } from "lucide-react";
+import { useUIComponent } from "ui-bridge";
 
 export interface ZoneSessionInfo {
   zoneIndex: number;
@@ -236,6 +237,106 @@ export function ZoneProfilePicker({
     },
     [profiles, activeProfileName, pageId],
   );
+
+  // ── UI Bridge registration ──────────────────────────────────────────────
+  // Registered here (always in the tree from TerminalPage) so agents can
+  // invoke profile actions without interacting with DOM elements.
+  useUIComponent({
+    id: "zone-profile-picker",
+    name: "Zone Profile Picker",
+    description:
+      "Saves and loads named zone-layout profiles (labels, notes, pins, sessions). " +
+      "Use load-profile / save-profile / delete-profile to manage profiles programmatically.",
+    actions: [
+      {
+        id: "open",
+        label: "Open dropdown",
+        handler: () => {
+          setOpen(true);
+        },
+      },
+      {
+        id: "close",
+        label: "Close dropdown",
+        handler: () => {
+          setOpen(false);
+          setShowSaveInput(false);
+          setSaveName("");
+        },
+      },
+      {
+        id: "load-profile",
+        label: "Load Profile",
+        handler: (params?: unknown) => {
+          const { name } = (params ?? {}) as { name?: string };
+          if (!name) throw new Error("load-profile requires { name: string }");
+          const profile = profiles[name];
+          if (!profile)
+            throw new Error(
+              `Profile not found: "${name}". Available: ${Object.keys(profiles).join(", ") || "none"}`,
+            );
+          handleLoad(name);
+        },
+      },
+      {
+        id: "save-profile",
+        label: "Save Profile",
+        handler: (params?: unknown) => {
+          const { name } = (params ?? {}) as { name?: string };
+          if (!name) throw new Error("save-profile requires { name: string }");
+          if (profileNames.length >= MAX_PROFILES && !profiles[name]) {
+            throw new Error(`Cannot save: maximum of ${MAX_PROFILES} profiles reached`);
+          }
+          // Capture Claude session IDs from current zone assignments
+          const sessions: ZoneSessionInfo[] = [];
+          if (zoneAssignments && tabs) {
+            const tabsById = new Map(tabs.map((t) => [t.id, t]));
+            for (const [zoneIdxStr, tabId] of Object.entries(zoneAssignments)) {
+              const tab = tabsById.get(tabId);
+              if (tab?.claudeSessionId) {
+                sessions.push({
+                  zoneIndex: Number(zoneIdxStr),
+                  claudeSessionId: tab.claudeSessionId,
+                  claudeConfigDir: tab.claudeConfigDir,
+                });
+              }
+            }
+          }
+          const profile: ZoneProfile = {
+            layoutId: currentLayoutId,
+            labels: { ...zoneLabels },
+            notes: { ...zoneNotes },
+            pins: [...pinnedZones],
+            autoApprovePatterns: [...autoApprovePatterns],
+            sessions: sessions.length > 0 ? sessions : undefined,
+          };
+          const updated = { ...profiles, [name]: profile };
+          setProfiles(updated);
+          saveProfilesToDb(updated, pageId);
+          setActiveProfileName(name);
+          saveActiveProfileToDb(name, pageId);
+        },
+      },
+      {
+        id: "delete-profile",
+        label: "Delete Profile",
+        handler: (params?: unknown) => {
+          const { name } = (params ?? {}) as { name?: string };
+          if (!name) throw new Error("delete-profile requires { name: string }");
+          if (!profiles[name]) throw new Error(`Profile not found: "${name}"`);
+          handleDelete(name);
+        },
+      },
+      {
+        id: "list-profiles",
+        label: "List Profiles",
+        handler: () => ({
+          profiles: profileNames,
+          active: activeProfileName,
+        }),
+      },
+    ],
+  });
 
   if (!loaded) return null;
 

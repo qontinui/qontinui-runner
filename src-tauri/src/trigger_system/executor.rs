@@ -10,6 +10,7 @@ use tracing::info;
 
 use crate::config_storage::ConfigStorage;
 use crate::unified_workflow_executor::LoopConfig;
+use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::AppState;
 
 /// Dependencies needed to spawn triggered workflows.

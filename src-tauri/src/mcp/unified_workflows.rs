@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::database::CreateTaskRunInput;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::workflow_generation;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -337,7 +338,7 @@ pub async fn get_unified_workflow(
             );
             // Cache locally for future access
             let create_req =
-                crate::unified_workflows::CreateUnifiedWorkflowRequest::from(&workflow);
+                crate::unified_workflows::unified_workflow_to_create_request(&workflow);
             if let Err(e) = state
                 .app_state
                 .pg_db
@@ -614,7 +615,7 @@ pub async fn duplicate_unified_workflow(
         }
     };
 
-    let mut create_req = crate::unified_workflows::CreateUnifiedWorkflowRequest::from(&original);
+    let mut create_req = crate::unified_workflows::unified_workflow_to_create_request(&original);
     create_req.name = format!("{} (Copy)", original.name);
 
     match state
@@ -756,7 +757,7 @@ pub async fn import_unified_workflow(
     }
 
     // Create the workflow using the existing create function logic
-    let create_request = crate::unified_workflows::CreateUnifiedWorkflowRequest::from(&workflow);
+    let create_request = crate::unified_workflows::unified_workflow_to_create_request(&workflow);
 
     // Use the database's create function but with our custom ID
     match state
@@ -928,7 +929,7 @@ pub async fn generate_unified_workflow_async_handler(
 
     // Save the meta-workflow to database (SQLite + PG)
     let mut create_request =
-        crate::unified_workflows::CreateUnifiedWorkflowRequest::from(&meta_workflow);
+        crate::unified_workflows::unified_workflow_to_create_request(&meta_workflow);
     create_request.generated_by_task_run_id = None; // Will be set after task run creation
 
     let saved_workflow = match state

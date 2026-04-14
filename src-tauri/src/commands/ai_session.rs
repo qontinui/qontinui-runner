@@ -13,6 +13,7 @@ use crate::claude_session::manager::SessionManager;
 use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
 use crate::claude_session::state::SessionState;
 use crate::commands::{AppState, CommandResponse};
+use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::database::CreateTaskRunInput;
 use crate::execution_context::AiSessionContext;
 use crate::mcp::shared::AiOutputEvent;

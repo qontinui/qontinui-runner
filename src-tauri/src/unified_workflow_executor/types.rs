@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::conditional_routing::{evaluate_routing_rules, ResolvedModelConfig, RoutingContext};
-use crate::unified_workflows::ModelOverrideConfig;
+use crate::unified_workflows::{ModelOverrideConfig, UnifiedWorkflowExt};
 
 /// Structured diff captured after each agentic iteration.
 ///

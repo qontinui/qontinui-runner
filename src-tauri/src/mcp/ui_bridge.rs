@@ -1007,18 +1007,59 @@ pub async fn ui_bridge_get_elements_handler(
         }
     }
 
+    // Extract Tier 1.2 text filter params for server-side post-filtering.
+    // These are applied after the SDK returns the element list so callers can
+    // narrow results without a full discover round-trip.
+    let filter_title = query.get("title").map(|s| s.to_lowercase());
+    let filter_aria_label = query.get("aria_label").map(|s| s.to_lowercase());
+    let filter_text = query.get("text").map(|s| s.to_lowercase());
+
     match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
         Ok(data) => {
             let mut resp_headers = HeaderMap::new();
             // The IPC response is either a raw array or `{ elements: [...] }`.
             // Normalize to a Vec<Value> we can re-wrap in either shape.
-            let elements_array: Vec<serde_json::Value> = if data.is_array() {
+            let mut elements_array: Vec<serde_json::Value> = if data.is_array() {
                 data.as_array().cloned().unwrap_or_default()
             } else if let Some(arr) = data.get("elements").and_then(|v| v.as_array()) {
                 arr.clone()
             } else {
                 Vec::new()
             };
+
+            // Apply Tier 1.2 filters: case-insensitive substring match on
+            // title, aria-label, or label/id text fields.
+            if filter_title.is_some() || filter_aria_label.is_some() || filter_text.is_some() {
+                elements_array.retain(|el| {
+                    let label = el
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let id = el
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+
+                    if let Some(ref needle) = filter_title {
+                        if !label.contains(needle.as_str()) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref needle) = filter_aria_label {
+                        if !label.contains(needle.as_str()) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref needle) = filter_text {
+                        if !label.contains(needle.as_str()) && !id.contains(needle.as_str()) {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
 
             let payload = if api_version_v1 {
                 // Legacy shape: data: [...] (raw list).
@@ -3119,6 +3160,43 @@ pub async fn ui_bridge_page_hard_refresh_handler(
         Ok(Json(ApiResponse::success(serde_json::json!({
             "success": true,
             "message": "Hard refresh triggered"
+        }))))
+    } else {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error("Main webview window not found".to_string())),
+        ))
+    }
+}
+
+/// Simulate a user clicking the window's X button.
+///
+/// Calls `WebviewWindow::close()` on the main window, which routes through
+/// Tauri's native window API and fires a proper `WindowEvent::CloseRequested`
+/// event — exactly the same path the OS's X-button click takes.
+///
+/// Needed by automation tests that want to verify the close handler's cleanup
+/// logic runs correctly. `window.close()` via `/control/page/evaluate`
+/// silently no-ops for top-level webviews (it's a browser convention that
+/// only windows opened by JS can be closed by JS), so dropping down to the
+/// native API is the only way to exercise this path through UI Bridge.
+pub async fn ui_bridge_page_close_request_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use tauri::Manager;
+    info!("UI Bridge API: Close request (simulating X-button click)");
+
+    if let Some(window) =
+        state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label())
+    {
+        window.close().map_err(|e| {
+            let msg = format!("Failed to close main window: {}", e);
+            error!("{}", msg);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg)))
+        })?;
+        Ok(Json(ApiResponse::success(serde_json::json!({
+            "success": true,
+            "message": "Close requested; Tauri WindowEvent::CloseRequested handler should now fire"
         }))))
     } else {
         Err((
@@ -6077,6 +6155,187 @@ pub async fn ui_bridge_wait_for_element_stable_handler(
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
+}
+
+// ============================================================================
+// Tier 3.1 — Wait-for-element with structured selector and condition
+// ============================================================================
+
+/// POST /ui-bridge/ai/wait-for-element-condition
+///
+/// Forwards to the JS SDK's `waitForElementByCondition` handler which uses
+/// registry-based polling and supports structured selectors (id, title,
+/// aria_label, text, type) and conditions (present / visible / clickable /
+/// text-matches).
+///
+/// Request body mirrors `WaitForElementByConditionRequest` in the SDK types.
+/// Returns 200 `{ matched: bool, element?: ..., waited_ms: number }` on
+/// success, or 408 when the SDK reports matched=false (timeout).
+pub async fn ui_bridge_wait_for_element_condition_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let timeout_ms = body
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5_000)
+        .min(60_000);
+
+    let condition = body
+        .get("condition")
+        .and_then(|v| v.as_str())
+        .unwrap_or("present");
+
+    info!(
+        "UI Bridge API: wait-for-element-condition condition={} timeout={}ms",
+        condition, timeout_ms
+    );
+
+    // Forward the entire body to the JS SDK handler.
+    let payload = serde_json::json!({ "params": body });
+
+    match ui_bridge_request_sync(&state, "wait_for_element_by_condition", payload).await {
+        Ok(data) => {
+            let matched = data.get("matched").and_then(|v| v.as_bool()).unwrap_or(false);
+            if matched {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                let waited = data.get("waited_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                info!(
+                    "UI Bridge API: wait-for-element-condition: no match within {}ms (waited {}ms)",
+                    timeout_ms, waited
+                );
+                // Return 408 with the body so callers can inspect waited_ms.
+                Err((
+                    StatusCode::REQUEST_TIMEOUT,
+                    Json(api_error(format!(
+                        "wait-for-element-condition: element not found within {}ms",
+                        timeout_ms
+                    ))),
+                ))
+            }
+        }
+        Err(e) => {
+            error!("UI Bridge API: wait-for-element-condition failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
+// Tier 3.2 — Mixed action/wait/snapshot batch execution
+// ============================================================================
+
+/// POST /ui-bridge/control/batch-execute
+///
+/// Executes a heterogeneous sequence of steps serially:
+///   `{ type: "action", element_id, action, params? }`
+///   `{ type: "wait", ms }`
+///   `{ type: "snapshot" }`
+///
+/// Forwards each step to the appropriate IPC handler. `stop_on_error` (default
+/// true) aborts on the first failure.
+///
+/// Response: `{ results: [...], completed: N, total: N }`
+pub async fn ui_bridge_control_batch_execute_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let actions = request
+        .get("actions")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let stop_on_error = request
+        .get("stop_on_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let total = actions.len();
+
+    info!(
+        "UI Bridge API: control/batch-execute {} steps, stop_on_error={}",
+        total, stop_on_error
+    );
+
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(total);
+    let mut completed: usize = 0;
+
+    for (i, step) in actions.iter().enumerate() {
+        let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        let step_result: serde_json::Value = match step_type {
+            "wait" => {
+                let ms = step.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                serde_json::json!({ "index": i, "success": true, "data": { "waited_ms": ms } })
+            }
+
+            "snapshot" => {
+                match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
+                    Ok(snap) => {
+                        serde_json::json!({ "index": i, "success": true, "data": snap })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "index": i, "success": false, "error": e })
+                    }
+                }
+            }
+
+            "action" => {
+                let element_id = step
+                    .get("element_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let action = step.get("action").and_then(|v| v.as_str()).unwrap_or("click");
+                let params = step.get("params").cloned();
+
+                let payload = serde_json::json!({
+                    "id": element_id,
+                    "action": action,
+                    "params": params,
+                });
+
+                match ui_bridge_request_sync(&state, "execute_action", payload).await {
+                    Ok(data) => {
+                        let ok = data
+                            .get("success")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        serde_json::json!({ "index": i, "success": ok, "data": data })
+                    }
+                    Err(e) => {
+                        serde_json::json!({ "index": i, "success": false, "error": e })
+                    }
+                }
+            }
+
+            unknown => {
+                serde_json::json!({
+                    "index": i,
+                    "success": false,
+                    "error": format!("Unknown step type: {}", unknown)
+                })
+            }
+        };
+
+        let step_ok = step_result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        results.push(step_result);
+        completed += 1;
+
+        if !step_ok && stop_on_error {
+            break;
+        }
+    }
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "results": results,
+        "completed": completed,
+        "total": total,
+    }))))
 }
 
 // ============================================================================
@@ -10250,6 +10509,7 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/spec/{id}"),
         ("POST", "/ui-bridge/control/page/refresh"),
         ("POST", "/ui-bridge/control/page/hard-refresh"),
+        ("POST", "/ui-bridge/control/page/close-request"),
         ("POST", "/ui-bridge/control/page/navigate"),
         ("POST", "/ui-bridge/control/page/back"),
         ("POST", "/ui-bridge/control/page/forward"),
@@ -10298,6 +10558,8 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/ai/wait-for-idle"),
         ("POST", "/ui-bridge/control/wait-for-element"),
         ("POST", "/ui-bridge/ai/wait-for-element"),
+        ("POST", "/ui-bridge/ai/wait-for-element-condition"),
+        ("POST", "/ui-bridge/control/batch-execute"),
         ("POST", "/ui-bridge/control/wait-for-element-state"),
         ("POST", "/ui-bridge/control/wait-for-element-stable"),
         ("POST", "/ui-bridge/control/wait-for-route"),
@@ -10441,6 +10703,8 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/undo-state"),
         ("POST", "/ui-bridge/control/error-baselines/capture"),
         ("POST", "/ui-bridge/control/error-baselines/compare"),
+        // Tier 2.1 — safelisted Tauri command proxy
+        ("POST", "/ui-bridge/tauri/invoke"),
     ]
 }
 
@@ -10638,6 +10902,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(ui_bridge_page_hard_refresh_handler),
         )
         .route(
+            "/ui-bridge/control/page/close-request",
+            post(ui_bridge_page_close_request_handler),
+        )
+        .route(
             "/ui-bridge/control/page/navigate",
             post(ui_bridge_page_navigate_handler),
         )
@@ -10831,6 +11099,16 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/ai/wait-for-element",
             post(ui_bridge_wait_for_element_handler),
+        )
+        // Tier 3.1 — Registry-based element condition polling
+        .route(
+            "/ui-bridge/ai/wait-for-element-condition",
+            post(ui_bridge_wait_for_element_condition_handler),
+        )
+        // Tier 3.2 — Mixed action/wait/snapshot batch
+        .route(
+            "/ui-bridge/control/batch-execute",
+            post(ui_bridge_control_batch_execute_handler),
         )
         // P3.3 — Convenience wait-for-element-state (simple id+state form)
         .route(
@@ -11343,6 +11621,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/control/clear-storage",
             post(ui_bridge_clear_storage_handler),
         )
+        // Tier 2.1 — safelisted Tauri command proxy
+        .merge(crate::mcp::tauri_proxy::routes())
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@ use crate::database::{CreateTaskRunInput, TaskRun};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
 use crate::mcp::types::{ApiResponse, ApiState};
 use crate::safe_lock::safe_lock_or_recover;
+use crate::unified_workflows::UnifiedWorkflowExt;
 
 /// PG-primary get_task_run helper.
 async fn pg_get_task_run(state: &Arc<ApiState>, id: &str) -> Result<Option<TaskRun>, String> {

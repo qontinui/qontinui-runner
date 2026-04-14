@@ -12,6 +12,7 @@ use tauri::Manager;
 use tracing::info;
 
 use crate::config_storage::ConfigStorage;
+use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::AppState;
 
 use super::types::LoopConfig;

@@ -9,6 +9,7 @@ use tauri::Manager;
 use tracing::{error, info, warn};
 
 use crate::config_storage::ConfigStorage;
+use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::AppState;
 
 use super::loop_controller::LoopController;
