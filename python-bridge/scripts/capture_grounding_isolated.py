@@ -462,6 +462,108 @@ def build_api_isolated_url(params: dict, sample_index: int | None = None) -> str
 # Main capture loop
 # ---------------------------------------------------------------------------
 
+def _derive_host_url(ui_bridge_url: str, path: str = "/dev/grounding/capture-host") -> str:
+    """Convert a UI Bridge URL like http://host:port/api/ui-bridge to a
+    full page URL at ``path`` on the same origin."""
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(ui_bridge_url)
+    # Drop the /api/ui-bridge suffix from the path
+    return urlunparse(parsed._replace(path=path, query="", fragment=""))
+
+
+def _has_capture_host_elements(client: UIBridgeClient) -> bool:
+    """Return True if the connected tab has registered capture-host elements."""
+    try:
+        snap = client.get_control_snapshot()
+    except Exception:
+        return False
+    seen_ids = {el.get("id") for el in snap.get("elements", [])}
+    return "capture-next-url" in seen_ids and "capture-advance" in seen_ids
+
+
+def _wait_for_capture_host(
+    client: UIBridgeClient, timeout_s: float = 15.0,
+) -> bool:
+    """Wait until a tab is connected AND it's the capture-host page."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            if client.health_check():
+                h = client._get("/health").get("data", {})
+                if h.get("connectedTabs") and _has_capture_host_elements(client):
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
+
+def _ensure_capture_host_connected(
+    client: UIBridgeClient,
+    ui_bridge_url: str,
+    max_attempts: int = 3,
+) -> None:
+    """Guarantee the browser has the capture-host page open with a healthy SDK.
+
+    Strategy:
+      1. If a tab is already on the capture-host page, we're done.
+      2. Else if any tab is connected, try navigating it to capture-host via
+         UI Bridge (hard reload).
+      3. Else open the capture-host URL in the user's default browser via
+         ``webbrowser.open``, creating a fresh tab.
+      4. Verify the connected tab is actually on capture-host by looking for
+         the registered ``capture-next-url`` and ``capture-advance`` elements.
+    """
+    import webbrowser
+
+    host_url = _derive_host_url(ui_bridge_url)
+
+    # Fast path — already on the capture host
+    if _has_capture_host_elements(client):
+        logger.info("Capture host already connected")
+        return
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            health = client._get("/health").get("data", {})
+        except Exception:
+            health = {}
+        tab_count = len(health.get("connectedTabs", []) or [])
+
+        if tab_count > 0:
+            try:
+                logger.info(
+                    "Redirecting existing tab to capture-host (attempt %d)", attempt,
+                )
+                client.navigate("/dev/grounding/capture-host", hard=True)
+                if _wait_for_capture_host(client, timeout_s=15.0):
+                    logger.info("Capture host connected")
+                    return
+            except Exception as exc:
+                logger.warning("Navigate via UI Bridge failed: %s", exc)
+
+        logger.info(
+            "Opening capture-host in default browser: %s (attempt %d)",
+            host_url, attempt,
+        )
+        try:
+            webbrowser.open(host_url, new=2)  # new=2 → new tab
+        except Exception as exc:
+            logger.warning("webbrowser.open failed: %s", exc)
+
+        if _wait_for_capture_host(client, timeout_s=20.0):
+            logger.info("Capture host connected")
+            return
+
+    logger.error(
+        "Failed to bootstrap capture-host after %d attempts. "
+        "Manually open %s in a browser and rerun.",
+        max_attempts, host_url,
+    )
+    sys.exit(1)
+
+
 def run_capture_host(
     ui_bridge_url: str,
     output_dir: Path,
@@ -487,12 +589,8 @@ def run_capture_host(
         logger.error("UI Bridge not reachable at %s", ui_bridge_url)
         sys.exit(1)
 
-    # Navigate to the capture host (hard reload to guarantee a clean state)
-    logger.info("Navigating to capture-host page...")
-    client.navigate("/dev/grounding/capture-host", hard=True)
-    if not client.wait_for_tab(timeout_s=12.0):
-        logger.error("Capture host did not connect to UI Bridge")
-        sys.exit(1)
+    # Ensure the browser is on the capture-host page with a healthy SDK.
+    _ensure_capture_host_connected(client, ui_bridge_url)
     time.sleep(1.0)  # let React hydrate, register ui-bridge elements
 
     samples = draw_samples(num_samples, seed)
@@ -511,20 +609,38 @@ def run_capture_host(
             time.sleep(0.05)
             client.element_action("capture-advance", "click")
 
-            # Wait for the iframe to load + postMessage the bbox back
+            # Wait for the iframe to postMessage its bbox back to the host,
+            # which mirrors the JSON into the `capture-last-bbox` input's
+            # value.  We poll the snapshot until we see a bbox whose
+            # sampleIndex matches the one we just advanced to.
             bbox: dict | None = None
             deadline = time.time() + 6.0
             while time.time() < deadline:
-                attrs = client.get_body_attributes()
-                raw = attrs.get("data-grounding-bbox")
-                cur_idx = attrs.get("data-current-sample-index")
-                if raw and str(cur_idx) == str(idx):
-                    try:
-                        bbox = json.loads(raw) if isinstance(raw, str) else raw
-                    except Exception:
-                        bbox = None
+                try:
+                    snap = client.get_control_snapshot()
+                    for el in snap.get("elements", []):
+                        if el.get("id") == "capture-last-bbox":
+                            raw = (
+                                (el.get("state") or {}).get("value")
+                                or el.get("value")
+                                or ""
+                            )
+                            if raw:
+                                try:
+                                    candidate = json.loads(raw)
+                                except Exception:
+                                    candidate = None
+                                if (
+                                    candidate
+                                    and int(candidate.get("sampleIndex", -1))
+                                    == idx
+                                ):
+                                    bbox = candidate
+                                    break
                     if bbox:
                         break
+                except Exception:
+                    pass
                 time.sleep(0.1)
 
             # Settle before screenshot
