@@ -98,7 +98,9 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
   const externalActiveTagFilters = labelsAndTags.activeTagFilters;
   const externalSetActiveTagFilters = labelsAndTags.setActiveTagFilters;
   const externalAllTags = labelsAndTags.allTags;
+  // eslint-disable-next-line react-hooks/refs -- intentional: metrics ref holds a stable mutable counter object
   const metrics = metricsRef.current;
+  // eslint-disable-next-line react-hooks/refs -- intentional: stateTimeAccum ref holds a stable mutable accumulator
   const stateTimeAccum = stateTimeAccumRef.current;
   const transitionEffects = useTransitionEffects();
   const autoFocus = transitionEffects.autoFocusNeedsInput;

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Search, Clock, Lightbulb, Network, RefreshCw } from "lucide-react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { TimelineView } from "./TimelineView";

@@ -8,7 +8,6 @@ import "@xterm/xterm/css/xterm.css";
 import type {
   IDisposable,
   ITerminalBackend,
-  ITerminalLink,
   ITerminalLinkProvider,
   TerminalBackendOptions,
 } from "./types";

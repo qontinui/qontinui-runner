@@ -52,6 +52,7 @@ export function DeveloperArchitecturePanel({
   }, []);
   useEffect(() => {
     const controller = new AbortController();
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- setState is inside async fetch callback, not synchronous
     loadSpecPageIds(controller.signal);
     return () => {
       controller.abort();

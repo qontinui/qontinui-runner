@@ -250,7 +250,7 @@ function MarkdownDiv({ className, ...props }: Record<string, unknown>) {
  */
 function MarkdownImg({ src, alt, ...rest }: React.ImgHTMLAttributes<HTMLImageElement>) {
   return (
-    // eslint-disable-next-line @next/next/no-img-element, jsx-a11y/alt-text
+    // eslint-disable-next-line
     <img
       src={src}
       alt={alt ?? ""}

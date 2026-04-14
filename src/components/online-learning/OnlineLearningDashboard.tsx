@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getApiBase } from "@/lib/runner-api";
 import { tracedFetch } from "@/lib/traced-fetch";

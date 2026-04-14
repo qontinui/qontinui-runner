@@ -9,7 +9,7 @@ import { useUIState } from "../useUIState";
 
 type UIStateReturn = ReturnType<typeof useUIState>;
 
-export interface UIStateContextValue extends UIStateReturn {}
+export type UIStateContextValue = UIStateReturn;
 
 export const UIStateContext = createContext<UIStateContextValue | null>(null);
 

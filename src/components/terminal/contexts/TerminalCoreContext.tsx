@@ -57,16 +57,19 @@ export function TerminalCoreProvider({ pageId, children }: TerminalCoreProviderP
   // Terminal refs map — create refs for new tabs, clean up stale ones
   const terminalRefs = useRef<Map<string, RefObject<TerminalInstanceHandle | null>>>(new Map());
 
-  for (const tab of tabs) {
-    if (!terminalRefs.current.has(tab.id)) {
-      terminalRefs.current.set(tab.id, createRef<TerminalInstanceHandle>());
+  useEffect(() => {
+    const map = terminalRefs.current;
+    for (const tab of tabs) {
+      if (!map.has(tab.id)) {
+        map.set(tab.id, createRef<TerminalInstanceHandle>());
+      }
     }
-  }
-  for (const key of terminalRefs.current.keys()) {
-    if (!tabs.some((t) => t.id === key)) {
-      terminalRefs.current.delete(key);
+    for (const key of map.keys()) {
+      if (!tabs.some((t) => t.id === key)) {
+        map.delete(key);
+      }
     }
-  }
+  }, [tabs]);
 
   // Pending Claude sessions to resume after a zone profile load settles
   const pendingProfileSessionsRef = useRef<ZoneSessionInfo[] | null>(null);

@@ -7,7 +7,7 @@
  * Layer 4 (bottom): Clorinde Queries + DB Tables
  */
 
-import { memo, useMemo, useState, useCallback, useRef } from "react";
+import { memo, useMemo, useState, useCallback, useEffect } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -24,7 +24,7 @@ import {
 } from "@xyflow/react";
 import * as dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
-import type { ApiSurface, ApiConnection } from "./types";
+import type { ApiSurface } from "./types";
 import { NODE_COLORS, EDGE_STYLES, type NodeCategory } from "./types";
 
 // ─── Props ───────────────────────────────────────────────────────────────────
@@ -374,17 +374,13 @@ function ApiSurfaceGraphInner({
   const [edges, setEdges, onEdgesChange] = useEdgesState(layoutEdges);
   const [, setHoveredId] = useState<string | null>(null);
 
-  // Sync layout when data changes (adjust during render)
-  const prevLayoutNodes = useRef(layoutNodes);
-  const prevLayoutEdges = useRef(layoutEdges);
-  if (prevLayoutNodes.current !== layoutNodes) {
-    prevLayoutNodes.current = layoutNodes;
+  // Sync layout when data changes
+  useEffect(() => {
     setNodes(layoutNodes);
-  }
-  if (prevLayoutEdges.current !== layoutEdges) {
-    prevLayoutEdges.current = layoutEdges;
+  }, [layoutNodes, setNodes]);
+  useEffect(() => {
     setEdges(layoutEdges);
-  }
+  }, [layoutEdges, setEdges]);
 
   const onNodeMouseEnter = useCallback(
     (_: unknown, node: Node) => {

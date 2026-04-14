@@ -157,7 +157,7 @@ export function DemoVideoPanel() {
   const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
   const [config, setConfig] = useState<DemoRecordingConfig>(DEFAULT_RECORDING_CONFIG);
   const [state, setState] = useState<DemoGenerationState>(INITIAL_GENERATION_STATE);
-  const [narration, setNarration] = useState<NarrationOutput | null>(null);
+  const [_narration, setNarration] = useState<NarrationOutput | null>(null);
 
   // Multi-page batch state
   const [allScripts, setAllScripts] = useState<DemoScript[]>([]);
@@ -482,7 +482,7 @@ export function DemoVideoPanel() {
               {allResults.length} video{allResults.length !== 1 ? "s" : ""} recorded
             </div>
 
-            {allResults.map((entry, i) => (
+            {allResults.map((entry, _i) => (
               <div
                 key={entry.result.videoPath}
                 className="space-y-3 border border-border rounded-md p-4"

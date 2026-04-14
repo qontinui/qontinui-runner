@@ -168,7 +168,7 @@ function SecurityPosture({ profile }: { profile: string }) {
         <h4 className="text-sm font-medium text-neutral-200">Security Posture</h4>
       </div>
       <div className="p-4 space-y-2">
-        {LAYER_NAMES.map((label, i) => {
+        {LAYER_NAMES.map((label, _i) => {
           const key = label.split(":")[0];
           const score = scores[key] ?? 0;
           return (

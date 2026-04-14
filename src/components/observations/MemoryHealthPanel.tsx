@@ -61,7 +61,7 @@ export function MemoryHealthPanel() {
   const accentBlue = getAccentColors("blue");
   const statusError = getStatusColors("error");
   const statusSuccess = getStatusColors("complete");
-  const statusWarning = getStatusColors("running");
+  const _statusWarning = getStatusColors("running");
 
   const fetchData = useCallback(async () => {
     setIsLoading(true);

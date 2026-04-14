@@ -45,7 +45,7 @@ export class FilePathLinkProvider implements ITerminalLinkProvider {
 
       // Parse optional :line:col from the match groups
       const lineNumber = match[1] ? parseInt(match[1], 10) : undefined;
-      const colNumber = match[2] ? parseInt(match[2], 10) : undefined;
+      const _colNumber = match[2] ? parseInt(match[2], 10) : undefined;
 
       // Strip the :line:col suffix from the display text to get the pure file path
       let filePath = fullMatch;

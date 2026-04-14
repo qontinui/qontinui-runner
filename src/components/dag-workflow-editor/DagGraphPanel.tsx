@@ -6,7 +6,7 @@
  * directed acyclic graph with auto-layout via dagre.
  */
 
-import { useCallback, useMemo, useEffect } from "react";
+import { useMemo, useEffect } from "react";
 import {
   ReactFlow,
   MiniMap,

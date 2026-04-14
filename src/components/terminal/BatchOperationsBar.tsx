@@ -82,7 +82,8 @@ export function BatchOperationsBar() {
       const ref = terminalRefs.current.get(tabId);
       ref?.current?.writeToTerminal(text);
     },
-    [terminalRefs],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- terminalRefs is a stable ref object
+    [],
   );
 
   const handleApproveAll = useCallback(() => {

@@ -219,6 +219,7 @@ export function DashboardPage({
   useEffect(() => {
     const taskId = state.taskInfo?.taskId;
     if (!taskId || !state.isRunning) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional cleanup when task stops
       setBreakpointSnapshot(null);
       if (breakpointPollRef.current) {
         clearInterval(breakpointPollRef.current);

@@ -56,7 +56,7 @@ export function WatcherManagementPanel() {
   const [watchers, setWatchers] = useState<Watcher[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState<WatcherFormData>({ ...DEFAULT_FORM });
-  const [editingId, setEditingId] = useState<string | null>(null);
+  const [_editingId, setEditingId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const loadWatchers = useCallback(async () => {

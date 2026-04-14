@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { ArrowDown, FileCode } from "lucide-react";
-import type { ApiSurface, ApiConnection } from "./types";
+import type { ApiSurface } from "./types";
 import { NODE_COLORS, type NodeCategory } from "./types";
 
 interface Props {

@@ -6,7 +6,7 @@
  * by coverage score.
  */
 
-import { useState, useMemo, useCallback, Fragment, useRef } from "react";
+import { useState, useMemo, useCallback, Fragment, useEffect } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -25,7 +25,6 @@ import "@xyflow/react/dist/style.css";
 import {
   Shield,
   AlertTriangle,
-  CheckCircle,
   XCircle,
   ChevronDown,
   ChevronRight,
@@ -148,7 +147,7 @@ function GapDetailRow({ gap }: { gap: GapDetail }) {
 // Main Panel
 // =============================================================================
 
-export function CoverageGapPanel({ data, loading, onRefresh }: CoverageGapPanelProps) {
+export function CoverageGapPanel({ data, loading, onRefresh: _onRefresh }: CoverageGapPanelProps) {
   const [view, setView] = useState<"table" | "graph">("table");
   const [expandedPage, setExpandedPage] = useState<string | null>(null);
 
@@ -160,17 +159,13 @@ export function CoverageGapPanel({ data, loading, onRefresh }: CoverageGapPanelP
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState(nodes);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState(edges);
 
-  // Sync flow state when derived graph data changes (adjust during render)
-  const prevNodes = useRef(nodes);
-  const prevEdges = useRef(edges);
-  if (prevNodes.current !== nodes) {
-    prevNodes.current = nodes;
+  // Sync flow state when derived graph data changes
+  useEffect(() => {
     setFlowNodes(nodes);
-  }
-  if (prevEdges.current !== edges) {
-    prevEdges.current = edges;
+  }, [nodes, setFlowNodes]);
+  useEffect(() => {
     setFlowEdges(edges);
-  }
+  }, [edges, setFlowEdges]);
 
   const toggleExpand = useCallback(
     (page: string) => setExpandedPage((prev) => (prev === page ? null : page)),

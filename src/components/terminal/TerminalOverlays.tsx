@@ -29,7 +29,8 @@ export function TerminalOverlays({ onSortZones = noop, onExport = noop }: Termin
       terminalRefs.current.get(tabId)?.current?.writeToTerminal("y\r");
       incrementMetric("totalApprovals");
     },
-    [terminalRefs, incrementMetric],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- terminalRefs is a stable ref object
+    [incrementMetric],
   );
 
   const rejectTab = useCallback(
@@ -37,7 +38,8 @@ export function TerminalOverlays({ onSortZones = noop, onExport = noop }: Termin
       terminalRefs.current.get(tabId)?.current?.writeToTerminal("n\r");
       incrementMetric("totalRejections");
     },
-    [terminalRefs, incrementMetric],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- terminalRefs is a stable ref object
+    [incrementMetric],
   );
 
   const approveAll = useCallback(() => {
@@ -47,7 +49,8 @@ export function TerminalOverlays({ onSortZones = noop, onExport = noop }: Termin
     for (const tab of ni) {
       terminalRefs.current.get(tab.id)?.current?.writeToTerminal("y\r");
     }
-  }, [tabs, sessionStates, terminalRefs, incrementMetric, addHistoryEvent]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- terminalRefs is a stable ref object
+  }, [tabs, sessionStates, incrementMetric, addHistoryEvent]);
 
   return (
     <>

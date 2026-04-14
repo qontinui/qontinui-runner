@@ -106,7 +106,7 @@ export function BreakpointInspector({ snapshot, onClose }: BreakpointInspectorPr
     } catch {
       return null;
     }
-  }, [snapshot?.variables_json]);
+  }, [snapshot]);
 
   const pendingSteps = useMemo(() => {
     if (!snapshot) return [];
@@ -119,7 +119,7 @@ export function BreakpointInspector({ snapshot, onClose }: BreakpointInspectorPr
     } catch {
       return [];
     }
-  }, [snapshot?.pending_steps_json]);
+  }, [snapshot]);
 
   if (!snapshot) return null;
 

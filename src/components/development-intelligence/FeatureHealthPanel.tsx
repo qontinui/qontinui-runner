@@ -6,8 +6,8 @@
  */
 
 import { useState, useMemo } from "react";
-import { ResponsiveContainer, PieChart, Pie, Cell, Tooltip } from "recharts";
-import { Activity, Clock, AlertTriangle, Archive, Filter, GitCommit, FileText } from "lucide-react";
+import { ResponsiveContainer, PieChart, Pie, Cell } from "recharts";
+import { Activity, Clock, AlertTriangle, Archive, GitCommit, FileText } from "lucide-react";
 import type {
   FeatureHealth,
   FeatureHealthResult,
@@ -201,7 +201,7 @@ function TimelineView({ features }: { features: FeatureHealth[] }) {
 // Main Panel
 // =============================================================================
 
-export function FeatureHealthPanel({ data, loading, onRefresh }: FeatureHealthPanelProps) {
+export function FeatureHealthPanel({ data, loading, onRefresh: _onRefresh }: FeatureHealthPanelProps) {
   const [view, setView] = useState<"board" | "timeline">("board");
   const [filter, setFilter] = useState<FeatureHealth["status"] | "all">("all");
 

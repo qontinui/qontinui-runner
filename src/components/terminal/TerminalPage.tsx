@@ -1,6 +1,5 @@
-import { useEffect, useCallback, useRef, useMemo } from "react";
+import { useEffect, useCallback } from "react";
 import { useUIComponent } from "ui-bridge";
-import { instanceStorage } from "@/lib/instance-storage";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
@@ -69,8 +68,8 @@ export function TerminalPage(props: TerminalPageProps) {
 }
 
 function TerminalPageInner({
-  onNavigateToBuilder,
-  onNavigateToActive,
+  onNavigateToBuilder: _onNavigateToBuilder,
+  onNavigateToActive: _onNavigateToActive,
   onSessionCountChange,
 }: TerminalPageProps) {
   const {
@@ -119,7 +118,7 @@ function TerminalPageInner({
   }, [tabs.length, onSessionCountChange]);
 
   const { fileConflicts, fileLockStates, sessionPersistence } = useShellInfra();
-  const { labelsAndTags, eventHistory, addHistoryEvent, metrics, incrementMetric, focusHistory } =
+  const { labelsAndTags, eventHistory, addHistoryEvent, metrics: _metrics, incrementMetric, focusHistory } =
     useZoneMetadata();
 
   const stateTracking = useSessionState();
@@ -132,7 +131,7 @@ function TerminalPageInner({
   const {
     state: uiState,
     dispatch,
-    toggleFocusMode,
+    toggleFocusMode: _toggleFocusMode,
     toggleAutoLayout,
     cycleViewMode,
   } = useUIStateCx();

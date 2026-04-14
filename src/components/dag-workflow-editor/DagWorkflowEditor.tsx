@@ -138,7 +138,7 @@ export function DagWorkflowEditor() {
       } else {
         setValidationStatus("error");
       }
-    } catch (err) {
+    } catch (_err) {
       // Backend command may not exist yet — use client-side fallback
       try {
         // eslint-disable-next-line @typescript-eslint/no-require-imports

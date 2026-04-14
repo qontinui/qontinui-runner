@@ -18,7 +18,7 @@ import {
   Bar,
   Cell,
 } from "recharts";
-import { TrendingUp, AlertTriangle, Layers, ChevronDown, ChevronRight } from "lucide-react";
+import { TrendingUp, AlertTriangle, Layers } from "lucide-react";
 import type {
   ComplexityScore,
   ComplexityAnalysisResult,
@@ -194,7 +194,7 @@ function ScoreBreakdownPanel({ score }: { score: ComplexityScore }) {
 // Main Dashboard
 // =============================================================================
 
-export function ComplexityDashboard({ data, loading, onRefresh }: ComplexityDashboardProps) {
+export function ComplexityDashboard({ data, loading, onRefresh: _onRefresh }: ComplexityDashboardProps) {
   const [selectedPage, setSelectedPage] = useState<string | null>(null);
 
   const treemapData = useMemo(() => {

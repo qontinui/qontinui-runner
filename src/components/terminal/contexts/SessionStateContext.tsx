@@ -5,7 +5,7 @@
  * Reads from TerminalCoreContext for tabs, terminalRefs, zoneLayout, and activeId.
  */
 
-import { createContext, useMemo, useRef, type ReactNode } from "react";
+import { createContext, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useTerminalCore } from "./useTerminalCore";
 import { useSessionStateTracking } from "../useSessionStateTracking";
 import { useUnreadTracking } from "../useUnreadTracking";
@@ -60,7 +60,9 @@ export function SessionStateProvider({ children }: SessionStateProviderProps) {
   const { processOutput, activeFindings, allFindings } = useTerminalFindings(activeId ?? null);
 
   // Wire findings processOutput into stateTracking's processOutputRef
-  processOutputRef.current = processOutput;
+  useEffect(() => {
+    processOutputRef.current = processOutput;
+  }, [processOutput]);
 
   const value = useMemo<SessionStateContextValue>(
     () => ({
