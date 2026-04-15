@@ -9,20 +9,18 @@
 // Types from shared-types package
 // =============================================================================
 
+// The generator (qontinui-schemas/rust/src/scheduler.rs →
+// json-schema-to-typescript) emits only the parent tagged-union types; the
+// per-variant aliases (`ScheduleOnce`, `WorkflowTask`, etc.) no longer exist
+// as standalone names. Consumers narrow against the `type` / `task_type`
+// discriminant instead.
 export type {
-  ScheduleOnce,
-  ScheduleCron,
-  ScheduleInterval,
-  ScheduleState,
   ScheduleExpression,
   IdleCondition,
   RepositoryWatch,
   RepositoryInactiveCondition,
   ScheduleConditions,
   ConditionStatus,
-  WorkflowTask,
-  PromptTask,
-  AutoFixTask,
   ScheduledTaskType,
   ScheduledTaskStatus,
   TaskExecutionRecord,

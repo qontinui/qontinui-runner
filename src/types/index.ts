@@ -140,17 +140,14 @@ export type {
   CategoryStore,
 } from "./findings";
 
-// Scheduler types (CI/CD scheduling system)
+// Scheduler types (CI/CD scheduling system). Per-variant aliases for
+// `ScheduleExpression` and `ScheduledTaskType` are no longer exported from
+// `@qontinui/shared-types/scheduler` — the generator only emits the parent
+// tagged-union types. Narrow against the `type` / `task_type` discriminant
+// when you need to branch on a specific variant.
 export type {
   ScheduleExpression,
-  ScheduleOnce,
-  ScheduleCron,
-  ScheduleInterval,
-  ScheduleState,
   ScheduledTaskType,
-  WorkflowTask,
-  PromptTask,
-  AutoFixTask,
   ScheduledTaskStatus,
   TaskExecutionRecord,
   ScheduledTask,
