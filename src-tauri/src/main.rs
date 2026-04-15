@@ -1390,6 +1390,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // SQLite→PG data migration removed (migration complete, PG is primary)
 
+            // Start MCP API server in background BEFORE any synchronous bridge/seed
+            // work below. Spawning early lets /health bind and respond during the
+            // WebView2 cold-profile init that follows, preventing supervisor health
+            // probes from timing out on temp runners. The server only needs the
+            // captures made above (mcp_app_state, mcp_rag_state, api_port,
+            // mcp_instance_manager), all of which are populated earlier in main().
+            let api_port = crate::mcp::types::get_mcp_api_port();
+            info!("Starting MCP API server on port {}", api_port);
+            let mcp_app_handle = app.handle().clone();
+            let mcp_instance_manager = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                info!("MCP API server task starting...");
+                match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, api_port, mcp_instance_manager).await {
+                    Ok(_) => info!("MCP API server stopped normally"),
+                    Err(e) => error!("MCP API server error: {}", e),
+                }
+            });
+
             // Clear runner log files from previous session
             executor::FileLogger::clear_logs();
             dom_capture::DomCaptureLogger::clear_captures();
@@ -1476,18 +1494,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             *extraction_lock = Some(extraction_executor);
             drop(extraction_lock);
 
-            // Start MCP API server in background using the shared AppState
-            let api_port = crate::mcp::types::get_mcp_api_port();
-            info!("Starting MCP API server on port {}", api_port);
-            let mcp_app_handle = app.handle().clone();
-            let mcp_instance_manager = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
-            tauri::async_runtime::spawn(async move {
-                info!("MCP API server task starting...");
-                match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, api_port, mcp_instance_manager).await {
-                    Ok(_) => info!("MCP API server stopped normally"),
-                    Err(e) => error!("MCP API server error: {}", e),
-                }
-            });
+            // MCP API server already spawned earlier (before bridge/seed work) so
+            // that /health binds during WebView2 cold-profile init.
 
             // Start heartbeat background task for fleet registration
             heartbeat::start_heartbeat(heartbeat_app_state);
