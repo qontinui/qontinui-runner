@@ -533,6 +533,24 @@ pub fn export_all_schemas() -> Value {
     add!("UiBridgeStepPhase", qws::UiBridgeStepPhase);
     add!("WorkflowStepPhase", qws::WorkflowStepPhase);
 
+    // ── qontinui-types: FullRunnerStep (all 16 handler-registered variants) ──
+    add!("FullRunnerStep", qws::FullRunnerStep);
+    add!("CodeExecutionStep", qws::CodeExecutionStep);
+    add!("ExecutePlaybookStep", qws::ExecutePlaybookStep);
+    add!("A11yAction", qws::A11yAction);
+    add!("NativeAccessibilityStep", qws::NativeAccessibilityStep);
+    add!("RestartProcessStep", qws::RestartProcessStep);
+    add!("SaveWorkflowArtifactStep", qws::SaveWorkflowArtifactStep);
+    add!("WorkflowFixupMode", qws::WorkflowFixupMode);
+    add!("WorkflowFixupStep", qws::WorkflowFixupStep);
+    add!("UiBridgeDesignAuditStep", qws::UiBridgeDesignAuditStep);
+    add!("VisualAssertionType", qws::VisualAssertionType);
+    add!("UiBridgeVisualAssertionStep", qws::UiBridgeVisualAssertionStep);
+    add!("WorkflowRefStep", qws::WorkflowRefStep);
+    add!("DagCancelStep", qws::DagCancelStep);
+    add!("DagApprovalStep", qws::DagApprovalStep);
+    add!("DagLoopStep", qws::DagLoopStep);
+
     Value::Object(m)
 }
 
@@ -556,7 +574,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 80, "Expected 80 schema entries");
+        assert_eq!(obj.len(), 96, "Expected 96 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
