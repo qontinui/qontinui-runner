@@ -27,7 +27,10 @@ import {
   buildSpecWorkflow,
   type SpecConfig as BuildSpecConfig,
 } from "@/lib/workflow-builder/buildSpecWorkflow";
+import { buildSpecBrief } from "@/lib/workflow-builder/buildSpecBrief";
+import { generateFromBrief } from "@/lib/workflow-builder/generateFromBrief";
 import { getApiBase } from "@/lib/runner-api";
+import { instanceStorage } from "@/lib/instance-storage";
 import { createSummaryStep } from "@/types/unified-workflow";
 import { useKnownIssues } from "@/hooks/useKnownIssues";
 import { SpecExperimentationDashboard } from "@/components/specs/SpecExperimentationDashboard";
@@ -36,6 +39,20 @@ import type { LoadedSpec } from "./types";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import { useSpecSync } from "@/hooks/useSpecSync";
+
+// ============================================================================
+// AI spec-generation flag — persisted via instanceStorage
+// ============================================================================
+
+const AI_GENERATION_STORAGE_KEY = "specs.useAiGeneration";
+
+function readAiGenerationFlag(): boolean {
+  return instanceStorage.getJSON<boolean>(AI_GENERATION_STORAGE_KEY, false) === true;
+}
+
+function writeAiGenerationFlag(value: boolean): void {
+  instanceStorage.setJSON(AI_GENERATION_STORAGE_KEY, value);
+}
 
 // ============================================================================
 // SpecsPage reducer
@@ -278,6 +295,21 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   } = pageState;
   const { issues: knownIssues, loadIssuesForSpec } = useKnownIssues();
 
+  // AI spec-generation toggle (persisted across reloads via instanceStorage).
+  const [useAiSpecGeneration, setUseAiSpecGeneration] = useState<boolean>(() =>
+    readAiGenerationFlag(),
+  );
+  const toggleUseAiSpecGeneration = useCallback(() => {
+    setUseAiSpecGeneration((prev) => {
+      const next = !prev;
+      writeAiGenerationFlag(next);
+      return next;
+    });
+  }, []);
+
+  // Dedicated progress state for the AI path (generation can take 30+ seconds).
+  const [isGeneratingWithAi, setIsGeneratingWithAi] = useState(false);
+
   useUIComponent({
     id: "specs-page",
     name: "Specs Page",
@@ -311,17 +343,90 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     }
   }, [state.selectedSpec, loadIssuesForSpec]);
 
+  // AI path: build a GenerationBrief, run the AI pipeline, persist the returned
+  // workflow, and navigate to the builder. On any failure, logs and returns —
+  // does NOT silently fall back to the deterministic path.
+  const runAiGeneration = useCallback(
+    async (
+      briefInput: Parameters<typeof buildSpecBrief>[0],
+      extraTags?: string[],
+    ): Promise<void> => {
+      setIsGeneratingWithAi(true);
+      try {
+        const brief = buildSpecBrief(briefInput);
+        const response = await generateFromBrief(brief);
+
+        if (!response.success) {
+          console.error(
+            "[Specs] AI workflow generation failed:",
+            response.message || "(no message)",
+          );
+          return;
+        }
+
+        // Mirror the shape returned by `generate_workflow_standalone`:
+        // `data = { success, error?, workflow? }`. We follow the same idiom as
+        // `useWorkflowGeneration.ts` and read the workflow from `data.workflow`.
+        const data = response.data as
+          | { workflow?: Record<string, unknown>; error?: string }
+          | null
+          | undefined;
+        const workflow = data?.workflow;
+        if (!workflow) {
+          console.error(
+            "[Specs] AI generation returned no workflow:",
+            data?.error || response.message || "(no details)",
+          );
+          return;
+        }
+
+        // The Rust backend already persists the workflow to the DB but does
+        // not surface the new DB id on the response. Re-POST here so we get a
+        // fresh navigable id — same idiom as the deterministic path.
+        const payload: Record<string, unknown> = {
+          ...workflow,
+          reflection_mode: true,
+        };
+        if (extraTags && extraTags.length > 0) {
+          const existingTags = Array.isArray(workflow.tags) ? (workflow.tags as unknown[]) : [];
+          payload.tags = [...existingTags, ...extraTags];
+        }
+
+        await saveWorkflowAndNavigate(payload, onNavigateToWorkflowBuilder);
+      } catch (err) {
+        console.error("[Specs] Error during AI workflow generation:", err);
+      } finally {
+        setIsGeneratingWithAi(false);
+      }
+    },
+    [onNavigateToWorkflowBuilder],
+  );
+
   // Build workflow from any spec type, save via API, navigate to builder
   const handleBuildWorkflow = useCallback(
     async (spec?: LoadedSpec) => {
       const target = spec || state.selectedSpec;
-      if (!target || isSavingWorkflow) return;
+      if (!target || isSavingWorkflow || isGeneratingWithAi) return;
 
       if (target.kind === "page-spec") {
         const activeIssues = knownIssues.filter((i) => i.status === "active");
+        const specConfig = target.config as unknown as BuildSpecConfig;
+        const workflowName = `Spec: ${target.config.description || target.specId}`;
+
+        // AI path — flag-gated. Does NOT fall back to deterministic on error.
+        if (useAiSpecGeneration) {
+          const pageUrl = (target.config as { metadata?: { pageUrl?: string } })?.metadata?.pageUrl;
+          await runAiGeneration({
+            specConfig,
+            workflowName,
+            pageUrl,
+          });
+          return;
+        }
+
         const workflow = buildSpecWorkflow({
-          specConfig: target.config as unknown as BuildSpecConfig,
-          workflowName: `Spec: ${target.config.description || target.specId}`,
+          specConfig,
+          workflowName,
           forcePromptOnly,
           includeRegressionChecks: includeRegressionChecks && activeIssues.length > 0,
           knownIssues: includeRegressionChecks ? activeIssues : [],
@@ -386,10 +491,13 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     [
       state.selectedSpec,
       isSavingWorkflow,
+      isGeneratingWithAi,
       onNavigateToWorkflowBuilder,
       forcePromptOnly,
       includeRegressionChecks,
       knownIssues,
+      useAiSpecGeneration,
+      runAiGeneration,
     ],
   );
 
@@ -433,18 +541,44 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   // Triage: "Fix Code" — create a scoped workflow for the broken group
   const handleTriageFixCode = useCallback(
     async (groupId: string) => {
-      if (!state.selectedSpec || state.selectedSpec.kind !== "page-spec" || isSavingWorkflow)
+      if (
+        !state.selectedSpec ||
+        state.selectedSpec.kind !== "page-spec" ||
+        isSavingWorkflow ||
+        isGeneratingWithAi
+      )
         return;
 
       const specConfig = state.selectedSpec.config as unknown as BuildSpecConfig;
       const groupName =
         specConfig.groups.find((g: { id: string }) => g.id === groupId)?.name || groupId;
 
+      const selectedGroupIds = new Set([groupId]);
+      const agenticPrompt = `These assertions in group "${groupName}" were previously passing but now fail. Investigate the regression and fix the code to make them pass again.`;
+      const workflowName = `Fix: ${specConfig.description || state.selectedSpec.specId} — ${groupName}`;
+
+      // AI path — flag-gated. Does NOT fall back on error.
+      if (useAiSpecGeneration) {
+        const pageUrl = (state.selectedSpec.config as { metadata?: { pageUrl?: string } })?.metadata
+          ?.pageUrl;
+        await runAiGeneration(
+          {
+            specConfig,
+            selectedGroupIds,
+            pageUrl,
+            workflowName,
+            additionalInstructions: agenticPrompt,
+          },
+          ["triage-fix"],
+        );
+        return;
+      }
+
       const workflow = buildSpecWorkflow({
         specConfig,
-        selectedGroupIds: new Set([groupId]),
-        agenticPrompt: `These assertions in group "${groupName}" were previously passing but now fail. Investigate the regression and fix the code to make them pass again.`,
-        workflowName: `Fix: ${specConfig.description || state.selectedSpec.specId} — ${groupName}`,
+        selectedGroupIds,
+        agenticPrompt,
+        workflowName,
       });
 
       dispatch({ type: "SET_SAVING_WORKFLOW", value: true });
@@ -476,7 +610,14 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
         dispatch({ type: "SET_SAVING_WORKFLOW", value: false });
       }
     },
-    [state.selectedSpec, isSavingWorkflow, onNavigateToWorkflowBuilder],
+    [
+      state.selectedSpec,
+      isSavingWorkflow,
+      isGeneratingWithAi,
+      onNavigateToWorkflowBuilder,
+      useAiSpecGeneration,
+      runAiGeneration,
+    ],
   );
 
   return (
@@ -500,7 +641,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
           {/* Connection bar */}
           <ConnectionBar
             connection={state.connection}
-            isLoading={state.isLoading || isSavingWorkflow}
+            isLoading={state.isLoading || isSavingWorkflow || isGeneratingWithAi}
             stats={state.stats}
             editMode={state.editMode}
             hasSelectedSpec={!!state.selectedSpec}
@@ -514,6 +655,9 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             includeRegressionChecks={includeRegressionChecks}
             onToggleRegressionChecks={() => dispatch({ type: "TOGGLE_REGRESSION_CHECKS" })}
             regressionIssueCount={knownIssues.filter((i) => i.status === "active").length}
+            useAiSpecGeneration={useAiSpecGeneration}
+            onToggleUseAiSpecGeneration={toggleUseAiSpecGeneration}
+            isGeneratingWithAi={isGeneratingWithAi}
             onBuildWorkflow={() => handleBuildWorkflow()}
             onCompileStateMachine={handleCompileStateMachine}
             onSyncAllSpecs={specSync.startSync}

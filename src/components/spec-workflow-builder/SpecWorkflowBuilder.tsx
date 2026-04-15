@@ -12,7 +12,7 @@
  */
 
 import { useState, useCallback, useMemo } from "react";
-import { FileJson, CheckSquare, Bot, Eye } from "lucide-react";
+import { FileJson, CheckSquare, Bot, Eye, Sparkles, Loader2, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { SpecFileLoader } from "./SpecFileLoader";
 import { SpecSelector } from "./SpecSelector";
@@ -26,6 +26,8 @@ import {
   type SpecConfig as BuildSpecConfig,
 } from "../../lib/workflow-builder/buildSpecWorkflow";
 import { buildSpecDrivenWorkflow } from "../../lib/workflow-builder/buildSpecDrivenWorkflow";
+import { buildSpecBrief } from "../../lib/workflow-builder/buildSpecBrief";
+import { generateFromBrief } from "../../lib/workflow-builder/generateFromBrief";
 
 type Step = "load" | "select" | "configure" | "preview";
 type WorkflowMode = "verify" | "implement" | "update";
@@ -44,6 +46,11 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
   const [maxIterations, setMaxIterations] = useState<number | null>(null);
   const [elementSource, setElementSource] = useState<"control" | "external">("control");
   const [workflowMode, setWorkflowMode] = useState<WorkflowMode>("verify");
+
+  // AI generation state (unified-generation path via generateFromBrief)
+  const [aiWorkflow, setAiWorkflow] = useState<UnifiedWorkflow | null>(null);
+  const [isGeneratingAi, setIsGeneratingAi] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
   // Extract generator metadata from SpecConfig
   const genMeta = useMemo<GeneratorSpecMetadata | undefined>(
@@ -143,6 +150,70 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     workflowMode,
     fileName,
   ]);
+
+  // Build a workflow name consistent with the deterministic preview for the brief.
+  const briefWorkflowName = useMemo(() => {
+    const isNavigation = generatorType === "navigation";
+    if (workflowMode === "verify") {
+      return isNavigation ? "Navigation Verification" : "Snapshot Verification";
+    }
+    if (workflowMode === "implement") {
+      return `Implement from Spec — ${fileName.replace(".spec.uibridge.json", "")}`;
+    }
+    return `Update from Spec — ${fileName.replace(".spec.uibridge.json", "")}`;
+  }, [generatorType, workflowMode, fileName]);
+
+  const handleGenerateWithAi = useCallback(async () => {
+    if (!loadedData) return;
+    setIsGeneratingAi(true);
+    setAiError(null);
+    try {
+      const isNavigation = generatorType === "navigation";
+      const explorationMeta = genMeta?.explorationMetadata as { targetUrl?: string } | undefined;
+      const pageUrl = isNavigation
+        ? explorationMeta?.targetUrl || states[0]?.pageUrl || undefined
+        : undefined;
+
+      const brief = buildSpecBrief({
+        specConfig: loadedData as unknown as BuildSpecConfig,
+        selectedGroupIds: selectedSpecIds,
+        elementSource,
+        pageUrl,
+        workflowName: briefWorkflowName,
+      });
+
+      const response = await generateFromBrief(brief);
+
+      if (response.success && response.data) {
+        // Match the idiom in useWorkflowGeneration.ts: result.data.workflow
+        const data = response.data as { workflow?: UnifiedWorkflow; error?: string };
+        if (data.workflow) {
+          setAiWorkflow(data.workflow);
+        } else {
+          setAiError(data.error ?? response.message ?? "Generation returned no workflow");
+        }
+      } else {
+        setAiError(response.message ?? "Generation failed");
+      }
+    } catch (err) {
+      setAiError(err instanceof Error ? err.message : "Generation failed");
+    } finally {
+      setIsGeneratingAi(false);
+    }
+  }, [
+    loadedData,
+    generatorType,
+    genMeta,
+    states,
+    selectedSpecIds,
+    elementSource,
+    briefWorkflowName,
+  ]);
+
+  const resetAiWorkflow = useCallback(() => {
+    setAiWorkflow(null);
+    setAiError(null);
+  }, []);
 
   const stepDefs: { id: Step; label: string; icon: React.ReactNode }[] = [
     { id: "load", label: "Load Specs", icon: <FileJson className="w-4 h-4" /> },
@@ -282,10 +353,72 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
         )}
 
         {currentStep === "preview" && workflow && (
-          <WorkflowPreview
-            workflow={workflow}
-            onApply={onApplyWorkflow ? () => onApplyWorkflow(workflow) : undefined}
-          />
+          <div className="flex flex-col h-full overflow-auto">
+            {/* AI generation action bar */}
+            <div className="flex items-center gap-2 px-4 py-3 border-b border-border bg-muted/30">
+              <button
+                onClick={handleGenerateWithAi}
+                disabled={isGeneratingAi || !loadedData}
+                title="Builds a spec brief and sends it through the AI workflow generator. Takes 30+ seconds. Result replaces the preview below."
+                className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {isGeneratingAi ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Sparkles className="w-4 h-4" />
+                )}
+                {isGeneratingAi ? "Generating…" : "Generate with AI"}
+              </button>
+              <span className="text-xs text-muted-foreground">
+                Builds a spec brief and sends it through the AI workflow generator. Takes 30+
+                seconds. Result replaces the preview below.
+              </span>
+            </div>
+
+            {/* AI error banner */}
+            {aiError && (
+              <div className="px-4 py-2 border-b border-red-500/30 bg-red-500/10 text-xs text-red-400">
+                {aiError}
+              </div>
+            )}
+
+            {/* AI-generated label + reset */}
+            {aiWorkflow && !isGeneratingAi && (
+              <div className="flex items-center gap-2 px-4 py-2 border-b border-purple-500/30 bg-purple-500/10">
+                <Sparkles className="w-3 h-3 text-purple-400" />
+                <span className="text-xs font-medium text-purple-400">AI-generated</span>
+                <button
+                  onClick={resetAiWorkflow}
+                  className="ml-auto flex items-center gap-1 px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  title="Reset to deterministic preview"
+                >
+                  <X className="w-3 h-3" />
+                  Reset to deterministic preview
+                </button>
+              </div>
+            )}
+
+            {/* Preview area */}
+            <div className="flex-1 min-h-0 overflow-auto">
+              {isGeneratingAi ? (
+                <div className="flex flex-col items-center justify-center h-full p-8 gap-3 text-muted-foreground">
+                  <Loader2 className="w-6 h-6 animate-spin text-purple-400" />
+                  <span className="text-sm">Generating with AI…</span>
+                  <span className="text-xs opacity-70">This can take 30+ seconds.</span>
+                </div>
+              ) : aiWorkflow ? (
+                <WorkflowPreview
+                  workflow={aiWorkflow}
+                  onApply={onApplyWorkflow ? () => onApplyWorkflow(aiWorkflow) : undefined}
+                />
+              ) : (
+                <WorkflowPreview
+                  workflow={workflow}
+                  onApply={onApplyWorkflow ? () => onApplyWorkflow(workflow) : undefined}
+                />
+              )}
+            </div>
+          </div>
         )}
       </div>
     </div>

@@ -19,6 +19,7 @@ import {
   Bug,
   Network,
   RefreshCw,
+  Sparkles,
 } from "lucide-react";
 import type { ConnectionState } from "./types";
 
@@ -34,6 +35,9 @@ interface ConnectionBarProps {
   includeRegressionChecks: boolean;
   onToggleRegressionChecks: () => void;
   regressionIssueCount: number;
+  useAiSpecGeneration: boolean;
+  onToggleUseAiSpecGeneration: () => void;
+  isGeneratingWithAi: boolean;
   onLoadBundled: () => void;
   onDiscover: (url: string) => void;
   onLoadFromFile: () => void;
@@ -57,6 +61,9 @@ export function ConnectionBar({
   includeRegressionChecks,
   onToggleRegressionChecks,
   regressionIssueCount,
+  useAiSpecGeneration,
+  onToggleUseAiSpecGeneration,
+  isGeneratingWithAi,
   onLoadBundled,
   onDiscover,
   onLoadFromFile,
@@ -256,17 +263,37 @@ export function ConnectionBar({
             Regression ({regressionIssueCount})
           </button>
         )}
+        {/* AI spec-generation toggle — routes Build Workflow through the
+            Builder-Verifier-Fixer pipeline instead of the deterministic
+            buildSpecWorkflow path. Persisted via instanceStorage. */}
+        <button
+          onClick={onToggleUseAiSpecGeneration}
+          className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
+          border transition-colors shrink-0 ${
+            useAiSpecGeneration
+              ? "bg-fuchsia-500/15 text-fuchsia-400 border-fuchsia-500/30"
+              : "bg-white/5 text-muted-foreground border-white/10 hover:bg-white/10"
+          }`}
+          title="Generate the workflow with the AI spec-brief pipeline (experimental). When off, the deterministic buildSpecWorkflow path is used."
+        >
+          <Sparkles className="w-3.5 h-3.5" />
+          Generate with AI (spec brief)
+        </button>
         {hasSelectedSpec && (
           <button
             ref={buildRef}
             onClick={onBuildWorkflow}
-            disabled={isLoading}
+            disabled={isLoading || isGeneratingWithAi}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
             bg-orange-500 text-white shadow-xs shadow-orange-500/25
             hover:bg-orange-600 disabled:opacity-50 transition-colors shrink-0"
           >
-            <Hammer className="w-3.5 h-3.5" />
-            Build Workflow
+            {isGeneratingWithAi ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Hammer className="w-3.5 h-3.5" />
+            )}
+            {isGeneratingWithAi ? "Generating…" : "Build Workflow"}
           </button>
         )}
         <button
