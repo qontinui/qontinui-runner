@@ -92,6 +92,182 @@ export function useAISearchEvents(
           return true;
         }
 
+        case "wait_for_element_by_condition": {
+          // Tier 3.1 companion to the Rust forwarder
+          // (qontinui-runner/src-tauri/src/mcp/ui_bridge.rs::ui_bridge_wait_for_element_condition_handler).
+          // The Rust handler forwards {params: body}; we poll the registry here and report
+          // {matched, element, waited_ms} back. Rust then converts no-match to HTTP 408.
+          //
+          // The matcher is inlined (not imported from ui-bridge/server) because the
+          // server subpath isn't published in the runtime bundle.
+          const matches = (
+            el: {
+              id: string;
+              type?: unknown;
+              label?: unknown;
+              ariaLabel?: unknown;
+              title?: unknown;
+            },
+            sel: { id?: string; title?: string; aria_label?: string; text?: string; type?: string },
+          ): boolean => {
+            if (sel.id && el.id !== sel.id) return false;
+            if (sel.title) {
+              const needle = sel.title.toLowerCase();
+              const t = ((el.title as string | undefined) ?? "").toLowerCase();
+              const a = ((el.ariaLabel as string | undefined) ?? "").toLowerCase();
+              const l = ((el.label as string | undefined) ?? "").toLowerCase();
+              if (!t.includes(needle) && !a.includes(needle) && !l.includes(needle)) return false;
+            }
+            if (sel.aria_label) {
+              const needle = sel.aria_label.toLowerCase();
+              const a = ((el.ariaLabel as string | undefined) ?? "").toLowerCase();
+              const l = ((el.label as string | undefined) ?? "").toLowerCase();
+              if (!a.includes(needle) && !l.includes(needle)) return false;
+            }
+            if (sel.text) {
+              const needle = sel.text.toLowerCase();
+              const l = ((el.label as string | undefined) ?? "").toLowerCase();
+              const i = el.id.toLowerCase();
+              if (!l.includes(needle) && !i.includes(needle)) return false;
+            }
+            return true;
+          };
+          const p = (payload.params ?? payload.body ?? {}) as {
+            selector?: Record<string, unknown>;
+            condition?: string;
+            timeout_ms?: number;
+            text_match?: string;
+          };
+          const selector = (p.selector ?? {}) as {
+            id?: string;
+            title?: string;
+            aria_label?: string;
+            text?: string;
+            type?: string;
+          };
+          const condition = p.condition ?? "present";
+          const timeoutMs = Math.min(
+            Math.max(typeof p.timeout_ms === "number" ? p.timeout_ms : 5000, 100),
+            60_000,
+          );
+          const textMatch = p.text_match;
+          const start = Date.now();
+          const pollMs = 100;
+
+          const checkCondition = (el: Record<string, unknown>, domEl: HTMLElement | null) => {
+            switch (condition) {
+              case "present":
+                return true;
+              case "visible":
+                if (!domEl) return false;
+                if (domEl.offsetParent === null) return false;
+                return (
+                  domEl.getBoundingClientRect().width > 0 &&
+                  domEl.getBoundingClientRect().height > 0
+                );
+              case "clickable":
+                if (!domEl) return false;
+                if (domEl.offsetParent === null) return false;
+                if (
+                  (domEl as HTMLButtonElement | HTMLInputElement).disabled ||
+                  domEl.getAttribute("aria-disabled") === "true"
+                )
+                  return false;
+                return (
+                  domEl.getBoundingClientRect().width > 0 &&
+                  domEl.getBoundingClientRect().height > 0
+                );
+              case "text-matches": {
+                if (!textMatch) return true;
+                const needle = textMatch.toLowerCase();
+                const label = ((el.label as string | undefined) ?? "").toLowerCase();
+                const aria = ((el.ariaLabel as string | undefined) ?? "").toLowerCase();
+                const tt = ((el.title as string | undefined) ?? "").toLowerCase();
+                const tc = (domEl?.textContent ?? "").toLowerCase();
+                return (
+                  label.includes(needle) ||
+                  aria.includes(needle) ||
+                  tt.includes(needle) ||
+                  tc.includes(needle)
+                );
+              }
+              default:
+                return true;
+            }
+          };
+
+          const pollOnce = async () => {
+            // Use bridge.discover() to match the path that GET /control/elements uses
+            // (proven to return 65 elements). Accessing registry directly picked a
+            // different instance whose getAllElements() returned empty.
+            const discovered = await currentBridge.discover({ includeHidden: true });
+            const elements = (discovered.elements ?? []) as Array<Record<string, unknown>>;
+            for (const el of elements) {
+              const domEl =
+                ((el as { element?: HTMLElement }).element as HTMLElement | undefined) ?? null;
+              const materialized = {
+                id: el.id as string,
+                type: el.type,
+                label: el.label,
+                ariaLabel:
+                  (el as { ariaLabel?: string }).ariaLabel ??
+                  domEl?.getAttribute("aria-label") ??
+                  undefined,
+                title:
+                  (el as { title?: string }).title ?? domEl?.getAttribute("title") ?? undefined,
+              };
+              if (!matches(materialized, selector)) continue;
+              if (
+                selector.type &&
+                materialized.type !== selector.type &&
+                !(domEl?.tagName ?? "").toLowerCase().includes(selector.type.toLowerCase())
+              ) {
+                continue;
+              }
+              if (checkCondition(materialized, domEl)) {
+                return {
+                  matched: true,
+                  element: materialized,
+                  waited_ms: Date.now() - start,
+                };
+              }
+            }
+            return null;
+          };
+
+          const result = await new Promise<{
+            matched: boolean;
+            element?: unknown;
+            waited_ms: number;
+          }>((resolve) => {
+            const tick = async () => {
+              try {
+                const hit = await pollOnce();
+                if (hit) {
+                  resolve(hit);
+                  return;
+                }
+              } catch {
+                /* swallow and retry */
+              }
+              if (Date.now() - start >= timeoutMs) {
+                resolve({ matched: false, waited_ms: Date.now() - start });
+                return;
+              }
+              setTimeout(tick, pollMs);
+            };
+            void tick();
+          });
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: result,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "ai_execute": {
           const { NLActionExecutor } = await import("ui-bridge/ai");
           const discovered = await currentBridge.discover({ includeHidden: true });
