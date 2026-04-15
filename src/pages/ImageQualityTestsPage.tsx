@@ -92,13 +92,13 @@ function ImageCard({
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // Edit state
-  const [editCategory, setEditCategory] = useState(entry.file.split("/")[0]);
-  const [editLabel, setEditLabel] = useState(entry.expected_label);
-  const [editIssue, setEditIssue] = useState(entry.issue);
-  const [editDescription, setEditDescription] = useState(entry.description);
-  const [editElementType, setEditElementType] = useState(entry.element_type || "");
-  const [editExpectedText, setEditExpectedText] = useState(entry.expected_text || "");
+  // Edit state — initialized when entering edit mode
+  const [editCategory, setEditCategory] = useState("");
+  const [editLabel, setEditLabel] = useState("");
+  const [editIssue, setEditIssue] = useState("");
+  const [editDescription, setEditDescription] = useState("");
+  const [editElementType, setEditElementType] = useState("");
+  const [editExpectedText, setEditExpectedText] = useState("");
 
   const category = entry.file.split("/")[0] as Category;
   const filename = entry.file.split("/").pop() || entry.file;
@@ -136,14 +136,14 @@ function ImageCard({
     };
   }, [entry.file]);
 
-  // Sync edit state when entry changes (e.g., after save)
-  useEffect(() => {
+  const startEditing = useCallback(() => {
     setEditCategory(entry.file.split("/")[0]);
     setEditLabel(entry.expected_label);
     setEditIssue(entry.issue);
     setEditDescription(entry.description);
     setEditElementType(entry.element_type || "");
     setEditExpectedText(entry.expected_text || "");
+    setEditing(true);
   }, [entry]);
 
   const handleSave = async () => {
@@ -343,7 +343,7 @@ function ImageCard({
         <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
           {!editing && (
             <button
-              onClick={() => setEditing(true)}
+              onClick={startEditing}
               className="p-1 rounded bg-blue-500/80 text-white"
               title="Edit metadata"
             >

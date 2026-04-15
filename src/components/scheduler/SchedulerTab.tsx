@@ -28,6 +28,17 @@ interface SchedulerTabProps {
   className?: string;
 }
 
+// Stable identity for the `actions` array passed to useUIElement. Inline
+// `["click"]` literals create a new array each render, which churns the
+// register/ref callbacks inside ui-bridge (see useUIElement: register has
+// `actions` in its deps, and the callback ref depends on register). Because
+// the App-level useUIBridge() subscribes to the registry via
+// useSyncExternalStore, each register/unregister bumps the snapshot version
+// and re-renders the App — triggering an infinite loop (React #185) on this
+// page, which has three useUIElement calls. Hoisting the array to module
+// scope gives it stable identity and breaks the loop.
+const CLICK_ACTIONS: ["click"] = ["click"];
+
 export function SchedulerTab({ className = "" }: SchedulerTabProps) {
   const [activeSubTab, setActiveSubTab] = useState<SchedulerSubTab>("tasks");
 
@@ -40,19 +51,19 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
     id: "scheduler-tab-tasks",
     type: "button",
     label: "Scheduled tasks tab",
-    actions: ["click"],
+    actions: CLICK_ACTIONS,
   });
   const { ref: historyTabRef } = useUIElement({
     id: "scheduler-tab-history",
     type: "button",
     label: "Task history tab",
-    actions: ["click"],
+    actions: CLICK_ACTIONS,
   });
   const { ref: settingsTabRef } = useUIElement({
     id: "scheduler-tab-settings",
     type: "button",
     label: "Scheduler settings tab",
-    actions: ["click"],
+    actions: CLICK_ACTIONS,
   });
   const [isCreating, setIsCreating] = useState(false);
   const [isAiBuilding, setIsAiBuilding] = useState(false);

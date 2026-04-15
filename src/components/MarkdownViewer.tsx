@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
@@ -77,24 +77,18 @@ function ThinkingSection({
 }) {
   const sectionId = contentId || hashContent(extractTextContent(children));
 
-  const [isExpanded, setIsExpanded] = useState(() => expandedSectionsStore.has(sectionId));
-
-  useEffect(() => {
-    setIsExpanded(expandedSectionsStore.has(sectionId));
-  }, [sectionId]);
+  const [, forceUpdate] = useState(0);
+  const isExpanded = expandedSectionsStore.has(sectionId);
 
   const toggleExpanded = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
-      setIsExpanded((prev) => {
-        const next = !prev;
-        if (next) {
-          expandedSectionsStore.add(sectionId);
-        } else {
-          expandedSectionsStore.delete(sectionId);
-        }
-        return next;
-      });
+      if (expandedSectionsStore.has(sectionId)) {
+        expandedSectionsStore.delete(sectionId);
+      } else {
+        expandedSectionsStore.add(sectionId);
+      }
+      forceUpdate((n) => n + 1);
     },
     [sectionId],
   );
