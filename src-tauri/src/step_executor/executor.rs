@@ -1934,27 +1934,29 @@ mod tests {
     /// `ExecutionStepConfig` and the target `FullRunnerStep` inner struct are
     /// included here.
     ///
-    /// Types excluded from this test and why:
+    /// Types still excluded and why:
     ///
-    /// - `prompt`: `ExecutionStepConfig.prompt_content` serialises as
-    ///   `"promptContent"` but `PromptStep.content` expects `"content"` — the
-    ///   field rename causes a "missing field" error on the second hop.
+    /// - `ui_bridge`: `UiBridgeStep` uses bare field names (`action`, `target`,
+    ///   `url`, `assert_type`, …) that conflict with `native_accessibility`'s
+    ///   field names on the fat `ExecutionStepConfig` struct. Renaming
+    ///   `ui_bridge_action` to serialize as `"action"` misroutes a11y steps.
+    ///   The clean fix is a per-variant Rust-field constructor (Session 2c)
+    ///   rather than JSON round-trip.
     ///
-    /// - `ui_bridge`: `ExecutionStepConfig.ui_bridge_action` serialises as
-    ///   `"ui_bridge_action"` but `UiBridgeStep.action` expects `"action"` —
-    ///   same class of mismatch.
-    ///
-    /// - `workflow`: `WorkflowStep.workflow_id` and `workflow_name` are
-    ///   required non-optional strings that have no corresponding aliases in
-    ///   `ExecutionStepConfig`.
+    /// - `workflow`: `WorkflowStep.workflow_name` is a required non-optional
+    ///   string with no corresponding field in `ExecutionStepConfig`
+    ///   (the handler falls back to `step.name` at runtime). Requires a
+    ///   schema change (make `workflow_name` optional) or a dedicated
+    ///   `workflow_name` field on `ExecutionStepConfig`.
     ///
     /// For those types the typed parse falls back to string-key dispatch (the
-    /// backward-compat path in `execute_single_step`), which is the correct
-    /// behaviour until Session 2b migrates individual handlers.
+    /// backward-compat path in `execute_single_step`). `prompt` now
+    /// round-trips cleanly because Session 2b aligned
+    /// `ExecutionStepConfig.prompt_content` to serialize as `"content"`.
     #[test]
     fn test_to_full_runner_step_round_trip() {
         // Each entry: (label, minimal JSON, expected handler key).
-        // Types that round-trip cleanly: command (phase aligns), dag_* (all-optional).
+        // Types that round-trip cleanly: command, prompt, dag_*.
         let cases: &[(&str, serde_json::Value, &str)] = &[
             (
                 "command",
@@ -1962,13 +1964,18 @@ mod tests {
                 "command",
             ),
             (
+                "prompt",
+                json!({"type": "prompt", "id": "s2", "name": "ask", "phase": "agentic", "content": "do the thing"}),
+                "prompt",
+            ),
+            (
                 "dag_cancel",
-                json!({"type": "dag_cancel", "id": "s2", "name": "stop"}),
+                json!({"type": "dag_cancel", "id": "s3", "name": "stop"}),
                 "dag_cancel",
             ),
             (
                 "dag_approval",
-                json!({"type": "dag_approval", "id": "s3", "name": "wait"}),
+                json!({"type": "dag_approval", "id": "s4", "name": "wait"}),
                 "dag_approval",
             ),
         ];

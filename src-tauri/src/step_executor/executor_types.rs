@@ -265,8 +265,17 @@ pub struct ExecutionStepConfig {
     // ========================================================================
     // Prompt Step Fields
     // ========================================================================
-    /// Prompt content (for prompt steps - not executed, passed to AI)
-    #[serde(rename = "promptContent", alias = "content")]
+    /// Prompt content (for prompt steps - not executed, passed to AI).
+    ///
+    /// Canonical wire name is `content` (matches `PromptStep::content` in
+    /// qontinui-types). Legacy aliases `promptContent` / `prompt_content`
+    /// are accepted on deserialize for older stored workflows and the
+    /// current SchedulerTaskForm request shape.
+    #[serde(
+        rename = "content",
+        alias = "promptContent",
+        alias = "prompt_content"
+    )]
     pub prompt_content: Option<String>,
 
     /// Prompt execution mode: "session" (default) or "response" (simple prompt→response)
@@ -299,6 +308,17 @@ pub struct ExecutionStepConfig {
     // ========================================================================
     // UI Bridge Step Fields
     // ========================================================================
+    // NOTE on canonical-name renames: `ExecutionStepConfig` is a fat struct
+    // shared by all step types, so bare canonical names like `"action"` and
+    // `"target"` are ambiguous — `native_accessibility` and `ui_bridge` both
+    // use them. Keeping prefixed primary names here preserves correct routing
+    // when ExecutionStepConfig is deserialized from mixed-type JSON. The
+    // `ExecutionStepConfig → FullRunnerStep` round-trip for ui_bridge /
+    // workflow variants therefore still falls back to string-key dispatch
+    // at runtime (see `executor.rs::execute_single_step` warn! path). The
+    // clean fix is a per-variant constructor (Session 2c) that reads typed
+    // Rust fields directly rather than round-tripping through JSON.
+
     /// UI Bridge: Action to perform ("navigate", "execute", "assert", "snapshot")
     #[serde(alias = "uiBridgeAction", alias = "ui_bridge_action")]
     pub ui_bridge_action: Option<String>,
