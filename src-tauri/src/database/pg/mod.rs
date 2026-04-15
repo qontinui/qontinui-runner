@@ -827,6 +827,48 @@ const MIGRATIONS: &[Migration] = &[
             UPDATE unified_workflows SET max_iterations = NULL WHERE max_iterations IS NOT NULL AND max_iterations <= 1;
         "#,
     },
+    Migration {
+        version: 20,
+        description: "Consolidate all tables into runner schema (drop public duplicates, move stragglers)",
+        sql: r#"
+            DO $$
+            DECLARE
+                tbl TEXT;
+            BEGIN
+                -- 1. Drop public-schema duplicates (tables that exist in both schemas).
+                --    The runner schema copy has all the data (search_path = runner, public).
+                FOR tbl IN
+                    SELECT p.table_name
+                    FROM information_schema.tables p
+                    JOIN information_schema.tables r
+                      ON p.table_name = r.table_name
+                    WHERE p.table_schema = 'public'
+                      AND r.table_schema = 'runner'
+                      AND p.table_type = 'BASE TABLE'
+                LOOP
+                    EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', tbl);
+                    RAISE NOTICE 'Dropped duplicate public.%', tbl;
+                END LOOP;
+
+                -- 2. Move public-only tables to runner schema.
+                FOR tbl IN
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_type = 'BASE TABLE'
+                      AND table_name NOT IN (
+                          SELECT table_name FROM information_schema.tables
+                          WHERE table_schema = 'runner'
+                      )
+                      AND table_name NOT LIKE 'pg_%'
+                      AND table_name != 'spatial_ref_sys'
+                LOOP
+                    EXECUTE format('ALTER TABLE public.%I SET SCHEMA runner', tbl);
+                    RAISE NOTICE 'Moved public.% to runner schema', tbl;
+                END LOOP;
+            END $$;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
