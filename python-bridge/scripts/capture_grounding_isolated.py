@@ -673,7 +673,40 @@ def run_capture_host(
 
             # Settle before screenshot
             time.sleep(SETTLE_DELAY)
-            png_bytes, screen_w, screen_h = capture_screen(monitor_index)
+
+            # Prefer the iframe's html2canvas render (tab-focus-independent)
+            # over mss monitor capture, which only shows whichever tab is
+            # actually visible on the captured monitor. Fall back to mss
+            # when the server doesn't have a rendered PNG ready.
+            png_bytes = None
+            screen_w = screen_h = 0
+            screenshot_endpoint = (
+                f"{base_origin}/api/grounding-isolated/screenshot"
+                f"?sampleIndex={idx}"
+            )
+            shot_deadline = time.time() + 4.0
+            while time.time() < shot_deadline:
+                try:
+                    resp = requests.get(screenshot_endpoint, timeout=3)
+                    if resp.status_code == 200 and resp.content:
+                        png_bytes = resp.content
+                        try:
+                            screen_w = int(resp.headers.get("X-Sample-Width", 0))
+                            screen_h = int(resp.headers.get("X-Sample-Height", 0))
+                        except (TypeError, ValueError):
+                            pass
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+            screenshot_source = "iframe"
+            if png_bytes is None:
+                png_bytes, screen_w, screen_h = capture_screen(monitor_index)
+                screenshot_source = "mss"
+            elif not screen_w or not screen_h:
+                # Fallback to mss just for viewport dimensions
+                _, screen_w, screen_h = capture_screen(monitor_index)
 
             # Build GroundingElement from reported bbox, falling back to estimate
             if bbox and int(bbox.get("width", 0)) > 0 and int(bbox.get("height", 0)) > 0:
@@ -713,6 +746,7 @@ def run_capture_host(
                     "sample_index": idx,
                     "capture_mode": "host",
                     "bbox_source": "iframe" if bbox else "estimate",
+                    "screenshot_source": screenshot_source,
                 },
             )
 
