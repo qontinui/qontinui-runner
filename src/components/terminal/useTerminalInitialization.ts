@@ -2,10 +2,21 @@ import { useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS } from "./useZoneLayout";
+import { writeWhenReady } from "./writeWhenReady";
 import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
+
+/** Build a `claude --resume <id>` command, optionally prefixed with CLAUDE_CONFIG_DIR. */
+function buildResumeCmd(sessionId: string, configDir: string | undefined): string {
+  const base = `claude --resume ${sessionId}`;
+  if (!configDir) return `${base}\r`;
+  const isWindows = navigator.platform.startsWith("Win");
+  return isWindows
+    ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; ${base}\r`
+    : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
+}
 
 /** Validate session IDs before interpolating into shell commands. */
 const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
@@ -189,19 +200,23 @@ export function useTerminalInitialization({
             setTimeout(async () => {
               for (const restore of pendingRestoresRef.current) {
                 if (restore.isClaudeSession && restore.claudeSessionId) {
-                  const ref = terminalRefs.current.get(restore.tabId);
-                  const handle = ref?.current;
-                  if (handle) {
-                    try {
-                      const resumeCmd = `claude --resume ${restore.claudeSessionId}\r`;
-                      await new Promise((r) => setTimeout(r, 500));
-                      handle.writeToTerminal(resumeCmd);
-                    } catch (err) {
-                      console.warn(
-                        `[TerminalPage] Failed to resume Claude session for ${restore.tabId}:`,
-                        err,
-                      );
-                    }
+                  try {
+                    const resumeCmd = buildResumeCmd(
+                      restore.claudeSessionId,
+                      restore.claudeConfigDir,
+                    );
+                    await new Promise((r) => setTimeout(r, 500));
+                    writeWhenReady(terminalRefs.current, restore.tabId, resumeCmd, {
+                      onTimeout: (id) =>
+                        console.warn(
+                          `[TerminalPage] resume: terminal ref for ${id} never became ready`,
+                        ),
+                    });
+                  } catch (err) {
+                    console.warn(
+                      `[TerminalPage] Failed to resume Claude session for ${restore.tabId}:`,
+                      err,
+                    );
                   }
                 }
               }
@@ -333,13 +348,20 @@ export function useTerminalInitialization({
                 if (
                   restore.isClaudeSession &&
                   restore.claudeSessionId &&
-                  isValidSessionId(restore.claudeSessionId) &&
-                  handle
+                  isValidSessionId(restore.claudeSessionId)
                 ) {
                   try {
-                    const resumeCmd = `claude --resume ${restore.claudeSessionId}\r`;
+                    const resumeCmd = buildResumeCmd(
+                      restore.claudeSessionId,
+                      restore.claudeConfigDir,
+                    );
                     await new Promise((r) => setTimeout(r, 500));
-                    handle.writeToTerminal(resumeCmd);
+                    writeWhenReady(terminalRefs.current, restore.tabId, resumeCmd, {
+                      onTimeout: (id) =>
+                        console.warn(
+                          `[TerminalPage] resume: terminal ref for ${id} never became ready`,
+                        ),
+                    });
                   } catch (err) {
                     console.warn(
                       `[TerminalPage] Failed to resume Claude session for ${restore.tabId}:`,

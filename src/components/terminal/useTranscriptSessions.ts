@@ -63,10 +63,43 @@ export function useTranscriptSessions(): UseTranscriptSessionsResult {
     }
   }, [fetchSessions]);
 
-  // Auto-refresh every 30 seconds to pick up newly created sessions
+  // Auto-refresh every 30 seconds to pick up newly created sessions.
+  // Pause when the page is hidden (minimized window or backgrounded tab) to avoid
+  // wasted backend scans, and do an immediate fetch when it becomes visible again.
   useEffect(() => {
-    const interval = setInterval(fetchSessions, 30_000);
-    return () => clearInterval(interval);
+    let interval: ReturnType<typeof setInterval> | null = null;
+
+    const start = () => {
+      if (interval === null) {
+        interval = setInterval(fetchSessions, 30_000);
+      }
+    };
+
+    const stop = () => {
+      if (interval !== null) {
+        clearInterval(interval);
+        interval = null;
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        stop();
+      } else {
+        fetchSessions();
+        start();
+      }
+    };
+
+    if (document.visibilityState !== "hidden") {
+      start();
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      stop();
+    };
   }, [fetchSessions]);
 
   const loadMessages = useCallback(async (sessionId: string): Promise<TranscriptMessage[]> => {

@@ -4,7 +4,7 @@
 //! types, text blocks, plan content) without any dependency on Claude Code itself.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -170,6 +170,7 @@ pub fn list_sessions(
         .map_err(|e| format!("Failed to read project directory {:?}: {}", project_dir, e))?;
 
     let mut cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -179,6 +180,7 @@ pub fn list_sessions(
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        seen.insert(path.clone());
 
         // Get file mtime
         let metadata = fs::metadata(&path);
@@ -286,6 +288,12 @@ pub fn list_sessions(
 
         sessions.push(session);
     }
+
+    // Evict orphaned cache entries: any path under this project_dir that we
+    // didn't observe in this scan corresponds to a session file that was
+    // deleted from disk. Only touch entries under the *current* project_dir
+    // so we don't disturb cached entries for other projects/config dirs.
+    cache.retain(|path, _| !path.starts_with(&project_dir) || seen.contains(path));
 
     drop(cache);
 

@@ -36,6 +36,7 @@ import { TerminalOverlays } from "./TerminalOverlays";
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { useTerminalInitialization } from "./useTerminalInitialization";
 import { useZoneActions } from "./useZoneActions";
+import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -228,27 +229,11 @@ function TerminalPageInner({
     return "single";
   };
 
-  /**
-   * Wait until a terminal ref is ready, then write text to it.
-   * Polls every 200ms for up to 5 seconds — handles the gap between
-   * tab creation and TerminalInstance mount / xterm.js init.
-   */
-  const writeWhenReady = (tabId: string, text: string, maxWaitMs = 5000) => {
-    const start = Date.now();
-    const poll = () => {
-      const handle = terminalRefs.current.get(tabId)?.current;
-      if (handle) {
-        handle.writeToTerminal(text);
-        return;
-      }
-      if (Date.now() - start < maxWaitMs) {
-        setTimeout(poll, 200);
-      } else {
-        console.warn(`[LaunchAI] terminal ref for ${tabId} never became ready`);
-      }
-    };
-    poll();
-  };
+  const writeWhenReady = (tabId: string, text: string, maxWaitMs = 5000) =>
+    writeWhenReadyHelper(terminalRefs.current, tabId, text, {
+      maxWaitMs,
+      onTimeout: (id) => console.warn(`[LaunchAI] terminal ref for ${id} never became ready`),
+    });
 
   if (!initialized) {
     return (
@@ -340,6 +325,22 @@ function TerminalPageInner({
                   const toCreate = Math.max(0, neededCount - existingTabCount);
                   for (let i = 0; i < toCreate; i++) {
                     await createAndAssignTerminal();
+                  }
+                  // Edge case: if existing tabs already satisfy the count, no new
+                  // terminals (and no zone-assignment changes) will be triggered, so
+                  // the effect watching zoneLayout.assignments in TerminalCoreContext
+                  // would never re-fire to consume pendingProfileSessionsRef. Bind
+                  // each profile session's zoneIndex to one of the existing tabs;
+                  // assignTabToZone always returns a new assignments object, so the
+                  // effect re-runs and processes the pending sessions.
+                  if (toCreate === 0) {
+                    const assignedTabs = new Set<string>();
+                    for (const s of profile.sessions) {
+                      const candidate = tabs.find((t) => !assignedTabs.has(t.id));
+                      if (!candidate) break;
+                      assignedTabs.add(candidate.id);
+                      zoneLayout.assignTabToZone(s.zoneIndex, candidate.id);
+                    }
                   }
                 }
               }}

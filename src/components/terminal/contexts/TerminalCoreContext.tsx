@@ -18,6 +18,7 @@ import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { type ZoneSessionInfo } from "../ZoneProfilePicker";
+import { writeWhenReady } from "../writeWhenReady";
 
 type TerminalManagerReturn = ReturnType<typeof useTerminalManager>;
 type ZoneLayoutReturn = ReturnType<typeof useZoneLayout>;
@@ -88,25 +89,6 @@ export function TerminalCoreProvider({ pageId, children }: TerminalCoreProviderP
         : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
     };
 
-    const writeWhenReady = (tabId: string, text: string, maxWaitMs = 5000) => {
-      const start = Date.now();
-      const poll = () => {
-        const handle = terminalRefs.current.get(tabId)?.current;
-        if (handle) {
-          handle.writeToTerminal(text);
-          return;
-        }
-        if (Date.now() - start < maxWaitMs) {
-          setTimeout(poll, 200);
-        } else {
-          console.warn(
-            `[TerminalCore] profile resume: terminal ref for ${tabId} never became ready`,
-          );
-        }
-      };
-      poll();
-    };
-
     // Effect can fire multiple times as assignments settle (one per terminal
     // creation). Process only sessions whose zone now has an assignment, and
     // leave the rest in the ref for the next assignments tick.
@@ -118,7 +100,17 @@ export function TerminalCoreProvider({ pageId, children }: TerminalCoreProviderP
           claudeSessionId: s.claudeSessionId,
           claudeConfigDir: s.claudeConfigDir,
         });
-        writeWhenReady(tabId, buildResumeCmd(s.claudeSessionId, s.claudeConfigDir));
+        writeWhenReady(
+          terminalRefs.current,
+          tabId,
+          buildResumeCmd(s.claudeSessionId, s.claudeConfigDir),
+          {
+            onTimeout: (id) =>
+              console.warn(
+                `[TerminalCore] profile resume: terminal ref for ${id} never became ready`,
+              ),
+          },
+        );
       } else {
         remaining.push(s);
       }
