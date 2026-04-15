@@ -72,6 +72,17 @@ cargo build --bin export_schemas --release 2>&1 | tail -5
 echo "==> Exporting schemas to $SCHEMAS_JSON..."
 cargo run --bin export_schemas --release -- --pretty > "$SCHEMAS_JSON"
 
+# schemars v1 emits `oneOf` for serde-tagged enums but no sibling
+# `discriminator` keyword. datamodel-codegen needs that keyword to emit
+# proper `Annotated[Union[...], Field(discriminator='...')]` tagged
+# unions — without it, every variant is tried in turn (slow, poor errors).
+# The post-processor is idempotent; safe to run unconditionally.
+DISCR_SCRIPT="$PROJECT_ROOT/../../qontinui-schemas/scripts/add_discriminators.py"
+if [ -f "$DISCR_SCRIPT" ] && command -v python >/dev/null 2>&1; then
+    echo "==> Annotating oneOf unions with discriminator keyword..."
+    python "$DISCR_SCRIPT" "$SCHEMAS_JSON"
+fi
+
 if [ "$DRY_RUN" = true ]; then
     echo "==> Dry run: schema output:"
     cat "$SCHEMAS_JSON"
@@ -193,6 +204,8 @@ if [ "$TS_ONLY" = false ]; then
                 --output-model-type pydantic_v2.BaseModel \
                 --target-python-version 3.11 \
                 --use-schema-description \
+                --use-annotated \
+                --use-union-operator \
                 >/dev/null 2>&1; then
                 SUCCESS_TYPES+=("$TYPE_NAME")
             else
