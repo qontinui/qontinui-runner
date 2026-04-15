@@ -292,6 +292,8 @@ export function ZoneProfilePicker({
       {
         id: "load-profile",
         label: "Load Profile",
+        description: "Apply a saved zone profile (layout, labels, sessions) by name.",
+        paramSchema: { name: "string" },
         handler: (params?: unknown) => {
           const { name } = (params ?? {}) as { name?: string };
           if (!name) throw new Error("load-profile requires { name: string }");
@@ -306,6 +308,8 @@ export function ZoneProfilePicker({
       {
         id: "save-profile",
         label: "Save Profile",
+        description: "Capture current layout + zone assignments as a named profile.",
+        paramSchema: { name: "string" },
         handler: (params?: unknown) => {
           const { name } = (params ?? {}) as { name?: string };
           if (!name) throw new Error("save-profile requires { name: string }");
@@ -345,6 +349,8 @@ export function ZoneProfilePicker({
       {
         id: "delete-profile",
         label: "Delete Profile",
+        description: "Remove a saved profile by name. Clears active-profile if it matches.",
+        paramSchema: { name: "string" },
         handler: (params?: unknown) => {
           const { name } = (params ?? {}) as { name?: string };
           if (!name) throw new Error("delete-profile requires { name: string }");

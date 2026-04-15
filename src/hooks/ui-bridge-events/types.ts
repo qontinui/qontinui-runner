@@ -288,7 +288,12 @@ export interface SerializedComponent {
     id: string;
     label?: string;
     description?: string;
+    paramSchema?: Record<string, unknown>;
+    /** HTTP path to invoke this action (e.g. POST to this URL with `{params: ...}`). */
+    path?: string;
   }>;
+  /** Template showing how to invoke any action (`{actionId}` placeholder). */
+  actionInvocationPath?: string;
   elementIds?: string[];
   registeredAt: number;
   mounted: boolean;
