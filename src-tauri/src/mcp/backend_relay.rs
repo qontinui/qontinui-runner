@@ -20,6 +20,11 @@ use crate::mcp::types::ApiState;
 pub struct BackendRelayState {
     /// Shutdown signal
     shutdown_tx: watch::Sender<bool>,
+    /// Kick counter: incremented to interrupt backoff sleeps and force an
+    /// immediate reconnect with freshly-read settings + tokens. Used after
+    /// login or backend_url changes so the running task picks up new state
+    /// without a full runner restart.
+    kick_tx: watch::Sender<u64>,
     /// Handle to the relay task
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -41,6 +46,19 @@ impl BackendRelayState {
         }
         info!("Backend relay stopped");
     }
+
+    /// Kick the relay: interrupt any in-progress backoff sleep and force the
+    /// loop to restart its next iteration immediately, re-reading settings
+    /// and auth tokens from scratch.
+    ///
+    /// Call this after:
+    /// - User re-logs in (fresh tokens stored in keyring)
+    /// - `cloud_relay.backend_url` changes in settings (new tunnel, etc.)
+    /// - Any other event that makes the relay's current backoff stale
+    pub fn kick(&self) {
+        let current = *self.kick_tx.borrow();
+        let _ = self.kick_tx.send(current.wrapping_add(1));
+    }
 }
 
 /// Start the backend relay client.
@@ -50,30 +68,35 @@ impl BackendRelayState {
 /// - Forwards outbound ai-output/session-state events to the backend
 /// - Auto-reconnects with exponential backoff
 /// - Refreshes auth token on each reconnection attempt
-pub async fn start_relay(api_state: Arc<ApiState>, backend_url: &str) -> Arc<BackendRelayState> {
+/// - Re-reads `cloud_relay.backend_url` from settings on every attempt, so
+///   settings changes (e.g., new tunnel URL) take effect on the next retry
+///   without needing a full runner restart
+///
+/// Note: the `backend_url` argument is retained for call-site clarity and to
+/// surface an error if cloud relay is disabled, but the loop itself always
+/// reads the current settings value so URL changes are picked up live.
+pub async fn start_relay(api_state: Arc<ApiState>, _backend_url: &str) -> Arc<BackendRelayState> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let ws_base_url = format!(
-        "{}/api/v1/automation/ws/automation/runner",
-        backend_url
-            .replace("https://", "wss://")
-            .replace("http://", "ws://"),
-    );
+    // Kick channel: incremented by `.kick()` to interrupt backoff sleeps and
+    // force an immediate retry with freshly-read settings + tokens.
+    let (kick_tx, kick_rx) = watch::channel(0u64);
     let state = api_state.clone();
 
     let task_handle = tokio::spawn(async move {
-        relay_loop(state, &ws_base_url, shutdown_rx).await;
+        relay_loop(state, shutdown_rx, kick_rx).await;
     });
 
     Arc::new(BackendRelayState {
         shutdown_tx,
+        kick_tx,
         task_handle: Mutex::new(Some(task_handle)),
     })
 }
 
 async fn relay_loop(
     api_state: Arc<ApiState>,
-    ws_base_url: &str,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut kick_rx: watch::Receiver<u64>,
 ) {
     use crate::auth::AuthManager;
 
@@ -91,6 +114,20 @@ async fn relay_loop(
             return;
         }
 
+        // Re-read backend URL from settings on every iteration so that URL
+        // changes (new tunnel, re-configured backend) are picked up live.
+        let ws_base_url = {
+            let settings = crate::settings::load_settings();
+            format!(
+                "{}/api/v1/automation/ws/automation/runner",
+                settings
+                    .cloud_relay
+                    .backend_url
+                    .replace("https://", "wss://")
+                    .replace("http://", "ws://"),
+            )
+        };
+
         // After many consecutive quick disconnects, the backend is persistently
         // rejecting us (e.g., streaming not enabled, session limits). Back off
         // aggressively to avoid hammering the server.
@@ -99,7 +136,7 @@ async fn relay_loop(
             warn!(
                 "Backend relay: {} consecutive quick disconnects. \
                  Check automation_streaming_enabled, session limits, and auth. \
-                 Backing off for {}s.",
+                 Backing off for {}s (send kick to retry sooner).",
                 consecutive_quick_disconnects,
                 extended_backoff / 1000
             );
@@ -109,8 +146,11 @@ async fn relay_loop(
                     info!("Backend relay shutting down during extended backoff");
                     return;
                 }
+                _ = kick_rx.changed() => {
+                    info!("Backend relay kicked during extended backoff — retrying now");
+                }
             }
-            // Reset counter after extended backoff so we try again
+            // Reset counter after extended backoff (or kick) so we try again
             consecutive_quick_disconnects = 0;
             backoff_ms = 2000;
         }
@@ -121,15 +161,20 @@ async fn relay_loop(
             Err(e) => {
                 warn!("Failed to refresh auth token for relay: {}", e);
                 // Backoff and retry — token may become available after re-login
-                info!("Reconnecting in {}ms...", backoff_ms);
+                info!("Reconnecting in {}ms... (send kick to retry sooner)", backoff_ms);
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {
+                        backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+                    }
                     _ = shutdown_rx.changed() => {
                         info!("Backend relay shutting down during backoff");
                         return;
                     }
+                    _ = kick_rx.changed() => {
+                        info!("Backend relay kicked during token backoff — retrying now");
+                        backoff_ms = 2000;
+                    }
                 }
-                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
                 continue;
             }
         };
@@ -229,15 +274,20 @@ async fn relay_loop(
         }
 
         // Exponential backoff before reconnecting
-        info!("Reconnecting in {}ms...", backoff_ms);
+        info!("Reconnecting in {}ms... (send kick to retry sooner)", backoff_ms);
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {
+                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+            }
             _ = shutdown_rx.changed() => {
                 info!("Backend relay shutting down during backoff");
                 return;
             }
+            _ = kick_rx.changed() => {
+                info!("Backend relay kicked during reconnect backoff — retrying now");
+                backoff_ms = 2000;
+            }
         }
-        backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
     }
 }
 
@@ -1192,7 +1242,12 @@ pub mod commands {
             drop(handle_guard);
 
             if is_alive {
-                return; // Relay is running, nothing to do
+                // Relay task is alive — it may be stuck in a backoff loop with
+                // stale tokens or pointed at a stale URL. Kick it so the next
+                // iteration re-reads settings + tokens and retries immediately.
+                info!("Cloud relay already running; kicking to re-read settings/tokens");
+                existing.kick();
+                return;
             }
 
             // Relay task has finished (dead connection) — stop it and restart
@@ -1318,7 +1373,23 @@ pub mod commands {
         settings.cloud_relay.auto_connect = auto_connect;
         settings::save_settings(&settings)
             .map_err(|e| format!("Failed to save settings: {}", e))?;
+
+        // If the relay is running, kick it so it re-reads settings (picks up
+        // the new backend_url) on its next iteration — no restart needed.
+        kick_cloud_relay().await;
+
         Ok("Cloud relay settings saved".to_string())
+    }
+
+    /// Kick the running cloud relay (if any) so it interrupts any backoff
+    /// sleep and immediately retries with freshly-read settings and tokens.
+    /// Call after login, settings changes, or any other event that makes
+    /// the relay's current state stale.
+    pub async fn kick_cloud_relay() {
+        let guard = get_relay_holder().lock().await;
+        if let Some(ref relay) = *guard {
+            relay.kick();
+        }
     }
 
     #[tauri::command]

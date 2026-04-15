@@ -1077,7 +1077,11 @@ async fn cloud_relay_login(
 
     match crate::commands::auth::login(email, password).await {
         Ok(resp) => {
-            // Restart relay with fresh tokens
+            // Kick any running relay so it re-reads tokens on next iteration.
+            // Handles the case where auto_connect=false (auto_start below bails
+            // out early but a running relay still needs to pick up fresh tokens).
+            crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+            // Also ensure the relay is started if it wasn't already.
             crate::mcp::backend_relay::commands::auto_start_cloud_relay(state).await;
             axum::Json(serde_json::json!({
                 "status": "logged_in",
