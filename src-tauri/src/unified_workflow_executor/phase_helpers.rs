@@ -1251,16 +1251,10 @@ pub(super) fn compute_embedding_sync(text: &str) -> Result<Vec<f32>, String> {
         text.to_string()
     };
 
-    // Spawn a dedicated OS thread that creates its own single-threaded tokio
-    // runtime. This guarantees no tokio thread-local state leaks from the
-    // parent runtime, which was the root cause of the Windows crash.
+    // Spawn a dedicated OS thread so this blocking HTTP call doesn't stall a
+    // tokio worker, and use Tauri's process-wide runtime for the async work.
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Failed to build isolated runtime: {}", e))?;
-
-        rt.block_on(async {
+        tauri::async_runtime::block_on(async {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()

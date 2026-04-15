@@ -225,17 +225,12 @@ impl ClaudeSession {
                 .unwrap_or_default();
 
             thread::spawn(move || {
-                // Create a tokio runtime for PG async calls
-                let pg_rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .ok();
                 let pg = crate::database::pg::PgDb::try_global();
 
-                let (pg, pg_rt) = match (pg, pg_rt) {
-                    (Some(pg), Some(rt)) => (pg, rt),
-                    _ => {
-                        warn!("Failed to get PG connection or runtime for AI output persistence");
+                let pg = match pg {
+                    Some(pg) => pg,
+                    None => {
+                        warn!("Failed to get PG connection for AI output persistence");
                         // Drain the channel so senders don't block
                         while turn_persist_rx.recv().is_ok() {}
                         return;
@@ -247,7 +242,7 @@ impl ClaudeSession {
                         continue;
                     }
                     let formatted = format!("\n[AI_RESPONSE]\n{}\n[/AI_RESPONSE]\n", delta);
-                    if let Err(e) = pg_rt.block_on(pg.append_task_output_ex(
+                    if let Err(e) = tauri::async_runtime::block_on(pg.append_task_output_ex(
                         &persist_task_run_id,
                         &formatted,
                         false,
@@ -623,11 +618,7 @@ impl ClaudeSession {
             let mut progress_count: u32 = 0;
 
             if let Some(ctx) = progress_ctx_for_processor {
-                // Use PgDb for progress storage (async via thread-local runtime)
-                let pg_rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .ok();
+                // Use PgDb for progress storage (async via tauri's runtime)
                 let pg = crate::database::pg::PgDb::try_global();
 
                 while let Ok(parsed_progress) = progress_rx.recv() {
@@ -641,7 +632,7 @@ impl ClaudeSession {
                             .unwrap_or_else(|| "?".to_string())
                     );
 
-                    if let (Some(ref rt), Some(ref pg)) = (&pg_rt, &pg) {
+                    if let Some(ref pg) = pg {
                         let is_step_complete = parsed_progress.marker_type
                             == crate::workflow_state::progress_markers::STEP_COMPLETE;
                         let data_json = if is_step_complete {
@@ -653,7 +644,7 @@ impl ClaudeSession {
                             None
                         };
 
-                        match rt.block_on(pg.save_step_progress_marker(
+                        match tauri::async_runtime::block_on(pg.save_step_progress_marker(
                             &ctx.checkpoint_id,
                             &parsed_progress.marker_type,
                             parsed_progress.current,
@@ -1169,17 +1160,6 @@ impl ClaudeSession {
         // 2. Read conversation history from DB
         let conversation_context = if let Some(ctx) = session_ctx {
             let task_run_id = ctx.task_run_id();
-            // Use a temporary tokio runtime for the DB call
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    warn!("Failed to create runtime for DB read: {}", e);
-                    return;
-                }
-            };
 
             let pg = match crate::database::pg::PgDb::try_global() {
                 Some(pg) => pg,
@@ -1189,8 +1169,7 @@ impl ClaudeSession {
                 }
             };
 
-            let output_log = rt
-                .block_on(pg.get_task_output(task_run_id))
+            let output_log = tauri::async_runtime::block_on(pg.get_task_output(task_run_id))
                 .unwrap_or_default();
 
             if output_log.is_empty() {

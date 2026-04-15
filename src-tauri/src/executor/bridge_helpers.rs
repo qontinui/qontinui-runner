@@ -3,11 +3,9 @@
 //! Provides synchronous wrappers around BridgeManager for use in Tauri commands
 //! and other sync contexts.
 //!
-//! IMPORTANT: These helpers work WITHOUT creating a tokio runtime context.
-//! This is critical because PythonBridge methods internally use their own
-//! tokio runtime (self.runtime.block_on). If we created a tokio context here,
-//! PythonBridge would detect it and panic with "Cannot start a runtime from
-//! within a runtime."
+//! Each helper that needs async work spawns a scoped OS thread and calls
+//! `tauri::async_runtime::block_on` from within it. This keeps the callers
+//! free of any tokio context while reusing Tauri's process-wide runtime.
 //!
 //! The BridgeManager uses std::sync::RwLock for its bridges map, so we can
 //! access bridges directly from any thread without needing async operations.
@@ -30,12 +28,7 @@ pub const BRIDGE_MANAGER_NOT_INIT: &str = "Bridge manager not initialized";
 pub fn get_bridge_manager(state: &Arc<AppState>) -> Result<Arc<BridgeManager>, String> {
     std::thread::scope(|s| {
         s.spawn(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create runtime");
-
-            rt.block_on(async {
+            tauri::async_runtime::block_on(async {
                 let manager_guard = state.bridge_manager.lock().await;
                 match &*manager_guard {
                     Some(manager) => Ok(manager.clone()),
@@ -85,18 +78,14 @@ where
     let mut bridges = manager.bridges.write().unwrap();
 
     if let Some(managed) = bridges.get_mut(&bid) {
-        // Run the async closure on a scoped thread with its own runtime
+        // Run the async closure on a scoped thread so the caller remains
+        // free of any tokio context.
         let bridge = &mut managed.bridge;
         std::thread::scope(|s| {
             s.spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Failed to create runtime");
                 // SAFETY: The scoped thread borrows `bridge` which is valid
-                // for the duration of the scope. The async closure runs within
-                // this thread's dedicated runtime.
-                Ok(rt.block_on(f(bridge)))
+                // for the duration of the scope.
+                Ok(tauri::async_runtime::block_on(f(bridge)))
             })
             .join()
             .expect("Bridge async operation thread panicked")
@@ -121,12 +110,7 @@ pub fn is_default_bridge_running(state: &Arc<AppState>) -> bool {
 pub fn get_or_create_default_bridge(state: &Arc<AppState>) -> Result<String, String> {
     std::thread::scope(|s| {
         s.spawn(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create runtime");
-
-            rt.block_on(async {
+            tauri::async_runtime::block_on(async {
                 let manager_guard = state.bridge_manager.lock().await;
                 match &*manager_guard {
                     Some(manager) => manager.get_or_create_default_bridge().await,
@@ -144,12 +128,7 @@ pub fn get_or_create_default_bridge(state: &Arc<AppState>) -> Result<String, Str
 pub fn start_default_bridge(state: &Arc<AppState>) -> Result<bool, String> {
     std::thread::scope(|s| {
         s.spawn(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create runtime");
-
-            rt.block_on(async {
+            tauri::async_runtime::block_on(async {
                 let manager_guard = state.bridge_manager.lock().await;
                 match &*manager_guard {
                     Some(manager) => manager.start_default_bridge().await,
@@ -167,12 +146,7 @@ pub fn start_default_bridge(state: &Arc<AppState>) -> Result<bool, String> {
 pub fn stop_default_bridge(state: &Arc<AppState>) -> Result<(), String> {
     std::thread::scope(|s| {
         s.spawn(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create runtime");
-
-            rt.block_on(async {
+            tauri::async_runtime::block_on(async {
                 let manager_guard = state.bridge_manager.lock().await;
                 match &*manager_guard {
                     Some(manager) => manager.stop_default_bridge().await,

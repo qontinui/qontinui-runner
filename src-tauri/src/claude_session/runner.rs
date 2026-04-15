@@ -770,16 +770,12 @@ fn run_claude_session_inline(
     let session_ctx_for_findings = session_ctx.clone();
 
     let finding_processor_handle = thread::spawn(move || {
-        let pg_rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok();
         let mut detected_findings: Vec<Finding> = Vec::new();
 
         // Only process if we have a finding context
         if let Some(ctx) = finding_ctx_for_processor {
             // PG is the primary DB; check availability once.
-            let pg_available = pg_rt.is_some() && crate::database::pg::PgDb::try_global().is_some();
+            let pg_available = crate::database::pg::PgDb::try_global().is_some();
 
             // Process incoming findings from the channel.
             // Use recv_timeout + session_done check so we don't block forever
@@ -808,15 +804,13 @@ fn run_claude_session_inline(
                     // Check if this is a resolved finding (marked via :resolved modifier)
                     let is_resolved = parsed_finding.is_resolved;
 
-                    let insert_result = if let Some(ref rt) = pg_rt {
+                    let insert_result = {
                         let pg = crate::database::pg::PgDb::global();
-                        rt.block_on(pg.insert_parsed_finding(
+                        tauri::async_runtime::block_on(pg.insert_parsed_finding(
                             &ctx.task_run_id,
                             ctx.session_num,
                             &parsed_finding,
                         ))
-                    } else {
-                        Err("No PG runtime available for finding insert".to_string())
                     };
                     match insert_result {
                         Ok(finding) => {
@@ -873,8 +867,7 @@ fn run_claude_session_inline(
                                 let description = finding.description.clone();
                                 let task_run_id = ctx.task_run_id.clone();
                                 let finding_title = finding.title.clone();
-                                if let Some(ref rt) = pg_rt {
-                                    rt.spawn(async move {
+                                tauri::async_runtime::spawn(async move {
                                     let ka = crate::knowledge_acquisition::KnowledgeAcquisition::new();
                                     if let Some(data) = crate::knowledge_acquisition::vuln_enrichment::enrich_from_description(&description, &ka).await {
                                         tracing::info!(
@@ -912,7 +905,6 @@ fn run_claude_session_inline(
                                         }
                                     }
                                 });
-                                }
                             }
 
                             detected_findings.push(finding);
@@ -951,11 +943,7 @@ fn run_claude_session_inline(
 
         // Only process if we have a progress context
         if let Some(ctx) = progress_ctx_for_processor {
-            // Use PgDb for progress storage (async via thread-local runtime)
-            let pg_rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok();
+            // Use PgDb for progress storage (async via tauri's runtime)
             let pg = crate::database::pg::PgDb::try_global();
 
             // Process incoming progress markers from the channel.
@@ -998,8 +986,8 @@ fn run_claude_session_inline(
                 };
 
                 // Store in database via PG
-                if let (Some(ref rt), Some(ref pg)) = (&pg_rt, &pg) {
-                    match rt.block_on(pg.save_step_progress_marker(
+                if let Some(ref pg) = pg {
+                    match tauri::async_runtime::block_on(pg.save_step_progress_marker(
                         &ctx.checkpoint_id,
                         &parsed_progress.marker_type,
                         parsed_progress.current,
@@ -1130,10 +1118,6 @@ fn run_claude_session_inline(
         let mut fix_count: u32 = 0;
 
         if let Some(ctx) = reflection_fix_ctx_for_processor {
-            let pg_rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok();
             // Use recv_timeout + session_done check so we don't block forever
             // if the stdout thread is abandoned and never drops the sender.
             loop {
@@ -1152,7 +1136,7 @@ fn run_claude_session_inline(
                     parsed_fix.description, parsed_fix.fix_type, parsed_fix.confidence
                 );
 
-                if pg_rt.is_some() {
+                {
                     let input = CreateReflectionFixInput {
                         source_task_run_id: ctx.source_task_run_id.clone(),
                         reflection_task_run_id: ctx.reflection_task_run_id.clone(),
@@ -1169,49 +1153,46 @@ fn run_claude_session_inline(
                         alternatives_considered: parsed_fix.alternatives_considered,
                     };
 
-                    let insert_result: Result<crate::reflection::types::ReflectionFix, String> =
-                        if let Some(ref rt) = pg_rt {
-                            let pg = crate::database::pg::PgDb::global();
-                            match rt.block_on(pg.save_reflection_fix(&input)) {
-                                Ok(fix) => {
-                                    // Set reflection_scope via PG
-                                    if parsed_fix.scope.as_deref() == Some("universal") {
-                                        let _ = rt.block_on(pg.update_fix_scope(
+                    let insert_result: Result<crate::reflection::types::ReflectionFix, String> = {
+                        let pg = crate::database::pg::PgDb::global();
+                        match tauri::async_runtime::block_on(pg.save_reflection_fix(&input)) {
+                            Ok(fix) => {
+                                // Set reflection_scope via PG
+                                if parsed_fix.scope.as_deref() == Some("universal") {
+                                    let _ = tauri::async_runtime::block_on(pg.update_fix_scope(
+                                        &fix.id,
+                                        "universal",
+                                        None,
+                                        parsed_fix.applicability.as_deref(),
+                                    ));
+                                } else {
+                                    let is_project_fix = matches!(
+                                        fix.fix_type.as_str(),
+                                        "project_environment"
+                                            | "project_architecture"
+                                            | "project_test_pattern"
+                                            | "project_recurring_issue"
+                                    );
+                                    if is_project_fix {
+                                        let _ = tauri::async_runtime::block_on(pg.update_fix_scope(
                                             &fix.id,
-                                            "universal",
+                                            "project",
+                                            ctx.project_path.as_deref(),
                                             None,
-                                            parsed_fix.applicability.as_deref(),
                                         ));
-                                    } else {
-                                        let is_project_fix = matches!(
-                                            fix.fix_type.as_str(),
-                                            "project_environment"
-                                                | "project_architecture"
-                                                | "project_test_pattern"
-                                                | "project_recurring_issue"
-                                        );
-                                        if is_project_fix {
-                                            let _ = rt.block_on(pg.update_fix_scope(
-                                                &fix.id,
-                                                "project",
-                                                ctx.project_path.as_deref(),
-                                                None,
-                                            ));
-                                        }
                                     }
-                                    // Link error_events via PG
-                                    if let Some(ref finding_id) = fix.source_finding_id {
-                                        let _ = rt.block_on(
-                                            pg.link_error_events_to_fix(&fix.id, finding_id),
-                                        );
-                                    }
-                                    Ok(fix)
                                 }
-                                Err(e) => Err(e),
+                                // Link error_events via PG
+                                if let Some(ref finding_id) = fix.source_finding_id {
+                                    let _ = tauri::async_runtime::block_on(
+                                        pg.link_error_events_to_fix(&fix.id, finding_id),
+                                    );
+                                }
+                                Ok(fix)
                             }
-                        } else {
-                            Err("No PG runtime available for reflection fix insert".to_string())
-                        };
+                            Err(e) => Err(e),
+                        }
+                    };
                     match insert_result {
                         Ok(fix) => {
                             fix_count += 1;
@@ -1263,13 +1244,13 @@ fn run_claude_session_inline(
                                         let related_files: Vec<String> =
                                             fix.file_changed.iter().cloned().collect();
 
-                                        let knowledge_result = if let Some(ref rt) = pg_rt {
+                                        let knowledge_result = {
                                             let pg = crate::database::pg::PgDb::global();
                                             let kid = uuid::Uuid::new_v4().to_string();
                                             let related_files_json =
                                                 serde_json::to_string(&related_files)
                                                     .unwrap_or_default();
-                                            rt.block_on(pg.create_task_knowledge(
+                                            tauri::async_runtime::block_on(pg.create_task_knowledge(
                                                 &kid,
                                                 &ctx.source_task_run_id,
                                                 category,
@@ -1280,23 +1261,19 @@ fn run_claude_session_inline(
                                                 &fix.confidence,
                                                 &related_files_json,
                                             ))
-                                        } else {
-                                            Err("No PG runtime".to_string())
                                         };
                                         match knowledge_result {
                                             Ok(knowledge_id) => {
                                                 // Set project_path on the knowledge entry
                                                 if let Some(ref pp) = ctx.project_path {
-                                                    if let Some(ref rt) = pg_rt {
-                                                        let pg =
-                                                            crate::database::pg::PgDb::global();
-                                                        let _ = rt.block_on(
-                                                            pg.update_task_knowledge_project_path(
-                                                                &knowledge_id,
-                                                                pp,
-                                                            ),
-                                                        );
-                                                    }
+                                                    let pg =
+                                                        crate::database::pg::PgDb::global();
+                                                    let _ = tauri::async_runtime::block_on(
+                                                        pg.update_task_knowledge_project_path(
+                                                            &knowledge_id,
+                                                            pp,
+                                                        ),
+                                                    );
                                                 }
 
                                                 info!(
@@ -1304,13 +1281,14 @@ fn run_claude_session_inline(
                                                     knowledge_id, category, ctx.project_path
                                                 );
                                                 // Best-effort embed so the row is searchable via Tier 0.
-                                                if let Some(ref rt) = pg_rt {
+                                                {
                                                     let pg = crate::database::pg::PgDb::global();
-                                                    let _ =
-                                                        rt.block_on(pg.embed_knowledge_content(
+                                                    let _ = tauri::async_runtime::block_on(
+                                                        pg.embed_knowledge_content(
                                                             &knowledge_id,
                                                             &fix.fix_description,
-                                                        ));
+                                                        ),
+                                                    );
                                                 }
                                                 let auto_msg = format!(
                                                     "Auto-applied project fix as {} knowledge: {}",
@@ -1345,13 +1323,13 @@ fn run_claude_session_inline(
                                         let related_files: Vec<String> =
                                             fix.file_changed.iter().cloned().collect();
 
-                                        let kb_result = if let Some(ref rt) = pg_rt {
+                                        let kb_result = {
                                             let pg = crate::database::pg::PgDb::global();
                                             let kid = uuid::Uuid::new_v4().to_string();
                                             let related_files_json =
                                                 serde_json::to_string(&related_files)
                                                     .unwrap_or_default();
-                                            rt.block_on(pg.create_task_knowledge(
+                                            tauri::async_runtime::block_on(pg.create_task_knowledge(
                                                 &kid,
                                                 &ctx.source_task_run_id,
                                                 category,
@@ -1362,20 +1340,19 @@ fn run_claude_session_inline(
                                                 &fix.confidence,
                                                 &related_files_json,
                                             ))
-                                        } else {
-                                            Err("No PG runtime".to_string())
                                         };
                                         match kb_result {
                                             Ok(knowledge_id) => {
                                                 info!("Auto-applied reflection fix as knowledge entry: {}", knowledge_id);
                                                 // Best-effort embed so the row is searchable via Tier 0.
-                                                if let Some(ref rt) = pg_rt {
+                                                {
                                                     let pg = crate::database::pg::PgDb::global();
-                                                    let _ =
-                                                        rt.block_on(pg.embed_knowledge_content(
+                                                    let _ = tauri::async_runtime::block_on(
+                                                        pg.embed_knowledge_content(
                                                             &knowledge_id,
                                                             &fix.fix_description,
-                                                        ));
+                                                        ),
+                                                    );
                                                 }
                                                 let auto_msg = format!(
                                                     "Auto-applied fix as {} knowledge: {}",
@@ -1422,13 +1399,11 @@ fn run_claude_session_inline(
                                                     provenance: "reflection".to_string(),
                                                     source_fix_id: Some(fix.id.clone()),
                                                 };
-                                            let stk_result = if let Some(ref rt) = pg_rt {
+                                            let stk_result = {
                                                 let pg = crate::database::pg::PgDb::global();
-                                                rt.block_on(
+                                                tauri::async_runtime::block_on(
                                                     pg.insert_step_type_knowledge(&stk_input),
                                                 )
-                                            } else {
-                                                Err("No PG runtime".to_string())
                                             };
                                             match stk_result {
                                                 Ok(entry) => {
@@ -1471,11 +1446,9 @@ fn run_claude_session_inline(
                             // for qualifying fix types at high/medium confidence.
                             {
                                 let fixes_slice = [fix];
-                                let rules_result = if let Some(ref rt) = pg_rt {
+                                let rules_result = {
                                     let pg = crate::database::pg::PgDb::global();
-                                    rt.block_on(pg.create_rules_from_reflection_fixes(&fixes_slice))
-                                } else {
-                                    Err("No PG runtime".to_string())
+                                    tauri::async_runtime::block_on(pg.create_rules_from_reflection_fixes(&fixes_slice))
                                 };
                                 match rules_result {
                                     Ok(n) if n > 0 => {
@@ -1503,19 +1476,15 @@ fn run_claude_session_inline(
         } else {
             // No explicit reflection fix context — try to infer it from session data.
             // This handles cases where the context wasn't wired through (defensive fallback).
-            let pg_rt_infer = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok();
             let inferred_ctx: Option<ReflectionFixContext> = session_ctx_for_reflection
                 .as_ref()
                 .and_then(|sc| {
                     let reflection_task_run_id = sc.context.task_run_id.clone();
                     // Look up source_task_run_id from PG
-                    let source_id: Option<String> = pg_rt_infer.as_ref().and_then(|rt| {
+                    let source_id: Option<String> = {
                         let pg = crate::database::pg::PgDb::global();
-                        rt.block_on(pg.get_source_task_run_id_for_reflection(&reflection_task_run_id)).ok()?
-                    });
+                        tauri::async_runtime::block_on(pg.get_source_task_run_id_for_reflection(&reflection_task_run_id)).ok()?
+                    };
                     let source_task_run_id = source_id?;
                     info!(
                         "Inferred reflection fix context from session data: source={}, reflection={}",
@@ -1563,11 +1532,9 @@ fn run_claude_session_inline(
                             alternatives_considered: parsed_fix.alternatives_considered,
                         };
 
-                        let fix_result = if let Some(ref rt) = pg_rt_infer {
+                        let fix_result = {
                             let pg = crate::database::pg::PgDb::global();
-                            rt.block_on(pg.save_reflection_fix(&input))
-                        } else {
-                            Err("No PG runtime".to_string())
+                            tauri::async_runtime::block_on(pg.save_reflection_fix(&input))
                         };
                         match fix_result {
                             Ok(fix) => {
@@ -1774,37 +1741,30 @@ fn run_claude_session_inline(
         };
 
         if !causal_links.is_empty() {
-            if let Ok(causal_rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                let pg = crate::database::pg::PgDb::global();
-                let rfx_ctx = reflection_fix_ctx.as_ref();
-                let task_run_id = rfx_ctx.map(|c| c.source_task_run_id.as_str());
+            let pg = crate::database::pg::PgDb::global();
+            let rfx_ctx = reflection_fix_ctx.as_ref();
+            let task_run_id = rfx_ctx.map(|c| c.source_task_run_id.as_str());
 
-                // Resolve workflow_name from PG
-                let workflow_name: Option<String> = task_run_id.and_then(|id| {
-                    causal_rt
-                        .block_on(pg.get_workflow_name_for_task_run(id))
-                        .ok()
-                });
+            // Resolve workflow_name from PG
+            let workflow_name: Option<String> = task_run_id.and_then(|id| {
+                tauri::async_runtime::block_on(pg.get_workflow_name_for_task_run(id)).ok()
+            });
 
-                for link in &causal_links {
-                    match causal_rt.block_on(pg.insert_causal_event(
-                        &link.cause_type,
-                        &link.cause_ref,
-                        &link.effect_type,
-                        &link.effect_ref,
-                        &link.relationship,
-                        "medium", // AI-identified links are medium confidence
-                        "ai_identified",
-                        workflow_name.as_deref(),
-                        task_run_id,
-                        Some(&link.description),
-                    )) {
-                        Ok(()) => causal_link_count += 1,
-                        Err(e) => warn!("Failed to store causal link: {}", e),
-                    }
+            for link in &causal_links {
+                match tauri::async_runtime::block_on(pg.insert_causal_event(
+                    &link.cause_type,
+                    &link.cause_ref,
+                    &link.effect_type,
+                    &link.effect_ref,
+                    &link.relationship,
+                    "medium", // AI-identified links are medium confidence
+                    "ai_identified",
+                    workflow_name.as_deref(),
+                    task_run_id,
+                    Some(&link.description),
+                )) {
+                    Ok(()) => causal_link_count += 1,
+                    Err(e) => warn!("Failed to store causal link: {}", e),
                 }
             }
         }

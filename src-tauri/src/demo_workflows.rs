@@ -19,23 +19,19 @@ const SETUP_DATA_PIPELINE: &str =
 /// Seed demo workflows if none with category "demo" exist.
 /// Uses PostgreSQL via the global PgDb instance.
 pub fn seed_demo_workflows_if_needed(pg: &Arc<PgDb>) {
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => {
-            // Build a small runtime for the sync caller
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime for demo seed");
-            rt.block_on(seed_demo_workflows_pg(pg));
-            return;
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            // Called from within an async context — use block_in_place to avoid
+            // nesting block_on inside a running runtime.
+            tokio::task::block_in_place(|| {
+                rt.block_on(seed_demo_workflows_pg(pg));
+            });
         }
-    };
-
-    // We are inside an async runtime but called from sync context — use block_in_place.
-    tokio::task::block_in_place(|| {
-        rt.block_on(seed_demo_workflows_pg(pg));
-    });
+        Err(_) => {
+            // No async context — use Tauri's process-wide runtime directly.
+            tauri::async_runtime::block_on(seed_demo_workflows_pg(pg));
+        }
+    }
 }
 
 async fn seed_demo_workflows_pg(pg: &Arc<PgDb>) {
