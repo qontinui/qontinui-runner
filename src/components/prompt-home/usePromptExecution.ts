@@ -28,7 +28,9 @@ interface UsePromptExecutionReturn {
   plan: PromptPlan | null;
   progress: StepProgress;
   error: string | null;
+  lastPrompt: string | null;
   submit: (prompt: string, explain: boolean) => Promise<void>;
+  retry: () => void;
   reset: () => void;
 }
 
@@ -42,6 +44,8 @@ export function usePromptExecution(): UsePromptExecutionReturn {
     currentStep: null,
   });
   const [error, setError] = useState<string | null>(null);
+  const [lastPrompt, setLastPrompt] = useState<string | null>(null);
+  const lastExplainRef = useRef(false);
   const abortRef = useRef(false);
   const runningRef = useRef(false);
 
@@ -58,6 +62,8 @@ export function usePromptExecution(): UsePromptExecutionReturn {
       if (runningRef.current) return;
       runningRef.current = true;
       abortRef.current = false;
+      setLastPrompt(prompt);
+      lastExplainRef.current = explain;
       setError(null);
       setPhase("planning");
 
@@ -151,7 +157,13 @@ export function usePromptExecution(): UsePromptExecutionReturn {
     [bridge],
   );
 
-  return { phase, plan, progress, error, submit, reset };
+  const retry = useCallback(() => {
+    if (lastPrompt && !runningRef.current) {
+      void submit(lastPrompt, lastExplainRef.current);
+    }
+  }, [lastPrompt, submit]);
+
+  return { phase, plan, progress, error, lastPrompt, submit, retry, reset };
 }
 
 interface StateMachineAPI {
