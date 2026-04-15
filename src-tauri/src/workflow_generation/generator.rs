@@ -3210,15 +3210,15 @@ fn apply_request_options(workflow: &mut UnifiedWorkflow, request: &GenerateWorkf
         workflow.skip_ai_summary = skip_ai_summary;
     }
     if let Some(ref log_source) = request.log_source_selection {
-        use crate::unified_workflows::LogSourceSelection;
-        workflow.log_source_selection =
-            if log_source == "default" || log_source == "ai" || log_source == "all" {
-                LogSourceSelection::Mode(log_source.clone())
-            } else {
-                LogSourceSelection::Profile {
-                    profile_id: log_source.clone(),
-                }
-            };
+        use crate::unified_workflows::{LogSourceMode, LogSourceSelection};
+        workflow.log_source_selection = match log_source.as_str() {
+            "default" => LogSourceSelection::Mode(LogSourceMode::Default),
+            "ai" => LogSourceSelection::Mode(LogSourceMode::Ai),
+            "all" => LogSourceSelection::Mode(LogSourceMode::All),
+            _ => LogSourceSelection::Profile {
+                profile_id: log_source.clone(),
+            },
+        };
     }
     if let Some(ref prompt_template) = request.prompt_template {
         workflow.prompt_template = Some(prompt_template.clone());

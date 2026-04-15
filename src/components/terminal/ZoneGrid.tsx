@@ -259,10 +259,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
         onDoubleClickCapture={() => onZoneDoubleClick(singleViewZone)}
       >
         {tab && (
-          <div
-            className="absolute top-0 left-0 right-0 flex items-center gap-2 px-3 py-1 bg-[#13141f]/90 backdrop-blur-sm z-20 cursor-pointer"
-            onDoubleClick={() => onZoneDoubleClick(singleViewZone)}
-          >
+          <div className="absolute top-0 left-0 right-0 flex items-center gap-2 px-3 py-1 bg-[#13141f]/90 backdrop-blur-sm z-20 cursor-pointer">
             <span className="text-[10px] text-[#7aa2f7] font-medium">Maximized</span>
             <span className="text-[10px] text-[#a9b1d6]">{tab.title}</span>
             <span className="text-[9px] text-[#565f89] ml-auto">

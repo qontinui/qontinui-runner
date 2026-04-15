@@ -46,44 +46,11 @@ use serde::{Deserialize, Serialize};
 
 /// The workflow execution architecture to use.
 ///
-/// This is a first-class workflow architecture option, allowing direct comparison
-/// between traditional deterministic verification and agentic verification approaches.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowArchitecture {
-    /// Traditional: Setup → [Deterministic Verification ↔ Agentic Fix]* → Completion.
-    /// Pre-defined verification steps run deterministically; agentic phase fixes failures.
-    #[default]
-    Traditional,
-    /// Agentic Verification: [Verification Agent → Worker Agent]* loop.
-    /// No pre-defined verification steps — a verification agent reasons about success.
-    AgenticVerification,
-    /// Multi-Agent Pipeline: Specialized agents in a DAG-structured pipeline.
-    ///
-    /// Instead of a single worker fixing all failures, this architecture decomposes
-    /// spec fulfillment into phases handled by specialized agents:
-    ///
-    /// 1. **Spec Analyst** — parses specs into acceptance criteria with dependency ordering
-    /// 2. **DAG Builder** — (deterministic) creates an execution DAG from criteria dependencies
-    /// 3. **Snapshot Agent** — captures and normalizes UI state via UI Bridge
-    /// 4. **Locator Agent** — maps criteria to code locations (files, components)
-    /// 5. **Implementer Agent(s)** — makes code changes for assigned DAG subtrees (parallel)
-    /// 6. **Verifier Agent(s)** — verifies criteria after each implementer (1:1, isolated)
-    ///
-    /// Each agent is independently configurable and measurable via the meta-optimizer,
-    /// enabling per-agent optimization instead of whole-loop tuning.
-    MultiAgentPipeline,
-}
-
-impl std::fmt::Display for WorkflowArchitecture {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Traditional => write!(f, "traditional"),
-            Self::AgenticVerification => write!(f, "agentic_verification"),
-            Self::MultiAgentPipeline => write!(f, "multi_agent_pipeline"),
-        }
-    }
-}
+/// Re-exported from `qontinui_types::workflow`. The type (with `Default`,
+/// `Display`, and snake_case serde) is defined in the shared schema crate;
+/// this alias keeps existing runner call-sites working after the DTO
+/// migration.
+pub use qontinui_types::workflow::WorkflowArchitecture;
 
 /// Configuration for the verification agent in the agentic verification loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]

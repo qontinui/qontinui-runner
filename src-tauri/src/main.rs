@@ -2083,8 +2083,34 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
 
-                // Wait for the dedicated shutdown thread (bounded wait)
-                let _ = shutdown_handle.join();
+                // Wait for the dedicated shutdown thread, but with a hard
+                // upper bound so a hung bridge or extractor can't freeze the
+                // close handler (and with it the whole window). Without this
+                // cap users see the X button "do nothing" — the handler is
+                // actually running, just blocked on a shutdown step.
+                //
+                // Any cleanup still running past the deadline continues in
+                // the background thread after we return from the close
+                // handler. The process then exits on its normal Tauri path;
+                // if something is still holding it up, the explicit
+                // `std::process::exit` below forces termination.
+                const SHUTDOWN_JOIN_DEADLINE_MS: u64 = 3_000;
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(SHUTDOWN_JOIN_DEADLINE_MS);
+                // Poll instead of blocking `.join()` so we can bail out on
+                // timeout. `JoinHandle::is_finished` is stable and doesn't
+                // require `nightly`.
+                while !shutdown_handle.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !shutdown_handle.is_finished() {
+                    warn!(
+                        "Shutdown thread did not finish within {}ms — continuing \
+                         window close; any remaining cleanup will be killed by \
+                         process exit",
+                        SHUTDOWN_JOIN_DEADLINE_MS
+                    );
+                }
 
                 // Close all interactive Claude sessions
                 if let Some(sm) =
@@ -2181,6 +2207,34 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Stop trigger service
                 tauri::async_runtime::spawn(async move {
                     crate::trigger_system::stop_trigger_service().await;
+                });
+
+                // ── Force-exit watchdog ──
+                //
+                // After this handler returns Tauri is supposed to close the
+                // window and drain the event loop, but we've observed cases
+                // where a prior panic (e.g. the tokio "Cannot drop a runtime
+                // in a context where blocking is not allowed" crash at
+                // startup) leaves the runtime in a half-dead state — all our
+                // cleanup runs, but Tauri never actually terminates. From
+                // the user's perspective the X button does nothing.
+                //
+                // Spawn a detached OS thread that waits a few seconds and
+                // then calls `std::process::exit` unconditionally. If Tauri
+                // exits cleanly first, the thread is killed with the process
+                // and the force-exit is never reached. Otherwise the user
+                // gets a bounded close time instead of a zombie window.
+                const FORCE_EXIT_GRACE_SECS: u64 = 5;
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        FORCE_EXIT_GRACE_SECS,
+                    ));
+                    warn!(
+                        "Force-exit watchdog: Tauri did not terminate within \
+                         {}s of the close handler returning — exiting process",
+                        FORCE_EXIT_GRACE_SECS
+                    );
+                    std::process::exit(0);
                 });
             }
         })

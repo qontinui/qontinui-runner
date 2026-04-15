@@ -1,580 +1,87 @@
 //! Unified Workflows
 //!
-//! This module provides types for the unified Workflow Builder system.
-//! All workflows are organized into three phases: Setup, Verification, Agentic.
+//! The DTO shape of the unified workflow types lives in `qontinui-types`
+//! (`qontinui_types::workflow`) and is re-exported here via `pub use`.
+//! Runner-specific behavior (iteration-cap helpers, stage normalization,
+//! request/response types, conversion helpers, step prepending) stays in
+//! this module.
+//!
+//! Because of Rust's orphan rule we can't define inherent `impl` blocks on
+//! foreign types, so methods that used to live on `UnifiedWorkflow` and
+//! `WorkflowStage` are exposed through extension traits
+//! (`UnifiedWorkflowExt`, `WorkflowStageExt`). The traits are re-exported
+//! through this module, so callers that do `use crate::unified_workflows::*;`
+//! (or explicitly import the extension trait) can keep calling
+//! `workflow.iter_cap()`, `stage.iter_cap_display()`, etc. verbatim.
 
-use serde::{Deserialize, Deserializer, Serialize};
+pub use qontinui_types::workflow::*;
+
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// A conditional routing rule that selects model/provider based on runtime context.
+// ============================================================================
+// Extension traits (orphan rule prevents inherent `impl` blocks on foreign
+// types)
+// ============================================================================
+
+/// Runner-side behavior for [`WorkflowStage`].
 ///
-/// Rules are evaluated in order; the first matching rule wins.
-/// Condition syntax: `"<variable> <op> <value>"` where:
-/// - Variables: `verification_failures`, `iteration`, `stage_index`
-/// - Operators: `>=`, `>`, `<=`, `<`, `==`, `!=`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingRule {
-    /// Condition expression, e.g. "verification_failures >= 2"
-    pub condition: String,
-    /// Model to use when this rule matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Provider to use when this rule matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Temperature override when this rule matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    /// Max tokens override when this rule matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-}
-
-/// Per-phase model override configuration.
-/// Each phase can independently specify a provider and/or model,
-/// along with optional temperature, max_tokens, fallback config,
-/// and conditional routing rules.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ModelOverrideConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Temperature override for this phase (0.0–1.0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    /// Max output tokens override for this phase.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    /// Fallback provider if the primary fails with a retryable error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_provider: Option<String>,
-    /// Fallback model if the primary fails with a retryable error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_model: Option<String>,
-    /// Conditional routing rules evaluated at runtime.
-    /// First matching rule wins; unmatched falls back to this config's static fields.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing_rules: Option<Vec<RoutingRule>>,
-}
-
-/// Map of phase name → model override config.
-/// Valid keys: "setup", "agentic", "completion", "verification",
-///             "investigation", "summary", "generation"
-pub type ModelOverrides = HashMap<String, ModelOverrideConfig>;
-
-/// Deserialize a Vec field that might be null in JSON (e.g., from Python's `None`).
-/// Returns an empty Vec for null, or the actual Vec for a valid array.
-fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    let opt: Option<Vec<T>> = Option::deserialize(deserializer)?;
-    Ok(opt.unwrap_or_default())
-}
-
-/// Log source selection mode for a workflow
-/// - "default": Use the global default profile (from Settings)
-/// - "ai": Let AI automatically select relevant sources
-/// - "all": Use all enabled log sources
-/// - { "profile_id": "..." }: Use a specific profile
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum LogSourceSelection {
-    /// Simple string modes: "default", "ai", "all"
-    Mode(String),
-    /// Specific profile selection
-    Profile { profile_id: String },
-}
-
-impl Default for LogSourceSelection {
-    fn default() -> Self {
-        LogSourceSelection::Mode("default".to_string())
-    }
-}
-
-/// Configuration for a health check URL
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HealthCheckUrl {
-    /// Display name for the health check (e.g., "Backend Server")
-    pub name: String,
-    /// URL to check (e.g., "http://localhost:8000/health")
-    pub url: String,
-    /// Expected HTTP status code (default: 200)
-    #[serde(default = "default_expected_status")]
-    pub expected_status: u16,
-    /// Timeout in seconds (default: 5)
-    #[serde(default = "default_health_timeout")]
-    pub timeout_seconds: u64,
-    /// Whether failure should stop the workflow (default: true)
-    #[serde(default = "default_is_critical")]
-    pub is_critical: bool,
-}
-
-fn default_expected_status() -> u16 {
-    200
-}
-
-/// Default timeout for health checks.
-/// Health checks need a reasonable timeout to avoid hanging on unresponsive services.
-fn default_health_timeout() -> u64 {
-    30 // 30 seconds - reasonable for health checks
-}
-
-fn default_is_critical() -> bool {
-    true
-}
-
-/// Condition for conditional stage execution.
-///
-/// When attached to a `WorkflowStage`, the stage is skipped if the condition
-/// evaluates to "should skip". All condition fields are optional and combine
-/// with AND semantics — all specified conditions must be met for the stage to run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StageCondition {
-    /// Run this stage only if the previous stage had this outcome.
-    /// - `"passed"`: run only if previous stage verification passed
-    /// - `"failed"`: run only if previous stage verification failed
-    /// - `"any"`: always run regardless of previous outcome (default behavior)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub if_previous: Option<String>,
-
-    /// Run this stage only after this many loop iterations have occurred
-    /// (across all stages). Useful for "escalation" stages that only kick in
-    /// after initial attempts have failed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_iteration: Option<u32>,
-
-    /// Skip this stage if the total number of failed stages so far is below
-    /// this threshold. Useful for "recovery" stages that only run when
-    /// multiple prior stages have failed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_failures: Option<u32>,
-}
-
-/// A workflow stage — a self-contained unit of execution with its own
-/// setup/verification/agentic/completion steps and verification-agentic loop.
-///
-/// Retry policy for a step or stage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryPolicy {
-    /// Number of retry attempts (0 = no retries)
-    #[serde(default)]
-    pub count: u32,
-    /// Delay between retries in milliseconds
-    #[serde(default = "default_retry_delay_ms")]
-    pub delay_ms: u64,
-    /// Whether to use exponential backoff
-    #[serde(default)]
-    pub backoff: bool,
-}
-
-fn default_retry_delay_ms() -> u64 {
-    2000
-}
-
-/// An output declared by a stage, available to subsequent stages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StageOutput {
-    /// Unique key for this output (e.g. "api_url", "auth_token")
-    pub key: String,
-    /// Human-readable description
-    #[serde(default)]
-    pub description: String,
-}
-
-/// An input required by a stage, referencing a prior stage's output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StageInput {
-    /// The key to bind this input to (matches a StageOutput.key from a prior stage)
-    pub key: String,
-    /// Which stage provides this input (stage id). If omitted, searches all prior stages.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_stage: Option<String>,
-    /// Whether this input is required (default: true). Missing required inputs are Critical findings.
-    #[serde(default = "default_true")]
-    pub required: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Multi-stage workflows execute stages sequentially. Each stage gets its own
-/// verification-agentic loop, and later stages see full output from all prior stages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowStage {
-    /// Unique identifier (UUID v4)
-    #[serde(default)]
-    pub id: String,
-    /// Display name for this stage
-    pub name: String,
-    /// Description of what this stage does
-    #[serde(default)]
-    pub description: String,
-    /// Setup phase steps for this stage
-    #[serde(default)]
-    pub setup_steps: Vec<Value>,
-    /// Verification phase steps for this stage
-    #[serde(default)]
-    pub verification_steps: Vec<Value>,
-    /// Agentic phase steps for this stage
-    #[serde(default)]
-    pub agentic_steps: Vec<Value>,
-    /// Completion phase steps for this stage
-    #[serde(default)]
-    pub completion_steps: Vec<Value>,
-    /// Maximum iterations for this stage's verification-agentic loop.
-    ///
-    /// `None` (omitted in JSON) means no iteration cap — the loop terminates
-    /// on success, explicit stop, or fix-attempt exhaustion. Users may set a
-    /// concrete cap to limit runtime or spend.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_iterations: Option<u32>,
-    /// Optional inactivity timeout in seconds for this stage's AI sessions
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<u64>,
-    /// AI provider override for this stage
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Model override for this stage
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Per-phase model overrides for this stage
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub model_overrides: ModelOverrides,
-    /// Whether to pause for human approval after each agentic phase.
-    #[serde(default)]
-    pub approval_gate: bool,
-    /// Optional condition for stage execution.
-    /// When set, the stage is evaluated against this condition before running.
-    /// If the condition is not met, the stage is skipped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub condition: Option<StageCondition>,
-    /// When true, run completion prompt steps BEFORE automation steps.
-    /// Default (false) runs automation first, then prompts.
-    #[serde(default)]
-    pub completion_prompts_first: bool,
-    /// Retry policy for this stage (overrides per-step defaults)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_policy: Option<RetryPolicy>,
-    /// Declared outputs that this stage produces for downstream stages
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outputs: Option<Vec<StageOutput>>,
-    /// Inputs required from prior stages
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inputs: Option<Vec<StageInput>>,
-}
-
-/// A unified workflow with steps organized by phase
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnifiedWorkflow {
-    /// Unique identifier (UUID v4)
-    #[serde(default)]
-    pub id: String,
-    /// Display name
-    pub name: String,
-    /// Description of what this workflow does
-    #[serde(default)]
-    pub description: String,
-    /// Category for organization
-    #[serde(default = "default_category")]
-    pub category: String,
-    /// Tags for filtering
-    #[serde(default)]
-    pub tags: Vec<String>,
-
-    /// Setup phase steps (JSON array)
-    #[serde(default)]
-    pub setup_steps: Vec<Value>,
-    /// Verification phase steps (JSON array)
-    #[serde(default)]
-    pub verification_steps: Vec<Value>,
-    /// Agentic phase steps (JSON array)
-    #[serde(default)]
-    pub agentic_steps: Vec<Value>,
-    /// Completion phase steps (JSON array) - runs once after the verification loop exits
-    #[serde(default)]
-    pub completion_steps: Vec<Value>,
-
-    /// Maximum iterations for agentic phase.
-    ///
-    /// `None` means no iteration cap — the loop terminates on success,
-    /// explicit stop, or fix-attempt exhaustion.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_iterations: Option<u32>,
-
-    /// Maximum consecutive non-improving fix attempts before escalating.
-    /// When the verification check count does not improve across this many iterations,
-    /// the loop exits with fix_attempts_exhausted. 0 = disabled. Default: 3.
-    #[serde(default = "default_max_fix_attempts")]
-    pub max_fix_attempts: u32,
-
-    /// Maximum number of CI-triggered auto-resumes before requiring human intervention.
-    /// Used by Phase 2 PR watcher integration. 0 = disabled. Default: 10.
-    #[serde(default = "default_max_ci_auto_resumes")]
-    pub max_ci_auto_resumes: u32,
-
-    /// Optional inactivity timeout in seconds for AI sessions.
-    ///   - None (default): No timeout, runs until completion or manual stop
-    ///   - Some(N): Kill AI session after N seconds of no output
-    ///
-    /// Takes precedence over the global AI settings timeout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<u64>,
-
-    /// AI provider override
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Model override
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-
-    /// Per-phase model overrides
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub model_overrides: ModelOverrides,
-
-    /// Skip AI summary generation at the end (default: false, meaning AI summary is generated)
-    #[serde(default)]
-    pub skip_ai_summary: bool,
-
-    /// Error IDs targeted by this workflow (for auto-resolution on success).
-    /// When the workflow completes successfully, these errors will be marked as resolved.
-    /// Used by error fix workflows generated from the Error Monitor.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub targeted_error_ids: Vec<i64>,
-
-    /// Log source selection for this workflow
-    /// - "default": Use the global default profile (from Settings → Log Sources)
-    /// - "ai": Let AI automatically select relevant sources based on context
-    /// - "all": Use all enabled log sources
-    /// - { "profile_id": "..." }: Use a specific profile
-    #[serde(default, skip_serializing_if = "is_default_log_source")]
-    pub log_source_selection: LogSourceSelection,
-
-    /// Manually added context IDs
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context_ids: Vec<String>,
-
-    /// Disabled context IDs (excluded from auto-include)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disabled_context_ids: Vec<String>,
-
-    /// Whether to auto-include contexts based on task mentions (default: true)
-    #[serde(default = "default_auto_include_contexts")]
-    pub auto_include_contexts: bool,
-
-    /// Custom developer prompt template for this workflow
-    /// When set, this template is used instead of the global default when running the workflow.
-    /// Supports variables: {{SESSION_ID}}, {{ITERATION}}, {{MAX_ITERATIONS}}, {{GOAL}},
-    /// {{EXECUTION_STEPS}}, {{WORKSPACE_ESCAPED}}
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_template: Option<String>,
-
-    /// Whether to automatically include a log_watch step before verification
-    /// When enabled (default), a log_watch step is prepended to verification steps
-    /// to detect runtime errors in backend/frontend logs
-    #[serde(default = "default_log_watch_enabled")]
-    pub log_watch_enabled: bool,
-
-    /// Whether to automatically include health check steps before verification
-    /// When enabled and health_check_urls is non-empty, health check steps are prepended
-    /// to verification steps to verify configured servers are running
-    #[serde(default = "default_health_check_enabled")]
-    pub health_check_enabled: bool,
-
-    /// URLs to health check before verification (user-configurable)
-    /// Each entry specifies a URL to check, expected status, and timeout
-    /// If empty, no health checks are performed even if health_check_enabled is true
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub health_check_urls: Vec<HealthCheckUrl>,
-
-    /// Whether to automatically include a pre-flight environment check at the start of setup.
-    /// When enabled (default), a shell command step runs to verify:
-    ///   - Disk space, Node.js/npm, Python/Poetry, Rust/Cargo, Git availability
-    ///
-    /// Uses global setting from Settings if not explicitly set per-workflow
-    #[serde(default = "default_preflight_check_enabled")]
-    pub preflight_check_enabled: bool,
-
-    /// Whether to run a completion sweep after verification passes.
-    /// The sweep reviews all completed work for gaps before proceeding to completion.
-    #[serde(default)]
-    pub enable_sweep: bool,
-
-    /// Maximum number of sweep iterations (default: 5).
-    #[serde(default = "default_max_sweep_iterations")]
-    pub max_sweep_iterations: u32,
-
-    /// Task run ID that generated this workflow (for meta-workflow tracking)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generated_by_task_run_id: Option<String>,
-
-    /// Optional stages for multi-stage workflows.
-    /// When non-empty, the workflow executes stages sequentially instead of using top-level steps.
-    /// Each stage has its own setup/verification/agentic/completion steps and loop.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_null_as_empty_vec"
-    )]
-    pub stages: Vec<WorkflowStage>,
-
-    /// Whether to stop execution if a stage fails verification.
-    /// Default: false (autonomous mode — continue to next stage even if previous failed).
-    #[serde(default)]
-    pub stop_on_failure: bool,
-
-    /// Per-constraint overrides: map of constraint_id to enabled (true) / disabled (false).
-    /// Applied to the constraint engine at execution time, after loading builtins and config.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub constraint_overrides: HashMap<String, bool>,
-
-    /// Whether to pause for human approval after each agentic phase.
-    #[serde(default)]
-    pub approval_gate: bool,
-
-    /// Whether to enable reflection mode during agentic iterations.
-    /// When true, the AI investigates root causes before fixing failures.
-    /// Default: true for user-created workflows.
-    #[serde(default = "default_reflection_mode")]
-    pub reflection_mode: bool,
-
-    /// When true, run completion prompt steps BEFORE automation steps.
-    /// Used by meta-workflows so AI hardener runs before save_workflow_artifact.
-    /// Default (false) runs automation first, then prompts.
-    #[serde(default)]
-    pub completion_prompts_first: bool,
-
-    /// Whether this workflow is marked as a favorite for quick access.
-    #[serde(default)]
-    pub is_favorite: bool,
-
-    /// Dependency graph computed during generation (JSON blob)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dependency_graph: Option<Value>,
-
-    /// Cost annotations computed during generation (JSON blob)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_annotations: Option<Value>,
-
-    /// Acceptance criteria from the specification agent (JSON blob).
-    /// Used by the canvas panel manager to show a live requirements tracker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acceptance_criteria: Option<Value>,
-
-    /// Quality report from the revision phase (JSON blob)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quality_report: Option<Value>,
-
-    /// Enable multi-agent fixer mode for the agentic phase.
-    /// When true, verification failures are triaged and fixed by specialized agents
-    /// (quick-fix for lint/compilation, feature-fix for missing functionality).
-    /// Default: true.
-    #[serde(default = "default_multi_agent_mode")]
-    pub multi_agent_mode: bool,
-
-    /// Policy for automatic git rollback when the workflow fails.
-    /// Values: "none" (default), "last_good", "clean".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollback_policy: Option<String>,
-
-    /// When true, the pipeline will stop execution if accumulated token usage
-    /// exceeds the token budget. Disabled by default — only logs warnings.
-    #[serde(default)]
-    pub enforce_token_budget: bool,
-
-    /// Restrict working directory resolution to the workspace boundary.
-    /// When true, steps cannot resolve paths outside the workspace root.
-    /// Default: false (permissive, current behavior).
-    #[serde(default)]
-    pub strict_cwd: bool,
-
-    /// Tags for per-execution tool whitelisting.
-    /// When non-empty, only skills matching at least one tag are included
-    /// in AI prompt context, reducing prompt bloat.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_tags: Vec<String>,
-
-    /// Per-workflow security profile override.
-    /// When set, overrides the default security profile from settings for this workflow.
-    /// Values: "permissive", "standard", "strict", or "custom".
-    /// If None, uses the default from Settings > Security.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub security_profile: Option<String>,
-
-    /// Run the workflow in an isolated git worktree.
-    /// When true, a new branch and worktree are created before execution.
-    /// Changes stay on the worktree branch and can be merged back after review.
-    /// Default: false.
-    #[serde(default)]
-    pub use_worktree: bool,
-
-    /// Workflow execution architecture override.
-    /// When set, forces the workflow to use a specific execution architecture
-    /// instead of the default Traditional loop. When None, the system infers
-    /// the best architecture based on workflow complexity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow_architecture:
-        Option<crate::agentic_verification::WorkflowArchitecture>,
-
-    /// Whether the AI semantic review actually ran successfully during generation.
-    /// When false, the workflow passed through the pipeline without AI verification
-    /// (e.g., all verification iterations failed at infrastructure level).
-    #[serde(default = "default_ai_reviewed")]
-    pub ai_reviewed: bool,
-
-    /// Flow control configuration as a JSON string (e.g., concurrency limits, queue behavior).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flow_control_json: Option<String>,
-
-    /// Per-phase timeout configuration as a JSON string.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase_timeouts_json: Option<String>,
-
-    /// ISO 8601 timestamp of creation
-    #[serde(default)]
-    pub created_at: String,
-    /// ISO 8601 timestamp of last modification (serialized as "modified_at" to match frontend)
-    #[serde(rename = "modified_at", default)]
-    pub updated_at: String,
-}
-
-impl WorkflowStage {
+/// Exposed as a trait because `WorkflowStage` is defined in `qontinui-types`
+/// and we cannot add inherent methods to it here. Import this trait (or
+/// `crate::unified_workflows::*`) to call these methods exactly as if they
+/// were inherent.
+pub trait WorkflowStageExt {
     /// Resolve the iteration cap for internal loop bounds.
     /// `None` → `u32::MAX` (effectively unlimited).
-    pub fn iter_cap(&self) -> u32 {
+    fn iter_cap(&self) -> u32;
+
+    /// Human-readable iteration cap for logs and UI (`"∞"` for unlimited).
+    fn iter_cap_display(&self) -> String;
+}
+
+impl WorkflowStageExt for WorkflowStage {
+    fn iter_cap(&self) -> u32 {
         self.max_iterations.unwrap_or(u32::MAX)
     }
 
-    /// Human-readable iteration cap for logs and UI (`"∞"` for unlimited).
-    pub fn iter_cap_display(&self) -> String {
+    fn iter_cap_display(&self) -> String {
         self.max_iterations
             .map(|n| n.to_string())
             .unwrap_or_else(|| "∞".to_string())
     }
 }
 
-impl UnifiedWorkflow {
+/// Runner-side behavior for [`UnifiedWorkflow`].
+///
+/// Exposed as a trait for the same orphan-rule reason as
+/// [`WorkflowStageExt`].
+pub trait UnifiedWorkflowExt {
     /// Resolve the iteration cap for internal loop bounds.
     /// `None` → `u32::MAX` (effectively unlimited for any real workflow).
-    pub fn iter_cap(&self) -> u32 {
-        self.max_iterations.unwrap_or(u32::MAX)
-    }
+    fn iter_cap(&self) -> u32;
 
     /// Human-readable iteration cap for logs and UI (`"∞"` for unlimited).
-    pub fn iter_cap_display(&self) -> String {
-        self.max_iterations
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "∞".to_string())
-    }
+    fn iter_cap_display(&self) -> String;
 
     /// Normalize any workflow to its stages representation.
     /// If stages is non-empty, return them as-is.
     /// If stages is empty, wrap top-level steps into a single stage.
-    pub fn normalize_to_stages(&self) -> Vec<WorkflowStage> {
+    fn normalize_to_stages(&self) -> Vec<WorkflowStage>;
+}
+
+impl UnifiedWorkflowExt for UnifiedWorkflow {
+    fn iter_cap(&self) -> u32 {
+        self.max_iterations.unwrap_or(u32::MAX)
+    }
+
+    fn iter_cap_display(&self) -> String {
+        self.max_iterations
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "∞".to_string())
+    }
+
+    fn normalize_to_stages(&self) -> Vec<WorkflowStage> {
         if !self.stages.is_empty() {
             // Warn if top-level steps also exist — they'll be ignored
             let has_top_level = !self.setup_steps.is_empty()
@@ -613,53 +120,21 @@ impl UnifiedWorkflow {
     }
 }
 
-fn default_auto_include_contexts() -> bool {
-    true
-}
-
-fn default_log_watch_enabled() -> bool {
-    true
-}
-
-fn default_health_check_enabled() -> bool {
-    true
-}
-
-fn default_preflight_check_enabled() -> bool {
-    true
-}
-
-fn default_max_sweep_iterations() -> u32 {
-    5
-}
+// ============================================================================
+// Runner-local default helpers
+// ============================================================================
 
 fn default_category() -> String {
     "general".to_string()
 }
 
-fn default_max_fix_attempts() -> u32 {
-    3
+fn default_conflict_strategy() -> String {
+    "generate".to_string()
 }
 
-fn default_max_ci_auto_resumes() -> u32 {
-    10
-}
-
-fn default_reflection_mode() -> bool {
-    true
-}
-
-fn default_ai_reviewed() -> bool {
-    true
-}
-
-fn default_multi_agent_mode() -> bool {
-    true
-}
-
-fn is_default_log_source(selection: &LogSourceSelection) -> bool {
-    matches!(selection, LogSourceSelection::Mode(s) if s == "default")
-}
+// ============================================================================
+// CreateUnifiedWorkflowRequest — runner HTTP request body
+// ============================================================================
 
 /// Request body for creating a new unified workflow
 #[derive(Debug, Clone, Deserialize)]
@@ -759,8 +234,7 @@ pub struct CreateUnifiedWorkflowRequest {
     pub ai_reviewed: Option<bool>,
     /// Workflow execution architecture override (e.g., "multi_agent_pipeline").
     #[serde(default)]
-    pub workflow_architecture:
-        Option<crate::agentic_verification::WorkflowArchitecture>,
+    pub workflow_architecture: Option<WorkflowArchitecture>,
     /// When true, the pipeline will stop execution if accumulated token usage
     /// exceeds the token budget. Disabled by default.
     #[serde(default)]
@@ -780,55 +254,64 @@ pub struct CreateUnifiedWorkflowRequest {
     pub rollback_policy: Option<String>,
 }
 
-impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest {
-    fn from(w: &UnifiedWorkflow) -> Self {
-        Self {
-            name: w.name.clone(),
-            description: w.description.clone(),
-            category: w.category.clone(),
-            tags: w.tags.clone(),
-            setup_steps: w.setup_steps.clone(),
-            verification_steps: w.verification_steps.clone(),
-            agentic_steps: w.agentic_steps.clone(),
-            completion_steps: w.completion_steps.clone(),
-            max_iterations: w.max_iterations,
-            timeout_seconds: w.timeout_seconds,
-            provider: w.provider.clone(),
-            model: w.model.clone(),
-            skip_ai_summary: w.skip_ai_summary,
-            log_source_selection: Some(w.log_source_selection.clone()),
-            context_ids: Some(w.context_ids.clone()),
-            disabled_context_ids: Some(w.disabled_context_ids.clone()),
-            auto_include_contexts: Some(w.auto_include_contexts),
-            prompt_template: w.prompt_template.clone(),
-            log_watch_enabled: Some(w.log_watch_enabled),
-            health_check_enabled: Some(w.health_check_enabled),
-            health_check_urls: Some(w.health_check_urls.clone()),
-            preflight_check_enabled: Some(w.preflight_check_enabled),
-            targeted_error_ids: Some(w.targeted_error_ids.clone()),
-            generated_by_task_run_id: w.generated_by_task_run_id.clone(),
-            enable_sweep: Some(w.enable_sweep),
-            max_sweep_iterations: Some(w.max_sweep_iterations),
-            stages: Some(w.stages.clone()),
-            stop_on_failure: Some(w.stop_on_failure),
-            constraint_overrides: Some(w.constraint_overrides.clone()),
-            approval_gate: Some(w.approval_gate),
-            reflection_mode: Some(w.reflection_mode),
-            completion_prompts_first: Some(w.completion_prompts_first),
-            model_overrides: Some(w.model_overrides.clone()),
-            dependency_graph: w.dependency_graph.clone(),
-            cost_annotations: w.cost_annotations.clone(),
-            quality_report: w.quality_report.clone(),
-            acceptance_criteria: w.acceptance_criteria.clone(),
-            ai_reviewed: Some(w.ai_reviewed),
-            workflow_architecture: w.workflow_architecture.clone(),
-            enforce_token_budget: Some(w.enforce_token_budget),
-            strict_cwd: w.strict_cwd,
-            tool_tags: w.tool_tags.clone(),
-            flow_control_json: w.flow_control_json.clone(),
-            phase_timeouts_json: w.phase_timeouts_json.clone(),
-            rollback_policy: w.rollback_policy.clone(),
-        }
+/// Build a [`CreateUnifiedWorkflowRequest`] from a [`UnifiedWorkflow`].
+///
+/// Previously `impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest`.
+/// Moved to a free function because `UnifiedWorkflow` is defined in
+/// `qontinui-types` and Rust's orphan rule forbids an inherent `From` impl
+/// between a foreign source type and a local target type? Actually, the
+/// orphan rule *does* allow `impl From<&ForeignType> for LocalType` since
+/// the target type is local — but we standardize on the free-function form
+/// for consistency with the other DTO migrations (scheduler, constraints).
+pub fn unified_workflow_to_create_request(
+    w: &UnifiedWorkflow,
+) -> CreateUnifiedWorkflowRequest {
+    CreateUnifiedWorkflowRequest {
+        name: w.name.clone(),
+        description: w.description.clone(),
+        category: w.category.clone(),
+        tags: w.tags.clone(),
+        setup_steps: w.setup_steps.clone(),
+        verification_steps: w.verification_steps.clone(),
+        agentic_steps: w.agentic_steps.clone(),
+        completion_steps: w.completion_steps.clone(),
+        max_iterations: w.max_iterations,
+        timeout_seconds: w.timeout_seconds,
+        provider: w.provider.clone(),
+        model: w.model.clone(),
+        skip_ai_summary: w.skip_ai_summary,
+        log_source_selection: Some(w.log_source_selection.clone()),
+        context_ids: Some(w.context_ids.clone()),
+        disabled_context_ids: Some(w.disabled_context_ids.clone()),
+        auto_include_contexts: Some(w.auto_include_contexts),
+        prompt_template: w.prompt_template.clone(),
+        log_watch_enabled: Some(w.log_watch_enabled),
+        health_check_enabled: Some(w.health_check_enabled),
+        health_check_urls: Some(w.health_check_urls.clone()),
+        preflight_check_enabled: Some(w.preflight_check_enabled),
+        targeted_error_ids: Some(w.targeted_error_ids.clone()),
+        generated_by_task_run_id: w.generated_by_task_run_id.clone(),
+        enable_sweep: Some(w.enable_sweep),
+        max_sweep_iterations: Some(w.max_sweep_iterations),
+        stages: Some(w.stages.clone()),
+        stop_on_failure: Some(w.stop_on_failure),
+        constraint_overrides: Some(w.constraint_overrides.clone()),
+        approval_gate: Some(w.approval_gate),
+        reflection_mode: Some(w.reflection_mode),
+        completion_prompts_first: Some(w.completion_prompts_first),
+        model_overrides: Some(w.model_overrides.clone()),
+        dependency_graph: w.dependency_graph.clone(),
+        cost_annotations: w.cost_annotations.clone(),
+        quality_report: w.quality_report.clone(),
+        acceptance_criteria: w.acceptance_criteria.clone(),
+        ai_reviewed: Some(w.ai_reviewed),
+        workflow_architecture: w.workflow_architecture.clone(),
+        enforce_token_budget: Some(w.enforce_token_budget),
+        strict_cwd: w.strict_cwd,
+        tool_tags: w.tool_tags.clone(),
+        flow_control_json: w.flow_control_json.clone(),
+        phase_timeouts_json: w.phase_timeouts_json.clone(),
+        rollback_policy: w.rollback_policy.clone(),
     }
 }
 
@@ -895,8 +378,7 @@ pub struct UpdateUnifiedWorkflowRequest {
     /// Whether the AI semantic review ran successfully during generation
     pub ai_reviewed: Option<bool>,
     /// Workflow execution architecture override (e.g., "multi_agent_pipeline").
-    pub workflow_architecture:
-        Option<crate::agentic_verification::WorkflowArchitecture>,
+    pub workflow_architecture: Option<WorkflowArchitecture>,
     /// When true, the pipeline will stop execution if accumulated token usage
     /// exceeds the token budget. Disabled by default.
     #[serde(default)]
@@ -956,10 +438,6 @@ pub struct ImportWorkflowRequest {
     pub conflict_strategy: String,
 }
 
-fn default_conflict_strategy() -> String {
-    "generate".to_string()
-}
-
 /// Result of importing a workflow
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportWorkflowResult {
@@ -970,6 +448,10 @@ pub struct ImportWorkflowResult {
     /// Original ID if it was changed
     pub original_id: Option<String>,
 }
+
+// ============================================================================
+// Step prepending helpers
+// ============================================================================
 
 /// Prepend a log_watch step to verification steps if log_watch_enabled is true.
 ///

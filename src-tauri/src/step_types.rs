@@ -6,47 +6,39 @@
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-/// Explicit mode for command steps, indicating which sub-handler to use.
+/// Explicit mode for command steps.
 ///
-/// When set, the `CommandHandler` uses this field to dispatch directly instead
-/// of inferring the mode from which optional fields are populated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandMode {
-    /// Plain shell command execution
-    Shell,
-    /// Code quality check (check_type determines the checker)
-    Check,
-    /// Execute all checks in a saved check group
-    CheckGroup,
-    /// Run a test (test_type/test_id determines the runner)
-    Test,
+/// DTO re-exported from `qontinui_types::workflow_step`. The runner-facing
+/// `as_str`, `from_str_opt`, and `Display` helpers are attached below as an
+/// extension trait so call-sites that rely on them continue to work.
+pub use qontinui_types::workflow_step::CommandMode;
+
+/// Runner-facing helpers for the foreign [`CommandMode`] DTO.
+pub trait CommandModeExt {
+    /// Stable lowercase string form (matches the wire serialization).
+    fn as_str(&self) -> &'static str;
+    /// Parse the stable string form; returns `None` for unknown inputs.
+    fn from_str_opt(s: &str) -> Option<CommandMode>;
 }
 
-impl CommandMode {
-    pub fn as_str(&self) -> &'static str {
+impl CommandModeExt for CommandMode {
+    fn as_str(&self) -> &'static str {
         match self {
-            Self::Shell => "shell",
-            Self::Check => "check",
-            Self::CheckGroup => "check_group",
-            Self::Test => "test",
+            CommandMode::Shell => "shell",
+            CommandMode::Check => "check",
+            CommandMode::CheckGroup => "check_group",
+            CommandMode::Test => "test",
         }
     }
 
-    pub fn from_str_opt(s: &str) -> Option<Self> {
+    fn from_str_opt(s: &str) -> Option<CommandMode> {
         match s {
-            "shell" => Some(Self::Shell),
-            "check" => Some(Self::Check),
-            "check_group" => Some(Self::CheckGroup),
-            "test" => Some(Self::Test),
+            "shell" => Some(CommandMode::Shell),
+            "check" => Some(CommandMode::Check),
+            "check_group" => Some(CommandMode::CheckGroup),
+            "test" => Some(CommandMode::Test),
             _ => None,
         }
-    }
-}
-
-impl std::fmt::Display for CommandMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
     }
 }
 

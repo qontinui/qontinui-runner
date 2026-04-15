@@ -13,7 +13,7 @@ use async_trait::async_trait;
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::step_executor::ExecutionStepConfig;
-use crate::step_types::CommandMode;
+use crate::step_types::{CommandMode, CommandModeExt};
 
 // Re-use the existing handler implementations directly
 use super::check::CheckHandler;
@@ -45,7 +45,7 @@ impl StepHandler for CommandHandler {
         let mode = step
             .command_mode
             .as_deref()
-            .and_then(CommandMode::from_str_opt);
+            .and_then(<CommandMode as CommandModeExt>::from_str_opt);
 
         match mode {
             Some(CommandMode::CheckGroup) => CheckGroupHandler.execute(step, context).await,

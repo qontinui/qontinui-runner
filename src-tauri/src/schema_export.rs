@@ -12,7 +12,7 @@
 
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -412,21 +412,125 @@ pub enum AppEvent {
 ///
 /// Keys are type names, values are full JSON Schema objects.
 /// Used by the `export_schemas` binary and the type generation pipeline.
+///
+/// In addition to the runner-local mirror types above, this re-exports the
+/// canonical DTO schemas from the `qontinui-types` crate
+/// (`qontinui-schemas/rust/`). Those types are the source of truth for the
+/// TypeScript and Python bindings; we emit schemas via `schema_for!` on the
+/// remote types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
-    json!({
-        "WorkerOutput": serde_json::to_value(schema_for!(WorkerOutput)).unwrap(),
-        "StructuredSignal": serde_json::to_value(schema_for!(StructuredSignal)).unwrap(),
-        "StructuredFinding": serde_json::to_value(schema_for!(StructuredFinding)).unwrap(),
-        "StructuredOverride": serde_json::to_value(schema_for!(StructuredOverride)).unwrap(),
-        "ConfidenceLevel": serde_json::to_value(schema_for!(ConfidenceLevel)).unwrap(),
-        "AgenticPhaseOutput": serde_json::to_value(schema_for!(AgenticPhaseOutput)).unwrap(),
-        "AgenticStatus": serde_json::to_value(schema_for!(AgenticStatus)).unwrap(),
-        "FileChange": serde_json::to_value(schema_for!(FileChange)).unwrap(),
-        "FindingOutput": serde_json::to_value(schema_for!(FindingOutput)).unwrap(),
-        "ReflectionFixOutput": serde_json::to_value(schema_for!(ReflectionFixOutput)).unwrap(),
-        "FlowEvent": serde_json::to_value(schema_for!(FlowEvent)).unwrap(),
-        "AppEvent": serde_json::to_value(schema_for!(AppEvent)).unwrap(),
-    })
+    use qontinui_types::{
+        constraints as qc, scheduler as qs, workflow as qw, workflow_step as qws,
+    };
+
+    // Built via a plain Map instead of `json!` to avoid the
+    // `recursion_limit` ceiling that the `json!` macro hits on large
+    // object literals.
+    let mut m: Map<String, Value> = Map::new();
+
+    macro_rules! add {
+        ($name:literal, $ty:ty) => {
+            m.insert(
+                $name.to_string(),
+                serde_json::to_value(schema_for!($ty)).unwrap(),
+            );
+        };
+    }
+
+    // ── Runner-local mirror types ──
+    add!("WorkerOutput", WorkerOutput);
+    add!("StructuredSignal", StructuredSignal);
+    add!("StructuredFinding", StructuredFinding);
+    add!("StructuredOverride", StructuredOverride);
+    add!("ConfidenceLevel", ConfidenceLevel);
+    add!("AgenticPhaseOutput", AgenticPhaseOutput);
+    add!("AgenticStatus", AgenticStatus);
+    add!("FileChange", FileChange);
+    add!("FindingOutput", FindingOutput);
+    add!("ReflectionFixOutput", ReflectionFixOutput);
+    add!("FlowEvent", FlowEvent);
+    add!("AppEvent", AppEvent);
+
+    // ── qontinui-types: constraints ──
+    add!("ConstraintSeverity", qc::ConstraintSeverity);
+    add!("ConstraintCheck", qc::ConstraintCheck);
+    add!("Constraint", qc::Constraint);
+    add!("ConstraintResult", qc::ConstraintResult);
+    add!("ConstraintViolation", qc::ConstraintViolation);
+    add!("ResourceLimits", qc::ResourceLimits);
+    add!("ConstraintProposal", qc::ConstraintProposal);
+    add!("NewConstraintProposal", qc::NewConstraintProposal);
+    add!("BuiltinOverrideProposal", qc::BuiltinOverrideProposal);
+    add!("ValidateConfigRequest", qc::ValidateConfigRequest);
+    add!("ValidateConfigResponse", qc::ValidateConfigResponse);
+    add!("ReadConfigResponse", qc::ReadConfigResponse);
+    add!("WriteConfigRequest", qc::WriteConfigRequest);
+    add!("WriteConfigResponse", qc::WriteConfigResponse);
+
+    // ── qontinui-types: scheduler ──
+    add!("ScheduleExpression", qs::ScheduleExpression);
+    add!("ConditionScheduleConfig", qs::ConditionScheduleConfig);
+    add!("IdleCondition", qs::IdleCondition);
+    add!("RepositoryWatch", qs::RepositoryWatch);
+    add!("RepositoryInactiveCondition", qs::RepositoryInactiveCondition);
+    add!("ScheduleConditions", qs::ScheduleConditions);
+    add!("ConditionStatus", qs::ConditionStatus);
+    add!("ScheduledTaskType", qs::ScheduledTaskType);
+    add!("ScheduledTaskStatus", qs::ScheduledTaskStatus);
+    add!("TaskExecutionRecord", qs::TaskExecutionRecord);
+    add!("ScheduledTask", qs::ScheduledTask);
+    add!("SchedulerSettings", qs::SchedulerSettings);
+    add!("SchedulerStatus", qs::SchedulerStatus);
+    add!("NextTaskInfo", qs::NextTaskInfo);
+    add!("CreateScheduledTaskRequest", qs::CreateScheduledTaskRequest);
+    add!("UpdateScheduledTaskRequest", qs::UpdateScheduledTaskRequest);
+
+    // ── qontinui-types: workflow frame ──
+    add!("RoutingRule", qw::RoutingRule);
+    add!("ModelOverrideConfig", qw::ModelOverrideConfig);
+    add!("LogSourceSelection", qw::LogSourceSelection);
+    add!("HealthCheckUrl", qw::HealthCheckUrl);
+    add!("WorkflowArchitecture", qw::WorkflowArchitecture);
+    add!("StageCondition", qw::StageCondition);
+    add!("RetryPolicy", qw::RetryPolicy);
+    add!("StageOutput", qw::StageOutput);
+    add!("StageInput", qw::StageInput);
+    add!("WorkflowStage", qw::WorkflowStage);
+    add!("UnifiedWorkflow", qw::UnifiedWorkflow);
+
+    // ── qontinui-types: workflow_step (canonical 4-variant step DTOs) ──
+    // `CanonicalStep` is the strict 4-variant discriminated union.
+    // `UnifiedStep` is the canonical-first, Value-fallback wrapper used for
+    // payloads that may include runner-specific step types.
+    add!("CanonicalStep", qws::CanonicalStep);
+    add!("UnifiedStep", qws::UnifiedStep);
+    add!("CommandStep", qws::CommandStep);
+    add!("PromptStep", qws::PromptStep);
+    add!("UiBridgeStep", qws::UiBridgeStep);
+    add!("WorkflowStep", qws::WorkflowStep);
+    add!("BaseStepFields", qws::BaseStepFields);
+    add!("RetrySpec", qws::RetrySpec);
+    add!("HttpMethod", qws::HttpMethod);
+    add!("ApiContentType", qws::ApiContentType);
+    add!("ApiAssertion", qws::ApiAssertion);
+    add!("ApiAssertionType", qws::ApiAssertionType);
+    add!("ApiAssertionOperator", qws::ApiAssertionOperator);
+    add!("ApiVariableExtraction", qws::ApiVariableExtraction);
+    add!("TestType", qws::TestType);
+    add!("PlaywrightExecutionMode", qws::PlaywrightExecutionMode);
+    add!("CheckType", qws::CheckType);
+    add!("CommandMode", qws::CommandMode);
+    add!("UiBridgeAction", qws::UiBridgeAction);
+    add!("UiBridgeAssertType", qws::UiBridgeAssertType);
+    add!("UiBridgeComparisonMode", qws::UiBridgeComparisonMode);
+    add!("UiBridgeSeverity", qws::UiBridgeSeverity);
+    add!("VerificationCategoryKind", qws::VerificationCategoryKind);
+    add!("CommandStepPhase", qws::CommandStepPhase);
+    add!("PromptStepPhase", qws::PromptStepPhase);
+    add!("UiBridgeStepPhase", qws::UiBridgeStepPhase);
+    add!("WorkflowStepPhase", qws::WorkflowStepPhase);
+
+    Value::Object(m)
 }
 
 #[cfg(test)]
@@ -449,7 +553,21 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 12, "Expected 12 schema entries");
+        assert_eq!(obj.len(), 80, "Expected 80 schema entries");
+
+        // Sanity-check that qontinui_types re-exports are present
+        assert!(
+            obj.contains_key("Constraint"),
+            "Missing Constraint schema from qontinui_types::constraints"
+        );
+        assert!(
+            obj.contains_key("ScheduledTask"),
+            "Missing ScheduledTask schema from qontinui_types::scheduler"
+        );
+        assert!(
+            obj.contains_key("UnifiedWorkflow"),
+            "Missing UnifiedWorkflow schema from qontinui_types::workflow"
+        );
     }
 
     #[test]
