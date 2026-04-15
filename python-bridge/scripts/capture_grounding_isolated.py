@@ -724,6 +724,26 @@ def run_capture_host(
             else:
                 target_el = estimate_target_bbox(params, screen_w, screen_h)
 
+            # Sanity filter: skip any sample whose bbox or screenshot is
+            # too small to be useful training data.  We've seen tiny
+            # screenshots (from slow html2canvas returns) and [0,0,1,1]
+            # bboxes (from estimate fallback running against a 0×0
+            # viewport) create garbage records that pollute the dataset.
+            bx, by, bw, bh = target_el.bbox
+            if bw < 10 or bh < 10:
+                logger.debug(
+                    "Sample %d: bbox too small (%dx%d) — skipping", idx, bw, bh,
+                )
+                total_skipped += 1
+                continue
+            if screen_w < 200 or screen_h < 200:
+                logger.debug(
+                    "Sample %d: screenshot too small (%dx%d) — skipping",
+                    idx, screen_w, screen_h,
+                )
+                total_skipped += 1
+                continue
+
             record = GroundingRecord(
                 image_hash="",
                 image_path="",
