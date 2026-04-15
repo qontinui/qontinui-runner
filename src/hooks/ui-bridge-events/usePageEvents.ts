@@ -322,7 +322,21 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
                 `Expression rejected: contains prohibited pattern${matched ? ` (${matched.source})` : ""}`,
               );
             }
-            const result = new Function("return " + expression)();
+            // Default: wrap as `return <expr>` so simple expressions like
+            // `document.title` evaluate to their value. If that's a SyntaxError
+            // (e.g., the caller passed multiple statements with top-level
+            // `let`/`const` and an explicit `return`), re-run as a raw function
+            // body so modern JS works without forcing IIFE wrappers on callers.
+            let result: unknown;
+            try {
+              result = new Function("return " + expression)();
+            } catch (firstErr) {
+              if (firstErr instanceof SyntaxError) {
+                result = new Function(expression)();
+              } else {
+                throw firstErr;
+              }
+            }
             const resolvedResult = await Promise.resolve(result);
             await sendResponse({
               requestId,
