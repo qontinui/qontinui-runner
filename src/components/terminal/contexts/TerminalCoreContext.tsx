@@ -77,9 +77,40 @@ export function TerminalCoreProvider({ pageId, children }: TerminalCoreProviderP
   useEffect(() => {
     const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
     const sessions = pendingProfileSessionsRef.current;
-    if (!sessions) return;
-    pendingProfileSessionsRef.current = null;
+    if (!sessions || sessions.length === 0) return;
 
+    const isWindows = navigator.platform.startsWith("Win");
+    const buildResumeCmd = (sessionId: string, configDir: string | undefined) => {
+      const base = `claude --resume ${sessionId}`;
+      if (!configDir) return `${base}\r`;
+      return isWindows
+        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; ${base}\r`
+        : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
+    };
+
+    const writeWhenReady = (tabId: string, text: string, maxWaitMs = 5000) => {
+      const start = Date.now();
+      const poll = () => {
+        const handle = terminalRefs.current.get(tabId)?.current;
+        if (handle) {
+          handle.writeToTerminal(text);
+          return;
+        }
+        if (Date.now() - start < maxWaitMs) {
+          setTimeout(poll, 200);
+        } else {
+          console.warn(
+            `[TerminalCore] profile resume: terminal ref for ${tabId} never became ready`,
+          );
+        }
+      };
+      poll();
+    };
+
+    // Effect can fire multiple times as assignments settle (one per terminal
+    // creation). Process only sessions whose zone now has an assignment, and
+    // leave the rest in the ref for the next assignments tick.
+    const remaining: ZoneSessionInfo[] = [];
     for (const s of sessions) {
       const tabId = zoneLayout.assignments[s.zoneIndex];
       if (tabId && SESSION_ID_RE.test(s.claudeSessionId)) {
@@ -87,13 +118,12 @@ export function TerminalCoreProvider({ pageId, children }: TerminalCoreProviderP
           claudeSessionId: s.claudeSessionId,
           claudeConfigDir: s.claudeConfigDir,
         });
-        const ref = terminalRefs.current.get(tabId);
-        const handle = ref?.current;
-        if (handle) {
-          handle.writeToTerminal(`claude --resume ${s.claudeSessionId}\r`);
-        }
+        writeWhenReady(tabId, buildResumeCmd(s.claudeSessionId, s.claudeConfigDir));
+      } else {
+        remaining.push(s);
       }
     }
+    pendingProfileSessionsRef.current = remaining.length > 0 ? remaining : null;
   }, [zoneLayout.assignments, updateTab]);
 
   const value = useMemo<TerminalCoreContextValue>(

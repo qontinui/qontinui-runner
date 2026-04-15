@@ -118,8 +118,14 @@ function TerminalPageInner({
   }, [tabs.length, onSessionCountChange]);
 
   const { fileConflicts, fileLockStates, sessionPersistence } = useShellInfra();
-  const { labelsAndTags, eventHistory, addHistoryEvent, metrics: _metrics, incrementMetric, focusHistory } =
-    useZoneMetadata();
+  const {
+    labelsAndTags,
+    eventHistory,
+    addHistoryEvent,
+    metrics: _metrics,
+    incrementMetric,
+    focusHistory,
+  } = useZoneMetadata();
 
   const stateTracking = useSessionState();
 
@@ -324,17 +330,17 @@ function TerminalPageInner({
                 labelsAndTags.setZoneNotes(profile.notes);
                 labelsAndTags.setPinnedZones(new Set(profile.pins));
                 transitionEffects.setAutoApprovePatterns(profile.autoApprovePatterns);
-                // Create terminals for profile sessions that need them
+                // Create terminals for profile sessions that need them.
+                // Stash sessions BEFORE creating terminals so the assignments-watching
+                // effect sees them as soon as the first assignment lands.
                 if (profile.sessions && profile.sessions.length > 0) {
-                  // Count how many new terminals we need (sessions without existing tabs)
+                  pendingProfileSessionsRef.current = profile.sessions;
                   const existingTabCount = tabs.length;
                   const neededCount = profile.sessions.length;
                   const toCreate = Math.max(0, neededCount - existingTabCount);
                   for (let i = 0; i < toCreate; i++) {
                     await createAndAssignTerminal();
                   }
-                  // Stash sessions for resume after assignments settle (useEffect above)
-                  pendingProfileSessionsRef.current = profile.sessions;
                 }
               }}
             />
