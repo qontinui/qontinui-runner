@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { Search, Loader2, CheckCircle2, XCircle, Sparkles, ChevronRight } from "lucide-react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { PromptSuggestions, savePromptToHistory } from "./PromptSuggestions";
-import { usePromptExecution } from "./usePromptExecution";
+import { usePromptExecutionContext } from "./PromptExecutionContext";
 import { useExplainModeTutorial } from "./useExplainModeTutorial";
 
 const EXPLAIN_KEY = "prompt-home-explain";
@@ -11,7 +11,7 @@ export function PromptHomePage() {
   const [input, setInput] = useState("");
   const [explain, setExplain] = useState(() => instanceStorage.getItem(EXPLAIN_KEY) === "true");
   const inputRef = useRef<HTMLInputElement>(null);
-  const { phase, plan, progress, error, submit, reset } = usePromptExecution();
+  const { phase, plan, progress, error, submit, reset } = usePromptExecutionContext();
 
   useExplainModeTutorial(explain, phase, progress, plan?.steps, plan?.summary);
 

@@ -62,6 +62,8 @@ import { TerminalPageProvider } from "./components/terminal/TerminalPageContext"
 import { ReorganizeDialog, type ReorganizePlan } from "./components/terminal/ReorganizeDialog";
 import { PerformanceOverlay } from "./components/dev";
 import { CommandPalette } from "./components/unified-search/CommandPalette";
+import { PromptExecutionProvider } from "./components/prompt-home/PromptExecutionContext";
+import { PromptAutomationOverlay } from "./components/prompt-home/PromptAutomationOverlay";
 import { useTaskRuns } from "./hooks/useAiData";
 import { getAllSpecs } from "./lib/spec-registry";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
@@ -679,7 +681,10 @@ export default function App() {
                   }}
                 >
                   <AutoContinueProvider>
-                    <AppWithTutorials />
+                    <PromptExecutionProvider>
+                      <AppWithTutorials />
+                      <PromptAutomationOverlay />
+                    </PromptExecutionProvider>
                   </AutoContinueProvider>
                 </ExecutionProvider>
               </EventManagerProvider>
