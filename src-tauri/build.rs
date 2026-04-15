@@ -4,5 +4,27 @@ fn main() {
     // serve a stale frontend bundle from the compile-time cache.
     println!("cargo:rerun-if-changed=../dist");
 
+    // Embed the current git SHA so the running binary can report exactly which
+    // commit it was built from. Surfaced via the runner /health endpoint and
+    // the supervisor's spawn-test response — lets manual-test sessions assert
+    // "this temp runner is the commit I'm debugging" without guessing from
+    // binary mtime.
+    let git_sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=QONTINUI_GIT_SHA={}", git_sha);
+    // Re-run this script if HEAD moves (branch switch, new commit).
+    // qontinui-runner's .git lives at ../.git relative to src-tauri.
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+
     tauri_build::build()
 }

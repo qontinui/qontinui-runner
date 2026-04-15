@@ -213,6 +213,10 @@ async fn health(
         "consoleErrorCount": console_errors,
         "aiProviderCircuitBreakers": ai_provider_states,
         "embeddingService": embedding_health,
+        // Git SHA of the commit this binary was built from (12-char). Embedded
+        // by build.rs via QONTINUI_GIT_SHA. Manual-test sessions can assert
+        // the temp runner is actually running the commit under debug.
+        "gitSha": env!("QONTINUI_GIT_SHA"),
     });
 
     if let Some((screenshot, width, height)) = diagnostic_screenshot {

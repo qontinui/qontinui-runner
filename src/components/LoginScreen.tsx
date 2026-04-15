@@ -105,7 +105,13 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
 
             {/* Error Message */}
             {error && (
-              <div className="flex items-start gap-2 p-3 bg-destructive/10 border border-destructive/50 rounded-lg animate-slideDown">
+              <div
+                id="login-error"
+                data-testid="login-error"
+                role="alert"
+                aria-live="assertive"
+                className="flex items-start gap-2 p-3 bg-destructive/10 border border-destructive/50 rounded-lg animate-slideDown"
+              >
                 <AlertCircle className="w-5 h-5 text-destructive shrink-0 mt-0.5" />
                 <p className="text-sm text-destructive">{error}</p>
               </div>
