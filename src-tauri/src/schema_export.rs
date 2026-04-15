@@ -420,7 +420,8 @@ pub enum AppEvent {
 /// remote types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        constraints as qc, scheduler as qs, workflow as qw, workflow_step as qws,
+        constraints as qc, geometry as qg, scheduler as qs, tree_events as qte,
+        workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -550,6 +551,35 @@ pub fn export_all_schemas() -> Value {
     add!("DagCancelStep", qws::DagCancelStep);
     add!("DagApprovalStep", qws::DagApprovalStep);
     add!("DagLoopStep", qws::DagLoopStep);
+
+    // ── qontinui-types: geometry ──
+    add!("CoordinateSystem", qg::CoordinateSystem);
+    add!("Coordinates", qg::Coordinates);
+    add!("Region", qg::Region);
+    add!("MonitorPosition", qg::MonitorPosition);
+    add!("Monitor", qg::Monitor);
+    add!("VirtualDesktop", qg::VirtualDesktop);
+
+    // ── qontinui-types: tree_events ──
+    add!("NodeType", qte::NodeType);
+    add!("NodeStatus", qte::NodeStatus);
+    add!("TreeEventType", qte::TreeEventType);
+    add!("ActionType", qte::ActionType);
+    add!("MatchLocation", qte::MatchLocation);
+    add!("TopMatch", qte::TopMatch);
+    add!("RuntimeData", qte::RuntimeData);
+    add!("StateContext", qte::StateContext);
+    add!("TimingInfo", qte::TimingInfo);
+    add!("Outcome", qte::Outcome);
+    add!("NodeMetadata", qte::NodeMetadata);
+    add!("TreeNode", qte::TreeNode);
+    add!("PathElement", qte::PathElement);
+    add!("TreeEvent", qte::TreeEvent);
+    add!("DisplayNode", qte::DisplayNode);
+    add!("TreeEventCreate", qte::TreeEventCreate);
+    add!("TreeEventResponse", qte::TreeEventResponse);
+    add!("TreeEventListResponse", qte::TreeEventListResponse);
+    add!("ExecutionTreeResponse", qte::ExecutionTreeResponse);
 
     Value::Object(m)
 }

@@ -20,12 +20,11 @@
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"],
-      "@qontinui/schemas/*": ["../qontinui-schemas/generated/typescript/*"],
       "@qontinui/workflow-utils": ["../qontinui-workflow-utils/dist/index.d.ts"],
       "@qontinui/shared-types/*": ["../qontinui-schemas/ts/dist/*"]
     }
   },
-  "include": ["src", "../qontinui-schemas/generated/typescript"],
+  "include": ["src"],
   "exclude": [
     "src/services/StateDetectionService.ts",
     "src/examples/StateDetectionExample.ts",

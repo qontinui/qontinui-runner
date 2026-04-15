@@ -25,13 +25,18 @@ export type {
   TopMatch,
 } from "./treeEvents";
 
-export {
+// Tree event enums are now string-literal union types (from Rust schemars
+// via json-schema-to-typescript), not runtime TS enums. Grep verified no
+// `NodeType.X` / `ActionType.X` value uses today — all consumers use them
+// as types only, so re-exporting as `type` is safe.
+export type {
   NodeType,
   NodeStatus,
   TreeEventType,
   ActionType as TreeActionType,
-  createDisplayNode,
 } from "./treeEvents";
+
+export { createDisplayNode } from "./treeEvents";
 
 // State machine types and functions
 export type {
@@ -171,7 +176,7 @@ export {
 // Re-exported from qontinui-schemas
 export type { Coordinates, Region, Monitor, VirtualDesktop, MonitorInfo } from "./geometry";
 
-export { CoordinateSystem } from "./geometry";
+export type { CoordinateSystem } from "./geometry";
 
 // Task run types (async AI task system)
 export type { TaskRun, TaskRunStatus, RunPromptRequest, RunPromptResponse } from "./taskRun";

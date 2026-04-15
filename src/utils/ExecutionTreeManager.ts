@@ -135,7 +135,14 @@ export class ExecutionTreeManager {
     // Flatten execution_record metadata into top-level metadata
     // Backend sends: metadata.execution_record.metadata.runtime
     // Frontend expects: metadata.runtime
-    const flattenedMetadata: ExtendedNodeMetadata = { ...(nodeData.metadata || {}) };
+    // is_expandable / is_inline are required on NodeMetadata (the Rust type
+    // has `#[serde(default)]` on both — after deserialization they're
+    // always present). Default to false when the backend omits them.
+    const flattenedMetadata: ExtendedNodeMetadata = {
+      is_expandable: false,
+      is_inline: false,
+      ...(nodeData.metadata || {}),
+    };
     const executionRecord = flattenedMetadata.execution_record;
     if (
       executionRecord &&
@@ -246,7 +253,11 @@ export class ExecutionTreeManager {
     // Deep merge metadata to preserve new fields from action_completed events
     if (nodeData.metadata) {
       // Flatten execution_record metadata before merging
-      const flattenedMetadata: ExtendedNodeMetadata = { ...nodeData.metadata };
+      const flattenedMetadata: ExtendedNodeMetadata = {
+        is_expandable: false,
+        is_inline: false,
+        ...nodeData.metadata,
+      };
       const executionRecord = flattenedMetadata.execution_record;
       if (
         executionRecord &&

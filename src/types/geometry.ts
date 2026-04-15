@@ -1,20 +1,27 @@
 /**
  * Geometry Types
  *
- * Re-exports types from qontinui-schemas for monitor and coordinate handling.
- * This provides a single import point for all geometry types in the runner.
+ * Re-exports from @qontinui/shared-types for monitor and coordinate handling.
+ * Single source of truth: qontinui-schemas/rust/src/geometry.rs.
  *
  * @module geometry
  */
 
-// Re-export all types from the shared schema
-export type { Coordinates, Region, Monitor, VirtualDesktop } from "@qontinui/schemas/geometry";
+export type {
+  Coordinates,
+  Region,
+  Monitor,
+  VirtualDesktop,
+  MonitorPosition,
+  CoordinateSystem,
+} from "@qontinui/shared-types/geometry";
 
-// Re-export enums (values, not just types)
-export { CoordinateSystem } from "@qontinui/schemas/geometry";
+// NOTE: `CoordinateSystem` is now a string-literal union type (not a runtime
+// enum) because the canonical Rust type produces that shape via schemars.
+// Callers that previously wrote `CoordinateSystem.SCREEN` must switch to the
+// literal `"screen"` — grep verified zero such call sites today.
 
 /**
- * @deprecated Use Monitor from @qontinui/schemas instead.
- * This alias is provided for backward compatibility during migration.
+ * @deprecated Use `Monitor` directly. Alias kept for the migration window.
  */
-export type { Monitor as MonitorInfo } from "@qontinui/schemas/geometry";
+export type { Monitor as MonitorInfo } from "@qontinui/shared-types/geometry";

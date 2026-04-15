@@ -1,13 +1,13 @@
 /**
  * Tree Event Types and Interfaces
  *
- * Re-exports types from qontinui-schemas and adds runner-specific extensions.
- * This provides a single import point for all tree event types in the runner.
+ * Re-exports from @qontinui/shared-types/tree-events plus a few
+ * runner-specific extensions. Single source of truth:
+ * qontinui-schemas/rust/src/tree_events.rs.
  *
  * @module treeEvents
  */
 
-// Re-export all types from the shared schema
 export type {
   MatchLocation,
   TopMatch,
@@ -23,25 +23,27 @@ export type {
   TreeEventResponse,
   TreeEventListResponse,
   ExecutionTreeResponse,
-} from "@qontinui/schemas/tree_events";
-
-// Re-export enums (values, not just types)
-export { NodeType, NodeStatus, TreeEventType, ActionType } from "@qontinui/schemas/tree_events";
+  // These are string-literal union types now (see CoordinateSystem note in
+  // ./geometry.ts), not runtime TS enums. All callers use them as types.
+  NodeType,
+  NodeStatus,
+  TreeEventType,
+  ActionType,
+} from "@qontinui/shared-types/tree-events";
 
 // Import types we need to extend
 import type {
   NodeType as SchemaNodeType,
   NodeStatus as SchemaNodeStatus,
   NodeMetadata as SchemaNodeMetadata,
-  RuntimeData as _SchemaRuntimeData,
-} from "@qontinui/schemas/tree_events";
+} from "@qontinui/shared-types/tree-events";
 
 /**
- * Extended NodeMetadata that allows additional properties for backward compatibility.
- * The backend may send additional fields not defined in the schema.
+ * Extended NodeMetadata that allows additional properties for backward
+ * compatibility. The backend may send additional fields not declared in the
+ * canonical Rust type.
  */
 export interface ExtendedNodeMetadata extends SchemaNodeMetadata {
-  // Allow additional properties for flexibility
   [key: string]: unknown;
 
   // Legacy fields that may be flattened from runtime
@@ -57,63 +59,39 @@ export interface ExtendedNodeMetadata extends SchemaNodeMetadata {
 }
 
 /**
- * TreeEventData - alias for TreeEvent for backward compatibility
- * This is the primary event type emitted by the backend's tree-based execution system
+ * TreeEventData — alias for TreeEvent for backward compatibility.
  */
-export type { TreeEvent as TreeEventData } from "@qontinui/schemas/tree_events";
+export type { TreeEvent as TreeEventData } from "@qontinui/shared-types/tree-events";
 
 /**
- * Display node structure used by the runner frontend.
- * Extends the schema's DisplayNode with runner-specific properties.
+ * Display node structure used by the runner frontend. Extends the canonical
+ * DisplayNode with runner-specific properties.
  *
- * Key differences from schema:
- * - `parent`: Reference to parent DisplayNode for navigation
- * - `isExpanded`: camelCase naming for React convention
+ * Differences from the canonical schema:
+ * - `parent`: Reference to parent DisplayNode for in-memory navigation
+ * - `isExpanded`: camelCase for React convention (schema uses `is_expanded`)
  * - `metadata`: Uses ExtendedNodeMetadata for backward compatibility
  */
 export interface DisplayNode {
-  /** Unique identifier for this node */
   id: string;
-
-  /** Type of node (workflow, action, or transition) */
   node_type: SchemaNodeType;
-
-  /** Display name for this node */
   name: string;
-
-  /** Timestamp when this node was created (Unix epoch in seconds) */
   timestamp: number;
-
-  /** Timestamp when this node completed (Unix epoch in seconds) */
   end_timestamp?: number | null;
-
-  /** Duration in seconds (calculated from end_timestamp - timestamp) */
   duration?: number | null;
-
-  /** Current execution status */
   status: SchemaNodeStatus;
-
-  /** Node metadata (action config, expandability, etc.) */
   metadata: ExtendedNodeMetadata;
-
-  /** Error message if status is "failed" */
   error?: string | null;
-
-  /** Child nodes in the tree */
   children: DisplayNode[];
-
-  /** Reference to parent node, or null if this is a root */
   parent: DisplayNode | null;
-
-  /** Whether this node should be expanded in the UI (default: true) */
+  /** Whether this node should be expanded in the UI (default: true). */
   isExpanded: boolean;
-
-  /** Nesting level in the tree (0 for root, 1 for first level children, etc.) */
+  /** Nesting level in the tree (0 for root, 1 for first-level children). */
   level?: number;
 }
 
 /**
- * Create a DisplayNode from a TreeNode or partial node data
+ * Create a DisplayNode from a TreeNode or partial node data.
  */
 export function createDisplayNode(
   node: {
