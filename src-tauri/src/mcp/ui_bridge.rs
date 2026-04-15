@@ -5690,8 +5690,28 @@ fn evaluate_wait_for_element_assertions(
     assertions: &[serde_json::Value],
 ) -> Result<(), String> {
     fn text_of(element: &serde_json::Value) -> String {
-        // ai_find / get_element results both expose text via several
-        // possible fields depending on which path produced them. Coalesce.
+        // Prefer live DOM reads (state.textContent / state.value) over the
+        // cached top-level `label`/`text`. The registered element's label is
+        // captured once at registration time, so a wait-for-element assertion
+        // polling for in-place text changes (e.g., an overlay transitioning
+        // from "Understanding your request..." to "Done") would never see the
+        // update if we consulted `label` first. `state.*` fields are re-read
+        // from the DOM on every get_element IPC call, so they reflect the
+        // current render.
+        let state = element.get("state");
+        for key in ["textContent", "value", "innerText"] {
+            if let Some(s) = state
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.as_str())
+            {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+        // Fall back to cached / top-level fields. These are still useful for
+        // ai_find results and for elements whose semantic label differs from
+        // their visible text (e.g., icon buttons with aria-label).
         for key in [
             "text",
             "label",
@@ -5704,15 +5724,6 @@ fn evaluate_wait_for_element_assertions(
                     return s.to_string();
                 }
             }
-        }
-        // Fall back to a nested `state.textContent`, which is what the
-        // discover endpoint produces for many element types.
-        if let Some(s) = element
-            .get("state")
-            .and_then(|v| v.get("textContent"))
-            .and_then(|v| v.as_str())
-        {
-            return s.to_string();
         }
         String::new()
     }
