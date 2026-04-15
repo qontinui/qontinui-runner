@@ -311,13 +311,12 @@ pub struct ExecutionStepConfig {
     // NOTE on canonical-name renames: `ExecutionStepConfig` is a fat struct
     // shared by all step types, so bare canonical names like `"action"` and
     // `"target"` are ambiguous — `native_accessibility` and `ui_bridge` both
-    // use them. Keeping prefixed primary names here preserves correct routing
-    // when ExecutionStepConfig is deserialized from mixed-type JSON. The
-    // `ExecutionStepConfig → FullRunnerStep` round-trip for ui_bridge /
-    // workflow variants therefore still falls back to string-key dispatch
-    // at runtime (see `executor.rs::execute_single_step` warn! path). The
-    // clean fix is a per-variant constructor (Session 2c) that reads typed
-    // Rust fields directly rather than round-tripping through JSON.
+    // use them.  Keeping prefixed primary names here preserves correct routing
+    // when ExecutionStepConfig is deserialized from mixed-type JSON.  The
+    // typed-dispatch boundary in `executor.rs::to_full_runner_step` uses
+    // per-variant Rust-field constructors (Session 2c) to produce the typed
+    // `FullRunnerStep` view without round-tripping through JSON, so these
+    // prefixed names do not block the typed invariant.
 
     /// UI Bridge: Action to perform ("navigate", "execute", "assert", "snapshot")
     #[serde(alias = "uiBridgeAction", alias = "ui_bridge_action")]

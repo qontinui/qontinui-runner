@@ -62,15 +62,107 @@ use super::executor_types::*;
 // Typed dispatch helpers — Session 2a
 // ============================================================================
 
-/// Serialize `ExecutionStepConfig` → `serde_json::Value` → `FullRunnerStep`.
+/// Build a [`FullRunnerStep`] variant from an `ExecutionStepConfig`.
 ///
-/// `ExecutionStepConfig` carries `step_type` serialized as `"type"` (via
-/// `#[serde(rename = "type")]`), which is exactly the tag field that
-/// `FullRunnerStep`'s `#[serde(tag = "type")]` expects.  The intermediate
-/// `Value` therefore has the right shape for the `from_value` call.
+/// Two construction paths:
+///
+/// 1. **Direct Rust-field constructor** (preferred): for step types whose
+///    inner `qontinui-types` struct uses bare field names that collide with
+///    other variants on the fat `ExecutionStepConfig` struct (e.g. `action`,
+///    `target`, `workflow_name`). Reading typed Rust fields sidesteps the
+///    JSON field-name ambiguity and always succeeds for well-formed configs.
+///
+/// 2. **JSON round-trip fallback**: everything else uses
+///    `serde_json::to_value` + `from_value`. `ExecutionStepConfig` serialises
+///    `step_type` as `"type"` (via `#[serde(rename = "type")]`), which is
+///    the tag field `FullRunnerStep`'s `#[serde(tag = "type")]` expects, so
+///    the intermediate `Value` has the right shape for `from_value`.
+///
+/// Add a new arm to the match below whenever a new step type is introduced
+/// that the JSON round-trip can't parse cleanly — don't paper over it with
+/// looser serde aliases on `ExecutionStepConfig`.
 fn to_full_runner_step(
     step: &ExecutionStepConfig,
 ) -> Result<qontinui_types::workflow_step::FullRunnerStep, String> {
+    use qontinui_types::workflow_step::{
+        FullRunnerStep, UiBridgeAction, UiBridgeAssertType, UiBridgeComparisonMode, UiBridgeSeverity,
+        UiBridgeStep, UiBridgeStepPhase, WorkflowStep, WorkflowStepPhase,
+    };
+
+    // Direct constructors for variants that don't round-trip cleanly.
+    match step.step_type.as_str() {
+        "ui_bridge" => {
+            let action = match step.ui_bridge_action.as_deref() {
+                Some(s) => parse_snake_enum::<UiBridgeAction>(s)
+                    .map_err(|e| format!("ui_bridge.action: {e}"))?,
+                None => UiBridgeAction::default(),
+            };
+            let assert_type = step
+                .ui_bridge_assert_type
+                .as_deref()
+                .map(|s| {
+                    parse_snake_enum::<UiBridgeAssertType>(s)
+                        .map_err(|e| format!("ui_bridge.assert_type: {e}"))
+                })
+                .transpose()?;
+            let comparison_mode = step
+                .ui_bridge_compare_mode
+                .as_deref()
+                .map(|s| {
+                    parse_snake_enum::<UiBridgeComparisonMode>(s)
+                        .map_err(|e| format!("ui_bridge.comparison_mode: {e}"))
+                })
+                .transpose()?;
+            let severity_threshold = step
+                .ui_bridge_severity_threshold
+                .as_deref()
+                .map(|s| {
+                    parse_snake_enum::<UiBridgeSeverity>(s)
+                        .map_err(|e| format!("ui_bridge.severity_threshold: {e}"))
+                })
+                .transpose()?;
+            let phase = parse_phase_or_default::<UiBridgeStepPhase>(step.phase.as_deref(), || {
+                UiBridgeStepPhase::default()
+            });
+            return Ok(FullRunnerStep::UiBridge(UiBridgeStep {
+                base: base_from_step(step),
+                phase,
+                action,
+                url: step.ui_bridge_url.clone(),
+                instruction: step.ui_bridge_instruction.clone(),
+                target: step.ui_bridge_target.clone(),
+                assert_type,
+                expected: step.ui_bridge_expected.clone(),
+                timeout_ms: step.ui_bridge_timeout_ms,
+                comparison_mode,
+                reference_snapshot_id: step.ui_bridge_reference_snapshot_id.clone(),
+                severity_threshold,
+                ui_bridge_snapshot_target: step.ui_bridge_snapshot_target.clone(),
+                action_plan: step.ui_bridge_action_plan.clone(),
+            }));
+        }
+        "workflow" => {
+            let workflow_id = step.ref_workflow_id.clone().ok_or_else(|| {
+                "workflow step missing required field ref_workflow_id / workflowId".to_string()
+            })?;
+            let workflow_name = step
+                .ref_workflow_name
+                .clone()
+                .or_else(|| step.name.clone())
+                .unwrap_or_default();
+            let phase = parse_phase_or_default::<WorkflowStepPhase>(step.phase.as_deref(), || {
+                WorkflowStepPhase::default()
+            });
+            return Ok(FullRunnerStep::Workflow(WorkflowStep {
+                base: base_from_step(step),
+                phase,
+                workflow_id,
+                workflow_name,
+            }));
+        }
+        _ => {}
+    }
+
     let value = serde_json::to_value(step)
         .map_err(|e| format!("failed to serialize ExecutionStepConfig: {e}"))?;
     serde_json::from_value(value).map_err(|e| {
@@ -79,6 +171,43 @@ fn to_full_runner_step(
             step.step_type
         )
     })
+}
+
+/// Parse a snake_case enum variant name by wrapping in a JSON string and
+/// routing through serde.  Works for any enum with
+/// `#[serde(rename_all = "snake_case")]`.
+fn parse_snake_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, String> {
+    serde_json::from_value::<T>(serde_json::Value::String(s.to_string()))
+        .map_err(|e| format!("unknown variant {:?}: {e}", s))
+}
+
+/// Parse a `phase` string into a variant-specific phase enum, falling back
+/// to the type's Default when the string is missing or unrecognised.
+///
+/// Variant phase enums are subsets of the global phase set (e.g. `UiBridgeStepPhase`
+/// excludes `agentic`); an invalid value here is usually upstream data carrying a
+/// phase the variant can't legally be in. Falling back to Default keeps dispatch
+/// unblocked — the handler still reads `step.phase` from `ExecutionStepConfig`
+/// when it needs the exact string.
+fn parse_phase_or_default<T: serde::de::DeserializeOwned>(
+    s: Option<&str>,
+    default: impl FnOnce() -> T,
+) -> T {
+    s.and_then(|s| parse_snake_enum::<T>(s).ok())
+        .unwrap_or_else(default)
+}
+
+/// Copy the `BaseStepFields` surface from an `ExecutionStepConfig`.
+///
+/// `ExecutionStepConfig` only carries `id` and `name` — the rest of the
+/// `BaseStepFields` surface (inputs, extract, depends_on, retry, …) lives
+/// on other dispatch paths and isn't needed for handler lookup.
+fn base_from_step(step: &ExecutionStepConfig) -> qontinui_types::workflow_step::BaseStepFields {
+    qontinui_types::workflow_step::BaseStepFields {
+        id: step.id.clone().unwrap_or_default(),
+        name: step.name.clone().unwrap_or_default(),
+        ..Default::default()
+    }
 }
 
 /// Exhaustive map from `FullRunnerStep` variant → handler-registry lookup key.
@@ -1934,29 +2063,18 @@ mod tests {
     /// `ExecutionStepConfig` and the target `FullRunnerStep` inner struct are
     /// included here.
     ///
-    /// Types still excluded and why:
+    /// `ui_bridge` and `workflow` also round-trip because Session 2c added
+    /// direct Rust-field constructors that bypass JSON field-name conflicts
+    /// on the fat `ExecutionStepConfig` struct (`action` / `target` /
+    /// `workflow_name` are shared across variants).
     ///
-    /// - `ui_bridge`: `UiBridgeStep` uses bare field names (`action`, `target`,
-    ///   `url`, `assert_type`, …) that conflict with `native_accessibility`'s
-    ///   field names on the fat `ExecutionStepConfig` struct. Renaming
-    ///   `ui_bridge_action` to serialize as `"action"` misroutes a11y steps.
-    ///   The clean fix is a per-variant Rust-field constructor (Session 2c)
-    ///   rather than JSON round-trip.
-    ///
-    /// - `workflow`: `WorkflowStep.workflow_name` is a required non-optional
-    ///   string with no corresponding field in `ExecutionStepConfig`
-    ///   (the handler falls back to `step.name` at runtime). Requires a
-    ///   schema change (make `workflow_name` optional) or a dedicated
-    ///   `workflow_name` field on `ExecutionStepConfig`.
-    ///
-    /// For those types the typed parse falls back to string-key dispatch (the
-    /// backward-compat path in `execute_single_step`). `prompt` now
-    /// round-trips cleanly because Session 2b aligned
-    /// `ExecutionStepConfig.prompt_content` to serialize as `"content"`.
+    /// Variants not covered below are tested indirectly via
+    /// `test_handler_lookup_key_all_variants`; add an explicit round-trip
+    /// case here only when a variant has non-trivial field mapping to
+    /// verify.
     #[test]
     fn test_to_full_runner_step_round_trip() {
         // Each entry: (label, minimal JSON, expected handler key).
-        // Types that round-trip cleanly: command, prompt, dag_*.
         let cases: &[(&str, serde_json::Value, &str)] = &[
             (
                 "command",
@@ -1967,6 +2085,30 @@ mod tests {
                 "prompt",
                 json!({"type": "prompt", "id": "s2", "name": "ask", "phase": "agentic", "content": "do the thing"}),
                 "prompt",
+            ),
+            (
+                "ui_bridge",
+                json!({
+                    "type": "ui_bridge",
+                    "id": "s5",
+                    "name": "click",
+                    "phase": "verification",
+                    "ui_bridge_action": "execute",
+                    "ui_bridge_target": "#submit",
+                    "ui_bridge_instruction": "click submit"
+                }),
+                "ui_bridge",
+            ),
+            (
+                "workflow",
+                json!({
+                    "type": "workflow",
+                    "id": "s6",
+                    "name": "run child",
+                    "phase": "setup",
+                    "ref_workflow_id": "wf-123"
+                }),
+                "workflow",
             ),
             (
                 "dag_cancel",
