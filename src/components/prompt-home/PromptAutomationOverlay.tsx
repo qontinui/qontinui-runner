@@ -39,6 +39,9 @@ export function PromptAutomationOverlay() {
 
   return (
     <div
+      id="prompt-automation-overlay"
+      data-testid="prompt-automation-overlay"
+      data-phase={phase}
       role="status"
       aria-live="polite"
       className={`
@@ -85,6 +88,8 @@ export function PromptAutomationOverlay() {
         <div className="flex items-center gap-1 shrink-0">
           {canExpand && (
             <button
+              id="prompt-overlay-expand"
+              data-testid="prompt-overlay-expand"
               onClick={() => setExpanded((v) => !v)}
               className="p-1 rounded-md hover:bg-accent text-muted-foreground"
               aria-label={expanded ? "Collapse" : "Expand"}
@@ -95,6 +100,8 @@ export function PromptAutomationOverlay() {
           )}
           {isError && lastPrompt && (
             <button
+              id="prompt-overlay-retry"
+              data-testid="prompt-overlay-retry"
               onClick={retry}
               className="p-1 rounded-md hover:bg-accent text-primary"
               aria-label="Retry"
@@ -104,6 +111,8 @@ export function PromptAutomationOverlay() {
             </button>
           )}
           <button
+            id="prompt-overlay-dismiss"
+            data-testid="prompt-overlay-dismiss"
             onClick={reset}
             className="p-1 rounded-md hover:bg-accent text-muted-foreground"
             aria-label={isWorking ? "Cancel" : "Dismiss"}
