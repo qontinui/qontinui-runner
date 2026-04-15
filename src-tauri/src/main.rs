@@ -2045,17 +2045,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // ── Explicit shutdown ordering ──
-                // Take PythonBridge (via bridge manager) and ExtractionExecutor out
-                // of AppState and clean them up on a dedicated thread with its own
-                // runtime, so Drop never runs inside Tauri's async context.
-                let extraction = {
-                    if let Ok(mut guard) = app_state.extraction_executor.lock() {
-                        guard.take()
-                    } else {
-                        None
-                    }
-                };
-
                 let app_state_clone = app_state.inner().clone();
 
                 let shutdown_handle = std::thread::spawn(move || {
@@ -2081,10 +2070,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // Stop extraction executor (synchronous — owns its own runtime)
-                    if let Some(mut ee) = extraction {
-                        info!("Stopping extraction executor on shutdown thread");
-                        let _ = ee.stop();
+                    // Stop the extraction executor. Safe to call here now that it no longer
+                    // owns an Arc<tokio::runtime::Runtime> — stop_internal() is pure
+                    // synchronous Python-subprocess teardown.
+                    if let Ok(mut guard) = app_state_clone.extraction_executor.lock() {
+                        if let Some(mut ee) = guard.take() {
+                            info!("Stopping extraction executor");
+                            let _ = ee.stop();
+                        }
                     }
                 });
 

@@ -72,23 +72,16 @@ pub struct ExtractionExecutor {
 
     /// Tauri app handle for emitting events
     app_handle: tauri::AppHandle,
-
-    /// Runtime for async tasks
-    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl ExtractionExecutor {
     pub fn new(app_handle: tauri::AppHandle) -> Self {
-        let runtime =
-            Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
-
-        Self {
+Self {
             process: None,
             process_manager: ProcessManager::new_for_extraction(app_handle.clone()),
             protocol_handler: ProtocolHandler::new(),
             lifecycle: Arc::new(RwLock::new(ExecutorLifecycle::new())),
             app_handle,
-            runtime,
         }
     }
 
@@ -120,14 +113,13 @@ impl ExtractionExecutor {
         // Clone shared state for tasks
         let lifecycle = Arc::clone(&self.lifecycle);
         let app_handle = self.app_handle.clone();
-        let runtime = Arc::clone(&self.runtime);
 
         // Spawn stdout reader task using output processor
         let lifecycle_stdout = Arc::clone(&lifecycle);
         let app_handle_stdout = app_handle.clone();
 
         std::thread::spawn(move || {
-            runtime.block_on(async {
+            tauri::async_runtime::block_on(async {
                 OutputProcessor::extraction_stdout_reader_task(
                     stdout,
                     lifecycle_stdout,
@@ -144,9 +136,8 @@ impl ExtractionExecutor {
         });
 
         // Spawn command sender task using protocol handler
-        let runtime_cmd = Arc::clone(&self.runtime);
         std::thread::spawn(move || {
-            runtime_cmd.block_on(async {
+            tauri::async_runtime::block_on(async {
                 ProtocolHandler::command_sender_task(stdin, cmd_rx).await;
             });
         });
@@ -157,9 +148,9 @@ impl ExtractionExecutor {
         info!("Extraction executor started, will process READY signal asynchronously");
 
         // Drain any queued events
-        let queued_events = self
-            .runtime
-            .block_on(async { self.lifecycle.read().await.drain_queued_events().await });
+        let queued_events = tauri::async_runtime::block_on(async {
+            self.lifecycle.read().await.drain_queued_events().await
+        });
 
         for queued in queued_events {
             info!(
@@ -191,12 +182,11 @@ impl ExtractionExecutor {
 
         // Initiate shutdown — use a dedicated thread if we are already inside a
         // tokio runtime to avoid nested block_on panic.
-        let runtime = Arc::clone(&self.runtime);
         let lifecycle = Arc::clone(&self.lifecycle);
         let protocol_handler_sender = self.protocol_handler.get_sender();
 
         let do_async_cleanup = move || {
-            runtime.block_on(async {
+            tauri::async_runtime::block_on(async {
                 let lc = lifecycle.read().await;
                 let _ = lc.shutdown().await;
 
@@ -246,8 +236,7 @@ impl ExtractionExecutor {
         };
 
         if let Some(tx) = self.protocol_handler.get_sender() {
-            self.runtime
-                .block_on(async { tx.send(cmd).await })
+            tauri::async_runtime::block_on(async { tx.send(cmd).await })
                 .map_err(|e| format!("Failed to send command: {}", e))?;
             Ok(())
         } else {
@@ -279,7 +268,7 @@ impl ExtractionExecutor {
 
         // Register for response before sending command
         let lifecycle = Arc::clone(&self.lifecycle);
-        let response_rx = self.runtime.block_on(async {
+        let response_rx = tauri::async_runtime::block_on(async {
             let lifecycle_guard = lifecycle.read().await;
             lifecycle_guard
                 .register_command_response(cmd_id.clone())
@@ -287,14 +276,13 @@ impl ExtractionExecutor {
         });
 
         // Send the command
-        self.runtime
-            .block_on(async { tx.send(cmd).await })
+        tauri::async_runtime::block_on(async { tx.send(cmd).await })
             .map_err(|e| format!("Failed to send command: {}", e))?;
 
         debug!("Sent extraction command '{}' with ID: {}", command, cmd_id);
 
         // Wait for response with timeout
-        let result = self.runtime.block_on(async {
+        let result = tauri::async_runtime::block_on(async {
             match timeout(timeout_duration, response_rx).await {
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(_)) => Err("Response channel closed unexpectedly".to_string()),
@@ -311,7 +299,7 @@ impl ExtractionExecutor {
     /// Checks if the extraction executor is running (internal implementation).
     fn is_running_internal(&self) -> bool {
         debug!("[EXTRACTION_EXECUTOR] is_running_internal() called");
-        let result = self.runtime.block_on(async {
+        let result = tauri::async_runtime::block_on(async {
             let state = self.lifecycle.read().await.get_state().await;
             state.can_accept_commands()
         });
@@ -323,8 +311,9 @@ impl ExtractionExecutor {
     }
 
     pub fn get_state(&self) -> ExecutorState {
-        self.runtime
-            .block_on(async { self.lifecycle.read().await.get_state().await })
+        tauri::async_runtime::block_on(async {
+            self.lifecycle.read().await.get_state().await
+        })
     }
 
     /// Start extraction executor on-demand if not already running.
@@ -343,7 +332,7 @@ impl ExtractionExecutor {
         if needs_start {
             // Reset lifecycle to Initializing so the new process can transition to Ready
             let lifecycle = Arc::clone(&self.lifecycle);
-            let reset_result = self.runtime.block_on(async {
+            let reset_result = tauri::async_runtime::block_on(async {
                 let lc = lifecycle.read().await;
                 lc.set_state(crate::executor::state::ExecutorState::Initializing {
                     started_at: std::time::SystemTime::now()

@@ -41,9 +41,6 @@ pub struct PythonBridge {
     /// Typed event emitter for frontend communication
     emitter: EventEmitter,
 
-    /// Runtime for async tasks
-    runtime: Arc<tokio::runtime::Runtime>,
-
     /// Headless event channel (only used when in headless mode).
     /// Events go here instead of Tauri frontend emit.
     headless_events: Option<broadcast::Sender<serde_json::Value>>,
@@ -51,8 +48,6 @@ pub struct PythonBridge {
 
 impl PythonBridge {
     pub fn new(app_handle: tauri::AppHandle) -> Self {
-        let runtime =
-            Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
         let emitter = EventEmitter::new(app_handle.clone());
 
         Self {
@@ -63,7 +58,6 @@ impl PythonBridge {
             health_monitor: Arc::new(HealthMonitor::new()),
             app_handle,
             emitter,
-            runtime,
             headless_events: None,
         }
     }
@@ -73,8 +67,6 @@ impl PythonBridge {
     /// Headless mode disables GUI interactions (screen capture, mouse/keyboard).
     /// Multiple headless bridges can run in parallel.
     pub fn new_headless(app_handle: tauri::AppHandle) -> Self {
-        let runtime =
-            Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
         let emitter = EventEmitter::new(app_handle.clone());
 
         Self {
@@ -85,7 +77,6 @@ impl PythonBridge {
             health_monitor: Arc::new(HealthMonitor::new()),
             app_handle,
             emitter,
-            runtime,
             headless_events: None,
         }
     }
@@ -151,7 +142,6 @@ impl PythonBridge {
         let lifecycle = Arc::clone(&self.lifecycle);
         let health_monitor = Arc::clone(&self.health_monitor);
         let app_handle = self.app_handle.clone();
-        let runtime = Arc::clone(&self.runtime);
 
         // Spawn stdout reader task using output processor
         // Use headless reader if we have a headless event channel
@@ -164,7 +154,7 @@ impl PythonBridge {
             // Headless mode: send events to dedicated channel instead of Tauri frontend
             info!("Starting headless stdout reader task");
             std::thread::spawn(move || {
-                runtime.block_on(async {
+                tauri::async_runtime::block_on(async {
                     OutputProcessor::headless_stdout_reader_task(
                         stdout,
                         lifecycle_stdout,
@@ -178,7 +168,7 @@ impl PythonBridge {
         } else {
             // GUI mode: emit events to Tauri frontend
             std::thread::spawn(move || {
-                runtime.block_on(async {
+                tauri::async_runtime::block_on(async {
                     OutputProcessor::stdout_reader_task(
                         stdout,
                         lifecycle_stdout,
@@ -224,9 +214,8 @@ impl PythonBridge {
         });
 
         // Spawn command sender task using protocol handler
-        let runtime_cmd = Arc::clone(&self.runtime);
         std::thread::spawn(move || {
-            runtime_cmd.block_on(async {
+            tauri::async_runtime::block_on(async {
                 ProtocolHandler::command_sender_task(stdin, cmd_rx).await;
             });
         });
@@ -246,9 +235,8 @@ impl PythonBridge {
         let cmd_tx_health = cmd_tx.clone();
         let (ping_tx, mut ping_rx) = mpsc::channel::<()>(10);
 
-        let runtime_health = Arc::clone(&self.runtime);
         std::thread::spawn(move || {
-            runtime_health.block_on(async {
+            tauri::async_runtime::block_on(async {
                 let task = HealthCheckTask::new(health_monitor_task, ping_tx);
                 if let Err(e) = task.run().await {
                     error!("Health check task error: {}", e);
@@ -257,9 +245,8 @@ impl PythonBridge {
         });
 
         // Spawn task to send ping commands
-        let runtime_ping = Arc::clone(&self.runtime);
         std::thread::spawn(move || {
-            runtime_ping.block_on(async {
+            tauri::async_runtime::block_on(async {
                 while let Some(()) = ping_rx.recv().await {
                     let ping_cmd = ExecutorCommand {
                         cmd_type: "command".to_string(),
@@ -360,14 +347,13 @@ impl PythonBridge {
         info!("Stopping Python executor (sync)");
 
         // Run async cleanup in a dedicated thread to avoid nested runtime issues
-        let runtime = Arc::clone(&self.runtime);
         let health_monitor = Arc::clone(&self.health_monitor);
         let lifecycle = Arc::clone(&self.lifecycle);
         let protocol_handler_sender = self.protocol_handler.get_sender();
 
         let cleanup_handle = std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.block_on(async {
+                tauri::async_runtime::block_on(async {
                     // Stop health monitoring
                     health_monitor.stop().await;
 
@@ -447,8 +433,7 @@ impl PythonBridge {
         };
 
         if let Some(tx) = self.protocol_handler.get_sender() {
-            self.runtime
-                .block_on(async { tx.send(cmd).await })
+            tauri::async_runtime::block_on(async { tx.send(cmd).await })
                 .map_err(|e| format!("Failed to send command: {}", e))?;
             Ok(())
         } else {
@@ -517,8 +502,7 @@ impl PythonBridge {
                     "settings": settings
                 })),
             };
-            self.runtime
-                .block_on(async { tx.send(cmd).await })
+            tauri::async_runtime::block_on(async { tx.send(cmd).await })
                 .map_err(|e| format!("Failed to send command: {}", e))?;
             Ok(())
         } else {
@@ -599,7 +583,7 @@ impl PythonBridge {
     /// `is_running_async()` instead.
     pub fn is_running(&self) -> bool {
         debug!("[PYTHON_BRIDGE] is_running() called");
-        let result = self.runtime.block_on(async {
+        let result = tauri::async_runtime::block_on(async {
             debug!("[PYTHON_BRIDGE] is_running() - getting lifecycle read lock");
             let state = self.lifecycle.read().await.get_state().await;
             debug!("[PYTHON_BRIDGE] is_running() - got state: {}", state.name());
@@ -673,7 +657,7 @@ impl PythonBridge {
 
         // Register for response before sending command
         let lifecycle = Arc::clone(&self.lifecycle);
-        let response_rx = self.runtime.block_on(async {
+        let response_rx = tauri::async_runtime::block_on(async {
             let lifecycle_guard = lifecycle.read().await;
             lifecycle_guard
                 .register_command_response(cmd_id.clone())
@@ -681,14 +665,13 @@ impl PythonBridge {
         });
 
         // Send the command
-        self.runtime
-            .block_on(async { tx.send(cmd).await })
+        tauri::async_runtime::block_on(async { tx.send(cmd).await })
             .map_err(|e| format!("Failed to send command: {}", e))?;
 
         debug!("Sent command '{}' with ID: {}", command, cmd_id);
 
         // Wait for response with timeout
-        let result = self.runtime.block_on(async {
+        let result = tauri::async_runtime::block_on(async {
             match timeout(timeout_duration, response_rx).await {
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(_)) => Err("Response channel closed unexpectedly".to_string()),
@@ -709,9 +692,9 @@ impl PythonBridge {
     /// `get_state_async()` instead.
     pub fn get_state(&self) -> ExecutorState {
         debug!("[PYTHON_BRIDGE] get_state() called");
-        let state = self
-            .runtime
-            .block_on(async { self.lifecycle.read().await.get_state().await });
+        let state = tauri::async_runtime::block_on(async {
+            self.lifecycle.read().await.get_state().await
+        });
         debug!("[PYTHON_BRIDGE] get_state() returning: {}", state.name());
         state
     }
