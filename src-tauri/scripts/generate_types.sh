@@ -89,6 +89,10 @@ if [ "$PY_ONLY" = false ]; then
         echo "WARNING: npx not found. Skipping TypeScript generation."
         echo "  Install Node.js and run: npm install -g json-schema-to-typescript"
     else
+        # Clean stale .d.ts files so removed types don't linger after regeneration.
+        # Mirrors the Python-side `rm -f "$PER_TYPE_DIR"/*.py` cleanup.
+        rm -f "$TS_OUT_DIR"/*.d.ts
+
         # Extract each schema and generate individual .d.ts files
         TYPES=$(cargo run --bin export_schemas --release -- --list)
         SCHEMAS_JSON_NATIVE="$(to_native_path "$SCHEMAS_JSON")"
