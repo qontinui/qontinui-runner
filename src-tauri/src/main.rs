@@ -2207,22 +2207,47 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     crate::trigger_system::stop_trigger_service().await;
                 });
 
-                // ── Force-exit watchdog ──
+                // ── Explicit exit request ──
                 //
-                // After this handler returns Tauri is supposed to close the
-                // window and drain the event loop, but we've observed cases
-                // where a prior panic (e.g. the tokio "Cannot drop a runtime
-                // in a context where blocking is not allowed" crash at
-                // startup) leaves the runtime in a half-dead state — all our
-                // cleanup runs, but Tauri never actually terminates. From
-                // the user's perspective the X button does nothing.
+                // Tauri's automatic "last-window-closed → exit" chain breaks
+                // in this app:
+                //   - WebView2's destroy on Windows sometimes hangs (see the
+                //     `Failed to unregister class Chrome_WidgetWin_0` error
+                //     that surfaces when the process is force-killed later).
+                //   - Long-lived `tauri::async_runtime::spawn` tasks (mDNS
+                //     scanner, workflow event bus, instance manager, backend
+                //     relay poll, AI-settings checker) never complete, so
+                //     Tauri's runtime shutdown has no clean point to drain.
                 //
-                // Spawn a detached OS thread that waits a few seconds and
-                // then calls `std::process::exit` unconditionally. If Tauri
-                // exits cleanly first, the thread is killed with the process
-                // and the force-exit is never reached. Otherwise the user
-                // gets a bounded close time instead of a zombie window.
-                const FORCE_EXIT_GRACE_SECS: u64 = 5;
+                // Calling `app_handle.exit(0)` explicitly bypasses the
+                // window-destruction path and fires `RunEvent::ExitRequested`
+                // directly. Tauri then aborts the runtime and returns from
+                // `app.run`, and the process exits as soon as `main()`
+                // returns. This is the polite, ordered shutdown path.
+                let exit_handle = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // Let the other spawned cleanup tasks run their first
+                    // tick before we pull the rug out — in practice they
+                    // all complete within ~500ms of the handler returning.
+                    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+                    info!("Requesting Tauri app exit");
+                    exit_handle.exit(0);
+                });
+
+                // ── Force-exit watchdog (safety net) ──
+                //
+                // Even with the explicit `app_handle.exit(0)` above, Tauri's
+                // event loop can still stall if WebView2 or a tao internal
+                // handler is blocked. This detached OS thread is the last
+                // line of defense: after a short grace period it calls
+                // `std::process::exit(0)` unconditionally. If Tauri exits
+                // cleanly first, the thread is killed with the process and
+                // the force-exit is never reached.
+                //
+                // Grace is short (3s) because our cleanup completes in
+                // ~1.2s and `app_handle.exit(0)` is scheduled for 1.5s.
+                // Anything past 3s is definitely stalled.
+                const FORCE_EXIT_GRACE_SECS: u64 = 3;
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(
                         FORCE_EXIT_GRACE_SECS,
