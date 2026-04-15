@@ -58,6 +58,56 @@ use tracing::{info, warn};
 // Types extracted to executor_types.rs (re-exported via mod.rs)
 use super::executor_types::*;
 
+// ============================================================================
+// Typed dispatch helpers — Session 2a
+// ============================================================================
+
+/// Serialize `ExecutionStepConfig` → `serde_json::Value` → `FullRunnerStep`.
+///
+/// `ExecutionStepConfig` carries `step_type` serialized as `"type"` (via
+/// `#[serde(rename = "type")]`), which is exactly the tag field that
+/// `FullRunnerStep`'s `#[serde(tag = "type")]` expects.  The intermediate
+/// `Value` therefore has the right shape for the `from_value` call.
+fn to_full_runner_step(
+    step: &ExecutionStepConfig,
+) -> Result<qontinui_types::workflow_step::FullRunnerStep, String> {
+    let value = serde_json::to_value(step)
+        .map_err(|e| format!("failed to serialize ExecutionStepConfig: {e}"))?;
+    serde_json::from_value(value).map_err(|e| {
+        format!(
+            "failed to parse step as FullRunnerStep (type={:?}): {e}",
+            step.step_type
+        )
+    })
+}
+
+/// Exhaustive map from `FullRunnerStep` variant → handler-registry lookup key.
+///
+/// Adding a new `FullRunnerStep` variant **without** updating this match
+/// produces a compile error — that is the entire point of this function.
+/// No wildcard arm is allowed here.
+fn handler_lookup_key(step: &qontinui_types::workflow_step::FullRunnerStep) -> &'static str {
+    use qontinui_types::workflow_step::FullRunnerStep;
+    match step {
+        FullRunnerStep::Command(_) => "command",
+        FullRunnerStep::Prompt(_) => "prompt",
+        FullRunnerStep::UiBridge(_) => "ui_bridge",
+        FullRunnerStep::Workflow(_) => "workflow",
+        FullRunnerStep::CodeExecution(_) => "code_execution",
+        FullRunnerStep::ExecutePlaybook(_) => "execute_playbook",
+        FullRunnerStep::NativeAccessibility(_) => "native_accessibility",
+        FullRunnerStep::RestartProcess(_) => "restart_process",
+        FullRunnerStep::SaveWorkflowArtifact(_) => "save_workflow_artifact",
+        FullRunnerStep::WorkflowFixup(_) => "workflow_fixup",
+        FullRunnerStep::UiBridgeDesignAudit(_) => "ui_bridge_design_audit",
+        FullRunnerStep::UiBridgeVisualAssertion(_) => "ui_bridge_visual_assertion",
+        FullRunnerStep::WorkflowRef(_) => "workflow_ref",
+        FullRunnerStep::DagCancel(_) => "dag_cancel",
+        FullRunnerStep::DagApproval(_) => "dag_approval",
+        FullRunnerStep::DagLoop(_) => "dag_loop",
+    }
+}
+
 // Imports from extracted modules
 
 // Legacy step handlers extracted to legacy_steps.rs
@@ -1232,16 +1282,34 @@ impl StepExecutor {
         Option<String>,
         Option<serde_json::Value>,
     ) {
-        // Try to use the handler registry for polymorphic dispatch.
-        // This is the new modular approach - handlers are self-contained and testable.
-        // If no handler is registered, fall back to the legacy match statement below.
-        // Normalize "test" → "command" for backward compatibility with saved workflows
-        let lookup_type = if step.step_type == "test" {
-            "command"
+        // Typed dispatch boundary (Session 2a).
+        //
+        // "test" is a backward-compat alias that predates the typed enum; it
+        // maps to the command handler at the string layer because there is no
+        // `FullRunnerStep::Test` variant.  All other types go through the
+        // exhaustive `handler_lookup_key` match so the compiler catches any
+        // new variant that hasn't been wired up.
+        let lookup_type: String = if step.step_type == "test" {
+            "command".to_string()
         } else {
-            &step.step_type
+            match to_full_runner_step(step) {
+                Ok(typed) => handler_lookup_key(&typed).to_string(),
+                Err(e) => {
+                    // Unknown or non-canonical step type (e.g. a custom type
+                    // added without updating FullRunnerStep, or a legacy saved
+                    // workflow).  Log a warning and fall through to the legacy
+                    // string-key dispatch path.  Session 2b will decide whether
+                    // to harden this into a hard error.
+                    warn!(
+                        "Step type {:?} did not match any FullRunnerStep variant \
+                         ({}); falling back to string-key dispatch",
+                        step.step_type, e
+                    );
+                    step.step_type.clone()
+                }
+            }
         };
-        if let Some(handler) = self.handler_registry.get(lookup_type) {
+        if let Some(handler) = self.handler_registry.get(lookup_type.as_str()) {
             let context = self.create_handler_context().await;
             let result = handler.execute(step, &context).await;
             return (
@@ -1805,5 +1873,154 @@ mod tests {
         let layers = compute_execution_layers(&steps).unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0], vec![0]);
+    }
+
+    // ========================================================================
+    // Session 2a: typed dispatch boundary tests
+    // ========================================================================
+
+    /// `handler_lookup_key` must return the right string for every one of the
+    /// 16 `FullRunnerStep` variants.  This test is the compile-time coverage
+    /// check: if someone adds a 17th variant without updating `handler_lookup_key`
+    /// the match in that function will fail to compile, not just fail at runtime.
+    #[test]
+    fn test_handler_lookup_key_all_variants() {
+        use qontinui_types::workflow_step::*;
+
+        // Helper to build a minimal BaseStepFields
+        let base = || BaseStepFields::default();
+
+        let cases: &[(&str, qontinui_types::workflow_step::FullRunnerStep)] = &[
+            ("command",                  FullRunnerStep::Command(CommandStep::default())),
+            ("prompt",                   FullRunnerStep::Prompt(PromptStep::default())),
+            ("ui_bridge",                FullRunnerStep::UiBridge(UiBridgeStep::default())),
+            ("workflow",                 FullRunnerStep::Workflow(WorkflowStep::default())),
+            ("code_execution",           FullRunnerStep::CodeExecution(CodeExecutionStep::default())),
+            ("execute_playbook",         FullRunnerStep::ExecutePlaybook(ExecutePlaybookStep::default())),
+            ("native_accessibility",     FullRunnerStep::NativeAccessibility(NativeAccessibilityStep::default())),
+            ("restart_process",          FullRunnerStep::RestartProcess(RestartProcessStep::default())),
+            ("save_workflow_artifact",   FullRunnerStep::SaveWorkflowArtifact(SaveWorkflowArtifactStep::default())),
+            ("workflow_fixup",           FullRunnerStep::WorkflowFixup(WorkflowFixupStep::default())),
+            ("ui_bridge_design_audit",   FullRunnerStep::UiBridgeDesignAudit(UiBridgeDesignAuditStep::default())),
+            ("ui_bridge_visual_assertion", FullRunnerStep::UiBridgeVisualAssertion(UiBridgeVisualAssertionStep::default())),
+            ("workflow_ref",             FullRunnerStep::WorkflowRef(WorkflowRefStep::default())),
+            ("dag_cancel",               FullRunnerStep::DagCancel(DagCancelStep::default())),
+            ("dag_approval",             FullRunnerStep::DagApproval(DagApprovalStep::default())),
+            ("dag_loop",                 FullRunnerStep::DagLoop(DagLoopStep::default())),
+        ];
+
+        // Exactly 16 variants — make sure we haven't accidentally skipped one.
+        assert_eq!(cases.len(), 16, "expected exactly 16 FullRunnerStep variants");
+
+        // Suppress unused-variable warning from the `base` helper when all
+        // cases use Default::default().
+        let _ = base();
+
+        for (expected_key, variant) in cases {
+            let actual = handler_lookup_key(variant);
+            assert_eq!(
+                actual, *expected_key,
+                "handler_lookup_key returned {:?} for variant that should map to {:?}",
+                actual, expected_key
+            );
+        }
+    }
+
+    /// Round-trip: `ExecutionStepConfig` → `to_full_runner_step` → `handler_lookup_key`
+    /// must yield the expected handler string for a representative set of types.
+    ///
+    /// The test builds `ExecutionStepConfig` values by deserializing from
+    /// carefully crafted JSON.  Only step types whose field names align between
+    /// `ExecutionStepConfig` and the target `FullRunnerStep` inner struct are
+    /// included here.
+    ///
+    /// Types excluded from this test and why:
+    ///
+    /// - `prompt`: `ExecutionStepConfig.prompt_content` serialises as
+    ///   `"promptContent"` but `PromptStep.content` expects `"content"` — the
+    ///   field rename causes a "missing field" error on the second hop.
+    ///
+    /// - `ui_bridge`: `ExecutionStepConfig.ui_bridge_action` serialises as
+    ///   `"ui_bridge_action"` but `UiBridgeStep.action` expects `"action"` —
+    ///   same class of mismatch.
+    ///
+    /// - `workflow`: `WorkflowStep.workflow_id` and `workflow_name` are
+    ///   required non-optional strings that have no corresponding aliases in
+    ///   `ExecutionStepConfig`.
+    ///
+    /// For those types the typed parse falls back to string-key dispatch (the
+    /// backward-compat path in `execute_single_step`), which is the correct
+    /// behaviour until Session 2b migrates individual handlers.
+    #[test]
+    fn test_to_full_runner_step_round_trip() {
+        // Each entry: (label, minimal JSON, expected handler key).
+        // Types that round-trip cleanly: command (phase aligns), dag_* (all-optional).
+        let cases: &[(&str, serde_json::Value, &str)] = &[
+            (
+                "command",
+                json!({"type": "command", "id": "s1", "name": "build", "phase": "setup"}),
+                "command",
+            ),
+            (
+                "dag_cancel",
+                json!({"type": "dag_cancel", "id": "s2", "name": "stop"}),
+                "dag_cancel",
+            ),
+            (
+                "dag_approval",
+                json!({"type": "dag_approval", "id": "s3", "name": "wait"}),
+                "dag_approval",
+            ),
+        ];
+
+        for (label, raw_json, expected_key) in cases {
+            let step: ExecutionStepConfig = serde_json::from_value(raw_json.clone())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to deserialize ExecutionStepConfig for {:?}: {}",
+                        label, e
+                    )
+                });
+            let typed = to_full_runner_step(&step)
+                .unwrap_or_else(|e| panic!("to_full_runner_step failed for {:?}: {}", label, e));
+            let key = handler_lookup_key(&typed);
+            assert_eq!(
+                key, *expected_key,
+                "round-trip key mismatch for step type {:?}",
+                label
+            );
+        }
+    }
+
+    /// Unknown step types must return an `Err` from `to_full_runner_step` so
+    /// the dispatch path can fall through to string-key dispatch.
+    #[test]
+    fn test_to_full_runner_step_unknown_returns_err() {
+        let step = ExecutionStepConfig {
+            step_type: "totally_unknown_custom_type".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            to_full_runner_step(&step).is_err(),
+            "expected Err for unknown step type, but got Ok"
+        );
+    }
+
+    /// The "test" step type must NOT be passed to `to_full_runner_step`; the
+    /// dispatch code normalizes it to "command" at the string layer before any
+    /// typed parse attempt.  Verify that "test" on its own does fail the typed
+    /// parse (confirming it has no FullRunnerStep variant).
+    #[test]
+    fn test_legacy_test_type_not_in_full_runner_step() {
+        let step = ExecutionStepConfig {
+            step_type: "test".to_string(),
+            ..Default::default()
+        };
+        // "test" is intentionally absent from FullRunnerStep; the dispatch
+        // code handles it before calling to_full_runner_step.
+        assert!(
+            to_full_runner_step(&step).is_err(),
+            "\"test\" should not be a FullRunnerStep variant; it is handled at the string layer"
+        );
     }
 }
