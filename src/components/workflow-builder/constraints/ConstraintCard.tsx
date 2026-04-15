@@ -11,9 +11,10 @@ import { ArrowUpCircle, ChevronDown, ChevronRight, Plus, Trash2, X } from "lucid
 import type {
   Constraint,
   ConstraintCheck,
-  ConstraintCheckType,
   ConstraintSeverity,
 } from "@qontinui/shared-types/constraints";
+
+type ConstraintCheckType = ConstraintCheck["type"];
 import {
   severityBadgeColor,
   severityLabel,
@@ -35,7 +36,7 @@ const inputClass =
 const selectClass =
   "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50 text-sm";
 
-const CHECK_TYPE_OPTIONS: { value: ConstraintCheckType; label: string }[] = [
+const CHECK_TYPE_OPTIONS: { value: ConstraintCheck["type"]; label: string }[] = [
   { value: "grep_forbidden", label: "Grep Forbidden" },
   { value: "grep_required", label: "Grep Required" },
   { value: "file_scope", label: "File Scope" },
@@ -49,7 +50,7 @@ const SEVERITY_OPTIONS: { value: ConstraintSeverity; label: string }[] = [
 ];
 
 /** Build a default check object for a given type. */
-function defaultCheck(type: ConstraintCheckType): ConstraintCheck {
+function defaultCheck(type: ConstraintCheck["type"]): ConstraintCheck {
   switch (type) {
     case "grep_forbidden":
       return { type: "grep_forbidden", pattern: "" };
@@ -59,6 +60,8 @@ function defaultCheck(type: ConstraintCheckType): ConstraintCheck {
       return { type: "file_scope", allowed_paths: ["src/"] };
     case "command":
       return { type: "command", cmd: "", timeout_secs: DEFAULT_COMMAND_TIMEOUT_SECS };
+    default:
+      return { type: "grep_forbidden", pattern: "" };
   }
 }
 
@@ -66,7 +69,7 @@ export function ConstraintCard({ constraint, onUpdate, onRemove, onPromote }: Co
   const [expanded, setExpanded] = useState(false);
   const isAi = isAiConstraint(constraint.id);
 
-  const handleCheckTypeChange = (newType: ConstraintCheckType) => {
+  const handleCheckTypeChange = (newType: ConstraintCheck["type"]) => {
     if (newType !== constraint.check.type) {
       onUpdate({ check: defaultCheck(newType) });
     }
@@ -211,7 +214,7 @@ export function ConstraintCard({ constraint, onUpdate, onRemove, onPromote }: Co
               <label className="block text-xs font-medium text-zinc-400 mb-1">Check Type</label>
               <select
                 value={constraint.check.type}
-                onChange={(e) => handleCheckTypeChange(e.target.value as ConstraintCheckType)}
+                onChange={(e) => handleCheckTypeChange(e.target.value as ConstraintCheck["type"])}
                 className={selectClass}
               >
                 {CHECK_TYPE_OPTIONS.map((opt) => (
@@ -285,7 +288,7 @@ function CheckEditor({
     case "file_scope":
       return (
         <FileScopeEditor
-          allowedPaths={check.allowed_paths}
+          allowedPaths={check.allowed_paths ?? []}
           onChange={(allowed_paths) => onChange({ ...check, allowed_paths })}
         />
       );

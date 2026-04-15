@@ -131,6 +131,8 @@ export function SchedulerTaskForm({
         return "prompt";
       case "AutoFix":
         return "autofix";
+      default:
+        return "workflow";
     }
   });
   const [workflowId, setWorkflowId] = useState(
@@ -175,7 +177,7 @@ export function SchedulerTaskForm({
     })),
   );
   const [timeoutMinutes, setTimeoutMinutes] = useState<number | undefined>(
-    initConditions?.timeout_minutes,
+    initConditions?.timeout_minutes ?? undefined,
   );
 
   // Auto-enable conditions when Condition schedule type is selected

@@ -136,7 +136,7 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
       ]);
 
       setConstraints(activeConstraints);
-      setConfigPath(config.path);
+      setConfigPath(config.path ?? undefined);
 
       // Parse resource limits from the raw TOML if available.
       // The active constraints endpoint returns merged constraints but not
@@ -223,14 +223,14 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
       // Validate first
       const validation = await validateConstraintConfig(toml);
       if (!validation.valid) {
-        setError(validation.errors.join("; "));
+        setError((validation.errors ?? []).join("; "));
         return false;
       }
 
       // Save
       const result = await saveConstraintConfig(toml, projectPath);
       if (!result.valid) {
-        setError(result.errors.join("; "));
+        setError((result.errors ?? []).join("; "));
         return false;
       }
 

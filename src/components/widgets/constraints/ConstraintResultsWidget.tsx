@@ -119,7 +119,8 @@ function ViolationRow({ violation }: { violation: ConstraintViolation }) {
  */
 function ConstraintRow({ result }: { result: ConstraintResult }) {
   const [expanded, setExpanded] = useState(false);
-  const hasViolations = result.violations.length > 0;
+  const violations = result.violations ?? [];
+  const hasViolations = violations.length > 0;
   const severityColors = getSeverityColors(result.severity);
 
   return (
@@ -177,7 +178,7 @@ function ConstraintRow({ result }: { result: ConstraintResult }) {
         {/* Violation count */}
         {hasViolations && (
           <span className="text-[10px] text-zinc-500">
-            {result.violations.length} violation{result.violations.length !== 1 ? "s" : ""}
+            {violations.length} violation{violations.length !== 1 ? "s" : ""}
           </span>
         )}
       </button>
@@ -187,7 +188,7 @@ function ConstraintRow({ result }: { result: ConstraintResult }) {
         <div
           className={cn("ml-8 mr-3 mb-1 rounded border", severityColors.bg, severityColors.border)}
         >
-          {result.violations.map((v, idx) => (
+          {violations.map((v, idx) => (
             <ViolationRow key={`${v.file ?? ""}-${idx}`} violation={v} />
           ))}
         </div>
