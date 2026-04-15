@@ -297,7 +297,7 @@ export function SchedulerTaskForm({
       case "condition":
         return {
           type: "Condition",
-          value: { rearm_delay_minutes: rearmDelay || undefined },
+          value: { rearm_delay_minutes: rearmDelay ?? 0 },
         };
     }
   };

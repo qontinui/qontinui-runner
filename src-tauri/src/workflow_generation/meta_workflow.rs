@@ -551,6 +551,41 @@ fn build_builder_prompt(
         ));
     }
 
+    // If the Additional Context embeds a Spec Generation Brief, inject
+    // explicit recognition/consumption rules so the Builder emits batched
+    // snapshot_assert steps, preconditions, and semantic prompts correctly.
+    if resolved_contexts.contains("Spec Generation Brief") {
+        prompt.push_str(
+            r#"
+## Spec Generation Brief Recognition
+
+If the Additional Context contains a block labeled "Spec Generation Brief (JSON)", parse it and follow these rules strictly:
+
+1. **Navigate first.** If the brief has a `pageUrl`, emit a setup step that navigates to it.
+2. **Preconditions become setup steps.** For each group in `groups[]`, emit one setup step per entry in `preconditions[]` before that group's verification steps. Each precondition describes a required UI state (e.g., "Findings panel is open"); the setup step should click the button or trigger the action that achieves that state. Infer the selector from the assertion descriptions in the group if it is not explicit.
+3. **Deterministic assertions become batched snapshot_assert steps.** For each group, emit ONE `ui_bridge` step with `ui_bridge_action: "snapshot_assert"` whose `ui_bridge_target` is a JSON-stringified array of the group's `deterministicAssertions[]`. Each array element must have the shape `{id, description, severity, assertionType, criteria, expected?, relatedCriteria?, minGap?}`. Use `ui_bridge_snapshot_target` = the brief's `elementSource` ("control" or "external", mapped via `external -> "sdk"`).
+4. **Semantic assertions become prompt or agentic steps.** Each group's `semanticAssertions[]` should become one or more `prompt` steps with a `content` field that includes the assertion descriptions. These may navigate and inspect the UI via the UI Bridge tools.
+5. **Always bias toward determinism.** When an assertion could be either deterministic or semantic, prefer the deterministic form (snapshot_assert).
+
+### Canonical snapshot_assert Step Example
+
+```json
+{
+  "id": "<uuid>",
+  "type": "ui_bridge",
+  "phase": "verification",
+  "name": "<group name>",
+  "ui_bridge_action": "snapshot_assert",
+  "ui_bridge_target": "[{\"id\":\"<assertion-id>\",\"description\":\"...\",\"severity\":\"critical\",\"assertionType\":\"exists\",\"criteria\":{\"role\":\"button\",\"textContent\":\"+\"}}, ...]",
+  "ui_bridge_snapshot_target": "control"
+}
+```
+
+Notice `ui_bridge_target` is a STRING containing JSON — NOT an object. The `ExecutionStepConfig` deserializer on the Rust side expects it in that form.
+"#,
+        );
+    }
+
     // Add custom template if provided
     if let Some(template) = custom_template {
         prompt.push_str(&format!("\n## Custom Instructions\n\n{}\n", template));

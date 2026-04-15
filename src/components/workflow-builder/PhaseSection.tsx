@@ -59,7 +59,9 @@ export function PhaseSection({
       onBatchDelete={(ids) => ids.forEach((id) => removeStep(id, phase))}
       renderStepList={(stepsToRender, isSelectionMode, selectedIds, onToggleSelect) => (
         <div className="space-y-2">
-          {stepsToRender.map((step, index) => (
+          {/* workflow-ui's wire `UnifiedStep` includes an open `Other` variant;
+              runner-produced steps are always canonical, so narrow here. */}
+          {(stepsToRender as UnifiedStep[]).map((step, index) => (
             <div key={step.id}>
               {renderStep(step, index, isSelectionMode, selectedIds.has(step.id), () =>
                 onToggleSelect(step.id),

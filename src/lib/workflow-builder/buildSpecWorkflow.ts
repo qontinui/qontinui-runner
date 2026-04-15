@@ -19,6 +19,7 @@
 import type { UnifiedWorkflow, PromptStep, VerificationStep } from "../../types/unified-workflow";
 import type { KnownIssue } from "@qontinui/shared-types";
 import { createSummaryStep } from "../../types/unified-workflow";
+import { DEFAULT_WORKFLOW_FLAGS } from "./workflowDefaults";
 
 // Re-export SpecConfig type shape for consumers that don't import ui-bridge directly
 export interface SpecAssertion {
@@ -108,7 +109,7 @@ const DETERMINISTIC_TYPES = new Set(["exists", "contains", "visible", "not_exist
 const SPATIAL_TYPES = new Set(["noOverlap", "minSpacing"]);
 
 /** Check if an assertion can be evaluated deterministically (no AI needed). */
-function isDeterministic(assertion: SpecAssertion): boolean {
+export function isDeterministic(assertion: SpecAssertion): boolean {
   const aType = assertion.assertionType || "exists";
   if (SPATIAL_TYPES.has(aType)) {
     return assertion.target?.criteria != null && assertion.relatedTarget?.criteria != null;
@@ -406,5 +407,6 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     tags: ["spec", "auto-generated", "live-page"],
     created_at: now,
     modified_at: now,
+    ...DEFAULT_WORKFLOW_FLAGS,
   };
 }

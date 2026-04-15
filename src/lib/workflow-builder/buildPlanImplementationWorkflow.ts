@@ -20,6 +20,7 @@ import type {
 import { createSummaryStep } from "../../types/unified-workflow";
 import { buildVerificationStep } from "./buildPlanWorkflow";
 import type { PlanPhase } from "./buildPlanWorkflow";
+import { DEFAULT_STAGE_FLAGS, DEFAULT_WORKFLOW_FLAGS } from "./workflowDefaults";
 
 // =============================================================================
 // Input Types
@@ -233,6 +234,7 @@ function buildImplementStage(
     agentic_steps: agenticSteps,
     completion_steps: [],
     max_iterations: maxIterations,
+    ...DEFAULT_STAGE_FLAGS,
   };
 }
 
@@ -262,6 +264,7 @@ function buildReviewStage(
     agentic_steps: agenticSteps,
     completion_steps: [],
     max_iterations: maxIterations,
+    ...DEFAULT_STAGE_FLAGS,
   };
 }
 
@@ -291,6 +294,7 @@ function buildNextStepsStage(
     agentic_steps: agenticSteps,
     completion_steps: [],
     max_iterations: maxIterations,
+    ...DEFAULT_STAGE_FLAGS,
   };
 }
 
@@ -382,6 +386,7 @@ export function buildPlanImplementationWorkflow(
       agentic_steps: manualTestAgenticSteps,
       completion_steps: [],
       max_iterations: 3,
+      ...DEFAULT_STAGE_FLAGS,
     });
   }
 
@@ -406,6 +411,7 @@ export function buildPlanImplementationWorkflow(
       agentic_steps: [],
       completion_steps: commitCompletionSteps,
       max_iterations: 1,
+      ...DEFAULT_STAGE_FLAGS,
     });
   }
 
@@ -434,5 +440,6 @@ export function buildPlanImplementationWorkflow(
     tags: ["plan", "auto-generated", "multi-stage", "implementation"],
     created_at: now,
     modified_at: now,
+    ...DEFAULT_WORKFLOW_FLAGS,
   };
 }

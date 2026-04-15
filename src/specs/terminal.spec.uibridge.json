@@ -1056,8 +1056,8 @@
             "label": "Script parse output"
           },
           "source": "ai-generated",
-          "reviewed": false,
-          "enabled": true
+          "reviewed": true,
+          "enabled": false
         },
         {
           "id": "term-plan-cli-execute",
@@ -1073,8 +1073,8 @@
             "label": "Execute inline endpoint"
           },
           "source": "ai-generated",
-          "reviewed": false,
-          "enabled": true
+          "reviewed": true,
+          "enabled": false
         },
         {
           "id": "term-plan-cli-follow",
@@ -1090,8 +1090,8 @@
             "label": "Follow mode output"
           },
           "source": "ai-generated",
-          "reviewed": false,
-          "enabled": true
+          "reviewed": true,
+          "enabled": false
         }
       ],
       "source": "ai-generated"
@@ -1494,7 +1494,7 @@
     "createdAt": "2026-03-05T00:00:00.000Z",
     "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/terminal",
-    "elementSource": "sdk",
+    "elementSource": "control",
     "tags": [
       "terminal",
       "pty",

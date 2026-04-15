@@ -1,9 +1,10 @@
 /**
  * Unified Workflow Types
  *
- * Data types are imported from the canonical @qontinui/schemas package.
- * UI constants (STEP_TYPES, PHASE_INFO, etc.) and feature detection types
- * are re-exported from @qontinui/shared-types.
+ * All workflow data types and UI constants come from @qontinui/shared-types,
+ * which is the canonical Rust-generated package (schemars → JSON Schema →
+ * json-schema-to-typescript, bundled with tsup).
+ *
  * Utility functions are re-exported from @qontinui/workflow-utils.
  *
  * Execution Order:
@@ -11,7 +12,7 @@
  */
 
 // =============================================================================
-// Data types from canonical schema package
+// Data types, UI constants, and feature detection — single source of truth
 // =============================================================================
 
 export {
@@ -30,7 +31,6 @@ export {
   type PromptStep,
   type UiBridgeStep,
   type StepTypeName,
-  type UnifiedStep,
   type WorkflowStep,
   type SetupStep,
   type VerificationStep,
@@ -43,19 +43,22 @@ export {
   type ModelOverrides,
   type WorkflowExport,
   type WorkflowImportResult,
-} from "@qontinui/schemas/unified_workflow";
-
-// =============================================================================
-// Types and constants from shared-types package
-// =============================================================================
-
-export {
   type WorkflowFeatures,
   type StepTypeInfo,
   STEP_TYPES,
   PHASE_INFO,
   DEFAULT_SUMMARY_PROMPT,
 } from "@qontinui/shared-types/workflow";
+
+// Runner UI treats workflow steps as strictly-canonical values — every
+// consumer narrows by the `type` discriminator and reads typed fields. The
+// wire contract's `UnifiedStep = CanonicalStep | { [k: string]: unknown }`
+// preserves lossless round-trip of unknown step shapes, but that `Other`
+// variant defeats field-level type inference at every consumer site. Alias
+// the runner's `UnifiedStep` to `CanonicalStep` so the UI keeps its strict
+// view. The wire-typed variant from `@qontinui/shared-types/workflow`
+// still exists for code that needs to round-trip unknown shapes.
+export type { CanonicalStep as UnifiedStep } from "@qontinui/shared-types/workflow";
 
 // =============================================================================
 // Utility functions from workflow-utils package

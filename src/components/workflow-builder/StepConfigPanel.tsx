@@ -12,11 +12,13 @@ import {
 
 function findStepPhase(
   stepId: string,
+  // Wire-side step arrays (UnifiedStep) carry an open `Other` variant whose
+  // `id` is typed `unknown`; widen the predicate shape here.
   workflow: {
-    setup_steps: { id: string }[];
-    verification_steps: { id: string }[];
-    agentic_steps: { id: string }[];
-    completion_steps?: { id: string }[];
+    setup_steps: ReadonlyArray<{ id?: unknown }>;
+    verification_steps: ReadonlyArray<{ id?: unknown }>;
+    agentic_steps: ReadonlyArray<{ id?: unknown }>;
+    completion_steps?: ReadonlyArray<{ id?: unknown }>;
   },
 ): WorkflowPhase | null {
   if (workflow.setup_steps.some((s) => s.id === stepId)) return "setup";
@@ -80,12 +82,14 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
     }
   })();
 
+  // Wire-side UnifiedStep arrays include an open `Other` variant; narrow to
+  // the runner-strict form so DataFlowSection can read `id`/`name`.
   const allSteps = [
     ...state.workflow.setup_steps,
     ...state.workflow.verification_steps,
     ...state.workflow.agentic_steps,
     ...(state.workflow.completion_steps || []),
-  ];
+  ] as UnifiedStep[];
 
   return (
     <div className="h-full flex flex-col bg-zinc-850 border-l border-zinc-700">
@@ -110,7 +114,12 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
             <span className="text-xs text-zinc-400">
               From skill:{" "}
               <span className="text-zinc-300 font-medium">
-                {selectedStep.skill_origin.skill_slug}
+                {/* skill_origin is typed as an opaque map on the wire, but
+                    all runner-produced origins include `skill_slug`. */}
+                {String(
+                  (selectedStep.skill_origin as { skill_slug?: string } | undefined)?.skill_slug ??
+                    "",
+                )}
               </span>
             </span>
             <button

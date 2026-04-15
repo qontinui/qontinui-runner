@@ -15,6 +15,7 @@ import type {
   PromptStep,
 } from "../types/unified-workflow";
 import { generateStepId, createSummaryStep } from "../types/unified-workflow";
+import { DEFAULT_WORKFLOW_FLAGS } from "../lib/workflow-builder/workflowDefaults";
 
 // =============================================================================
 // Types from loaded configuration
@@ -205,6 +206,7 @@ class WorkflowGeneratorServiceClass {
       tags: ["auto-generated", "state-machine"],
       created_at: now,
       modified_at: now,
+      ...DEFAULT_WORKFLOW_FLAGS,
     };
   }
 

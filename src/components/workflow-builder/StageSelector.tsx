@@ -306,12 +306,14 @@ function StageSettings({
   stage,
   onUpdate,
 }: {
+  // Accept the WorkflowStage shape (nullable provider/model/max_iterations)
+  // directly so the caller doesn't need to re-map.
   stage: {
     description?: string;
     /** `null` = unlimited; a positive value caps the verification-agentic loop. */
     max_iterations?: number | null;
-    provider?: string;
-    model?: string;
+    provider?: string | null;
+    model?: string | null;
     model_overrides?: ModelOverrides;
   };
   onUpdate: (updates: Record<string, unknown>) => void;
@@ -377,10 +379,7 @@ function StageSettings({
             </div>
             <div>
               <label className="text-[10px] text-zinc-500">
-                Max iterations{" "}
-                <span className="text-zinc-600">
-                  (blank = unlimited)
-                </span>
+                Max iterations <span className="text-zinc-600">(blank = unlimited)</span>
               </label>
               <input
                 type="number"

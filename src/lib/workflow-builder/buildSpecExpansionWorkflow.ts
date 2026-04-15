@@ -14,6 +14,7 @@
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { createSummaryStep } from "../../types/unified-workflow";
 import type { SpecConfig } from "./buildSpecWorkflow";
+import { DEFAULT_WORKFLOW_FLAGS } from "./workflowDefaults";
 
 export interface BuildSpecExpansionWorkflowInput {
   /** The existing spec configuration to expand */
@@ -137,6 +138,7 @@ Focus on quality over quantity — each assertion should verify something meanin
     completion_steps: [createSummaryStep()],
 
     max_iterations: maxIterations,
+    ...DEFAULT_WORKFLOW_FLAGS,
     reflection_mode: true,
   };
 

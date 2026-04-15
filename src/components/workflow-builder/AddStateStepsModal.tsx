@@ -697,7 +697,12 @@ export function AddStateStepsModal({
                             V
                           </span>
                           <span className="truncate">{step.name}</span>
-                          <span className="text-xs text-zinc-500 ml-auto">{step.type}</span>
+                          {/* VerificationStep union lacks the `type` discriminator
+                              in its TS shape (only CanonicalStep carries it);
+                              cast for JSX render. */}
+                          <span className="text-xs text-zinc-500 ml-auto">
+                            {String((step as { type?: string }).type ?? "")}
+                          </span>
                         </div>
                       ))}
                     {addAgenticStep && preview.agenticStep && (

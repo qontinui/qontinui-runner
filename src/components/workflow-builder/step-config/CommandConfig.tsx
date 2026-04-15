@@ -14,7 +14,7 @@ function TestFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate:
         </label>
         <select
           id="test-type-select"
-          value={step.test_type}
+          value={step.test_type ?? ""}
           onChange={(e) => onUpdate({ test_type: e.target.value as TestType })}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
         >
@@ -118,7 +118,7 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
         </label>
         <select
           id="check-type-select"
-          value={step.check_type}
+          value={step.check_type ?? ""}
           onChange={(e) => {
             const newType = e.target.value as CheckType;
             onUpdate({ check_type: newType, tool: undefined, command: undefined });
@@ -399,7 +399,7 @@ export function CommandConfig({
       </label>
       <select
         id="command-mode-select"
-        value={effectiveMode}
+        value={effectiveMode ?? ""}
         onChange={(e) => handleModeChange(e.target.value)}
         className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
       >

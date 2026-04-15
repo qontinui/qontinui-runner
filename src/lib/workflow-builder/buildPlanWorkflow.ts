@@ -24,6 +24,7 @@ import type {
   WorkflowStage,
 } from "../../types/unified-workflow";
 import { createSummaryStep } from "../../types/unified-workflow";
+import { DEFAULT_STAGE_FLAGS, DEFAULT_WORKFLOW_FLAGS } from "./workflowDefaults";
 
 // =============================================================================
 // Input Types
@@ -240,7 +241,13 @@ export function buildVerificationStep(
  *   - completion_steps: empty (summary is at workflow level)
  */
 export function buildPlanWorkflow(input: BuildPlanWorkflowInput): UnifiedWorkflow {
-  const { phases, agenticPrompt, maxIterations = null, workflowName, snapshotTarget = "sdk" } = input;
+  const {
+    phases,
+    agenticPrompt,
+    maxIterations = null,
+    workflowName,
+    snapshotTarget = "sdk",
+  } = input;
 
   const now = new Date().toISOString();
 
@@ -281,6 +288,7 @@ export function buildPlanWorkflow(input: BuildPlanWorkflowInput): UnifiedWorkflo
       agentic_steps: agenticSteps,
       completion_steps: [],
       max_iterations: phase.max_iterations ?? maxIterations,
+      ...DEFAULT_STAGE_FLAGS,
     };
   });
 
@@ -308,5 +316,6 @@ export function buildPlanWorkflow(input: BuildPlanWorkflowInput): UnifiedWorkflo
     tags: ["plan", "auto-generated", "multi-stage"],
     created_at: now,
     modified_at: now,
+    ...DEFAULT_WORKFLOW_FLAGS,
   };
 }

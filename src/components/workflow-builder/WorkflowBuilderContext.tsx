@@ -51,6 +51,10 @@ import {
   isWorkflowEmpty,
 } from "../../types";
 import { registerUserSkills } from "@qontinui/workflow-utils";
+import {
+  DEFAULT_STAGE_FLAGS,
+  DEFAULT_WORKFLOW_FLAGS,
+} from "../../lib/workflow-builder/workflowDefaults";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
 import { createLogger } from "@/lib/logger";
@@ -140,15 +144,18 @@ function getPhaseSteps(
 ): UnifiedStep[] {
   const source =
     stageIndex !== null && workflow.stages?.[stageIndex] ? workflow.stages[stageIndex] : workflow;
+  // Runner-produced workflows only contain canonical steps; narrow the wire
+  // `UnifiedStep[]` (which includes an open `Other` variant) to the runner's
+  // strict `UnifiedStep[]` (= CanonicalStep[]) the builder expects.
   switch (phase) {
     case "setup":
-      return source.setup_steps ?? [];
+      return (source.setup_steps ?? []) as UnifiedStep[];
     case "verification":
-      return source.verification_steps ?? [];
+      return (source.verification_steps ?? []) as UnifiedStep[];
     case "agentic":
-      return source.agentic_steps ?? [];
+      return (source.agentic_steps ?? []) as UnifiedStep[];
     case "completion":
-      return source.completion_steps ?? [];
+      return (source.completion_steps ?? []) as UnifiedStep[];
     default:
       return [];
   }
@@ -376,12 +383,16 @@ function workflowBuilderReducer(
       return { ...state, error: action.payload };
 
     case "RESET_TO_NEW": {
+      // createDefaultWorkflow()'s declared return type is an Omit of the new
+      // strict UnifiedWorkflow, but UnifiedWorkflow's index signature defeats
+      // spread inference; cast to assemble the full workflow.
       const emptyWorkflow: UnifiedWorkflow = {
+        ...DEFAULT_WORKFLOW_FLAGS,
         ...createDefaultWorkflow(),
         id: generateStepId(),
         created_at: new Date().toISOString(),
         modified_at: new Date().toISOString(),
-      };
+      } as UnifiedWorkflow;
       return {
         ...state,
         workflow: emptyWorkflow,
@@ -416,6 +427,7 @@ function workflowBuilderReducer(
           agentic_steps: state.workflow.agentic_steps,
           completion_steps: state.workflow.completion_steps ?? [],
           max_iterations: state.workflow.max_iterations ?? 10,
+          ...DEFAULT_STAGE_FLAGS,
         };
         const newStage: WorkflowStage = {
           id: generateStepId(),
@@ -426,6 +438,7 @@ function workflowBuilderReducer(
           agentic_steps: [],
           completion_steps: [],
           max_iterations: state.workflow.max_iterations ?? 10,
+          ...DEFAULT_STAGE_FLAGS,
         };
         return {
           ...state,
@@ -449,6 +462,7 @@ function workflowBuilderReducer(
         agentic_steps: [],
         completion_steps: [],
         max_iterations: state.workflow.max_iterations ?? 10,
+        ...DEFAULT_STAGE_FLAGS,
       };
       return {
         ...state,
@@ -687,12 +701,17 @@ function RunnerWorkflowBuilderInner({
   // Also load the original workflow to preserve update vs create state
   const storedOriginalWorkflow = !initialWorkflow && !startEmpty ? loadOriginalFromStorage() : null;
 
+  // createDefaultWorkflow() returns a partial with runtime-only fields; its
+  // declared type is `Omit<UnifiedWorkflow, "id"|"created_at"|"modified_at">`
+  // but the index signature on UnifiedWorkflow defeats precise spread
+  // inference, so cast to assemble the full workflow.
   const emptyWorkflow: UnifiedWorkflow = {
+    ...DEFAULT_WORKFLOW_FLAGS,
     ...createDefaultWorkflow(),
     id: generateStepId(),
     created_at: new Date().toISOString(),
     modified_at: new Date().toISOString(),
-  };
+  } as UnifiedWorkflow;
 
   const initialState: WorkflowBuilderState = {
     workflow: initialWorkflow ?? storedWorkflow ?? emptyWorkflow,

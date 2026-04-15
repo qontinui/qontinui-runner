@@ -82,7 +82,7 @@ function ResolvedModelPreview() {
 
   const rows = MODEL_OVERRIDE_PHASES.map((phase) => ({
     ...phase,
-    resolved: resolveModelForPhase(phase.key, overrides, workflow.model, undefined),
+    resolved: resolveModelForPhase(phase.key, overrides, workflow.model ?? undefined, undefined),
   }));
 
   const badgeClass = (source: string) => {
@@ -169,7 +169,12 @@ function PerPhaseModelSelect() {
       null,
     );
     if (parsed && typeof parsed === "object") {
-      updateWorkflow({ model_overrides: parsed });
+      // Storage holds an opaque Record; the UnifiedWorkflow field is a typed
+      // ModelOverrideConfig map. The persisted shape was written by this
+      // panel, so narrow back to the expected type at the read site.
+      updateWorkflow({
+        model_overrides: parsed as { [k: string]: ModelOverrideConfig },
+      });
     }
   };
 

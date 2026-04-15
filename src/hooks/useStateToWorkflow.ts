@@ -330,16 +330,17 @@ export function useStateToWorkflow(): UseStateToWorkflowReturn {
         verificationSteps: addVerificationSteps ? verificationSteps : [],
         agenticStep,
         addToWorkflow: (addStep) => {
-          // Add verification steps
+          // VerificationStep/PromptStep unions lack the `type` discriminator
+          // that CanonicalStep requires. The generator always sets `type` on
+          // every produced step, so narrow to UnifiedStep at the boundary.
           if (addVerificationSteps) {
             verificationSteps.forEach((step) => {
-              addStep(step, "verification");
+              addStep(step as UnifiedStep, "verification");
             });
           }
 
-          // Add agentic step
           if (addAgenticStep && agenticStep) {
-            addStep(agenticStep, "agentic");
+            addStep(agenticStep as UnifiedStep, "agentic");
           }
         },
       };
