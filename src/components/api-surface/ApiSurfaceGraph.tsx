@@ -7,7 +7,7 @@
  * Layer 4 (bottom): Clorinde Queries + DB Tables
  */
 
-import { memo, useMemo, useState, useCallback, useEffect } from "react";
+import { memo, useMemo, useState, useCallback, useRef } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -370,17 +370,21 @@ function ApiSurfaceGraphInner({
     [items, graphEdges],
   );
 
+  const prevLayoutNodesRef = useRef(layoutNodes);
+  const prevLayoutEdgesRef = useRef(layoutEdges);
   const [nodes, setNodes, onNodesChange] = useNodesState(layoutNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(layoutEdges);
   const [, setHoveredId] = useState<string | null>(null);
 
-  // Sync layout when data changes
-  useEffect(() => {
+  // Sync layout during render when data changes
+  if (prevLayoutNodesRef.current !== layoutNodes) {
+    prevLayoutNodesRef.current = layoutNodes;
     setNodes(layoutNodes);
-  }, [layoutNodes, setNodes]);
-  useEffect(() => {
+  }
+  if (prevLayoutEdgesRef.current !== layoutEdges) {
+    prevLayoutEdgesRef.current = layoutEdges;
     setEdges(layoutEdges);
-  }, [layoutEdges, setEdges]);
+  }
 
   const onNodeMouseEnter = useCallback(
     (_: unknown, node: Node) => {

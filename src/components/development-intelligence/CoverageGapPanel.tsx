@@ -6,7 +6,7 @@
  * by coverage score.
  */
 
-import { useState, useMemo, useCallback, Fragment, useEffect } from "react";
+import { useState, useMemo, useCallback, Fragment, useRef } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -156,16 +156,20 @@ export function CoverageGapPanel({ data, loading, onRefresh: _onRefresh }: Cover
     [data],
   );
 
+  const prevNodesRef = useRef(nodes);
+  const prevEdgesRef = useRef(edges);
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState(nodes);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState(edges);
 
-  // Sync flow state when derived graph data changes
-  useEffect(() => {
+  // Sync flow state during render when derived graph data changes
+  if (prevNodesRef.current !== nodes) {
+    prevNodesRef.current = nodes;
     setFlowNodes(nodes);
-  }, [nodes, setFlowNodes]);
-  useEffect(() => {
+  }
+  if (prevEdgesRef.current !== edges) {
+    prevEdgesRef.current = edges;
     setFlowEdges(edges);
-  }, [edges, setFlowEdges]);
+  }
 
   const toggleExpand = useCallback(
     (page: string) => setExpandedPage((prev) => (prev === page ? null : page)),
