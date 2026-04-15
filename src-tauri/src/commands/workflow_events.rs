@@ -90,10 +90,7 @@ pub async fn post_workflow_event(event: WorkflowEventPayload) {
                     .text()
                     .await
                     .unwrap_or_else(|_| "unknown".to_string());
-                warn!(
-                    "Workflow event emission failed ({}): {}",
-                    status, body
-                );
+                warn!("Workflow event emission failed ({}): {}", status, body);
             }
         }
         Err(e) => {

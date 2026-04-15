@@ -1305,14 +1305,12 @@ fn run_claude_session_inline(
                                                 );
                                                 // Best-effort embed so the row is searchable via Tier 0.
                                                 if let Some(ref rt) = pg_rt {
-                                                    let pg =
-                                                        crate::database::pg::PgDb::global();
-                                                    let _ = rt.block_on(
-                                                        pg.embed_knowledge_content(
+                                                    let pg = crate::database::pg::PgDb::global();
+                                                    let _ =
+                                                        rt.block_on(pg.embed_knowledge_content(
                                                             &knowledge_id,
                                                             &fix.fix_description,
-                                                        ),
-                                                    );
+                                                        ));
                                                 }
                                                 let auto_msg = format!(
                                                     "Auto-applied project fix as {} knowledge: {}",
@@ -1372,14 +1370,12 @@ fn run_claude_session_inline(
                                                 info!("Auto-applied reflection fix as knowledge entry: {}", knowledge_id);
                                                 // Best-effort embed so the row is searchable via Tier 0.
                                                 if let Some(ref rt) = pg_rt {
-                                                    let pg =
-                                                        crate::database::pg::PgDb::global();
-                                                    let _ = rt.block_on(
-                                                        pg.embed_knowledge_content(
+                                                    let pg = crate::database::pg::PgDb::global();
+                                                    let _ =
+                                                        rt.block_on(pg.embed_knowledge_content(
                                                             &knowledge_id,
                                                             &fix.fix_description,
-                                                        ),
-                                                    );
+                                                        ));
                                                 }
                                                 let auto_msg = format!(
                                                     "Auto-applied fix as {} knowledge: {}",

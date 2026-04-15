@@ -334,4 +334,3 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
 
     Ok(follow_up_id)
 }
-

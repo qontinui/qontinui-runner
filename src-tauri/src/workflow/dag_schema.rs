@@ -111,7 +111,6 @@ pub enum TriggerRule {
     NoneFailedMinOneSuccess,
 }
 
-
 /// Context isolation mode for a node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]

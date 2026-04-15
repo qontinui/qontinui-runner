@@ -37,14 +37,11 @@ pub struct WorkflowResult {
     /// Worktree branch name (if workflow ran in a worktree)
     pub worktree_branch: Option<String>,
     /// Workflow architecture used (traditional, agentic_verification, or multi_agent_pipeline).
-    pub workflow_architecture:
-        Option<crate::agentic_verification::WorkflowArchitecture>,
+    pub workflow_architecture: Option<crate::agentic_verification::WorkflowArchitecture>,
     /// Agentic verification config (if agentic verification was used).
-    pub agentic_verification_config:
-        Option<crate::agentic_verification::AgenticVerificationConfig>,
+    pub agentic_verification_config: Option<crate::agentic_verification::AgenticVerificationConfig>,
     /// Multi-agent pipeline config (if multi-agent pipeline was used).
-    pub multi_agent_pipeline_config:
-        Option<crate::agentic_verification::MultiAgentPipelineConfig>,
+    pub multi_agent_pipeline_config: Option<crate::agentic_verification::MultiAgentPipelineConfig>,
 }
 
 impl WorkflowResult {

@@ -473,7 +473,10 @@ async fn build_compressed_iteration_history(
     // 4. Accumulated knowledge (unresolved only -- deduped against iteration history above)
     // Priority: MEDIUM
     if budget_remaining > 200 {
-        if let Ok(all_knowledge) = pg_db.list_task_knowledge(execution_id, None, false, false).await {
+        if let Ok(all_knowledge) = pg_db
+            .list_task_knowledge(execution_id, None, false, false)
+            .await
+        {
             if !all_knowledge.is_empty() {
                 let unresolved: Vec<_> = all_knowledge
                     .iter()

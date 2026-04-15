@@ -159,15 +159,13 @@ pub fn dag_to_step_configs(def: &DagWorkflowDef) -> Result<Vec<ExecutionStepConf
     let mut configs: Vec<ExecutionStepConfig> = Vec::with_capacity(def.nodes.len());
 
     for (node_id, node) in &def.nodes {
-        let effective_timeout = node
-            .timeout_seconds
-            .or(def.defaults.timeout_seconds);
+        let effective_timeout = node.timeout_seconds.or(def.defaults.timeout_seconds);
 
-        let (retry_count, retry_delay_ms) =
-            node.retry.as_ref().or(def.defaults.retry.as_ref()).map_or(
-                (None, None),
-                |r| (Some(r.max_attempts), Some(r.delay_ms)),
-            );
+        let (retry_count, retry_delay_ms) = node
+            .retry
+            .as_ref()
+            .or(def.defaults.retry.as_ref())
+            .map_or((None, None), |r| (Some(r.max_attempts), Some(r.delay_ms)));
 
         let effective_provider = node
             .context
@@ -261,7 +259,8 @@ fn validate_when_refs(
 ) {
     // Find all tokens that start with '$'
     for token in when_expr.split_whitespace() {
-        let token = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '$' && c != '_' && c != '.');
+        let token =
+            token.trim_matches(|c: char| !c.is_alphanumeric() && c != '$' && c != '_' && c != '.');
         if token.starts_with('$') {
             // Strip leading '$', take first segment before '.'
             let raw = &token[1..];

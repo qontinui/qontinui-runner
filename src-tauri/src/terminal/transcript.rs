@@ -182,10 +182,7 @@ pub fn list_sessions(
 
         // Get file mtime
         let metadata = fs::metadata(&path);
-        let mtime = metadata
-            .as_ref()
-            .ok()
-            .and_then(|m| m.modified().ok());
+        let mtime = metadata.as_ref().ok().and_then(|m| m.modified().ok());
 
         // Check cache: if we've seen this file with the same mtime, reuse the result
         if let Some(mtime) = mtime {
@@ -219,7 +216,13 @@ pub fn list_sessions(
         // Skip workflow-spawned sessions (they use bypassPermissions)
         if is_workflow_session(&content) {
             if let Some(mt) = mtime {
-                cache.insert(path.clone(), CachedSession { mtime: mt, session: None });
+                cache.insert(
+                    path.clone(),
+                    CachedSession {
+                        mtime: mt,
+                        session: None,
+                    },
+                );
             }
             continue;
         }
@@ -238,7 +241,13 @@ pub fn list_sessions(
         // Skip sessions with no real messages
         if message_count == 0 {
             if let Some(mt) = mtime {
-                cache.insert(path.clone(), CachedSession { mtime: mt, session: None });
+                cache.insert(
+                    path.clone(),
+                    CachedSession {
+                        mtime: mt,
+                        session: None,
+                    },
+                );
             }
             continue;
         }

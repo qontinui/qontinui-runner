@@ -196,7 +196,15 @@ mod tests {
 
     #[test]
     fn from_env_parses_enabled_variants() {
-        for v in ["enabled", "ENABLED", "1", "true", "on", "yes", "  Enabled  "] {
+        for v in [
+            "enabled",
+            "ENABLED",
+            "1",
+            "true",
+            "on",
+            "yes",
+            "  Enabled  ",
+        ] {
             with_env(ENV_MODE, Some(v), || {
                 assert_eq!(WsvConfig::from_env().mode, WsvMode::Enabled, "value={v}");
             });

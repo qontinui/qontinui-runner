@@ -207,10 +207,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows_affected = conn
-            .execute(
-                "DELETE FROM ui_bridge_baselines WHERE id = $1",
-                &[&id],
-            )
+            .execute("DELETE FROM ui_bridge_baselines WHERE id = $1", &[&id])
             .await
             .map_err(|e| format!("PG baseline_delete: {}", e))?;
 

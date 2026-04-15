@@ -195,9 +195,7 @@ pub async fn get_screenshot(Query(query): Query<ScreenshotQuery>) -> impl IntoRe
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({"error": e}).to_string(),
-                ))
+                .body(Body::from(serde_json::json!({"error": e}).to_string()))
                 .unwrap()
         }
         Err(e) => {
@@ -267,9 +265,7 @@ fn encode_rgba_to_jpeg(image: &image::RgbaImage, quality: u8) -> Result<Vec<u8>,
 ///
 /// Request a pairing PIN from Sunshine for Moonlight to use.
 /// The runner relays the PIN request to Sunshine's local admin API.
-pub async fn post_pair(
-    AxumState(_state): AxumState<Arc<ApiState>>,
-) -> Json<PairResponse> {
+pub async fn post_pair(AxumState(_state): AxumState<Arc<ApiState>>) -> Json<PairResponse> {
     let host_ip = get_local_ip();
 
     let client = match reqwest::Client::builder()
@@ -362,7 +358,9 @@ pub async fn post_focus(
         "runner" => {
             // Get the runner's window handle to tell Sunshine what to capture
             use tauri::Manager;
-            let window = state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label());
+            let window = state
+                .app_handle
+                .get_webview_window(qontinui_runner_lib::get_main_window_label());
             match window {
                 Some(win) => {
                     let title = win
@@ -467,18 +465,13 @@ async fn configure_sunshine_app(window_title: &str) -> Result<(), String> {
         "app-name": window_title,
     });
 
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_connect() {
-                "Sunshine is not running".to_string()
-            } else {
-                format!("Failed to contact Sunshine: {}", e)
-            }
-        })?;
+    let resp = client.post(&url).json(&body).send().await.map_err(|e| {
+        if e.is_connect() {
+            "Sunshine is not running".to_string()
+        } else {
+            format!("Failed to contact Sunshine: {}", e)
+        }
+    })?;
 
     if resp.status().is_success() {
         info!("Configured Sunshine app capture for '{}'", window_title);
@@ -502,17 +495,13 @@ async fn configure_sunshine_desktop() -> Result<(), String> {
 
     let url = format!("{}/api/apps/close", sunshine_base_url());
 
-    let resp = client
-        .post(&url)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_connect() {
-                "Sunshine is not running".to_string()
-            } else {
-                format!("Failed to contact Sunshine: {}", e)
-            }
-        })?;
+    let resp = client.post(&url).send().await.map_err(|e| {
+        if e.is_connect() {
+            "Sunshine is not running".to_string()
+        } else {
+            format!("Failed to contact Sunshine: {}", e)
+        }
+    })?;
 
     if resp.status().is_success() {
         info!("Configured Sunshine for full desktop capture");
@@ -521,10 +510,7 @@ async fn configure_sunshine_desktop() -> Result<(), String> {
         // Non-success is acceptable — may mean no app was running
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        warn!(
-            "Sunshine close-app returned {}: {}",
-            status, body
-        );
+        warn!("Sunshine close-app returned {}: {}", status, body);
         Ok(())
     }
 }

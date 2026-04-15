@@ -250,10 +250,7 @@ async fn run_sweep(
                 ),
             };
             if let Err(e) = app_handle.emit("stale-task-detected", &payload) {
-                warn!(
-                    "Failed to emit stale-task-detected for {}: {}",
-                    task.id, e
-                );
+                warn!("Failed to emit stale-task-detected for {}: {}", task.id, e);
             } else {
                 tracker.mark_notified(&task.id);
                 info!(

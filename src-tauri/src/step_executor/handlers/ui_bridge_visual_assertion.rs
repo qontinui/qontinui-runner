@@ -37,10 +37,7 @@ impl StepHandler for UiBridgeVisualAssertionHandler {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to create HTTP client: {}", e);
-                return StepHandlerResult::failure(format!(
-                    "Failed to create HTTP client: {}",
-                    e
-                ));
+                return StepHandlerResult::failure(format!("Failed to create HTTP client: {}", e));
             }
         };
 
@@ -70,15 +67,14 @@ impl StepHandler for UiBridgeVisualAssertionHandler {
         }
 
         // Step 2: Determine assertion type
-        let assertion_type = step
-            .visual_assertion_type
-            .as_deref()
-            .unwrap_or("text");
+        let assertion_type = step.visual_assertion_type.as_deref().unwrap_or("text");
 
         info!(
             "Running visual assertion: type={}, target={:?}",
             assertion_type,
-            step.visual_assertion_expected.as_deref().unwrap_or("(none)")
+            step.visual_assertion_expected
+                .as_deref()
+                .unwrap_or("(none)")
         );
 
         // Step 3: Build request and call appropriate endpoint
@@ -175,10 +171,7 @@ impl StepHandler for UiBridgeVisualAssertionHandler {
         let data = response.get("data").cloned().unwrap_or(json!({}));
 
         if assertion_type == "text" || assertion_type == "screenshot" {
-            let passed = data
-                .get("pass")
-                .and_then(|p| p.as_bool())
-                .unwrap_or(false);
+            let passed = data.get("pass").and_then(|p| p.as_bool()).unwrap_or(false);
 
             if !passed {
                 let error_detail = data
@@ -187,11 +180,20 @@ impl StepHandler for UiBridgeVisualAssertionHandler {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| {
                         if assertion_type == "text" {
-                            let actual = data.get("actualText").and_then(|t| t.as_str()).unwrap_or("");
-                            let expected = data.get("expectedText").and_then(|t| t.as_str()).unwrap_or("");
+                            let actual = data
+                                .get("actualText")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
+                            let expected = data
+                                .get("expectedText")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
                             format!("Expected '{}', got '{}'", expected, actual)
                         } else {
-                            let diff = data.get("diffPercentage").and_then(|d| d.as_f64()).unwrap_or(0.0);
+                            let diff = data
+                                .get("diffPercentage")
+                                .and_then(|d| d.as_f64())
+                                .unwrap_or(0.0);
                             format!("Visual regression: {:.2}% pixels differ", diff)
                         }
                     });

@@ -421,4 +421,3 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
 
     Ok(fixer_id)
 }
-

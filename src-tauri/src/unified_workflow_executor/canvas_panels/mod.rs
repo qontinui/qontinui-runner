@@ -647,9 +647,7 @@ impl CanvasPanelManager {
             crate::agentic_verification::VerificationStatus::Pass => "PASS",
             crate::agentic_verification::VerificationStatus::Partial => "PARTIAL",
             crate::agentic_verification::VerificationStatus::Fail => "FAIL",
-            crate::agentic_verification::VerificationStatus::Unreachable => {
-                "UNREACHABLE"
-            }
+            crate::agentic_verification::VerificationStatus::Unreachable => "UNREACHABLE",
             crate::agentic_verification::VerificationStatus::Refused => "REFUSED",
         };
 

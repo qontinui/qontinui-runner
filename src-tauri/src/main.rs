@@ -10,12 +10,12 @@
 #![allow(clippy::too_many_arguments)]
 
 mod action_service;
+mod agentic_verification;
 mod ai_pricing;
 mod ai_provider;
-pub mod api_config;
 mod ai_router;
 mod ai_workflows;
-mod agentic_verification;
+pub mod api_config;
 mod api_request;
 mod auth;
 mod backup;
@@ -135,11 +135,11 @@ mod validation;
 mod verification;
 mod video_recorder;
 mod vision;
+mod workflow;
 mod workflow_event_bus;
 mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
-mod workflow;
 mod worktree;
 mod zombie_sweep;
 
@@ -366,8 +366,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         container_executor: TokioMutex::new(None), // Initialized via container settings when enabled
         run_cost_trackers: TokioMutex::new(std::collections::HashMap::new()),
         working_representation_cache: {
-            let cache = Arc::new(crate::memory::working_representation::WorkingRepresentationCache::new());
-            crate::memory::working_representation::WorkingRepresentationCache::set_global(cache.clone());
+            let cache =
+                Arc::new(crate::memory::working_representation::WorkingRepresentationCache::new());
+            crate::memory::working_representation::WorkingRepresentationCache::set_global(
+                cache.clone(),
+            );
             cache
         },
     });
@@ -387,7 +390,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     if !is_secondary_instance {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // When a second instance is launched, focus the existing window
-            if let Some(window) = app.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
+            if let Some(window) =
+                app.get_webview_window(qontinui_runner_lib::get_main_window_label())
+            {
                 let _ = window.unminimize();
                 let _ = window.set_focus();
             }

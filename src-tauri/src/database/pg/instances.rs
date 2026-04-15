@@ -42,7 +42,10 @@ impl PgDb {
         // before upserting. This avoids a unique-constraint violation on the port column.
         conn.execute(
             "DELETE FROM runner_instances WHERE port = $1 AND id != $2",
-            &[&port_i32 as &(dyn tokio_postgres::types::ToSql + Sync), &id as &(dyn tokio_postgres::types::ToSql + Sync)],
+            &[
+                &port_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
+                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
         )
         .await
         .map_err(|e| format!("PG upsert_runner_instance (port cleanup): {}", e))?;
@@ -123,10 +126,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         let count = conn
-            .execute(
-                "DELETE FROM runner_instances WHERE id = $1",
-                &[&id],
-            )
+            .execute("DELETE FROM runner_instances WHERE id = $1", &[&id])
             .await
             .map_err(|e| format!("PG remove_runner_instance: {}", e))?;
 

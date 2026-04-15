@@ -549,8 +549,7 @@ pub async fn refresh_model_profiles(
     app_state: State<'_, Arc<AppState>>,
     days: Option<i64>,
 ) -> Result<Vec<crate::routing::model_profiles::ModelProfile>, String> {
-    crate::routing::model_profiles::refresh_all_profiles(&app_state.pg_db, days.unwrap_or(30))
-        .await
+    crate::routing::model_profiles::refresh_all_profiles(&app_state.pg_db, days.unwrap_or(30)).await
 }
 
 #[tauri::command]
@@ -558,8 +557,7 @@ pub async fn get_model_recommendations(
     app_state: State<'_, Arc<AppState>>,
     budget_usd: Option<f64>,
 ) -> Result<Vec<crate::routing::model_profiles::ModelRecommendation>, String> {
-    crate::routing::model_profiles::get_model_recommendation(&app_state.pg_db, budget_usd)
-        .await
+    crate::routing::model_profiles::get_model_recommendation(&app_state.pg_db, budget_usd).await
 }
 
 // ── Comparison Bridge ─────────────────────────────────────────────────

@@ -67,10 +67,7 @@ impl PgDb {
     /// Returns the new row's id on success. On error, logs a warning and
     /// returns None — callers on the agentic loop hot path MUST treat a
     /// failure as a non-fatal telemetry loss.
-    pub async fn insert_wsv_disagreement(
-        &self,
-        input: WsvDisagreementInsert<'_>,
-    ) -> Option<i64> {
+    pub async fn insert_wsv_disagreement(&self, input: WsvDisagreementInsert<'_>) -> Option<i64> {
         let conn = match self.pool.get().await {
             Ok(c) => c,
             Err(e) => {

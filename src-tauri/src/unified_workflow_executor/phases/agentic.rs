@@ -761,7 +761,10 @@ impl AgenticExecutor {
                     }
                 }
                 Err(e) => {
-                    warn!("AGENTIC-PHASE: Failed to build working representation: {}", e);
+                    warn!(
+                        "AGENTIC-PHASE: Failed to build working representation: {}",
+                        e
+                    );
                     enhanced_prompt
                 }
             }
@@ -914,9 +917,7 @@ impl AgenticExecutor {
         // in the pipeline loop, so we skip injection here for pipeline runs to avoid duplication.
         let is_pipeline = matches!(
             config.workflow_architecture,
-            Some(
-                crate::agentic_verification::WorkflowArchitecture::MultiAgentPipeline
-            )
+            Some(crate::agentic_verification::WorkflowArchitecture::MultiAgentPipeline)
         );
         let enhanced_prompt = if !is_pipeline {
             if let Some((_, ref rec_id)) = config.active_canary {

@@ -163,7 +163,9 @@ pub async fn plan_intent_handler(
     // Extract JSON from AI output (find outermost braces)
     let json_str = if let Some(start) = output.find('{') {
         // rfind returns None if no closing brace; fall back to end of string
-        let end = output.rfind('}').unwrap_or_else(|| output.len().saturating_sub(1));
+        let end = output
+            .rfind('}')
+            .unwrap_or_else(|| output.len().saturating_sub(1));
         &output[start..=end]
     } else {
         output.as_str()
@@ -177,7 +179,10 @@ pub async fn plan_intent_handler(
         )
     })?;
 
-    info!("HTTP: Intent plan generated with {} steps", plan.steps.len());
+    info!(
+        "HTTP: Intent plan generated with {} steps",
+        plan.steps.len()
+    );
     Ok(Json(ApiResponse::success(plan)))
 }
 

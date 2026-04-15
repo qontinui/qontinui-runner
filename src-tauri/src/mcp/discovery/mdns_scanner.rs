@@ -92,7 +92,10 @@ impl MdnsScanner {
         let receiver = match daemon.browse(MDNS_SERVICE_TYPE) {
             Ok(r) => r,
             Err(e) => {
-                warn!("Failed to start mDNS browse for {}: {}", MDNS_SERVICE_TYPE, e);
+                warn!(
+                    "Failed to start mDNS browse for {}: {}",
+                    MDNS_SERVICE_TYPE, e
+                );
                 return;
             }
         };
@@ -106,10 +109,7 @@ impl MdnsScanner {
                         let txt = info.get_properties();
                         let mut records: HashMap<String, String> = HashMap::new();
                         for prop in txt.iter() {
-                            records.insert(
-                                prop.key().to_string(),
-                                prop.val_str().to_string(),
-                            );
+                            records.insert(prop.key().to_string(), prop.val_str().to_string());
                         }
 
                         let device_id = records
@@ -117,14 +117,10 @@ impl MdnsScanner {
                             .cloned()
                             .unwrap_or_else(|| info.get_fullname().to_string());
 
-                        let addresses: Vec<IpAddr> =
-                            info.get_addresses().iter().copied().collect();
+                        let addresses: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
                         let port = info.get_port();
 
-                        debug!(
-                            "mDNS discovered: {} at {:?}:{}",
-                            device_id, addresses, port
-                        );
+                        debug!("mDNS discovered: {} at {:?}:{}", device_id, addresses, port);
 
                         let device_info = MdnsDeviceInfo {
                             device_id,

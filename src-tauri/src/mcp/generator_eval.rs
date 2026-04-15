@@ -116,12 +116,14 @@ async fn get_artifact_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.pg_db.get_generation_artifact_by_id(&id).await {
+    match state
+        .app_state
+        .pg_db
+        .get_generation_artifact_by_id(&id)
+        .await
+    {
         Ok(Some(row)) => Ok(Json(ApiResponse::success(row))),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error("Artifact not found")),
-        )),
+        Ok(None) => Err((StatusCode::NOT_FOUND, Json(api_error("Artifact not found")))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(&e)))),
     }
 }

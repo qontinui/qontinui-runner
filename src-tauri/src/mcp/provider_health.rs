@@ -17,5 +17,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
         .route("/provider-health", get(get_provider_health))
-        .route("/provider-health/{provider_key}/reset", post(reset_provider_health))
+        .route(
+            "/provider-health/{provider_key}/reset",
+            post(reset_provider_health),
+        )
 }

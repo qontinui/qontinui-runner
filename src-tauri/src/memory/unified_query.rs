@@ -101,7 +101,6 @@ pub enum ReasoningLevel {
     Max,
 }
 
-
 impl ReasoningLevel {
     pub fn from_str_opt(s: &str) -> Self {
         match s.to_lowercase().as_str() {
@@ -913,7 +912,14 @@ pub async fn query_memory_reasoned(
         }
     }
 
-    let synthesis = synthesize_results(&params.query, &results, &neighborhood_context, &causal_context, level).await;
+    let synthesis = synthesize_results(
+        &params.query,
+        &results,
+        &neighborhood_context,
+        &causal_context,
+        level,
+    )
+    .await;
 
     let response = ReasonedMemoryResponse {
         results,
@@ -925,7 +931,9 @@ pub async fn query_memory_reasoned(
 
     // Save to cache (TTL 30 minutes)
     if let Ok(json) = serde_json::to_string(&response) {
-        let _ = pg.save_cached_query(&query_hash, level_str, &json, 30).await;
+        let _ = pg
+            .save_cached_query(&query_hash, level_str, &json, 30)
+            .await;
     }
 
     Ok(response)
@@ -985,7 +993,12 @@ async fn synthesize_results(
             let neighbor_strs: Vec<String> = ns
                 .neighbors
                 .iter()
-                .map(|n| format!("  - {} ({}) via '{}' [{}]", n.label, n.kind, n.edge_label, n.direction))
+                .map(|n| {
+                    format!(
+                        "  - {} ({}) via '{}' [{}]",
+                        n.label, n.kind, n.edge_label, n.direction
+                    )
+                })
                 .collect();
             context_parts.push(format!(
                 "Result '{}': neighbors:\n{}",
@@ -1051,13 +1064,13 @@ async fn synthesize_results(
         ai_provider::run_prompt_with_model_override(
             &prompt_clone,
             &task_context,
-            None,  // doctor_handle
-            None,  // model_override (use default)
-            None,  // provider_override
+            None,      // doctor_handle
+            None,      // model_override (use default)
+            None,      // provider_override
             Some(0.4), // moderate temperature
             max_tokens,
-            None,  // fallback_model
-            None,  // fallback_provider
+            None, // fallback_model
+            None, // fallback_provider
         )
     })
     .await;
@@ -1067,10 +1080,7 @@ async fn synthesize_results(
             if ai_response.success && !ai_response.output.is_empty() {
                 Some(ai_response.output)
             } else {
-                warn!(
-                    "Memory synthesis LLM call failed: {:?}",
-                    ai_response.error
-                );
+                warn!("Memory synthesis LLM call failed: {:?}", ai_response.error);
                 None
             }
         }

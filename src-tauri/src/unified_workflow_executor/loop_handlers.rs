@@ -16,8 +16,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::database::CreateTaskRunEventInput;
 use crate::event_system::EventBroadcaster;
-use crate::orchestrator::types::StageTransition;
 use crate::orchestrator::knowledge::{parse_findings_from_output, AgentType};
+use crate::orchestrator::types::StageTransition;
 use crate::step_executor::{ExecutionStepConfig, StepExecutionResult, VerificationPhaseResult};
 use crate::step_registry::StepEventLogger;
 use crate::str_utils::truncate_str;
@@ -1192,7 +1192,9 @@ impl LoopController {
         let failure_context = if let Some(ref ci_ctx) = config.ci_failure_context {
             let mut ci_section = String::from("## CI Failure Context\n\n");
             if ci_ctx.merge_conflict {
-                ci_section.push_str("**Merge conflict detected** — resolve conflicts before proceeding.\n\n");
+                ci_section.push_str(
+                    "**Merge conflict detected** — resolve conflicts before proceeding.\n\n",
+                );
             }
             if !ci_ctx.failed_check_names.is_empty() {
                 ci_section.push_str(&format!(
@@ -1201,7 +1203,10 @@ impl LoopController {
                 ));
             }
             for (check_name, log) in &ci_ctx.check_logs {
-                ci_section.push_str(&format!("### {} (log excerpt)\n```\n{}\n```\n\n", check_name, log));
+                ci_section.push_str(&format!(
+                    "### {} (log excerpt)\n```\n{}\n```\n\n",
+                    check_name, log
+                ));
             }
             format!("{}{}", ci_section, failure_context)
         } else {
@@ -1675,8 +1680,7 @@ impl LoopController {
                     .iteration_results
                     .last()
                     .is_some_and(|r| r.verification_passed);
-            let signals =
-                RoutingSignals::extract(&failure_context, ctx.iteration, previous_failed);
+            let signals = RoutingSignals::extract(&failure_context, ctx.iteration, previous_failed);
             config.routing_context.word_count = signals.word_count;
             config.routing_context.code_block_count = signals.code_block_count;
             config.routing_context.cross_file_dep_count = signals.cross_file_dep_count;
@@ -1733,11 +1737,8 @@ impl LoopController {
                 ctx.iteration
             );
 
-            match crate::planning_bridge::execute_htn_attempt(
-                failure_context,
-                &config.htn_config,
-            )
-            .await
+            match crate::planning_bridge::execute_htn_attempt(failure_context, &config.htn_config)
+                .await
             {
                 Ok(result) if result.plan_found && result.execution_success => {
                     info!(

@@ -93,10 +93,7 @@ pub async fn register_with_primary() -> Option<String> {
             id
         }
         Ok(resp) => {
-            debug!(
-                "Registration with primary failed: HTTP {}",
-                resp.status()
-            );
+            debug!("Registration with primary failed: HTTP {}", resp.status());
             None
         }
         Err(e) => {

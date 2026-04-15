@@ -161,4 +161,3 @@ pub trait TicketProvider: Send + Sync {
         config: &TicketProviderConfig,
     ) -> Result<(), String>;
 }
-

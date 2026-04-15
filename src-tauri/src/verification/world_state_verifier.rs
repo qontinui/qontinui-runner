@@ -15,9 +15,7 @@ use serde_json::json;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::agentic_verification::{
-    VerificationIssue, VerificationStatus, VerificationVerdict,
-};
+use crate::agentic_verification::{VerificationIssue, VerificationStatus, VerificationVerdict};
 
 /// Errors returned by the WorldStateVerifier. Callers should fall back
 /// to the existing text-based verifier agent on any error.
@@ -109,7 +107,10 @@ impl WorldStateVerifier {
             goal_context,
         );
 
-        let url = format!("{}/v1/chat/completions", self.endpoint.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.endpoint.trim_end_matches('/')
+        );
         debug!("WSM: POST {} (model={})", url, self.model);
 
         let resp = self.client.post(&url).json(&payload).send().await?;
@@ -226,10 +227,7 @@ fn parse_judgement(content: &str) -> Result<WsmJudgement, VerifierError> {
     } else if let Some(start) = trimmed.find("```") {
         let after = &trimmed[start + 3..];
         // Skip optional language tag line.
-        let line_end = after
-            .find('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let line_end = after.find('\n').map(|i| i + 1).unwrap_or(0);
         let body = &after[line_end..];
         let end = body
             .find("```")
@@ -261,8 +259,12 @@ fn parse_judgement(content: &str) -> Result<WsmJudgement, VerifierError> {
         return Err(VerifierError::Parse("no JSON found in WSM output".into()));
     };
 
-    serde_json::from_str::<WsmJudgement>(json_str)
-        .map_err(|e| VerifierError::Parse(format!("{e} — raw: {}", json_str.chars().take(200).collect::<String>())))
+    serde_json::from_str::<WsmJudgement>(json_str).map_err(|e| {
+        VerifierError::Parse(format!(
+            "{e} — raw: {}",
+            json_str.chars().take(200).collect::<String>()
+        ))
+    })
 }
 
 fn judgement_to_verdict(j: WsmJudgement) -> VerificationVerdict {

@@ -207,12 +207,10 @@ async fn browse_directory(
                     .modified()
                     .ok()
                     .and_then(|t| {
-                        t.duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| {
-                                chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
-                                    .map(|dt| dt.to_rfc3339())
-                            })
+                        t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| {
+                            chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
+                                .map(|dt| dt.to_rfc3339())
+                        })
                     })
                     .flatten();
 
@@ -220,7 +218,11 @@ async fn browse_directory(
                     name,
                     path: full_path,
                     is_dir: metadata.is_dir(),
-                    size_bytes: if metadata.is_file() { metadata.len() } else { 0 },
+                    size_bytes: if metadata.is_file() {
+                        metadata.len()
+                    } else {
+                        0
+                    },
                     modified,
                 });
             }
@@ -235,7 +237,9 @@ async fn browse_directory(
 
     // Sort: directories first, then alphabetical
     entries.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
     Ok(Json(serde_json::json!({
@@ -254,10 +258,7 @@ async fn read_file(
     let path = Path::new(&req.path);
 
     if !path.is_file() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Not a file: {}", req.path),
-        ));
+        return Err((StatusCode::BAD_REQUEST, format!("Not a file: {}", req.path)));
     }
 
     if !is_path_safe(path) {
@@ -267,8 +268,12 @@ async fn read_file(
         ));
     }
 
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot read metadata: {}", e)))?;
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cannot read metadata: {}", e),
+        )
+    })?;
 
     let content_type = guess_content_type(path);
     let is_text = is_text_content_type(&content_type);

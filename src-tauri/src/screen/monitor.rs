@@ -151,8 +151,7 @@ pub struct MonitorManager {
 impl MonitorManager {
     /// Enumerate all attached physical monitors via xcap.
     pub fn detect() -> Result<Self, String> {
-        let xcap_monitors =
-            XcapMonitor::all().map_err(|e| format!("xcap Monitor::all: {e}"))?;
+        let xcap_monitors = XcapMonitor::all().map_err(|e| format!("xcap Monitor::all: {e}"))?;
         if xcap_monitors.is_empty() {
             return Err("xcap returned zero monitors".to_string());
         }
@@ -204,7 +203,9 @@ impl MonitorManager {
     /// Returns `None` if the point is in the gap between monitors or
     /// outside the virtual desktop entirely.
     pub fn at_logical_point(&self, x: i32, y: i32) -> Option<&Monitor> {
-        self.monitors.iter().find(|m| m.contains_logical_point(x, y))
+        self.monitors
+            .iter()
+            .find(|m| m.contains_logical_point(x, y))
     }
 
     /// Logical-pixel bounding box of the entire virtual desktop:

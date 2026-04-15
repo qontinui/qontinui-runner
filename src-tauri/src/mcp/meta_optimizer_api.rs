@@ -1751,7 +1751,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         )
         // Duel pools / beam search / span events (read-only)
         .route("/meta-optimizer/duel-pools", get(list_duel_pools_handler))
-        .route("/meta-optimizer/duel-pools/{id}", get(get_duel_pool_handler))
+        .route(
+            "/meta-optimizer/duel-pools/{id}",
+            get(get_duel_pool_handler),
+        )
         .route(
             "/meta-optimizer/duel-pools/{id}/results",
             get(list_duel_results_handler),

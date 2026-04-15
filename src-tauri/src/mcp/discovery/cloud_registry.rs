@@ -60,11 +60,7 @@ impl CloudRegistryPoller {
         debug!("[cloud-registry] Polling {}", url);
 
         let client = reqwest::Client::new();
-        let resp = client
-            .get(&url)
-            .bearer_auth(auth_token)
-            .send()
-            .await?;
+        let resp = client.get(&url).bearer_auth(auth_token).send().await?;
 
         // Treat non-2xx as an error via response error handling
         let resp = resp.error_for_status()?;
@@ -74,11 +70,9 @@ impl CloudRegistryPoller {
         let json: serde_json::Value = resp.json().await?;
 
         let devices = if let Some(arr) = json.as_array() {
-            serde_json::from_value(serde_json::Value::Array(arr.clone()))
-                .unwrap_or_default()
+            serde_json::from_value(serde_json::Value::Array(arr.clone())).unwrap_or_default()
         } else if let Some(arr) = json.get("devices").and_then(|v| v.as_array()) {
-            serde_json::from_value(serde_json::Value::Array(arr.clone()))
-                .unwrap_or_default()
+            serde_json::from_value(serde_json::Value::Array(arr.clone())).unwrap_or_default()
         } else {
             Vec::new()
         };

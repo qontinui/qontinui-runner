@@ -184,7 +184,10 @@ impl BreakpointManager {
             // Check if task was stopped (takes priority)
             match self.app_state.pg_db.get_task_run(execution_id).await {
                 Ok(Some(task)) if task.status == "stopped" || task.status == "cancelled" => {
-                    info!("Task {} stopped while at breakpoint (restate path)", execution_id);
+                    info!(
+                        "Task {} stopped while at breakpoint (restate path)",
+                        execution_id
+                    );
                     return Ok(());
                 }
                 _ => {}
@@ -251,8 +254,13 @@ impl BreakpointManager {
 
         // Delegate to Restate awakeable path when available.
         if self.should_use_restate().await {
-            info!("Restate enabled — using awakeable path for breakpoint {}", snapshot_id);
-            return self.wait_for_resume_restate(snapshot_id, execution_id).await;
+            info!(
+                "Restate enabled — using awakeable path for breakpoint {}",
+                snapshot_id
+            );
+            return self
+                .wait_for_resume_restate(snapshot_id, execution_id)
+                .await;
         }
 
         // Fallback: PG polling

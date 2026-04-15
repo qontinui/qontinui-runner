@@ -312,10 +312,7 @@ pub async fn get_account_usage(
 
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
-        .route(
-            "/analytics/account-usage",
-            get(get_account_usage),
-        )
+        .route("/analytics/account-usage", get(get_account_usage))
         .route(
             "/analytics/token-usage/summary",
             get(get_token_usage_summary),

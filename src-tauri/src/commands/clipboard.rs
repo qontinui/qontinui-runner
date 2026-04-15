@@ -103,7 +103,10 @@ pub async fn share_to_mobile(text: String) -> Result<ClipboardEntryResponse, Str
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        error!("Clipboard push failed with status {}: {}", status, error_text);
+        error!(
+            "Clipboard push failed with status {}: {}",
+            status, error_text
+        );
         return Err(format!("Failed to share: {}", error_text));
     }
 
@@ -145,9 +148,9 @@ pub async fn share_file_to_mobile(file_path: String) -> Result<SharedFileRespons
     }
 
     // Check file size before reading into memory (50 MB limit, matches backend)
-    let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
-        format!("Failed to read file metadata: {}", e)
-    })?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
     const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
     if metadata.len() > MAX_FILE_SIZE {
         return Err(format!(
@@ -228,6 +231,9 @@ pub async fn share_file_to_mobile(file_path: String) -> Result<SharedFileRespons
         format!("Invalid response from server: {}", e)
     })?;
 
-    info!("File shared to mobile: id={}, filename={}", entry.id, entry.filename);
+    info!(
+        "File shared to mobile: id={}, filename={}",
+        entry.id, entry.filename
+    );
     Ok(entry)
 }

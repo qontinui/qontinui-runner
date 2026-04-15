@@ -208,5 +208,4 @@ mod tests {
             "Common code patterns should not trigger injection detection"
         );
     }
-
 }

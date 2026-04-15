@@ -346,7 +346,9 @@ impl StepType {
             "code_execution" | "codeexecution" | "code" => Some(StepType::CodeExecution),
 
             // Visual Assertion
-            "ui_bridge_visual_assertion" | "uibridgevisualassertion" | "visual_assertion"
+            "ui_bridge_visual_assertion"
+            | "uibridgevisualassertion"
+            | "visual_assertion"
             | "visualassertion" => Some(StepType::UiBridgeVisualAssertion),
 
             _ => {

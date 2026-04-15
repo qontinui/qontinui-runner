@@ -535,7 +535,9 @@ async fn run_loop(
 
     info!(
         "Orchestration loop starting: workflow={}, target=:{}, max_iterations={}",
-        config.workflow_id, target_port, config.iter_cap_display()
+        config.workflow_id,
+        target_port,
+        config.iter_cap_display()
     );
 
     // Wait for target runner to be healthy before starting
@@ -642,7 +644,11 @@ async fn run_loop(
             state.restart_signaled = false; // Reset for this iteration
         }
 
-        info!("=== Iteration {}/{} ===", iteration, config.iter_cap_display());
+        info!(
+            "=== Iteration {}/{} ===",
+            iteration,
+            config.iter_cap_display()
+        );
 
         // --- Phase 1: Execute workflow ---
         info!(
@@ -1457,7 +1463,8 @@ async fn run_pipeline_loop(
 
         info!(
             "=== Pipeline Iteration {}/{} ===",
-            iteration, config.iter_cap_display()
+            iteration,
+            config.iter_cap_display()
         );
 
         // --- Phase 1: Build (conditional) ---
@@ -1903,7 +1910,8 @@ async fn run_pipeline_loop(
         let reason = if should_exit {
             format!(
                 "Reached max iterations ({}/{})",
-                iteration, config.iter_cap_display()
+                iteration,
+                config.iter_cap_display()
             )
         } else {
             format!("{} fixes found — continuing", fix_count)

@@ -71,9 +71,8 @@ fn get_settings_path() -> Option<PathBuf> {
 /// backup would always miss the real prompts file). Scoped per-runner for
 /// secondary instances.
 fn get_prompts_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| {
-        crate::instance::scope_path(&d.join("com.qontinui.runner")).join("prompts.json")
-    })
+    dirs::config_dir()
+        .map(|d| crate::instance::scope_path(&d.join("com.qontinui.runner")).join("prompts.json"))
 }
 
 /// Get the path to playwright-tests.json (per-runner for secondary instances).

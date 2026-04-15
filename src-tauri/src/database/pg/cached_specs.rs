@@ -12,8 +12,7 @@ fn read_discovered_at(row: &tokio_postgres::Row, idx: usize) -> String {
         return ts.to_rfc3339();
     }
     // Fallback: legacy TEXT (pre-migration rows or if migration hasn't run)
-    row.try_get::<_, String>(idx)
-        .unwrap_or_default()
+    row.try_get::<_, String>(idx).unwrap_or_default()
 }
 
 impl PgDb {

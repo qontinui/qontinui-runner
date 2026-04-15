@@ -3814,8 +3814,7 @@ impl PgDb {
             placeholders.join(", ")
         );
 
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            vec![&pool_id];
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&pool_id];
         for id in keep_ids {
             params.push(id);
         }
@@ -4002,16 +4001,18 @@ impl PgDb {
             )
             .await
             .map_err(|e| format!("PG get_resource_version: {}", e))?;
-        Ok(rows.first().map(|r| crate::meta_optimizer::resource_versioning::ResourceVersion {
-            id: r.get(0),
-            resource_type: r.get(1),
-            resource_key: r.get(2),
-            version: r.get(3),
-            content_hash: r.get(4),
-            content: r.get(5),
-            metadata_json: r.get(6),
-            created_at: r.get::<_, Option<String>>(7).unwrap_or_default(),
-        }))
+        Ok(rows.first().map(
+            |r| crate::meta_optimizer::resource_versioning::ResourceVersion {
+                id: r.get(0),
+                resource_type: r.get(1),
+                resource_key: r.get(2),
+                version: r.get(3),
+                content_hash: r.get(4),
+                content: r.get(5),
+                metadata_json: r.get(6),
+                created_at: r.get::<_, Option<String>>(7).unwrap_or_default(),
+            },
+        ))
     }
 
     /// Get the latest version of a resource.
@@ -4036,16 +4037,18 @@ impl PgDb {
             )
             .await
             .map_err(|e| format!("PG get_latest_resource_version: {}", e))?;
-        Ok(rows.first().map(|r| crate::meta_optimizer::resource_versioning::ResourceVersion {
-            id: r.get(0),
-            resource_type: r.get(1),
-            resource_key: r.get(2),
-            version: r.get(3),
-            content_hash: r.get(4),
-            content: r.get(5),
-            metadata_json: r.get(6),
-            created_at: r.get::<_, Option<String>>(7).unwrap_or_default(),
-        }))
+        Ok(rows.first().map(
+            |r| crate::meta_optimizer::resource_versioning::ResourceVersion {
+                id: r.get(0),
+                resource_type: r.get(1),
+                resource_key: r.get(2),
+                version: r.get(3),
+                content_hash: r.get(4),
+                content: r.get(5),
+                metadata_json: r.get(6),
+                created_at: r.get::<_, Option<String>>(7).unwrap_or_default(),
+            },
+        ))
     }
 
     // ========================================================================
@@ -4084,7 +4087,10 @@ impl PgDb {
             sql.push_str(&format!(" AND status = ${}", params.len() + 1));
             params.push(&status_owned);
         }
-        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${}", params.len() + 1));
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC LIMIT ${}",
+            params.len() + 1
+        ));
         params.push(&limit);
         let rows = conn
             .query(sql.as_str(), &params[..])
@@ -4236,7 +4242,10 @@ impl PgDb {
             sql.push_str(&format!(" AND agent_type = ${}", params.len() + 1));
             params.push(&agent_owned);
         }
-        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${}", params.len() + 1));
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC LIMIT ${}",
+            params.len() + 1
+        ));
         params.push(&limit);
         let rows = conn
             .query(sql.as_str(), &params[..])

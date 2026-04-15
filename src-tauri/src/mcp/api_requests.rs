@@ -207,21 +207,21 @@ pub async fn import_curl_to_library(
         .create_saved_api_request(&create_req)
         .await
     {
-        Ok(value) => match serde_json::from_value::<crate::saved_api_requests::SavedApiRequest>(
-            value,
-        ) {
-            Ok(parsed_req) => Ok(Json(ApiResponse::success(parsed_req))),
-            Err(e) => {
-                error!("Failed to parse created saved API request: {}", e);
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!(
-                        "Failed to parse created saved API request: {}",
-                        e
-                    ))),
-                ))
+        Ok(value) => {
+            match serde_json::from_value::<crate::saved_api_requests::SavedApiRequest>(value) {
+                Ok(parsed_req) => Ok(Json(ApiResponse::success(parsed_req))),
+                Err(e) => {
+                    error!("Failed to parse created saved API request: {}", e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!(
+                            "Failed to parse created saved API request: {}",
+                            e
+                        ))),
+                    ))
+                }
             }
-        },
+        }
         Err(e) => {
             error!("Failed to save imported cURL to library: {}", e);
             Err((

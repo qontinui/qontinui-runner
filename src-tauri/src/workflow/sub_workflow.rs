@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Maximum sub-workflow nesting depth.
 pub const MAX_SUB_WORKFLOW_DEPTH: u32 = 8;
@@ -209,7 +209,10 @@ mod tests {
         let deserialized: SubWorkflowConfig = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.workflow_ref, "wf.yaml");
         assert_eq!(deserialized.depth, 2);
-        assert_eq!(deserialized.resolved_inputs.get("key"), Some(&json!("value")));
+        assert_eq!(
+            deserialized.resolved_inputs.get("key"),
+            Some(&json!("value"))
+        );
     }
 
     #[test]

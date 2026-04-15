@@ -810,4 +810,3 @@ impl ProcessCaptureManager {
         let _ = tauri::Emitter::emit(&self.app_handle, "process-state-changed", status);
     }
 }
-

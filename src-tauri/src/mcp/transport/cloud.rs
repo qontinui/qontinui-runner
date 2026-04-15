@@ -317,8 +317,7 @@ impl CloudTransport {
 
     /// Close all active tunnels.
     pub async fn close_all(&self) {
-        let handles: Vec<(String, TunnelHandle)> =
-            self.tunnels.lock().await.drain().collect();
+        let handles: Vec<(String, TunnelHandle)> = self.tunnels.lock().await.drain().collect();
         for (device_id, handle) in handles {
             info!("[cloud-transport] Closing tunnel for {}", device_id);
             handle.shutdown().await;
@@ -402,12 +401,7 @@ async fn handle_local_connection(
     })?;
 
     // ── Wait for response (5 s timeout) ─────────────────────────────────────
-    let tunnel_resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        resp_rx,
-    )
-    .await
-    {
+    let tunnel_resp = match tokio::time::timeout(std::time::Duration::from_secs(5), resp_rx).await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             // sender dropped

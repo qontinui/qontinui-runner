@@ -298,5 +298,4 @@ mod tests {
         assert!(md.contains("1. **Rule One**: Do this thing"));
         assert!(md.contains("2. **Rule Two**: Do that thing"));
     }
-
 }

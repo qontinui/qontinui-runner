@@ -111,7 +111,11 @@ impl GitHubTicketProvider {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    if now < reset { reset - now } else { 60 }
+                    if now < reset {
+                        reset - now
+                    } else {
+                        60
+                    }
                 } else {
                     return Err(format!(
                         "GitHub API returned {}: {}",
@@ -230,10 +234,7 @@ impl TicketProvider for GitHubTicketProvider {
         TicketSource::GitHub
     }
 
-    async fn fetch_actionable(
-        &self,
-        config: &TicketProviderConfig,
-    ) -> Result<Vec<Ticket>, String> {
+    async fn fetch_actionable(&self, config: &TicketProviderConfig) -> Result<Vec<Ticket>, String> {
         let (owner, repo) = Self::parse_target(&config.target)?;
 
         let labels = if config.actionable_labels.is_empty() {
@@ -251,7 +252,9 @@ impl TicketProvider for GitHubTicketProvider {
         while let Some(url) = next_url.take() {
             let resp = self
                 .send_with_rate_limit(
-                    self.client.get(&url).headers(self.headers(&config.api_token)),
+                    self.client
+                        .get(&url)
+                        .headers(self.headers(&config.api_token)),
                 )
                 .await?;
 
@@ -308,7 +311,9 @@ impl TicketProvider for GitHubTicketProvider {
         while let Some(url) = next_url.take() {
             let resp = self
                 .send_with_rate_limit(
-                    self.client.get(&url).headers(self.headers(&config.api_token)),
+                    self.client
+                        .get(&url)
+                        .headers(self.headers(&config.api_token)),
                 )
                 .await?;
 
@@ -409,9 +414,7 @@ impl TicketProvider for GitHubTicketProvider {
                 body["state_reason"] = serde_json::Value::String(reason.to_string());
             }
             let resp = self
-                .send_with_rate_limit(
-                    self.client.patch(&url).headers(headers.clone()).json(&body),
-                )
+                .send_with_rate_limit(self.client.patch(&url).headers(headers.clone()).json(&body))
                 .await?;
             if !resp.status().is_success() {
                 return Err(format!(
@@ -464,9 +467,7 @@ impl TicketProvider for GitHubTicketProvider {
             );
             let req = self.client.delete(&url).headers(headers.clone());
             match self.send_with_rate_limit(req).await {
-                Ok(resp)
-                    if !resp.status().is_success() && resp.status().as_u16() != 404 =>
-                {
+                Ok(resp) if !resp.status().is_success() && resp.status().as_u16() != 404 => {
                     tracing::warn!(
                         "GitHub: failed to remove label '{}' from issue {}: {} {}",
                         label,

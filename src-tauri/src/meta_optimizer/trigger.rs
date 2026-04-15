@@ -247,7 +247,10 @@ pub fn check_and_launch_optimizers(
                 None => None,
             };
             let Some(wf) = workflow_name else {
-                debug!("Pattern distiller: no workflow name for source run {}", trid);
+                debug!(
+                    "Pattern distiller: no workflow name for source run {}",
+                    trid
+                );
                 return;
             };
             use crate::online_learning::pattern_distiller::PatternDistiller;
@@ -744,4 +747,3 @@ pub fn check_and_launch_optimizers_with_pg(
     super::recommendations::auto_evaluate_with_agentic_scores(pg_db);
     Ok(launched)
 }
-

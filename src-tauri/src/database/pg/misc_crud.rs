@@ -217,10 +217,11 @@ impl PgDb {
         let method_str = serde_json::to_string(&input.method)
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_else(|_| "GET".to_string());
-        let headers_json = serde_json::to_string(&input.headers).unwrap_or_else(|_| "{}".to_string());
+        let headers_json =
+            serde_json::to_string(&input.headers).unwrap_or_else(|_| "{}".to_string());
         let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
-        let extractions_json = serde_json::to_string(&input.variable_extractions)
-            .unwrap_or_else(|_| "[]".to_string());
+        let extractions_json =
+            serde_json::to_string(&input.variable_extractions).unwrap_or_else(|_| "[]".to_string());
         let assertions_json =
             serde_json::to_string(&input.assertions).unwrap_or_else(|_| "[]".to_string());
         let timeout_ms: i32 = input.timeout_ms as i32;
@@ -327,8 +328,9 @@ impl PgDb {
         };
         let assertions_json = match &input.assertions {
             Some(a) => serde_json::to_string(a).unwrap_or_else(|_| "[]".to_string()),
-            None => serde_json::to_string(&current["assertions"])
-                .unwrap_or_else(|_| "[]".to_string()),
+            None => {
+                serde_json::to_string(&current["assertions"]).unwrap_or_else(|_| "[]".to_string())
+            }
         };
         let credential_id: Option<String> = match &input.credential_id {
             Some(c) => Some(c.clone()),
@@ -736,7 +738,10 @@ impl PgDb {
                     crate::mcp_client::McpTransport::Stdio => {
                         // Switching to stdio: update stdio_config if provided, clear http_config
                         (
-                            input.stdio_config.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                            input
+                                .stdio_config
+                                .as_ref()
+                                .map(|c| serde_json::to_string(c).unwrap_or_default()),
                             None::<String>,
                             false,
                             true, // clear http_config
@@ -746,7 +751,10 @@ impl PgDb {
                         // Switching to http: update http_config if provided, clear stdio_config
                         (
                             None::<String>,
-                            input.http_config.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                            input
+                                .http_config
+                                .as_ref()
+                                .map(|c| serde_json::to_string(c).unwrap_or_default()),
                             true, // clear stdio_config
                             false,
                         )
@@ -755,8 +763,14 @@ impl PgDb {
             } else {
                 // No transport change — normal COALESCE behavior
                 (
-                    input.stdio_config.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
-                    input.http_config.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                    input
+                        .stdio_config
+                        .as_ref()
+                        .map(|c| serde_json::to_string(c).unwrap_or_default()),
+                    input
+                        .http_config
+                        .as_ref()
+                        .map(|c| serde_json::to_string(c).unwrap_or_default()),
                     false,
                     false,
                 )
@@ -842,7 +856,10 @@ impl PgDb {
         &self,
     ) -> Result<Vec<crate::mcp_client::McpServerConfig>, String> {
         let all = self.list_mcp_servers().await?;
-        Ok(all.into_iter().filter(|s| s.auto_start && s.enabled).collect())
+        Ok(all
+            .into_iter()
+            .filter(|s| s.auto_start && s.enabled)
+            .collect())
     }
 
     /// Update cached tools for an MCP server.

@@ -25,10 +25,7 @@ impl LanTransport {
 
     /// Validate that the device at `address` is reachable and has UI Bridge
     /// running.  Returns a `DiscoveredApp` with the device's metadata.
-    pub async fn check_device(
-        &self,
-        address: SocketAddr,
-    ) -> Result<DiscoveredApp, TransportError> {
+    pub async fn check_device(&self, address: SocketAddr) -> Result<DiscoveredApp, TransportError> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -39,13 +36,14 @@ impl LanTransport {
 
         let url = format!("http://{}/ui-bridge/health", address);
 
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| TransportError::DeviceUnreachable {
-                address: address.to_string(),
-            })?;
+        let resp =
+            client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| TransportError::DeviceUnreachable {
+                    address: address.to_string(),
+                })?;
 
         let body: serde_json::Value =
             resp.json()
@@ -55,12 +53,12 @@ impl LanTransport {
                     reason: format!("invalid JSON: {}", e),
                 })?;
 
-        let ui_bridge = body.get("uiBridge").ok_or_else(|| {
-            TransportError::HealthCheckFailed {
+        let ui_bridge = body
+            .get("uiBridge")
+            .ok_or_else(|| TransportError::HealthCheckFailed {
                 address: address.to_string(),
                 reason: "response missing 'uiBridge' field".to_string(),
-            }
-        })?;
+            })?;
 
         let now = chrono::Utc::now().timestamp_millis();
 

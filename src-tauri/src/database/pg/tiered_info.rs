@@ -1723,7 +1723,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool: {}", e))?;
         // transition_reliability table does not exist in the schema — return empty
-        tracing::debug!(config_id, "get_transition_metrics: transition_reliability table not in schema");
+        tracing::debug!(
+            config_id,
+            "get_transition_metrics: transition_reliability table not in schema"
+        );
         let _ = conn; // suppress unused warning
         Ok(vec![])
     }
@@ -1739,7 +1742,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool: {}", e))?;
         // element_resolution_metrics table does not exist in the schema — return empty
-        tracing::debug!(config_id, "get_element_metrics: element_resolution_metrics table not in schema");
+        tracing::debug!(
+            config_id,
+            "get_element_metrics: element_resolution_metrics table not in schema"
+        );
         let _ = conn; // suppress unused warning
         Ok(vec![])
     }

@@ -2261,10 +2261,7 @@ impl PgDb {
             .collect();
 
         if pending.is_empty() {
-            info!(
-                "Schema is up to date at version {}",
-                current_version
-            );
+            info!("Schema is up to date at version {}", current_version);
             return Ok(());
         }
 
@@ -2291,10 +2288,7 @@ impl PgDb {
             // Execute the migration SQL (skip empty / no-op migrations).
             if !migration.sql.trim().is_empty() {
                 txn.batch_execute(migration.sql).await.map_err(|e| {
-                    error!(
-                        "Migration v{} failed: {}",
-                        migration.version, e
-                    );
+                    error!("Migration v{} failed: {}", migration.version, e);
                     format!(
                         "Migration v{} ({}) failed: {}",
                         migration.version, migration.description, e
@@ -2311,19 +2305,11 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| {
-                format!(
-                    "Failed to record migration v{}: {}",
-                    migration.version, e
-                )
-            })?;
+            .map_err(|e| format!("Failed to record migration v{}: {}", migration.version, e))?;
 
-            txn.commit().await.map_err(|e| {
-                format!(
-                    "Failed to commit migration v{}: {}",
-                    migration.version, e
-                )
-            })?;
+            txn.commit()
+                .await
+                .map_err(|e| format!("Failed to commit migration v{}: {}", migration.version, e))?;
 
             info!(
                 "Migration v{} applied successfully: {}",
@@ -2528,8 +2514,8 @@ mod migration_tests {
     #[test]
     fn migration_sql_statements_look_parseable() {
         const KEYWORDS: &[&str] = &[
-            "CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT",
-            "GRANT", "REVOKE", "COMMENT", "WITH", "DO",
+            "CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT", "GRANT", "REVOKE",
+            "COMMENT", "WITH", "DO",
         ];
 
         for migration in MIGRATIONS {
@@ -2649,10 +2635,7 @@ mod migration_tests {
     #[test]
     fn ensure_tables_subset_of_schema_pg_sql() {
         let schema_sql = include_str!("../../../schema.pg.sql");
-        let re = regex::Regex::new(
-            r"(?i)CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)",
-        )
-        .unwrap();
+        let re = regex::Regex::new(r"(?i)CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)").unwrap();
 
         let schema_tables: std::collections::HashSet<String> = re
             .captures_iter(schema_sql)

@@ -46,12 +46,15 @@ pub async fn generate_entity_profile(
     let obs_ids: Vec<i64> = observations.iter().map(|o| o.id).collect();
 
     // 2. Gather observation types for topic extraction
-    let mut topic_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut topic_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for obs in &observations {
         if let Some(ref tk) = obs.topic_key {
             *topic_counts.entry(tk.clone()).or_insert(0) += 1;
         }
-        *topic_counts.entry(obs.observation_type.clone()).or_insert(0) += 1;
+        *topic_counts
+            .entry(obs.observation_type.clone())
+            .or_insert(0) += 1;
     }
 
     // Sort topics by frequency, take top 5
@@ -162,10 +165,7 @@ pub async fn generate_entity_profile(
     .await
     {
         Ok((summary, detail)) => {
-            debug!(
-                entity_label,
-                "Generated LLM-based entity profile"
-            );
+            debug!(entity_label, "Generated LLM-based entity profile");
             (summary, Some(detail))
         }
         Err(e) => {
@@ -191,19 +191,28 @@ pub async fn generate_entity_profile(
         entity_label: entity_label.to_string(),
         profile_summary,
         profile_detail,
-        source_observation_ids: if obs_ids.is_empty() { None } else { Some(obs_ids) },
-        source_finding_ids: if finding_ids.is_empty() { None } else { Some(finding_ids) },
+        source_observation_ids: if obs_ids.is_empty() {
+            None
+        } else {
+            Some(obs_ids)
+        },
+        source_finding_ids: if finding_ids.is_empty() {
+            None
+        } else {
+            Some(finding_ids)
+        },
         source_fix_ids: None,
-        source_cross_run_pattern_ids: if pattern_ids.is_empty() { None } else { Some(pattern_ids) },
+        source_cross_run_pattern_ids: if pattern_ids.is_empty() {
+            None
+        } else {
+            Some(pattern_ids)
+        },
     };
 
     let id = pg.save_entity_profile(&input).await?;
     info!(
         entity_kind,
-        entity_id,
-        entity_label,
-        id,
-        "Generated entity profile"
+        entity_id, entity_label, id, "Generated entity profile"
     );
 
     Ok(id)
@@ -266,7 +275,13 @@ pub async fn generate_profiles_for_graph_entities(
     let candidates: Vec<(&str, &str, &str)> = graph
         .iter_node_weights()
         .filter(|node| target_strs.contains(&node.kind.as_str()))
-        .map(|node| (node.kind.as_str(), node.entity_id.as_str(), node.label.as_str()))
+        .map(|node| {
+            (
+                node.kind.as_str(),
+                node.entity_id.as_str(),
+                node.label.as_str(),
+            )
+        })
         .collect();
 
     info!(
@@ -370,10 +385,7 @@ async fn generate_profile_via_llm(
         patterns_section.push_str(&format!("- {}\n", preview));
     }
     if pattern_previews.len() > 10 {
-        patterns_section.push_str(&format!(
-            "  ... and {} more\n",
-            pattern_previews.len() - 10
-        ));
+        patterns_section.push_str(&format!("  ... and {} more\n", pattern_previews.len() - 10));
     }
     if patterns_section.is_empty() {
         patterns_section.push_str("  (none)\n");
@@ -414,9 +426,9 @@ async fn generate_profile_via_llm(
         ai_provider::run_prompt_with_model_override(
             &prompt_clone,
             &context,
-            None, // doctor_handle
-            None, // model_override — uses Haiku-class via task router
-            None, // provider_override
+            None,      // doctor_handle
+            None,      // model_override — uses Haiku-class via task router
+            None,      // provider_override
             Some(0.3), // low temperature for structured output
             Some(1024),
             None, // fallback_model
@@ -429,7 +441,9 @@ async fn generate_profile_via_llm(
     if !response.success {
         return Err(format!(
             "LLM call failed: {:?}",
-            response.error.unwrap_or_else(|| "unknown error".to_string())
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
         ));
     }
 

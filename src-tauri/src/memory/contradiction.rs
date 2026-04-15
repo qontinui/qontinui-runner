@@ -32,9 +32,8 @@ fn recency_score(valid_from: &str) -> f64 {
     let parsed = chrono::DateTime::parse_from_rfc3339(valid_from);
     match parsed {
         Ok(dt) => {
-            let age_days = (chrono::Utc::now() - dt.with_timezone(&chrono::Utc))
-                .num_hours() as f64
-                / 24.0;
+            let age_days =
+                (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_hours() as f64 / 24.0;
             // Exponential decay with ~30-day half-life
             (-0.0231 * age_days).exp()
         }
@@ -217,7 +216,7 @@ async fn llm_resolve(
             &context,
             None, // doctor_handle
             model_override,
-            None, // provider_override — use default
+            None,      // provider_override — use default
             Some(0.2), // low temperature for structured output
             Some(512),
             None, // fallback_model

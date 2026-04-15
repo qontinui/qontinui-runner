@@ -156,7 +156,10 @@ impl PgDb {
     /// Get the GitHub token from the PR watch associated with a task run.
     /// Returns the most recently created watch's token (active or completed — the
     /// token remains valid even after the watch finishes).
-    pub async fn get_pr_watch_token_for_task(&self, task_run_id: &str) -> Result<Option<String>, String> {
+    pub async fn get_pr_watch_token_for_task(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Option<String>, String> {
         let conn = self
             .pool
             .get()

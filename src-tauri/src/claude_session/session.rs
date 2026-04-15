@@ -140,8 +140,13 @@ impl ClaudeSession {
 
         // Set CLAUDE_CONFIG_DIR to the resolved account (for multi-account support)
         let ai_settings = crate::settings::get_ai_settings();
-        if let Some(config_dir) = crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli) {
-            info!("Setting CLAUDE_CONFIG_DIR={} for session {}", config_dir, session_id);
+        if let Some(config_dir) =
+            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli)
+        {
+            info!(
+                "Setting CLAUDE_CONFIG_DIR={} for session {}",
+                config_dir, session_id
+            );
             cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
         }
 
@@ -447,8 +452,13 @@ impl ClaudeSession {
                 use tauri::Manager;
                 if let Some(app_state) = app_handle_stdout.try_state::<std::sync::Arc<AppState>>() {
                     app_state.file_lock_manager.release_all_sync(fallback_id);
-                    app_state.file_registry_manager.release_all_sync(fallback_id);
-                    info!("[STDOUT_READER] Released file locks for terminal session {}", fallback_id);
+                    app_state
+                        .file_registry_manager
+                        .release_all_sync(fallback_id);
+                    info!(
+                        "[STDOUT_READER] Released file locks for terminal session {}",
+                        fallback_id
+                    );
                 }
             }
 
@@ -1144,8 +1154,9 @@ impl ClaudeSession {
             return;
         }
 
-        let new_config_dir = get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli)
-            .unwrap_or_else(|| "unknown".to_string());
+        let new_config_dir =
+            get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli)
+                .unwrap_or_else(|| "unknown".to_string());
         let label = std::path::Path::new(&new_config_dir)
             .file_name()
             .and_then(|n| n.to_str())
@@ -1183,7 +1194,10 @@ impl ClaudeSession {
                 .unwrap_or_default();
 
             if output_log.is_empty() {
-                info!("No conversation history to replay for session {}", session_id);
+                info!(
+                    "No conversation history to replay for session {}",
+                    session_id
+                );
                 None
             } else {
                 let turns = parse_conversation(&output_log);

@@ -302,7 +302,10 @@ impl CodeExecutionHandler {
                     false,
                     None,
                     String::new(),
-                    format!("Code execution timed out after {} seconds", timeout_secs_val),
+                    format!(
+                        "Code execution timed out after {} seconds",
+                        timeout_secs_val
+                    ),
                 ),
             }
         } else {

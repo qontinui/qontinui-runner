@@ -52,9 +52,7 @@ pub async fn spawn_review_subtask(
     let uuid_prefix: String = uuid::Uuid::new_v4().to_string().chars().take(8).collect();
     let review_id = format!(
         "review-{}-pr{}-{}",
-        parent_prefix,
-        config.pr_number,
-        uuid_prefix,
+        parent_prefix, config.pr_number, uuid_prefix,
     );
     let review_name = format!(
         "Review PR #{} ({})",
@@ -288,7 +286,8 @@ pub async fn process_review_outcome(
         Err(e) => {
             tracing::warn!(
                 "Failed to read review output for {}: {}, allowing parent to proceed",
-                review_task_run_id, e
+                review_task_run_id,
+                e
             );
             return true;
         }
@@ -298,7 +297,8 @@ pub async fn process_review_outcome(
     let outcome = parse_review_outcome(&output);
     tracing::info!(
         "Review subtask {} outcome: {:?}",
-        review_task_run_id, outcome
+        review_task_run_id,
+        outcome
     );
 
     // 3. Read PR context from result_data
@@ -355,19 +355,24 @@ pub async fn process_review_outcome(
                     {
                         tracing::warn!(
                             "Failed to post GitHub review for PR #{} in {}: {}",
-                            pr_number, repo_full_name, e
+                            pr_number,
+                            repo_full_name,
+                            e
                         );
                         github_post_failed = true;
                     } else {
                         tracing::info!(
                             "Posted {} review on PR #{} in {}",
-                            event, pr_number, repo_full_name
+                            event,
+                            pr_number,
+                            repo_full_name
                         );
                     }
                 } else {
                     tracing::warn!(
                         "Failed to create GitHub client for review of PR #{}: {:?}",
-                        pr_number, client_result.err()
+                        pr_number,
+                        client_result.err()
                     );
                     github_post_failed = true;
                 }

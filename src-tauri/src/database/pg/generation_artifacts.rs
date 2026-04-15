@@ -164,9 +164,7 @@ impl PgDb {
     ///
     /// Joins `generation_pipeline_artifacts` with `workflow_generation_feedback`
     /// to produce the 12-field `DashboardMetrics` shape the frontend expects.
-    pub async fn get_generator_dashboard_metrics(
-        &self,
-    ) -> Result<serde_json::Value, String> {
+    pub async fn get_generator_dashboard_metrics(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool
             .get()
@@ -234,10 +232,7 @@ impl PgDb {
     }
 
     /// Daily time-series of generator activity over the last `days` days.
-    pub async fn get_generator_trends(
-        &self,
-        days: i32,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    pub async fn get_generator_trends(&self, days: i32) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
             .get()
@@ -264,23 +259,19 @@ impl PgDb {
                ORDER BY day"#,
             days
         );
-        let rows = conn
-            .query(sql.as_str(), &[])
-            .await
-            .map_err(|e| {
-                // Include the error source chain — tokio_postgres::Error's
-                // top-level Display can collapse to "db error" and hide the
-                // actual SQLSTATE/column/message from Postgres.
-                let mut detail = format!("{}", e);
-                let mut src: Option<&(dyn std::error::Error + 'static)> =
-                    std::error::Error::source(&e);
-                while let Some(s) = src {
-                    detail.push_str(" | ");
-                    detail.push_str(&s.to_string());
-                    src = std::error::Error::source(s);
-                }
-                format!("PG get_generator_trends: {}", detail)
-            })?;
+        let rows = conn.query(sql.as_str(), &[]).await.map_err(|e| {
+            // Include the error source chain — tokio_postgres::Error's
+            // top-level Display can collapse to "db error" and hide the
+            // actual SQLSTATE/column/message from Postgres.
+            let mut detail = format!("{}", e);
+            let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+            while let Some(s) = src {
+                detail.push_str(" | ");
+                detail.push_str(&s.to_string());
+                src = std::error::Error::source(s);
+            }
+            format!("PG get_generator_trends: {}", detail)
+        })?;
 
         Ok(rows
             .iter()

@@ -497,19 +497,35 @@ pub struct ExecutionStepConfig {
     // Visual Assertion
     // ========================================================================
     /// Visual assertion type: "text", "screenshot", or "highlight".
-    #[serde(alias = "visualAssertionType", alias = "visual_assertion_type", default)]
+    #[serde(
+        alias = "visualAssertionType",
+        alias = "visual_assertion_type",
+        default
+    )]
     pub visual_assertion_type: Option<String>,
 
     /// Element query (JSON) for text assertions.
-    #[serde(alias = "visualAssertionQuery", alias = "visual_assertion_query", default)]
+    #[serde(
+        alias = "visualAssertionQuery",
+        alias = "visual_assertion_query",
+        default
+    )]
     pub visual_assertion_query: Option<serde_json::Value>,
 
     /// Expected text (for text assertion) or element ID (for screenshot/highlight).
-    #[serde(alias = "visualAssertionExpected", alias = "visual_assertion_expected", default)]
+    #[serde(
+        alias = "visualAssertionExpected",
+        alias = "visual_assertion_expected",
+        default
+    )]
     pub visual_assertion_expected: Option<String>,
 
     /// Options JSON for the assertion (TextAssertionOptions or ScreenshotAssertionOptions).
-    #[serde(alias = "visualAssertionOptions", alias = "visual_assertion_options", default)]
+    #[serde(
+        alias = "visualAssertionOptions",
+        alias = "visual_assertion_options",
+        default
+    )]
     pub visual_assertion_options: Option<serde_json::Value>,
 
     // ========================================================================

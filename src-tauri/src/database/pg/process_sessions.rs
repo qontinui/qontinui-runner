@@ -413,10 +413,7 @@ impl PgDb {
 
     /// Delete process sessions (and their output via CASCADE) older than the
     /// retention period. Returns the number of sessions deleted.
-    pub async fn cleanup_old_process_sessions(
-        &self,
-        retention_days: u32,
-    ) -> Result<u32, String> {
+    pub async fn cleanup_old_process_sessions(&self, retention_days: u32) -> Result<u32, String> {
         let conn = self
             .pool
             .get()

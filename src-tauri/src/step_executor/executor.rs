@@ -781,7 +781,10 @@ impl StepExecutor {
                 // Save snapshot and wait for resume
                 match bp_manager.save_snapshot(&snapshot).await {
                     Ok(_) => {
-                        info!("Breakpoint snapshot {} saved, waiting for resume", snapshot.id);
+                        info!(
+                            "Breakpoint snapshot {} saved, waiting for resume",
+                            snapshot.id
+                        );
 
                         // Set task status to paused
                         let parent_id = get_parent_task_id(execution_id);
@@ -831,7 +834,10 @@ impl StepExecutor {
                         info!("Breakpoint {} resumed — continuing execution", snapshot.id);
                     }
                     Err(e) => {
-                        warn!("Failed to save breakpoint snapshot: {} — continuing without pause", e);
+                        warn!(
+                            "Failed to save breakpoint snapshot: {} — continuing without pause",
+                            e
+                        );
                     }
                 }
             }

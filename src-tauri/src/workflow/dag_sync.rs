@@ -160,9 +160,15 @@ pub async fn import_workflow_file(file_path: &Path, pg_db: &Arc<PgDb>) -> Import
     match upsert_result {
         Ok(_) => {
             if was_updated {
-                info!("dag_sync: updated workflow '{}' ({})", workflow_name, workflow_id);
+                info!(
+                    "dag_sync: updated workflow '{}' ({})",
+                    workflow_name, workflow_id
+                );
             } else {
-                info!("dag_sync: imported new workflow '{}' ({})", workflow_name, workflow_id);
+                info!(
+                    "dag_sync: imported new workflow '{}' ({})",
+                    workflow_name, workflow_id
+                );
             }
             ImportResult {
                 file_path: path_str,
@@ -230,10 +236,8 @@ pub async fn export_workflow_as_yaml(
     // 3. Build a minimal DagWorkflowDef from DB fields.
     //    We emit a single prompt node as a placeholder so the YAML is valid
     //    (at least one node required by the validator).
+    use crate::workflow::dag_schema::{DagNodeDef, NodeDefaults, TriggerRule, WorkflowSettings};
     use std::collections::HashMap;
-    use crate::workflow::dag_schema::{
-        DagNodeDef, NodeDefaults, TriggerRule, WorkflowSettings,
-    };
 
     let placeholder_node = DagNodeDef {
         name: Some(name.clone()),

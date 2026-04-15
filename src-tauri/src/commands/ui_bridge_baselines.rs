@@ -107,10 +107,7 @@ pub async fn sm_list_baselines(
     target_scope: Option<String>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<BaselineMeta>, String> {
-    app_state
-        .pg_db
-        .baseline_list(target_scope.as_deref())
-        .await
+    app_state.pg_db.baseline_list(target_scope.as_deref()).await
 }
 
 /// Delete a baseline by ID.

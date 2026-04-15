@@ -170,7 +170,8 @@ impl KnowledgeBase {
         related: &[String],
     ) -> Result<StoredTaskKnowledge, String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let related_files_json = serde_json::to_string(related).unwrap_or_else(|_| "[]".to_string());
+        let related_files_json =
+            serde_json::to_string(related).unwrap_or_else(|_| "[]".to_string());
         self.pg_db
             .create_task_knowledge(
                 &id,
@@ -689,10 +690,7 @@ impl KnowledgeBase {
     }
 
     /// Get all overrides for a task.
-    pub async fn get_all_overrides(
-        &self,
-        task_run_id: &str,
-    ) -> Result<OverrideCollection, String> {
+    pub async fn get_all_overrides(&self, task_run_id: &str) -> Result<OverrideCollection, String> {
         let knowledge = self
             .pg_db
             .list_task_knowledge(
@@ -756,7 +754,9 @@ impl KnowledgeBase {
         task_run_id: &str,
         criterion_id: &str,
     ) -> Result<bool, String> {
-        let overrides = self.get_criterion_overrides(task_run_id, criterion_id).await?;
+        let overrides = self
+            .get_criterion_overrides(task_run_id, criterion_id)
+            .await?;
         Ok(!overrides.is_empty())
     }
 
@@ -899,10 +899,7 @@ pub fn process_worker_output_full(
 // ============================================================================
 
 /// Query execution spans for a task run from the database.
-async fn query_execution_spans(
-    pg: &PgDb,
-    task_run_id: &str,
-) -> Result<Vec<ExecutionSpan>, String> {
+async fn query_execution_spans(pg: &PgDb, task_run_id: &str) -> Result<Vec<ExecutionSpan>, String> {
     let rows = pg.get_execution_spans(task_run_id).await?;
     Ok(rows
         .into_iter()

@@ -411,16 +411,13 @@ pub struct LoopConfig {
     /// Workflow execution architecture override.
     /// When set to "agentic_verification", the loop controller uses the agentic
     /// verification loop instead of the traditional verification-agentic loop.
-    pub workflow_architecture:
-        Option<crate::agentic_verification::WorkflowArchitecture>,
+    pub workflow_architecture: Option<crate::agentic_verification::WorkflowArchitecture>,
     /// Configuration for the agentic verification loop (only used when
     /// workflow_architecture = AgenticVerification).
-    pub agentic_verification_config:
-        Option<crate::agentic_verification::AgenticVerificationConfig>,
+    pub agentic_verification_config: Option<crate::agentic_verification::AgenticVerificationConfig>,
     /// Configuration for the multi-agent pipeline architecture (only used when
     /// workflow_architecture = MultiAgentPipeline).
-    pub multi_agent_pipeline_config:
-        Option<crate::agentic_verification::MultiAgentPipelineConfig>,
+    pub multi_agent_pipeline_config: Option<crate::agentic_verification::MultiAgentPipelineConfig>,
     /// Active canary rollout for this execution (runtime state, set by loop_controller::run).
     /// Tuple of (canary_id, recommendation_id). None if no canary is active.
     pub active_canary: Option<(String, String)>,

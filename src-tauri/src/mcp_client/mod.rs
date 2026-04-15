@@ -79,8 +79,7 @@ impl McpClientManager {
 
     /// Helper to get the PgDb global instance.
     fn pg_db() -> Result<std::sync::Arc<crate::database::pg::PgDb>, String> {
-        crate::database::pg::PgDb::try_global()
-            .ok_or_else(|| "PgDb not initialized".to_string())
+        crate::database::pg::PgDb::try_global().ok_or_else(|| "PgDb not initialized".to_string())
     }
 
     /// Get all configured MCP servers
@@ -242,21 +241,19 @@ impl McpClientManager {
 
         // Cache the tool list in the database
         if let Ok(tools_json) = serde_json::to_string(&tools) {
-            let _ = Self::pg_db()
-                .ok()
-                .map(|db| {
-                    let server_id = server_id.to_string();
-                    let now_clone = now.clone();
-                    tokio::spawn(async move {
-                        let _ = db
-                            .update_mcp_server_cached_tools(
-                                &server_id,
-                                Some(&tools_json),
-                                Some(&now_clone),
-                            )
-                            .await;
-                    });
+            let _ = Self::pg_db().ok().map(|db| {
+                let server_id = server_id.to_string();
+                let now_clone = now.clone();
+                tokio::spawn(async move {
+                    let _ = db
+                        .update_mcp_server_cached_tools(
+                            &server_id,
+                            Some(&tools_json),
+                            Some(&now_clone),
+                        )
+                        .await;
                 });
+            });
         }
 
         // Store the connection state
@@ -952,7 +949,11 @@ impl McpClientManager {
         info!(
             "Auto-starting {} MCP server(s): {}",
             servers.len(),
-            servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+            servers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
 
         for server in &servers {

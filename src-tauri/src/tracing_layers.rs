@@ -428,5 +428,4 @@ mod tests {
         assert!(json.contains("test.span"));
         assert!(json.contains("abc12345"));
     }
-
 }

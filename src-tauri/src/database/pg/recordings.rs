@@ -135,11 +135,7 @@ impl PgDb {
 
     /// Update a recording's status, and set `completed_at` when transitioning
     /// to a terminal status.
-    pub async fn update_recording_status(
-        &self,
-        id: &str,
-        status: &str,
-    ) -> Result<bool, String> {
+    pub async fn update_recording_status(&self, id: &str, status: &str) -> Result<bool, String> {
         let conn = self
             .pool
             .get()
@@ -333,8 +329,8 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
-        let options_json: Option<String> = options
-            .map(|o| serde_json::to_string(o).unwrap_or_else(|_| "null".to_string()));
+        let options_json: Option<String> =
+            options.map(|o| serde_json::to_string(o).unwrap_or_else(|_| "null".to_string()));
 
         conn.execute(
             r#"
@@ -426,26 +422,18 @@ impl PgDb {
             base_url: row.get(3),
             action_count: action_count.unwrap_or(0),
             status: status_str.parse().unwrap_or(RecordingStatus::Recording),
-            started_at: row
-                .get::<_, Option<String>>(6)
-                .unwrap_or_default(),
+            started_at: row.get::<_, Option<String>>(6).unwrap_or_default(),
             completed_at: row.get(7),
             duration_ms: duration_ms_raw.map(|v| v as i64),
             browser_info: browser_info_json.and_then(|s| serde_json::from_str(&s).ok()),
             tab_id: row.get(10),
             tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            created_at: row
-                .get::<_, Option<String>>(12)
-                .unwrap_or_default(),
-            updated_at: row
-                .get::<_, Option<String>>(13)
-                .unwrap_or_default(),
+            created_at: row.get::<_, Option<String>>(12).unwrap_or_default(),
+            updated_at: row.get::<_, Option<String>>(13).unwrap_or_default(),
         }
     }
 
-    fn recorded_action_row_to_struct(
-        row: &tokio_postgres::Row,
-    ) -> Result<RecordedAction, String> {
+    fn recorded_action_row_to_struct(row: &tokio_postgres::Row) -> Result<RecordedAction, String> {
         let action_type_str: String = row.get(3);
         let action_type: ActionType = action_type_str
             .parse()
@@ -471,9 +459,7 @@ impl PgDb {
             screenshot_path: row.get(8),
             timestamp: row.get(9),
             duration_ms: duration_ms.map(|v| v as i64),
-            created_at: row
-                .get::<_, Option<String>>(11)
-                .unwrap_or_default(),
+            created_at: row.get::<_, Option<String>>(11).unwrap_or_default(),
         })
     }
 
@@ -496,9 +482,7 @@ impl PgDb {
             script_content: row.get(3),
             file_name: row.get(4),
             options,
-            created_at: row
-                .get::<_, Option<String>>(6)
-                .unwrap_or_default(),
+            created_at: row.get::<_, Option<String>>(6).unwrap_or_default(),
         })
     }
 }

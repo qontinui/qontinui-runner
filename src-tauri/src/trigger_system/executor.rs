@@ -58,9 +58,7 @@ pub async fn execute_triggered_workflow(
     );
 
     // 1b. Check for DAG workflow routing
-    if let Some(dag_def) =
-        crate::workflow::dag_routing::check_dag_routing(workflow_id, db).await
-    {
+    if let Some(dag_def) = crate::workflow::dag_routing::check_dag_routing(workflow_id, db).await {
         let execution_id = format!(
             "trigger-{}-{}-{}",
             workflow_id,
@@ -104,10 +102,12 @@ pub async fn execute_triggered_workflow(
             // Store dag_node_metrics if available
             if let Ok(ref r) = result {
                 if let Ok(metrics_json) = serde_json::to_string(&r.node_metrics) {
-                    let _ = pg.set_task_run_result_data(
-                        &exec_id,
-                        &serde_json::json!({ "dag_node_metrics": metrics_json }).to_string(),
-                    ).await;
+                    let _ = pg
+                        .set_task_run_result_data(
+                            &exec_id,
+                            &serde_json::json!({ "dag_node_metrics": metrics_json }).to_string(),
+                        )
+                        .await;
                 }
             }
             tracing::info!(execution_id = %exec_id, ?duration, ?status, "DAG workflow finished");

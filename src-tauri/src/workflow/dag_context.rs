@@ -1,8 +1,8 @@
 //! DAG context utilities — connects fresh_context and sub_workflow
 //! modules to the DAG execution pipeline.
 
-use std::collections::HashMap;
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::workflow::dag_schema::{ContextMode, DagNodeDef};
 use crate::workflow::fresh_context::{build_fresh_context_prompt, IterationDiffSummary};
@@ -42,13 +42,9 @@ pub fn resolve_node_context(
 ///
 /// Returns Ok(()) if the sub-workflow invocation is allowed,
 /// or Err with a human-readable error message.
-pub fn validate_node_sub_workflow(
-    node: &DagNodeDef,
-    current_depth: u32,
-) -> Result<(), String> {
+pub fn validate_node_sub_workflow(node: &DagNodeDef, current_depth: u32) -> Result<(), String> {
     if let Some(ref wf_ref) = node.workflow_ref {
-        validate_sub_workflow(wf_ref, current_depth, None)
-            .map_err(|e| format!("{}", e))
+        validate_sub_workflow(wf_ref, current_depth, None).map_err(|e| format!("{}", e))
     } else {
         Ok(()) // Not a workflow_ref node
     }
@@ -253,7 +249,11 @@ mod tests {
         let result = validate_node_sub_workflow(&node, MAX_SUB_WORKFLOW_DEPTH);
         assert!(result.is_err(), "should fail at max depth");
         let msg = result.unwrap_err();
-        assert!(msg.contains("exceeds maximum"), "error should mention max depth: {}", msg);
+        assert!(
+            msg.contains("exceeds maximum"),
+            "error should mention max depth: {}",
+            msg
+        );
     }
 
     // ── NodeExecutionContext::for_node ───────────────────────────────────────
@@ -265,7 +265,10 @@ mod tests {
         let ctx = NodeExecutionContext::for_node(&node, "Do work.", 1, &store, &[], &[], 0);
         assert!(ctx.is_ok());
         let ctx = ctx.unwrap();
-        assert!(ctx.fresh_prompt.is_none(), "default context → no fresh prompt");
+        assert!(
+            ctx.fresh_prompt.is_none(),
+            "default context → no fresh prompt"
+        );
         assert!(!ctx.is_sub_workflow);
         assert_eq!(ctx.sub_workflow_depth, 0);
     }

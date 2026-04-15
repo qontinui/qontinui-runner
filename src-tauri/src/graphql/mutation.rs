@@ -319,11 +319,7 @@ impl MutationRoot {
         }
 
         // Expire any waiting breakpoint snapshots for this task (cleanup)
-        let _ = state
-            .app_state
-            .pg_db
-            .expire_breakpoint_snapshots(&id)
-            .await;
+        let _ = state.app_state.pg_db.expire_breakpoint_snapshots(&id).await;
 
         // Release URL locks
         state.app_state.url_lock_manager.release_all(&id).await;
@@ -478,10 +474,7 @@ impl MutationRoot {
         let run = 'pg: {
             match state.app_state.pg_db.create_task_run(&input).await {
                 Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!(
-                    "PG create_task_run failed in run_workflow: {}",
-                    e
-                ),
+                Err(e) => tracing::warn!("PG create_task_run failed in run_workflow: {}", e),
             }
             return Err(Error::new("PG create_task_run failed in run_workflow"));
         };

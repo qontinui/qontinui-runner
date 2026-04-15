@@ -297,17 +297,15 @@ impl CircuitBreaker {
 
     fn release_probe(&self) {
         // Use fetch_update to avoid atomic underflow wrapping to u32::MAX
-        let _ = self.active_probes.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |current| {
+        let _ = self
+            .active_probes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 if current > 0 {
                     Some(current - 1)
                 } else {
                     None // Don't decrement below zero
                 }
-            },
-        );
+            });
     }
 }
 
@@ -327,10 +325,9 @@ fn breakers() -> &'static DashMap<String, CircuitBreaker> {
 /// Get or create a circuit breaker for a provider.
 fn get_or_create(provider_key: &str) -> dashmap::mapref::one::Ref<'static, String, CircuitBreaker> {
     let map = breakers();
-    map.entry(provider_key.to_string())
-        .or_insert_with(|| {
-            CircuitBreaker::new(provider_key.to_string(), CircuitBreakerConfig::default())
-        });
+    map.entry(provider_key.to_string()).or_insert_with(|| {
+        CircuitBreaker::new(provider_key.to_string(), CircuitBreakerConfig::default())
+    });
     map.get(provider_key).unwrap()
 }
 
@@ -816,7 +813,10 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert!(found_half_open, "should receive HalfOpen event for test_provider");
+        assert!(
+            found_half_open,
+            "should receive HalfOpen event for test_provider"
+        );
 
         // Success closes the circuit
         cb.record_success();
@@ -834,7 +834,10 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert!(found_closed, "should receive Closed event for test_provider");
+        assert!(
+            found_closed,
+            "should receive Closed event for test_provider"
+        );
     }
 
     // ---- Edge cases ----

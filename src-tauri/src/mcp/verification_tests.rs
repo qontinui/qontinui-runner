@@ -131,7 +131,10 @@ pub async fn update_test(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            Err((status, Json(api_error(format!("Failed to update test: {}", e)))))
+            Err((
+                status,
+                Json(api_error(format!("Failed to update test: {}", e))),
+            ))
         }
     }
 }

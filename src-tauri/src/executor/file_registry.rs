@@ -520,11 +520,7 @@ impl FileLockManager {
     }
 
     /// Check if a file is held by a different session. Returns the holder name if so.
-    pub async fn is_held_by_other(
-        &self,
-        file_path: &str,
-        task_run_id: &str,
-    ) -> Option<String> {
+    pub async fn is_held_by_other(&self, file_path: &str, task_run_id: &str) -> Option<String> {
         let normalized = normalize_path(file_path);
         let state = self.state.read().await;
         state

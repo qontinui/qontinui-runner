@@ -243,11 +243,7 @@ mod tests {
         // Emit events out of order
         collector.emit_reward(0.85, "accuracy", 2);
         collector.emit_message("user", "Fix the bug", 0);
-        collector.emit_object(
-            "config",
-            serde_json::json!({"model": "claude"}),
-            1,
-        );
+        collector.emit_object("config", serde_json::json!({"model": "claude"}), 1);
         collector.emit_reward(0.92, "completeness", 3);
         collector.emit_message("assistant", "Done", 4);
 

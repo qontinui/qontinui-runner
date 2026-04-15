@@ -223,11 +223,10 @@ impl GitHubClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.token))
-                .unwrap_or_else(|e| {
-                    tracing::warn!("Invalid GitHub token header value: {e}");
-                    HeaderValue::from_static("Bearer invalid-token")
-                }),
+            HeaderValue::from_str(&format!("Bearer {}", self.token)).unwrap_or_else(|e| {
+                tracing::warn!("Invalid GitHub token header value: {e}");
+                HeaderValue::from_static("Bearer invalid-token")
+            }),
         );
         headers.insert(
             ACCEPT,
@@ -242,12 +241,7 @@ impl GitHubClient {
     }
 
     /// Fetch PR status.
-    pub async fn get_pr(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u64,
-    ) -> Result<PrStatus, String> {
+    pub async fn get_pr(&self, owner: &str, repo: &str, number: u64) -> Result<PrStatus, String> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/pulls/{}",
             owner, repo, number

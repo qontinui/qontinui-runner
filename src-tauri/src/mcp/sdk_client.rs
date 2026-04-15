@@ -3373,14 +3373,38 @@ pub fn routes() -> Router<Arc<ApiState>> {
             get(handle_design_get_style_guide).delete(handle_design_clear_style_guide),
         )
         // Visual automation (ui-bridge-auto)
-        .route("/ui-bridge/sdk/auto/assertText", post(handle_auto_assert_text))
-        .route("/ui-bridge/sdk/auto/extractText", post(handle_auto_extract_text))
-        .route("/ui-bridge/sdk/auto/assertScreenshot", post(handle_auto_assert_screenshot))
-        .route("/ui-bridge/sdk/auto/captureBaseline", post(handle_auto_capture_baseline))
-        .route("/ui-bridge/sdk/auto/highlightElement", post(handle_auto_highlight_element))
-        .route("/ui-bridge/sdk/auto/dismissHighlight", post(handle_auto_dismiss_highlight))
-        .route("/ui-bridge/sdk/auto/dismissAllHighlights", post(handle_auto_dismiss_all_highlights))
-        .route("/ui-bridge/sdk/auto/translateCoordinate", post(handle_auto_translate_coordinate))
+        .route(
+            "/ui-bridge/sdk/auto/assertText",
+            post(handle_auto_assert_text),
+        )
+        .route(
+            "/ui-bridge/sdk/auto/extractText",
+            post(handle_auto_extract_text),
+        )
+        .route(
+            "/ui-bridge/sdk/auto/assertScreenshot",
+            post(handle_auto_assert_screenshot),
+        )
+        .route(
+            "/ui-bridge/sdk/auto/captureBaseline",
+            post(handle_auto_capture_baseline),
+        )
+        .route(
+            "/ui-bridge/sdk/auto/highlightElement",
+            post(handle_auto_highlight_element),
+        )
+        .route(
+            "/ui-bridge/sdk/auto/dismissHighlight",
+            post(handle_auto_dismiss_highlight),
+        )
+        .route(
+            "/ui-bridge/sdk/auto/dismissAllHighlights",
+            post(handle_auto_dismiss_all_highlights),
+        )
+        .route(
+            "/ui-bridge/sdk/auto/translateCoordinate",
+            post(handle_auto_translate_coordinate),
+        )
         // Console capture / error tracking
         .route("/ui-bridge/sdk/console/health", get(handle_console_health))
         .route(

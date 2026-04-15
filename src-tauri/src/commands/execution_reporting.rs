@@ -918,9 +918,7 @@ pub async fn complete_execution_run(
         RunStatus::Completed => {
             let summary = format!(
                 "Run completed in {:.0}s ({} actions, {} failed)",
-                result.duration_seconds,
-                result.stats.total_actions,
-                result.stats.failed_actions
+                result.duration_seconds, result.stats.total_actions, result.stats.failed_actions
             );
             super::workflow_events::emit_run_completed(
                 &result.run_id,
@@ -929,10 +927,7 @@ pub async fn complete_execution_run(
             );
         }
         RunStatus::Failed | RunStatus::Timeout => {
-            let error_msg = request
-                .error_message
-                .as_deref()
-                .unwrap_or("Unknown error");
+            let error_msg = request.error_message.as_deref().unwrap_or("Unknown error");
             super::workflow_events::emit_run_failed(&result.run_id, error_msg);
         }
         _ => {} // Cancelled, Paused, etc. — no push notification

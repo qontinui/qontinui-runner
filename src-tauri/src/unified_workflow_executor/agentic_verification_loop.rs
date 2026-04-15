@@ -385,7 +385,10 @@ impl LoopController {
         // actually achieved its intent. Gated by QONTINUI_WORLD_STATE_VERIFIER.
         let wsv_mode = parse_mode();
         let wsm: Option<WorldStateVerifier> = if wsv_mode.is_active() {
-            info!("AGENTIC-VERIFICATION: World State Verifier active (mode={:?})", wsv_mode);
+            info!(
+                "AGENTIC-VERIFICATION: World State Verifier active (mode={:?})",
+                wsv_mode
+            );
             Some(WorldStateVerifier::from_env())
         } else {
             None
@@ -495,52 +498,50 @@ impl LoopController {
             // didn't run this round.
             let mut wsm_pre_for_panel: Option<String> = None;
             let mut wsm_post_for_panel: Option<String> = None;
-            let wsm_verdict: Option<(VerificationVerdict, u64)> =
-                if should_verify && wsm.is_some() && prev_pre_screenshot.is_some() {
-                    let wsm_start = std::time::Instant::now();
-                    let post_screenshot = self.try_capture_raw_screenshot().await;
-                    match (post_screenshot, prev_pre_screenshot.as_ref()) {
-                        (Some(post), Some(pre)) => {
-                            // Stash the pair for the canvas panel builder.
-                            wsm_pre_for_panel = Some(pre.clone());
-                            wsm_post_for_panel = Some(post.clone());
-                            let result = wsm
-                                .as_ref()
-                                .unwrap()
-                                .verify(pre, &post, &prev_worker_intent, Some(&goal))
-                                .await;
-                            let dur = wsm_start.elapsed().as_millis() as u64;
-                            match result {
-                                Ok(v) => {
-                                    info!(
-                                        "WSM: status={} confidence={:.2} ({}ms)",
-                                        v.status, v.confidence, dur
-                                    );
-                                    Some((v, dur))
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "WSM: verify failed ({}); falling back to text verifier",
-                                        e
-                                    );
-                                    None
-                                }
+            let wsm_verdict: Option<(VerificationVerdict, u64)> = if should_verify
+                && wsm.is_some()
+                && prev_pre_screenshot.is_some()
+            {
+                let wsm_start = std::time::Instant::now();
+                let post_screenshot = self.try_capture_raw_screenshot().await;
+                match (post_screenshot, prev_pre_screenshot.as_ref()) {
+                    (Some(post), Some(pre)) => {
+                        // Stash the pair for the canvas panel builder.
+                        wsm_pre_for_panel = Some(pre.clone());
+                        wsm_post_for_panel = Some(post.clone());
+                        let result = wsm
+                            .as_ref()
+                            .unwrap()
+                            .verify(pre, &post, &prev_worker_intent, Some(&goal))
+                            .await;
+                        let dur = wsm_start.elapsed().as_millis() as u64;
+                        match result {
+                            Ok(v) => {
+                                info!(
+                                    "WSM: status={} confidence={:.2} ({}ms)",
+                                    v.status, v.confidence, dur
+                                );
+                                Some((v, dur))
+                            }
+                            Err(e) => {
+                                warn!("WSM: verify failed ({}); falling back to text verifier", e);
+                                None
                             }
                         }
-                        _ => {
-                            debug!("WSM: skipping — no POST screenshot available");
-                            None
-                        }
                     }
-                } else {
-                    None
-                };
+                    _ => {
+                        debug!("WSM: skipping — no POST screenshot available");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
             // In Enabled mode with a valid WSM verdict, skip the text verifier
             // agent entirely. In Shadow mode, always run the text verifier
             // regardless of whether WSM returned something.
-            let skip_text_verifier =
-                wsv_mode == WsvMode::Enabled && wsm_verdict.is_some();
+            let skip_text_verifier = wsv_mode == WsvMode::Enabled && wsm_verdict.is_some();
 
             let text_verdict: Option<(VerificationVerdict, u64)> = if should_verify
                 && !skip_text_verifier
@@ -720,16 +721,17 @@ impl LoopController {
                         );
                         // Fire-and-forget PG insert. Never block the loop
                         // on a telemetry write — log and continue on error.
-                        let insert = crate::database::pg::wsv_disagreements::WsvDisagreementInsert {
-                            task_run_id: &config.execution_id,
-                            iteration: iteration as i32,
-                            text_status: &tv.status.to_string(),
-                            wsm_status: &wv.status.to_string(),
-                            text_confidence: tv.confidence,
-                            wsm_confidence: wv.confidence,
-                            intent: &prev_worker_intent,
-                            wsm_observations: &wv.observations,
-                        };
+                        let insert =
+                            crate::database::pg::wsv_disagreements::WsvDisagreementInsert {
+                                task_run_id: &config.execution_id,
+                                iteration: iteration as i32,
+                                text_status: &tv.status.to_string(),
+                                wsm_status: &wv.status.to_string(),
+                                text_confidence: tv.confidence,
+                                wsm_confidence: wv.confidence,
+                                intent: &prev_worker_intent,
+                                wsm_observations: &wv.observations,
+                            };
                         if self
                             .app_state
                             .pg_db
@@ -1164,8 +1166,8 @@ impl LoopController {
             // iteration AND the user has the show_screenshot_evidence toggle on.
             // Downsampling degrades gracefully to the original string on
             // any error, so we can always unwrap into the optional fields.
-            let embed_evidence = wsm_verdict.is_some()
-                && crate::verification::mode::show_screenshot_evidence();
+            let embed_evidence =
+                wsm_verdict.is_some() && crate::verification::mode::show_screenshot_evidence();
             let (pre_thumb, post_thumb) = if embed_evidence {
                 use crate::unified_workflow_executor::canvas_panels::screenshot_embed::{
                     downsample_screenshot_for_embed, THUMBNAIL_TARGET_WIDTH,

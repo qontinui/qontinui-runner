@@ -141,11 +141,7 @@ impl OptimizationPipeline {
         }
 
         // ── Step 4: Beam search — generate candidates ────────────────
-        let mut beam = BeamSearchState::new(
-            self.config.beam.clone(),
-            agent_type,
-            &seed_prompt,
-        );
+        let mut beam = BeamSearchState::new(self.config.beam.clone(), agent_type, &seed_prompt);
 
         // Gather failure evidence for critique context (includes concrete span examples)
         let evidence = self.gather_failure_evidence(&target).await;
@@ -195,8 +191,7 @@ impl OptimizationPipeline {
 
             // Execute each generation request via the LLM (sync, blocking)
             let responses = tokio::task::block_in_place(|| {
-                let mut out: Vec<(String, String, String)> =
-                    Vec::with_capacity(requests.len());
+                let mut out: Vec<(String, String, String)> = Vec::with_capacity(requests.len());
                 for req in &requests {
                     let context = crate::ai_router::TaskContext::from_prompt(&req.llm_prompt);
                     let resp = crate::ai_provider::routing::run_prompt_with_routing(
@@ -232,8 +227,7 @@ impl OptimizationPipeline {
 
         // ── Step 5: Create duel pool ─────────────────────────────────
         let pool_id = format!("dp-{}", uuid::Uuid::new_v4());
-        let config_json =
-            serde_json::to_string(&self.config).unwrap_or_else(|_| "{}".to_string());
+        let config_json = serde_json::to_string(&self.config).unwrap_or_else(|_| "{}".to_string());
 
         self.pg_db
             .create_duel_pool(&pool_id, agent_type, &config_json)
@@ -269,12 +263,7 @@ impl OptimizationPipeline {
         // Also create a beam search run record
         let beam_run_id = format!("bsr-{}", uuid::Uuid::new_v4());
         self.pg_db
-            .create_beam_search_run(
-                &beam_run_id,
-                agent_type,
-                Some(&pool_id),
-                &config_json,
-            )
+            .create_beam_search_run(&beam_run_id, agent_type, Some(&pool_id), &config_json)
             .await?;
 
         info!(
@@ -457,17 +446,11 @@ impl OptimizationPipeline {
             .rankings()
             .iter()
             .map(|(id, score)| {
-                let (alpha, beta) = pool
-                    .beta_posteriors
-                    .get(id)
-                    .copied()
-                    .unwrap_or((1.0, 1.0));
+                let (alpha, beta) = pool.beta_posteriors.get(id).copied().unwrap_or((1.0, 1.0));
                 (id.clone(), *score, alpha, beta)
             })
             .collect();
-        self.pg_db
-            .update_candidate_scores(pool_id, &scores)
-            .await?;
+        self.pg_db.update_candidate_scores(pool_id, &scores).await?;
 
         // Get the winner
         let rankings = pool.rankings();
@@ -541,8 +524,7 @@ impl OptimizationPipeline {
 
         // Record evolution
         let score_before = Some(1.0 - target_failure_rate_for(agent_type));
-        let baseline_hash =
-            Some(super::prompt_evolution::compute_prompt_hash(&winner_prompt));
+        let baseline_hash = Some(super::prompt_evolution::compute_prompt_hash(&winner_prompt));
 
         let evolution_id = super::prompt_evolution::record_evolution_full(
             &self.pg_db,
@@ -630,7 +612,9 @@ impl OptimizationPipeline {
             let triplets = TraceToMessages::convert(&span_events);
 
             for triplet in &triplets {
-                if triplet.reward < LOW_REWARD_THRESHOLD && failure_examples.len() < MAX_FAILURE_EXAMPLES {
+                if triplet.reward < LOW_REWARD_THRESHOLD
+                    && failure_examples.len() < MAX_FAILURE_EXAMPLES
+                {
                     let inp = if triplet.input.len() > CONTENT_TRUNCATE {
                         format!("{}...", &triplet.input[..CONTENT_TRUNCATE])
                     } else {
@@ -799,12 +783,8 @@ mod tests {
     /// ranking — composes correctly when all pieces are wired together.
     #[test]
     fn test_beam_to_duel_to_ranking_integration() {
-        use crate::meta_optimizer::beam_search::{
-            BeamSearchConfig, BeamSearchState,
-        };
-        use crate::meta_optimizer::duel_engine::{
-            CandidatePool, DuelCandidate, DuelResult,
-        };
+        use crate::meta_optimizer::beam_search::{BeamSearchConfig, BeamSearchState};
+        use crate::meta_optimizer::duel_engine::{CandidatePool, DuelCandidate, DuelResult};
         use rand::SeedableRng;
 
         // ── Step 1: Beam search produces candidates ──────────────
@@ -814,11 +794,8 @@ mod tests {
             max_generations: 1,
             ..Default::default()
         };
-        let mut beam = BeamSearchState::new(
-            config,
-            "verifier",
-            "You are a verifier. Check the output.",
-        );
+        let mut beam =
+            BeamSearchState::new(config, "verifier", "You are a verifier. Check the output.");
 
         // Simulate generation by injecting "LLM responses" as if they came
         // from real LLM calls. Each response contains a [BEAM_REWRITE] block.

@@ -85,8 +85,8 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Serialise event_data to TEXT (consistent with other TEXT-blob columns).
-        let event_data_str: Option<String> = event_data
-            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
+        let event_data_str: Option<String> =
+            event_data.map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
 
         let event_type_str = event_type.as_str();
 
@@ -141,7 +141,10 @@ impl PgDb {
             )
             .await
             .map_err(|e| {
-                error!("event_log_replay_from failed for execution {}: {}", execution_id, e);
+                error!(
+                    "event_log_replay_from failed for execution {}: {}",
+                    execution_id, e
+                );
                 format!("Failed to replay event log: {}", e)
             })?;
 
@@ -162,8 +165,7 @@ impl PgDb {
                     id: r.get::<_, i64>(0),
                     execution_id: r.get::<_, String>(1),
                     node_id: r.get::<_, String>(2),
-                    event_type: EventType::from_str(&event_type_str)
-                        .unwrap_or(EventType::Started),
+                    event_type: EventType::from_str(&event_type_str).unwrap_or(EventType::Started),
                     event_data,
                     cursor: r.get::<_, i64>(5),
                     created_at: r.get::<_, String>(6),
@@ -245,7 +247,10 @@ impl PgDb {
             )
             .await
             .map_err(|e| {
-                error!("event_log_prune_before failed for execution {}: {}", execution_id, e);
+                error!(
+                    "event_log_prune_before failed for execution {}: {}",
+                    execution_id, e
+                );
                 format!("Failed to prune event log: {}", e)
             })?;
 
@@ -255,10 +260,7 @@ impl PgDb {
     /// Get the latest cursor for an execution (for resume position on restart).
     ///
     /// Returns 0 if no events exist yet (fresh execution).
-    pub async fn event_log_latest_cursor(
-        &self,
-        execution_id: &str,
-    ) -> Result<i64, String> {
+    pub async fn event_log_latest_cursor(&self, execution_id: &str) -> Result<i64, String> {
         let conn = self
             .pool
             .get()
@@ -272,7 +274,10 @@ impl PgDb {
             )
             .await
             .map_err(|e| {
-                error!("event_log_latest_cursor failed for execution {}: {}", execution_id, e);
+                error!(
+                    "event_log_latest_cursor failed for execution {}: {}",
+                    execution_id, e
+                );
                 format!("Failed to get latest cursor: {}", e)
             })?;
 
@@ -282,10 +287,7 @@ impl PgDb {
     /// Delete all events for an execution (cleanup after completion or cancellation).
     ///
     /// Returns the number of rows deleted.
-    pub async fn event_log_delete_execution(
-        &self,
-        execution_id: &str,
-    ) -> Result<u64, String> {
+    pub async fn event_log_delete_execution(&self, execution_id: &str) -> Result<u64, String> {
         let conn = self
             .pool
             .get()

@@ -26,7 +26,10 @@ pub fn set_main_window_label(label: &str) {
 
 /// Get the main window label. Returns `"main"` if never explicitly set.
 pub fn get_main_window_label() -> &'static str {
-    MAIN_WINDOW_LABEL.get().map(|s| s.as_str()).unwrap_or("main")
+    MAIN_WINDOW_LABEL
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or("main")
 }
 
 /// Convenience: get the main WebviewWindow from an AppHandle.

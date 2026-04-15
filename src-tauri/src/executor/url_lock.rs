@@ -75,11 +75,9 @@ impl UrlLockManager {
 
             // Wait for any release event, with a periodic timeout so we
             // can re-check stale locks even if no release notification fires.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                self.notify.notified(),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(30), self.notify.notified())
+                    .await;
 
             self.cleanup_stale_locks().await;
         }
@@ -440,12 +438,8 @@ mod tests {
             "Workflow A",
         )
         .await;
-        mgr.acquire(
-            "http://localhost:9876/ui-bridge",
-            "task-2",
-            "Workflow B",
-        )
-        .await;
+        mgr.acquire("http://localhost:9876/ui-bridge", "task-2", "Workflow B")
+            .await;
 
         let locks = mgr.info().await;
         assert_eq!(locks.len(), 2);
@@ -462,12 +456,8 @@ mod tests {
             "Workflow A",
         )
         .await;
-        mgr.acquire(
-            "http://localhost:9876/ui-bridge",
-            "task-1",
-            "Workflow A",
-        )
-        .await;
+        mgr.acquire("http://localhost:9876/ui-bridge", "task-1", "Workflow A")
+            .await;
 
         // Task 2 holds one URL
         mgr.acquire("http://example.com/ui-bridge", "task-2", "Workflow B")

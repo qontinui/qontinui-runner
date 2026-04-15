@@ -124,8 +124,7 @@ pub fn rank_results<T>(
             if emb.len() != query_embedding.len() {
                 return None;
             }
-            let similarity =
-                crate::database::embeddings::cosine_similarity(query_embedding, &emb);
+            let similarity = crate::database::embeddings::cosine_similarity(query_embedding, &emb);
             if similarity < config.min_similarity {
                 return None;
             }

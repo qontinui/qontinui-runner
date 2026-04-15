@@ -108,7 +108,14 @@ impl PgDb {
                        ticket_url = EXCLUDED.ticket_url,
                        updated_at = NOW()
                    RETURNING id"#,
-                &[&id, &source, &external_id, &ticket_url, &task_run_id, &workflow_id],
+                &[
+                    &id,
+                    &source,
+                    &external_id,
+                    &ticket_url,
+                    &task_run_id,
+                    &workflow_id,
+                ],
             )
             .await
             .map_err(|e| format!("PG insert_ticket_task_mapping: {}", e))?;

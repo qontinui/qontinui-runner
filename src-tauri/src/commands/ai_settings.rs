@@ -790,7 +790,10 @@ pub struct AccountUsageInfo {
 ///
 /// The Anthropic 7-day window resets at `resets_at`. We compute how far
 /// through the current 7-day period we are and derive expected linear usage.
-fn compute_expected_usage(utilization: f64, resets_at: Option<u64>) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+fn compute_expected_usage(
+    utilization: f64,
+    resets_at: Option<u64>,
+) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
     let Some(reset_ts) = resets_at else {
         return (None, None, None, None);
     };
@@ -811,7 +814,12 @@ fn compute_expected_usage(utilization: f64, resets_at: Option<u64>) -> (Option<f
     let remaining_days = remaining_secs / 86400.0;
     let expected = elapsed_fraction; // linear expectation
     let delta = utilization - expected;
-    (Some(expected), Some(delta), Some(elapsed_fraction), Some(remaining_days))
+    (
+        Some(expected),
+        Some(delta),
+        Some(elapsed_fraction),
+        Some(remaining_days),
+    )
 }
 
 /// Read the OAuth access token from a Claude config directory's credentials file.
@@ -1368,7 +1376,8 @@ pub fn get_provider_api_key(provider: &str) -> Result<Option<String>, String> {
 /// Returns a snapshot of every provider that has been seen by the circuit breaker
 /// registry, along with its current state and availability.
 #[tauri::command]
-pub async fn get_provider_circuit_states() -> Result<Vec<crate::ai_provider::circuit_breaker::ProviderCircuitState>, String> {
+pub async fn get_provider_circuit_states(
+) -> Result<Vec<crate::ai_provider::circuit_breaker::ProviderCircuitState>, String> {
     Ok(crate::ai_provider::circuit_breaker::all_provider_circuit_states())
 }
 
@@ -1451,9 +1460,9 @@ pub fn save_wsv_settings(
         .map_err(|e| format!("Failed to save WSV settings: {}", e))?;
 
     // Update in-process live config so the next iteration picks it up.
-    crate::verification::WsvConfig::set_global(
-        crate::verification::WsvConfig::from_settings(&new_settings),
-    );
+    crate::verification::WsvConfig::set_global(crate::verification::WsvConfig::from_settings(
+        &new_settings,
+    ));
 
     Ok(CommandResponse {
         success: true,
@@ -1528,7 +1537,11 @@ pub async fn test_wsv_connection(endpoint: String) -> Result<WsvConnectionTestRe
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+                .filter_map(|m| {
+                    m.get("id")
+                        .and_then(|id| id.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -1551,10 +1564,7 @@ pub async fn list_wsv_disagreements(
     state: tauri::State<'_, std::sync::Arc<crate::commands::AppState>>,
     task_run_id: Option<String>,
     limit: Option<i64>,
-) -> Result<
-    Vec<crate::database::pg::wsv_disagreements::WsvDisagreementRow>,
-    String,
-> {
+) -> Result<Vec<crate::database::pg::wsv_disagreements::WsvDisagreementRow>, String> {
     let limit = crate::database::pg::wsv_disagreements::normalize_limit(limit);
     state
         .pg_db

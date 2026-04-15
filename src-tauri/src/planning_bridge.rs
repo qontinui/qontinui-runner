@@ -81,14 +81,14 @@ pub async fn request_htn_plan(
     let state_json = serde_json::to_string(world_state)
         .map_err(|e| format!("Failed to serialize world state: {}", e))?;
 
-    let task_json = serde_json::to_string(&task)
-        .map_err(|e| format!("Failed to serialize task: {}", e))?;
+    let task_json =
+        serde_json::to_string(&task).map_err(|e| format!("Failed to serialize task: {}", e))?;
 
     // Build a Python script that creates the planner, runs it, and prints
     // JSON to stdout. We pass state and task as escaped JSON strings inside
     // the script.
-    let multistate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../multistate/src");
+    let multistate_src =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../multistate/src");
     let multistate_src_str = multistate_src.display().to_string().replace('\\', "\\\\");
 
     let python_script = format!(
@@ -187,13 +187,21 @@ print(json.dumps({{
     }
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let json_line = stdout_str.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let json_line = stdout_str
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
 
     // Parse the raw JSON into an intermediate structure first, since the
     // Python planner returns actions as arrays [name, arg1, arg2, ...]
     // rather than {name, args} objects.
-    let raw: serde_json::Value = serde_json::from_str(json_line)
-        .map_err(|e| format!("Failed to parse planner output: {} (raw: {})", e, stdout_str))?;
+    let raw: serde_json::Value = serde_json::from_str(json_line).map_err(|e| {
+        format!(
+            "Failed to parse planner output: {} (raw: {})",
+            e, stdout_str
+        )
+    })?;
 
     let success = raw["success"].as_bool().unwrap_or(false);
     let planning_time_ms = raw["planning_time_ms"].as_f64().unwrap_or(0.0);
@@ -298,12 +306,11 @@ pub async fn execute_htn_attempt(
     let task_json = serde_json::to_string(&task_description)
         .map_err(|e| format!("Failed to serialize task: {}", e))?;
 
-    let multistate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../multistate/src");
+    let multistate_src =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../multistate/src");
     let multistate_src_str = multistate_src.display().to_string().replace('\\', "\\\\");
 
-    let qontinui_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../qontinui/src");
+    let qontinui_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../qontinui/src");
     let qontinui_src_str = qontinui_src.display().to_string().replace('\\', "\\\\");
 
     let python_script = format!(
@@ -400,7 +407,10 @@ print(json.dumps({{
 
     let python = config.python_path.as_deref().unwrap_or("python");
 
-    debug!("Running HTN execute_htn_attempt via: {} -c <script>", python);
+    debug!(
+        "Running HTN execute_htn_attempt via: {} -c <script>",
+        python
+    );
 
     let mut child = tokio::process::Command::new(python)
         .args(["-c", &python_script])
@@ -446,10 +456,18 @@ print(json.dumps({{
     }
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let json_line = stdout_str.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let json_line = stdout_str
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
 
-    let result: HtnExecutionResult = serde_json::from_str(json_line)
-        .map_err(|e| format!("Failed to parse HTN execution result: {} (raw: {})", e, stdout_str))?;
+    let result: HtnExecutionResult = serde_json::from_str(json_line).map_err(|e| {
+        format!(
+            "Failed to parse HTN execution result: {} (raw: {})",
+            e, stdout_str
+        )
+    })?;
 
     info!(
         "HTN execute result: plan_found={}, exec_success={}, actions={}, time={:.1}ms",

@@ -350,7 +350,10 @@ impl PgDb {
         // update API unable to express "remove the cap" — users must use a
         // full PUT/replace for that. Here we just layer the two: a Some in
         // the request overrides, otherwise keep the existing value.
-        let max_iterations = request.max_iterations.map(Some).unwrap_or(existing.max_iterations);
+        let max_iterations = request
+            .max_iterations
+            .map(Some)
+            .unwrap_or(existing.max_iterations);
         let timeout_seconds: Option<u64> = match &request.timeout_seconds {
             Some(val) => *val,
             None => existing.timeout_seconds,

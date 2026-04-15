@@ -231,18 +231,14 @@ where
                 let wait_secs = wait_duration.as_secs();
 
                 // Calculate which account will be used and when
-                let resume_time = chrono::Local::now()
-                    + chrono::Duration::seconds(wait_secs as i64);
+                let resume_time =
+                    chrono::Local::now() + chrono::Duration::seconds(wait_secs as i64);
                 let resume_str = resume_time.format("%H:%M:%S").to_string();
 
                 warn!(
                     "{}: all accounts rate-limited (cycle {}/{}). \
                      Waiting {}s — will retry at {} with next available account.",
-                    operation_name,
-                    rate_limit_waits,
-                    MAX_RATE_LIMIT_WAITS,
-                    wait_secs,
-                    resume_str,
+                    operation_name, rate_limit_waits, MAX_RATE_LIMIT_WAITS, wait_secs, resume_str,
                 );
 
                 std::thread::sleep(wait_duration);

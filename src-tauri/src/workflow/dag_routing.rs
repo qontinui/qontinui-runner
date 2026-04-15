@@ -34,10 +34,7 @@ use crate::workflow::dag_schema::{DagWorkflowDef, TriggerRule};
 /// `when` clauses, non-default `trigger_rule`, `loop_body`, `approval`,
 /// `cancel_reason`, or sub-`workflow_ref`) are also logged as explicitly
 /// requiring the DAG executor so operators can observe the routing decision.
-pub async fn check_dag_routing(
-    workflow_id: &str,
-    pg_db: &Arc<PgDb>,
-) -> Option<DagWorkflowDef> {
+pub async fn check_dag_routing(workflow_id: &str, pg_db: &Arc<PgDb>) -> Option<DagWorkflowDef> {
     let source_yaml = get_source_yaml(workflow_id, pg_db).await?;
 
     let def = match parse_dag_workflow(&source_yaml) {

@@ -998,11 +998,9 @@ pub async fn generate_unified_workflow_async_handler(
     }
 
     // Check for DAG workflow routing — if source_yaml exists, use DAG driver
-    if let Some(dag_def) = crate::workflow::dag_routing::check_dag_routing(
-        &saved_workflow.id,
-        &state.app_state.pg_db,
-    )
-    .await
+    if let Some(dag_def) =
+        crate::workflow::dag_routing::check_dag_routing(&saved_workflow.id, &state.app_state.pg_db)
+            .await
     {
         let dag_deps = crate::workflow::dag_driver::DagDriverDeps {
             app_state: state.app_state.clone(),
@@ -1016,8 +1014,7 @@ pub async fn generate_unified_workflow_async_handler(
         let pg = state.app_state.pg_db.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
-                crate::workflow::dag_driver::execute_dag_workflow(dag_def, dag_deps).await;
+            let result = crate::workflow::dag_driver::execute_dag_workflow(dag_def, dag_deps).await;
             let duration = start.elapsed().as_millis() as u64;
             let status = match &result {
                 Ok(r) if r.success => "completed",
@@ -1344,11 +1341,8 @@ pub async fn run_unified_workflow(
     }
 
     // Check for DAG workflow routing — if source_yaml exists, use DAG driver
-    if let Some(dag_def) = crate::workflow::dag_routing::check_dag_routing(
-        &id,
-        &state.app_state.pg_db,
-    )
-    .await
+    if let Some(dag_def) =
+        crate::workflow::dag_routing::check_dag_routing(&id, &state.app_state.pg_db).await
     {
         let execution_id = format!(
             "unified-workflow-{}-{}",
@@ -1376,8 +1370,7 @@ pub async fn run_unified_workflow(
         let pg = state.app_state.pg_db.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
-                crate::workflow::dag_driver::execute_dag_workflow(dag_def, dag_deps).await;
+            let result = crate::workflow::dag_driver::execute_dag_workflow(dag_def, dag_deps).await;
             let duration = start.elapsed().as_millis() as u64;
             let status = match &result {
                 Ok(r) if r.success => "completed",
@@ -1581,7 +1574,10 @@ pub async fn run_unified_workflow(
             if let Some(raf) = overrides.get("run_agentic_first").and_then(|v| v.as_bool()) {
                 loop_config.run_agentic_first = raf;
             }
-            info!("Applied runtime config overrides to loop_config: {}", overrides);
+            info!(
+                "Applied runtime config overrides to loop_config: {}",
+                overrides
+            );
         }
 
         let execution_id_for_guard = execution_id.clone();

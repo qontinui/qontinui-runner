@@ -66,7 +66,6 @@ pub mod checks; // Code quality checks (linting, formatting, type checking)
 pub mod clipboard; // Clipboard sync: share text to mobile via backend relay
 pub mod comparison; // Side-by-side architecture comparison runs
 pub mod config;
-pub mod file_browser; // Safe read-only filesystem browsing for mobile
 pub mod container_settings;
 pub mod context;
 pub mod cost_dashboard; // Cost dashboard with cache efficiency and phase breakdowns
@@ -80,6 +79,7 @@ pub mod execution;
 pub mod execution_reporting;
 pub mod execution_variables; // Execution variables (auth source, custom variables)
 pub mod extraction;
+pub mod file_browser; // Safe read-only filesystem browsing for mobile
 pub mod findings;
 pub mod flow; // Flow designer commands
 pub mod global_log_sources; // Global log source management
@@ -227,7 +227,8 @@ pub struct AppState {
         TokioMutex<HashMap<String, Arc<crate::cost_management::RunCostTrackers>>>,
     /// In-memory cache of pre-computed working representations, keyed by task_run_id.
     /// Avoids rebuilding expensive parallel PG queries on every prompt construction.
-    pub working_representation_cache: Arc<crate::memory::working_representation::WorkingRepresentationCache>,
+    pub working_representation_cache:
+        Arc<crate::memory::working_representation::WorkingRepresentationCache>,
 }
 
 impl AppState {

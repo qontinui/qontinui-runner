@@ -313,7 +313,10 @@ async fn handle_ws_terminal(
         let encoded = STANDARD.encode(&scrollback_data);
         let msg = serde_json::json!({"type": "buffer", "data": encoded}).to_string();
         if sender.send(Message::Text(msg.into())).await.is_err() {
-            debug!("WebSocket disconnected during scrollback send for terminal {}", terminal_id);
+            debug!(
+                "WebSocket disconnected during scrollback send for terminal {}",
+                terminal_id
+            );
             return;
         }
     }
@@ -340,7 +343,10 @@ async fn handle_ws_terminal(
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("WebSocket client lagged for terminal {}, skipped {} chunks", tid_out, n);
+                    warn!(
+                        "WebSocket client lagged for terminal {}, skipped {} chunks",
+                        tid_out, n
+                    );
                     let msg = serde_json::json!({
                         "type": "warning",
                         "message": format!("Skipped {} output chunks due to lag", n)
@@ -394,7 +400,10 @@ async fn handle_ws_terminal(
             Ok(Message::Close(_)) => break,
             Ok(_) => {} // Ping/Pong handled automatically by axum
             Err(e) => {
-                debug!("WebSocket receive error for terminal {}: {}", terminal_id, e);
+                debug!(
+                    "WebSocket receive error for terminal {}: {}",
+                    terminal_id, e
+                );
                 break;
             }
         }

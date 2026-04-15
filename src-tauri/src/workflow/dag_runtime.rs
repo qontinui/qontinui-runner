@@ -63,9 +63,7 @@ pub enum LayerAdvance {
         outcomes: HashMap<String, NodeOutcome>,
     },
     /// Workflow was cancelled by a cancel node.
-    Cancelled {
-        reason: String,
-    },
+    Cancelled { reason: String },
 }
 
 /// Summary of a completed DAG workflow execution.
@@ -86,7 +84,7 @@ pub struct DagWorkflowResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DagNodeMetric {
     pub node_id: String,
-    pub outcome: String,         // "success", "failed", "skipped", "cancelled"
+    pub outcome: String, // "success", "failed", "skipped", "cancelled"
     pub duration_ms: Option<u64>,
     pub retry_count: u32,
     pub was_skipped: bool,
@@ -147,7 +145,9 @@ impl DagRuntime {
                     self.finished = true;
                     self.outcomes.insert(
                         node_exec.node_id.clone(),
-                        NodeOutcome::Cancelled { reason: reason.clone() },
+                        NodeOutcome::Cancelled {
+                            reason: reason.clone(),
+                        },
                     );
                     return LayerAdvance::Cancelled { reason };
                 }
@@ -161,12 +161,8 @@ impl DagRuntime {
                 .map(|n| n.depends_on.clone())
                 .unwrap_or_default();
 
-            let decision = decide_node_execution(
-                node_exec,
-                &self.outcomes,
-                &depends_on,
-                &self.variables,
-            );
+            let decision =
+                decide_node_execution(node_exec, &self.outcomes, &depends_on, &self.variables);
 
             match decision {
                 NodeDecision::Execute => {
@@ -178,7 +174,9 @@ impl DagRuntime {
                 NodeDecision::Skip { reason } => {
                     self.outcomes.insert(
                         node_exec.node_id.clone(),
-                        NodeOutcome::Skipped { reason: reason.clone() },
+                        NodeOutcome::Skipped {
+                            reason: reason.clone(),
+                        },
                     );
                     skipped.push(SkippedNode {
                         node_id: node_exec.node_id.clone(),
@@ -190,7 +188,9 @@ impl DagRuntime {
                     self.finished = true;
                     self.outcomes.insert(
                         node_exec.node_id.clone(),
-                        NodeOutcome::Cancelled { reason: reason.clone() },
+                        NodeOutcome::Cancelled {
+                            reason: reason.clone(),
+                        },
                     );
                     return LayerAdvance::Cancelled { reason };
                 }
@@ -238,7 +238,10 @@ impl DagRuntime {
     /// Check if the workflow succeeded (no failures, no cancellation).
     pub fn is_success(&self) -> bool {
         self.cancel_reason.is_none()
-            && !self.outcomes.values().any(|o| matches!(o, NodeOutcome::Failed))
+            && !self
+                .outcomes
+                .values()
+                .any(|o| matches!(o, NodeOutcome::Failed))
     }
 
     /// Build the final result summary.
@@ -258,10 +261,19 @@ impl DagRuntime {
 
         for (node_id, outcome) in &self.outcomes {
             let (outcome_str, was_skipped) = match outcome {
-                NodeOutcome::Success => { completed += 1; ("success", false) }
-                NodeOutcome::Failed => { failed += 1; ("failed", false) }
-                NodeOutcome::Skipped { .. } => { skipped_count += 1; ("skipped", true) }
-                NodeOutcome::Cancelled { .. } => { ("cancelled", false) }
+                NodeOutcome::Success => {
+                    completed += 1;
+                    ("success", false)
+                }
+                NodeOutcome::Failed => {
+                    failed += 1;
+                    ("failed", false)
+                }
+                NodeOutcome::Skipped { .. } => {
+                    skipped_count += 1;
+                    ("skipped", true)
+                }
+                NodeOutcome::Cancelled { .. } => ("cancelled", false),
             };
             node_metrics.push(DagNodeMetric {
                 node_id: node_id.clone(),
@@ -382,8 +394,8 @@ nodes:
 
     #[test]
     fn test_simple_two_node_success() {
-        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML)
-            .expect("should parse and build plan");
+        let mut runtime =
+            DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML).expect("should parse and build plan");
 
         let mut results = HashMap::new();
         results.insert("nodeA", (true, None));
@@ -401,12 +413,11 @@ nodes:
     #[test]
     fn test_failure_propagates_skip() {
         // nodeA fails → nodeB (depends on nodeA with AllSuccess) should be skipped
-        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML).expect("should parse");
 
         let mut results = HashMap::new();
         results.insert("nodeA", (false, None)); // nodeA fails
-        results.insert("nodeB", (true, None));  // won't run
+        results.insert("nodeB", (true, None)); // won't run
 
         let result = drive_to_completion(&mut runtime, &results);
 
@@ -417,8 +428,7 @@ nodes:
 
     #[test]
     fn test_parallel_nodes_then_join() {
-        let mut runtime = DagRuntime::from_yaml(THREE_NODE_PARALLEL_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(THREE_NODE_PARALLEL_YAML).expect("should parse");
 
         let mut results = HashMap::new();
         results.insert("nodeA", (true, None));
@@ -433,8 +443,7 @@ nodes:
 
     #[test]
     fn test_cancel_node_stops_workflow() {
-        let mut runtime = DagRuntime::from_yaml(CANCEL_NODE_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(CANCEL_NODE_YAML).expect("should parse");
 
         // First advance: nodeA is ready
         let advance1 = runtime.advance();
@@ -451,7 +460,11 @@ nodes:
         assert!(matches!(advance2, LayerAdvance::Cancelled { .. }));
 
         if let LayerAdvance::Cancelled { reason } = advance2 {
-            assert!(reason.contains("cancelled") || reason.contains("Cancelled") || reason.contains("policy"));
+            assert!(
+                reason.contains("cancelled")
+                    || reason.contains("Cancelled")
+                    || reason.contains("policy")
+            );
         }
 
         assert!(runtime.cancel_reason.is_some());
@@ -459,8 +472,7 @@ nodes:
 
     #[test]
     fn test_when_condition_skips_node_on_false() {
-        let mut runtime = DagRuntime::from_yaml(WHEN_CONDITION_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(WHEN_CONDITION_YAML).expect("should parse");
 
         // nodeA returns output where proceed != 'yes'
         let advance1 = runtime.advance();
@@ -483,8 +495,7 @@ nodes:
 
     #[test]
     fn test_when_condition_executes_node_on_true() {
-        let mut runtime = DagRuntime::from_yaml(WHEN_CONDITION_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(WHEN_CONDITION_YAML).expect("should parse");
 
         let mut results = HashMap::new();
         results.insert("nodeA", (true, Some(json!({"proceed": "yes"}))));
@@ -499,8 +510,7 @@ nodes:
 
     #[test]
     fn test_all_done_trigger_runs_after_failure() {
-        let mut runtime = DagRuntime::from_yaml(ALL_DONE_TRIGGER_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(ALL_DONE_TRIGGER_YAML).expect("should parse");
 
         // nodeA fails, nodeB succeeds, nodeC has all_done so runs anyway
         let mut results = HashMap::new();
@@ -520,8 +530,7 @@ nodes:
 
     #[test]
     fn test_build_result_metrics() {
-        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML).expect("should parse");
 
         let mut results = HashMap::new();
         results.insert("nodeA", (true, None));
@@ -545,8 +554,7 @@ nodes:
 
     #[test]
     fn test_advance_after_finished_returns_complete() {
-        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML).expect("should parse");
 
         let mut results = HashMap::new();
         results.insert("nodeA", (true, None));
@@ -561,8 +569,7 @@ nodes:
 
     #[test]
     fn test_variable_propagation() {
-        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML).expect("should parse");
 
         let advance1 = runtime.advance();
         if let LayerAdvance::Ready { nodes, .. } = advance1 {
@@ -583,8 +590,7 @@ nodes:
 
     #[test]
     fn test_is_success_false_on_failure() {
-        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(SIMPLE_TWO_NODE_YAML).expect("should parse");
 
         let mut results = HashMap::new();
         results.insert("nodeA", (false, None));
@@ -596,8 +602,7 @@ nodes:
 
     #[test]
     fn test_is_success_false_on_cancel() {
-        let mut runtime = DagRuntime::from_yaml(CANCEL_NODE_YAML)
-            .expect("should parse");
+        let mut runtime = DagRuntime::from_yaml(CANCEL_NODE_YAML).expect("should parse");
 
         let advance1 = runtime.advance();
         if let LayerAdvance::Ready { nodes, .. } = advance1 {

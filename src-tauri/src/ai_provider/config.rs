@@ -104,7 +104,8 @@ pub fn rotate_account_on_rate_limit() -> bool {
         let available = config_dirs.iter().find(|d| {
             current.as_ref() != Some(*d)
                 && map
-                    .get(*d).is_none_or(|t| t.elapsed().as_secs() >= RATE_LIMIT_COOLDOWN_SECS)
+                    .get(*d)
+                    .is_none_or(|t| t.elapsed().as_secs() >= RATE_LIMIT_COOLDOWN_SECS)
         });
 
         if let Some(dir) = available {
@@ -177,9 +178,8 @@ pub fn time_until_next_account_available() -> Option<std::time::Duration> {
                     break;
                 }
                 let remaining = RATE_LIMIT_COOLDOWN_SECS - elapsed;
-                earliest_remaining = Some(
-                    earliest_remaining.map_or(remaining, |prev: u64| prev.min(remaining)),
-                );
+                earliest_remaining =
+                    Some(earliest_remaining.map_or(remaining, |prev: u64| prev.min(remaining)));
             } else {
                 // Account was never rate-limited — it's available
                 all_in_cooldown = false;
@@ -285,7 +285,10 @@ pub fn switch_to_account(config_dir: &str) -> bool {
         }
     }
 
-    info!("Manually switching to account '{}'", short_label(config_dir));
+    info!(
+        "Manually switching to account '{}'",
+        short_label(config_dir)
+    );
     set_resolved_config_dir(Some(config_dir.to_string()));
     true
 }

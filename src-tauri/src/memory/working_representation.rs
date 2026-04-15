@@ -23,9 +23,9 @@ static GLOBAL_WR_CACHE: OnceLock<Arc<WorkingRepresentationCache>> = OnceLock::ne
 impl WorkingRepresentationCache {
     /// Set the global cache instance. Call once during app initialization.
     pub fn set_global(cache: Arc<WorkingRepresentationCache>) {
-        GLOBAL_WR_CACHE
-            .set(cache)
-            .unwrap_or_else(|_| warn!("WorkingRepresentationCache::set_global called more than once (ignored)"));
+        GLOBAL_WR_CACHE.set(cache).unwrap_or_else(|_| {
+            warn!("WorkingRepresentationCache::set_global called more than once (ignored)")
+        });
     }
 
     /// Get the global cache instance. Returns None if not initialized.

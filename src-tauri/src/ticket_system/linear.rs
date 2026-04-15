@@ -83,11 +83,7 @@ impl LinearTicketProvider {
 
     /// Resolve the internal team ID from the team key (e.g., "ENG").
     /// Results are cached for the lifetime of this provider instance.
-    async fn resolve_team_id(
-        &self,
-        token: &str,
-        team_key: &str,
-    ) -> Result<String, String> {
+    async fn resolve_team_id(&self, token: &str, team_key: &str) -> Result<String, String> {
         // Check cache first
         if let Some(cached) = self.team_id_cache.lock().unwrap().get(team_key) {
             return Ok(cached.clone());
@@ -114,7 +110,10 @@ impl LinearTicketProvider {
             .map(|s| s.to_string())
             .ok_or_else(|| "Team ID missing from response".to_string())?;
 
-        self.team_id_cache.lock().unwrap().insert(team_key.to_string(), id.clone());
+        self.team_id_cache
+            .lock()
+            .unwrap()
+            .insert(team_key.to_string(), id.clone());
         Ok(id)
     }
 
@@ -148,18 +147,24 @@ impl LinearTicketProvider {
         // Cache all states from this response (avoids re-fetching for different state types)
         for state in states {
             if let (Some(sid), Some(stype)) = (state["id"].as_str(), state["type"].as_str()) {
-                self.workflow_state_cache.lock().unwrap()
+                self.workflow_state_cache
+                    .lock()
+                    .unwrap()
                     .insert((team_id.to_string(), stype.to_string()), sid.to_string());
             }
         }
 
-        self.workflow_state_cache.lock().unwrap()
+        self.workflow_state_cache
+            .lock()
+            .unwrap()
             .get(&cache_key)
             .cloned()
-            .ok_or_else(|| format!(
-                "No workflow state with type '{}' found for team {}",
-                state_type, team_id
-            ))
+            .ok_or_else(|| {
+                format!(
+                    "No workflow state with type '{}' found for team {}",
+                    state_type, team_id
+                )
+            })
     }
 
     /// Map a TicketState to a Linear workflow state type string.
@@ -190,10 +195,7 @@ impl TicketProvider for LinearTicketProvider {
         TicketSource::Linear
     }
 
-    async fn fetch_actionable(
-        &self,
-        config: &TicketProviderConfig,
-    ) -> Result<Vec<Ticket>, String> {
+    async fn fetch_actionable(&self, config: &TicketProviderConfig) -> Result<Vec<Ticket>, String> {
         let team_id = self
             .resolve_team_id(&config.api_token, &config.target)
             .await?;
@@ -211,7 +213,10 @@ impl TicketProvider for LinearTicketProvider {
                     format!("\"{}\"", escaped)
                 })
                 .collect();
-            format!(", labels: {{ name: {{ in: [{}] }} }}", labels_json.join(", "))
+            format!(
+                ", labels: {{ name: {{ in: [{}] }} }}",
+                labels_json.join(", ")
+            )
         };
 
         let query = format!(

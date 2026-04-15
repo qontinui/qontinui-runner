@@ -54,7 +54,12 @@ impl PgDb {
                            hit_count = 0,
                            created_at = NOW(),
                            expires_at = EXCLUDED.expires_at",
-            &[&query_hash, &reasoning_level, &result_json, &ttl_minutes.to_string()],
+            &[
+                &query_hash,
+                &reasoning_level,
+                &result_json,
+                &ttl_minutes.to_string(),
+            ],
         )
         .await
         .map_err(|e| format!("PG save_cached_query: {}", e))?;

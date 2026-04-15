@@ -27,8 +27,7 @@ impl PgDb {
             serde_json::to_string(&wr.entity_profiles).unwrap_or_else(|_| "[]".into());
         let findings_json =
             serde_json::to_string(&wr.recent_findings).unwrap_or_else(|_| "[]".into());
-        let fixes_json =
-            serde_json::to_string(&wr.recent_fixes).unwrap_or_else(|_| "[]".into());
+        let fixes_json = serde_json::to_string(&wr.recent_fixes).unwrap_or_else(|_| "[]".into());
         let skills_json =
             serde_json::to_string(&wr.applicable_skills).unwrap_or_else(|_| "[]".into());
 
@@ -398,10 +397,7 @@ impl PgDb {
     }
 
     /// Fetch approved/user skills ordered by usage count.
-    pub async fn fetch_skill_snapshots(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<SkillSnapshot>, String> {
+    pub async fn fetch_skill_snapshots(&self, limit: i64) -> Result<Vec<SkillSnapshot>, String> {
         let conn = self
             .pool
             .get()

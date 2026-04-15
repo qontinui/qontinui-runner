@@ -389,4 +389,3 @@ pub fn record_evolution_full_with_pg(
         baseline_prompt_hash,
     )
 }
-

@@ -24,10 +24,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/memory/entity-profiles", get(list_handler))
         .route("/memory/entity-profiles/search", get(search_handler))
-        .route(
-            "/memory/entity-profiles/{kind}/{id}",
-            get(get_handler),
-        )
+        .route("/memory/entity-profiles/{kind}/{id}", get(get_handler))
         .route("/memory/entity-profiles/generate", post(generate_handler))
         .route("/memory/entity-profiles/refresh", post(refresh_handler))
 }

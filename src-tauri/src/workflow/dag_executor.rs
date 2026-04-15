@@ -1,5 +1,5 @@
-use crate::workflow::dag_schema::TriggerRule;
 use super::variable_engine::VariableStore;
+use crate::workflow::dag_schema::TriggerRule;
 use std::collections::HashMap;
 
 /// Outcome of a node after execution.
@@ -75,11 +75,7 @@ pub fn evaluate_trigger_rule(
                 NodeDecision::Execute
             } else {
                 NodeDecision::Skip {
-                    reason: format!(
-                        "{} of {} upstream nodes failed",
-                        failures,
-                        depends_on.len()
-                    ),
+                    reason: format!("{} of {} upstream nodes failed", failures, depends_on.len()),
                 }
             }
         }
@@ -153,8 +149,8 @@ pub fn decide_node_execution(
 pub fn build_execution_plan(
     def: &crate::workflow::dag_schema::DagWorkflowDef,
 ) -> Result<DagExecutionPlan, String> {
-    use crate::workflow::dag_parser::dag_to_step_configs;
     use crate::step_executor::dag::compute_execution_layers;
+    use crate::workflow::dag_parser::dag_to_step_configs;
 
     let step_configs = dag_to_step_configs(def)?;
     let layers = compute_execution_layers(&step_configs)?;
@@ -177,9 +173,7 @@ pub fn build_execution_plan(
                     DagNodeExecution {
                         node_id,
                         step_index: idx,
-                        trigger_rule: node_def
-                            .map(|n| n.trigger_rule.clone())
-                            .unwrap_or_default(),
+                        trigger_rule: node_def.map(|n| n.trigger_rule.clone()).unwrap_or_default(),
                         when_condition: node_def.and_then(|n| n.when.clone()),
                     }
                 })
@@ -232,7 +226,12 @@ mod tests {
     fn test_one_success_skips_when_none_succeed() {
         let up = outcomes(&[
             ("a", NodeOutcome::Failed),
-            ("b", NodeOutcome::Skipped { reason: "x".to_string() }),
+            (
+                "b",
+                NodeOutcome::Skipped {
+                    reason: "x".to_string(),
+                },
+            ),
         ]);
         let deps = vec!["a".to_string(), "b".to_string()];
         let decision = evaluate_trigger_rule(&TriggerRule::OneSuccess, &up, &deps);
@@ -249,7 +248,15 @@ mod tests {
 
     #[test]
     fn test_none_failed_min_one_success_passes() {
-        let up = outcomes(&[("a", NodeOutcome::Success), ("b", NodeOutcome::Skipped { reason: "x".to_string() })]);
+        let up = outcomes(&[
+            ("a", NodeOutcome::Success),
+            (
+                "b",
+                NodeOutcome::Skipped {
+                    reason: "x".to_string(),
+                },
+            ),
+        ]);
         let deps = vec!["a".to_string(), "b".to_string()];
         let decision = evaluate_trigger_rule(&TriggerRule::NoneFailedMinOneSuccess, &up, &deps);
         assert!(matches!(decision, NodeDecision::Execute));

@@ -672,10 +672,7 @@ pub fn create_router(
                                 .timeout(std::time::Duration::from_secs(2))
                                 .build()
                                 .unwrap_or_else(|_| reqwest::Client::new());
-                            let url = format!(
-                                "http://127.0.0.1:{}/ui-bridge/health",
-                                local_port
-                            );
+                            let url = format!("http://127.0.0.1:{}/ui-bridge/health", local_port);
                             if client.get(&url).send().await.is_ok() {
                                 let now = chrono::Utc::now().timestamp_millis();
                                 let info = crate::mcp::physical_device::PhysicalDeviceInfo {
@@ -777,9 +774,8 @@ pub fn create_router(
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
-            let cloud_settings = crate::config_facade::get_setting::<
-                crate::settings::CloudRelaySettings,
-            >();
+            let cloud_settings =
+                crate::config_facade::get_setting::<crate::settings::CloudRelaySettings>();
             if !cloud_settings.device_bridge_enabled {
                 tracing::debug!("Cloud device bridge disabled, skipping registry poller");
                 return;
@@ -838,9 +834,8 @@ pub fn create_router(
                 return;
             }
 
-            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<
-                crate::mcp::discovery::mdns_scanner::MdnsEvent,
-            >(32);
+            let (event_tx, mut event_rx) =
+                tokio::sync::mpsc::channel::<crate::mcp::discovery::mdns_scanner::MdnsEvent>(32);
             let scanner = crate::mcp::discovery::mdns_scanner::MdnsScanner::new();
             scanner.start(event_tx);
 
@@ -852,8 +847,7 @@ pub fn create_router(
                 match event {
                     crate::mcp::discovery::mdns_scanner::MdnsEvent::Discovered(info) => {
                         if let Some(&addr) = info.addresses.first() {
-                            let socket_addr =
-                                std::net::SocketAddr::new(addr, info.port);
+                            let socket_addr = std::net::SocketAddr::new(addr, info.port);
                             tracing::info!(
                                 "mDNS device found: {} at {}",
                                 info.device_id,
@@ -876,40 +870,23 @@ pub fn create_router(
                                 }
                                 _ => crate::mcp::transport::DeviceOs::Android,
                             };
-                            let device_info =
-                                crate::mcp::physical_device::PhysicalDeviceInfo {
-                                    id: info.device_id.clone(),
-                                    os,
-                                    device_kind: "physical".to_string(),
-                                    model: info
-                                        .txt_records
-                                        .get("model")
-                                        .cloned(),
-                                    app_id: info
-                                        .txt_records
-                                        .get("app_id")
-                                        .cloned(),
-                                    ui_bridge_version: info
-                                        .txt_records
-                                        .get("version")
-                                        .cloned(),
-                                    first_seen_at: now,
-                                    pairing_token: info
-                                        .txt_records
-                                        .get("pairing_token")
-                                        .cloned(),
-                                };
-                            let transport =
-                                crate::mcp::physical_device::ActiveTransport {
-                                    kind: crate::mcp::transport::TransportKind::Lan,
-                                    proxy_url: format!(
-                                        "http://{}",
-                                        socket_addr
-                                    ),
-                                    established_at: now,
-                                    last_healthy_at: now,
-                                    fail_count: 0,
-                                };
+                            let device_info = crate::mcp::physical_device::PhysicalDeviceInfo {
+                                id: info.device_id.clone(),
+                                os,
+                                device_kind: "physical".to_string(),
+                                model: info.txt_records.get("model").cloned(),
+                                app_id: info.txt_records.get("app_id").cloned(),
+                                ui_bridge_version: info.txt_records.get("version").cloned(),
+                                first_seen_at: now,
+                                pairing_token: info.txt_records.get("pairing_token").cloned(),
+                            };
+                            let transport = crate::mcp::physical_device::ActiveTransport {
+                                kind: crate::mcp::transport::TransportKind::Lan,
+                                proxy_url: format!("http://{}", socket_addr),
+                                established_at: now,
+                                last_healthy_at: now,
+                                fail_count: 0,
+                            };
                             state
                                 .physical_device_registry
                                 .register(device_info, transport)
@@ -1185,7 +1162,9 @@ pub async fn start_server(
                         Some(name) => format!("Qontinui Runner — {} [:{}]", name, try_port),
                         None => format!("Qontinui Runner [:{}]", try_port),
                     };
-                    if let Some(window) = emitter.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
+                    if let Some(window) =
+                        emitter.get_webview_window(qontinui_runner_lib::get_main_window_label())
+                    {
                         if let Err(e) = window.set_title(&title) {
                             warn!("Failed to set window title: {}", e);
                         } else {

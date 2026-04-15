@@ -907,9 +907,7 @@ impl PgDb {
     ///
     /// Returns `(scanned, rewritten)`. Safe to run multiple times — rows that
     /// already match are left untouched.
-    pub async fn backfill_capture_screenshot_dimensions(
-        &self,
-    ) -> Result<(usize, usize), String> {
+    pub async fn backfill_capture_screenshot_dimensions(&self) -> Result<(usize, usize), String> {
         let conn = self
             .pool
             .get()
@@ -1237,8 +1235,8 @@ impl PgDb {
 
             // Classify: bounds extents vs physical image dimensions
             // "physical-in-physical": max extents are close to decoded physical dims
-            let phys_match_w = (max_right - phys_w).abs() < tolerance
-                || (max_right > 0.0 && max_right <= phys_w);
+            let phys_match_w =
+                (max_right - phys_w).abs() < tolerance || (max_right > 0.0 && max_right <= phys_w);
             let phys_match_h = (max_bottom - phys_h).abs() < tolerance
                 || (max_bottom > 0.0 && max_bottom <= phys_h);
 
@@ -1252,7 +1250,11 @@ impl PgDb {
 
             // Heuristic: if bounds extents are significantly smaller than physical
             // and scaling them up matches better, classify as CSS
-            let ratio_w = if phys_w > 0.0 { max_right / phys_w } else { 0.0 };
+            let ratio_w = if phys_w > 0.0 {
+                max_right / phys_w
+            } else {
+                0.0
+            };
 
             let classification = if max_right <= 0.0 && max_bottom <= 0.0 {
                 "unknown"

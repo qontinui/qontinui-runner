@@ -56,7 +56,15 @@ pub async fn create_version(
     let id = format!("rv-{}", uuid::Uuid::new_v4());
 
     pg_db
-        .create_resource_version(&id, resource_type, resource_key, next_version, &hash, content, metadata)
+        .create_resource_version(
+            &id,
+            resource_type,
+            resource_key,
+            next_version,
+            &hash,
+            content,
+            metadata,
+        )
         .await?;
 
     debug!(
@@ -78,7 +86,13 @@ pub fn create_version_sync(
     metadata: Option<&str>,
 ) -> Result<i64, String> {
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(create_version(pg_db, resource_type, resource_key, content, metadata))
+        Handle::current().block_on(create_version(
+            pg_db,
+            resource_type,
+            resource_key,
+            content,
+            metadata,
+        ))
     })
 }
 
@@ -114,8 +128,10 @@ pub fn diff_versions(a: &ResourceVersion, b: &ResourceVersion) -> String {
 
     let mut diff = format!(
         "--- v{} ({})\n+++ v{} ({})\n",
-        a.version, a.content_hash.get(..8).unwrap_or("?"),
-        b.version, b.content_hash.get(..8).unwrap_or("?"),
+        a.version,
+        a.content_hash.get(..8).unwrap_or("?"),
+        b.version,
+        b.content_hash.get(..8).unwrap_or("?"),
     );
 
     // Simple LCS-based diff (adequate for prompt comparison)
@@ -129,8 +145,7 @@ pub fn diff_versions(a: &ResourceVersion, b: &ResourceVersion) -> String {
             i += 1;
             j += 1;
         } else if j < lines_b.len()
-            && (i >= lines_a.len()
-                || lines_a[i..].iter().any(|&l| l == lines_b[j]))
+            && (i >= lines_a.len() || lines_a[i..].iter().any(|&l| l == lines_b[j]))
         {
             diff.push_str(&format!("+{}\n", lines_b[j]));
             j += 1;
@@ -185,8 +200,12 @@ mod tests {
         assert!(diff.contains(" line1"));
         assert!(diff.contains(" line2"));
         // No content additions (excluding the +++ header line)
-        assert!(!diff.lines().any(|l| l.starts_with('+') && !l.starts_with("+++")));
-        assert!(!diff.lines().any(|l| l.starts_with('-') && !l.starts_with("---")));
+        assert!(!diff
+            .lines()
+            .any(|l| l.starts_with('+') && !l.starts_with("+++")));
+        assert!(!diff
+            .lines()
+            .any(|l| l.starts_with('-') && !l.starts_with("---")));
     }
 
     #[test]

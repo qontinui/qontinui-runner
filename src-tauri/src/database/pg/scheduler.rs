@@ -4,11 +4,11 @@
 //! and scheduler_settings.
 
 use super::PgDb;
-use chrono::{DateTime, Utc};
 use crate::scheduler::{
     scheduled_task_type_default, ConditionScheduleConfig, ScheduleExpression, ScheduledTask,
     ScheduledTaskStatus, ScheduledTaskType, SchedulerSettings, TaskExecutionRecord,
 };
+use chrono::{DateTime, Utc};
 use tracing::warn;
 
 // ============================================================================
@@ -217,9 +217,18 @@ impl PgDb {
                 &task.skip_if_completed,
                 &task.auto_fix_on_failure,
                 &task.success_criteria,
-                &task.created_at.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
-                &task.modified_at.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
-                &task.next_run.as_deref().and_then(|s| s.parse::<DateTime<Utc>>().ok()),
+                &task
+                    .created_at
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+                &task
+                    .modified_at
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+                &task
+                    .next_run
+                    .as_deref()
+                    .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
                 &last_run_id,
             ],
         )
@@ -268,8 +277,14 @@ impl PgDb {
                 &task.skip_if_completed,
                 &task.auto_fix_on_failure,
                 &task.success_criteria,
-                &task.modified_at.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
-                &task.next_run.as_deref().and_then(|s| s.parse::<DateTime<Utc>>().ok()),
+                &task
+                    .modified_at
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+                &task
+                    .next_run
+                    .as_deref()
+                    .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
                 &last_run_id,
                 &task.id,
             ],

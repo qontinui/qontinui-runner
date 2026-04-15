@@ -100,21 +100,21 @@ pub async fn create_saved_api_request(
         .create_saved_api_request(&request)
         .await
     {
-        Ok(value) => match serde_json::from_value::<crate::saved_api_requests::SavedApiRequest>(
-            value,
-        ) {
-            Ok(parsed) => Ok(Json(ApiResponse::success(parsed))),
-            Err(e) => {
-                error!("Failed to parse created saved API request: {}", e);
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!(
-                        "Failed to parse created saved API request: {}",
-                        e
-                    ))),
-                ))
+        Ok(value) => {
+            match serde_json::from_value::<crate::saved_api_requests::SavedApiRequest>(value) {
+                Ok(parsed) => Ok(Json(ApiResponse::success(parsed))),
+                Err(e) => {
+                    error!("Failed to parse created saved API request: {}", e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!(
+                            "Failed to parse created saved API request: {}",
+                            e
+                        ))),
+                    ))
+                }
             }
-        },
+        }
         Err(e) => {
             error!("Failed to create saved API request: {}", e);
             Err((

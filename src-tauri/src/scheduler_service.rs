@@ -343,7 +343,8 @@ impl SchedulerService {
                         task_name,
                         auto_fix_on_failure,
                         Box::pin(async move {
-                            self.launch_unified_workflow(&workflow_id, monitor_index).await
+                            self.launch_unified_workflow(&workflow_id, monitor_index)
+                                .await
                         }),
                     )
                     .await;
@@ -376,9 +377,9 @@ impl SchedulerService {
                         task_id,
                         task_name,
                         auto_fix_on_failure,
-                        Box::pin(async move {
-                            self.launch_auto_fix(check_findings, force_run).await
-                        }),
+                        Box::pin(
+                            async move { self.launch_auto_fix(check_findings, force_run).await },
+                        ),
                     )
                     .await;
                 return;
@@ -416,8 +417,7 @@ impl SchedulerService {
             }
             // Async task types are handled by the launch_and_poll branch above
             // and return early; the compiler still needs them in this match.
-            ScheduledTaskType::Prompt { .. }
-            | ScheduledTaskType::AutoFix { .. } => unreachable!(
+            ScheduledTaskType::Prompt { .. } | ScheduledTaskType::AutoFix { .. } => unreachable!(
                 "Async task types must be handled by the launch_and_poll dispatch above"
             ),
         };
@@ -517,7 +517,9 @@ impl SchedulerService {
         task_id: String,
         task_name: String,
         auto_fix_on_failure: bool,
-        launch_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>,
+        launch_fut: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
+        >,
     ) {
         let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
         let execution_id = record.execution_id.clone();
@@ -877,9 +879,7 @@ impl SchedulerService {
             .and_then(|d| d.get("task_run_id"))
             .and_then(|v| v.as_str())
             .map(String::from)
-            .ok_or_else(|| {
-                "Launch endpoint reported success but omitted task_run_id".to_string()
-            })
+            .ok_or_else(|| "Launch endpoint reported success but omitted task_run_id".to_string())
     }
 
     /// Launch a prompt and return the resulting `session_id` (which is also

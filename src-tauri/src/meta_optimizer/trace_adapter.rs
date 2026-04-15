@@ -69,11 +69,7 @@ impl TraceToMessages {
             .collect();
 
         // Default reward if none found
-        let default_reward = rewards
-            .iter()
-            .map(|(_, v)| *v)
-            .next_back()
-            .unwrap_or(0.0);
+        let default_reward = rewards.iter().map(|(_, v)| *v).next_back().unwrap_or(0.0);
 
         for step in 0..=max_step {
             let mut input = None;
@@ -101,9 +97,8 @@ impl TraceToMessages {
 
             if let (Some(inp), Some(out)) = (input, output) {
                 // Use step reward, or nearest reward, or default
-                let r = reward.unwrap_or_else(|| {
-                    nearest_reward(&rewards, step).unwrap_or(default_reward)
-                });
+                let r = reward
+                    .unwrap_or_else(|| nearest_reward(&rewards, step).unwrap_or(default_reward));
                 triplets.push(MessageTriplet {
                     input: inp,
                     output: out,
@@ -144,7 +139,11 @@ impl TraceToTriplet {
         }
 
         let mut sorted = triplets.to_vec();
-        sorted.sort_by(|a, b| b.reward.partial_cmp(&a.reward).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.reward
+                .partial_cmp(&a.reward)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mut contrastive = Vec::new();
 
@@ -189,9 +188,7 @@ pub trait OptimizationAlgorithm: Send + Sync {
         &self,
         agent_type: &str,
         triplets: &[MessageTriplet],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + '_>>;
 }
 
 // ---------------------------------------------------------------------------

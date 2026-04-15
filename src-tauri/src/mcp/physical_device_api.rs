@@ -147,7 +147,11 @@ async fn connect_device(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ConnectDeviceResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let proxy_url = match state.physical_device_registry.get_active_proxy_url(&id).await {
+    let proxy_url = match state
+        .physical_device_registry
+        .get_active_proxy_url(&id)
+        .await
+    {
         Some(url) => url,
         None => {
             return Err((
@@ -196,7 +200,11 @@ async fn disconnect_device(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Find the proxy URL for this device
-    let proxy_url = match state.physical_device_registry.get_active_proxy_url(&id).await {
+    let proxy_url = match state
+        .physical_device_registry
+        .get_active_proxy_url(&id)
+        .await
+    {
         Some(url) => url,
         None => {
             return Err((
@@ -454,22 +462,13 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/devices/{id}/disconnect",
             post(disconnect_device),
         )
-        .route(
-            "/ui-bridge/devices/{id}/transport",
-            get(get_transport_info),
-        )
+        .route("/ui-bridge/devices/{id}/transport", get(get_transport_info))
         .route(
             "/ui-bridge/devices/{id}/transport/prefer",
             post(prefer_transport),
         )
         .route("/ui-bridge/devices/pair/initiate", post(initiate_pairing))
         .route("/ui-bridge/devices/pair/confirm", post(confirm_pairing))
-        .route(
-            "/ui-bridge/devices/{id}/pairing",
-            delete(revoke_pairing),
-        )
-        .route(
-            "/ui-bridge/devices/register-lan",
-            post(register_lan_device),
-        )
+        .route("/ui-bridge/devices/{id}/pairing", delete(revoke_pairing))
+        .route("/ui-bridge/devices/register-lan", post(register_lan_device))
 }

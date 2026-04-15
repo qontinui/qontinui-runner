@@ -150,7 +150,10 @@ impl PgDb {
                 return Ok(());
             }
         };
-        if let Err(e) = self.store_knowledge_embedding(knowledge_id, &embedding).await {
+        if let Err(e) = self
+            .store_knowledge_embedding(knowledge_id, &embedding)
+            .await
+        {
             tracing::warn!(
                 "embed_knowledge_content: store failed for {}: {} (row saved without embedding)",
                 knowledge_id,
@@ -694,5 +697,4 @@ impl PgDb {
 
         Ok(archived as usize)
     }
-
 }

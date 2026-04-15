@@ -91,7 +91,7 @@ pub fn determine_pr_action(
                     ci_context: CiFailureContext {
                         failed_check_names: failed_checks.clone(),
                         check_logs: HashMap::new(), // Logs fetched separately
-                        pr_number: None,             // Set by caller
+                        pr_number: None,            // Set by caller
                         merge_conflict,
                     },
                 };
@@ -140,7 +140,10 @@ pub fn start_pr_watcher(
         };
 
         let interval = Duration::from_secs(poll_interval_seconds.max(10)); // min 10s
-        tracing::info!("PR watcher started (poll interval: {}s)", interval.as_secs());
+        tracing::info!(
+            "PR watcher started (poll interval: {}s)",
+            interval.as_secs()
+        );
 
         loop {
             if stop_signal.load(Ordering::SeqCst) {
@@ -345,7 +348,10 @@ async fn poll_single_pr(
             let ci_context_json = match serde_json::to_string(&ci_context) {
                 Ok(json) => json,
                 Err(e) => {
-                    tracing::warn!("PR watcher: failed to serialize CI context for task {}: {e}", watch.task_run_id);
+                    tracing::warn!(
+                        "PR watcher: failed to serialize CI context for task {}: {e}",
+                        watch.task_run_id
+                    );
                     "{}".to_string()
                 }
             };
@@ -454,9 +460,7 @@ async fn poll_single_pr(
                 watch.pr_number,
                 watch.task_run_id,
             );
-            pg_db
-                .mark_pr_watch_complete(&watch.id, "merged")
-                .await?;
+            pg_db.mark_pr_watch_complete(&watch.id, "merged").await?;
             pg_db
                 .update_task_run_status(&watch.task_run_id, "complete")
                 .await?;

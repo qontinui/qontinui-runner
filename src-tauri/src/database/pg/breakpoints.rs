@@ -156,10 +156,7 @@ impl PgDb {
     }
 
     /// Resume a breakpoint snapshot (set status to 'resumed').
-    pub async fn resume_breakpoint_snapshot(
-        &self,
-        snapshot_id: &str,
-    ) -> Result<bool, String> {
+    pub async fn resume_breakpoint_snapshot(&self, snapshot_id: &str) -> Result<bool, String> {
         let conn = self
             .pool
             .get()
@@ -183,10 +180,7 @@ impl PgDb {
     }
 
     /// Expire all waiting snapshots for a task run (e.g., on task cancellation).
-    pub async fn expire_breakpoint_snapshots(
-        &self,
-        execution_id: &str,
-    ) -> Result<u64, String> {
+    pub async fn expire_breakpoint_snapshots(&self, execution_id: &str) -> Result<u64, String> {
         let conn = self
             .pool
             .get()

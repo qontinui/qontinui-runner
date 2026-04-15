@@ -263,9 +263,7 @@ pub struct CreateUnifiedWorkflowRequest {
 /// orphan rule *does* allow `impl From<&ForeignType> for LocalType` since
 /// the target type is local — but we standardize on the free-function form
 /// for consistency with the other DTO migrations (scheduler, constraints).
-pub fn unified_workflow_to_create_request(
-    w: &UnifiedWorkflow,
-) -> CreateUnifiedWorkflowRequest {
+pub fn unified_workflow_to_create_request(w: &UnifiedWorkflow) -> CreateUnifiedWorkflowRequest {
     CreateUnifiedWorkflowRequest {
         name: w.name.clone(),
         description: w.description.clone(),

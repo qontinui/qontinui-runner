@@ -4,8 +4,8 @@
 //! requests and pruning based on Copeland scores. Each generation expands the
 //! top candidates via different thinking styles, then prunes back to beam width.
 
-use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -200,10 +200,7 @@ impl BeamSearchState {
         for (parent_id, response, thinking_style) in responses {
             let blocks = extract_beam_rewrite_blocks(&response);
             if blocks.is_empty() {
-                debug!(
-                    parent_id,
-                    "No BEAM_REWRITE block found in LLM response"
-                );
+                debug!(parent_id, "No BEAM_REWRITE block found in LLM response");
                 continue;
             }
 
@@ -252,8 +249,7 @@ impl BeamSearchState {
             })
             .collect();
 
-        current_gen_ids
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        current_gen_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // IDs to keep from current generation.
         let keep_ids: Vec<String> = current_gen_ids
@@ -286,7 +282,11 @@ impl BeamSearchState {
         let active_parent_ids: Vec<String> = self
             .candidates
             .iter()
-            .filter(|c| !self.pruned_ids.contains(&c.id) && !pruned_now.contains(&c.id) && !unscored_pruned.contains(&c.id))
+            .filter(|c| {
+                !self.pruned_ids.contains(&c.id)
+                    && !pruned_now.contains(&c.id)
+                    && !unscored_pruned.contains(&c.id)
+            })
             .filter_map(|c| c.parent_id.clone())
             .collect();
 
@@ -449,8 +449,7 @@ fn extract_field(text: &str, key: &str) -> Option<String> {
         .iter()
         .filter(|&&k| k != key)
         .filter_map(|k| {
-            find_line_anchored(&text[key_pos + key.len()..], k)
-                .map(|pos| key_pos + key.len() + pos)
+            find_line_anchored(&text[key_pos + key.len()..], k).map(|pos| key_pos + key.len() + pos)
         })
         .min();
 
@@ -520,11 +519,8 @@ mod tests {
 
     #[test]
     fn test_beam_state_new_has_seed() {
-        let state = BeamSearchState::new(
-            BeamSearchConfig::default(),
-            "planner",
-            "You are a planner.",
-        );
+        let state =
+            BeamSearchState::new(BeamSearchConfig::default(), "planner", "You are a planner.");
         assert_eq!(state.candidates.len(), 1);
         assert_eq!(state.current_generation, 0);
         assert!(state.candidates[0].id.starts_with("beam-seed-"));
@@ -541,8 +537,7 @@ mod tests {
             branch_factor: 2,
             ..Default::default()
         };
-        let mut state =
-            BeamSearchState::new(config, "planner", "You are a planner.");
+        let mut state = BeamSearchState::new(config, "planner", "You are a planner.");
 
         // Add a second candidate so we have 2 parents.
         state.candidates.push(BeamCandidate {
@@ -560,20 +555,14 @@ mod tests {
             ("beam-extra".to_string(), 0.6),
         ];
 
-        let requests = state.prepare_generation_prompts(
-            &scores,
-            "Failed to produce JSON output",
-            &[],
-        );
+        let requests =
+            state.prepare_generation_prompts(&scores, "Failed to produce JSON output", &[]);
 
         // 2 parents x 2 branch_factor = 4 requests
         assert_eq!(requests.len(), 4);
         // Each request should reference a valid parent.
         for req in &requests {
-            assert!(
-                req.parent_id == state.candidates[0].id
-                    || req.parent_id == "beam-extra"
-            );
+            assert!(req.parent_id == state.candidates[0].id || req.parent_id == "beam-extra");
             assert!(!req.llm_prompt.is_empty());
             assert!(req.llm_prompt.contains("BEAM_REWRITE"));
             assert!(req.llm_prompt.contains("Failed to produce JSON output"));
@@ -583,8 +572,7 @@ mod tests {
     #[test]
     fn test_process_generation_responses() {
         let config = BeamSearchConfig::default();
-        let mut state =
-            BeamSearchState::new(config, "planner", "You are a planner.");
+        let mut state = BeamSearchState::new(config, "planner", "You are a planner.");
         let parent_id = state.candidates[0].id.clone();
 
         let response = "\
@@ -601,22 +589,19 @@ rewritten_prompt: |
 "
         .to_string();
 
-        let new_candidates =
-            state.process_generation_responses(vec![(parent_id.clone(), response, "Structural clarity".to_string())]);
+        let new_candidates = state.process_generation_responses(vec![(
+            parent_id.clone(),
+            response,
+            "Structural clarity".to_string(),
+        )]);
 
         assert_eq!(new_candidates.len(), 1);
         assert_eq!(new_candidates[0].generation, 1);
         assert_eq!(new_candidates[0].parent_id, Some(parent_id));
         assert!(new_candidates[0].id.starts_with("beam-1-"));
-        assert!(new_candidates[0]
-            .critique
-            .contains("lacks structure"));
-        assert!(new_candidates[0]
-            .changes_summary
-            .contains("step-by-step"));
-        assert!(new_candidates[0]
-            .prompt_content
-            .contains("expert planner"));
+        assert!(new_candidates[0].critique.contains("lacks structure"));
+        assert!(new_candidates[0].changes_summary.contains("step-by-step"));
+        assert!(new_candidates[0].prompt_content.contains("expert planner"));
         assert_eq!(state.current_generation, 1);
         // Total candidates: seed + 1 new
         assert_eq!(state.candidates.len(), 2);
@@ -672,10 +657,7 @@ rewritten_prompt: |
         assert!(!active_ids.contains(&"cand-5".to_string()));
 
         // The seed (generation 0) should still be active as a parent.
-        let seed_active = state
-            .active_candidates()
-            .iter()
-            .any(|c| c.generation == 0);
+        let seed_active = state.active_candidates().iter().any(|c| c.generation == 0);
         assert!(seed_active);
     }
 

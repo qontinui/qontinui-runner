@@ -231,10 +231,7 @@ impl CompressionService {
     }
 
     /// Estimate the token count for a task's current context.
-    pub async fn estimate_context_tokens(
-        &self,
-        task_run_id: &str,
-    ) -> Result<TokenCount, String> {
+    pub async fn estimate_context_tokens(&self, task_run_id: &str) -> Result<TokenCount, String> {
         let all_knowledge = self
             .pg
             .list_task_knowledge(task_run_id, None, false, false)
@@ -316,8 +313,7 @@ impl CompressionService {
         ] {
             // Only compress if this category has significant tokens
             if tokens > 1000 {
-                let (summarized, summaries) =
-                    self.compress_category(task_run_id, category).await?;
+                let (summarized, summaries) = self.compress_category(task_run_id, category).await?;
                 items_summarized += summarized;
                 summary_entries_created += summaries;
                 if summarized > 0 {
@@ -404,10 +400,7 @@ impl CompressionService {
             "item_count": summary.item_count,
         })
         .to_string();
-        let summary_iteration = to_compress
-            .last()
-            .map(|e| e.iteration as i32)
-            .unwrap_or(0);
+        let summary_iteration = to_compress.last().map(|e| e.iteration as i32).unwrap_or(0);
 
         // Atomic insert-summary + archive-originals. A crash between the two
         // used to leave orphan rows; compress_and_archive wraps both in one

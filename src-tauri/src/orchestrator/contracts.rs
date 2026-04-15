@@ -21,9 +21,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::agentic_verification::{
-    CodeLocation, LocatedCriterion, PipelineAcceptanceCriterion,
-};
+use crate::agentic_verification::{CodeLocation, LocatedCriterion, PipelineAcceptanceCriterion};
 use crate::orchestrator::structured_output::ConfidenceLevel;
 use crate::unified_workflow_executor::agentic_output::FileChange;
 use crate::unified_workflow_executor::multi_agent_pipeline_loop::{

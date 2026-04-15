@@ -50,8 +50,7 @@ pub async fn get_mcp_server_handler(
 pub async fn create_mcp_server_handler(
     State(state): State<Arc<ApiState>>,
     Json(input): Json<CreateMcpServerInput>,
-) -> Result<(StatusCode, Json<ApiResponse<McpServerConfig>>), (StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<(StatusCode, Json<ApiResponse<McpServerConfig>>), (StatusCode, Json<ApiResponse<()>>)> {
     info!("Creating MCP server via API: {}", input.name);
     match state.app_state.pg_db.create_mcp_server(input).await {
         Ok(server) => {

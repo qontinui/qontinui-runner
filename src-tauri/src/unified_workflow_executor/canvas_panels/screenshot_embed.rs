@@ -96,11 +96,7 @@ mod tests {
     fn make_rgb_png_b64(w: u32, h: u32) -> String {
         // Build a deterministic RGB gradient so encoding is non-trivial.
         let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(w, h, |x, y| {
-            Rgb([
-                (x % 256) as u8,
-                (y % 256) as u8,
-                ((x + y) % 256) as u8,
-            ])
+            Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
         });
         let mut bytes: Vec<u8> = Vec::new();
         img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)

@@ -111,13 +111,7 @@ mod tests {
 
     #[test]
     fn test_build_fresh_context_prompt_minimal() {
-        let prompt = build_fresh_context_prompt(
-            "Do the thing.",
-            1,
-            &HashMap::new(),
-            &[],
-            &[],
-        );
+        let prompt = build_fresh_context_prompt("Do the thing.", 1, &HashMap::new(), &[], &[]);
         assert!(prompt.contains("Iteration 1"));
         assert!(prompt.contains("Do the thing."));
         assert!(prompt.contains("---"));

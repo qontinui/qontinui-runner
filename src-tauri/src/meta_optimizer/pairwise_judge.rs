@@ -159,10 +159,7 @@ pub fn parse_pairwise_response(response: &str, was_swapped: bool) -> PairwiseJud
     let winner = resolve_winner(positional_winner, was_swapped);
 
     // -- rationale --
-    let rationale = parsed["rationale"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let rationale = parsed["rationale"].as_str().unwrap_or("").to_string();
 
     // -- confidence (normalized and clamped) --
     let raw_confidence = parsed["confidence"].as_f64().unwrap_or(0.0);
@@ -343,9 +340,13 @@ mod tests {
         assert_eq!(result.rationale, "Output 1 is more accurate.");
         assert!((result.confidence - 0.85).abs() < f64::EPSILON);
         let scores_a = result.scores_a.unwrap();
-        assert!(scores_a.iter().any(|(k, v)| k == "correctness" && (*v - 9.0).abs() < f64::EPSILON));
+        assert!(scores_a
+            .iter()
+            .any(|(k, v)| k == "correctness" && (*v - 9.0).abs() < f64::EPSILON));
         let scores_b = result.scores_b.unwrap();
-        assert!(scores_b.iter().any(|(k, v)| k == "correctness" && (*v - 6.0).abs() < f64::EPSILON));
+        assert!(scores_b
+            .iter()
+            .any(|(k, v)| k == "correctness" && (*v - 6.0).abs() < f64::EPSILON));
     }
 
     #[test]
@@ -363,9 +364,13 @@ mod tests {
         assert_eq!(result.winner, PairwiseWinner::B);
         // scores_1 (positional) maps to B when swapped, scores_2 maps to A
         let scores_a = result.scores_a.unwrap();
-        assert!(scores_a.iter().any(|(k, v)| k == "correctness" && (*v - 5.0).abs() < f64::EPSILON));
+        assert!(scores_a
+            .iter()
+            .any(|(k, v)| k == "correctness" && (*v - 5.0).abs() < f64::EPSILON));
         let scores_b = result.scores_b.unwrap();
-        assert!(scores_b.iter().any(|(k, v)| k == "correctness" && (*v - 9.0).abs() < f64::EPSILON));
+        assert!(scores_b
+            .iter()
+            .any(|(k, v)| k == "correctness" && (*v - 9.0).abs() < f64::EPSILON));
     }
 
     #[test]

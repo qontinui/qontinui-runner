@@ -512,7 +512,10 @@ fn detect_port_from_script(script: &str) -> Option<u16> {
     let parts: Vec<&str> = script.split_whitespace().collect();
     for (i, part) in parts.iter().enumerate() {
         // --port=N or -p=N
-        if let Some(val) = part.strip_prefix("--port=").or_else(|| part.strip_prefix("-p=")) {
+        if let Some(val) = part
+            .strip_prefix("--port=")
+            .or_else(|| part.strip_prefix("-p="))
+        {
             if let Ok(port) = val.parse::<u16>() {
                 return Some(port);
             }

@@ -85,9 +85,7 @@ fn row_to_test_result(r: &Row) -> TestResult {
         id: r.get(0),
         test_id: r.get(1),
         task_run_id: r.get(2),
-        status: status_str
-            .parse()
-            .unwrap_or(TestResultStatus::Pending),
+        status: status_str.parse().unwrap_or(TestResultStatus::Pending),
         started_at: started_at.map(|d| d.to_rfc3339()),
         completed_at: completed_at.map(|d| d.to_rfc3339()),
         duration_ms: r.get::<_, Option<i32>>(6).map(|v| v as i64),
@@ -199,8 +197,7 @@ impl PgDb {
             .creation_analysis
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
-        let config_str =
-            serde_json::to_string(&input.config).unwrap_or_else(|_| "{}".to_string());
+        let config_str = serde_json::to_string(&input.config).unwrap_or_else(|_| "{}".to_string());
         let tags_str = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
         let timeout: Option<i32> = input.timeout_seconds.map(|t| t as i32);
 
@@ -268,8 +265,7 @@ impl PgDb {
             .creation_analysis
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
-        let config_str =
-            serde_json::to_string(&input.config).unwrap_or_else(|_| "{}".to_string());
+        let config_str = serde_json::to_string(&input.config).unwrap_or_else(|_| "{}".to_string());
         let tags_str = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
         let timeout: Option<i32> = input.timeout_seconds.map(|t| t as i32);
 
@@ -441,10 +437,16 @@ impl PgDb {
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()));
         let screenshots_str =
             serde_json::to_string(screenshots).unwrap_or_else(|_| "[]".to_string());
-        let started_dt: Option<DateTime<Utc>> =
-            started_at.and_then(|s| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc)));
-        let completed_dt: Option<DateTime<Utc>> = completed_at
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc)));
+        let started_dt: Option<DateTime<Utc>> = started_at.and_then(|s| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        });
+        let completed_dt: Option<DateTime<Utc>> = completed_at.and_then(|s| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        });
         let duration_i32: Option<i32> = duration_ms.map(|v| v.min(i32::MAX as i64) as i32);
         let assertions_passed_i32 = assertions_passed as i32;
         let assertions_failed_i32 = assertions_failed as i32;

@@ -323,7 +323,10 @@ pub async fn on_task_completed(
     let comment = if success {
         format!("Qontinui task {} completed successfully.", task_run_id)
     } else {
-        format!("Qontinui task {} failed. See logs for details.", task_run_id)
+        format!(
+            "Qontinui task {} failed. See logs for details.",
+            task_run_id
+        )
     };
 
     if let Err(e) = provider

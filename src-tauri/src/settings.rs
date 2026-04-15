@@ -979,7 +979,6 @@ pub enum WsvMode {
     Shadow,
 }
 
-
 /// World State Verifier settings persisted to the settings file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldStateVerifierSettings {
@@ -1294,9 +1293,7 @@ pub fn get_world_state_verifier_settings() -> WorldStateVerifierSettings {
 }
 
 /// Save World State Verifier settings.
-pub fn save_world_state_verifier_settings(
-    wsv: WorldStateVerifierSettings,
-) -> Result<(), String> {
+pub fn save_world_state_verifier_settings(wsv: WorldStateVerifierSettings) -> Result<(), String> {
     crate::config_facade::save_setting(wsv)
 }
 

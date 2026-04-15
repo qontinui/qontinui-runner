@@ -958,10 +958,8 @@ pub async fn ui_bridge_get_elements_handler(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     Query(query): Query<std::collections::HashMap<String, String>>,
-) -> Result<
-    (HeaderMap, Json<ApiResponse<serde_json::Value>>),
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<(HeaderMap, Json<ApiResponse<serde_json::Value>>), (StatusCode, Json<ApiResponse<()>>)>
+{
     let refresh = query
         .get("refresh")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -970,10 +968,7 @@ pub async fn ui_bridge_get_elements_handler(
     // P3.2: opt-in legacy shape via `?v=1` query or `X-Api-Version: 1` header.
     // Default (no opt-in) returns the v2 wrapped object; the deprecation header
     // is attached only when v1 is in effect so v2 callers don't see noise.
-    let api_version_v1 = query
-        .get("v")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    let api_version_v1 = query.get("v").map(|v| v == "1").unwrap_or(false)
         || headers
             .get("x-api-version")
             .and_then(|v| v.to_str().ok())
@@ -1373,10 +1368,7 @@ pub async fn ui_bridge_batch_actions_handler(
             tokio::time::sleep(std::time::Duration::from_millis(delay_between_ms)).await;
         }
 
-        let element_id = step
-            .get("elementId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let element_id = step.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
         let action = step.get("action").cloned().unwrap_or(serde_json::json!({}));
 
         let payload = serde_json::json!({
@@ -1385,8 +1377,7 @@ pub async fn ui_bridge_batch_actions_handler(
             "params": action.get("params"),
         });
 
-        let result =
-            ui_bridge_request_sync(&state, "execute_action", payload).await;
+        let result = ui_bridge_request_sync(&state, "execute_action", payload).await;
 
         let (success, response) = match result {
             Ok(data) => (
@@ -1510,7 +1501,9 @@ pub async fn ui_bridge_execute_action_handler(
     .await
     {
         let is_disabled = {
-            let props = elem_data.get("properties").or_else(|| elem_data.get("props"));
+            let props = elem_data
+                .get("properties")
+                .or_else(|| elem_data.get("props"));
             let aria_disabled = elem_data
                 .get("ariaDisabled")
                 .and_then(|v| v.as_str())
@@ -1535,11 +1528,7 @@ pub async fn ui_bridge_execute_action_handler(
                 .and_then(|p| p.get("disabled"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            aria_disabled
-                || disabled_attr
-                || data_disabled
-                || prop_aria_disabled
-                || prop_disabled
+            aria_disabled || disabled_attr || data_disabled || prop_aria_disabled || prop_disabled
         };
 
         if is_disabled {
@@ -1574,8 +1563,7 @@ pub async fn ui_bridge_execute_action_handler(
                 .as_deref()
                 .map(|e| {
                     let lower = e.to_lowercase();
-                    lower.contains("never registered or discovered")
-                        || lower.contains("not found")
+                    lower.contains("never registered or discovered") || lower.contains("not found")
                 })
                 .unwrap_or(false),
             Err((_, ref err_resp)) => err_resp
@@ -1583,8 +1571,7 @@ pub async fn ui_bridge_execute_action_handler(
                 .as_deref()
                 .map(|e| {
                     let lower = e.to_lowercase();
-                    lower.contains("never registered or discovered")
-                        || lower.contains("not found")
+                    lower.contains("never registered or discovered") || lower.contains("not found")
                 })
                 .unwrap_or(false),
             _ => false,
@@ -1604,9 +1591,8 @@ pub async fn ui_bridge_execute_action_handler(
             .await;
 
             // Retry the original action once
-            let retry_result = wrap_ipc_result(
-                ui_bridge_request_sync(&state, "execute_action", payload).await,
-            );
+            let retry_result =
+                wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload).await);
 
             match &retry_result {
                 Ok(ref resp) if resp.success => {
@@ -1636,8 +1622,7 @@ pub async fn ui_bridge_execute_action_handler(
                 .as_deref()
                 .map(|e| {
                     let lower = e.to_lowercase();
-                    lower.contains("never registered or discovered")
-                        || lower.contains("not found")
+                    lower.contains("never registered or discovered") || lower.contains("not found")
                 })
                 .unwrap_or(false),
             Err(_) => true,
@@ -1654,7 +1639,9 @@ pub async fn ui_bridge_execute_action_handler(
                 if let Ok(decoded_bytes) =
                     base64::engine::general_purpose::STANDARD.decode(stable_ref_b64)
                 {
-                    if let Ok(stable_ref_json) = serde_json::from_slice::<serde_json::Value>(&decoded_bytes) {
+                    if let Ok(stable_ref_json) =
+                        serde_json::from_slice::<serde_json::Value>(&decoded_bytes)
+                    {
                         info!(
                             "execute_action: attempting stable ref resolution for element {}",
                             id
@@ -1662,28 +1649,22 @@ pub async fn ui_bridge_execute_action_handler(
                         let resolve_payload = serde_json::json!({
                             "stableRef": stable_ref_json
                         });
-                        if let Ok(resolve_result) = ui_bridge_request_sync(
-                            &state,
-                            "resolve_stable_ref",
-                            resolve_payload,
-                        )
-                        .await
+                        if let Ok(resolve_result) =
+                            ui_bridge_request_sync(&state, "resolve_stable_ref", resolve_payload)
+                                .await
                         {
-                            if let Some(new_id) = resolve_result
-                                .get("elementId")
-                                .and_then(|v| v.as_str())
+                            if let Some(new_id) =
+                                resolve_result.get("elementId").and_then(|v| v.as_str())
                             {
-                                info!(
-                                    "execute_action: stable ref resolved {} -> {}",
-                                    id, new_id
-                                );
+                                info!("execute_action: stable ref resolved {} -> {}", id, new_id);
                                 // Retry with the resolved ID
                                 let retry_payload = serde_json::json!({
                                     "elementId": new_id,
                                     "action": action_obj
                                 });
                                 let retry_result = wrap_ipc_result(
-                                    ui_bridge_request_sync(&state, "execute_action", retry_payload).await,
+                                    ui_bridge_request_sync(&state, "execute_action", retry_payload)
+                                        .await,
                                 );
                                 match &retry_result {
                                     Ok(ref resp) if resp.success => {
@@ -1695,7 +1676,12 @@ pub async fn ui_bridge_execute_action_handler(
                                         result = retry_result.map(|mut r| {
                                             let merged = match r.data.take() {
                                                 Some(serde_json::Value::Object(mut m)) => {
-                                                    m.insert("resolvedId".to_string(), serde_json::Value::String(new_id.to_string()));
+                                                    m.insert(
+                                                        "resolvedId".to_string(),
+                                                        serde_json::Value::String(
+                                                            new_id.to_string(),
+                                                        ),
+                                                    );
                                                     serde_json::Value::Object(m)
                                                 }
                                                 Some(other) => serde_json::json!({
@@ -2073,10 +2059,7 @@ pub async fn ui_bridge_get_last_discovered_handler(
     // cache_* fields; otherwise wrap it under `data`.
     let response = match entry.data.clone() {
         serde_json::Value::Object(mut map) => {
-            map.insert(
-                "cache_age_ms".to_string(),
-                serde_json::Value::from(age_ms),
-            );
+            map.insert("cache_age_ms".to_string(), serde_json::Value::from(age_ms));
             map.insert(
                 "cache_element_count".to_string(),
                 serde_json::Value::from(entry.element_count),
@@ -2230,9 +2213,15 @@ pub struct NavigateAndWaitRequest {
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
-fn default_nav_action() -> String { "click".into() }
-fn default_stable_ms() -> u64 { 800 }
-fn default_timeout_ms() -> u64 { 8000 }
+fn default_nav_action() -> String {
+    "click".into()
+}
+fn default_stable_ms() -> u64 {
+    800
+}
+fn default_timeout_ms() -> u64 {
+    8000
+}
 
 pub async fn ui_bridge_navigate_and_wait_handler(
     State(state): State<Arc<ApiState>>,
@@ -3141,7 +3130,10 @@ pub async fn ui_bridge_page_hard_refresh_handler(
     use tauri::Manager;
     info!("UI Bridge API: Hard refresh (cache bypass)");
 
-    if let Some(window) = state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
+    if let Some(window) = state
+        .app_handle
+        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+    {
         // Use fetch cache-busting + location replacement to bypass browser cache.
         // This is safer than deleting the EBWebView Cache directory.
         let js = r#"
@@ -3186,8 +3178,9 @@ pub async fn ui_bridge_page_close_request_handler(
     use tauri::Manager;
     info!("UI Bridge API: Close request (simulating X-button click)");
 
-    if let Some(window) =
-        state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label())
+    if let Some(window) = state
+        .app_handle
+        .get_webview_window(qontinui_runner_lib::get_main_window_label())
     {
         window.close().map_err(|e| {
             let msg = format!("Failed to close main window: {}", e);
@@ -3230,12 +3223,22 @@ pub async fn ui_bridge_page_navigate_handler(
     if !url.starts_with('/') {
         // Validate absolute URLs: must be http(s)://localhost or http(s)://127.0.0.1
         // Use strict patterns that prevent authority confusion (e.g. http://localhost@evil.com)
-        let is_valid_localhost = ["http://localhost/", "http://localhost:", "https://localhost/", "https://localhost:",
-                                  "http://127.0.0.1/", "http://127.0.0.1:", "https://127.0.0.1/", "https://127.0.0.1:"]
-            .iter()
-            .any(|prefix| url.starts_with(prefix))
-            || url == "http://localhost" || url == "https://localhost"
-            || url == "http://127.0.0.1" || url == "https://127.0.0.1";
+        let is_valid_localhost = [
+            "http://localhost/",
+            "http://localhost:",
+            "https://localhost/",
+            "https://localhost:",
+            "http://127.0.0.1/",
+            "http://127.0.0.1:",
+            "https://127.0.0.1/",
+            "https://127.0.0.1:",
+        ]
+        .iter()
+        .any(|prefix| url.starts_with(prefix))
+            || url == "http://localhost"
+            || url == "https://localhost"
+            || url == "http://127.0.0.1"
+            || url == "https://127.0.0.1";
 
         if !is_valid_localhost {
             return Err((
@@ -4599,12 +4602,12 @@ fn capture_runner_window(
 /// This is a convenience wrapper used by the snapshot and health fallback paths.
 /// Returns `Some((base64_png, width, height))` on success, `None` on failure.
 /// Does not require the UI Bridge SDK — uses native xcap capture.
-pub async fn capture_runner_window_base64(
-    state: &Arc<ApiState>,
-) -> Option<(String, i32, i32)> {
+pub async fn capture_runner_window_base64(state: &Arc<ApiState>) -> Option<(String, i32, i32)> {
     use tauri::Manager;
 
-    let window = state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label())?;
+    let window = state
+        .app_handle
+        .get_webview_window(qontinui_runner_lib::get_main_window_label())?;
     let scale = window.scale_factor().unwrap_or(1.0);
     let pos = window.inner_position().unwrap_or_default();
     let size = window.inner_size().unwrap_or_default();
@@ -4642,7 +4645,9 @@ fn capture_monitor_screenshot(
     }
 
     let mgr = screen::MonitorManager::detect()?;
-    let idx = monitor_index.map(|i| i as usize).unwrap_or_else(|| mgr.primary_index());
+    let idx = monitor_index
+        .map(|i| i as usize)
+        .unwrap_or_else(|| mgr.primary_index());
     let captured = screen::CapturedScreenshot::from_monitor(&mgr, idx)?;
     let mut data = AnnotatedScreenshotData::from_captured(&captured)?;
     data.monitor = monitor_index;
@@ -4686,7 +4691,9 @@ pub async fn ui_bridge_annotated_screenshot_handler(
         // so we capture the monitor and crop to the window bounds.
         if query.runner.unwrap_or(false) {
             use tauri::Manager;
-            let window = state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label());
+            let window = state
+                .app_handle
+                .get_webview_window(qontinui_runner_lib::get_main_window_label());
             if let Some(win) = window {
                 let scale = win.scale_factor().unwrap_or(1.0);
                 // Use inner_position/inner_size for the content area (viewport).
@@ -4798,7 +4805,10 @@ pub async fn ui_bridge_annotated_screenshot_handler(
                 );
             }
             Err(e) => {
-                warn!("UI Bridge screenshot: Annotation failed, returning raw screenshot: {}", e);
+                warn!(
+                    "UI Bridge screenshot: Annotation failed, returning raw screenshot: {}",
+                    e
+                );
                 // Fall through — return the unannotated screenshot
             }
         }
@@ -4934,7 +4944,9 @@ async fn apply_annotation(
 ///
 /// Tries normalizedRect first (already 0-1), then falls back to rect
 /// with viewport heuristic normalization.
-fn extract_normalized_rect_from_element(el: &serde_json::Value) -> Option<crate::vision::types::NormalizedRect> {
+fn extract_normalized_rect_from_element(
+    el: &serde_json::Value,
+) -> Option<crate::vision::types::NormalizedRect> {
     use crate::vision::types::NormalizedRect;
 
     // Try normalizedRect (UI Bridge provides this directly)
@@ -5264,7 +5276,10 @@ pub async fn ui_bridge_with_diff_handler(
         info!("UI Bridge API: Single execute with diff");
         let element_id = body.get("elementId").cloned().unwrap_or_default();
         let operation = body.get("operation").cloned().unwrap_or_default();
-        let params = body.get("params").cloned().unwrap_or(serde_json::Value::Null);
+        let params = body
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let payload = serde_json::json!({
             "elementAction": {
                 "elementId": element_id,
@@ -5488,7 +5503,9 @@ pub async fn ui_bridge_wait_for_element_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+    let body = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| serde_json::json!({}));
 
     let query = body.get("query").and_then(|v| v.as_str()).map(String::from);
     let element_id = body
@@ -5496,10 +5513,7 @@ pub async fn ui_bridge_wait_for_element_handler(
         .and_then(|v| v.as_str())
         .map(String::from);
     let element_type = body.get("type").and_then(|v| v.as_str()).map(String::from);
-    let timeout_ms = body
-        .get("timeout")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5000);
+    let timeout_ms = body.get("timeout").and_then(|v| v.as_u64()).unwrap_or(5000);
     let poll_interval_ms = body
         .get("pollIntervalMs")
         .and_then(|v| v.as_u64())
@@ -5633,8 +5647,7 @@ pub async fn ui_bridge_wait_for_element_handler(
 
         // Timeout check: if the next poll would overshoot the deadline,
         // give up now rather than sleep-then-check.
-        if std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms)
-            > deadline
+        if std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms) > deadline
         {
             let elapsed_ms = start.elapsed().as_millis() as u64;
             let descriptor = if let Some(q) = &query {
@@ -5735,9 +5748,7 @@ fn evaluate_wait_for_element_assertions(
                 let bounds = element
                     .get("bounds")
                     .or_else(|| element.get("rect"))
-                    .or_else(|| {
-                        element.get("state").and_then(|s| s.get("rect"))
-                    });
+                    .or_else(|| element.get("state").and_then(|s| s.get("rect")));
                 let (w, h) = match bounds {
                     Some(b) => (
                         b.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -5746,10 +5757,7 @@ fn evaluate_wait_for_element_assertions(
                     None => (0.0, 0.0),
                 };
                 if w <= 0.0 || h <= 0.0 {
-                    return Err(format!(
-                        "visible: element bounds are {}x{}",
-                        w, h
-                    ));
+                    return Err(format!("visible: element bounds are {}x{}", w, h));
                 }
             }
             "text_contains" | "text_equals" => {
@@ -5825,7 +5833,9 @@ pub async fn ui_bridge_expect_text_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+    let body = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| serde_json::json!({}));
 
     let text = match body.get("text").and_then(|v| v.as_str()) {
         Some(t) if !t.is_empty() => t.to_string(),
@@ -5836,10 +5846,7 @@ pub async fn ui_bridge_expect_text_handler(
             ));
         }
     };
-    let timeout_ms = body
-        .get("timeout")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5000);
+    let timeout_ms = body.get("timeout").and_then(|v| v.as_u64()).unwrap_or(5000);
     let poll_interval_ms = body
         .get("pollIntervalMs")
         .and_then(|v| v.as_u64())
@@ -5861,13 +5868,12 @@ pub async fn ui_bridge_expect_text_handler(
     // Use serde_json::to_string to produce a fully RFC-compliant JS string
     // literal. This handles every edge case (newlines, U+2028/U+2029,
     // backticks, backslashes, quotes) correctly — unlike ad-hoc escaping.
-    let js_literal = serde_json::to_string(&text)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to encode search text: {}", e))),
-            )
-        })?;
+    let js_literal = serde_json::to_string(&text).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to encode search text: {}", e))),
+        )
+    })?;
     let js = if case_insensitive {
         format!(
             "document.body.innerText.toLowerCase().includes({}.toLowerCase())",
@@ -5961,7 +5967,10 @@ pub async fn ui_bridge_expect_text_handler(
 /// The frontend's ai_find shape is `{ element: {...}, confidence: 0.x,
 /// alternatives: [...] }` wrapped in the usual `data` envelope. Returns
 /// the element only if confidence >= min_confidence.
-fn extract_ai_find_match(data: &serde_json::Value, min_confidence: f64) -> Option<serde_json::Value> {
+fn extract_ai_find_match(
+    data: &serde_json::Value,
+    min_confidence: f64,
+) -> Option<serde_json::Value> {
     // Walk into the response trying both {elem, conf} at top level and
     // nested under `data`, matching other ai_find callers.
     let find_match = |v: &serde_json::Value| -> Option<serde_json::Value> {
@@ -6111,14 +6120,22 @@ pub async fn ui_bridge_wait_for_element_stable_handler(
     if element_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error("wait-for-element-stable: 'elementId' is required")),
+            Json(api_error(
+                "wait-for-element-stable: 'elementId' is required",
+            )),
         ));
     }
 
     let quiet_ms = body.get("quietMs").and_then(|v| v.as_u64()).unwrap_or(500);
     let timeout_ms = body.get("timeout").and_then(|v| v.as_u64()).unwrap_or(5000);
-    let observe_attributes = body.get("observeAttributes").and_then(|v| v.as_bool()).unwrap_or(true);
-    let observe_subtree = body.get("observeSubtree").and_then(|v| v.as_bool()).unwrap_or(false);
+    let observe_attributes = body
+        .get("observeAttributes")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let observe_subtree = body
+        .get("observeSubtree")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     info!(
         "UI Bridge API: wait-for-element-stable elementId={} quietMs={} timeout={}ms",
@@ -6137,7 +6154,10 @@ pub async fn ui_bridge_wait_for_element_stable_handler(
 
     match ui_bridge_request_sync(&state, "wait_for_element_stable", payload).await {
         Ok(data) => {
-            let stable = data.get("stable").and_then(|v| v.as_bool()).unwrap_or(false);
+            let stable = data
+                .get("stable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if stable {
                 Ok(Json(ApiResponse::success(data)))
             } else {
@@ -6175,7 +6195,9 @@ pub async fn ui_bridge_wait_for_element_condition_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+    let body = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| serde_json::json!({}));
 
     let timeout_ms = body
         .get("timeout_ms")
@@ -6198,7 +6220,10 @@ pub async fn ui_bridge_wait_for_element_condition_handler(
 
     match ui_bridge_request_sync(&state, "wait_for_element_by_condition", payload).await {
         Ok(data) => {
-            let matched = data.get("matched").and_then(|v| v.as_bool()).unwrap_or(false);
+            let matched = data
+                .get("matched")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if matched {
                 Ok(Json(ApiResponse::success(data)))
             } else {
@@ -6290,7 +6315,10 @@ pub async fn ui_bridge_control_batch_execute_handler(
                     .get("element_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let action = step.get("action").and_then(|v| v.as_str()).unwrap_or("click");
+                let action = step
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("click");
                 let params = step.get("params").cloned();
 
                 let payload = serde_json::json!({
@@ -6322,7 +6350,10 @@ pub async fn ui_bridge_control_batch_execute_handler(
             }
         };
 
-        let step_ok = step_result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        let step_ok = step_result
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         results.push(step_result);
         completed += 1;
 
@@ -7191,7 +7222,11 @@ pub async fn ui_bridge_ai_find_handler(
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.5)
                 .clamp(0.0, 1.0);
-            let min_confidence = if min_confidence == 0.0 { 0.5 } else { min_confidence };
+            let min_confidence = if min_confidence == 0.0 {
+                0.5
+            } else {
+                min_confidence
+            };
             let inner = data.get("data").unwrap_or(&data);
             let conf = inner
                 .get("confidence")
@@ -7212,10 +7247,7 @@ pub async fn ui_bridge_ai_find_handler(
                         }),
                     );
                 }
-                if let Some(inner_obj) = data
-                    .get_mut("data")
-                    .and_then(|d| d.as_object_mut())
-                {
+                if let Some(inner_obj) = data.get_mut("data").and_then(|d| d.as_object_mut()) {
                     inner_obj.insert("element".to_string(), serde_json::Value::Null);
                     inner_obj.insert(
                         "belowThreshold".to_string(),
@@ -7907,7 +7939,9 @@ pub async fn ui_bridge_element_screenshot_handler(
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error("element-screenshot requires `id` query param".to_string())),
+                Json(api_error(
+                    "element-screenshot requires `id` query param".to_string(),
+                )),
             ))
         }
     };
@@ -8352,12 +8386,15 @@ pub async fn ui_bridge_readiness_handler(
             .unwrap_or_default()
             .as_millis() as u64;
         let age_ms = now_ms.saturating_sub(last_pong);
-        (StatusCode::OK, Json(serde_json::json!({
-            "ready": true,
-            "lastPongMs": last_pong,
-            "lastPongAgeMs": age_ms,
-            "processUptimeMs": state.started_at.elapsed().as_millis() as u64
-        })))
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ready": true,
+                "lastPongMs": last_pong,
+                "lastPongAgeMs": age_ms,
+                "processUptimeMs": state.started_at.elapsed().as_millis() as u64
+            })),
+        )
     } else {
         // When the frontend is not ready and the process has been up for >30s,
         // attach a native screenshot + boot errors so agents can diagnose the
@@ -8365,9 +8402,7 @@ pub async fn ui_bridge_readiness_handler(
         let uptime_ms = state.started_at.elapsed().as_millis() as u64;
         let mut result = diag;
         if uptime_ms >= 30_000 {
-            if let Some((screenshot, width, height)) =
-                capture_runner_window_base64(&state).await
-            {
+            if let Some((screenshot, width, height)) = capture_runner_window_base64(&state).await {
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert(
                         "diagnosticScreenshot".to_string(),
@@ -9988,7 +10023,9 @@ pub async fn ui_bridge_wait_for_element_state_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+    let body = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| serde_json::json!({}));
 
     let id = body
         .get("id")
@@ -10053,10 +10090,7 @@ pub async fn ui_bridge_wait_for_element_state_handler(
         if let Ok(data) = lookup {
             // Element returned — extract the state block (either nested at
             // `data.element.state` or at `data.state` depending on shape).
-            let element = data
-                .get("element")
-                .cloned()
-                .unwrap_or_else(|| data.clone());
+            let element = data.get("element").cloned().unwrap_or_else(|| data.clone());
             let matched = element
                 .get("state")
                 .and_then(|s| s.get(state_field))
@@ -10172,7 +10206,9 @@ pub async fn ui_bridge_wait_for_route_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+    let body = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| serde_json::json!({}));
     let pattern = match body.get("pattern").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
@@ -10204,10 +10240,7 @@ pub async fn ui_bridge_wait_for_route_handler(
             // Snapshot exposes `page.route.pattern`, `page.pathname`,
             // `page.url`. We try them in order so this works for apps that
             // haven't called `setRouteInfo` yet.
-            let page = data
-                .get("page")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            let page = data.get("page").cloned().unwrap_or(serde_json::Value::Null);
             let route_pattern = page
                 .get("route")
                 .and_then(|r| r.get("pattern"))
@@ -10298,10 +10331,9 @@ pub async fn ui_bridge_control_batch_handler(
 
     // Pre-snapshot for diffing. Best-effort — if it fails we report a null
     // diff but still execute the batch.
-    let pre_snapshot =
-        ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({}))
-            .await
-            .ok();
+    let pre_snapshot = ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({}))
+        .await
+        .ok();
 
     let total_start = std::time::Instant::now();
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(steps.len());
@@ -10309,10 +10341,7 @@ pub async fn ui_bridge_control_batch_handler(
     let mut stopped_early = false;
 
     for (i, step) in steps.iter().enumerate() {
-        let element_id = step
-            .get("elementId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let element_id = step.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
         let action = step
             .get("action")
             .and_then(|v| v.as_str())
@@ -10363,10 +10392,9 @@ pub async fn ui_bridge_control_batch_handler(
     let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
     // Post-snapshot for diffing.
-    let post_snapshot =
-        ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({}))
-            .await
-            .ok();
+    let post_snapshot = ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({}))
+        .await
+        .ok();
     let snapshot_diff = compute_snapshot_diff(pre_snapshot.as_ref(), post_snapshot.as_ref());
 
     let payload = serde_json::json!({
@@ -10436,8 +10464,8 @@ fn compute_snapshot_diff(
 /// The list is generated by walking the static manifest in `route_manifest()`
 /// — kept in sync with the actual `routes()` registrations by hand. A unit
 /// test in this module asserts that every entry resolves to a known handler.
-pub async fn ui_bridge_routes_manifest_handler()
--> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+pub async fn ui_bridge_routes_manifest_handler(
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let mut entries: Vec<(String, String)> = route_manifest()
         .iter()
         .map(|(m, p)| (m.to_string(), p.to_string()))
@@ -10477,7 +10505,10 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/batch"),
         ("GET", "/ui-bridge/control/components"),
         ("GET", "/ui-bridge/control/component/{id}"),
-        ("POST", "/ui-bridge/control/component/{id}/action/{action_id}"),
+        (
+            "POST",
+            "/ui-bridge/control/component/{id}/action/{action_id}",
+        ),
         ("POST", "/ui-bridge/control/discover"),
         ("GET", "/ui-bridge/control/snapshot"),
         ("GET", "/ui-bridge/control/windows"),
@@ -10527,7 +10558,10 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/ai/page-summary"),
         ("POST", "/ui-bridge/control/assert"),
         ("GET", "/ui-bridge/control/design/element/{id}/styles"),
-        ("POST", "/ui-bridge/control/design/element/{id}/state-styles"),
+        (
+            "POST",
+            "/ui-bridge/control/design/element/{id}/state-styles",
+        ),
         ("POST", "/ui-bridge/control/design/snapshot"),
         ("POST", "/ui-bridge/control/design/responsive"),
         ("POST", "/ui-bridge/control/design/audit"),
@@ -10858,10 +10892,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // exposed them under `/control/*` while callers (and the skill docs)
         // used the `/ai/*` namespace.
         .route("/ui-bridge/ai/forms", get(ui_bridge_get_forms_handler))
-        .route(
-            "/ui-bridge/ai/fill-form",
-            post(ui_bridge_fill_form_handler),
-        )
+        .route("/ui-bridge/ai/fill-form", post(ui_bridge_fill_form_handler))
         .route(
             "/ui-bridge/ai/design-audit",
             post(ui_bridge_design_audit_handler),
@@ -11130,10 +11161,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(ui_bridge_wait_for_element_stable_handler),
         )
         // Wait for a substring to appear in the page text
-        .route(
-            "/ui-bridge/ai/expect",
-            post(ui_bridge_expect_text_handler),
-        )
+        .route("/ui-bridge/ai/expect", post(ui_bridge_expect_text_handler))
         .route(
             "/ui-bridge/control/diagnose-stuck",
             post(ui_bridge_diagnose_stuck_screen_handler),
@@ -11204,7 +11232,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // Batch execution
         .route("/ui-bridge/batch", post(ui_bridge_batch_handler))
         // Composite: execute action(s) with atomic change-buffer diffing
-        .route("/ui-bridge/control/with-diff", post(ui_bridge_with_diff_handler))
+        .route(
+            "/ui-bridge/control/with-diff",
+            post(ui_bridge_with_diff_handler),
+        )
         // Diagnostics & health
         .route("/ui-bridge/diagnostics", get(ui_bridge_diagnostics_handler))
         .route(
@@ -11649,10 +11680,8 @@ mod manifest_drift_tests {
         // (axum allows chaining like get(h).delete(h2) on the same route).
         // Two passes: find each .route call, then within its body grep for
         // method-constructor calls.
-        let route_open_re = regex::Regex::new(
-            r#"(?s)\.route\(\s*"(/ui-bridge/[^"]+)"\s*,"#,
-        )
-        .unwrap();
+        let route_open_re =
+            regex::Regex::new(r#"(?s)\.route\(\s*"(/ui-bridge/[^"]+)"\s*,"#).unwrap();
         let method_re = regex::Regex::new(r#"\b(get|post|put|delete|patch)\("#).unwrap();
 
         let mut source_routes: HashSet<(String, String)> = HashSet::new();
@@ -11666,7 +11695,8 @@ mod manifest_drift_tests {
             // Stop at first balanced ")" — for our purposes, the next ".route("
             // delimiter is a safe upper bound, and we only care about methods
             // before the first newline followed by ".route(" or "}\n".
-            let scan_end = body.find("\n        .route(")
+            let scan_end = body
+                .find("\n        .route(")
                 .or_else(|| body.find("\n    }"))
                 .unwrap_or(body.len());
             let scan = &body[..scan_end];

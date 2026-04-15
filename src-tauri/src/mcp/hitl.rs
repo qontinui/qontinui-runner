@@ -3,7 +3,13 @@
 //! Exposes deferred questions from overnight/unattended runs so a human
 //! reviewer can approve or reject them via the API.
 
-use axum::{extract::State, http::StatusCode, response::Json, routing::{get, post}, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::Json,
+    routing::{get, post},
+    Router,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -43,12 +49,7 @@ async fn get_pending_handler(
         .pg_db
         .get_all_pending_questions()
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(e)),
-            )
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "questions": questions }),
@@ -77,12 +78,7 @@ async fn respond_handler(
         .pg_db
         .review_deferred_question(&id, &body.status, body.comment.as_deref())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(e)),
-            )
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "id": id, "status": body.status }),

@@ -33,10 +33,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/memory/contradictions/scan",
             post(contradiction_scan_handler),
         )
-        .route(
-            "/memory/contradictions/log",
-            get(contradiction_log_handler),
-        )
+        .route("/memory/contradictions/log", get(contradiction_log_handler))
         .route("/memory/dreamer/run", post(dreamer_run_handler))
         .route("/memory/dreamer/traces", get(dreamer_traces_handler))
         .route("/memory/dreamer/log", get(dreamer_log_handler))
@@ -316,10 +313,7 @@ async fn contradiction_log_handler(
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to get contradiction log: {}",
-                e
-            ))),
+            Json(api_error(format!("Failed to get contradiction log: {}", e))),
         )),
     }
 }
@@ -379,10 +373,7 @@ async fn dreamer_traces_handler(
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to get reasoning traces: {}",
-                e
-            ))),
+            Json(api_error(format!("Failed to get reasoning traces: {}", e))),
         )),
     }
 }

@@ -32,8 +32,8 @@ use tracing::{info, warn};
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
 use crate::database::pg::event_log::EventType;
-use crate::step_executor::StepExecutor;
 use crate::step_executor::executor_types::ExecutionStepConfig;
+use crate::step_executor::StepExecutor;
 use crate::workflow::dag_executor::NodeOutcome;
 use crate::workflow::dag_parser::dag_to_step_configs;
 use crate::workflow::dag_runtime::{DagRuntime, DagWorkflowResult, LayerAdvance};
@@ -79,8 +79,8 @@ pub async fn execute_dag_workflow(
     let execution_id = deps.execution_id.clone();
 
     // ── Build runtime ────────────────────────────────────────────────────────
-    let mut runtime = DagRuntime::new(def.clone())
-        .map_err(|e| format!("Failed to build DAG runtime: {}", e))?;
+    let mut runtime =
+        DagRuntime::new(def.clone()).map_err(|e| format!("Failed to build DAG runtime: {}", e))?;
 
     // ── Pre-compute step configs keyed by node_id ────────────────────────────
     let step_configs = dag_to_step_configs(&def)
@@ -148,13 +148,18 @@ pub async fn execute_dag_workflow(
                             "Replaying completed node from event log (crash recovery)"
                         );
                         // Return the cached result immediately without re-executing.
-                        node_futures.push(
-                            Box::pin(async move {
-                                (node_id, NodeOutcome::Success, Some(cached_output), 0u64, 0u32)
-                            })
-                                as std::pin::Pin<
-                                    Box<
-                                        dyn std::future::Future<
+                        node_futures.push(Box::pin(async move {
+                            (
+                                node_id,
+                                NodeOutcome::Success,
+                                Some(cached_output),
+                                0u64,
+                                0u32,
+                            )
+                        })
+                            as std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
                                             Output = (
                                                 String,
                                                 NodeOutcome,
@@ -163,9 +168,8 @@ pub async fn execute_dag_workflow(
                                                 u32,
                                             ),
                                         > + Send,
-                                    >,
                                 >,
-                        );
+                            >);
                         continue;
                     }
 
@@ -175,8 +179,7 @@ pub async fn execute_dag_workflow(
                     // Top-level DAG executions always start at depth 0.
                     if let Some(node_def) = def.nodes.get(&node_id) {
                         if let Err(e) = crate::workflow::dag_context::validate_node_sub_workflow(
-                            node_def,
-                            0, // top-level DAG execution depth
+                            node_def, 0, // top-level DAG execution depth
                         ) {
                             warn!(
                                 node_id = %node_id,
@@ -194,7 +197,19 @@ pub async fn execute_dag_workflow(
                             node_futures.push(Box::pin(async move {
                                 (node_id, NodeOutcome::Failed, None, 0u64, 0u32)
                             })
-                                as std::pin::Pin<Box<dyn std::future::Future<Output = (String, NodeOutcome, Option<serde_json::Value>, u64, u32)> + Send>>);
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn std::future::Future<
+                                                Output = (
+                                                    String,
+                                                    NodeOutcome,
+                                                    Option<serde_json::Value>,
+                                                    u64,
+                                                    u32,
+                                                ),
+                                            > + Send,
+                                    >,
+                                >);
                             continue;
                         }
                     }
@@ -210,7 +225,19 @@ pub async fn execute_dag_workflow(
                             node_futures.push(Box::pin(async move {
                                 (node_id, NodeOutcome::Failed, None, 0u64, 0u32)
                             })
-                                as std::pin::Pin<Box<dyn std::future::Future<Output = (String, NodeOutcome, Option<serde_json::Value>, u64, u32)> + Send>>);
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn std::future::Future<
+                                                Output = (
+                                                    String,
+                                                    NodeOutcome,
+                                                    Option<serde_json::Value>,
+                                                    u64,
+                                                    u32,
+                                                ),
+                                            > + Send,
+                                    >,
+                                >);
                             continue;
                         }
                     };
@@ -227,8 +254,8 @@ pub async fn execute_dag_workflow(
                                 if let Some(fresh_prompt) =
                                     crate::workflow::dag_context::resolve_node_context(
                                         node_def,
-                                        "",  // base_prompt not available at dag_driver level
-                                        0,   // iteration 0 for single-pass DAG
+                                        "", // base_prompt not available at dag_driver level
+                                        0,  // iteration 0 for single-pass DAG
                                         &variables_snapshot,
                                         &[], // no verification failures in DAG context
                                         &[], // no iteration diffs in DAG context
@@ -300,7 +327,11 @@ pub async fn execute_dag_workflow(
                             };
 
                             let success = matches!(outcome, NodeOutcome::Success);
-                            let event_type = if success { EventType::Completed } else { EventType::Failed };
+                            let event_type = if success {
+                                EventType::Completed
+                            } else {
+                                EventType::Failed
+                            };
                             let event_data = json!({
                                 "success": success,
                                 "duration_ms": duration_ms,
@@ -319,7 +350,19 @@ pub async fn execute_dag_workflow(
                         };
 
                         node_futures.push(Box::pin(fut)
-                            as std::pin::Pin<Box<dyn std::future::Future<Output = (String, NodeOutcome, Option<serde_json::Value>, u64, u32)> + Send>>);
+                            as std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = (
+                                                String,
+                                                NodeOutcome,
+                                                Option<serde_json::Value>,
+                                                u64,
+                                                u32,
+                                            ),
+                                        > + Send,
+                                >,
+                            >);
                         continue;
                     }
 
@@ -375,12 +418,10 @@ pub async fn execute_dag_workflow(
                                 .await;
 
                             // Exponential backoff: delay_ms * backoff^(attempt-1)
-                            let wait_ms = (delay_ms as f64
-                                * backoff.powi((attempt - 1) as i32))
-                                as u64;
+                            let wait_ms =
+                                (delay_ms as f64 * backoff.powi((attempt - 1) as i32)) as u64;
                             if wait_ms > 0 {
-                                tokio::time::sleep(std::time::Duration::from_millis(wait_ms))
-                                    .await;
+                                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                             }
 
                             last_error = error;
@@ -417,11 +458,29 @@ pub async fn execute_dag_workflow(
                             )
                             .await;
 
-                        (node_id_log, outcome, last_output, total_duration_ms, retries)
+                        (
+                            node_id_log,
+                            outcome,
+                            last_output,
+                            total_duration_ms,
+                            retries,
+                        )
                     };
 
                     node_futures.push(Box::pin(fut)
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = (String, NodeOutcome, Option<serde_json::Value>, u64, u32)> + Send>>);
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = (
+                                            String,
+                                            NodeOutcome,
+                                            Option<serde_json::Value>,
+                                            u64,
+                                            u32,
+                                        ),
+                                    > + Send,
+                            >,
+                        >);
                 }
 
                 // ── Await all node futures in parallel ───────────────────────
@@ -519,7 +578,10 @@ async fn execute_loop_node(
     let body_ids = match &node_def.loop_body {
         Some(ids) if !ids.is_empty() => ids.clone(),
         _ => {
-            warn!(node_id, "dag_loop node has empty or missing loop_body — marking failed");
+            warn!(
+                node_id,
+                "dag_loop node has empty or missing loop_body — marking failed"
+            );
             return (NodeOutcome::Failed, None, 0);
         }
     };
@@ -537,8 +599,7 @@ async fn execute_loop_node(
                 None => {
                     warn!(
                         node_id,
-                        body_id,
-                        "Loop body node not found in config_map — skipping"
+                        body_id, "Loop body node not found in config_map — skipping"
                     );
                     continue;
                 }
@@ -554,17 +615,14 @@ async fn execute_loop_node(
             }
 
             let start = Instant::now();
-            let (success, _error, _screenshot, output) =
-                executor.execute_single_step(&step).await;
+            let (success, _error, _screenshot, output) = executor.execute_single_step(&step).await;
             total_duration_ms += start.elapsed().as_millis() as u64;
             last_output = output;
 
             if !success {
                 warn!(
                     node_id,
-                    body_id,
-                    iteration,
-                    "Loop body node failed — aborting loop"
+                    body_id, iteration, "Loop body node failed — aborting loop"
                 );
                 return (NodeOutcome::Failed, last_output, total_duration_ms);
             }
@@ -582,8 +640,7 @@ async fn execute_loop_node(
             if exit_code == 0 {
                 info!(
                     node_id,
-                    iteration,
-                    "Loop until_bash condition met — breaking"
+                    iteration, "Loop until_bash condition met — breaking"
                 );
                 break;
             }

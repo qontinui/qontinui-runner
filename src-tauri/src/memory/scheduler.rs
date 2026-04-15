@@ -29,10 +29,10 @@ pub struct MemorySchedulerConfig {
 impl Default for MemorySchedulerConfig {
     fn default() -> Self {
         Self {
-            interval_secs: 600,            // 10 minutes
+            interval_secs: 600, // 10 minutes
             initial_delay_secs: 60,
             consolidation: ConsolidationConfig::default(),
-            dreamer_interval_secs: 28800,  // 8 hours
+            dreamer_interval_secs: 28800,     // 8 hours
             dreamer_initial_delay_secs: 1800, // 30 minutes
         }
     }
@@ -112,8 +112,7 @@ pub fn start_dreamer_scheduler(
             // Check cooldown (dreamer-specific)
             match pg.get_last_dreamer_time().await {
                 Ok(Some(last)) => {
-                    let hours_since =
-                        (chrono::Utc::now() - last).num_seconds() as f64 / 3600.0;
+                    let hours_since = (chrono::Utc::now() - last).num_seconds() as f64 / 3600.0;
                     if hours_since < (config.dreamer_interval_secs as f64 / 3600.0) * 0.9 {
                         debug!(
                             "Dreamer: cooldown active ({:.1}h since last run), skipping",

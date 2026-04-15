@@ -207,9 +207,10 @@ mod tests {
     fn test_resolve_inputs() {
         let mut store = VariableStore::new();
         store.set_output("nodeA", json!({"score": 99}));
-        let inputs: HashMap<String, String> = [("my_score".to_string(), "$nodeA.score".to_string())]
-            .into_iter()
-            .collect();
+        let inputs: HashMap<String, String> =
+            [("my_score".to_string(), "$nodeA.score".to_string())]
+                .into_iter()
+                .collect();
         let resolved = store.resolve_inputs(&inputs);
         assert_eq!(resolved.get("my_score"), Some(&json!(99)));
     }

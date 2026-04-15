@@ -530,7 +530,10 @@ impl RunRecorder {
             _ => run.error_type.clone(),
         };
 
-        let ended_at = run.ended_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        let ended_at = run
+            .ended_at
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         let duration_ms = run.duration_ms.unwrap_or(0).min(i32::MAX as u64) as i32;
 
         // Serialize JSON-blob columns. Schema uses TEXT for these.
@@ -578,7 +581,6 @@ impl RunRecorder {
 
         Ok(run_id)
     }
-
 }
 
 /// Builder pattern for creating transitions from Python events.

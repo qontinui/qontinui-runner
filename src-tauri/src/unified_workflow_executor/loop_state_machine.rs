@@ -163,7 +163,6 @@ pub(crate) struct LoopContext {
     pub active_contingencies: Vec<String>,
 
     // --- Fix attempt tracking (Phase 1: Bounded Fix Loop) ---
-
     /// Consecutive non-improving iterations (separate from iteration counter).
     /// Resets to 0 when verification shows progress (more checks pass than previous best).
     pub fix_attempts: u32,

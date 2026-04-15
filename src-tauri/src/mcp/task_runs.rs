@@ -225,11 +225,7 @@ pub async fn stop_task_run(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Expire any waiting breakpoint snapshots for this task (cleanup)
-    let _ = state
-        .app_state
-        .pg_db
-        .expire_breakpoint_snapshots(&id)
-        .await;
+    let _ = state.app_state.pg_db.expire_breakpoint_snapshots(&id).await;
 
     // Explicitly release URL locks for this task (don't rely solely on
     // WorkflowDropGuard's sync release, which can fail under contention)
@@ -2893,7 +2889,10 @@ pub async fn get_breakpoint_snapshot(
     if snapshot.execution_id != id {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("Snapshot {} does not belong to task run {}", snapshot_id, id),
+            format!(
+                "Snapshot {} does not belong to task run {}",
+                snapshot_id, id
+            ),
         ));
     }
 
@@ -2922,7 +2921,10 @@ pub async fn resume_breakpoint_snapshot(
     if snapshot.execution_id != id {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("Snapshot {} does not belong to task run {}", snapshot_id, id),
+            format!(
+                "Snapshot {} does not belong to task run {}",
+                snapshot_id, id
+            ),
         ));
     }
 
@@ -2988,7 +2990,10 @@ pub async fn resume_breakpoint_snapshot(
     } else {
         Err((
             StatusCode::CONFLICT,
-            format!("Failed to resume snapshot {} — may already be resumed", snapshot_id),
+            format!(
+                "Failed to resume snapshot {} — may already be resumed",
+                snapshot_id
+            ),
         ))
     }
 }

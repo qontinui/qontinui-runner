@@ -48,4 +48,3 @@ pub struct CausalSummary {
     pub by_cause_type: HashMap<String, u32>,
     pub avg_chain_length: f64,
 }
-

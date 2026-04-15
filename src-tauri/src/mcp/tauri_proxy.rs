@@ -19,7 +19,7 @@ use serde_json::Value;
 use tauri::Manager as _;
 use tracing::info;
 
-use crate::mcp::types::{ApiState};
+use crate::mcp::types::ApiState;
 use crate::terminal::TerminalManager;
 
 // ============================================================================
@@ -65,10 +65,18 @@ pub struct TauriInvokeResponse {
 
 impl TauriInvokeResponse {
     fn ok(data: Value) -> Self {
-        Self { success: true, data: Some(data), error: None }
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        }
     }
     fn err(msg: impl Into<String>) -> Self {
-        Self { success: false, data: None, error: Some(msg.into()) }
+        Self {
+            success: false,
+            data: None,
+            error: Some(msg.into()),
+        }
     }
 }
 
@@ -121,7 +129,9 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
         // ── settings ─────────────────────────────────────────────────────────
         "setting_get" => {
             #[derive(Deserialize)]
-            struct Args { key: String }
+            struct Args {
+                key: String,
+            }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
@@ -134,7 +144,10 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
 
         "setting_set" => {
             #[derive(Deserialize)]
-            struct Args { key: String, value: Value }
+            struct Args {
+                key: String,
+                value: Value,
+            }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
@@ -168,10 +181,17 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 .state::<Arc<TerminalManager>>()
                 .inner()
                 .clone();
-            match tm.create(a.title, a.working_dir, a.page_id, a.cols, a.rows, state.app_handle.clone()) {
-                Ok(info) => TauriInvokeResponse::ok(
-                    serde_json::to_value(&info).unwrap_or(Value::Null)
-                ),
+            match tm.create(
+                a.title,
+                a.working_dir,
+                a.page_id,
+                a.cols,
+                a.rows,
+                state.app_handle.clone(),
+            ) {
+                Ok(info) => {
+                    TauriInvokeResponse::ok(serde_json::to_value(&info).unwrap_or(Value::Null))
+                }
                 Err(e) => TauriInvokeResponse::err(e),
             }
         }
@@ -179,7 +199,10 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
         "terminal_write" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
-            struct Args { terminal_id: String, data: String }
+            struct Args {
+                terminal_id: String,
+                data: String,
+            }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
@@ -191,7 +214,12 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 .clone();
             let session = match tm.get(&a.terminal_id) {
                 Some(s) => s,
-                None => return TauriInvokeResponse::err(format!("Terminal not found: {}", a.terminal_id)),
+                None => {
+                    return TauriInvokeResponse::err(format!(
+                        "Terminal not found: {}",
+                        a.terminal_id
+                    ))
+                }
             };
             let bytes = match STANDARD.decode(&a.data) {
                 Ok(b) => b,
@@ -206,7 +234,9 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
         "terminal_close" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
-            struct Args { terminal_id: String }
+            struct Args {
+                terminal_id: String,
+            }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
@@ -243,19 +273,19 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
         "check_accounts_usage" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
-            struct Args { config_dirs: Vec<String> }
+            struct Args {
+                config_dirs: Vec<String>,
+            }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
             };
             match crate::commands::ai_settings::check_accounts_usage(a.config_dirs).await {
-                Ok(cmd) => {
-                    TauriInvokeResponse::ok(serde_json::json!({
-                        "success": cmd.success,
-                        "message": cmd.message,
-                        "data": cmd.data,
-                    }))
-                }
+                Ok(cmd) => TauriInvokeResponse::ok(serde_json::json!({
+                    "success": cmd.success,
+                    "message": cmd.message,
+                    "data": cmd.data,
+                })),
                 Err(e) => TauriInvokeResponse::err(e),
             }
         }
@@ -271,6 +301,5 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
 
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
-    axum::Router::new()
-        .route("/ui-bridge/tauri/invoke", post(tauri_invoke_handler))
+    axum::Router::new().route("/ui-bridge/tauri/invoke", post(tauri_invoke_handler))
 }

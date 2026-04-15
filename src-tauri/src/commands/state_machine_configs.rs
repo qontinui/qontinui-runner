@@ -342,10 +342,7 @@ process.stdout.write(emitPersistedStateMachineJSON(result.states, result.transit
         return Err("Static analysis produced no output".to_string());
     }
 
-    info!(
-        "Generated state machine: {} bytes",
-        json.len()
-    );
+    info!("Generated state machine: {} bytes", json.len());
 
     Ok(json)
 }

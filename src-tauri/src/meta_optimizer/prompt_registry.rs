@@ -49,7 +49,10 @@ pub fn create_variant(
             variant.id, variant_name
         )),
     ) {
-        tracing::warn!("Failed to create resource version for prompt variant: {}", e);
+        tracing::warn!(
+            "Failed to create resource version for prompt variant: {}",
+            e
+        );
     }
 
     Ok(variant)

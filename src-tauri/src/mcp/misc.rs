@@ -1596,9 +1596,9 @@ async fn spawn_instance(
             .await
         {
             Ok(_) => tracing::debug!("Registered spawned instance with supervisor"),
-            Err(_) => tracing::debug!(
-                "Supervisor not reachable — primary runner is the coordinator"
-            ),
+            Err(_) => {
+                tracing::debug!("Supervisor not reachable — primary runner is the coordinator")
+            }
         }
     }
 
@@ -1709,7 +1709,9 @@ async fn register_instance(
     if body.port == self_port {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error("Cannot register with the same port as the primary")),
+            Json(ApiResponse::error(
+                "Cannot register with the same port as the primary",
+            )),
         ));
     }
 
@@ -1764,7 +1766,9 @@ async fn instance_heartbeat(
     } else {
         Err((
             axum::http::StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("Instance not registered — re-register with POST /instances/register")),
+            Json(ApiResponse::error(
+                "Instance not registered — re-register with POST /instances/register",
+            )),
         ))
     }
 }
@@ -1774,9 +1778,7 @@ async fn instance_heartbeat(
 /// Returns the same shape as the supervisor's `GET /runners` endpoint so that
 /// scripts (runner_status.py, runner_lock.py, manual-test) can target either
 /// the supervisor (port 9875) or the primary runner (port 9876).
-async fn list_runners(
-    State(state): State<Arc<ApiState>>,
-) -> Json<serde_json::Value> {
+async fn list_runners(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     let self_port = state
         .app_state
         .api_port

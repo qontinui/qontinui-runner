@@ -41,9 +41,7 @@ fn sample_gamma_inline(rng: &mut StdRng, shape: f64) -> f64 {
 
         let u: f64 = rng.random();
         // Squeeze + rejection
-        if u < 1.0 - 0.0331 * x.powi(4)
-            || u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln())
-        {
+        if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
             return d * v;
         }
     }
@@ -241,10 +239,7 @@ impl CandidatePool {
             .candidates
             .iter()
             .map(|c| {
-                let &(alpha, beta) = self
-                    .beta_posteriors
-                    .get(&c.id)
-                    .unwrap_or(&(1.0, 1.0));
+                let &(alpha, beta) = self.beta_posteriors.get(&c.id).unwrap_or(&(1.0, 1.0));
                 let s = sample_beta_inline(rng, alpha, beta);
                 (c.id.clone(), s)
             })
@@ -262,9 +257,7 @@ impl CandidatePool {
     /// Record a duel result: update the win matrix and Beta posteriors.
     pub fn record_duel_result(&mut self, result: &DuelResult) {
         // Validate winner_id is one of the two candidates
-        if result.winner_id != result.candidate_a_id
-            && result.winner_id != result.candidate_b_id
-        {
+        if result.winner_id != result.candidate_a_id && result.winner_id != result.candidate_b_id {
             tracing::warn!(
                 winner = %result.winner_id,
                 a = %result.candidate_a_id,
@@ -323,9 +316,9 @@ impl CandidatePool {
     /// The top candidate by Copeland score.
     pub fn top_candidate(&self) -> Option<&DuelCandidate> {
         let scores = self.matrix.copeland_scores();
-        scores.first().and_then(|(id, _)| {
-            self.candidates.iter().find(|c| c.id == *id)
-        })
+        scores
+            .first()
+            .and_then(|(id, _)| self.candidates.iter().find(|c| c.id == *id))
     }
 
     /// Rankings: Copeland scores sorted descending.

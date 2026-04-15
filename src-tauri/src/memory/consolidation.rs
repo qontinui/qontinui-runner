@@ -472,7 +472,9 @@ pub async fn run_consolidation(
 
     // After consolidation (success or failure), invalidate all cached working
     // representations so the next prompt build picks up freshly consolidated data.
-    if let Some(wr_cache) = crate::memory::working_representation::WorkingRepresentationCache::try_global() {
+    if let Some(wr_cache) =
+        crate::memory::working_representation::WorkingRepresentationCache::try_global()
+    {
         info!("Invalidating all working representation cache entries after consolidation");
         wr_cache.invalidate_all().await;
     }
@@ -779,8 +781,13 @@ async fn try_llm_inductive(
     }
 
     let json_str = strip_markdown_fences(&response.output);
-    let parsed: LlmInductiveResponse = serde_json::from_str(json_str)
-        .map_err(|e| format!("Failed to parse inductive JSON: {} — raw: {}", e, &json_str[..json_str.len().min(200)]))?;
+    let parsed: LlmInductiveResponse = serde_json::from_str(json_str).map_err(|e| {
+        format!(
+            "Failed to parse inductive JSON: {} — raw: {}",
+            e,
+            &json_str[..json_str.len().min(200)]
+        )
+    })?;
 
     Ok((parsed.conclusion, parsed.confidence.clamp(0.0, 1.0)))
 }
@@ -843,8 +850,13 @@ async fn try_llm_abductive(
     }
 
     let json_str = strip_markdown_fences(&response.output);
-    let parsed: LlmAbductiveResponse = serde_json::from_str(json_str)
-        .map_err(|e| format!("Failed to parse abductive JSON: {} — raw: {}", e, &json_str[..json_str.len().min(200)]))?;
+    let parsed: LlmAbductiveResponse = serde_json::from_str(json_str).map_err(|e| {
+        format!(
+            "Failed to parse abductive JSON: {} — raw: {}",
+            e,
+            &json_str[..json_str.len().min(200)]
+        )
+    })?;
 
     Ok((parsed.hypothesis, parsed.confidence.clamp(0.0, 1.0)))
 }
@@ -888,25 +900,24 @@ pub(crate) async fn phase_inductive(
             let heuristic_confidence = (group.len() as f64 / 10.0).min(0.9);
 
             // Try LLM, fall back to heuristic
-            let (conclusion, confidence, source) =
-                match try_llm_inductive(obs_type, group).await {
-                    Ok((c, conf)) => {
-                        debug!(
-                            obs_type,
-                            count = group.len(),
-                            "LLM inductive reasoning succeeded"
-                        );
-                        (c, conf, "llm")
-                    }
-                    Err(e) => {
-                        debug!(
-                            obs_type,
-                            error = %e,
-                            "LLM inductive reasoning unavailable, using heuristic"
-                        );
-                        (heuristic_conclusion, heuristic_confidence, "heuristic")
-                    }
-                };
+            let (conclusion, confidence, source) = match try_llm_inductive(obs_type, group).await {
+                Ok((c, conf)) => {
+                    debug!(
+                        obs_type,
+                        count = group.len(),
+                        "LLM inductive reasoning succeeded"
+                    );
+                    (c, conf, "llm")
+                }
+                Err(e) => {
+                    debug!(
+                        obs_type,
+                        error = %e,
+                        "LLM inductive reasoning unavailable, using heuristic"
+                    );
+                    (heuristic_conclusion, heuristic_confidence, "heuristic")
+                }
+            };
 
             traces.push(CreateReasoningTraceInput {
                 reasoning_type: "inductive".to_string(),
@@ -933,10 +944,7 @@ pub(crate) async fn phase_inductive(
     for obs in observations {
         if let Some(ref tk) = obs.topic_key {
             if let Some(prefix) = tk.split('/').next() {
-                by_prefix
-                    .entry(prefix.to_string())
-                    .or_default()
-                    .push(obs);
+                by_prefix.entry(prefix.to_string()).or_default().push(obs);
             }
         }
     }
@@ -1109,9 +1117,7 @@ pub(crate) async fn phase_deductive(
                     if let Ok(recent_traces) = pg.get_recent_traces(None, 100).await {
                         for trace in &recent_traces {
                             if trace.is_valid && trace.premise_ids.contains(&model_id) {
-                                let _ = pg
-                                    .invalidate_trace(trace.id, Some(new_trace_id))
-                                    .await;
+                                let _ = pg.invalidate_trace(trace.id, Some(new_trace_id)).await;
                             }
                         }
                     }
@@ -1174,8 +1180,7 @@ pub(crate) async fn phase_abductive(
         for (area, cluster) in &clusters {
             if cluster.len() >= 2 {
                 let premise_ids: Vec<i64> = cluster.iter().map(|o| o.id).collect();
-                let titles: Vec<&str> =
-                    cluster.iter().take(4).map(|o| o.title.as_str()).collect();
+                let titles: Vec<&str> = cluster.iter().take(4).map(|o| o.title.as_str()).collect();
 
                 // Heuristic fallback values
                 let heuristic_conclusion = format!(
@@ -1190,25 +1195,25 @@ pub(crate) async fn phase_abductive(
                 let heuristic_confidence = 0.5 + (cluster.len() as f64 * 0.05).min(0.3);
 
                 // Try LLM, fall back to heuristic
-                let (conclusion, confidence, source) =
-                    match try_llm_abductive(area, cluster).await {
-                        Ok((hyp, conf)) => {
-                            debug!(
-                                area,
-                                count = cluster.len(),
-                                "LLM abductive reasoning succeeded"
-                            );
-                            (hyp, conf, "llm")
-                        }
-                        Err(e) => {
-                            debug!(
-                                area,
-                                error = %e,
-                                "LLM abductive reasoning unavailable, using heuristic"
-                            );
-                            (heuristic_conclusion, heuristic_confidence, "heuristic")
-                        }
-                    };
+                let (conclusion, confidence, source) = match try_llm_abductive(area, cluster).await
+                {
+                    Ok((hyp, conf)) => {
+                        debug!(
+                            area,
+                            count = cluster.len(),
+                            "LLM abductive reasoning succeeded"
+                        );
+                        (hyp, conf, "llm")
+                    }
+                    Err(e) => {
+                        debug!(
+                            area,
+                            error = %e,
+                            "LLM abductive reasoning unavailable, using heuristic"
+                        );
+                        (heuristic_conclusion, heuristic_confidence, "heuristic")
+                    }
+                };
 
                 traces.push(CreateReasoningTraceInput {
                     reasoning_type: "abductive".to_string(),

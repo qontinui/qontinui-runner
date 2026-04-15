@@ -90,9 +90,8 @@ fn validate_path(requested: &str) -> Result<PathBuf, String> {
     let requested_path = PathBuf::from(requested);
 
     // Resolve to absolute path
-    let canonical = std::fs::canonicalize(&requested_path).map_err(|e| {
-        format!("Path not found or inaccessible: {}", e)
-    })?;
+    let canonical = std::fs::canonicalize(&requested_path)
+        .map_err(|e| format!("Path not found or inaccessible: {}", e))?;
 
     let safe_dirs = get_safe_directories();
 
@@ -122,9 +121,8 @@ fn validate_path(requested: &str) -> Result<PathBuf, String> {
 /// check but before the I/O operation. Combined with re-canonicalization
 /// immediately before I/O, this narrows the race window to near zero.
 fn verify_not_symlink(path: &Path) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(path).map_err(|e| {
-        format!("Failed to read symlink metadata: {}", e)
-    })?;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("Failed to read symlink metadata: {}", e))?;
     if meta.file_type().is_symlink() {
         warn!("file_browser_symlink_rejected: path={}", path.display());
         return Err("Access denied: symlinks are not allowed".to_string());
@@ -136,9 +134,8 @@ fn verify_not_symlink(path: &Path) -> Result<(), String> {
 /// roots. This is called immediately before the actual filesystem operation to
 /// narrow the TOCTOU window between `validate_path` and the I/O call.
 fn revalidate_path(path: &Path) -> Result<PathBuf, String> {
-    let canonical = std::fs::canonicalize(path).map_err(|e| {
-        format!("Re-canonicalization failed: {}", e)
-    })?;
+    let canonical =
+        std::fs::canonicalize(path).map_err(|e| format!("Re-canonicalization failed: {}", e))?;
 
     let safe_dirs = get_safe_directories();
     for (safe_root, _label) in &safe_dirs {
@@ -151,7 +148,8 @@ fn revalidate_path(path: &Path) -> Result<PathBuf, String> {
 
     warn!(
         "file_browser_revalidation_failed: path={}, canonical={:?}",
-        path.display(), canonical,
+        path.display(),
+        canonical,
     );
     Err("Access denied: path escaped allowed directories between checks".to_string())
 }
@@ -166,14 +164,69 @@ fn is_text_file(path: &Path) -> bool {
 
     matches!(
         ext.as_str(),
-        "txt" | "md" | "json" | "yaml" | "yml" | "toml" | "xml" | "html" | "css"
-            | "js" | "ts" | "jsx" | "tsx" | "py" | "rs" | "go" | "java" | "c" | "cpp"
-            | "h" | "hpp" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd"
-            | "sql" | "csv" | "log" | "env" | "ini" | "cfg" | "conf" | "gitignore"
-            | "dockerignore" | "editorconfig" | "prettierrc" | "eslintrc"
-            | "makefile" | "dockerfile" | "proto" | "graphql" | "gql" | "svelte"
-            | "vue" | "swift" | "kt" | "kts" | "gradle" | "rb" | "php" | "lua"
-            | "r" | "jl" | "ex" | "exs" | "erl" | "hs" | "ml" | "mli" | "dart"
+        "txt"
+            | "md"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "html"
+            | "css"
+            | "js"
+            | "ts"
+            | "jsx"
+            | "tsx"
+            | "py"
+            | "rs"
+            | "go"
+            | "java"
+            | "c"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "ps1"
+            | "bat"
+            | "cmd"
+            | "sql"
+            | "csv"
+            | "log"
+            | "env"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "gitignore"
+            | "dockerignore"
+            | "editorconfig"
+            | "prettierrc"
+            | "eslintrc"
+            | "makefile"
+            | "dockerfile"
+            | "proto"
+            | "graphql"
+            | "gql"
+            | "svelte"
+            | "vue"
+            | "swift"
+            | "kt"
+            | "kts"
+            | "gradle"
+            | "rb"
+            | "php"
+            | "lua"
+            | "r"
+            | "jl"
+            | "ex"
+            | "exs"
+            | "erl"
+            | "hs"
+            | "ml"
+            | "mli"
+            | "dart"
     )
 }
 
@@ -232,9 +285,11 @@ pub async fn browse_directory(path: String) -> Result<BrowseResult, String> {
         format!("Failed to read directory: {}", e)
     })?;
 
-    while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
-        format!("Error reading entry: {}", e)
-    })? {
+    while let Some(entry) = read_dir
+        .next_entry()
+        .await
+        .map_err(|e| format!("Error reading entry: {}", e))?
+    {
         let metadata = match entry.metadata().await {
             Ok(m) => m,
             Err(_) => continue, // skip entries we can't stat
@@ -251,12 +306,10 @@ pub async fn browse_directory(path: String) -> Result<BrowseResult, String> {
             .modified()
             .ok()
             .and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| {
-                        chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
-                            .map(|dt| dt.to_rfc3339())
-                    })
+                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| {
+                    chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
+                        .map(|dt| dt.to_rfc3339())
+                })
             })
             .flatten();
 
@@ -276,7 +329,11 @@ pub async fn browse_directory(path: String) -> Result<BrowseResult, String> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
-    info!("browse_directory: path={}, count={}", canonical.display(), entries.len());
+    info!(
+        "browse_directory: path={}, count={}",
+        canonical.display(),
+        entries.len()
+    );
 
     Ok(BrowseResult {
         path: canonical.to_string_lossy().to_string(),
@@ -309,9 +366,9 @@ pub async fn read_file_content(
     // Re-canonicalize immediately before I/O to narrow the TOCTOU window.
     let canonical = revalidate_path(&canonical)?;
 
-    let metadata = tokio::fs::metadata(&canonical).await.map_err(|e| {
-        format!("Failed to read file metadata: {}", e)
-    })?;
+    let metadata = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
 
     let size = metadata.len();
     let limit = max_bytes.unwrap_or(MAX_READ_BYTES).min(MAX_READ_BYTES);
@@ -337,7 +394,12 @@ pub async fn read_file_content(
         None
     };
 
-    info!("read_file_content: path={}, size_bytes={}, is_text={}", canonical.display(), size, is_text);
+    info!(
+        "read_file_content: path={}, size_bytes={}, is_text={}",
+        canonical.display(),
+        size,
+        is_text
+    );
 
     Ok(FileContentResult {
         path: canonical.to_string_lossy().to_string(),

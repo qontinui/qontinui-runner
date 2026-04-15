@@ -86,14 +86,13 @@ pub fn launch_generated_workflow(
                 chrono::Utc::now().timestamp_millis()
             );
 
-            let input =
-                crate::database::CreateTaskRunInput::new(&execution_id, &dag_def.name)
-                    .with_prompt(format!("DAG workflow: {}", dag_def.name))
-                    .with_task_type("ai")
-                    .with_workflow_name(&dag_def.name)
-                    .with_workflow_id(&generated_workflow_id)
-                    .with_workflow_type("dag")
-                    .with_parent_task_run_id(meta_task_run_id);
+            let input = crate::database::CreateTaskRunInput::new(&execution_id, &dag_def.name)
+                .with_prompt(format!("DAG workflow: {}", dag_def.name))
+                .with_task_type("ai")
+                .with_workflow_name(&dag_def.name)
+                .with_workflow_id(&generated_workflow_id)
+                .with_workflow_type("dag")
+                .with_parent_task_run_id(meta_task_run_id);
 
             let pg_create = pg_db.clone();
             let input_clone = input.clone();

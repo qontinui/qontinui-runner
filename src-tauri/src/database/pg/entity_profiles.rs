@@ -32,20 +32,27 @@ impl PgDb {
     /// recomputes content_hash.
     ///
     /// Returns the profile ID (new or existing).
-    pub async fn save_entity_profile(&self, input: &CreateEntityProfileInput) -> Result<i64, String> {
+    pub async fn save_entity_profile(
+        &self,
+        input: &CreateEntityProfileInput,
+    ) -> Result<i64, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let hash = profile_content_hash(&input.entity_kind, &input.entity_id, &input.profile_summary);
+        let hash =
+            profile_content_hash(&input.entity_kind, &input.entity_id, &input.profile_summary);
         let topic_key = derive_topic_key(&input.entity_kind, &input.entity_id);
 
         let obs_ids = input.source_observation_ids.clone().unwrap_or_default();
         let finding_ids = input.source_finding_ids.clone().unwrap_or_default();
         let fix_ids = input.source_fix_ids.clone().unwrap_or_default();
-        let pattern_ids = input.source_cross_run_pattern_ids.clone().unwrap_or_default();
+        let pattern_ids = input
+            .source_cross_run_pattern_ids
+            .clone()
+            .unwrap_or_default();
 
         let row = conn
             .query_one(
@@ -149,7 +156,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG search_entity_profiles: {}", e))?;
 
-        Ok(rows.iter().map(|r| row_to_entity_profile_search(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| row_to_entity_profile_search(r))
+            .collect())
     }
 
     /// Get profiles filtered by entity kind, ordered by importance.

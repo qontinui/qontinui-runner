@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::sync::watch;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::mcp::transport::{DeviceOs, TransportKind};
@@ -115,9 +115,7 @@ impl PhysicalDeviceRegistry {
         match map.get_mut(&info.id) {
             Some(device) => {
                 // Remove existing transport of the same kind, then add the new one
-                device
-                    .transports
-                    .retain(|t| t.kind != transport.kind);
+                device.transports.retain(|t| t.kind != transport.kind);
                 device.transports.push(transport);
                 sort_transports(&mut device.transports);
                 device.active_transport_idx = 0;
@@ -159,12 +157,7 @@ impl PhysicalDeviceRegistry {
 
     /// Add or replace a transport of the given kind, then re-sort and reset
     /// the active index to 0 (best transport).
-    pub async fn promote_transport(
-        &self,
-        id: &str,
-        kind: TransportKind,
-        proxy_url: String,
-    ) {
+    pub async fn promote_transport(&self, id: &str, kind: TransportKind, proxy_url: String) {
         let mut map = self.devices.write().await;
         if let Some(device) = map.get_mut(id) {
             device.transports.retain(|t| t.kind != kind);
@@ -241,9 +234,9 @@ impl PhysicalDeviceRegistry {
                     let map = self.devices.read().await;
                     map.values()
                         .filter_map(|d| {
-                            d.transports.get(d.active_transport_idx).map(|t| {
-                                (d.info.id.clone(), t.kind, t.proxy_url.clone())
-                            })
+                            d.transports
+                                .get(d.active_transport_idx)
+                                .map(|t| (d.info.id.clone(), t.kind, t.proxy_url.clone()))
                         })
                         .collect()
                 };
@@ -267,11 +260,7 @@ impl PhysicalDeviceRegistry {
                     };
 
                     // Find the transport in the device's list
-                    let transport = match device
-                        .transports
-                        .iter_mut()
-                        .find(|t| t.kind == kind)
-                    {
+                    let transport = match device.transports.iter_mut().find(|t| t.kind == kind) {
                         Some(t) => t,
                         None => continue,
                     };

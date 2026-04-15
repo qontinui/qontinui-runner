@@ -950,8 +950,14 @@ async fn handle_relay_command(
                     .get("working_dir")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let cols = data.get("cols").and_then(|v| v.as_u64()).map(|v| v.min(u16::MAX as u64) as u16);
-                let rows = data.get("rows").and_then(|v| v.as_u64()).map(|v| v.min(u16::MAX as u64) as u16);
+                let cols = data
+                    .get("cols")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.min(u16::MAX as u64) as u16);
+                let rows = data
+                    .get("rows")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.min(u16::MAX as u64) as u16);
 
                 match tm.create(
                     title,
@@ -1022,8 +1028,16 @@ async fn handle_relay_command(
                     .get("terminal_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let cols = data.get("cols").and_then(|v| v.as_u64()).unwrap_or(80).min(u16::MAX as u64) as u16;
-                let rows = data.get("rows").and_then(|v| v.as_u64()).unwrap_or(24).min(u16::MAX as u64) as u16;
+                let cols = data
+                    .get("cols")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(80)
+                    .min(u16::MAX as u64) as u16;
+                let rows = data
+                    .get("rows")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(24)
+                    .min(u16::MAX as u64) as u16;
 
                 if let Some(session) = tm.get(terminal_id) {
                     if let Err(e) = session.resize(cols, rows) {
@@ -1157,7 +1171,10 @@ pub mod commands {
             // Auto-detect local backend for local dev
             match detect_local_backend().await {
                 Some(url) => {
-                    info!("Local backend detected at {}, auto-connecting cloud relay", url);
+                    info!(
+                        "Local backend detected at {}, auto-connecting cloud relay",
+                        url
+                    );
                     url
                 }
                 None => return,

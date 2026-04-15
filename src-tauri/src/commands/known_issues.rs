@@ -295,4 +295,3 @@ pub async fn create_pattern_template(
     );
     Ok(template)
 }
-

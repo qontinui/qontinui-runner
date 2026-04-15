@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::cache_aware_builder::StructuredPrompt;
+use super::circuit_breaker;
 use super::claude_api::{
     run_claude_api, run_claude_api_cached, run_claude_api_multimodal,
     run_claude_api_with_overrides, run_claude_api_with_structured_output,
@@ -12,7 +13,6 @@ use super::gemini_api::{
 };
 use super::gemini_cli::run_gemini_cli;
 use super::multimodal::MultimodalPrompt;
-use super::circuit_breaker;
 use super::retry::{
     retry_with_backoff, retry_with_backoff_tracked, retry_with_fallback,
     retry_with_fallback_tracked,
@@ -208,7 +208,8 @@ pub fn run_prompt_with_model_override(
     // Resolve provider keys for circuit breaker tracking
     let ai_settings = settings::get_ai_settings();
     let primary_key = resolve_provider_key(provider_override, &ai_settings.provider);
-    let fallback_key = fallback_provider.map(|p| resolve_provider_key(Some(p), &ai_settings.provider));
+    let fallback_key =
+        fallback_provider.map(|p| resolve_provider_key(Some(p), &ai_settings.provider));
 
     // Build the primary call closure
     let primary = || {

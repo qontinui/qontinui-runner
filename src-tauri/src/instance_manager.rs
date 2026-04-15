@@ -82,18 +82,16 @@ impl InstanceManager {
         {
             warn!("Failed to register primary in DB: {}", e);
         } else {
-            info!("Registered primary runner in DB (port={}, pid={})", port, pid);
+            info!(
+                "Registered primary runner in DB (port={}, pid={})",
+                port, pid
+            );
         }
     }
 
     /// Register an externally-started runner instance.
     /// Returns the assigned or existing instance ID.
-    pub async fn register_instance(
-        &self,
-        name: String,
-        port: u16,
-        pid: Option<u32>,
-    ) -> String {
+    pub async fn register_instance(&self, name: String, port: u16, pid: Option<u32>) -> String {
         let mut registered = self.registered.lock().await;
 
         // Check if already registered by port
@@ -148,11 +146,7 @@ impl InstanceManager {
     }
 
     /// Update heartbeat for a registered instance.
-    pub async fn update_heartbeat(
-        &self,
-        id: &str,
-        running_tasks: Option<u32>,
-    ) -> bool {
+    pub async fn update_heartbeat(&self, id: &str, running_tasks: Option<u32>) -> bool {
         let mut registered = self.registered.lock().await;
         if let Some(inst) = registered.get_mut(id) {
             inst.last_heartbeat = chrono::Utc::now();

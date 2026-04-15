@@ -915,10 +915,7 @@ impl PgDb {
     /// and startup-resume paths treat them uniformly.
     ///
     /// Returns the IDs of rows that were claimed.
-    pub async fn claim_orphaned_task_runs(
-        &self,
-        runner_port: u16,
-    ) -> Result<Vec<String>, String> {
+    pub async fn claim_orphaned_task_runs(&self, runner_port: u16) -> Result<Vec<String>, String> {
         let conn = self
             .pool
             .get()
@@ -1005,7 +1002,11 @@ impl PgDb {
                 sessions_count: r.get::<_, i32>("sessions_count") as u32,
                 max_sessions: {
                     let v: i32 = r.get("max_sessions");
-                    if v == 0 { None } else { Some(v as u32) }
+                    if v == 0 {
+                        None
+                    } else {
+                        Some(v as u32)
+                    }
                 },
                 output_log: String::new(),
                 error_message: non_empty(r.get::<_, String>("error_message")),
@@ -1957,7 +1958,10 @@ impl PgDb {
     }
 
     /// Check if a task has any incomplete blocking children.
-    pub async fn has_blocking_incomplete_children(&self, task_run_id: &str) -> Result<bool, String> {
+    pub async fn has_blocking_incomplete_children(
+        &self,
+        task_run_id: &str,
+    ) -> Result<bool, String> {
         let conn = self
             .pool
             .get()

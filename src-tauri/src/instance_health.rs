@@ -22,17 +22,16 @@ const DEAD_THRESHOLD_SECS: i64 = 120;
 /// Start the instance health monitor background task.
 ///
 /// Only the primary runner should call this. Secondaries do not monitor other instances.
-pub fn start_instance_health_monitor(
-    pg_db: Arc<PgDb>,
-    instance_manager: Arc<InstanceManager>,
-) {
+pub fn start_instance_health_monitor(pg_db: Arc<PgDb>, instance_manager: Arc<InstanceManager>) {
     // Only run on the primary
     if crate::instance::is_secondary() {
         return;
     }
 
-    info!("Starting instance health monitor (check every {}s, stale after {}s, dead after {}s)",
-        CHECK_INTERVAL_SECS, STALE_THRESHOLD_SECS, DEAD_THRESHOLD_SECS);
+    info!(
+        "Starting instance health monitor (check every {}s, stale after {}s, dead after {}s)",
+        CHECK_INTERVAL_SECS, STALE_THRESHOLD_SECS, DEAD_THRESHOLD_SECS
+    );
 
     tauri::async_runtime::spawn(async move {
         // Wait for startup to settle
@@ -49,9 +48,15 @@ pub fn start_instance_health_monitor(
             ticker.tick().await;
 
             // 1. Mark instances with stale heartbeats as unhealthy
-            match pg_db.mark_stale_runner_instances(STALE_THRESHOLD_SECS).await {
+            match pg_db
+                .mark_stale_runner_instances(STALE_THRESHOLD_SECS)
+                .await
+            {
                 Ok(count) if count > 0 => {
-                    info!("Marked {} instance(s) as unhealthy (heartbeat stale)", count);
+                    info!(
+                        "Marked {} instance(s) as unhealthy (heartbeat stale)",
+                        count
+                    );
                 }
                 Err(e) => {
                     debug!("Failed to mark stale instances: {}", e);
@@ -85,7 +90,10 @@ pub fn start_instance_health_monitor(
             }
 
             // 3. Clean up dead instances (unhealthy beyond threshold)
-            match pg_db.cleanup_dead_runner_instances(DEAD_THRESHOLD_SECS).await {
+            match pg_db
+                .cleanup_dead_runner_instances(DEAD_THRESHOLD_SECS)
+                .await
+            {
                 Ok(count) if count > 0 => {
                     info!("Cleaned up {} dead instance(s)", count);
                 }
@@ -104,10 +112,7 @@ pub fn start_instance_health_monitor(
 /// Purge all stale/dead instances immediately.
 ///
 /// Called by `POST /instances/purge-stale` for on-demand cleanup.
-pub async fn purge_stale_instances(
-    pg_db: &PgDb,
-    instance_manager: &InstanceManager,
-) -> (u64, u64) {
+pub async fn purge_stale_instances(pg_db: &PgDb, instance_manager: &InstanceManager) -> (u64, u64) {
     let marked = pg_db
         .mark_stale_runner_instances(STALE_THRESHOLD_SECS)
         .await
@@ -136,10 +141,7 @@ pub async fn purge_stale_instances(
     }
 
     // Remove instances that are still unhealthy/stopped after probing
-    let cleaned = pg_db
-        .cleanup_dead_runner_instances(0)
-        .await
-        .unwrap_or(0);
+    let cleaned = pg_db.cleanup_dead_runner_instances(0).await.unwrap_or(0);
 
     // Also clean up in-memory: remove registered instances whose ports are gone
     let in_mem_purged = instance_manager.purge_unreachable_registered().await;

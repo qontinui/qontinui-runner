@@ -46,13 +46,12 @@ impl LoopController {
             if tr.is_review {
                 let parent_id = tr.parent_task_run_id.as_deref().unwrap_or("");
                 if !parent_id.is_empty() {
-                    let should_complete =
-                        super::review_subtask::process_review_outcome(
-                            &self.app_state.pg_db,
-                            execution_id,
-                            parent_id,
-                        )
-                        .await;
+                    let should_complete = super::review_subtask::process_review_outcome(
+                        &self.app_state.pg_db,
+                        execution_id,
+                        parent_id,
+                    )
+                    .await;
                     if !should_complete {
                         info!(
                             "Review {} requested changes, marking as failed instead of completed",
@@ -277,11 +276,19 @@ impl LoopController {
                                         parent_id
                                     );
                                     if let Err(e) = pg.complete_task_run(&parent_id).await {
-                                        warn!("Failed to complete parent task {}: {}", parent_id, e);
+                                        warn!(
+                                            "Failed to complete parent task {}: {}",
+                                            parent_id, e
+                                        );
                                     } else {
                                         // Emit task-run-update event for the parent
                                         let broadcaster = EventBroadcaster::new(app_handle);
-                                        broadcaster.task_run_update(&parent_id, "completed", None, None);
+                                        broadcaster.task_run_update(
+                                            &parent_id,
+                                            "completed",
+                                            None,
+                                            None,
+                                        );
                                     }
                                 }
                                 Ok(true) => {
@@ -291,7 +298,10 @@ impl LoopController {
                                     );
                                 }
                                 Err(e) => {
-                                    warn!("Failed to check blocking children for parent {}: {}", parent_id, e);
+                                    warn!(
+                                        "Failed to check blocking children for parent {}: {}",
+                                        parent_id, e
+                                    );
                                 }
                             }
                         }
@@ -310,10 +320,9 @@ impl LoopController {
                 let pg_clone = self.app_state.pg_db.clone();
                 let task_id = execution_id.to_string();
                 tokio::spawn(async move {
-                    if let Err(e) = crate::ticket_system::service::on_task_completed(
-                        &pg_clone, &task_id, true,
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::ticket_system::service::on_task_completed(&pg_clone, &task_id, true)
+                            .await
                     {
                         tracing::debug!("Ticket sync on-completion hook failed: {}", e);
                     }
@@ -412,10 +421,9 @@ impl LoopController {
                 let pg_clone = self.app_state.pg_db.clone();
                 let task_id = execution_id.to_string();
                 tokio::spawn(async move {
-                    if let Err(e) = crate::ticket_system::service::on_task_completed(
-                        &pg_clone, &task_id, false,
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::ticket_system::service::on_task_completed(&pg_clone, &task_id, false)
+                            .await
                     {
                         tracing::debug!("Ticket sync on-failure hook failed: {}", e);
                     }
@@ -439,10 +447,18 @@ impl LoopController {
                                         parent_id
                                     );
                                     if let Err(e) = pg.complete_task_run(&parent_id).await {
-                                        warn!("Failed to complete parent task {}: {}", parent_id, e);
+                                        warn!(
+                                            "Failed to complete parent task {}: {}",
+                                            parent_id, e
+                                        );
                                     } else {
                                         let broadcaster = EventBroadcaster::new(app_handle);
-                                        broadcaster.task_run_update(&parent_id, "completed", None, None);
+                                        broadcaster.task_run_update(
+                                            &parent_id,
+                                            "completed",
+                                            None,
+                                            None,
+                                        );
                                     }
                                 }
                                 Ok(true) => {
@@ -452,7 +468,10 @@ impl LoopController {
                                     );
                                 }
                                 Err(e) => {
-                                    warn!("Failed to check blocking children for parent {}: {}", parent_id, e);
+                                    warn!(
+                                        "Failed to check blocking children for parent {}: {}",
+                                        parent_id, e
+                                    );
                                 }
                             }
                         }
@@ -736,7 +755,12 @@ async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id:
 
     // Extract findings from task knowledge (PG)
     let findings = pg
-        .get_task_knowledge_by_categories(execution_id, &["Finding", "RootCause", "Solution"], 10, false)
+        .get_task_knowledge_by_categories(
+            execution_id,
+            &["Finding", "RootCause", "Solution"],
+            10,
+            false,
+        )
         .await
         .unwrap_or_default();
 
