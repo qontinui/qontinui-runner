@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Save, FolderOpen, Trash2, ChevronDown } from "lucide-react";
 import { useUIComponent } from "ui-bridge";
 
@@ -114,10 +115,16 @@ export function ZoneProfilePicker({
     onLoadProfileRef.current = onLoadProfile;
   });
 
-  // Load profiles and active profile from database on mount
+  // Load profiles and active profile from database on mount, and refetch
+  // when the backend emits `setting-changed` for keys we care about. This
+  // lets external `setting_set` calls (automation, other windows) show up
+  // without a runner restart.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const profilesKey = profileSettingKey(pageId);
+    const activeKey = activeProfileSettingKey(pageId);
+
+    const refetch = async () => {
       const [profs, active] = await Promise.all([
         loadProfilesFromDb(pageId),
         loadActiveProfileFromDb(pageId),
@@ -126,9 +133,27 @@ export function ZoneProfilePicker({
       setProfiles(profs);
       setActiveProfileName(active);
       setLoaded(true);
-    })();
+    };
+
+    refetch();
+
+    let unlistenFn: UnlistenFn | null = null;
+    listen<string>("setting-changed", (event) => {
+      if (event.payload === profilesKey || event.payload === activeKey) {
+        refetch();
+      }
+    })
+      .then((unlisten) => {
+        if (cancelled) unlisten();
+        else unlistenFn = unlisten;
+      })
+      .catch(() => {
+        /* event bus not available — mount-only load remains the fallback */
+      });
+
     return () => {
       cancelled = true;
+      if (unlistenFn) unlistenFn();
     };
   }, [pageId]);
 

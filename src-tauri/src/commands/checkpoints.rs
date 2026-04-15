@@ -3,7 +3,7 @@
 use crate::commands::{AppState, CommandResponse};
 use crate::database::{CheckpointData, SessionEvent};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 /// Get a checkpoint by workflow name.
 #[tauri::command]
@@ -140,14 +140,17 @@ pub async fn setting_get(
     app_state.pg_db.get_setting(&key).await
 }
 
-/// Set a setting value.
+/// Set a setting value. Emits a `setting-changed` event so frontend hooks
+/// that cache settings in React state can refresh without a page reload.
 #[tauri::command]
 pub async fn setting_set(
+    app_handle: tauri::AppHandle,
     app_state: State<'_, Arc<AppState>>,
     key: String,
     value: serde_json::Value,
 ) -> Result<CommandResponse, String> {
     app_state.pg_db.set_setting(&key, &value).await?;
+    let _ = app_handle.emit("setting-changed", &key);
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Setting '{}' saved", key)),
