@@ -789,12 +789,13 @@ pub fn create_router(
                 cloud_settings.backend_url.clone(),
                 cloud_settings.cloud_registry_poll_secs,
             );
+            let cloud_transport = std::sync::Arc::new(
+                crate::mcp::transport::cloud::CloudTransport::new(cloud_settings.backend_url.clone()),
+            );
 
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 cloud_settings.cloud_registry_poll_secs,
             ));
-
-            let _registry = &state.physical_device_registry;
 
             loop {
                 interval.tick().await;
@@ -804,16 +805,63 @@ pub fn create_router(
                 if let Some(token) = token {
                     match poller.poll(&token).await {
                         Ok(devices) => {
+                            let registry = &state.physical_device_registry;
                             for device in devices {
                                 tracing::debug!(
                                     "Cloud device available: {} ({})",
                                     device.device_id,
                                     device.display_name
                                 );
-                                // Cloud device registration via LAN/relay transport
-                                // is handled by cloud relay session logic; here we
-                                // only log presence so the operator can see what is
-                                // available in the fleet.
+                                // Skip if already registered (any transport)
+                                if registry.get_device(&device.device_id).await.is_some() {
+                                    continue;
+                                }
+                                // Open a cloud tunnel for this device so the registry
+                                // has a working proxy URL. The tunnel stays open for
+                                // the device's lifetime in the registry.
+                                match cloud_transport.open_tunnel(&device.device_id, &token).await {
+                                    Ok(local_port) => {
+                                        let os = match device.platform.to_lowercase().as_str() {
+                                            "ios" => crate::mcp::transport::DeviceOs::Ios,
+                                            _ => crate::mcp::transport::DeviceOs::Android,
+                                        };
+                                        let now = chrono::Utc::now().timestamp_millis();
+                                        let info = crate::mcp::physical_device::PhysicalDeviceInfo {
+                                            id: device.device_id.clone(),
+                                            os,
+                                            device_kind: "physical".to_string(),
+                                            model: None,
+                                            app_id: if device.app_id.is_empty() {
+                                                None
+                                            } else {
+                                                Some(device.app_id.clone())
+                                            },
+                                            ui_bridge_version: None,
+                                            first_seen_at: now,
+                                            pairing_token: None,
+                                        };
+                                        let transport = crate::mcp::physical_device::ActiveTransport {
+                                            kind: crate::mcp::transport::TransportKind::Cloud,
+                                            proxy_url: format!("http://127.0.0.1:{}", local_port),
+                                            established_at: now,
+                                            last_healthy_at: now,
+                                            fail_count: 0,
+                                        };
+                                        registry.register(info, transport).await;
+                                        tracing::info!(
+                                            "Cloud device registered: {} via tunnel on port {}",
+                                            device.device_id,
+                                            local_port
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to open cloud tunnel for {}: {}",
+                                            device.device_id,
+                                            e
+                                        );
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
