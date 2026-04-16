@@ -26,11 +26,19 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        // Build IN clause with positional parameters
+        // Build IN clause with positional parameters.
+        //
+        // NOTE: `created_at` and `updated_at` are TIMESTAMPTZ in PostgreSQL
+        // (see schema.pg.sql and migration v10 which promotes them). The Rust
+        // struct `StepTypeKnowledge` declares both as `String`, so we MUST
+        // cast to TEXT in SQL — tokio-postgres does not coerce TIMESTAMPTZ
+        // into `String` and `row.get` panics with "error retrieving column N:
+        // error deserializing column N". Matches the pattern already used for
+        // `created_at::TEXT` across 25+ other pg modules.
         let placeholders: Vec<String> = (1..=step_types.len()).map(|i| format!("${}", i)).collect();
         let sql = format!(
             r#"
-            SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
+            SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at::TEXT, updated_at::TEXT
             FROM step_type_knowledge
             WHERE step_type IN ({}) AND status = 'active'
             ORDER BY step_type, priority DESC
@@ -62,8 +70,12 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        // `created_at`/`updated_at` are TIMESTAMPTZ in PG; cast to TEXT so
+        // that `stk_row_to_struct` (which types them as `String`) can
+        // deserialize them without panicking. See the note on
+        // `load_knowledge_for_step_types` for background.
         let mut sql = String::from(
-            "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
+            "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at::TEXT, updated_at::TEXT
              FROM step_type_knowledge WHERE 1=1",
         );
         let mut param_values: Vec<String> = Vec::new();
@@ -106,9 +118,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        // TIMESTAMPTZ → TEXT cast required; see load_knowledge_for_step_types.
         let row = conn
             .query_opt(
-                "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
+                "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at::TEXT, updated_at::TEXT
                  FROM step_type_knowledge WHERE id = $1",
                 &[&id],
             )
@@ -131,9 +144,10 @@ impl PgDb {
 
         // Dedup guard
         if let Some(ref fix_id) = input.source_fix_id {
+            // TIMESTAMPTZ → TEXT cast required; see load_knowledge_for_step_types.
             let existing = conn
                 .query_opt(
-                    "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
+                    "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at::TEXT, updated_at::TEXT
                      FROM step_type_knowledge WHERE source_fix_id = $1 LIMIT 1",
                     &[fix_id],
                 )
@@ -268,6 +282,28 @@ impl PgDb {
     // -- helpers --
 
     fn stk_row_to_struct(row: &tokio_postgres::Row) -> StepTypeKnowledge {
+        // Columns 9 and 10 (`created_at`, `updated_at`) are TIMESTAMPTZ in
+        // PostgreSQL but modeled as `String` on the Rust side. The callers
+        // above cast them to TEXT in SQL, so `row.get::<_, String>(9)` should
+        // succeed — but we use `try_get` here so any future regression (e.g.
+        // a caller that forgets the `::TEXT` cast and wires the raw column
+        // through this helper) logs a warning instead of panicking the task
+        // via `spawn_blocking`, which surfaces to the frontend as
+        // "task NNN panicked with message error deserializing column 9".
+        let created_at: String = row.try_get(9).unwrap_or_else(|e| {
+            tracing::warn!(
+                "stk_row_to_struct: column 9 (created_at) deserialization failed: {} — using empty string",
+                e
+            );
+            String::new()
+        });
+        let updated_at: String = row.try_get(10).unwrap_or_else(|e| {
+            tracing::warn!(
+                "stk_row_to_struct: column 10 (updated_at) deserialization failed: {} — using empty string",
+                e
+            );
+            String::new()
+        });
         StepTypeKnowledge {
             id: row.get(0),
             step_type: row.get(1),
@@ -278,8 +314,8 @@ impl PgDb {
             status: row.get(6),
             provenance: row.get(7),
             source_fix_id: row.get(8),
-            created_at: row.get(9),
-            updated_at: row.get(10),
+            created_at,
+            updated_at,
         }
     }
 }
