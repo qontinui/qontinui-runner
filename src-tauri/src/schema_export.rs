@@ -421,8 +421,9 @@ pub enum AppEvent {
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
         accessibility as qa, config as qcfg, constraints as qc, execution as qe,
-        geometry as qg, scheduler as qs, state_machine as qsm, task_run as qtr,
-        tree_events as qte, workflow as qw, workflow_step as qws,
+        geometry as qg, rag as qr, scheduler as qs, state_machine as qsm,
+        targets as qt, task_run as qtr, tree_events as qte, workflow as qw,
+        workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -595,6 +596,45 @@ pub fn export_all_schemas() -> Value {
     add!("AccessibilityNode", qa::AccessibilityNode);
     add!("AccessibilitySnapshot", qa::AccessibilitySnapshot);
     add!("AccessibilitySelector", qa::AccessibilitySelector);
+
+    // ── qontinui-types: targets (action-target discriminated union) ──
+    add!("SearchStrategy", qt::SearchStrategy);
+    add!("MatchMethod", qt::MatchMethod);
+    add!("PollingConfig", qt::PollingConfig);
+    add!("PatternOptions", qt::PatternOptions);
+    add!("MatchAdjustment", qt::MatchAdjustment);
+    add!("SearchOptions", qt::SearchOptions);
+    add!("OcrEngine", qt::OcrEngine);
+    add!("TextMatchType", qt::TextMatchType);
+    add!("TextSearchOptions", qt::TextSearchOptions);
+    add!("TargetConfig", qt::TargetConfig);
+
+    // ── qontinui-types: rag (RAG dashboard + embedding sync) ──
+    add!("JobStatus", qr::JobStatus);
+    add!("RagProcessingStatus", qr::RagProcessingStatus);
+    add!("ComputeTextEmbeddingRequest", qr::ComputeTextEmbeddingRequest);
+    add!("ComputeTextEmbeddingResponse", qr::ComputeTextEmbeddingResponse);
+    add!("ComputeEmbeddingRequest", qr::ComputeEmbeddingRequest);
+    add!("ComputeEmbeddingResponse", qr::ComputeEmbeddingResponse);
+    add!("BatchComputeEmbeddingRequest", qr::BatchComputeEmbeddingRequest);
+    add!("BatchEmbeddingResult", qr::BatchEmbeddingResult);
+    add!("BatchComputeEmbeddingResponse", qr::BatchComputeEmbeddingResponse);
+    add!("EmbeddingResultItem", qr::EmbeddingResultItem);
+    add!("EmbeddingResultsRequest", qr::EmbeddingResultsRequest);
+    add!("EmbeddingResultsResponse", qr::EmbeddingResultsResponse);
+    add!("RagProgressEvent", qr::RagProgressEvent);
+    add!("RagCompletionEvent", qr::RagCompletionEvent);
+    add!("JobSummary", qr::JobSummary);
+    add!("RAGDashboardStats", qr::RAGDashboardStats);
+    add!("EmbeddingItem", qr::EmbeddingItem);
+    add!("EmbeddingListResponse", qr::EmbeddingListResponse);
+    add!("JobItem", qr::JobItem);
+    add!("JobListResponse", qr::JobListResponse);
+    add!("SemanticSearchRequest", qr::SemanticSearchRequest);
+    add!("SearchResultItem", qr::SearchResultItem);
+    add!("SemanticSearchResponse", qr::SemanticSearchResponse);
+    add!("StateFilterItem", qr::StateFilterItem);
+    add!("StatesResponse", qr::StatesResponse);
 
     // ── qontinui-types: task_run (Session 4b path A) ──
     add!("TaskRunStatus", qtr::TaskRunStatus);
