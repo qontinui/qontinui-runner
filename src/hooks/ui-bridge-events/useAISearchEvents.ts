@@ -196,25 +196,45 @@ export function useAISearchEvents(
             }
           };
 
-          const pollOnce = async () => {
-            // Use bridge.discover() to match the path that GET /control/elements uses
-            // (proven to return 65 elements). Accessing registry directly picked a
-            // different instance whose getAllElements() returned empty.
-            const discovered = await currentBridge.discover({ includeHidden: true });
-            const elements = (discovered.elements ?? []) as Array<Record<string, unknown>>;
-            for (const el of elements) {
-              const domEl =
-                ((el as { element?: HTMLElement }).element as HTMLElement | undefined) ?? null;
+          // FIX: Poll the registry directly (same source `GET /control/elements` uses
+          // via createSnapshotAsync), not `currentBridge.discover()`.
+          //
+          // `discover()` delegates to `executor.find()` which does a fresh DOM scan +
+          // filters + async batching on every call. On a freshly-spawned runner, back-
+          // to-back discover() calls can return stale/empty results while mutations
+          // settle — the exact flake this handler hit (HTTP 408 while the element was
+          // already in the registry one second earlier).
+          //
+          // `registry.getAllElements()` is a synchronous `Array.from(Map.values())` —
+          // always fresh and authoritative. If the live DOM element is still attached,
+          // we pull ariaLabel/title off it; otherwise we use the element's cached label.
+          //
+          // We bind to `currentBridge.registry` (the same registry the bridge is wired
+          // to) rather than calling `getGlobalRegistry()` from ui-bridge directly,
+          // because the latter has been observed to hand back a different instance in
+          // some bundling configurations.
+          const pollOnce = () => {
+            const registry = (
+              currentBridge as unknown as {
+                registry?: {
+                  getAllElements: () => Array<{
+                    id: string;
+                    element: HTMLElement;
+                    type?: unknown;
+                    label?: string;
+                  }>;
+                } | null;
+              }
+            ).registry;
+            const registryElements = registry?.getAllElements?.() ?? [];
+            for (const el of registryElements) {
+              const domEl = (el.element as HTMLElement | null) ?? null;
               const materialized = {
-                id: el.id as string,
+                id: el.id,
                 type: el.type,
                 label: el.label,
-                ariaLabel:
-                  (el as { ariaLabel?: string }).ariaLabel ??
-                  domEl?.getAttribute("aria-label") ??
-                  undefined,
-                title:
-                  (el as { title?: string }).title ?? domEl?.getAttribute("title") ?? undefined,
+                ariaLabel: domEl?.getAttribute("aria-label") ?? undefined,
+                title: domEl?.getAttribute("title") ?? undefined,
               };
               if (!matches(materialized, selector)) continue;
               if (
@@ -240,9 +260,13 @@ export function useAISearchEvents(
             element?: unknown;
             waited_ms: number;
           }>((resolve) => {
-            const tick = async () => {
+            const tick = () => {
               try {
-                const hit = await pollOnce();
+                // First poll runs immediately (no initial 100ms wait). If the
+                // registry is empty right now, we don't give up — we keep
+                // polling until timeout_ms (the element may still be
+                // registering on a freshly-navigated page).
+                const hit = pollOnce();
                 if (hit) {
                   resolve(hit);
                   return;
@@ -256,7 +280,7 @@ export function useAISearchEvents(
               }
               setTimeout(tick, pollMs);
             };
-            void tick();
+            tick();
           });
           await sendResponse({
             requestId,
