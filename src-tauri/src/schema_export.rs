@@ -420,8 +420,9 @@ pub enum AppEvent {
 /// remote types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        constraints as qc, geometry as qg, scheduler as qs, tree_events as qte,
-        workflow as qw, workflow_step as qws,
+        constraints as qc, execution as qe, geometry as qg, scheduler as qs,
+        state_machine as qsm, task_run as qtr, tree_events as qte, workflow as qw,
+        workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -580,6 +581,109 @@ pub fn export_all_schemas() -> Value {
     add!("TreeEventResponse", qte::TreeEventResponse);
     add!("TreeEventListResponse", qte::TreeEventListResponse);
     add!("ExecutionTreeResponse", qte::ExecutionTreeResponse);
+
+    // ── qontinui-types: task_run (Session 4b path A) ──
+    add!("TaskRunStatus", qtr::TaskRunStatus);
+    add!("TaskType", qtr::TaskType);
+    add!("TaskRun", qtr::TaskRun);
+    add!("TaskRunBackend", qtr::TaskRunBackend);
+    add!("TaskRunSession", qtr::TaskRunSession);
+    add!("TaskRunFindingCategory", qtr::TaskRunFindingCategory);
+    add!("TaskRunFindingSeverity", qtr::TaskRunFindingSeverity);
+    add!("TaskRunFindingStatus", qtr::TaskRunFindingStatus);
+    add!("TaskRunFindingActionType", qtr::TaskRunFindingActionType);
+    add!("TaskRunFinding", qtr::TaskRunFinding);
+    add!("TaskRunFindingSummary", qtr::TaskRunFindingSummary);
+    add!("TaskRunBackendDetail", qtr::TaskRunBackendDetail);
+    add!("TaskRunCreate", qtr::TaskRunCreate);
+    add!("TaskRunUpdate", qtr::TaskRunUpdate);
+    add!("TaskRunFindingCreate", qtr::TaskRunFindingCreate);
+    add!("TaskRunFindingUpdate", qtr::TaskRunFindingUpdate);
+    add!("RunPromptResponseData", qtr::RunPromptResponseData);
+    add!("RunPromptResponse", qtr::RunPromptResponse);
+    add!("RunPromptRequest", qtr::RunPromptRequest);
+    add!("CreateTaskRunRequest", qtr::CreateTaskRunRequest);
+    add!("TaskRunFilters", qtr::TaskRunFilters);
+    add!("TaskRunFindingFilters", qtr::TaskRunFindingFilters);
+    add!("Pagination", qtr::Pagination);
+    add!("TaskRunListResponse", qtr::TaskRunListResponse);
+    add!("TaskRunFindingsListResponse", qtr::TaskRunFindingsListResponse);
+    add!("FindingsSummary", qtr::FindingsSummary);
+    add!("CheckIssueDetail", qtr::CheckIssueDetail);
+    add!("IndividualCheckResult", qtr::IndividualCheckResult);
+    add!("VerificationStepDetails", qtr::VerificationStepDetails);
+    add!("StepExecutionConfig", qtr::StepExecutionConfig);
+    add!("VerificationStepResult", qtr::VerificationStepResult);
+    add!("GateEvaluationResult", qtr::GateEvaluationResult);
+    add!("VerificationPhaseResult", qtr::VerificationPhaseResult);
+    add!("VerificationResultResponse", qtr::VerificationResultResponse);
+    add!("VerificationResultsListResponse", qtr::VerificationResultsListResponse);
+
+    // ── qontinui-types: execution (Session 4c tiers 1+2) ──
+    // `ActionType` and `MatchLocation` also exist in tree_events; register
+    // the execution-domain versions under prefixed names so both can coexist
+    // in the shared schema registry.  TS re-exports them under the local
+    // names via `export type { ExecutionActionType as ActionType }`.
+    add!("RunType", qe::RunType);
+    add!("RunStatus", qe::RunStatus);
+    add!("ActionStatus", qe::ActionStatus);
+    add!("ExecutionActionType", qe::ActionType);
+    add!("ErrorType", qe::ErrorType);
+    add!("IssueSeverity", qe::IssueSeverity);
+    add!("ScreenshotType", qe::ScreenshotType);
+    add!("RunnerMetadata", qe::RunnerMetadata);
+    add!("WorkflowMetadata", qe::WorkflowMetadata);
+    add!("ExecutionStats", qe::ExecutionStats);
+    add!("CoverageData", qe::CoverageData);
+    add!("LLMMetrics", qe::LLMMetrics);
+    add!("ExecutionRunCreate", qe::ExecutionRunCreate);
+    add!("ExecutionRunResponse", qe::ExecutionRunResponse);
+    add!("ExecutionMatchLocation", qe::MatchLocation);
+    add!("ActionExecutionCreate", qe::ActionExecutionCreate);
+    add!("ActionExecutionResponse", qe::ActionExecutionResponse);
+    add!("ScreenshotAnnotationShape", qe::ScreenshotAnnotationShape);
+    add!("ScreenshotAnnotation", qe::ScreenshotAnnotation);
+    add!("ExecutionScreenshotCreate", qe::ExecutionScreenshotCreate);
+    add!("ExecutionScreenshotResponse", qe::ExecutionScreenshotResponse);
+    add!("ExecutionIssueCreate", qe::ExecutionIssueCreate);
+    add!("ExecutionIssueResponse", qe::ExecutionIssueResponse);
+    add!("ExecutionRunComplete", qe::ExecutionRunComplete);
+    add!("ExecutionRunCompleteResponse", qe::ExecutionRunCompleteResponse);
+
+    // ── qontinui-types: state_machine (Session 4d) ──
+    add!("StandardActionType", qsm::StandardActionType);
+    add!("Point", qsm::Point);
+    add!("ScrollDirection", qsm::ScrollDirection);
+    add!("MouseButton", qsm::MouseButton);
+    add!("TransitionActionValue", qsm::TransitionActionValue);
+    add!("TransitionAction", qsm::TransitionAction);
+    add!("DomainKnowledge", qsm::DomainKnowledge);
+    add!("StateMachineConfig", qsm::StateMachineConfig);
+    add!("StateMachineConfigCreate", qsm::StateMachineConfigCreate);
+    add!("StateMachineConfigUpdate", qsm::StateMachineConfigUpdate);
+    add!("StateMachineConfigFull", qsm::StateMachineConfigFull);
+    add!("StateMachineState", qsm::StateMachineState);
+    add!("StateMachineStateCreate", qsm::StateMachineStateCreate);
+    add!("StateMachineStateUpdate", qsm::StateMachineStateUpdate);
+    add!("StateMachineTransition", qsm::StateMachineTransition);
+    add!("StateMachineTransitionCreate", qsm::StateMachineTransitionCreate);
+    add!("StateMachineTransitionUpdate", qsm::StateMachineTransitionUpdate);
+    add!("PathfindingRequest", qsm::PathfindingRequest);
+    add!("PathfindingStep", qsm::PathfindingStep);
+    add!("PathfindingResult", qsm::PathfindingResult);
+    add!("TransitionExecutionResult", qsm::TransitionExecutionResult);
+    add!("NavigationResult", qsm::NavigationResult);
+    add!("TransitionInfo", qsm::TransitionInfo);
+    add!("AvailableTransitionsResult", qsm::AvailableTransitionsResult);
+    add!("ActiveStatesResult", qsm::ActiveStatesResult);
+    add!("InitialStatesSource", qsm::InitialStatesSource);
+    add!("InitialStateRef", qsm::InitialStateRef);
+    add!("ResolvedInitialStates", qsm::ResolvedInitialStates);
+    add!("ResolvedInitialStatesResult", qsm::ResolvedInitialStatesResult);
+    add!("DiscoveryStrategy", qsm::DiscoveryStrategy);
+    add!("StateNodeData", qsm::StateNodeData);
+    add!("TransitionEdgeData", qsm::TransitionEdgeData);
+    add!("StateMachineExportFormat", qsm::StateMachineExportFormat);
 
     Value::Object(m)
 }
