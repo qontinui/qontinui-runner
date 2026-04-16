@@ -421,9 +421,9 @@ pub enum AppEvent {
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
         accessibility as qa, config as qcfg, constraints as qc, execution as qe,
-        geometry as qg, rag as qr, scheduler as qs, state_machine as qsm,
-        targets as qt, task_run as qtr, tree_events as qte, workflow as qw,
-        workflow_step as qws,
+        findings as qfn, geometry as qg, process_management as qpm, rag as qr,
+        scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr,
+        ticket_system as qts, tree_events as qte, workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -548,7 +548,10 @@ pub fn export_all_schemas() -> Value {
     add!("WorkflowFixupStep", qws::WorkflowFixupStep);
     add!("UiBridgeDesignAuditStep", qws::UiBridgeDesignAuditStep);
     add!("VisualAssertionType", qws::VisualAssertionType);
-    add!("UiBridgeVisualAssertionStep", qws::UiBridgeVisualAssertionStep);
+    add!(
+        "UiBridgeVisualAssertionStep",
+        qws::UiBridgeVisualAssertionStep
+    );
     add!("WorkflowRefStep", qws::WorkflowRefStep);
     add!("DagCancelStep", qws::DagCancelStep);
     add!("DagApprovalStep", qws::DagApprovalStep);
@@ -596,6 +599,7 @@ pub fn export_all_schemas() -> Value {
     add!("AccessibilityNode", qa::AccessibilityNode);
     add!("AccessibilitySnapshot", qa::AccessibilitySnapshot);
     add!("AccessibilitySelector", qa::AccessibilitySelector);
+    add!("RoleCriterion", qa::RoleCriterion);
 
     // ── qontinui-types: targets (action-target discriminated union) ──
     add!("SearchStrategy", qt::SearchStrategy);
@@ -607,18 +611,31 @@ pub fn export_all_schemas() -> Value {
     add!("OcrEngine", qt::OcrEngine);
     add!("TextMatchType", qt::TextMatchType);
     add!("TextSearchOptions", qt::TextSearchOptions);
+    add!("AccessibilityRoleCriterion", qt::AccessibilityRoleCriterion);
     add!("TargetConfig", qt::TargetConfig);
 
     // ── qontinui-types: rag (RAG dashboard + embedding sync) ──
     add!("JobStatus", qr::JobStatus);
     add!("RagProcessingStatus", qr::RagProcessingStatus);
-    add!("ComputeTextEmbeddingRequest", qr::ComputeTextEmbeddingRequest);
-    add!("ComputeTextEmbeddingResponse", qr::ComputeTextEmbeddingResponse);
+    add!(
+        "ComputeTextEmbeddingRequest",
+        qr::ComputeTextEmbeddingRequest
+    );
+    add!(
+        "ComputeTextEmbeddingResponse",
+        qr::ComputeTextEmbeddingResponse
+    );
     add!("ComputeEmbeddingRequest", qr::ComputeEmbeddingRequest);
     add!("ComputeEmbeddingResponse", qr::ComputeEmbeddingResponse);
-    add!("BatchComputeEmbeddingRequest", qr::BatchComputeEmbeddingRequest);
+    add!(
+        "BatchComputeEmbeddingRequest",
+        qr::BatchComputeEmbeddingRequest
+    );
     add!("BatchEmbeddingResult", qr::BatchEmbeddingResult);
-    add!("BatchComputeEmbeddingResponse", qr::BatchComputeEmbeddingResponse);
+    add!(
+        "BatchComputeEmbeddingResponse",
+        qr::BatchComputeEmbeddingResponse
+    );
     add!("EmbeddingResultItem", qr::EmbeddingResultItem);
     add!("EmbeddingResultsRequest", qr::EmbeddingResultsRequest);
     add!("EmbeddingResultsResponse", qr::EmbeddingResultsResponse);
@@ -635,6 +652,28 @@ pub fn export_all_schemas() -> Value {
     add!("SemanticSearchResponse", qr::SemanticSearchResponse);
     add!("StateFilterItem", qr::StateFilterItem);
     add!("StatesResponse", qr::StatesResponse);
+
+    // ── qontinui-types: process_management ──
+    add!("ParserType", qpm::ParserType);
+    add!("ProcessState", qpm::ProcessState);
+    add!("OutputStream", qpm::OutputStream);
+    add!("OutputLine", qpm::OutputLine);
+    add!("ProcessConfig", qpm::ProcessConfig);
+    add!("ProcessStatus", qpm::ProcessStatus);
+
+    // ── qontinui-types: findings ──
+    add!("FindingCategory", qfn::FindingCategory);
+    add!("FindingSeverity", qfn::FindingSeverity);
+    add!("FindingStatus", qfn::FindingStatus);
+    add!("FindingActionType", qfn::FindingActionType);
+    add!("FindingCodeContext", qfn::FindingCodeContext);
+    add!("FindingUserInput", qfn::FindingUserInput);
+    add!("FindingCreate", qfn::FindingCreate);
+    add!("FindingBatchCreate", qfn::FindingBatchCreate);
+    add!("FindingUpdate", qfn::FindingUpdate);
+    add!("FindingDetail", qfn::FindingDetail);
+    add!("FindingListResponse", qfn::FindingListResponse);
+    add!("FindingSummary", qfn::FindingSummary);
 
     // ── qontinui-types: task_run (Session 4b path A) ──
     add!("TaskRunStatus", qtr::TaskRunStatus);
@@ -661,7 +700,10 @@ pub fn export_all_schemas() -> Value {
     add!("TaskRunFindingFilters", qtr::TaskRunFindingFilters);
     add!("Pagination", qtr::Pagination);
     add!("TaskRunListResponse", qtr::TaskRunListResponse);
-    add!("TaskRunFindingsListResponse", qtr::TaskRunFindingsListResponse);
+    add!(
+        "TaskRunFindingsListResponse",
+        qtr::TaskRunFindingsListResponse
+    );
     add!("FindingsSummary", qtr::FindingsSummary);
     add!("CheckIssueDetail", qtr::CheckIssueDetail);
     add!("IndividualCheckResult", qtr::IndividualCheckResult);
@@ -670,8 +712,21 @@ pub fn export_all_schemas() -> Value {
     add!("VerificationStepResult", qtr::VerificationStepResult);
     add!("GateEvaluationResult", qtr::GateEvaluationResult);
     add!("VerificationPhaseResult", qtr::VerificationPhaseResult);
-    add!("VerificationResultResponse", qtr::VerificationResultResponse);
-    add!("VerificationResultsListResponse", qtr::VerificationResultsListResponse);
+    add!(
+        "VerificationResultResponse",
+        qtr::VerificationResultResponse
+    );
+    add!(
+        "VerificationResultsListResponse",
+        qtr::VerificationResultsListResponse
+    );
+
+    // ── qontinui-types: ticket_system ──
+    add!("TicketSource", qts::TicketSource);
+    add!("TicketState", qts::TicketState);
+    add!("Ticket", qts::Ticket);
+    add!("TicketComment", qts::TicketComment);
+    add!("TicketProviderConfig", qts::TicketProviderConfig);
 
     // ── qontinui-types: execution (Session 4c tiers 1+2) ──
     // `ActionType` and `MatchLocation` also exist in tree_events; register
@@ -698,11 +753,51 @@ pub fn export_all_schemas() -> Value {
     add!("ScreenshotAnnotationShape", qe::ScreenshotAnnotationShape);
     add!("ScreenshotAnnotation", qe::ScreenshotAnnotation);
     add!("ExecutionScreenshotCreate", qe::ExecutionScreenshotCreate);
-    add!("ExecutionScreenshotResponse", qe::ExecutionScreenshotResponse);
+    add!(
+        "ExecutionScreenshotResponse",
+        qe::ExecutionScreenshotResponse
+    );
     add!("ExecutionIssueCreate", qe::ExecutionIssueCreate);
     add!("ExecutionIssueResponse", qe::ExecutionIssueResponse);
     add!("ExecutionRunComplete", qe::ExecutionRunComplete);
-    add!("ExecutionRunCompleteResponse", qe::ExecutionRunCompleteResponse);
+    add!(
+        "ExecutionRunCompleteResponse",
+        qe::ExecutionRunCompleteResponse
+    );
+    // Additional types ported from api/execution.py.
+    add!("IssueStatus", qe::IssueStatus);
+    add!("IssueType", qe::IssueType);
+    add!("IssueSource", qe::IssueSource);
+    add!("ActionExecutionBatch", qe::ActionExecutionBatch);
+    add!(
+        "ActionExecutionBatchResponse",
+        qe::ActionExecutionBatchResponse
+    );
+    add!("ExecutionIssueBatch", qe::ExecutionIssueBatch);
+    add!(
+        "ExecutionIssueBatchResponse",
+        qe::ExecutionIssueBatchResponse
+    );
+    add!("ExecutionIssueUpdate", qe::ExecutionIssueUpdate);
+    add!("VisualComparisonResult", qe::VisualComparisonResult);
+    add!("ExecutionRunDetail", qe::ExecutionRunDetail);
+    add!("ExecutionIssueDetail", qe::ExecutionIssueDetail);
+    add!("ExecutionRunListResponse", qe::ExecutionRunListResponse);
+    add!(
+        "ActionExecutionListResponse",
+        qe::ActionExecutionListResponse
+    );
+    add!("ExecutionIssueListResponse", qe::ExecutionIssueListResponse);
+    add!("ActionReliabilityStats", qe::ActionReliabilityStats);
+    add!("ExecutionTrendDataPoint", qe::ExecutionTrendDataPoint);
+    add!("ExecutionTrendResponse", qe::ExecutionTrendResponse);
+    add!("ModelCostBreakdown", qe::ModelCostBreakdown);
+    add!("LLMCostSummary", qe::LLMCostSummary);
+    add!("CostTrendDataPoint", qe::CostTrendDataPoint);
+    add!("CostTrendResponse", qe::CostTrendResponse);
+    add!("HistoricalActionQuery", qe::HistoricalActionQuery);
+    add!("HistoricalActionResult", qe::HistoricalActionResult);
+    add!("PlaybackFrameRequest", qe::PlaybackFrameRequest);
 
     // ── qontinui-types: state_machine (Session 4d) ──
     add!("StandardActionType", qsm::StandardActionType);
@@ -720,20 +815,32 @@ pub fn export_all_schemas() -> Value {
     add!("StateMachineStateCreate", qsm::StateMachineStateCreate);
     add!("StateMachineStateUpdate", qsm::StateMachineStateUpdate);
     add!("StateMachineTransition", qsm::StateMachineTransition);
-    add!("StateMachineTransitionCreate", qsm::StateMachineTransitionCreate);
-    add!("StateMachineTransitionUpdate", qsm::StateMachineTransitionUpdate);
+    add!(
+        "StateMachineTransitionCreate",
+        qsm::StateMachineTransitionCreate
+    );
+    add!(
+        "StateMachineTransitionUpdate",
+        qsm::StateMachineTransitionUpdate
+    );
     add!("PathfindingRequest", qsm::PathfindingRequest);
     add!("PathfindingStep", qsm::PathfindingStep);
     add!("PathfindingResult", qsm::PathfindingResult);
     add!("TransitionExecutionResult", qsm::TransitionExecutionResult);
     add!("NavigationResult", qsm::NavigationResult);
     add!("TransitionInfo", qsm::TransitionInfo);
-    add!("AvailableTransitionsResult", qsm::AvailableTransitionsResult);
+    add!(
+        "AvailableTransitionsResult",
+        qsm::AvailableTransitionsResult
+    );
     add!("ActiveStatesResult", qsm::ActiveStatesResult);
     add!("InitialStatesSource", qsm::InitialStatesSource);
     add!("InitialStateRef", qsm::InitialStateRef);
     add!("ResolvedInitialStates", qsm::ResolvedInitialStates);
-    add!("ResolvedInitialStatesResult", qsm::ResolvedInitialStatesResult);
+    add!(
+        "ResolvedInitialStatesResult",
+        qsm::ResolvedInitialStatesResult
+    );
     add!("DiscoveryStrategy", qsm::DiscoveryStrategy);
     add!("StateNodeData", qsm::StateNodeData);
     add!("TransitionEdgeData", qsm::TransitionEdgeData);
@@ -762,7 +869,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 96, "Expected 96 schema entries");
+        assert_eq!(obj.len(), 308, "Expected 308 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

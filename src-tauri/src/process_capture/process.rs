@@ -73,7 +73,8 @@ impl ManagedProcess {
         {
             return Err(format!(
                 "Process '{}' is in state {}, cannot start",
-                self.config.name, self.runtime.state
+                self.config.name,
+                self.runtime.state.as_str()
             ));
         }
 

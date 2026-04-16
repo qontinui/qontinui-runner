@@ -1,19 +1,28 @@
 //! Core types and traits for the ticket system.
+//!
+//! The wire-format DTO types (`TicketSource`, `TicketState`, `Ticket`,
+//! `TicketComment`, `TicketProviderConfig`) live in the `qontinui-types` crate
+//! (`qontinui_types::ticket_system`) and are re-exported here so the rest of
+//! the runner can continue `use crate::ticket_system::types::*`. Runner-local
+//! behavior — the `TicketProvider` trait, the `as_str()` helper on
+//! `TicketSource`, and the explicit `to_json_with_token` / `from_json_with_token`
+//! DB-serialization helpers on `TicketProviderConfig` — stays here, attached
+//! via extension traits.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
-/// Which ticket provider this refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketSource {
-    GitHub,
-    Linear,
-    Jira,
+pub use qontinui_types::ticket_system::{
+    Ticket, TicketComment, TicketProviderConfig, TicketSource, TicketState,
+};
+
+/// Runner-local helpers on `TicketSource`.
+pub trait TicketSourceExt {
+    /// Lowercase string tag, used for DB storage keys and log lines.
+    fn as_str(&self) -> &'static str;
 }
 
-impl TicketSource {
-    pub fn as_str(&self) -> &'static str {
+impl TicketSourceExt for TicketSource {
+    fn as_str(&self) -> &'static str {
         match self {
             TicketSource::GitHub => "github",
             TicketSource::Linear => "linear",
@@ -22,80 +31,26 @@ impl TicketSource {
     }
 }
 
-/// Abstract ticket state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketState {
-    /// Ticket is open and ready for work.
-    Open,
-    /// Task is actively working on this ticket.
-    InProgress,
-    /// Task is done, awaiting review/close.
-    Done,
-    /// Ticket is closed.
-    Closed,
+/// Runner-local DB-serialization helpers on `TicketProviderConfig`.
+///
+/// These exist as separate methods (rather than relying on the `Serialize`
+/// impl directly) to make the "this serialization includes the secret
+/// `api_token` and is intended for at-rest persistence only" intent explicit
+/// at the call site.
+pub trait TicketProviderConfigExt: Sized {
+    /// Serialize the full config including the `api_token` for DB persistence.
+    ///
+    /// Used when writing to `ticket_provider_configs.config_json` so the
+    /// watcher can be reconstructed across restarts. Never return the result
+    /// of this over a UI-facing API without redacting the token first.
+    fn to_json_with_token(&self) -> Result<String, String>;
+
+    /// Deserialize a config previously stored via `to_json_with_token`.
+    fn from_json_with_token(json: &str) -> Result<Self, String>;
 }
 
-/// A ticket fetched from an external system.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Ticket {
-    /// External ID (issue number, ticket key).
-    pub external_id: String,
-    pub source: TicketSource,
-    pub title: String,
-    pub body: String,
-    pub labels: Vec<String>,
-    pub assignee: Option<String>,
-    pub url: String,
-    pub state: TicketState,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-/// A comment on a ticket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TicketComment {
-    pub id: String,
-    pub author: String,
-    pub body: String,
-    pub created_at: String,
-}
-
-/// Provider configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TicketProviderConfig {
-    pub source: TicketSource,
-    /// API token. NOTE: this is persisted in the DB (inside `workflow_triggers.trigger_config`
-    /// and `ticket_provider_configs.config_json`) so the watcher can be reconstructed across
-    /// restarts. The MCP/HTTP API layer is responsible for redacting this field in any
-    /// outbound responses to the frontend. Treat it as secret-at-rest only.
-    pub api_token: String,
-    /// GitHub: "owner/repo". Linear: team key. Jira: project key.
-    pub target: String,
-    /// Labels/filters to determine "actionable" tickets (e.g., ["automate", "qontinui"]).
-    pub actionable_labels: Vec<String>,
-    /// Workflow ID to create tasks from matched tickets.
-    pub workflow_id: String,
-    /// Poll interval in seconds (default: 60).
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_seconds: u64,
-    /// Whether to update ticket state when the task completes.
-    #[serde(default = "default_true")]
-    pub update_on_completion: bool,
-}
-
-fn default_poll_interval() -> u64 {
-    60
-}
-fn default_true() -> bool {
-    true
-}
-
-impl TicketProviderConfig {
-    /// Serialize the full config including the api_token for DB persistence.
-    /// Use this for storing in `ticket_provider_configs.config_json` so that
-    /// the watcher can be reconstructed across restarts.
-    pub fn to_json_with_token(&self) -> Result<String, String> {
+impl TicketProviderConfigExt for TicketProviderConfig {
+    fn to_json_with_token(&self) -> Result<String, String> {
         let v = serde_json::json!({
             "source": self.source,
             "api_token": self.api_token,
@@ -108,8 +63,7 @@ impl TicketProviderConfig {
         serde_json::to_string(&v).map_err(|e| e.to_string())
     }
 
-    /// Deserialize a config previously stored via `to_json_with_token`.
-    pub fn from_json_with_token(json: &str) -> Result<Self, String> {
+    fn from_json_with_token(json: &str) -> Result<Self, String> {
         let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         Ok(Self {
             source: serde_json::from_value(v["source"].clone()).map_err(|e| e.to_string())?,
@@ -130,7 +84,9 @@ impl TicketProviderConfig {
     }
 }
 
-/// Trait for ticket provider implementations.
+/// Trait for ticket provider implementations. Held in the runner because
+/// implementations carry runtime state (HTTP clients, caches) and aren't
+/// part of the wire contract.
 #[async_trait]
 pub trait TicketProvider: Send + Sync {
     fn source(&self) -> TicketSource;

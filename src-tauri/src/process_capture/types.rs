@@ -1,72 +1,43 @@
 //! Types for process capture and management.
+//!
+//! The wire-format DTOs (`ProcessConfig`, `ProcessState`, `ProcessStatus`,
+//! `OutputLine`, `OutputStream`, and the `ParserType` that
+//! `ProcessConfig.parser` references) live in
+//! `qontinui_types::process_management`; this module re-exports them so the
+//! rest of the runner can continue to `use crate::process_capture::types::*`
+//! without change.
+//!
+//! Runtime-only state (`ProcessRuntime` with its `Instant` stamps and session
+//! ids) and runner-side behavior (`ProcessConfig::backfill_build_command`,
+//! plus a `Display`-style helper for `ProcessState`) stay here. Behavior on
+//! the foreign DTOs is exposed through extension traits because Rust's orphan
+//! rule forbids inherent `impl` blocks on types defined in another crate.
+//! Import `ProcessConfigExt` / `ProcessStateExt` (or glob-import this module)
+//! to call `config.backfill_build_command()` and `state.as_str()` exactly as
+//! if they were inherent.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+pub use qontinui_types::process_management::*;
+
 use std::time::Instant;
 
-use crate::error_monitor::types::ParserType;
+// ============================================================================
+// ProcessConfig behavior (extension trait)
+// ============================================================================
 
-/// Configuration for a managed process.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessConfig {
-    /// Unique identifier (UUID)
-    pub id: String,
-    /// Human-readable name (e.g., "FastAPI Backend")
-    pub name: String,
-    /// Command to execute (e.g., "python", "npm", "cargo")
-    pub command: String,
-    /// Command arguments (e.g., ["run", "dev"])
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Working directory (absolute path)
-    pub cwd: String,
-    /// Extra environment variables
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// Port to check for health (optional)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health_port: Option<u16>,
-    /// Parser type for error detection
-    #[serde(default)]
-    pub parser: ParserType,
-    /// Start when runner launches
-    #[serde(default)]
-    pub auto_start: bool,
-    /// Category (e.g., "backend", "frontend")
-    #[serde(default = "default_category")]
-    pub category: String,
-    /// Ring buffer max lines (default 2000)
-    #[serde(default = "default_buffer_size")]
-    pub buffer_size: usize,
-    /// Whether this config is enabled
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Regex patterns for errors to ignore (matched against error message and raw entry)
-    #[serde(default)]
-    pub ignore_patterns: Vec<String>,
-    /// Startup group for ordered startup (lower groups start first, default 0).
-    /// Processes in the same group start together. The runner waits for health ports
-    /// in each group to be ready before starting the next group.
-    #[serde(default)]
-    pub start_group: u32,
-    /// Whether this is a dev-mode-only service (not started in production builds)
-    #[serde(default)]
-    pub dev_only: bool,
-    /// Whether rebuild and AI fix features are enabled for this process
-    #[serde(default = "default_true")]
-    pub rebuild_enabled: bool,
-    /// Build command to run before restarting (e.g., "cargo", "npm")
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_command: Option<String>,
-    /// Build command arguments (e.g., ["build"], ["run", "build"])
-    #[serde(default)]
-    pub build_args: Vec<String>,
-}
-
-impl ProcessConfig {
+/// Runner-side behavior for [`ProcessConfig`].
+///
+/// Exposed as a trait because `ProcessConfig` is defined in `qontinui-types`
+/// and we cannot add inherent methods to it here. Import this trait (or use
+/// `crate::process_capture::types::*`) to call these methods exactly as if
+/// they were inherent.
+pub trait ProcessConfigExt {
     /// If no build command is configured, infer one from the run command.
     /// This ensures existing configs automatically get rebuild support.
-    pub fn backfill_build_command(&mut self) {
+    fn backfill_build_command(&mut self);
+}
+
+impl ProcessConfigExt for ProcessConfig {
+    fn backfill_build_command(&mut self) {
         if self.build_command.is_some() {
             return;
         }
@@ -96,83 +67,39 @@ impl ProcessConfig {
     }
 }
 
-fn default_category() -> String {
-    "general".to_string()
+// ============================================================================
+// ProcessState behavior (extension trait)
+// ============================================================================
+
+/// Runner-side helpers for [`ProcessState`].
+///
+/// Replaces the pre-extraction `impl std::fmt::Display for ProcessState`,
+/// which is impossible here because of the orphan rule. Callers that need a
+/// human-readable string should use [`ProcessStateExt::as_str`] — every wire
+/// value uses the same spelling as the old `Display` impl (`"stopped"`,
+/// `"starting"`, etc.), so log messages and error strings keep their previous
+/// formatting.
+pub trait ProcessStateExt {
+    fn as_str(&self) -> &'static str;
 }
 
-fn default_buffer_size() -> usize {
-    2000
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// State of a managed process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessState {
-    Stopped,
-    Starting,
-    Building,
-    Running,
-    Healthy,
-    Stopping,
-    Failed,
-}
-
-impl std::fmt::Display for ProcessState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ProcessStateExt for ProcessState {
+    fn as_str(&self) -> &'static str {
         match self {
-            ProcessState::Stopped => write!(f, "stopped"),
-            ProcessState::Starting => write!(f, "starting"),
-            ProcessState::Building => write!(f, "building"),
-            ProcessState::Running => write!(f, "running"),
-            ProcessState::Healthy => write!(f, "healthy"),
-            ProcessState::Stopping => write!(f, "stopping"),
-            ProcessState::Failed => write!(f, "failed"),
+            ProcessState::Stopped => "stopped",
+            ProcessState::Starting => "starting",
+            ProcessState::Building => "building",
+            ProcessState::Running => "running",
+            ProcessState::Healthy => "healthy",
+            ProcessState::Stopping => "stopping",
+            ProcessState::Failed => "failed",
         }
     }
 }
 
-/// Which output stream a line came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OutputStream {
-    Stdout,
-    Stderr,
-}
-
-/// A single line of output from a managed process.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputLine {
-    /// ISO 8601 timestamp
-    pub timestamp: String,
-    /// Which stream this came from
-    pub stream: OutputStream,
-    /// The line content
-    pub line: String,
-}
-
-/// Status summary of a managed process.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessStatus {
-    pub id: String,
-    pub name: String,
-    pub state: ProcessState,
-    pub pid: Option<u32>,
-    /// Uptime in seconds (None if not running)
-    pub uptime_secs: Option<u64>,
-    /// Whether the health port is responding
-    pub port_healthy: Option<bool>,
-    /// Number of times this process has been restarted
-    pub restart_count: u32,
-    /// Number of errors detected from this process
-    pub error_count: u32,
-    pub category: String,
-    /// Whether this process has a build command configured
-    pub has_build_command: bool,
-}
+// ============================================================================
+// Runtime state (runner-only)
+// ============================================================================
 
 /// Internal runtime state for a managed process.
 pub(crate) struct ProcessRuntime {

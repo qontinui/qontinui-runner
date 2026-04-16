@@ -9,7 +9,8 @@ use crate::database::CreateTaskRunInput;
 use crate::ticket_system::github::GitHubTicketProvider;
 use crate::ticket_system::linear::LinearTicketProvider;
 use crate::ticket_system::types::{
-    Ticket, TicketProvider, TicketProviderConfig, TicketSource, TicketState,
+    Ticket, TicketProvider, TicketProviderConfig, TicketProviderConfigExt, TicketSource,
+    TicketSourceExt, TicketState,
 };
 
 /// Marker type representing the (stateless) ticket sync service.

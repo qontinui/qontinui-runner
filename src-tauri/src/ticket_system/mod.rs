@@ -11,5 +11,6 @@ pub mod types;
 
 pub use service::TicketSyncService;
 pub use types::{
-    Ticket, TicketComment, TicketProvider, TicketProviderConfig, TicketSource, TicketState,
+    Ticket, TicketComment, TicketProvider, TicketProviderConfig, TicketProviderConfigExt,
+    TicketSource, TicketSourceExt, TicketState,
 };
