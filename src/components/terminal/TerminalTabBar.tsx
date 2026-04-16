@@ -4,7 +4,7 @@ import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { AccountUsageInfo } from "./useSessionManager";
 import { LaunchMenu } from "./LaunchMenu";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent, UIBridgeComponentScope } from "ui-bridge";
 
 interface TerminalTabBarProps {
   tabs: TerminalTab[];
@@ -377,36 +377,38 @@ export function TerminalTabBar({
 
         {/* Launch menu dropdown */}
         {onQuickLaunch && (
-          <div className="relative shrink-0">
-            <button
-              onMouseDown={(e) => e.stopPropagation()}
-              onClick={() => setShowQuickLaunch(!showQuickLaunch)}
-              className={`flex items-center justify-center w-5 h-6 rounded transition-colors ${
-                showQuickLaunch
-                  ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-                  : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
-              }`}
-              title="Launch menu"
-            >
-              <ChevronDown className="w-3 h-3" />
-            </button>
-            {showQuickLaunch && (
-              <LaunchMenu
-                onCreatePlain={(count) => onQuickLaunch(count)}
-                onCreateAiSession={(count, configDir, context) =>
-                  onLaunchAiSession?.(count, configDir, context)
-                }
-                onCreateMultiAiSessions={(configDirs, context) =>
-                  onLaunchMultiAiSessions?.(configDirs, context)
-                }
-                onCreateWithCommand={(count, command) => onQuickLaunch(count, command)}
-                accountUsage={accountUsage ?? []}
-                launchCommands={launchCommands}
-                fileLocks={fileLocks}
-                onClose={() => setShowQuickLaunch(false)}
-              />
-            )}
-          </div>
+          <UIBridgeComponentScope componentId="terminal-launch-menu">
+            <div className="relative shrink-0">
+              <button
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={() => setShowQuickLaunch(!showQuickLaunch)}
+                className={`flex items-center justify-center w-5 h-6 rounded transition-colors ${
+                  showQuickLaunch
+                    ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
+                    : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
+                }`}
+                title="Launch menu"
+              >
+                <ChevronDown className="w-3 h-3" />
+              </button>
+              {showQuickLaunch && (
+                <LaunchMenu
+                  onCreatePlain={(count) => onQuickLaunch(count)}
+                  onCreateAiSession={(count, configDir, context) =>
+                    onLaunchAiSession?.(count, configDir, context)
+                  }
+                  onCreateMultiAiSessions={(configDirs, context) =>
+                    onLaunchMultiAiSessions?.(configDirs, context)
+                  }
+                  onCreateWithCommand={(count, command) => onQuickLaunch(count, command)}
+                  accountUsage={accountUsage ?? []}
+                  launchCommands={launchCommands}
+                  fileLocks={fileLocks}
+                  onClose={() => setShowQuickLaunch(false)}
+                />
+              )}
+            </div>
+          </UIBridgeComponentScope>
         )}
       </div>
 

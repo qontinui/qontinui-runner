@@ -37,6 +37,7 @@ import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { useTerminalInitialization } from "./useTerminalInitialization";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
+import { UIBridgeComponentScope } from "ui-bridge";
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -249,283 +250,289 @@ function TerminalPageInner({
   }
 
   return (
-    <div className="h-full flex flex-col bg-[#1a1b26]">
-      <TerminalTabBar
-        tabs={tabs}
-        activeId={activeId}
-        onSelect={(id) => {
-          setActiveId(id);
-          const zoneIdx = Object.entries(zoneLayout.assignments).find(([, tabId]) => tabId === id);
-          if (zoneIdx) {
-            zoneLayout.setFocusedZone(Number(zoneIdx[0]));
-          }
-        }}
-        onClose={closeTerminal}
-        onCreate={() => createAndAssignTerminal()}
-        onRename={renameTab}
-        sessionStates={stateTracking.sessionStates}
-        layoutPicker={
-          <div className="flex items-center gap-1">
-            <ZoneLayoutPicker
-              currentLayoutId={zoneLayout.layoutId}
-              onSelectLayout={zoneLayout.setLayoutId}
-              tabCount={tabs.length}
-            />
-            {zoneLayout.isMultiZone && (
-              <>
-                <button
-                  onClick={cycleViewMode}
-                  className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors"
-                  title={`View mode: ${uiState.viewMode} (Ctrl+Shift+M to cycle)`}
-                >
-                  <span className="font-mono uppercase tracking-wider">{uiState.viewMode}</span>
-                  <span className="text-[#565f89]/50">{zoneLayout.layout.zones.length}z</span>
-                </button>
-                <button
-                  onClick={() => dispatch({ type: "RESET_RATIOS" })}
-                  className="px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors"
-                  title="Reset zone sizes to equal"
-                >
-                  Reset
-                </button>
-              </>
-            )}
-            <button
-              onClick={toggleAutoLayout}
-              className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-                uiState.autoLayout
-                  ? "text-[#9ece6a] bg-[#9ece6a]/10"
-                  : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-              }`}
-              title={`Auto-layout: ${uiState.autoLayout ? "ON" : "OFF"} — automatically switch layout based on terminal count`}
-            >
-              Auto
-            </button>
-            <ZoneProfilePicker
-              currentLayoutId={zoneLayout.layoutId}
-              zoneLabels={labelsAndTags.zoneLabels}
-              zoneNotes={labelsAndTags.zoneNotes}
-              pinnedZones={labelsAndTags.pinnedZones}
-              autoApprovePatterns={transitionEffects.autoApprovePatterns}
-              pageId={pageId}
-              zoneAssignments={zoneLayout.assignments}
-              tabs={tabs}
-              initialized={initialized}
-              onLoadProfile={async (profile) => {
-                zoneLayout.setLayoutId(profile.layoutId);
-                labelsAndTags.setZoneLabels(profile.labels);
-                labelsAndTags.setZoneNotes(profile.notes);
-                labelsAndTags.setPinnedZones(new Set(profile.pins));
-                transitionEffects.setAutoApprovePatterns(profile.autoApprovePatterns);
-                // Create terminals for profile sessions that need them.
-                // Stash sessions BEFORE creating terminals so the assignments-watching
-                // effect sees them as soon as the first assignment lands.
-                if (profile.sessions && profile.sessions.length > 0) {
-                  pendingProfileSessionsRef.current = profile.sessions;
-                  const existingTabCount = tabs.length;
-                  const neededCount = profile.sessions.length;
-                  const toCreate = Math.max(0, neededCount - existingTabCount);
-                  for (let i = 0; i < toCreate; i++) {
-                    await createAndAssignTerminal();
-                  }
-                  // Edge case: if existing tabs already satisfy the count, no new
-                  // terminals (and no zone-assignment changes) will be triggered, so
-                  // the effect watching zoneLayout.assignments in TerminalCoreContext
-                  // would never re-fire to consume pendingProfileSessionsRef. Bind
-                  // each profile session's zoneIndex to one of the existing tabs;
-                  // assignTabToZone always returns a new assignments object, so the
-                  // effect re-runs and processes the pending sessions.
-                  if (toCreate === 0) {
-                    const assignedTabs = new Set<string>();
-                    for (const s of profile.sessions) {
-                      const candidate = tabs.find((t) => !assignedTabs.has(t.id));
-                      if (!candidate) break;
-                      assignedTabs.add(candidate.id);
-                      zoneLayout.assignTabToZone(s.zoneIndex, candidate.id);
+    <UIBridgeComponentScope componentId="terminal-page">
+      <div className="h-full flex flex-col bg-[#1a1b26]">
+        <TerminalTabBar
+          tabs={tabs}
+          activeId={activeId}
+          onSelect={(id) => {
+            setActiveId(id);
+            const zoneIdx = Object.entries(zoneLayout.assignments).find(
+              ([, tabId]) => tabId === id,
+            );
+            if (zoneIdx) {
+              zoneLayout.setFocusedZone(Number(zoneIdx[0]));
+            }
+          }}
+          onClose={closeTerminal}
+          onCreate={() => createAndAssignTerminal()}
+          onRename={renameTab}
+          sessionStates={stateTracking.sessionStates}
+          layoutPicker={
+            <div className="flex items-center gap-1">
+              <ZoneLayoutPicker
+                currentLayoutId={zoneLayout.layoutId}
+                onSelectLayout={zoneLayout.setLayoutId}
+                tabCount={tabs.length}
+              />
+              {zoneLayout.isMultiZone && (
+                <>
+                  <button
+                    onClick={cycleViewMode}
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors"
+                    title={`View mode: ${uiState.viewMode} (Ctrl+Shift+M to cycle)`}
+                  >
+                    <span className="font-mono uppercase tracking-wider">{uiState.viewMode}</span>
+                    <span className="text-[#565f89]/50">{zoneLayout.layout.zones.length}z</span>
+                  </button>
+                  <button
+                    onClick={() => dispatch({ type: "RESET_RATIOS" })}
+                    className="px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors"
+                    title="Reset zone sizes to equal"
+                  >
+                    Reset
+                  </button>
+                </>
+              )}
+              <button
+                onClick={toggleAutoLayout}
+                className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+                  uiState.autoLayout
+                    ? "text-[#9ece6a] bg-[#9ece6a]/10"
+                    : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+                }`}
+                title={`Auto-layout: ${uiState.autoLayout ? "ON" : "OFF"} — automatically switch layout based on terminal count`}
+              >
+                Auto
+              </button>
+              <ZoneProfilePicker
+                currentLayoutId={zoneLayout.layoutId}
+                zoneLabels={labelsAndTags.zoneLabels}
+                zoneNotes={labelsAndTags.zoneNotes}
+                pinnedZones={labelsAndTags.pinnedZones}
+                autoApprovePatterns={transitionEffects.autoApprovePatterns}
+                pageId={pageId}
+                zoneAssignments={zoneLayout.assignments}
+                tabs={tabs}
+                initialized={initialized}
+                onLoadProfile={async (profile) => {
+                  zoneLayout.setLayoutId(profile.layoutId);
+                  labelsAndTags.setZoneLabels(profile.labels);
+                  labelsAndTags.setZoneNotes(profile.notes);
+                  labelsAndTags.setPinnedZones(new Set(profile.pins));
+                  transitionEffects.setAutoApprovePatterns(profile.autoApprovePatterns);
+                  // Create terminals for profile sessions that need them.
+                  // Stash sessions BEFORE creating terminals so the assignments-watching
+                  // effect sees them as soon as the first assignment lands.
+                  if (profile.sessions && profile.sessions.length > 0) {
+                    pendingProfileSessionsRef.current = profile.sessions;
+                    const existingTabCount = tabs.length;
+                    const neededCount = profile.sessions.length;
+                    const toCreate = Math.max(0, neededCount - existingTabCount);
+                    for (let i = 0; i < toCreate; i++) {
+                      await createAndAssignTerminal();
+                    }
+                    // Edge case: if existing tabs already satisfy the count, no new
+                    // terminals (and no zone-assignment changes) will be triggered, so
+                    // the effect watching zoneLayout.assignments in TerminalCoreContext
+                    // would never re-fire to consume pendingProfileSessionsRef. Bind
+                    // each profile session's zoneIndex to one of the existing tabs;
+                    // assignTabToZone always returns a new assignments object, so the
+                    // effect re-runs and processes the pending sessions.
+                    if (toCreate === 0) {
+                      const assignedTabs = new Set<string>();
+                      for (const s of profile.sessions) {
+                        const candidate = tabs.find((t) => !assignedTabs.has(t.id));
+                        if (!candidate) break;
+                        assignedTabs.add(candidate.id);
+                        zoneLayout.assignTabToZone(s.zoneIndex, candidate.id);
+                      }
                     }
                   }
-                }
-              }}
-            />
-          </div>
-        }
-        assignments={zoneLayout.isMultiZone ? zoneLayout.assignments : undefined}
-        activityData={stateTracking.activityData}
-        stateDurations={stateTracking.stateDurations}
-        lastOutputLines={stateTracking.lastOutputLines}
-        unreadTabs={transitionEffects.unseenNeedsInput}
-        staleTabs={stateTracking.staleTabs}
-        zoneLabels={labelsAndTags.zoneLabels}
-        labelColorMap={labelsAndTags.labelColorMap}
-        onQuickLaunch={async (count, autoCommand) => {
-          const totalTabs = tabs.length + count;
-          const layoutId = pickLayout(totalTabs);
-          zoneLayout.setLayoutId(layoutId);
-          const title = autoCommand ? autoCommand.slice(0, 20) : undefined;
-          const createdTabIds: string[] = [];
-          for (let i = 0; i < count; i++) {
-            const tabId = await createAndAssignTerminal(title);
-            if (tabId) createdTabIds.push(tabId);
+                }}
+              />
+            </div>
           }
-          if (autoCommand && createdTabIds.length > 0) {
-            for (const tabId of createdTabIds) {
-              writeWhenReady(tabId, `${autoCommand}\r`);
-            }
-          }
-        }}
-        onLaunchAiSession={async (count, configDir, context) => {
-          const totalTabs = tabs.length + count;
-          const layoutId = pickLayout(totalTabs);
-          zoneLayout.setLayoutId(layoutId);
-
-          const isWindows = navigator.platform.startsWith("Win");
-          const customCmd = sessionManager.launchCommands?.[configDir];
-          const cmd = customCmd
-            ? customCmd
-            : isWindows
-              ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude`
-              : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
-          // Smart tab naming: use custom command or account label
-          const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
-          const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
-          const createdTabIds: string[] = [];
-          for (let i = 0; i < count; i++) {
-            const tabId = await createAndAssignTerminal(label);
-            if (tabId) createdTabIds.push(tabId);
-          }
-          if (createdTabIds.length > 0) {
-            // Type the launch command once the terminal ref is mounted
-            for (const tabId of createdTabIds) {
-              writeWhenReady(tabId, `${cmd}\r`);
-            }
-            // Type the initial instructions after Claude starts
-            if (context) {
-              const safeContext = context.replace(/\n/g, " ");
-              setTimeout(() => {
-                for (const tabId of createdTabIds) {
-                  writeWhenReady(tabId, `${safeContext}\r`);
-                }
-              }, 8000);
-            }
-          }
-        }}
-        onLaunchMultiAiSessions={async (configDirs, context) => {
-          const count = configDirs.length;
-          const totalTabs = tabs.length + count;
-          const layoutId = pickLayout(totalTabs);
-          zoneLayout.setLayoutId(layoutId);
-
-          const isWindows = navigator.platform.startsWith("Win");
-          const cmds = sessionManager.launchCommands ?? {};
-          const createdTabIds: string[] = [];
-          for (let i = 0; i < count; i++) {
-            const customCmd = cmds[configDirs[i]];
-            const dirName =
-              configDirs[i].replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
-            const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
-            const tabId = await createAndAssignTerminal(label);
-            if (tabId) {
-              createdTabIds.push(tabId);
-              const cmd = customCmd
-                ? customCmd
-                : isWindows
-                  ? `$env:CLAUDE_CONFIG_DIR="${configDirs[i]}"; claude`
-                  : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
-              // Stagger launch commands across accounts
-              setTimeout(() => writeWhenReady(tabId, `${cmd}\r`), i * 300);
-            }
-          }
-          // Type initial instructions after Claude starts (stagger per session)
-          if (context && createdTabIds.length > 0) {
-            const safeContext = context.replace(/\n/g, " ");
-            for (let j = 0; j < createdTabIds.length; j++) {
-              const tabId = createdTabIds[j];
-              setTimeout(() => writeWhenReady(tabId, `${safeContext}\r`), j * 300 + 8000);
-            }
-          }
-        }}
-        accountUsage={sessionManager.accountUsage}
-        launchCommands={sessionManager.launchCommands}
-        fileLocks={sessionManager.fileLocks}
-        fileLockStates={fileLockStates}
-      />
-      <ZoneStatusBar
-        onExport={handleExportOutput}
-        onSortZones={handleSortZones}
-        onOpenDocFile={handleOpenDocFile}
-      />
-      <TerminalNotification
-        message={workflowGen.notification?.message ?? null}
-        type={workflowGen.notification?.type ?? "success"}
-        onDismiss={() => workflowGen.setNotification(null)}
-      />
-      <FileConflictBanner
-        conflicts={fileConflicts.conflicts}
-        recentAlert={fileConflicts.recentAlert}
-        onDismissAlert={fileConflicts.dismissAlert}
-      />
-
-      {uiState.showTimeline && zoneLayout.isMultiZone && (
-        <ZoneTimeline
-          tabs={tabs}
-          assignments={zoneLayout.assignments}
-          sessionStates={stateTracking.sessionStates}
-          eventHistory={eventHistory}
-          onClose={() => dispatch({ type: "SET_SHOW_TIMELINE", payload: false })}
-        />
-      )}
-
-      {uiState.showOutputSearch && (
-        <OutputSearchBar
-          outputSearch={uiState.outputSearch}
-          onSearchChange={(v) => dispatch({ type: "SET_OUTPUT_SEARCH", payload: v })}
-          onClose={() => dispatch({ type: "SET_SHOW_OUTPUT_SEARCH", payload: false })}
+          assignments={zoneLayout.isMultiZone ? zoneLayout.assignments : undefined}
+          activityData={stateTracking.activityData}
+          stateDurations={stateTracking.stateDurations}
           lastOutputLines={stateTracking.lastOutputLines}
-        />
-      )}
+          unreadTabs={transitionEffects.unseenNeedsInput}
+          staleTabs={stateTracking.staleTabs}
+          zoneLabels={labelsAndTags.zoneLabels}
+          labelColorMap={labelsAndTags.labelColorMap}
+          onQuickLaunch={async (count, autoCommand) => {
+            const totalTabs = tabs.length + count;
+            const layoutId = pickLayout(totalTabs);
+            zoneLayout.setLayoutId(layoutId);
+            const title = autoCommand ? autoCommand.slice(0, 20) : undefined;
+            const createdTabIds: string[] = [];
+            for (let i = 0; i < count; i++) {
+              const tabId = await createAndAssignTerminal(title);
+              if (tabId) createdTabIds.push(tabId);
+            }
+            if (autoCommand && createdTabIds.length > 0) {
+              for (const tabId of createdTabIds) {
+                writeWhenReady(tabId, `${autoCommand}\r`);
+              }
+            }
+          }}
+          onLaunchAiSession={async (count, configDir, context) => {
+            const totalTabs = tabs.length + count;
+            const layoutId = pickLayout(totalTabs);
+            zoneLayout.setLayoutId(layoutId);
 
-      <div className="flex-1 flex flex-row overflow-hidden">
-        {workflowGen.showSidebar && (
-          <SessionManagerPanel
-            manager={sessionManager}
-            selectedSessionId={workflowGen.selectedTranscriptSessionId}
-            sessionConflictCounts={fileConflicts.sessionConflictCounts}
+            const isWindows = navigator.platform.startsWith("Win");
+            const customCmd = sessionManager.launchCommands?.[configDir];
+            const cmd = customCmd
+              ? customCmd
+              : isWindows
+                ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude`
+                : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
+            // Smart tab naming: use custom command or account label
+            const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
+            const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
+            const createdTabIds: string[] = [];
+            for (let i = 0; i < count; i++) {
+              const tabId = await createAndAssignTerminal(label);
+              if (tabId) createdTabIds.push(tabId);
+            }
+            if (createdTabIds.length > 0) {
+              // Type the launch command once the terminal ref is mounted
+              for (const tabId of createdTabIds) {
+                writeWhenReady(tabId, `${cmd}\r`);
+              }
+              // Type the initial instructions after Claude starts
+              if (context) {
+                const safeContext = context.replace(/\n/g, " ");
+                setTimeout(() => {
+                  for (const tabId of createdTabIds) {
+                    writeWhenReady(tabId, `${safeContext}\r`);
+                  }
+                }, 8000);
+              }
+            }
+          }}
+          onLaunchMultiAiSessions={async (configDirs, context) => {
+            const count = configDirs.length;
+            const totalTabs = tabs.length + count;
+            const layoutId = pickLayout(totalTabs);
+            zoneLayout.setLayoutId(layoutId);
+
+            const isWindows = navigator.platform.startsWith("Win");
+            const cmds = sessionManager.launchCommands ?? {};
+            const createdTabIds: string[] = [];
+            for (let i = 0; i < count; i++) {
+              const customCmd = cmds[configDirs[i]];
+              const dirName =
+                configDirs[i].replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
+              const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
+              const tabId = await createAndAssignTerminal(label);
+              if (tabId) {
+                createdTabIds.push(tabId);
+                const cmd = customCmd
+                  ? customCmd
+                  : isWindows
+                    ? `$env:CLAUDE_CONFIG_DIR="${configDirs[i]}"; claude`
+                    : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
+                // Stagger launch commands across accounts
+                setTimeout(() => writeWhenReady(tabId, `${cmd}\r`), i * 300);
+              }
+            }
+            // Type initial instructions after Claude starts (stagger per session)
+            if (context && createdTabIds.length > 0) {
+              const safeContext = context.replace(/\n/g, " ");
+              for (let j = 0; j < createdTabIds.length; j++) {
+                const tabId = createdTabIds[j];
+                setTimeout(() => writeWhenReady(tabId, `${safeContext}\r`), j * 300 + 8000);
+              }
+            }
+          }}
+          accountUsage={sessionManager.accountUsage}
+          launchCommands={sessionManager.launchCommands}
+          fileLocks={sessionManager.fileLocks}
+          fileLockStates={fileLockStates}
+        />
+        <ZoneStatusBar
+          onExport={handleExportOutput}
+          onSortZones={handleSortZones}
+          onOpenDocFile={handleOpenDocFile}
+        />
+        <TerminalNotification
+          message={workflowGen.notification?.message ?? null}
+          type={workflowGen.notification?.type ?? "success"}
+          onDismiss={() => workflowGen.setNotification(null)}
+        />
+        <FileConflictBanner
+          conflicts={fileConflicts.conflicts}
+          recentAlert={fileConflicts.recentAlert}
+          onDismissAlert={fileConflicts.dismissAlert}
+        />
+
+        {uiState.showTimeline && zoneLayout.isMultiZone && (
+          <ZoneTimeline
+            tabs={tabs}
+            assignments={zoneLayout.assignments}
+            sessionStates={stateTracking.sessionStates}
+            eventHistory={eventHistory}
+            onClose={() => dispatch({ type: "SET_SHOW_TIMELINE", payload: false })}
           />
         )}
 
-        <div className="flex-1 relative overflow-hidden">
-          {tabs.length > 0 ? (
-            <ZoneGrid
-              onZoneClick={handleZoneClick}
-              onZoneDoubleClick={handleZoneDoubleClick}
-              onExit={handleExit}
-              onExportZone={handleExportZone}
-            />
-          ) : (
-            <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">
-              <span className="text-sm">
-                No terminals open. Press{" "}
-                <kbd className="px-1.5 py-0.5 rounded bg-[#2a2d3d] text-[#a9b1d6] text-xs font-mono">
-                  Ctrl+Shift+T
-                </kbd>{" "}
-                or click + to create one.
-              </span>
-            </div>
-          )}
-
-          {zoneLayout.isMultiZone && <ZoneMinimap />}
-
-          {zoneLayout.isMultiZone && !transitionEffects.batchBarDismissed && <BatchOperationsBar />}
-        </div>
-
-        {uiState.showControlPanel && zoneLayout.isMultiZone && (
-          <ZoneControlPanel onCreateTerminal={() => createAndAssignTerminal()} />
+        {uiState.showOutputSearch && (
+          <OutputSearchBar
+            outputSearch={uiState.outputSearch}
+            onSearchChange={(v) => dispatch({ type: "SET_OUTPUT_SEARCH", payload: v })}
+            onClose={() => dispatch({ type: "SET_SHOW_OUTPUT_SEARCH", payload: false })}
+            lastOutputLines={stateTracking.lastOutputLines}
+          />
         )}
 
-        <TerminalRightPanel />
-      </div>
+        <div className="flex-1 flex flex-row overflow-hidden">
+          {workflowGen.showSidebar && (
+            <SessionManagerPanel
+              manager={sessionManager}
+              selectedSessionId={workflowGen.selectedTranscriptSessionId}
+              sessionConflictCounts={fileConflicts.sessionConflictCounts}
+            />
+          )}
 
-      <TerminalOverlays onSortZones={handleSortZones} onExport={handleExportOutput} />
-    </div>
+          <div className="flex-1 relative overflow-hidden">
+            {tabs.length > 0 ? (
+              <ZoneGrid
+                onZoneClick={handleZoneClick}
+                onZoneDoubleClick={handleZoneDoubleClick}
+                onExit={handleExit}
+                onExportZone={handleExportZone}
+              />
+            ) : (
+              <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">
+                <span className="text-sm">
+                  No terminals open. Press{" "}
+                  <kbd className="px-1.5 py-0.5 rounded bg-[#2a2d3d] text-[#a9b1d6] text-xs font-mono">
+                    Ctrl+Shift+T
+                  </kbd>{" "}
+                  or click + to create one.
+                </span>
+              </div>
+            )}
+
+            {zoneLayout.isMultiZone && <ZoneMinimap />}
+
+            {zoneLayout.isMultiZone && !transitionEffects.batchBarDismissed && (
+              <BatchOperationsBar />
+            )}
+          </div>
+
+          {uiState.showControlPanel && zoneLayout.isMultiZone && (
+            <ZoneControlPanel onCreateTerminal={() => createAndAssignTerminal()} />
+          )}
+
+          <TerminalRightPanel />
+        </div>
+
+        <TerminalOverlays onSortZones={handleSortZones} onExport={handleExportOutput} />
+      </div>
+    </UIBridgeComponentScope>
   );
 }
