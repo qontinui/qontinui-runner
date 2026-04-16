@@ -46,8 +46,15 @@ import { useSpecSync } from "@/hooks/useSpecSync";
 
 const AI_GENERATION_STORAGE_KEY = "specs.useAiGeneration";
 
+// Default: AI path on. Verified end-to-end on the Terminal spec at commit
+// 19d9422de (6 setup steps + 14 verifications + 1 agentic, category
+// "spec-generated", tags ["spec","auto-generated"]). Users can flip back to
+// the deterministic builder via the "Generate with AI (spec brief)" toggle
+// in ConnectionBar — the toggle persists via instanceStorage, so
+// `instanceStorage.setItem("specs.useAiGeneration", "false")` rolls back
+// per-instance without a code change.
 function readAiGenerationFlag(): boolean {
-  return instanceStorage.getJSON<boolean>(AI_GENERATION_STORAGE_KEY, false) === true;
+  return instanceStorage.getJSON<boolean>(AI_GENERATION_STORAGE_KEY, true) !== false;
 }
 
 function writeAiGenerationFlag(value: boolean): void {
