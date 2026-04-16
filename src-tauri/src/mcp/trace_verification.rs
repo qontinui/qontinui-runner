@@ -7,7 +7,7 @@ use regex::Regex;
 use tracing::{info, warn};
 
 use crate::config_storage::ConfigStorage;
-use crate::orchestrator::{DeterministicVerifier, WorkerSignal};
+use crate::orchestrator::{DeterministicVerifier, WorkerSignal, WorkerSignalExt};
 
 // ============================================================================
 // Trace and Video Extraction Utilities

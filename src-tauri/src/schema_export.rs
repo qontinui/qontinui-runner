@@ -420,10 +420,12 @@ pub enum AppEvent {
 /// remote types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        accessibility as qa, config as qcfg, constraints as qc, execution as qe,
-        findings as qfn, geometry as qg, process_management as qpm, rag as qr,
+        accessibility as qa, config as qcfg, constraints as qc, discovery as qdc,
+        execution as qe, findings as qfn, geometry as qg,
+        orchestration_config as qoc, process_management as qpm, rag as qr,
         scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr,
-        ticket_system as qts, tree_events as qte, workflow as qw, workflow_step as qws,
+        ticket_system as qts, tree_events as qte, verification as qv, workflow as qw,
+        workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -653,6 +655,31 @@ pub fn export_all_schemas() -> Value {
     add!("StateFilterItem", qr::StateFilterItem);
     add!("StatesResponse", qr::StatesResponse);
 
+    // ── qontinui-types: orchestration_config ──
+    add!("OlConfig", qoc::OlConfig);
+    add!("CreateOlConfigRequest", qoc::CreateOlConfigRequest);
+    add!("UpdateOlConfigRequest", qoc::UpdateOlConfigRequest);
+    add!("StallDetectorConfig", qoc::StallDetectorConfig);
+    add!("SummarizationConfig", qoc::SummarizationConfig);
+    add!("DecomposerConfig", qoc::DecomposerConfig);
+    add!("OrchestrationLoopConfig", qoc::OrchestrationLoopConfig);
+    add!("PipelineConfig", qoc::PipelineConfig);
+    add!("BuildPhaseConfig", qoc::BuildPhaseConfig);
+    add!("ImplementFixesConfig", qoc::ImplementFixesConfig);
+    add!("DiagnosePhaseConfig", qoc::DiagnosePhaseConfig);
+    add!("RootCauseCategory", qoc::RootCauseCategory);
+    add!("DiagnosticResult", qoc::DiagnosticResult);
+    add!("ExitStrategy", qoc::ExitStrategy);
+    add!("BetweenIterations", qoc::BetweenIterations);
+    add!("LoopPhase", qoc::LoopPhase);
+    add!("OrchestrationLoopStatus", qoc::OrchestrationLoopStatus);
+    add!("IterationResult", qoc::IterationResult);
+    add!("ExitCheckResult", qoc::ExitCheckResult);
+    add!("MultiLoopConfig", qoc::MultiLoopConfig);
+    add!("MultiLoopEntry", qoc::MultiLoopEntry);
+    add!("MultiLoopStatus", qoc::MultiLoopStatus);
+    add!("LoopInstanceStatus", qoc::LoopInstanceStatus);
+
     // ── qontinui-types: process_management ──
     add!("ParserType", qpm::ParserType);
     add!("ProcessState", qpm::ProcessState);
@@ -674,6 +701,25 @@ pub fn export_all_schemas() -> Value {
     add!("FindingDetail", qfn::FindingDetail);
     add!("FindingListResponse", qfn::FindingListResponse);
     add!("FindingSummary", qfn::FindingSummary);
+
+    // ── qontinui-types: discovery ──
+    add!("DiscoverySourceType", qdc::DiscoverySourceType);
+    add!("TransitionTriggerType", qdc::TransitionTriggerType);
+    add!("DiscoveryBoundingBox", qdc::DiscoveryBoundingBox);
+    add!("DiscoveryTransitionTrigger", qdc::DiscoveryTransitionTrigger);
+    add!("DiscoveredStateImage", qdc::DiscoveredStateImage);
+    add!("DiscoveredState", qdc::DiscoveredState);
+    add!("DiscoveredTransition", qdc::DiscoveredTransition);
+    add!("StateDiscoveryResult", qdc::StateDiscoveryResult);
+    add!("StateDiscoveryResultSummary", qdc::StateDiscoveryResultSummary);
+    add!(
+        "StateDiscoveryResultListResponse",
+        qdc::StateDiscoveryResultListResponse
+    );
+    add!("StateDiscoveryResultCreate", qdc::StateDiscoveryResultCreate);
+    add!("StateDiscoveryResultUpdate", qdc::StateDiscoveryResultUpdate);
+    add!("StateMachineExport", qdc::StateMachineExport);
+    add!("StateMachineImport", qdc::StateMachineImport);
 
     // ── qontinui-types: task_run (Session 4b path A) ──
     add!("TaskRunStatus", qtr::TaskRunStatus);
@@ -846,6 +892,32 @@ pub fn export_all_schemas() -> Value {
     add!("TransitionEdgeData", qsm::TransitionEdgeData);
     add!("StateMachineExportFormat", qsm::StateMachineExportFormat);
 
+    // ── qontinui-types: verification ──
+    add!("SuccessCriterion", qv::SuccessCriterion);
+    add!("CriterionType", qv::CriterionType);
+    add!("VerificationMethod", qv::VerificationMethod);
+    add!("VerificationPlan", qv::VerificationPlan);
+    add!("WorkerDomain", qv::WorkerDomain);
+    add!("DomainAssignment", qv::DomainAssignment);
+    add!("WorkerStatus", qv::WorkerStatus);
+    add!("WorkerInstance", qv::WorkerInstance);
+    add!("WorkerCoordinationMessage", qv::WorkerCoordinationMessage);
+    add!("DomainVerificationResult", qv::DomainVerificationResult);
+    add!("WorkerSignal", qv::WorkerSignal);
+    add!("Finding", qv::Finding);
+    add!("Confidence", qv::Confidence);
+    add!("VerificationResult", qv::VerificationResult);
+    add!(
+        "IterationVerificationResults",
+        qv::IterationVerificationResults
+    );
+    add!("VerificationAgentContext", qv::VerificationAgentContext);
+    add!("ExtendIterationsRequest", qv::ExtendIterationsRequest);
+    add!("CriterionOverride", qv::CriterionOverride);
+    add!("OverrideCollection", qv::OverrideCollection);
+    add!("TaskCompletionResult", qv::TaskCompletionResult);
+    add!("StageTransition", qv::StageTransition);
+
     Value::Object(m)
 }
 
@@ -869,7 +941,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 308, "Expected 308 schema entries");
+        assert_eq!(obj.len(), 366, "Expected 366 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

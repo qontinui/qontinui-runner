@@ -40,7 +40,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::orchestrator::types::{Confidence, CriterionOverride, Finding, WorkerSignal};
+use crate::orchestrator::types::{
+    Confidence, CriterionOverride, CriterionOverrideExt, Finding, WorkerSignal,
+};
 use crate::str_utils::truncate_str;
 use crate::validation::coercion::{apply_coercions, CoercionPolicy};
 use crate::validation::validator::SchemaValidator;

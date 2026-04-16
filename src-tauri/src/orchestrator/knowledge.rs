@@ -19,7 +19,8 @@ use crate::database::pg::PgDb;
 use crate::database::{StoredTaskKnowledge, StoredVerificationResult};
 use crate::orchestrator::compression::{CompressionConfig, CompressionResult, CompressionService};
 use crate::orchestrator::types::{
-    Confidence, CriterionOverride, Finding, OverrideCollection, WorkerSignal,
+    Confidence, CriterionOverride, CriterionOverrideExt, Finding, OverrideCollection,
+    OverrideCollectionExt, WorkerSignal, WorkerSignalExt,
 };
 use crate::str_utils::truncate_str;
 

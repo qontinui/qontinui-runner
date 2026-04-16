@@ -10,7 +10,8 @@
 use tracing::debug;
 
 use super::types::{
-    CriterionType, Finding, IterationVerificationResults, VerificationPlan, VerificationResult,
+    CriterionType, Finding, IterationVerificationResults, VerificationPlan, VerificationPlanExt,
+    VerificationResult,
 };
 use crate::execution_context::AiSessionContext;
 use crate::mcp::shared::emit_ai_output;
