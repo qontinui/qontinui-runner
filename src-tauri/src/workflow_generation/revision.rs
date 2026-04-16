@@ -443,8 +443,19 @@ fn compute_quality_score(findings: &[QualityFinding]) -> f32 {
         }
     }
 
-    let penalty =
-        0.3 * critical_count as f32 + 0.1 * warning_count as f32 + 0.02 * info_count as f32;
+    // Calibration notes (2026-04): AI semantic analysis surfaces many
+    // advisory warnings on real-world spec-driven workflows — 20–40 warnings
+    // is routine and doesn't indicate a broken workflow. The previous formula
+    // (0.1 per warning) saturated to 0.00 at ~10 warnings, causing every
+    // spec→workflow AI generation to be rejected by the 0.3 confidence-gate
+    // even with zero critical findings. Critical findings still dominate
+    // (0.3 each — one critical drops score to 0.7), warnings are capped
+    // in aggregate so they can't single-handedly zero the score, and info
+    // findings are near-free.
+    let crit_penalty = 0.3 * critical_count as f32;
+    let warn_penalty = (0.006 * warning_count as f32).min(0.2);
+    let info_penalty = (0.002 * info_count as f32).min(0.05);
+    let penalty = crit_penalty + warn_penalty + info_penalty;
 
     (1.0 - penalty).clamp(0.0, 1.0)
 }
