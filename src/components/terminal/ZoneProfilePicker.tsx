@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Save, FolderOpen, Trash2, ChevronDown } from "lucide-react";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent, UIBridgeComponentScope } from "ui-bridge";
 
 export interface ZoneSessionInfo {
   zoneIndex: number;
@@ -372,125 +372,129 @@ export function ZoneProfilePicker({
   if (!loaded) return null;
 
   return (
-    <div className="relative shrink-0" ref={ref}>
-      <button
-        onClick={() => setOpen(!open)}
-        className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-          open
-            ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-            : activeProfileName
-              ? "text-[#7aa2f7] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10"
-              : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-        }`}
-        title={
-          activeProfileName
-            ? `Profile: ${activeProfileName}`
-            : "Zone profiles — save/load configurations"
-        }
-      >
-        <FolderOpen className="w-3 h-3" />
-        {activeProfileName && <span className="max-w-[80px] truncate">{activeProfileName}</span>}
-        <ChevronDown className="w-2.5 h-2.5" />
-      </button>
+    <UIBridgeComponentScope componentId="zone-profile-picker">
+      <div className="relative shrink-0" ref={ref}>
+        <button
+          onClick={() => setOpen(!open)}
+          className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+            open
+              ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
+              : activeProfileName
+                ? "text-[#7aa2f7] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10"
+                : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+          }`}
+          title={
+            activeProfileName
+              ? `Profile: ${activeProfileName}`
+              : "Zone profiles — save/load configurations"
+          }
+        >
+          <FolderOpen className="w-3 h-3" />
+          {activeProfileName && <span className="max-w-[80px] truncate">{activeProfileName}</span>}
+          <ChevronDown className="w-2.5 h-2.5" />
+        </button>
 
-      {open && (
-        <div className="absolute left-0 top-full mt-1 w-56 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden">
-          <div className="px-3 py-1.5 text-[9px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d]">
-            Zone Profiles ({profileNames.length}/{MAX_PROFILES})
-          </div>
+        {open && (
+          <div className="absolute left-0 top-full mt-1 w-56 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden">
+            <div className="px-3 py-1.5 text-[9px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d]">
+              Zone Profiles ({profileNames.length}/{MAX_PROFILES})
+            </div>
 
-          {/* Save current */}
-          <div className="px-2 py-1.5 border-b border-[#2a2d3d]">
-            {showSaveInput ? (
-              <div className="flex items-center gap-1">
-                <input
-                  id="zone-profile-name-input"
-                  autoFocus
-                  value={saveName}
-                  onChange={(e) => setSaveName(e.target.value)}
-                  onKeyDown={(e) => {
-                    e.stopPropagation();
-                    if (e.key === "Enter") handleSave();
-                    if (e.key === "Escape") {
-                      setShowSaveInput(false);
-                      setSaveName("");
-                    }
-                  }}
-                  placeholder="Profile name..."
-                  className="flex-1 bg-[#13141f] border border-[#2a2d3d] rounded px-1.5 py-0.5 text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7]"
-                  maxLength={30}
-                />
+            {/* Save current */}
+            <div className="px-2 py-1.5 border-b border-[#2a2d3d]">
+              {showSaveInput ? (
+                <div className="flex items-center gap-1">
+                  <input
+                    id="zone-profile-name-input"
+                    autoFocus
+                    value={saveName}
+                    onChange={(e) => setSaveName(e.target.value)}
+                    onKeyDown={(e) => {
+                      e.stopPropagation();
+                      if (e.key === "Enter") handleSave();
+                      if (e.key === "Escape") {
+                        setShowSaveInput(false);
+                        setSaveName("");
+                      }
+                    }}
+                    placeholder="Profile name..."
+                    className="flex-1 bg-[#13141f] border border-[#2a2d3d] rounded px-1.5 py-0.5 text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7]"
+                    maxLength={30}
+                  />
+                  <button
+                    id="zone-profile-save-btn"
+                    onClick={handleSave}
+                    disabled={!saveName.trim()}
+                    className="p-0.5 rounded text-[#9ece6a] hover:bg-[#9ece6a]/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                    title="Save profile"
+                  >
+                    <Save className="w-3 h-3" />
+                  </button>
+                </div>
+              ) : (
                 <button
-                  id="zone-profile-save-btn"
-                  onClick={handleSave}
-                  disabled={!saveName.trim()}
-                  className="p-0.5 rounded text-[#9ece6a] hover:bg-[#9ece6a]/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                  title="Save profile"
+                  id="zone-profile-save-current"
+                  onClick={() => setShowSaveInput(true)}
+                  disabled={profileNames.length >= MAX_PROFILES}
+                  className="flex items-center gap-1.5 w-full text-left px-1 py-0.5 text-[10px] text-[#9ece6a] hover:bg-[#9ece6a]/10 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                 >
                   <Save className="w-3 h-3" />
+                  Save current configuration
                 </button>
-              </div>
-            ) : (
-              <button
-                id="zone-profile-save-current"
-                onClick={() => setShowSaveInput(true)}
-                disabled={profileNames.length >= MAX_PROFILES}
-                className="flex items-center gap-1.5 w-full text-left px-1 py-0.5 text-[10px] text-[#9ece6a] hover:bg-[#9ece6a]/10 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-              >
-                <Save className="w-3 h-3" />
-                Save current configuration
-              </button>
-            )}
-          </div>
+              )}
+            </div>
 
-          {/* Saved profiles */}
-          <div className="max-h-48 overflow-y-auto scrollbar-dark">
-            {profileNames.length === 0 ? (
-              <div className="px-3 py-3 text-center text-[10px] text-[#565f89]">
-                No saved profiles
-              </div>
-            ) : (
-              profileNames.map((name) => {
-                const p = profiles[name];
-                const labelCount = Object.keys(p.labels).filter((k) => p.labels[Number(k)]).length;
-                return (
-                  <div
-                    key={name}
-                    className={`flex items-center gap-1.5 px-2 py-1.5 hover:bg-[#2a2d3d]/50 transition-colors group ${
-                      name === activeProfileName ? "bg-[#7aa2f7]/5" : ""
-                    }`}
-                  >
-                    <button onClick={() => handleLoad(name)} className="flex-1 min-w-0 text-left">
-                      <div className="text-[11px] text-[#c0caf5] truncate">{name}</div>
-                      <div className="text-[9px] text-[#565f89]">
-                        {p.layoutId} · {labelCount} label{labelCount !== 1 ? "s" : ""}
-                        {p.pins.length > 0 &&
-                          ` · ${p.pins.length} pin${p.pins.length !== 1 ? "s" : ""}`}
-                        {p.sessions && p.sessions.length > 0 && (
-                          <span className="text-[#7aa2f7]">
-                            {" "}
-                            · {p.sessions.length} session{p.sessions.length !== 1 ? "s" : ""}
-                          </span>
-                        )}
-                      </div>
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDelete(name);
-                      }}
-                      className="p-0.5 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 opacity-0 group-hover:opacity-100 transition-all shrink-0"
-                      title="Delete profile"
+            {/* Saved profiles */}
+            <div className="max-h-48 overflow-y-auto scrollbar-dark">
+              {profileNames.length === 0 ? (
+                <div className="px-3 py-3 text-center text-[10px] text-[#565f89]">
+                  No saved profiles
+                </div>
+              ) : (
+                profileNames.map((name) => {
+                  const p = profiles[name];
+                  const labelCount = Object.keys(p.labels).filter(
+                    (k) => p.labels[Number(k)],
+                  ).length;
+                  return (
+                    <div
+                      key={name}
+                      className={`flex items-center gap-1.5 px-2 py-1.5 hover:bg-[#2a2d3d]/50 transition-colors group ${
+                        name === activeProfileName ? "bg-[#7aa2f7]/5" : ""
+                      }`}
                     >
-                      <Trash2 className="w-3 h-3" />
-                    </button>
-                  </div>
-                );
-              })
-            )}
+                      <button onClick={() => handleLoad(name)} className="flex-1 min-w-0 text-left">
+                        <div className="text-[11px] text-[#c0caf5] truncate">{name}</div>
+                        <div className="text-[9px] text-[#565f89]">
+                          {p.layoutId} · {labelCount} label{labelCount !== 1 ? "s" : ""}
+                          {p.pins.length > 0 &&
+                            ` · ${p.pins.length} pin${p.pins.length !== 1 ? "s" : ""}`}
+                          {p.sessions && p.sessions.length > 0 && (
+                            <span className="text-[#7aa2f7]">
+                              {" "}
+                              · {p.sessions.length} session{p.sessions.length !== 1 ? "s" : ""}
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDelete(name);
+                        }}
+                        className="p-0.5 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 opacity-0 group-hover:opacity-100 transition-all shrink-0"
+                        title="Delete profile"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
           </div>
-        </div>
-      )}
-    </div>
+        )}
+      </div>
+    </UIBridgeComponentScope>
   );
 }

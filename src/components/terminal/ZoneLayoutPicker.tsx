@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { LayoutGrid } from "lucide-react";
 import { LAYOUT_PRESETS, type LayoutPreset } from "./useZoneLayout";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent, UIBridgeComponentScope } from "ui-bridge";
 
 interface ZoneLayoutPickerProps {
   currentLayoutId: string;
@@ -130,69 +130,71 @@ export function ZoneLayoutPicker({
   const currentLayout = LAYOUT_PRESETS.find((l) => l.id === currentLayoutId);
 
   return (
-    <div className="relative" ref={dropdownRef}>
-      <button
-        onClick={() => setOpen(!open)}
-        className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs transition-colors ${
-          open
-            ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-            : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
-        }`}
-        title="Change layout (Ctrl+Shift+L)"
-      >
-        <LayoutGrid className="w-3.5 h-3.5" />
-        {currentLayout && <span className="hidden sm:inline">{currentLayout.name}</span>}
-      </button>
+    <UIBridgeComponentScope componentId="zone-layout-picker">
+      <div className="relative" ref={dropdownRef}>
+        <button
+          onClick={() => setOpen(!open)}
+          className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs transition-colors ${
+            open
+              ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
+              : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
+          }`}
+          title="Change layout (Ctrl+Shift+L)"
+        >
+          <LayoutGrid className="w-3.5 h-3.5" />
+          {currentLayout && <span className="hidden sm:inline">{currentLayout.name}</span>}
+        </button>
 
-      {open && (
-        <div className="absolute left-0 top-full mt-1 w-56 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden">
-          <div className="px-3 py-2 text-[10px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d]">
-            Zone Layouts
-          </div>
-          <div className="py-1">
-            {LAYOUT_PRESETS.map((preset) => {
-              const isActive = preset.id === currentLayoutId;
-              const zoneCount = preset.zones.length;
-              const hasEnoughTabs = tabCount >= zoneCount;
+        {open && (
+          <div className="absolute left-0 top-full mt-1 w-56 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden">
+            <div className="px-3 py-2 text-[10px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d]">
+              Zone Layouts
+            </div>
+            <div className="py-1">
+              {LAYOUT_PRESETS.map((preset) => {
+                const isActive = preset.id === currentLayoutId;
+                const zoneCount = preset.zones.length;
+                const hasEnoughTabs = tabCount >= zoneCount;
 
-              return (
-                <button
-                  key={preset.id}
-                  onClick={() => {
-                    onSelectLayout(preset.id);
-                    setOpen(false);
-                  }}
-                  className={`w-full flex items-center gap-3 px-3 py-1.5 text-left transition-colors ${
-                    isActive
-                      ? "bg-[#7aa2f7]/10 text-[#7aa2f7]"
-                      : "text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-                  }`}
-                >
-                  <LayoutThumbnail layout={preset} isActive={isActive} />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium">{preset.name}</span>
-                      {preset.shortcutKey && (
-                        <kbd className="text-[9px] px-1 py-0.5 rounded bg-[#2a2d3d] text-[#565f89] font-mono">
-                          {preset.shortcutKey}
-                        </kbd>
-                      )}
+                return (
+                  <button
+                    key={preset.id}
+                    onClick={() => {
+                      onSelectLayout(preset.id);
+                      setOpen(false);
+                    }}
+                    className={`w-full flex items-center gap-3 px-3 py-1.5 text-left transition-colors ${
+                      isActive
+                        ? "bg-[#7aa2f7]/10 text-[#7aa2f7]"
+                        : "text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+                    }`}
+                  >
+                    <LayoutThumbnail layout={preset} isActive={isActive} />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-medium">{preset.name}</span>
+                        {preset.shortcutKey && (
+                          <kbd className="text-[9px] px-1 py-0.5 rounded bg-[#2a2d3d] text-[#565f89] font-mono">
+                            {preset.shortcutKey}
+                          </kbd>
+                        )}
+                      </div>
+                      <span
+                        className={`text-[10px] ${
+                          hasEnoughTabs ? "text-[#565f89]" : "text-[#e0af68]"
+                        }`}
+                      >
+                        {zoneCount} zone{zoneCount !== 1 ? "s" : ""}
+                        {!hasEnoughTabs && ` (${tabCount} tab${tabCount !== 1 ? "s" : ""})`}
+                      </span>
                     </div>
-                    <span
-                      className={`text-[10px] ${
-                        hasEnoughTabs ? "text-[#565f89]" : "text-[#e0af68]"
-                      }`}
-                    >
-                      {zoneCount} zone{zoneCount !== 1 ? "s" : ""}
-                      {!hasEnoughTabs && ` (${tabCount} tab${tabCount !== 1 ? "s" : ""})`}
-                    </span>
-                  </div>
-                </button>
-              );
-            })}
+                  </button>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      )}
-    </div>
+        )}
+      </div>
+    </UIBridgeComponentScope>
   );
 }

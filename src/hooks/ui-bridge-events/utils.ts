@@ -72,6 +72,10 @@ export function serializeElement(element: RegisteredElement): SerializedElement 
     state: element.getState(),
     registeredAt: element.registeredAt,
     mounted: element.mounted,
+    ownedByComponent: element.ownedByComponent,
+    componentActionBasePath: element.ownedByComponent
+      ? `/ui-bridge/control/component/${element.ownedByComponent}`
+      : undefined,
   };
 }
 

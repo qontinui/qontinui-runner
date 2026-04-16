@@ -275,6 +275,19 @@ export interface SerializedElement {
   state: ElementState;
   registeredAt: number;
   mounted: boolean;
+  /**
+   * ID of a registered component that renders this element. Present when the
+   * element was registered inside a `<UIBridgeComponentScope>`. Callers should
+   * prefer higher-level component actions (see `componentActionBasePath`)
+   * over driving the element directly.
+   */
+  ownedByComponent?: string;
+  /**
+   * Base path for invoking component-level actions that may supersede direct
+   * element interaction. Call `GET <base>` for action details or
+   * `POST <base>/action/<actionId>` with a matching params body.
+   */
+  componentActionBasePath?: string;
 }
 
 /**
