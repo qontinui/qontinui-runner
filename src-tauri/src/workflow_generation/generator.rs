@@ -1961,6 +1961,18 @@ pub fn generate_workflow(
         let current_validation_errors = validate_workflow(&workflow);
         let error_count = current_validation_errors.len();
         if error_count > 0 {
+            // Log every error so "Low confidence score (0.00)" failures can
+            // be diagnosed without re-running with extra instrumentation.
+            warn!(
+                "Factor 1: {} validation errors contributing to score penalty:",
+                error_count
+            );
+            for (i, err) in current_validation_errors.iter().enumerate().take(20) {
+                warn!(
+                    "  [{}] kind={:?} field={} step={:?} message={}",
+                    i, err.kind, err.field, err.step_name, err.message
+                );
+            }
             // Each error reduces score; 5+ errors drops this factor to 0
             score *= (1.0 - (error_count as f32 / 5.0).min(1.0)).max(0.0);
         }
