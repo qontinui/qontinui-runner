@@ -1468,6 +1468,13 @@ pub fn delete_managed_process_config(id: &str) -> Result<(), String> {
     crate::config_facade::delete_managed_process_config(id)
 }
 
+/// Replace the entire managed-process list atomically.
+pub fn replace_managed_process_configs(
+    configs: Vec<crate::process_capture::ProcessConfig>,
+) -> Result<(), String> {
+    crate::config_facade::replace_managed_process_configs(configs)
+}
+
 // ============================================================================
 // Execution Variables Settings
 // ============================================================================

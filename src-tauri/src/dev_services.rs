@@ -211,36 +211,85 @@ pub fn get_missing_dev_services(
         .collect()
 }
 
-/// Upgrade existing configs that match dev service ports but lack auto_start.
+/// Upgrade legacy configs and remove duplicate configs on dev-service ports.
 ///
-/// When a user has a legacy config for a dev service port (e.g., port 8000)
-/// with `auto_start: false`, upgrade it with the dev service defaults:
-/// auto_start, start_group, dev_only, and the correct command/args/cwd/env.
-pub fn upgrade_legacy_configs(configs: &mut [ProcessConfig], workspace: &Path) {
+/// Two responsibilities, run in order:
+///
+/// 1. **Upgrade:** if a user-added config matches a dev-service port but has
+///    `auto_start: false`, bump `auto_start`, `start_group`, `dev_only`, and
+///    replace `command/args/cwd/env` with the dev-service defaults. Legacy
+///    configs often carry wrong commands (e.g. bare `python` instead of
+///    `poetry run python run.py`).
+///
+/// 2. **Dedupe:** for each dev-service port, collapse to a single config.
+///    Prefer the canonical dev-service entry (deterministic UUID v5) when
+///    present; otherwise keep the first match. All other enabled configs on
+///    that port are dropped — two configs racing for the same port end up
+///    with one failing `EADDRINUSE`, which is the exact symptom that made us
+///    write this pass.
+///
+/// Returns `true` if anything was mutated so the caller can persist.
+pub fn upgrade_and_dedupe_configs(configs: &mut Vec<ProcessConfig>, workspace: &Path) -> bool {
     let defaults = get_default_dev_services(workspace);
+    let mut changed = false;
 
     for config in configs.iter_mut() {
         if !config.auto_start && config.enabled {
             if let Some(port) = config.health_port {
-                // Find matching dev service default by port
                 if let Some(dev_default) = defaults.iter().find(|d| d.health_port == Some(port)) {
                     info!(
-                        "Dev-mode: upgrading legacy config '{}' (port {}) → command='{}', start_group={}, dev_only=true",
+                        "Dev-mode: upgrading legacy config '{}' (port {}) -> command='{}', start_group={}, dev_only=true",
                         config.name, port, dev_default.command, dev_default.start_group
                     );
                     config.auto_start = true;
                     config.start_group = dev_default.start_group;
                     config.dev_only = true;
-                    // Replace command/args/cwd/env with dev defaults
-                    // (legacy configs often have wrong commands, e.g., bare `python` instead of `poetry run`)
                     config.command = dev_default.command.clone();
                     config.args = dev_default.args.clone();
                     config.cwd = dev_default.cwd.clone();
                     config.env = dev_default.env.clone();
+                    changed = true;
                 }
             }
         }
     }
+
+    for default in &defaults {
+        let Some(port) = default.health_port else {
+            continue;
+        };
+        let matches: Vec<usize> = configs
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.health_port == Some(port) && c.enabled)
+            .map(|(i, _)| i)
+            .collect();
+        if matches.len() <= 1 {
+            continue;
+        }
+        let keep_idx = matches
+            .iter()
+            .copied()
+            .find(|&i| configs[i].id == default.id)
+            .unwrap_or(matches[0]);
+        let removed_names: Vec<String> = matches
+            .iter()
+            .filter(|&&i| i != keep_idx)
+            .map(|&i| configs[i].name.clone())
+            .collect();
+        info!(
+            "Dev-mode: deduping port {} -> keeping '{}', removing {:?}",
+            port, configs[keep_idx].name, removed_names
+        );
+        let mut to_remove: Vec<usize> = matches.into_iter().filter(|&i| i != keep_idx).collect();
+        to_remove.sort_by(|a, b| b.cmp(a));
+        for i in to_remove {
+            configs.remove(i);
+        }
+        changed = true;
+    }
+
+    changed
 }
 
 /// Check if the current environment is development mode.

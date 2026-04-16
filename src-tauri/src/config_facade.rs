@@ -857,6 +857,19 @@ pub fn delete_managed_process_config(id: &str) -> Result<(), String> {
     save_settings(&settings)
 }
 
+/// Replace the entire managed-process list in one atomic save.
+///
+/// Used by the dev-service upgrade/dedupe pass at boot. Caller has already
+/// reasoned about the full list, so a per-entry save loop would needlessly
+/// re-read and re-write settings N times.
+pub fn replace_managed_process_configs(
+    configs: Vec<crate::process_capture::ProcessConfig>,
+) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.managed_processes = configs;
+    save_settings(&settings)
+}
+
 // ============================================================================
 // Execution Variables Helpers
 // ============================================================================

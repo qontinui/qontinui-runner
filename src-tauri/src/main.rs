@@ -1576,24 +1576,42 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     config.backfill_build_command();
                 }
 
-                // In dev-mode, upgrade legacy configs and inject missing dev services
+                // In dev-mode, upgrade legacy configs, dedupe dev-service ports,
+                // and inject missing dev services. Persist if anything changed so
+                // the cleanup survives future boots (otherwise duplicates can
+                // re-accumulate in settings.json across sessions).
                 if dev_services::is_dev_mode() {
                     if let Some(workspace) = dev_services::find_workspace_root() {
-                        // Upgrade existing configs that match dev service ports but lack auto_start
-                        dev_services::upgrade_legacy_configs(&mut configs, &workspace);
+                        let mutated =
+                            dev_services::upgrade_and_dedupe_configs(&mut configs, &workspace);
 
-                        // Inject any dev services not yet covered
                         let missing = dev_services::get_missing_dev_services(&workspace, &configs);
-                        if !missing.is_empty() {
+                        let injected = !missing.is_empty();
+                        if injected {
                             info!(
                                 "Dev-mode: injecting {} default dev services for workspace {}",
                                 missing.len(),
                                 workspace.display()
                             );
                             for svc in &missing {
-                                info!("  → {} (group {}, port {:?})", svc.name, svc.start_group, svc.health_port);
+                                info!("  -> {} (group {}, port {:?})", svc.name, svc.start_group, svc.health_port);
                             }
                             configs.extend(missing);
+                        }
+
+                        if mutated || injected {
+                            if let Err(e) =
+                                settings::replace_managed_process_configs(configs.clone())
+                            {
+                                warn!(
+                                    "Failed to persist dev-service config cleanup: {}. \
+                                     Runtime state is still correct but duplicates may \
+                                     re-appear on next boot.",
+                                    e
+                                );
+                            } else {
+                                info!("Dev-mode: persisted upgraded/deduped/injected configs to settings");
+                            }
                         }
                     }
                 }
