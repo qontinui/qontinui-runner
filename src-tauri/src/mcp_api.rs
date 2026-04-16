@@ -201,6 +201,19 @@ async fn health(
     // Embedding service health probe (cached, refreshed every 30s).
     let embedding_health = embedding_service_health().await;
 
+    // Expose the instanceStorage port-namespace suffix so test scripts can
+    // compute keys mechanically instead of reading instance-storage.ts. The
+    // rule (see qontinui-runner/src/lib/instance-storage.ts::namespacedKey):
+    // primary (9876) uses bare keys, every other port suffixes ":<port>".
+    // Tests use this to read/write per-instance flags like
+    // "specs.useAiGeneration" via `<key><suffix>`.
+    let api_port = state.app_state.api_port.load(Ordering::Relaxed);
+    let storage_namespace_suffix = if api_port == 9876 {
+        String::new()
+    } else {
+        format!(":{}", api_port)
+    };
+
     let mut data = serde_json::json!({
         "status": status,
         "ready": last_pong > 0,
@@ -217,6 +230,10 @@ async fn health(
         // by build.rs via QONTINUI_GIT_SHA. Manual-test sessions can assert
         // the temp runner is actually running the commit under debug.
         "gitSha": env!("QONTINUI_GIT_SHA"),
+        "storage": {
+            "apiPort": api_port,
+            "namespaceSuffix": storage_namespace_suffix,
+        },
     });
 
     if let Some((screenshot, width, height)) = diagnostic_screenshot {
