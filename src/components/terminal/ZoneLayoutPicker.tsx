@@ -97,6 +97,8 @@ export function ZoneLayoutPicker({
       {
         id: "select-layout",
         label: "Select Layout",
+        description: "Switch the terminal grid to a named layout preset.",
+        paramSchema: { layoutId: "string (use list-layouts to enumerate valid IDs)" },
         handler: (params?: unknown) => {
           const { layoutId } = (params ?? {}) as { layoutId?: string };
           if (!layoutId) throw new Error("select-layout requires { layoutId: string }");
@@ -113,6 +115,7 @@ export function ZoneLayoutPicker({
       {
         id: "list-layouts",
         label: "List Layouts",
+        description: "Return [{id, name, zones, shortcutKey}] for every built-in layout preset.",
         handler: () =>
           LAYOUT_PRESETS.map((l) => ({
             id: l.id,

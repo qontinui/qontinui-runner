@@ -102,6 +102,7 @@ function TerminalPageInner({
       {
         id: "create-terminal",
         label: "Create Terminal",
+        description: "Spawn a new PTY-backed terminal tab and assign it to the next free zone.",
         handler: async () => {
           await createTerminal();
         },
@@ -109,6 +110,7 @@ function TerminalPageInner({
       {
         id: "list-terminals",
         label: "List Terminals",
+        description: "Return [{id, title, isAlive}] for every currently mounted terminal tab.",
         handler: () => tabs.map((t) => ({ id: t.id, title: t.title, isAlive: t.isAlive })),
       },
     ],

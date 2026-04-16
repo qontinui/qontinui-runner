@@ -268,6 +268,8 @@ export function TerminalTabBar({
       {
         id: "create-plain",
         label: "Create Plain Terminal",
+        description: "Spawn N blank terminals using the user's default shell.",
+        paramSchema: { count: "number (>= 1, defaults to 1)" },
         handler: (params?: unknown) => {
           const { count = 1 } = (params ?? {}) as { count?: number };
           if (typeof count !== "number" || count < 1) {
@@ -280,6 +282,13 @@ export function TerminalTabBar({
       {
         id: "create-ai-session",
         label: "Create AI Session",
+        description:
+          "Spawn N terminals pre-configured to launch `claude` under the given CLAUDE_CONFIG_DIR, optionally pre-typing a context prompt.",
+        paramSchema: {
+          count: "number (>= 1, defaults to 1)",
+          configDir: "string (absolute path to a Claude Code config dir, required)",
+          context: "string (optional initial prompt auto-typed after claude starts)",
+        },
         handler: (params?: unknown) => {
           const {
             count = 1,
@@ -304,6 +313,12 @@ export function TerminalTabBar({
       {
         id: "create-best-account",
         label: "Create AI Session with Best Account",
+        description:
+          "Like create-ai-session, but picks the AI account with the lowest current utilization. Fails if no accounts are configured.",
+        paramSchema: {
+          count: "number (>= 1, defaults to 1)",
+          context: "string (optional initial prompt auto-typed after claude starts)",
+        },
         handler: (params?: unknown) => {
           const { count = 1, context } = (params ?? {}) as {
             count?: number;
@@ -321,6 +336,12 @@ export function TerminalTabBar({
       {
         id: "create-with-command",
         label: "Create Terminal with Command",
+        description:
+          "Spawn N terminals and auto-type the given shell command into each after the prompt renders.",
+        paramSchema: {
+          count: "number (>= 1, defaults to 1)",
+          command: "string (the shell command to type + Enter, required)",
+        },
         handler: (params?: unknown) => {
           const { count = 1, command } = (params ?? {}) as {
             count?: number;
