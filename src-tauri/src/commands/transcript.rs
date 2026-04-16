@@ -283,24 +283,50 @@ pub async fn generate_workflow_standalone(
         });
     }
 
-    // Enrich context with existing specs for spec-aware generation
-    let existing_specs = crate::commands::ai_session::fetch_existing_specs().await;
-    let enriched_context = if existing_specs != "No existing specs found" {
-        crate::commands::ai_session::build_spec_aware_context(&inline_context, &existing_specs)
+    // Detect brief-mode: the Specs-page AI path prefixes its inline_context
+    // with "Spec Generation Brief (JSON)". Those calls want the brief fed to
+    // the Builder verbatim — the transcript-style spec-aware rewrap
+    // (`build_spec_aware_context` is a "generate NEW spec files from a plan"
+    // envelope) would compete with the brief's "consume EXISTING spec into
+    // snapshot_assert steps" instructions and the Builder produces an empty
+    // workflow because the two voices contradict. Brief mode also skips the
+    // specification-synthesis agent for the same reason.
+    let is_brief_mode = inline_context.contains("Spec Generation Brief (JSON)");
+
+    let enriched_context = if is_brief_mode {
+        // Pass through unchanged — the brief carries its own instructions and
+        // meta_workflow.rs::build_builder_prompt will append the matching
+        // "Spec Generation Brief Recognition" rules section.
+        inline_context.clone()
     } else {
-        format!(
-            "The following is a Claude Code conversation transcript or selected text. \
-             Use this context to generate an appropriate workflow:\n\n{}",
-            inline_context
-        )
+        let existing_specs = crate::commands::ai_session::fetch_existing_specs().await;
+        if existing_specs != "No existing specs found" {
+            crate::commands::ai_session::build_spec_aware_context(&inline_context, &existing_specs)
+        } else {
+            format!(
+                "The following is a Claude Code conversation transcript or selected text. \
+                 Use this context to generate an appropriate workflow:\n\n{}",
+                inline_context
+            )
+        }
     };
 
     // Build generation request
+    let (request_category, request_tags, generate_spec_flag) = if is_brief_mode {
+        (
+            Some("spec-generated".to_string()),
+            Some(vec!["spec".to_string(), "auto-generated".to_string()]),
+            Some(false),
+        )
+    } else {
+        (None, None, Some(true))
+    };
+
     let request = crate::workflow_generation::GenerateWorkflowRequest {
         description,
         inline_context: Some(enriched_context),
-        category: None,
-        tags: None,
+        category: request_category,
+        tags: request_tags,
         max_iterations: None,
         provider: None,
         model: None,
@@ -317,7 +343,7 @@ pub async fn generate_workflow_standalone(
         include_design_guidance: None,
         auto_run: None,
         model_overrides: None,
-        generate_specification: Some(true),
+        generate_specification: generate_spec_flag,
         verification_depth: None,
         discover_ui_bridge_specs: None,
         simple_mode: None,
