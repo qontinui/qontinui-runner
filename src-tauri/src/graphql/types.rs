@@ -584,6 +584,7 @@ pub enum GqlFindingStatus {
 pub enum GqlFindingActionType {
     AutoFix,
     NeedsUserInput,
+    Manual,
     Informational,
 }
 
@@ -662,6 +663,7 @@ impl GqlFinding {
             action_type: match f.action_type {
                 FA::AutoFix => GqlFindingActionType::AutoFix,
                 FA::NeedsUserInput => GqlFindingActionType::NeedsUserInput,
+                FA::Manual => GqlFindingActionType::Manual,
                 FA::Informational => GqlFindingActionType::Informational,
             },
             title: f.title,

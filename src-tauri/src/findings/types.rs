@@ -143,6 +143,7 @@ impl FindingStatus {
 pub enum FindingActionType {
     AutoFix,
     NeedsUserInput,
+    Manual,
     Informational,
 }
 
@@ -151,6 +152,7 @@ impl FindingActionType {
         match self {
             Self::AutoFix => "auto_fix",
             Self::NeedsUserInput => "needs_user_input",
+            Self::Manual => "manual",
             Self::Informational => "informational",
         }
     }
@@ -159,6 +161,7 @@ impl FindingActionType {
         match s {
             "auto_fix" => Some(Self::AutoFix),
             "needs_user_input" => Some(Self::NeedsUserInput),
+            "manual" => Some(Self::Manual),
             "informational" => Some(Self::Informational),
             _ => None,
         }

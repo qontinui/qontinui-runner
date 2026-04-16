@@ -139,6 +139,7 @@ impl From<&FindingStatus> for AITaskFindingStatus {
 pub enum AITaskFindingActionType {
     AutoFix,
     NeedsUserInput,
+    Manual,
     Informational,
 }
 
@@ -148,6 +149,7 @@ impl From<&crate::findings::types::FindingActionType> for AITaskFindingActionTyp
         match action {
             FindingActionType::AutoFix => Self::AutoFix,
             FindingActionType::NeedsUserInput => Self::NeedsUserInput,
+            FindingActionType::Manual => Self::Manual,
             FindingActionType::Informational => Self::Informational,
         }
     }
