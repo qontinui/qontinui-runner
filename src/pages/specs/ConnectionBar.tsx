@@ -267,6 +267,11 @@ export function ConnectionBar({
             Builder-Verifier-Fixer pipeline instead of the deterministic
             buildSpecWorkflow path. Persisted via instanceStorage. */}
         <button
+          id="specs-ai-toggle"
+          type="button"
+          role="switch"
+          aria-pressed={useAiSpecGeneration}
+          aria-label="Generate with AI (spec brief)"
           onClick={onToggleUseAiSpecGeneration}
           className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
           border transition-colors shrink-0 ${

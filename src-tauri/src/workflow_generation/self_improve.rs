@@ -423,15 +423,34 @@ pub async fn analyze_generation_patterns_pg(
         .map(|r| r.get(0))
         .unwrap_or(0);
 
-    // Average rating
+    // Average rating.
+    //
+    // NOTE: `rating` is INTEGER, and PostgreSQL's `AVG(integer)` returns
+    // `numeric`, which tokio-postgres does NOT deserialize into `f64`.
+    // Attempting `row.get::<_, Option<f64>>(0)` on a numeric column panics
+    // with "error deserializing column 0: cannot convert between the Rust
+    // type `core::option::Option<f64>` and the Postgres type `numeric`".
+    // That panic bubbles up through `spawn_blocking` and surfaces to the
+    // frontend as:
+    //     "Generation task failed: task NNN panicked with message
+    //      \"error retrieving column 0: error deserializing column 0\""
+    // The cast to DOUBLE PRECISION forces the server to return float8,
+    // which `f64` accepts. `try_get` adds a belt-and-suspenders guard
+    // so any future type drift logs a warning instead of crashing.
     let avg_rating: Option<f64> = conn
         .query_one(
-            "SELECT AVG(rating) FROM workflow_generation_feedback WHERE feedback_type = 'rating' AND rating IS NOT NULL",
+            "SELECT AVG(rating)::double precision FROM workflow_generation_feedback WHERE feedback_type = 'rating' AND rating IS NOT NULL",
             &[],
         )
         .await
         .ok()
-        .and_then(|r| r.get(0));
+        .and_then(|r| match r.try_get::<_, Option<f64>>(0) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("avg_rating deserialization failed: {}", e);
+                None
+            }
+        });
 
     let ctx = SelfImprovementContext {
         common_verifier_issues,
