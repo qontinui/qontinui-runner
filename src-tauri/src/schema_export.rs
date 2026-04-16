@@ -421,11 +421,11 @@ pub enum AppEvent {
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
         accessibility as qa, config as qcfg, constraints as qc, discovery as qdc,
-        execution as qe, findings as qfn, geometry as qg,
+        execution as qe, findings as qfn, geometry as qg, mcp_config as qmc,
         orchestration_config as qoc, process_management as qpm, rag as qr,
         scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr,
-        ticket_system as qts, tree_events as qte, verification as qv, workflow as qw,
-        workflow_step as qws,
+        terminal as qtm, ticket_system as qts, tree_events as qte,
+        verification as qv, workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -767,6 +767,26 @@ pub fn export_all_schemas() -> Value {
         qtr::VerificationResultsListResponse
     );
 
+    // ── qontinui-types: mcp_config ──
+    add!("McpTransport", qmc::McpTransport);
+    add!("StdioConfig", qmc::StdioConfig);
+    add!("HttpConfig", qmc::HttpConfig);
+    add!("McpServerConfig", qmc::McpServerConfig);
+    add!("McpToolInputSchema", qmc::McpToolInputSchema);
+    add!("McpToolInfo", qmc::McpToolInfo);
+    add!("McpServerStatus", qmc::McpServerStatus);
+    add!("CreateMcpServerInput", qmc::CreateMcpServerInput);
+    add!("UpdateMcpServerInput", qmc::UpdateMcpServerInput);
+    add!("McpToolCallResult", qmc::McpToolCallResult);
+    add!("CreateMcpCallInput", qmc::CreateMcpCallInput);
+    add!("McpCallRecord", qmc::McpCallRecord);
+    add!("McpCallsResult", qmc::McpCallsResult);
+
+    // ── qontinui-types: terminal ──
+    add!("TerminalInfo", qtm::TerminalInfo);
+    add!("TerminalOutputEvent", qtm::TerminalOutputEvent);
+    add!("TerminalExitEvent", qtm::TerminalExitEvent);
+
     // ── qontinui-types: ticket_system ──
     add!("TicketSource", qts::TicketSource);
     add!("TicketState", qts::TicketState);
@@ -941,7 +961,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 366, "Expected 366 schema entries");
+        assert_eq!(obj.len(), 382, "Expected 382 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
