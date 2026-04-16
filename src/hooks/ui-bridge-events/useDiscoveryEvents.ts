@@ -170,7 +170,12 @@ export function useDiscoveryEvents(
 
         case "get_snapshot": {
           logger.debug("get_snapshot: creating snapshot...");
-          const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync();
+          // The runner mounts UI Bridge HTTP routes under /ui-bridge/* so
+          // override the snapshot's default componentActionBasePath prefix
+          // to produce URLs callers can hit directly.
+          const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync(50, {
+            componentBasePath: "/ui-bridge/control/component",
+          });
           logger.debug(`get_snapshot: snapshot created (${snapshot.elements.length} elements)`);
 
           // Enrich with page context, modals, and toasts from trackers if available.

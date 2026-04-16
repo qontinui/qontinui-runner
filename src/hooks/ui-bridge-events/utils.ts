@@ -1,5 +1,9 @@
 import { getApiPort } from "@/lib/runner-api";
-import type { RegisteredElement, RegisteredComponent } from "ui-bridge";
+import {
+  type RegisteredElement,
+  type RegisteredComponent,
+  serializeRegisteredElement,
+} from "ui-bridge";
 import type { SerializedElement, SerializedComponent } from "./types";
 
 /**
@@ -62,21 +66,19 @@ export function mapTaskRunStatus(status: string): string {
  * Serialize a RegisteredElement to a plain object (removes DOM references)
  */
 export function serializeElement(element: RegisteredElement): SerializedElement {
+  // Delegate to ui-bridge's shared serializer so this path can't drift from
+  // BridgeSnapshot's element shape. The runner mounts UI Bridge routes under
+  // /ui-bridge/control/*, so override the default base path. Add registeredAt
+  // /mounted on top — they're single-element-detail-only and not part of the
+  // snapshot contract.
+  const base = serializeRegisteredElement(element, {
+    componentBasePath: "/ui-bridge/control/component",
+  });
   return {
-    id: element.id,
-    type: element.type,
-    label: element.label,
-    actions: element.actions,
-    customActions: element.customActions ? Object.keys(element.customActions) : undefined,
-    identifier: element.getIdentifier(),
-    state: element.getState(),
+    ...base,
     registeredAt: element.registeredAt,
     mounted: element.mounted,
-    ownedByComponent: element.ownedByComponent,
-    componentActionBasePath: element.ownedByComponent
-      ? `/ui-bridge/control/component/${element.ownedByComponent}`
-      : undefined,
-  };
+  } as SerializedElement;
 }
 
 /**
