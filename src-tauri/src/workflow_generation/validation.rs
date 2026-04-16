@@ -82,8 +82,29 @@ const VALID_TEST_TYPES: &[&str] = &[
     "custom_command",
 ];
 
-/// Valid ui_bridge action enum values
-const VALID_UI_BRIDGE_ACTIONS: &[&str] = &["navigate", "execute", "assert", "snapshot"];
+/// Valid ui_bridge action enum values.
+///
+/// This list MUST stay in sync with the action dispatch in
+/// `src-tauri/src/step_executor/handlers/ui_bridge.rs`. When drift occurs, a
+/// Builder that correctly emits a valid action gets its workflow flagged with
+/// validation errors, which zeroes Factor 1 of the confidence score
+/// (generator.rs ~line 1965) and the quality gate rejects the workflow with a
+/// misleading "Low confidence score (0.00)" message. Dispatch handlers are at
+/// ui_bridge.rs:918 (compare), :927 (element_action), :936 (wait_for_element),
+/// :945 (wait), :959 (snapshot_assert), :975-1032 (navigate/execute/assert/
+/// snapshot/action_plan).
+const VALID_UI_BRIDGE_ACTIONS: &[&str] = &[
+    "navigate",
+    "execute",
+    "assert",
+    "snapshot",
+    "snapshot_assert",
+    "element_action",
+    "wait_for_element",
+    "wait",
+    "compare",
+    "action_plan",
+];
 
 /// Validate a generated workflow and return any errors
 pub fn validate_workflow(workflow: &UnifiedWorkflow) -> Vec<ValidationError> {
