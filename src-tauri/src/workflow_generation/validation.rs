@@ -2,6 +2,7 @@
 //!
 //! Validates generated workflows for structural correctness.
 
+use crate::step_types::StepType;
 use crate::unified_workflows::UnifiedWorkflow;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -339,10 +340,20 @@ fn validate_phase_constraints(steps: &[Value], phase: &str, errors: &mut Vec<Val
     let core_types = ["command", "ui_bridge", "prompt"];
 
     for (i, step) in steps.iter().enumerate() {
-        if let Some(step_type) = step.get("type").and_then(|v| v.as_str()) {
-            if !allowed_types.contains(&step_type) {
-                // Distinguish "unknown type entirely" vs "known type in wrong phase"
-                let kind = if core_types.contains(&step_type) {
+        if let Some(step_type_raw) = step.get("type").and_then(|v| v.as_str()) {
+            // Normalize aliases before checking allowed-types. The step executor
+            // recognizes many legacy/alias forms ("http" → command, "shell" →
+            // command, "uibridge" → ui_bridge, etc.) via StepType::from_str_compat.
+            // Without this normalization, the AI Builder legitimately emitting a
+            // normalizable alias triggers InvalidStepType, every alias adds a
+            // validation error, and 5+ errors zero Factor 1 of the confidence
+            // score — rejecting a workflow that would otherwise execute fine.
+            let canonical = StepType::from_str_compat(step_type_raw)
+                .map(|t| t.as_str())
+                .unwrap_or(step_type_raw);
+
+            if !allowed_types.contains(&canonical) {
+                let kind = if core_types.contains(&canonical) {
                     ValidationErrorKind::InvalidPhase
                 } else {
                     ValidationErrorKind::InvalidStepType
@@ -352,7 +363,7 @@ fn validate_phase_constraints(steps: &[Value], phase: &str, errors: &mut Vec<Val
                     field: format!("{}_steps[{}]", phase, i),
                     message: format!(
                         "Step type '{}' is not allowed in {} phase. Allowed types: {:?}",
-                        step_type, phase, allowed_types
+                        step_type_raw, phase, allowed_types
                     ),
                     step_name: step_name_from(step),
                 });
