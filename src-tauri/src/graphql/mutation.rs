@@ -9,6 +9,7 @@ use async_graphql::*;
 use std::sync::Arc;
 use tracing::info;
 
+use crate::findings::FindingStatusExt;
 use crate::mcp::types::ApiState;
 use crate::mcp::ui_bridge;
 use crate::unified_workflows::UnifiedWorkflowExt;

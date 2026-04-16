@@ -11,7 +11,9 @@ use tauri::Emitter;
 use tracing::{debug, info, warn};
 
 use crate::doctor::DoctorHandle;
-use crate::findings::{Finding, FindingParser, ParsedFinding};
+use crate::findings::{
+    Finding, FindingCategoryExt, FindingParser, FindingSeverityExt, ParsedFinding,
+};
 use crate::mcp::shared::{
     emit_ai_output, AiSessionContext, FindingContext, ProgressContext, ReflectionFixContext,
 };
@@ -868,7 +870,8 @@ fn run_claude_session_inline(
                                 let task_run_id = ctx.task_run_id.clone();
                                 let finding_title = finding.title.clone();
                                 tauri::async_runtime::spawn(async move {
-                                    let ka = crate::knowledge_acquisition::KnowledgeAcquisition::new();
+                                    let ka =
+                                        crate::knowledge_acquisition::KnowledgeAcquisition::new();
                                     if let Some(data) = crate::knowledge_acquisition::vuln_enrichment::enrich_from_description(&description, &ka).await {
                                         tracing::info!(
                                             "[knowledge_acquisition] Enriched security finding '{}': {} CVEs, exploit_available={}",
@@ -1174,12 +1177,13 @@ fn run_claude_session_inline(
                                             | "project_recurring_issue"
                                     );
                                     if is_project_fix {
-                                        let _ = tauri::async_runtime::block_on(pg.update_fix_scope(
-                                            &fix.id,
-                                            "project",
-                                            ctx.project_path.as_deref(),
-                                            None,
-                                        ));
+                                        let _ =
+                                            tauri::async_runtime::block_on(pg.update_fix_scope(
+                                                &fix.id,
+                                                "project",
+                                                ctx.project_path.as_deref(),
+                                                None,
+                                            ));
                                     }
                                 }
                                 // Link error_events via PG
@@ -1250,24 +1254,25 @@ fn run_claude_session_inline(
                                             let related_files_json =
                                                 serde_json::to_string(&related_files)
                                                     .unwrap_or_default();
-                                            tauri::async_runtime::block_on(pg.create_task_knowledge(
-                                                &kid,
-                                                &ctx.source_task_run_id,
-                                                category,
-                                                "reflection",
-                                                1,
-                                                &fix.fix_description,
-                                                fix.file_changed.as_deref(),
-                                                &fix.confidence,
-                                                &related_files_json,
-                                            ))
+                                            tauri::async_runtime::block_on(
+                                                pg.create_task_knowledge(
+                                                    &kid,
+                                                    &ctx.source_task_run_id,
+                                                    category,
+                                                    "reflection",
+                                                    1,
+                                                    &fix.fix_description,
+                                                    fix.file_changed.as_deref(),
+                                                    &fix.confidence,
+                                                    &related_files_json,
+                                                ),
+                                            )
                                         };
                                         match knowledge_result {
                                             Ok(knowledge_id) => {
                                                 // Set project_path on the knowledge entry
                                                 if let Some(ref pp) = ctx.project_path {
-                                                    let pg =
-                                                        crate::database::pg::PgDb::global();
+                                                    let pg = crate::database::pg::PgDb::global();
                                                     let _ = tauri::async_runtime::block_on(
                                                         pg.update_task_knowledge_project_path(
                                                             &knowledge_id,
@@ -1329,17 +1334,19 @@ fn run_claude_session_inline(
                                             let related_files_json =
                                                 serde_json::to_string(&related_files)
                                                     .unwrap_or_default();
-                                            tauri::async_runtime::block_on(pg.create_task_knowledge(
-                                                &kid,
-                                                &ctx.source_task_run_id,
-                                                category,
-                                                "reflection",
-                                                1,
-                                                &fix.fix_description,
-                                                fix.file_changed.as_deref(),
-                                                &fix.confidence,
-                                                &related_files_json,
-                                            ))
+                                            tauri::async_runtime::block_on(
+                                                pg.create_task_knowledge(
+                                                    &kid,
+                                                    &ctx.source_task_run_id,
+                                                    category,
+                                                    "reflection",
+                                                    1,
+                                                    &fix.fix_description,
+                                                    fix.file_changed.as_deref(),
+                                                    &fix.confidence,
+                                                    &related_files_json,
+                                                ),
+                                            )
                                         };
                                         match kb_result {
                                             Ok(knowledge_id) => {
@@ -1448,7 +1455,9 @@ fn run_claude_session_inline(
                                 let fixes_slice = [fix];
                                 let rules_result = {
                                     let pg = crate::database::pg::PgDb::global();
-                                    tauri::async_runtime::block_on(pg.create_rules_from_reflection_fixes(&fixes_slice))
+                                    tauri::async_runtime::block_on(
+                                        pg.create_rules_from_reflection_fixes(&fixes_slice),
+                                    )
                                 };
                                 match rules_result {
                                     Ok(n) if n > 0 => {

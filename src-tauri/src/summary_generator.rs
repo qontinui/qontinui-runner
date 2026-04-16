@@ -11,7 +11,9 @@ use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
-use crate::findings::types::{Finding, FindingStatus};
+use crate::findings::types::{
+    Finding, FindingCategoryExt, FindingSeverityExt, FindingStatus, FindingStatusExt,
+};
 use crate::str_utils::truncate_str;
 use tracing::{debug, error, info, warn};
 

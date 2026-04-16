@@ -26,7 +26,9 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use super::types::{FindingCategory, FindingSeverity, ParsedFinding};
+use super::types::{
+    FindingCategory, FindingCategoryExt, FindingSeverity, FindingSeverityExt, ParsedFinding,
+};
 
 /// Regex for finding start marker: [FINDING:category:severity] or [FINDING:category:severity:modifier]
 /// where modifier can be 'needs_input' or 'resolved'

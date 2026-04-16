@@ -15,6 +15,7 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::findings::FindingStatusExt;
 use crate::mcp::types::ApiState;
 
 use super::query::build_health_snapshot;

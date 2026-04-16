@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::info;
 
-use crate::findings::{Finding, FindingStatus};
+use crate::findings::{Finding, FindingStatus, FindingStatusExt};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 /// Request body for updating finding status

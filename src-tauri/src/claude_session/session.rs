@@ -16,7 +16,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::claude_protocol::request_id::next_request_id;
 use crate::claude_protocol::types::{OutgoingControlRequest, UserInputMessage};
-use crate::findings::{Finding, FindingParser, ParsedFinding};
+use crate::findings::{
+    Finding, FindingCategoryExt, FindingParser, FindingSeverityExt, ParsedFinding,
+};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext, FindingContext, ProgressContext};
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
@@ -1169,8 +1171,8 @@ impl ClaudeSession {
                 }
             };
 
-            let output_log = tauri::async_runtime::block_on(pg.get_task_output(task_run_id))
-                .unwrap_or_default();
+            let output_log =
+                tauri::async_runtime::block_on(pg.get_task_output(task_run_id)).unwrap_or_default();
 
             if output_log.is_empty() {
                 info!(

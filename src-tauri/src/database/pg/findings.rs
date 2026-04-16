@@ -2,8 +2,9 @@
 
 use super::PgDb;
 use crate::findings::{
-    Finding, FindingActionType, FindingCategory, FindingCodeContext, FindingSeverity,
-    FindingStatus, FindingSummary, FindingUserInput,
+    Finding, FindingActionType, FindingActionTypeExt, FindingCategory, FindingCategoryExt,
+    FindingCodeContext, FindingSeverity, FindingSeverityExt, FindingStatus, FindingStatusExt,
+    FindingSummary, FindingUserInput,
 };
 
 impl PgDb {

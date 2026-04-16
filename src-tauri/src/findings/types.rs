@@ -1,30 +1,35 @@
 //! Finding types for AI-detected issues.
 //!
-//! These types mirror the Pydantic models in qontinui-schemas/findings.
+//! The runner's finding enums are re-exported from the canonical
+//! `qontinui_types::task_run::TaskRunFinding*` enums in the schemas crate.
+//! Keeping a single source of truth guarantees that variants the runner
+//! emits always exist in the generated types the backend consumes (and in
+//! the corresponding PG ENUMs), so drift is impossible at compile time.
+//!
+//! The `as_str` / `from_str` / `is_terminal` helpers that runner code
+//! depends on are provided as an extension trait below, so callers keep
+//! calling `finding.category.as_str()` etc. unchanged. Free-function
+//! wrappers are also exposed for explicit call sites.
 
 use serde::{Deserialize, Serialize};
 
-/// Categories of AI-detected findings
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FindingCategory {
-    CodeBug,
-    Security,
-    Performance,
-    Todo,
-    Enhancement,
-    ConfigIssue,
-    TestIssue,
-    Documentation,
-    RuntimeIssue,
-    AlreadyFixed,
-    ExpectedBehavior,
-    Warning,
-    DataMigration,
+pub use qontinui_types::task_run::{
+    TaskRunFindingActionType as FindingActionType, TaskRunFindingCategory as FindingCategory,
+    TaskRunFindingSeverity as FindingSeverity, TaskRunFindingStatus as FindingStatus,
+};
+
+// ============================================================================
+// Extension traits — static exhaustiveness for snake_case mapping helpers.
+// ============================================================================
+
+/// `as_str` / `from_str` helpers on [`FindingCategory`].
+pub trait FindingCategoryExt: Sized {
+    fn as_str(&self) -> &'static str;
+    fn from_str(s: &str) -> Option<Self>;
 }
 
-impl FindingCategory {
-    pub fn as_str(&self) -> &'static str {
+impl FindingCategoryExt for FindingCategory {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::CodeBug => "code_bug",
             Self::Security => "security",
@@ -42,7 +47,7 @@ impl FindingCategory {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> Option<Self> {
         match s {
             "code_bug" => Some(Self::CodeBug),
             "security" => Some(Self::Security),
@@ -62,19 +67,14 @@ impl FindingCategory {
     }
 }
 
-/// Severity levels for findings
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum FindingSeverity {
-    Critical,
-    High,
-    Medium,
-    Low,
-    Info,
+/// `as_str` / `from_str` helpers on [`FindingSeverity`].
+pub trait FindingSeverityExt: Sized {
+    fn as_str(&self) -> &'static str;
+    fn from_str(s: &str) -> Option<Self>;
 }
 
-impl FindingSeverity {
-    pub fn as_str(&self) -> &'static str {
+impl FindingSeverityExt for FindingSeverity {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Critical => "critical",
             Self::High => "high",
@@ -84,7 +84,7 @@ impl FindingSeverity {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> Option<Self> {
         match s {
             "critical" => Some(Self::Critical),
             "high" => Some(Self::High),
@@ -96,20 +96,15 @@ impl FindingSeverity {
     }
 }
 
-/// Lifecycle status of a finding
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FindingStatus {
-    Detected,
-    InProgress,
-    NeedsInput,
-    Resolved,
-    WontFix,
-    Deferred,
+/// `as_str` / `from_str` / `is_terminal` helpers on [`FindingStatus`].
+pub trait FindingStatusExt: Sized {
+    fn as_str(&self) -> &'static str;
+    fn from_str(s: &str) -> Option<Self>;
+    fn is_terminal(&self) -> bool;
 }
 
-impl FindingStatus {
-    pub fn as_str(&self) -> &'static str {
+impl FindingStatusExt for FindingStatus {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Detected => "detected",
             Self::InProgress => "in_progress",
@@ -120,7 +115,7 @@ impl FindingStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> Option<Self> {
         match s {
             "detected" => Some(Self::Detected),
             "in_progress" => Some(Self::InProgress),
@@ -132,23 +127,19 @@ impl FindingStatus {
         }
     }
 
-    pub fn is_terminal(&self) -> bool {
+    fn is_terminal(&self) -> bool {
         matches!(self, Self::Resolved | Self::WontFix | Self::Deferred)
     }
 }
 
-/// Type of action needed for a finding
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FindingActionType {
-    AutoFix,
-    NeedsUserInput,
-    Manual,
-    Informational,
+/// `as_str` / `from_str` helpers on [`FindingActionType`].
+pub trait FindingActionTypeExt: Sized {
+    fn as_str(&self) -> &'static str;
+    fn from_str(s: &str) -> Option<Self>;
 }
 
-impl FindingActionType {
-    pub fn as_str(&self) -> &'static str {
+impl FindingActionTypeExt for FindingActionType {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::AutoFix => "auto_fix",
             Self::NeedsUserInput => "needs_user_input",
@@ -157,7 +148,7 @@ impl FindingActionType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> Option<Self> {
         match s {
             "auto_fix" => Some(Self::AutoFix),
             "needs_user_input" => Some(Self::NeedsUserInput),

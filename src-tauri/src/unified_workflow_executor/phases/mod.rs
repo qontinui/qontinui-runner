@@ -26,6 +26,8 @@
 
 use tracing::{debug, info};
 
+use crate::findings::{FindingCategoryExt, FindingStatusExt};
+
 // Token tracking, UI Bridge, environment readiness, response mode, and token
 // estimation extracted to phase_helpers module.
 pub(super) use super::phase_helpers::{

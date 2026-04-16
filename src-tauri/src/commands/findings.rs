@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::commands::AppState;
 use crate::database::StoredTaskKnowledge;
-use crate::findings::{Finding, FindingStatus, FindingSummary};
+use crate::findings::{Finding, FindingStatus, FindingStatusExt, FindingSummary};
 
 /// Get all findings for a task run.
 #[tauri::command]

@@ -17,6 +17,7 @@ use tauri::Emitter;
 use tracing::{error, info, warn};
 
 use crate::executor::with_default_bridge;
+use crate::findings::{FindingCategoryExt, FindingSeverityExt, FindingStatusExt};
 use crate::mcp::shared::emit_ai_output;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use regex::Regex;

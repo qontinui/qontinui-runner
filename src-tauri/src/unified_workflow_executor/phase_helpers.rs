@@ -18,7 +18,7 @@ use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
 
 use crate::commands::execution_reporting::LLMMetrics;
-use crate::findings::{FindingParser, ParsedFinding};
+use crate::findings::{FindingCategoryExt, FindingParser, FindingSeverityExt, ParsedFinding};
 use crate::mcp::types::MCP_API_PORT;
 use crate::step_executor::ExecutionStepConfig;
 
