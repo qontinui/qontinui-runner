@@ -352,7 +352,7 @@ pub async fn generate_workflow_standalone(
     let gen_result = gen_result.map(|(response, _)| response);
 
     match gen_result {
-        Ok(response) => {
+        Ok(mut response) => {
             // Save workflow to database if generation succeeded
             if response.success {
                 if let Some(ref workflow) = response.workflow {
@@ -418,6 +418,12 @@ pub async fn generate_workflow_standalone(
                                 "Saved standalone generated workflow '{}' (id={})",
                                 saved.name, saved.id
                             );
+                            // Overwrite the pre-save generator UUID with the persisted
+                            // DB id so callers can navigate to the actual row without
+                            // re-POSTing and creating a duplicate.
+                            if let Some(ref mut wf) = response.workflow {
+                                wf.id = saved.id.clone();
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to save standalone generated workflow: {}", e);

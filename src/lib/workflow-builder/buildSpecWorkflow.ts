@@ -1,10 +1,20 @@
 /**
- * buildSpecWorkflow
+ * buildSpecWorkflow — pure deterministic spec→workflow converter.
  *
- * Builds a complete UnifiedWorkflow from a SpecConfig. Extracted from
- * SpecWorkflowBuilder.tsx for reuse in both the spec workflow builder
- * and the live page generator's spec workflow mode.
+ * ## When to use
+ * Use this for **CI regression, batch verification, and offline/token-free
+ * flows**: same spec against the same page every commit, reproducible output,
+ * no API key or network required.
  *
+ * ## When NOT to use
+ * For interactive authoring on the Specs page, prefer `buildSpecBrief` +
+ * `generateFromBrief` (gated by the `specs.useAiGeneration` flag / the
+ * "Generate with AI" toggle in ConnectionBar). The AI path can synthesize
+ * setup/navigation steps the spec itself may be missing, handle
+ * semantic/behavior assertions via agentic orchestration, and inherits the
+ * Builder→Verifier→Fixer pipeline plus post-execution reflection.
+ *
+ * ## What this builder does
  * Generates a hybrid workflow:
  *  - Assertions with deterministic types (exists, contains, visible, not_exists)
  *    AND a target with search criteria become fast UiBridge "snapshot_assert" steps.
@@ -14,6 +24,13 @@
  * Deterministic assertions within the same group are batched into a single
  * UiBridge step that fetches one snapshot and evaluates all assertions locally
  * in Rust — no AI tokens, completes in seconds.
+ *
+ * ## Known limitation
+ * This builder copies the spec verbatim. If the spec is missing `setupActions`
+ * on groups whose assertions depend on a specific UI state (e.g., a panel must
+ * be open), the workflow will silently fail on correct code. The AI path
+ * (`generateFromBrief`) mitigates this by deriving preconditions and letting
+ * the Builder agent synthesize setup steps.
  */
 
 import type { UnifiedWorkflow, PromptStep, VerificationStep } from "../../types/unified-workflow";

@@ -3351,7 +3351,10 @@ fn write_back_verification_templates(
         let template = match criterion.method {
             specification::VerificationMethod::UiBridge => serde_json::json!({
                 "type": "ui_bridge",
-                "ui_bridge_action": "snapshot_assert",
+                // `assert` accepts a free-form hint string; `snapshot_assert`
+                // would require a stringified JSON array of assertion specs,
+                // which `verification_hint` is not.
+                "ui_bridge_action": "assert",
                 "ui_bridge_target": criterion.verification_hint,
             }),
             specification::VerificationMethod::Command => serde_json::json!({

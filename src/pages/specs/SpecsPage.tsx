@@ -380,18 +380,29 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
           return;
         }
 
-        // The Rust backend already persists the workflow to the DB but does
-        // not surface the new DB id on the response. Re-POST here so we get a
-        // fresh navigable id — same idiom as the deterministic path.
+        // The Rust backend persists the workflow server-side and returns the
+        // DB id on `workflow.id`. Navigate to it directly — no re-POST. When
+        // the caller supplied `extraTags`, we still need a re-POST to apply
+        // them (rare path; triage fix is the only current caller).
+        const workflowId = typeof workflow.id === "string" ? workflow.id : "";
+        if (!extraTags || extraTags.length === 0) {
+          if (workflowId) {
+            onNavigateToWorkflowBuilder?.(workflowId);
+          } else {
+            console.error("[Specs] AI-generated workflow has no id; cannot navigate");
+          }
+          return;
+        }
+
+        const existingTags = Array.isArray(workflow.tags) ? (workflow.tags as unknown[]) : [];
         const payload: Record<string, unknown> = {
           ...workflow,
           reflection_mode: true,
+          tags: [...existingTags, ...extraTags],
         };
-        if (extraTags && extraTags.length > 0) {
-          const existingTags = Array.isArray(workflow.tags) ? (workflow.tags as unknown[]) : [];
-          payload.tags = [...existingTags, ...extraTags];
-        }
-
+        // Strip the server-assigned id so saveWorkflowAndNavigate creates a
+        // new row with the merged tags rather than colliding on primary key.
+        delete payload.id;
         await saveWorkflowAndNavigate(payload, onNavigateToWorkflowBuilder);
       } catch (err) {
         console.error("[Specs] Error during AI workflow generation:", err);
