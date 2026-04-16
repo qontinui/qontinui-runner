@@ -2079,10 +2079,34 @@ pub async fn ui_bridge_get_last_discovered_handler(
 }
 
 /// Get a full snapshot of the UI Bridge state.
+///
+/// Supports optional query-string filters applied after the snapshot is
+/// fetched from the SDK:
+///   - `?visibleOnly=true` — drop elements whose `state.visible` is false.
+///   - `?currentRouteOnly=true` — drop elements whose `page.pathname` (when
+///     present) does not match the snapshot-level page pathname. In a
+///     standard SPA every registered element belongs to the current route, so
+///     this is usually a no-op, but we forward it consistently for callers
+///     that rely on the filter existing end-to-end.
+///
+/// Filtering happens in this Rust handler (not via a special SDK code path),
+/// because `get_snapshot` participates in the dedup cache keyed by type, and
+/// filtering client-side here keeps the cached payload shared across callers.
 pub async fn ui_bridge_get_snapshot_handler(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting snapshot");
+    let truthy = |v: &String| {
+        let s = v.trim();
+        s == "1" || s.eq_ignore_ascii_case("true")
+    };
+    let visible_only = query.get("visibleOnly").is_some_and(truthy);
+    let current_route_only = query.get("currentRouteOnly").is_some_and(truthy);
+
+    info!(
+        "UI Bridge API: Getting snapshot (visibleOnly={}, currentRouteOnly={})",
+        visible_only, current_route_only
+    );
 
     // Try to get snapshot; if elements are empty, auto-discover once and retry.
     // This avoids the common cold-start pitfall where the first snapshot call
@@ -2113,6 +2137,65 @@ pub async fn ui_bridge_get_snapshot_handler(
 
     match snapshot_result {
         Ok(mut data) => {
+            // Apply post-fetch filters. We do this before enrichment so the
+            // architecture summary still attaches to the filtered response.
+            //
+            // `visibleOnly`: drop any element whose `state.visible` is
+            // explicitly false. Elements missing `state.visible` are kept,
+            // since older snapshot shapes and DOM-fallback entries may not
+            // populate it — better to over-include than silently drop.
+            //
+            // `currentRouteOnly`: drop elements whose optional `page.pathname`
+            // disagrees with the snapshot's top-level `page.pathname`. This is
+            // a no-op in SPAs where the registry only holds current-route
+            // elements, but we forward it so the filter works end-to-end.
+            if visible_only || current_route_only {
+                let snapshot_pathname = data
+                    .get("page")
+                    .and_then(|p| p.get("pathname"))
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.to_string());
+
+                if let Some(obj) = data.as_object_mut() {
+                    if let Some(elements_val) = obj.get_mut("elements") {
+                        if let Some(arr) = elements_val.as_array_mut() {
+                            let before = arr.len();
+                            arr.retain(|el| {
+                                if visible_only {
+                                    if let Some(visible) = el
+                                        .get("state")
+                                        .and_then(|s| s.get("visible"))
+                                        .and_then(|v| v.as_bool())
+                                    {
+                                        if !visible {
+                                            return false;
+                                        }
+                                    }
+                                }
+                                if current_route_only {
+                                    if let (Some(el_path), Some(snap_path)) = (
+                                        el.get("page")
+                                            .and_then(|p| p.get("pathname"))
+                                            .and_then(|p| p.as_str()),
+                                        snapshot_pathname.as_deref(),
+                                    ) {
+                                        if el_path != snap_path {
+                                            return false;
+                                        }
+                                    }
+                                }
+                                true
+                            });
+                            let after = arr.len();
+                            debug!(
+                                "UI Bridge snapshot filter: visibleOnly={} currentRouteOnly={} kept {}/{} elements",
+                                visible_only, current_route_only, after, before
+                            );
+                        }
+                    }
+                }
+            }
+
             // Enrich snapshot with architecture spec summaries from the database.
             // Wrapped in a timeout so a slow/stuck PG pool never blocks the snapshot response.
             let enrich_result = tokio::time::timeout(
@@ -5700,10 +5783,7 @@ fn evaluate_wait_for_element_assertions(
         // current render.
         let state = element.get("state");
         for key in ["textContent", "value", "innerText"] {
-            if let Some(s) = state
-                .and_then(|v| v.get(key))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(s) = state.and_then(|v| v.get(key)).and_then(|v| v.as_str()) {
                 if !s.is_empty() {
                     return s.to_string();
                 }
