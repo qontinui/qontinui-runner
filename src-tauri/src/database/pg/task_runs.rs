@@ -1097,16 +1097,20 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        // Get start time to calculate duration
+        // Get start time to calculate duration. ::TEXT cast + try_get so
+        // TIMESTAMPTZ→String driver drift logs instead of panicking.
         let row = conn
             .query_one(
-                "SELECT started_at FROM task_run_automation WHERE id = $1",
+                "SELECT started_at::TEXT FROM task_run_automation WHERE id = $1",
                 &[&id],
             )
             .await
             .map_err(|e| format!("PG get automation start time: {}", e))?;
 
-        let started_at: String = row.get(0);
+        let started_at: String = row.try_get(0).unwrap_or_else(|e| {
+            tracing::warn!("task_run_automation started_at decode drift: {}", e);
+            String::new()
+        });
         let now = chrono::Utc::now();
         let duration_ms = if let Ok(start) = chrono::DateTime::parse_from_rfc3339(&started_at) {
             now.signed_duration_since(start.with_timezone(&chrono::Utc))
@@ -1163,16 +1167,20 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        // Get start time to calculate duration
+        // Get start time to calculate duration. ::TEXT cast + try_get so
+        // TIMESTAMPTZ→String driver drift logs instead of panicking.
         let row = conn
             .query_one(
-                "SELECT started_at FROM task_run_automation WHERE id = $1",
+                "SELECT started_at::TEXT FROM task_run_automation WHERE id = $1",
                 &[&id],
             )
             .await
             .map_err(|e| format!("PG get automation start time: {}", e))?;
 
-        let started_at: String = row.get(0);
+        let started_at: String = row.try_get(0).unwrap_or_else(|e| {
+            tracing::warn!("task_run_automation started_at decode drift: {}", e);
+            String::new()
+        });
         let now = chrono::Utc::now();
         let duration_ms = if let Ok(start) = chrono::DateTime::parse_from_rfc3339(&started_at) {
             now.signed_duration_since(start.with_timezone(&chrono::Utc))
@@ -1227,9 +1235,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        // ::TEXT casts on TIMESTAMPTZ + try_get below to guard against driver drift.
         let rows = conn
             .query(
-                r#"SELECT id, task_run_id, workflow_name, started_at, ended_at, duration_ms,
+                r#"SELECT id, task_run_id, workflow_name, started_at::TEXT, ended_at::TEXT, duration_ms,
                        automation_status, success, error_type, error_message,
                        actions_summary, states_visited, transitions_executed,
                        template_matches, anomalies, iteration_number
@@ -1247,8 +1256,14 @@ impl PgDb {
                 id: r.get(0),
                 task_run_id: r.get(1),
                 workflow_name: r.get(2),
-                started_at: r.get(3),
-                ended_at: r.get(4),
+                started_at: r.try_get(3).unwrap_or_else(|e| {
+                    tracing::warn!("task_run_automation started_at decode drift: {}", e);
+                    String::new()
+                }),
+                ended_at: r.try_get(4).unwrap_or_else(|e| {
+                    tracing::warn!("task_run_automation ended_at decode drift: {}", e);
+                    None
+                }),
                 duration_ms: r.get(5),
                 automation_status: r.get(6),
                 success: r.get(7),
@@ -1275,9 +1290,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        // ::TEXT casts on TIMESTAMPTZ + try_get below to guard against driver drift.
         let row = conn
             .query_opt(
-                r#"SELECT id, task_run_id, workflow_name, started_at, ended_at, duration_ms,
+                r#"SELECT id, task_run_id, workflow_name, started_at::TEXT, ended_at::TEXT, duration_ms,
                        automation_status, success, error_type, error_message,
                        actions_summary, states_visited, transitions_executed,
                        template_matches, anomalies, iteration_number
@@ -1292,8 +1308,14 @@ impl PgDb {
             id: r.get(0),
             task_run_id: r.get(1),
             workflow_name: r.get(2),
-            started_at: r.get(3),
-            ended_at: r.get(4),
+            started_at: r.try_get(3).unwrap_or_else(|e| {
+                tracing::warn!("task_run_automation started_at decode drift: {}", e);
+                String::new()
+            }),
+            ended_at: r.try_get(4).unwrap_or_else(|e| {
+                tracing::warn!("task_run_automation ended_at decode drift: {}", e);
+                None
+            }),
             duration_ms: r.get(5),
             automation_status: r.get(6),
             success: r.get(7),
@@ -1372,6 +1394,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        // ::TEXT cast on created_at (TIMESTAMPTZ) + try_get below — same
+        // driver-drift-resistance pattern as step_type_knowledge.rs.
         let rows = if let Some(success) = success_filter {
             conn.query(
                 r#"SELECT id, task_run_id, step_id, step_name,
@@ -1379,7 +1403,7 @@ impl PgDb {
                        arguments, resolved_arguments,
                        response, response_type, duration_ms,
                        extractions, assertions,
-                       success, error_message, created_at
+                       success, error_message, created_at::TEXT
                 FROM task_run_mcp_calls
                 WHERE task_run_id = $1 AND success = $2
                 ORDER BY created_at ASC"#,
@@ -1394,7 +1418,7 @@ impl PgDb {
                        arguments, resolved_arguments,
                        response, response_type, duration_ms,
                        extractions, assertions,
-                       success, error_message, created_at
+                       success, error_message, created_at::TEXT
                 FROM task_run_mcp_calls
                 WHERE task_run_id = $1
                 ORDER BY created_at ASC"#,
@@ -1423,7 +1447,10 @@ impl PgDb {
                 assertions: r.get(13),
                 success: r.get(14),
                 error_message: r.get(15),
-                created_at: r.get(16),
+                created_at: r.try_get(16).unwrap_or_else(|e| {
+                    tracing::warn!("task_run_mcp_calls created_at decode drift: {}", e);
+                    String::new()
+                }),
             })
             .collect();
 

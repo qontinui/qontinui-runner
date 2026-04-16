@@ -332,14 +332,53 @@ pub async fn generate_workflow_standalone(
     let pg_db = app_state.pg_db.clone();
     let pg_clone = pg_db.clone();
 
+    // catch_unwind safety net: converts any latent panic inside the generation
+    // pipeline (e.g. a future PG deserialization drift) into a clean structured
+    // error response instead of a bare JoinError::Panic bubbling to the frontend.
     let gen_result = tokio::task::spawn_blocking(move || {
-        let (response, artifact) = crate::workflow_generation::generate_workflow(
-            request,
-            doctor_handle.as_ref(),
-            Some(&pg_clone),
-            None,
-        );
-        (response, artifact)
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            crate::workflow_generation::generate_workflow(
+                request,
+                doctor_handle.as_ref(),
+                Some(&pg_clone),
+                None,
+            )
+        }));
+        match panic_result {
+            Ok(pair) => pair,
+            Err(payload) => {
+                let reason = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                tracing::error!("generate_workflow panicked: {}", reason);
+                let response = crate::workflow_generation::GenerateWorkflowResponse {
+                    workflow: None,
+                    validation_errors: Vec::new(),
+                    success: false,
+                    error: Some(format!("Workflow generation panicked: {}", reason)),
+                    model_used: None,
+                    verification_iterations: Vec::new(),
+                    hardening_summary: None,
+                    discovery_calls: Vec::new(),
+                    acceptance_criteria: None,
+                    quality_report: None,
+                    confidence_score: None,
+                    workflow_evaluation: None,
+                    exploration_stats: None,
+                };
+                // Empty artifact placeholder so the save path can skip cleanly.
+                let artifact =
+                    crate::workflow_generation::pipeline_artifacts::PipelineArtifactBuilder::new(
+                        "",
+                        None,
+                    )
+                    .build(0);
+                (response, artifact)
+            }
+        }
     })
     .await;
 

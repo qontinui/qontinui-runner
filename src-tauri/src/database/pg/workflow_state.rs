@@ -563,11 +563,13 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         let iter_i32: Option<i32> = iteration.map(|i| i as i32);
 
+        // Cast TIMESTAMPTZ columns to TEXT so they deserialize into String without
+        // panicking on driver-type drift (same pattern as step_type_knowledge.rs fix).
         let rows = if let Some(iter_val) = iter_i32 {
             conn.query(
                 r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
                           stage_index, step_type, step_name, status, result_json, step_config_json,
-                          started_at, completed_at, duration_ms, error
+                          started_at::TEXT, completed_at::TEXT, duration_ms, error
                    FROM workflow_step_checkpoints
                    WHERE execution_id = $1 AND phase = $2 AND iteration = $3
                    ORDER BY step_index ASC"#,
@@ -578,7 +580,7 @@ impl PgDb {
             conn.query(
                 r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
                           stage_index, step_type, step_name, status, result_json, step_config_json,
-                          started_at, completed_at, duration_ms, error
+                          started_at::TEXT, completed_at::TEXT, duration_ms, error
                    FROM workflow_step_checkpoints
                    WHERE execution_id = $1 AND phase = $2 AND iteration IS NULL
                    ORDER BY step_index ASC"#,
@@ -591,7 +593,11 @@ impl PgDb {
         Ok(rows
             .into_iter()
             .map(|r| {
-                let status_str: String = r.get(9);
+                // try_get so a future column-type drift warns instead of panicking the row mapper.
+                let status_str: String = r.try_get(9).unwrap_or_else(|e| {
+                    tracing::warn!("workflow_step_checkpoints status decode drift: {}", e);
+                    String::new()
+                });
                 let status = status_str.parse().unwrap_or(StepCheckpointStatus::Pending);
                 let iter_raw: Option<i32> = r.get(4);
                 let step_idx: i32 = r.get(5);
@@ -611,8 +617,14 @@ impl PgDb {
                     status,
                     result_json: r.get(10),
                     step_config_json: r.get(11),
-                    started_at: r.get(12),
-                    completed_at: r.get(13),
+                    started_at: r.try_get(12).unwrap_or_else(|e| {
+                        tracing::warn!("started_at decode drift: {}", e);
+                        None
+                    }),
+                    completed_at: r.try_get(13).unwrap_or_else(|e| {
+                        tracing::warn!("completed_at decode drift: {}", e);
+                        None
+                    }),
                     duration_ms: dur,
                     error: r.get(15),
                 }
@@ -630,11 +642,13 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        // Cast TIMESTAMPTZ columns to TEXT + try_get below to guard against
+        // driver-type drift (same pattern as step_type_knowledge.rs fix).
         let rows = conn
             .query(
                 r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
                       stage_index, step_type, step_name, status, result_json, step_config_json,
-                      started_at, completed_at, duration_ms, error
+                      started_at::TEXT, completed_at::TEXT, duration_ms, error
                FROM workflow_step_checkpoints
                WHERE execution_id = $1
                ORDER BY step_index ASC"#,
@@ -646,7 +660,10 @@ impl PgDb {
         Ok(rows
             .into_iter()
             .map(|r| {
-                let status_str: String = r.get(9);
+                let status_str: String = r.try_get(9).unwrap_or_else(|e| {
+                    tracing::warn!("workflow_step_checkpoints status decode drift: {}", e);
+                    String::new()
+                });
                 let status = status_str.parse().unwrap_or(StepCheckpointStatus::Pending);
                 let iter_raw: Option<i32> = r.get(4);
                 let step_idx: i32 = r.get(5);
@@ -666,8 +683,14 @@ impl PgDb {
                     status,
                     result_json: r.get(10),
                     step_config_json: r.get(11),
-                    started_at: r.get(12),
-                    completed_at: r.get(13),
+                    started_at: r.try_get(12).unwrap_or_else(|e| {
+                        tracing::warn!("started_at decode drift: {}", e);
+                        None
+                    }),
+                    completed_at: r.try_get(13).unwrap_or_else(|e| {
+                        tracing::warn!("completed_at decode drift: {}", e);
+                        None
+                    }),
                     duration_ms: dur,
                     error: r.get(15),
                 }
