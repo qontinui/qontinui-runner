@@ -1957,12 +1957,18 @@ pub fn generate_workflow(
     let confidence_score = {
         let mut score: f32 = 1.0;
 
-        // Factor 1: Remaining validation errors reduce confidence
+        // Factor 1: Remaining validation errors reduce confidence.
+        //
+        // Soft cap: penalty tops out at 50% so a workflow with many structural
+        // issues still gets a non-zero baseline (the rest of the score then
+        // reflects how well the semantic/quality layers liked it). The
+        // previous "5+ errors → factor = 0" made the confidence gate treat a
+        // flurry of fix_workflow-droppable errors (orphan depends_on, alias
+        // drift) the same as a completely malformed workflow, and rejected
+        // every spec-driven AI workflow.
         let current_validation_errors = validate_workflow(&workflow);
         let error_count = current_validation_errors.len();
         if error_count > 0 {
-            // Log every error so "Low confidence score (0.00)" failures can
-            // be diagnosed without re-running with extra instrumentation.
             warn!(
                 "Factor 1: {} validation errors contributing to score penalty:",
                 error_count
@@ -1973,8 +1979,8 @@ pub fn generate_workflow(
                     i, err.kind, err.field, err.step_name, err.message
                 );
             }
-            // Each error reduces score; 5+ errors drops this factor to 0
-            score *= (1.0 - (error_count as f32 / 5.0).min(1.0)).max(0.0);
+            let penalty = (error_count as f32 * 0.05).min(0.5);
+            score *= (1.0 - penalty).max(0.5);
         }
 
         // Factor 2: Quality report pass/fail and finding counts

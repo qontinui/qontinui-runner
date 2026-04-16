@@ -796,6 +796,35 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
         }
     }
 
+    // Pass 1b: Collect the set of known step IDs (after remapping) so we
+    // can drop orphaned depends_on references in pass 2. The AI Builder
+    // occasionally emits `depends_on: ["foo"]` where step `foo` was never
+    // actually defined — those references become InvalidReference errors
+    // that accumulate and zero Factor 1 of the confidence score. Dropping
+    // unresolvable references lets the workflow still execute (unordered)
+    // rather than being rejected wholesale.
+    let known_ids: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        for steps in [
+            &workflow.setup_steps,
+            &workflow.verification_steps,
+            &workflow.agentic_steps,
+            &workflow.completion_steps,
+        ] {
+            for step in steps.iter() {
+                if let Some(id) = step.get("id").and_then(|v| v.as_str()) {
+                    // Use the post-remap id when available
+                    let effective = id_map
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| id.to_string());
+                    set.insert(effective);
+                }
+            }
+        }
+        set
+    };
+
     // Pass 2: Apply ID replacements, fix phases, fix step types (needs re-borrow)
     let all_steps_mut: Vec<&mut Vec<Value>> = vec![
         &mut workflow.setup_steps,
@@ -898,15 +927,26 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
                     map.insert("mode".to_string(), Value::String(inferred_mode.to_string()));
                 }
 
-                // Update depends_on references
+                // Update depends_on references, remapping old ids and
+                // dropping orphans that reference steps that don't exist.
                 if let Some(Value::Array(deps)) = map.get_mut("depends_on") {
-                    for dep in deps.iter_mut() {
-                        if let Some(old_dep) = dep.as_str().map(String::from) {
-                            if let Some(new_dep) = id_map.get(&old_dep) {
-                                *dep = Value::String(new_dep.clone());
-                            }
+                    let mut kept: Vec<Value> = Vec::with_capacity(deps.len());
+                    for dep in deps.iter() {
+                        let Some(old_dep) = dep.as_str() else { continue };
+                        let remapped = id_map
+                            .get(old_dep)
+                            .cloned()
+                            .unwrap_or_else(|| old_dep.to_string());
+                        if known_ids.contains(&remapped) {
+                            kept.push(Value::String(remapped));
+                        } else {
+                            tracing::info!(
+                                "Dropping orphaned depends_on '{}' (step not found in workflow)",
+                                old_dep
+                            );
                         }
                     }
+                    *deps = kept;
                 }
             }
         }
