@@ -420,9 +420,9 @@ pub enum AppEvent {
 /// remote types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        constraints as qc, execution as qe, geometry as qg, scheduler as qs,
-        state_machine as qsm, task_run as qtr, tree_events as qte, workflow as qw,
-        workflow_step as qws,
+        accessibility as qa, config as qcfg, constraints as qc, execution as qe,
+        geometry as qg, scheduler as qs, state_machine as qsm, task_run as qtr,
+        tree_events as qte, workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -581,6 +581,20 @@ pub fn export_all_schemas() -> Value {
     add!("TreeEventResponse", qte::TreeEventResponse);
     add!("TreeEventListResponse", qte::TreeEventListResponse);
     add!("ExecutionTreeResponse", qte::ExecutionTreeResponse);
+
+    // ── qontinui-types: config (AI context + workflow category) ──
+    add!("ContextAutoInclude", qcfg::ContextAutoInclude);
+    add!("Context", qcfg::Context);
+    add!("Category", qcfg::Category);
+
+    // ── qontinui-types: accessibility ──
+    add!("AccessibilityRole", qa::AccessibilityRole);
+    add!("AccessibilityBackend", qa::AccessibilityBackend);
+    add!("AccessibilityState", qa::AccessibilityState);
+    add!("AccessibilityBounds", qa::AccessibilityBounds);
+    add!("AccessibilityNode", qa::AccessibilityNode);
+    add!("AccessibilitySnapshot", qa::AccessibilitySnapshot);
+    add!("AccessibilitySelector", qa::AccessibilitySelector);
 
     // ── qontinui-types: task_run (Session 4b path A) ──
     add!("TaskRunStatus", qtr::TaskRunStatus);
