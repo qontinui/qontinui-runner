@@ -22,9 +22,16 @@ fn main() {
         })
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=QONTINUI_GIT_SHA={}", git_sha);
-    // Re-run this script if HEAD moves (branch switch, new commit).
-    // qontinui-runner's .git lives at ../.git relative to src-tauri.
+    // Re-run this script when HEAD moves. qontinui-runner's .git lives at
+    // ../.git relative to src-tauri.
+    //   - .git/HEAD fires on branch switch / detached-head jumps.
+    //   - .git/refs/heads/ (directory) fires on any new commit to any local
+    //     branch, since refs/heads/<branch> is the file git updates when
+    //     advancing a branch ref. Without this a fresh commit on the
+    //     currently-checked-out branch would keep the old QONTINUI_GIT_SHA
+    //     embedded, defeating the purpose of this stamp.
     println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/refs/heads");
 
     tauri_build::build()
 }
