@@ -141,9 +141,16 @@ unsafe impl Sync for UiaHandleTable {}
 
 impl UiaHandleTable {
     pub(super) fn new() -> Self {
+        // Clippy flags Arc<DashMap<_, IUIAutomationElement>> as "non-Send/Sync
+        // inner". The COM pointers inside are thread-safe under
+        // COINIT_MULTITHREADED — the unsafe `Send`/`Sync` impls above cover
+        // the whole `UiaHandleTable` and the cloned `Arc` returned by
+        // `shared_map`.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let handles = Arc::new(DashMap::new());
         Self {
             counter: AtomicU64::new(1),
-            handles: Arc::new(DashMap::new()),
+            handles,
         }
     }
 

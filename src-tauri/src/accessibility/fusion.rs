@@ -241,8 +241,10 @@ mod tests {
 
     #[test]
     fn test_fuse_with_webview_container() {
-        let mut config = FusionConfig::default();
-        config.enabled = true;
+        let config = FusionConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let engine = FusionEngine::new(config);
 
         // Native tree: Window > [Titlebar, WebView container]
@@ -301,8 +303,10 @@ mod tests {
 
     #[test]
     fn test_fuse_no_webview_container() {
-        let mut config = FusionConfig::default();
-        config.enabled = true;
+        let config = FusionConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let engine = FusionEngine::new(config);
 
         // Native tree with no webview
@@ -363,9 +367,11 @@ mod tests {
 
     #[test]
     fn test_append_merge_strategy() {
-        let mut config = FusionConfig::default();
-        config.enabled = true;
-        config.merge_strategy = MergeStrategy::Append;
+        let config = FusionConfig {
+            enabled: true,
+            merge_strategy: MergeStrategy::Append,
+            ..Default::default()
+        };
         let engine = FusionEngine::new(config);
 
         let mut native = make_node(UnifiedRole::Window, "App", NodeSource::Uia, None);

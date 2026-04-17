@@ -1047,6 +1047,11 @@ impl Drop for JabAdapter {
     }
 }
 
+// Suppress unused-import warnings for Windows FFI items that are only used
+// behind `unsafe` blocks the compiler can't always see.
+#[allow(dead_code)]
+fn _touch_pcwstr(_: PCWSTR, _: PathBuf, _: *const c_void) {}
+
 // ---------------------------------------------------------------------------
 // Tests — pure-Rust helpers only; anything that touches the DLL is skipped
 // when JAB isn't installed on the build machine.
@@ -1111,16 +1116,13 @@ mod tests {
 
     #[test]
     fn patterns_for_edit_field_includes_value() {
-        let mut info = AccessibleContextInfo::default();
-        info.accessible_text = 1;
-        info.accessible_component = 1;
+        let info = AccessibleContextInfo {
+            accessible_text: 1,
+            accessible_component: 1,
+            ..Default::default()
+        };
         let p = patterns_for(&info, UnifiedRole::Edit);
         assert!(p.contains(&InteractionPattern::Value));
         assert!(p.contains(&InteractionPattern::CoordinateClick));
     }
 }
-
-// Suppress unused-import warnings for Windows FFI items that are only used
-// behind `unsafe` blocks the compiler can't always see.
-#[allow(dead_code)]
-fn _touch_pcwstr(_: PCWSTR, _: PathBuf, _: *const c_void) {}
