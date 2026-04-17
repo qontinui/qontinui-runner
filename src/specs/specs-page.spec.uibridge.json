@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs Viewer/Editor page -- a three-panel layout for viewing, editing, and managing project specifications of all types (page specs, architecture, API, data, dependency, constraint). The left panel shows a hierarchical spec tree grouped by application. The center panel shows spec details with inline editing capabilities. The right panel provides an AI chat for spec review, gap analysis, creation, and workflow building. Users can load bundled specs, discover specs from connected apps via UI Bridge, load/save spec files from disk, toggle edit mode for assertions/groups, and build verification workflows from specs.",
+  "description": "Specs Viewer/Editor page -- a three-panel layout for viewing, editing, and managing project specifications of all types (page specs, architecture, API, data, dependency, constraint). The left panel shows a hierarchical spec tree grouped by application. The center panel shows spec details with inline editing capabilities. The right panel provides an AI chat for spec review, gap analysis, creation, and workflow building. Users can load bundled specs, discover specs from connected apps via UI Bridge, load/save spec files from disk, toggle edit mode for assertions/groups, and build verification workflows from specs. The page includes a feature-flagged AI workflow generation path (default-on) that builds a structured GenerationBrief from a spec and routes it through the Builder-Verifier-Fixer pipeline for richer workflows with setup/navigation steps.",
   "groups": [
     {
       "id": "specs-page-layout",
@@ -1018,6 +1018,121 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "specs-ai-generation",
+      "name": "AI Spec-Brief Workflow Generation",
+      "description": "The Specs page offers a feature-flagged AI workflow generation path that builds a structured GenerationBrief from a spec and hands it to the Builder-Verifier-Fixer pipeline. The toggle persists via instanceStorage and the generated workflow includes setup/navigation steps that the deterministic path cannot synthesize.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "specs-ai-toggle-exists",
+          "description": "A toggle button with id=specs-ai-toggle, role=switch, and aria-pressed indicating its state is present in the ConnectionBar. Label: 'Generate with AI (spec brief)'. Default on (aria-pressed=true). Fuchsia when active, muted when inactive.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "specs-ai-toggle"
+            },
+            "label": "AI spec-generation toggle"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "specs-ai-toggle-behavior",
+          "description": "Clicking specs-ai-toggle toggles the AI generation flag. When on (fuchsia, aria-pressed=true), Build Workflow routes through buildSpecBrief + generateFromBrief (AI pipeline). When off (muted, aria-pressed=false), it routes through deterministic buildSpecWorkflow. Persisted via instanceStorage key specs.useAiGeneration.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "specs-ai-toggle"
+            },
+            "label": "AI toggle click behavior"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "specs-ai-generating-state",
+          "description": "When the AI path is active and Build Workflow is clicked, the button shows a Loader2 spinner and text 'Generating...' (disabled). Remains disabled until pipeline completes or errors. On error, console.error logs the failure reason and the button returns to enabled.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Generating"
+            },
+            "label": "Build Workflow generating state"
+          },
+          "precondition": "AI toggle is on and Build Workflow was clicked with a spec selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "specs-ai-workflow-result",
+          "description": "When the AI pipeline completes successfully, the workflow is persisted server-side (category=spec-generated, tags=[spec, auto-generated]) and the user is navigated to the workflow builder. The workflow includes setup steps for page navigation and panel opening.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Build Workflow"
+            },
+            "label": "AI workflow generation result"
+          },
+          "precondition": "AI toggle is on and a spec is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "specs-swb-ai-generate-button",
+          "description": "SpecWorkflowBuilder preview has a 'Generate with AI' button (Sparkles icon). Clicking builds a brief and sends to the AI generator. While generating, a spinner replaces the preview. On success, the AI workflow replaces the deterministic preview with an 'AI-generated' label and a 'Reset to deterministic preview' action.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Generate with AI"
+            },
+            "label": "SpecWorkflowBuilder AI generate button"
+          },
+          "precondition": "A spec is selected and the SpecWorkflowBuilder preview is visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "specs-swb-reset-to-deterministic",
+          "description": "After AI workflow replaces preview, 'Reset to deterministic preview' action is shown. Clicking clears the AI workflow and restores the original deterministic buildSpecWorkflow preview.",
+          "category": "behavior",
+          "severity": "info",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Reset to deterministic"
+            },
+            "label": "Reset to deterministic preview"
+          },
+          "precondition": "AI-generated workflow is displayed in SpecWorkflowBuilder",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "stateMachine": {
@@ -1026,48 +1141,82 @@
         "id": "empty",
         "name": "Empty — No Specs Loaded",
         "description": "No specs have been loaded yet. The spec tree shows 'No specs loaded.' with guidance to load bundled specs or connect to an app. The detail panel shows 'Select a spec from the sidebar to view details'. The AI chat panel is visible but has no spec context.",
-        "elements": [{ "textContent": "No specs loaded" }, { "textContent": "Select a spec" }],
+        "elements": [
+          {
+            "textContent": "No specs loaded"
+          },
+          {
+            "textContent": "Select a spec"
+          }
+        ],
         "isInitial": true,
         "transitions": [
           {
             "id": "empty-to-specs-loaded",
             "name": "Load bundled specs",
-            "activateStates": ["specs-loaded-no-selection"],
-            "deactivateStates": ["empty"],
+            "activateStates": [
+              "specs-loaded-no-selection"
+            ],
+            "deactivateStates": [
+              "empty"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Bundled" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "textContent": "Bundled"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           },
           {
             "id": "empty-to-discovering",
             "name": "Start app discovery via Discover button",
-            "activateStates": ["discovering"],
-            "deactivateStates": ["empty"],
+            "activateStates": [
+              "discovering"
+            ],
+            "deactivateStates": [
+              "empty"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Discover" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "textContent": "Discover"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           },
           {
             "id": "empty-to-specs-loaded-file",
             "name": "Load spec from file",
-            "activateStates": ["specs-loaded-no-selection"],
-            "deactivateStates": ["empty"],
+            "activateStates": [
+              "specs-loaded-no-selection"
+            ],
+            "deactivateStates": [
+              "empty"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "File" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "textContent": "File"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           }
@@ -1077,22 +1226,34 @@
         "id": "discovering",
         "name": "Discovering — Connecting to App",
         "description": "The runner is connecting to a running application via UI Bridge to discover its specs. The connection bar shows a spinner icon. The tree and detail panel remain in their previous state until discovery completes or fails.",
-        "elements": [{ "textContent": "Discover" }],
+        "elements": [
+          {
+            "textContent": "Discover"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "discovering-to-specs-loaded",
             "name": "Discovery succeeds and specs are loaded (automatic transition)",
-            "activateStates": ["specs-loaded-no-selection"],
-            "deactivateStates": ["discovering"],
+            "activateStates": [
+              "specs-loaded-no-selection"
+            ],
+            "deactivateStates": [
+              "discovering"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "discovering-to-previous",
             "name": "Discovery fails with error (automatic transition back to previous state)",
-            "activateStates": ["empty"],
-            "deactivateStates": ["discovering"],
+            "activateStates": [
+              "empty"
+            ],
+            "deactivateStates": [
+              "discovering"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -1103,37 +1264,61 @@
         "name": "Specs Loaded — No Selection",
         "description": "Specs are loaded in the tree (from bundled, file, or discovery). The tree shows spec nodes grouped by application. The detail panel shows the 'Select a spec from the sidebar to view details' placeholder. The mode badge shows 'viewer'.",
         "elements": [
-          { "textContent": "Specifications" },
-          { "textContent": "Select a spec" },
-          { "textContent": "viewer" }
+          {
+            "textContent": "Specifications"
+          },
+          {
+            "textContent": "Select a spec"
+          },
+          {
+            "textContent": "viewer"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-loaded-to-spec-selected",
             "name": "Click a spec node in the tree",
-            "activateStates": ["spec-selected-viewer"],
-            "deactivateStates": ["specs-loaded-no-selection"],
+            "activateStates": [
+              "spec-selected-viewer"
+            ],
+            "deactivateStates": [
+              "specs-loaded-no-selection"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Specifications" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Specifications"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "specs-loaded-to-discovering",
             "name": "Start app discovery",
-            "activateStates": ["discovering"],
-            "deactivateStates": ["specs-loaded-no-selection"],
+            "activateStates": [
+              "discovering"
+            ],
+            "deactivateStates": [
+              "specs-loaded-no-selection"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Discover" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "textContent": "Discover"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           }
@@ -1144,73 +1329,115 @@
         "name": "Spec Selected — Viewer Mode",
         "description": "A spec is selected in the tree and its details are shown in the center panel. For page specs, the overview shows ID, description, metadata, and groups list. For other spec types, the appropriate detail view is shown (tech stack, endpoints, entities, etc.). The mode badge shows 'viewer'. Save, Build Workflow, and Edit buttons are visible in the connection bar.",
         "elements": [
-          { "textContent": "viewer" },
-          { "textContent": "Save" },
-          { "textContent": "Build Workflow" }
+          {
+            "textContent": "viewer"
+          },
+          {
+            "textContent": "Save"
+          },
+          {
+            "textContent": "Build Workflow"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "spec-viewer-to-editor",
             "name": "Toggle edit mode via Edit button",
-            "activateStates": ["spec-selected-editor"],
-            "deactivateStates": ["spec-selected-viewer"],
+            "activateStates": [
+              "spec-selected-editor"
+            ],
+            "deactivateStates": [
+              "spec-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Edit" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Edit"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "spec-viewer-to-group-viewer",
             "name": "Click a group node in the expanded spec tree",
-            "activateStates": ["group-selected-viewer"],
-            "deactivateStates": ["spec-selected-viewer"],
+            "activateStates": [
+              "group-selected-viewer"
+            ],
+            "deactivateStates": [
+              "spec-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Groups" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Groups"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "spec-viewer-to-chat-review",
             "name": "Activate AI chat review mode",
-            "activateStates": ["ai-chat-review"],
+            "activateStates": [
+              "ai-chat-review"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Review" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Review"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "spec-viewer-to-chat-create",
             "name": "Activate AI chat create mode",
-            "activateStates": ["ai-chat-create"],
+            "activateStates": [
+              "ai-chat-create"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Create" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Create"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "spec-viewer-to-no-selection",
             "name": "Click a different spec or deselect",
-            "activateStates": ["specs-loaded-no-selection"],
-            "deactivateStates": ["spec-selected-viewer"],
+            "activateStates": [
+              "specs-loaded-no-selection"
+            ],
+            "deactivateStates": [
+              "spec-selected-viewer"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -1221,37 +1448,61 @@
         "name": "Spec Selected — Editor Mode",
         "description": "A page spec is selected with edit mode active. The mode badge shows 'editor'. The spec overview shows groups with trash icons for removal and an 'Add group' button for creating new groups. The Done button replaces the Edit button to exit edit mode.",
         "elements": [
-          { "textContent": "editor" },
-          { "textContent": "Done" },
-          { "textContent": "Add group" }
+          {
+            "textContent": "editor"
+          },
+          {
+            "textContent": "Done"
+          },
+          {
+            "textContent": "Add group"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "spec-editor-to-viewer",
             "name": "Exit edit mode via Done button",
-            "activateStates": ["spec-selected-viewer"],
-            "deactivateStates": ["spec-selected-editor"],
+            "activateStates": [
+              "spec-selected-viewer"
+            ],
+            "deactivateStates": [
+              "spec-selected-editor"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Done" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Done"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "spec-editor-to-group-editor",
             "name": "Click a group node while in edit mode",
-            "activateStates": ["group-selected-editor"],
-            "deactivateStates": ["spec-selected-editor"],
+            "activateStates": [
+              "group-selected-editor"
+            ],
+            "deactivateStates": [
+              "spec-selected-editor"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Groups" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Groups"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1261,34 +1512,59 @@
         "id": "group-selected-viewer",
         "name": "Group Selected — Viewer Mode",
         "description": "A group within a page spec is selected. The detail panel shows the group name heading with category badge, group description, and a list of all assertions with severity badges, enabled state (eye icons), description, type, category, and source badges. The mode badge shows 'viewer'.",
-        "elements": [{ "textContent": "viewer" }, { "textContent": "critical" }],
+        "elements": [
+          {
+            "textContent": "viewer"
+          },
+          {
+            "textContent": "critical"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "group-viewer-to-editor",
             "name": "Toggle edit mode via Edit button",
-            "activateStates": ["group-selected-editor"],
-            "deactivateStates": ["group-selected-viewer"],
+            "activateStates": [
+              "group-selected-editor"
+            ],
+            "deactivateStates": [
+              "group-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Edit" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Edit"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "group-viewer-to-spec-viewer",
             "name": "Click the parent spec node in the tree",
-            "activateStates": ["spec-selected-viewer"],
-            "deactivateStates": ["group-selected-viewer"],
+            "activateStates": [
+              "spec-selected-viewer"
+            ],
+            "deactivateStates": [
+              "group-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Specifications" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Specifications"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1299,37 +1575,61 @@
         "name": "Group Selected — Editor Mode",
         "description": "A group is selected with edit mode active. The detail panel shows assertions with toggleable eye icons, trash icons for removal, and an 'Add assertion' button. The mode badge shows 'editor'. The Done button exits edit mode.",
         "elements": [
-          { "textContent": "editor" },
-          { "textContent": "Done" },
-          { "textContent": "Add assertion" }
+          {
+            "textContent": "editor"
+          },
+          {
+            "textContent": "Done"
+          },
+          {
+            "textContent": "Add assertion"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "group-editor-to-viewer",
             "name": "Exit edit mode via Done button",
-            "activateStates": ["group-selected-viewer"],
-            "deactivateStates": ["group-selected-editor"],
+            "activateStates": [
+              "group-selected-viewer"
+            ],
+            "deactivateStates": [
+              "group-selected-editor"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Done" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Done"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "group-editor-to-spec-editor",
             "name": "Click the parent spec node while in edit mode",
-            "activateStates": ["spec-selected-editor"],
-            "deactivateStates": ["group-selected-editor"],
+            "activateStates": [
+              "spec-selected-editor"
+            ],
+            "deactivateStates": [
+              "group-selected-editor"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Specifications" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Specifications"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1339,20 +1639,36 @@
         "id": "ai-chat-review",
         "name": "AI Chat — Review Mode",
         "description": "The AI chat panel is in review mode. Quick-action buttons are visible: 'Review spec quality', 'Find gaps', 'Suggest improvements', 'Generate assertions'. A 'Build verification workflow' button is shown for page specs. The chat input placeholder says 'Ask about this spec...' when a spec is selected.",
-        "elements": [{ "textContent": "Review spec quality" }, { "textContent": "Find gaps" }],
+        "elements": [
+          {
+            "textContent": "Review spec quality"
+          },
+          {
+            "textContent": "Find gaps"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "chat-review-to-create",
             "name": "Switch to create mode",
-            "activateStates": ["ai-chat-create"],
-            "deactivateStates": ["ai-chat-review"],
+            "activateStates": [
+              "ai-chat-create"
+            ],
+            "deactivateStates": [
+              "ai-chat-review"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Create" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Create"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
@@ -1360,13 +1676,20 @@
             "id": "chat-review-to-default",
             "name": "Deactivate review mode by clicking Review again",
             "activateStates": [],
-            "deactivateStates": ["ai-chat-review"],
+            "deactivateStates": [
+              "ai-chat-review"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Review" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Review"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1376,20 +1699,36 @@
         "id": "ai-chat-create",
         "name": "AI Chat — Create Mode",
         "description": "The AI chat panel is in create mode. Spec creation template buttons are shown: 'New Page Spec', 'New Architecture Spec', 'New API Spec', 'New Data Spec'. The chat input placeholder says 'Describe the spec you want to create...'.",
-        "elements": [{ "textContent": "Create" }, { "textContent": "AI Chat" }],
+        "elements": [
+          {
+            "textContent": "Create"
+          },
+          {
+            "textContent": "AI Chat"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "chat-create-to-review",
             "name": "Switch to review mode",
-            "activateStates": ["ai-chat-review"],
-            "deactivateStates": ["ai-chat-create"],
+            "activateStates": [
+              "ai-chat-review"
+            ],
+            "deactivateStates": [
+              "ai-chat-create"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Review" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Review"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
@@ -1397,13 +1736,20 @@
             "id": "chat-create-to-default",
             "name": "Deactivate create mode by clicking Create again",
             "activateStates": [],
-            "deactivateStates": ["ai-chat-create"],
+            "deactivateStates": [
+              "ai-chat-create"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Create" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Create"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1418,7 +1764,15 @@
     "updatedAt": "2026-03-06T00:00:00.000Z",
     "pageUrl": "/specs",
     "elementSource": "sdk",
-    "tags": ["specs", "viewer", "editor", "ai-chat", "workflow-builder", "spec-tree", "ui-bridge"],
+    "tags": [
+      "specs",
+      "viewer",
+      "editor",
+      "ai-chat",
+      "workflow-builder",
+      "spec-tree",
+      "ui-bridge"
+    ],
     "specType": "semantic"
   }
 }
