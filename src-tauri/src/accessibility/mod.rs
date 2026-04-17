@@ -28,6 +28,8 @@
 pub mod adapters;
 pub mod cache;
 pub mod events;
+#[cfg(test)]
+mod flaui_conformance_test;
 pub mod fusion;
 #[cfg(test)]
 mod integration_test;
@@ -48,6 +50,9 @@ use self::model::{NodeSource, UnifiedNode, UnifiedSnapshot};
 use self::query::QueryBuilder;
 use self::ref_manager::RefManager;
 use self::traits::{ConnectionTarget, InteractionParams, InteractionResult, PlatformAdapter};
+
+#[cfg(windows)]
+use self::adapters::jab::JabAdapter;
 
 /// Top-level facade for the accessibility system.
 ///
@@ -96,6 +101,40 @@ impl AccessibilityManager {
         target: ConnectionTarget,
         timeout_ms: u64,
     ) -> anyhow::Result<()> {
+        // On Windows, detect Java Swing/AWT windows (SunAwtFrame, SWT_Window0,
+        // …) and route to the JAB adapter instead of UIA — UIA sees those
+        // windows as opaque HWNDs with zero child elements.
+        #[cfg(windows)]
+        {
+            if let Some(class) = win32_routing::window_class_for_target(&target) {
+                if win32_routing::is_java_window_class(&class) {
+                    info!(
+                        window_class = %class,
+                        "Detected Java window class — routing to JAB adapter"
+                    );
+                    let mut jab = Box::new(JabAdapter::new()) as Box<dyn PlatformAdapter>;
+                    match jab.connect(target.clone(), timeout_ms).await {
+                        Ok(()) => {
+                            self.native_adapter = jab;
+                            let _ = self.event_tx.send(A11yEvent::ConnectionChanged {
+                                connected: true,
+                                backend: self.native_adapter.backend_name().to_string(),
+                            });
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "JAB connection failed for Java window — falling back to UIA. \
+                                 If the tree ends up empty, run `jabswitch -enable`."
+                            );
+                            // fall through to UIA
+                        }
+                    }
+                }
+            }
+        }
+
         info!(
             "Connecting to accessibility source via {}",
             self.native_adapter.backend_name()
@@ -179,6 +218,26 @@ impl AccessibilityManager {
             snapshot.total_nodes, snapshot.interactive_nodes, generation
         );
 
+        // On Windows: if UIA returned effectively-empty tree AND the last
+        // connected HWND's process has jvm.dll loaded, emit a diagnostic
+        // suggesting `jabswitch -enable`. This is a narrow diagnostic, not a
+        // full resolver framework (see plan Phase 3).
+        #[cfg(windows)]
+        {
+            if self.native_adapter.backend_name() == "uia"
+                && snapshot.total_nodes <= 1
+                && win32_routing::last_connected_target_is_jvm()
+            {
+                warn!(
+                    total_nodes = snapshot.total_nodes,
+                    hint = "jabswitch -enable",
+                    "UIA returned empty tree for a JVM process. Java Swing/AWT apps require \
+                     the Java Access Bridge. Run `jabswitch -enable` (ships with the JDK) to \
+                     activate JAB, then reconnect."
+                );
+            }
+        }
+
         Ok(snapshot)
     }
 
@@ -186,6 +245,9 @@ impl AccessibilityManager {
     fn native_adapter_source(&self) -> NodeSource {
         match self.native_adapter.backend_name() {
             "uia" => NodeSource::Uia,
+            // JAB is a Windows-family backend; until NodeSource grows a
+            // dedicated variant we continue to tag JAB-sourced trees as Uia.
+            "jab" => NodeSource::Uia,
             "atspi" => NodeSource::Atspi,
             "ax" => NodeSource::Ax,
             _ => NodeSource::Uia,
@@ -357,5 +419,198 @@ impl AccessibilityManager {
 impl Default for AccessibilityManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows-only routing helpers
+//
+// - window_class_for_target: resolve a ConnectionTarget to its HWND's class
+//   name, so we can detect Swing/AWT frames and route to JAB.
+// - is_java_window_class: membership test over the known Java class prefixes.
+// - last_connected_target_is_jvm: EnumProcessModules-based probe for `jvm.dll`
+//   in the PID behind the most recent connection. Used to emit the jabswitch
+//   diagnostic from the capture path.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod win32_routing {
+    use std::sync::Mutex;
+
+    use once_cell::sync::Lazy;
+    use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HMODULE, HWND, LPARAM};
+    use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleFileNameExW};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    use super::ConnectionTarget;
+
+    /// The last `(hwnd, pid)` pair `AccessibilityManager::connect` resolved.
+    /// Read by `last_connected_target_is_jvm`. Stored as two primitives so the
+    /// `Mutex` is trivially `Send + Sync`.
+    static LAST_TARGET: Lazy<Mutex<Option<(isize, u32)>>> = Lazy::new(|| Mutex::new(None));
+
+    /// Resolve a ConnectionTarget into the class name of its top-level HWND,
+    /// if one exists. Returns None for Desktop and for titles/PIDs we can't
+    /// locate.
+    pub(super) fn window_class_for_target(target: &ConnectionTarget) -> Option<String> {
+        let hwnd = match target {
+            ConnectionTarget::Desktop => return None,
+            ConnectionTarget::ProcessId(pid) => find_hwnd_by_pid(*pid)?,
+            ConnectionTarget::WindowTitle(title) => find_hwnd_by_title(title)?,
+        };
+        let mut pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        *LAST_TARGET.lock().unwrap() = Some((hwnd.0 as isize, pid));
+
+        let mut buf = [0u16; 256];
+        let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+        if n <= 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..n as usize]))
+    }
+
+    /// Known Java top-level window classes. These are the classes Swing/AWT
+    /// and SWT emit; UIA sees them as opaque `Pane` elements with no children.
+    pub(super) fn is_java_window_class(class: &str) -> bool {
+        // Swing/AWT prefixes: SunAwtFrame, SunAwtDialog, SunAwtWindow,
+        // SunAwtCanvas. SWT uses SWT_Window0. Eclipse JRE uses JavaEmbedded.
+        class.starts_with("SunAwt")
+            || class == "SWT_Window0"
+            || class == "JavaEmbeddedFrame"
+    }
+
+    /// Probe the last-connected PID for `jvm.dll`. Returns `false` if we've
+    /// never connected, or if the process is not a JVM, or if we can't
+    /// enumerate modules (usually a permissions / architecture mismatch).
+    pub(super) fn last_connected_target_is_jvm() -> bool {
+        let pid = match *LAST_TARGET.lock().unwrap() {
+            Some((_, pid)) => pid,
+            None => return false,
+        };
+        process_has_jvm_dll(pid)
+    }
+
+    /// EnumProcessModules-based probe. Safe for 64-bit → 64-bit inspection;
+    /// 32-bit processes opened from a 64-bit runner will return `false`
+    /// silently (the module list read path requires matching bitness).
+    fn process_has_jvm_dll(pid: u32) -> bool {
+        let handle = unsafe {
+            match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) {
+                Ok(h) => h,
+                Err(_) => return false,
+            }
+        };
+        if handle.is_invalid() {
+            return false;
+        }
+        let result = unsafe { probe_modules(handle) };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        result
+    }
+
+    unsafe fn probe_modules(process: HANDLE) -> bool {
+        // First call to size the buffer.
+        let mut needed: u32 = 0;
+        let ok = EnumProcessModules(process, std::ptr::null_mut(), 0, &mut needed);
+        if ok.is_err() || needed == 0 {
+            return false;
+        }
+        let count = (needed as usize) / std::mem::size_of::<HMODULE>();
+        if count == 0 {
+            return false;
+        }
+        let mut modules = vec![HMODULE::default(); count];
+        let ok = EnumProcessModules(process, modules.as_mut_ptr(), needed, &mut needed);
+        if ok.is_err() {
+            return false;
+        }
+
+        for hmod in &modules {
+            let mut name_buf = [0u16; 260];
+            let n = GetModuleFileNameExW(process, *hmod, &mut name_buf);
+            if n == 0 {
+                continue;
+            }
+            let path_str = String::from_utf16_lossy(&name_buf[..n as usize]);
+            let lower = path_str.to_ascii_lowercase();
+            if lower.ends_with("\\jvm.dll") || lower.ends_with("/jvm.dll") {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Enumerate visible top-level windows and return the first whose title
+    /// contains `needle` (case-insensitive).
+    fn find_hwnd_by_title(needle: &str) -> Option<HWND> {
+        struct Ctx {
+            needle: String,
+            found: Option<HWND>,
+        }
+        unsafe extern "system" fn proc(hwnd: HWND, l: LPARAM) -> BOOL {
+            let ctx = &mut *(l.0 as *mut Ctx);
+            if !IsWindowVisible(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            let len = GetWindowTextLengthW(hwnd);
+            if len <= 0 {
+                return BOOL(1);
+            }
+            let mut buf = vec![0u16; (len + 1) as usize];
+            let got = GetWindowTextW(hwnd, &mut buf);
+            if got <= 0 {
+                return BOOL(1);
+            }
+            let title = String::from_utf16_lossy(&buf[..got as usize]);
+            if title.to_lowercase().contains(&ctx.needle) {
+                ctx.found = Some(hwnd);
+                return BOOL(0);
+            }
+            BOOL(1)
+        }
+        let mut ctx = Ctx {
+            needle: needle.to_lowercase(),
+            found: None,
+        };
+        unsafe {
+            let _ = EnumWindows(Some(proc), LPARAM(&mut ctx as *mut _ as isize));
+        }
+        ctx.found
+    }
+
+    /// Enumerate visible top-level windows and return the first one belonging
+    /// to `pid`.
+    fn find_hwnd_by_pid(pid: u32) -> Option<HWND> {
+        struct Ctx {
+            pid: u32,
+            found: Option<HWND>,
+        }
+        unsafe extern "system" fn proc(hwnd: HWND, l: LPARAM) -> BOOL {
+            let ctx = &mut *(l.0 as *mut Ctx);
+            if !IsWindowVisible(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            let mut win_pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut win_pid));
+            if win_pid == ctx.pid {
+                ctx.found = Some(hwnd);
+                return BOOL(0);
+            }
+            BOOL(1)
+        }
+        let mut ctx = Ctx { pid, found: None };
+        unsafe {
+            let _ = EnumWindows(Some(proc), LPARAM(&mut ctx as *mut _ as isize));
+        }
+        ctx.found
     }
 }

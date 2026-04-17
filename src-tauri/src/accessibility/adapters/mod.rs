@@ -12,6 +12,9 @@ use super::traits::PlatformAdapter;
 #[cfg(windows)]
 pub mod uia;
 
+#[cfg(windows)]
+pub mod jab;
+
 #[cfg(target_os = "linux")]
 pub mod atspi_adapter;
 

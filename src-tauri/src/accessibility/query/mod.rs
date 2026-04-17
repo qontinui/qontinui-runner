@@ -4,7 +4,14 @@
 //! in a `UnifiedNode` tree by role, label, value, automation ID, and other
 //! criteria. Inspired by `rerun-io/kittest`.
 
-use super::model::{TriBool, UnifiedNode, UnifiedRole, UnifiedState};
+pub mod typed;
+
+pub use typed::{
+    try_as_button, try_as_checkbox, try_as_combobox, try_as_textbox, try_as_window, Button,
+    CheckBox, ComboBox, TextBox, TypedError, Window,
+};
+
+use super::model::{ControlType, TriBool, UnifiedNode, UnifiedRole, UnifiedState};
 
 /// Filter predicate for matching nodes in an accessibility tree.
 #[derive(Debug, Clone)]
@@ -13,10 +20,18 @@ pub enum By {
     Role(UnifiedRole),
     /// Match by any of the given roles.
     Roles(Vec<UnifiedRole>),
+    /// Match by FlaUI-style control type (mapped internally to `UnifiedRole`).
+    ControlType(ControlType),
     /// Match by exact accessible name (label).
     Label(String),
     /// Match by substring in accessible name.
     LabelContains(String),
+    /// Match by substring in any user-visible text field.
+    ///
+    /// Searches `name`, `value`, and `description` as a union — FlaUI's
+    /// `ByText` semantics. A node matches if the substring appears in any
+    /// of them.
+    Text(String),
     /// Match by exact value.
     Value(String),
     /// Match by substring in value.
@@ -157,6 +172,16 @@ impl QueryBuilder {
         self
     }
 
+    /// Filter by FlaUI-style [`ControlType`].
+    ///
+    /// Internally this maps through [`ControlType::to_unified_role`], so
+    /// `by_control_type(ControlType::CheckBox)` is equivalent to
+    /// `by_role(UnifiedRole::Checkbox)` but reads closer to FlaUI code.
+    pub fn by_control_type(mut self, control_type: ControlType) -> Self {
+        self.filters.push(By::ControlType(control_type));
+        self
+    }
+
     /// Filter by exact accessible name (label).
     pub fn by_label(mut self, label: impl Into<String>) -> Self {
         self.filters.push(By::Label(label.into()));
@@ -166,6 +191,17 @@ impl QueryBuilder {
     /// Filter by substring in accessible name.
     pub fn by_label_contains(mut self, substr: impl Into<String>) -> Self {
         self.filters.push(By::LabelContains(substr.into()));
+        self
+    }
+
+    /// Filter by substring match against any user-visible text field.
+    ///
+    /// Unlike [`Self::by_label_contains`] (which only checks `name`), this
+    /// matches if the substring appears in `name`, `value`, *or* `description`.
+    /// Mirrors FlaUI's `ByText`, which queries the UIA `Text` pattern's
+    /// combined surface.
+    pub fn by_text(mut self, substr: impl Into<String>) -> Self {
+        self.filters.push(By::Text(substr.into()));
         self
     }
 
@@ -304,6 +340,28 @@ impl QueryBuilder {
 
             By::Roles(roles) => roles.contains(&node.role),
 
+            By::ControlType(ct) => node.role == ct.to_unified_role(),
+
+            By::Text(substr) => {
+                let haystacks = [
+                    node.name.as_deref(),
+                    node.value.as_deref(),
+                    node.description.as_deref(),
+                ];
+                haystacks.iter().any(|opt| match opt {
+                    Some(field) => {
+                        if self.case_sensitive {
+                            field.contains(substr.as_str())
+                        } else {
+                            field
+                                .to_ascii_lowercase()
+                                .contains(&substr.to_ascii_lowercase())
+                        }
+                    }
+                    None => false,
+                })
+            }
+
             By::Label(label) => {
                 let node_name = node.name.as_deref().unwrap_or("");
                 if self.case_sensitive {
@@ -314,7 +372,9 @@ impl QueryBuilder {
             }
 
             By::LabelContains(substr) => {
-                let node_name = node.name.as_deref().unwrap_or("");
+                let Some(node_name) = node.name.as_deref() else {
+                    return false;
+                };
                 if self.case_sensitive {
                     node_name.contains(substr.as_str())
                 } else {
@@ -334,7 +394,9 @@ impl QueryBuilder {
             }
 
             By::ValueContains(substr) => {
-                let node_value = node.value.as_deref().unwrap_or("");
+                let Some(node_value) = node.value.as_deref() else {
+                    return false;
+                };
                 if self.case_sensitive {
                     node_value.contains(substr.as_str())
                 } else {
@@ -446,30 +508,10 @@ mod tests {
         }
     }
 
-    impl Default for UnifiedNode {
-        fn default() -> Self {
-            Self {
-                ref_id: String::new(),
-                role: UnifiedRole::Unknown,
-                name: None,
-                value: None,
-                description: None,
-                bounds: None,
-                state: UnifiedState::default(),
-                is_interactive: false,
-                level: None,
-                automation_id: None,
-                class_name: None,
-                html_tag: None,
-                url: None,
-                source: NodeSource::Uia,
-                platform_handle: None,
-                supported_patterns: vec![],
-                generation: 0,
-                children: vec![],
-            }
-        }
-    }
+    // `Default for UnifiedNode` is defined at module level under `#[cfg(test)]`
+    // in `model.rs` so sibling test modules (e.g. `query::typed::tests`,
+    // `accessibility::flaui_conformance_test`) can share the same helper
+    // without duplicate-impl conflicts.
 
     #[test]
     fn test_by_role() {
