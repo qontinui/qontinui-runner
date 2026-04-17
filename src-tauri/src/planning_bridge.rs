@@ -54,6 +54,9 @@ pub struct HtnConfig {
     /// Optional path to a serialized StateManager JSON file.
     /// When provided, the planner uses the saved state machine; otherwise empty.
     pub state_machine_path: Option<String>,
+    /// Optional path to a directory of HTN method JSON files.
+    /// When provided, methods are loaded alongside the built-in generic methods.
+    pub methods_directory: Option<String>,
 }
 
 impl Default for HtnConfig {
@@ -66,6 +69,7 @@ impl Default for HtnConfig {
             ui_bridge_url: None,
             target_type: None,
             state_machine_path: None,
+            methods_directory: None,
         }
     }
 }
@@ -144,6 +148,7 @@ pub async fn execute_htn_attempt(
         "ui_bridge_url": config.ui_bridge_url,
         "target_type": config.target_type.as_deref().unwrap_or("web"),
         "state_machine_path": config.state_machine_path,
+        "methods_directory": config.methods_directory,
         "timeout_ms": config.timeout_ms,
         "max_replans": config.max_replans,
     });

@@ -521,12 +521,19 @@ impl LoopConfig {
                 htn.enabled = workflow.htn_enabled;
                 htn.ui_bridge_url = workflow.htn_ui_bridge_url.clone();
                 htn.state_machine_path = workflow.htn_state_machine_path.clone();
-                // Default state_machine_path to bundled runner_state_machine.json when enabled
-                if htn.enabled && htn.state_machine_path.is_none() {
+                // Default state_machine_path and methods_directory to bundled data when enabled
+                if htn.enabled {
                     let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
-                    htn.state_machine_path = Some(
-                        data_dir.join("runner_state_machine.json").display().to_string(),
-                    );
+                    if htn.state_machine_path.is_none() {
+                        htn.state_machine_path = Some(
+                            data_dir.join("runner_state_machine.json").display().to_string(),
+                        );
+                    }
+                    if htn.methods_directory.is_none() {
+                        htn.methods_directory = Some(
+                            data_dir.join("htn_methods").display().to_string(),
+                        );
+                    }
                 }
                 htn
             },
