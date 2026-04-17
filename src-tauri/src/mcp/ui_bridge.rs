@@ -7674,6 +7674,21 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                     "single": "{ operation, elementId, params } — returns { result, changes, changeCount }",
                     "batch": "{ operations: [{ operation, elementId, params }] } — returns { results, changes, changeCount }"
                 }
+            },
+            "diagnostics": {
+                "description": "WebView readiness diagnostics and proactive health checks",
+                "endpoints": ["diagnostics", "diagnostics/readiness"],
+                "readiness": {
+                    "method": "GET",
+                    "path": "/ui-bridge/diagnostics/readiness",
+                    "description": "Returns 200 when frontend is ready, 503 with diagnostic details when not ready",
+                    "response": "{ ready, sdk_connected, last_pong_age_ms, uptime_ms }"
+                }
+            },
+            "stableRefs": {
+                "description": "Stable element references that survive React re-renders via fingerprint + semantic path fallback",
+                "includeInDiscover": true,
+                "resolutionStrategies": ["primaryId", "data-ui-bridge-id", "fingerprint", "semanticPath"]
             }
         }
     })))
