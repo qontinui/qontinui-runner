@@ -161,7 +161,10 @@ async fn relay_loop(
             Err(e) => {
                 warn!("Failed to refresh auth token for relay: {}", e);
                 // Backoff and retry — token may become available after re-login
-                info!("Reconnecting in {}ms... (send kick to retry sooner)", backoff_ms);
+                info!(
+                    "Reconnecting in {}ms... (send kick to retry sooner)",
+                    backoff_ms
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {
                         backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
@@ -274,7 +277,10 @@ async fn relay_loop(
         }
 
         // Exponential backoff before reconnecting
-        info!("Reconnecting in {}ms... (send kick to retry sooner)", backoff_ms);
+        info!(
+            "Reconnecting in {}ms... (send kick to retry sooner)",
+            backoff_ms
+        );
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {
                 backoff_ms = (backoff_ms * 2).min(max_backoff_ms);

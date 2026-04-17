@@ -1572,6 +1572,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let mut configs = settings::get_managed_process_configs();
 
                 // Backfill build commands for configs that don't have them yet
+                // (ProcessConfigExt trait provides backfill_build_command after
+                // the DTO moved to qontinui_types::process_management).
+                use crate::process_capture::types::ProcessConfigExt;
                 for config in &mut configs {
                     config.backfill_build_command();
                 }

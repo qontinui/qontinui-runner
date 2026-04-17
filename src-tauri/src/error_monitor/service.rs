@@ -24,7 +24,8 @@ use crate::error_monitor::pipeline::processors::parser::ParserProcessor;
 use crate::error_monitor::pipeline::traits::{Exporter, Processor};
 use crate::error_monitor::pipeline::types::{LogRecord, SourceMeta};
 use crate::error_monitor::types::{
-    ErrorEvent, ErrorSeverity, LogFormat, LogSourceConfig, ParserType, PathType, StoredErrorEvent,
+    ErrorEvent, ErrorSeverity, LogFormat, LogSourceConfig, ParserType, ParserTypeExt, PathType,
+    StoredErrorEvent,
 };
 
 /// File position tracker for incremental parsing

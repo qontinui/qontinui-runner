@@ -692,9 +692,8 @@ impl PythonBridge {
     /// `get_state_async()` instead.
     pub fn get_state(&self) -> ExecutorState {
         debug!("[PYTHON_BRIDGE] get_state() called");
-        let state = tauri::async_runtime::block_on(async {
-            self.lifecycle.read().await.get_state().await
-        });
+        let state =
+            tauri::async_runtime::block_on(async { self.lifecycle.read().await.get_state().await });
         debug!("[PYTHON_BRIDGE] get_state() returning: {}", state.name());
         state
     }

@@ -85,8 +85,8 @@ fn to_full_runner_step(
     step: &ExecutionStepConfig,
 ) -> Result<qontinui_types::workflow_step::FullRunnerStep, String> {
     use qontinui_types::workflow_step::{
-        FullRunnerStep, UiBridgeAction, UiBridgeAssertType, UiBridgeComparisonMode, UiBridgeSeverity,
-        UiBridgeStep, UiBridgeStepPhase, WorkflowStep, WorkflowStepPhase,
+        FullRunnerStep, UiBridgeAction, UiBridgeAssertType, UiBridgeComparisonMode,
+        UiBridgeSeverity, UiBridgeStep, UiBridgeStepPhase, WorkflowStep, WorkflowStepPhase,
     };
 
     // Direct constructors for variants that don't round-trip cleanly.
@@ -2020,26 +2020,69 @@ mod tests {
         let base = || BaseStepFields::default();
 
         let cases: &[(&str, qontinui_types::workflow_step::FullRunnerStep)] = &[
-            ("command",                  FullRunnerStep::Command(CommandStep::default())),
-            ("prompt",                   FullRunnerStep::Prompt(PromptStep::default())),
-            ("ui_bridge",                FullRunnerStep::UiBridge(UiBridgeStep::default())),
-            ("workflow",                 FullRunnerStep::Workflow(WorkflowStep::default())),
-            ("code_execution",           FullRunnerStep::CodeExecution(CodeExecutionStep::default())),
-            ("execute_playbook",         FullRunnerStep::ExecutePlaybook(ExecutePlaybookStep::default())),
-            ("native_accessibility",     FullRunnerStep::NativeAccessibility(NativeAccessibilityStep::default())),
-            ("restart_process",          FullRunnerStep::RestartProcess(RestartProcessStep::default())),
-            ("save_workflow_artifact",   FullRunnerStep::SaveWorkflowArtifact(SaveWorkflowArtifactStep::default())),
-            ("workflow_fixup",           FullRunnerStep::WorkflowFixup(WorkflowFixupStep::default())),
-            ("ui_bridge_design_audit",   FullRunnerStep::UiBridgeDesignAudit(UiBridgeDesignAuditStep::default())),
-            ("ui_bridge_visual_assertion", FullRunnerStep::UiBridgeVisualAssertion(UiBridgeVisualAssertionStep::default())),
-            ("workflow_ref",             FullRunnerStep::WorkflowRef(WorkflowRefStep::default())),
-            ("dag_cancel",               FullRunnerStep::DagCancel(DagCancelStep::default())),
-            ("dag_approval",             FullRunnerStep::DagApproval(DagApprovalStep::default())),
-            ("dag_loop",                 FullRunnerStep::DagLoop(DagLoopStep::default())),
+            ("command", FullRunnerStep::Command(CommandStep::default())),
+            ("prompt", FullRunnerStep::Prompt(PromptStep::default())),
+            (
+                "ui_bridge",
+                FullRunnerStep::UiBridge(UiBridgeStep::default()),
+            ),
+            (
+                "workflow",
+                FullRunnerStep::Workflow(WorkflowStep::default()),
+            ),
+            (
+                "code_execution",
+                FullRunnerStep::CodeExecution(CodeExecutionStep::default()),
+            ),
+            (
+                "execute_playbook",
+                FullRunnerStep::ExecutePlaybook(ExecutePlaybookStep::default()),
+            ),
+            (
+                "native_accessibility",
+                FullRunnerStep::NativeAccessibility(NativeAccessibilityStep::default()),
+            ),
+            (
+                "restart_process",
+                FullRunnerStep::RestartProcess(RestartProcessStep::default()),
+            ),
+            (
+                "save_workflow_artifact",
+                FullRunnerStep::SaveWorkflowArtifact(SaveWorkflowArtifactStep::default()),
+            ),
+            (
+                "workflow_fixup",
+                FullRunnerStep::WorkflowFixup(WorkflowFixupStep::default()),
+            ),
+            (
+                "ui_bridge_design_audit",
+                FullRunnerStep::UiBridgeDesignAudit(UiBridgeDesignAuditStep::default()),
+            ),
+            (
+                "ui_bridge_visual_assertion",
+                FullRunnerStep::UiBridgeVisualAssertion(UiBridgeVisualAssertionStep::default()),
+            ),
+            (
+                "workflow_ref",
+                FullRunnerStep::WorkflowRef(WorkflowRefStep::default()),
+            ),
+            (
+                "dag_cancel",
+                FullRunnerStep::DagCancel(DagCancelStep::default()),
+            ),
+            (
+                "dag_approval",
+                FullRunnerStep::DagApproval(DagApprovalStep::default()),
+            ),
+            ("dag_loop", FullRunnerStep::DagLoop(DagLoopStep::default())),
         ];
 
         // Exactly 16 variants — make sure we haven't accidentally skipped one.
-        assert_eq!(cases.len(), 16, "expected exactly 16 FullRunnerStep variants");
+        assert_eq!(
+            cases.len(),
+            16,
+            "expected exactly 16 FullRunnerStep variants"
+        );
 
         // Suppress unused-variable warning from the `base` helper when all
         // cases use Default::default().

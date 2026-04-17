@@ -271,11 +271,7 @@ pub struct ExecutionStepConfig {
     /// qontinui-types). Legacy aliases `promptContent` / `prompt_content`
     /// are accepted on deserialize for older stored workflows and the
     /// current SchedulerTaskForm request shape.
-    #[serde(
-        rename = "content",
-        alias = "promptContent",
-        alias = "prompt_content"
-    )]
+    #[serde(rename = "content", alias = "promptContent", alias = "prompt_content")]
     pub prompt_content: Option<String>,
 
     /// Prompt execution mode: "session" (default) or "response" (simple prompt→response)
@@ -317,7 +313,6 @@ pub struct ExecutionStepConfig {
     // per-variant Rust-field constructors (Session 2c) to produce the typed
     // `FullRunnerStep` view without round-tripping through JSON, so these
     // prefixed names do not block the typed invariant.
-
     /// UI Bridge: Action to perform ("navigate", "execute", "assert", "snapshot")
     #[serde(alias = "uiBridgeAction", alias = "ui_bridge_action")]
     pub ui_bridge_action: Option<String>,

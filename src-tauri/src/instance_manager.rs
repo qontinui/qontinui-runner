@@ -75,7 +75,10 @@ impl InstanceManager {
         let pid = std::process::id();
         let id = format!("primary-{}", port);
 
-        eprintln!("[InstanceManager] register_self_as_primary: id={} port={}", id, port);
+        eprintln!(
+            "[InstanceManager] register_self_as_primary: id={} port={}",
+            id, port
+        );
         match self
             .pg_db
             .upsert_runner_instance(&id, "primary", port, &hostname, true, Some(pid), "healthy")
@@ -83,7 +86,10 @@ impl InstanceManager {
         {
             Ok(()) => {
                 eprintln!("[InstanceManager] register_self_as_primary: OK");
-                info!("Registered primary runner in DB (port={}, pid={})", port, pid);
+                info!(
+                    "Registered primary runner in DB (port={}, pid={})",
+                    port, pid
+                );
             }
             Err(e) => {
                 eprintln!("[InstanceManager] register_self_as_primary: ERR: {}", e);
@@ -142,7 +148,10 @@ impl InstanceManager {
             .upsert_runner_instance(&id, &name, port, &hostname, false, pid, "healthy")
             .await
         {
-            Ok(()) => info!("DB write-through: registered instance {} on port {}", id, port),
+            Ok(()) => info!(
+                "DB write-through: registered instance {} on port {}",
+                id, port
+            ),
             Err(e) => warn!("Failed to persist registered instance to DB: {}", e),
         }
 

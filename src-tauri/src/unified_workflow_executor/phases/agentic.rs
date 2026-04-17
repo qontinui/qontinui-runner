@@ -788,6 +788,9 @@ impl AgenticExecutor {
 
         // Pre-build managed process status summary for iteration context
         let process_status_summary = {
+            // ProcessStateExt provides `.as_str()` since ProcessState moved to
+            // qontinui_types::process_management (no more Display impl).
+            use crate::process_capture::types::ProcessStateExt;
             let mgr_lock = self.app_state.process_capture_manager.lock().await;
             if let Some(ref mgr) = *mgr_lock {
                 let statuses = mgr.get_all_status().await;
@@ -813,7 +816,7 @@ impl AgenticExecutor {
                             "- {} [{}]: {} ({}, {} errors)",
                             s.name,
                             s.category,
-                            s.state,
+                            s.state.as_str(),
                             if uptime.is_empty() {
                                 health.to_string()
                             } else {

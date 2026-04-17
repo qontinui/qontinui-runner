@@ -76,7 +76,7 @@ pub struct ExtractionExecutor {
 
 impl ExtractionExecutor {
     pub fn new(app_handle: tauri::AppHandle) -> Self {
-Self {
+        Self {
             process: None,
             process_manager: ProcessManager::new_for_extraction(app_handle.clone()),
             protocol_handler: ProtocolHandler::new(),
@@ -311,9 +311,7 @@ Self {
     }
 
     pub fn get_state(&self) -> ExecutorState {
-        tauri::async_runtime::block_on(async {
-            self.lifecycle.read().await.get_state().await
-        })
+        tauri::async_runtime::block_on(async { self.lifecycle.read().await.get_state().await })
     }
 
     /// Start extraction executor on-demand if not already running.

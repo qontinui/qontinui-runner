@@ -56,6 +56,14 @@ pub struct HtnConfig {
     pub max_replans: u32,
     /// Python executable path (uses "python" if not set).
     pub python_path: Option<String>,
+    /// UI Bridge URL for querying element state (e.g., "http://localhost:1420").
+    /// If None, HTN runs in plan-only mode without actual GUI execution.
+    pub ui_bridge_url: Option<String>,
+    /// UI Bridge target type: "web", "desktop", "mobile".
+    pub target_type: Option<String>,
+    /// Optional path to a serialized StateManager JSON file.
+    /// When provided, the planner uses the saved state machine; otherwise empty.
+    pub state_machine_path: Option<String>,
 }
 
 impl Default for HtnConfig {
@@ -65,6 +73,9 @@ impl Default for HtnConfig {
             planning_timeout_ms: 5000,
             max_replans: 5,
             python_path: None,
+            ui_bridge_url: None,
+            target_type: None,
+            state_machine_path: None,
         }
     }
 }
@@ -303,121 +314,61 @@ pub async fn execute_htn_attempt(
     task_description: &str,
     config: &HtnConfig,
 ) -> Result<HtnExecutionResult, String> {
-    let task_json = serde_json::to_string(&task_description)
-        .map_err(|e| format!("Failed to serialize task: {}", e))?;
-
+    let qontinui_src =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../qontinui/src");
     let multistate_src =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../multistate/src");
-    let multistate_src_str = multistate_src.display().to_string().replace('\\', "\\\\");
 
-    let qontinui_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../qontinui/src");
-    let qontinui_src_str = qontinui_src.display().to_string().replace('\\', "\\\\");
-
-    let python_script = format!(
-        r#"
-import sys
-sys.path.insert(0, r'{multistate_src_str}')
-sys.path.insert(0, r'{qontinui_src_str}')
-
-import json
-import time
-
-start = time.time()
-
-# Try to import the orchestrator
-try:
-    from multistate.planning.planner import HTNPlanner, WorldState
-    from multistate.planning.operators import STANDARD_OPERATORS
-    from multistate.planning.methods.generic import GENERIC_METHODS
-    from multistate.planning.registry import create_default_registry
-    from multistate.planning.executor import PlanExecutor
-    from multistate.planning.blackboard import Blackboard
-    from multistate.planning.world_adapter import WorldStateAdapter
-except ImportError as e:
-    print(json.dumps({{
-        'plan_found': False,
-        'execution_success': False,
-        'plan_actions': 0,
-        'steps_succeeded': 0,
-        'replans': 0,
-        'total_time_ms': 0,
-        'summary': f'Import error: {{e}}',
-        'error': str(e),
-    }}))
-    sys.exit(0)
-
-# Parse the task from the failure context.
-task_desc = json.loads({task_json_py})
-
-# Build a minimal world state from what we know.
-state = WorldState(
-    active_states=set(),
-    available_transitions=set(),
-    element_visible={{}},
-    element_values={{}},
-    blackboard={{}},
-)
-
-# Build planner with all methods
-registry = create_default_registry()
-planner = registry.build_planner()
-
-# Try to plan with the task description as a single-element task
-task_tuple = (task_desc,) if isinstance(task_desc, str) else tuple(task_desc)
-plan_result = planner.find_plan(state, [task_tuple])
-
-if not plan_result.success or not plan_result.actions:
-    elapsed = (time.time() - start) * 1000
-    print(json.dumps({{
-        'plan_found': False,
-        'execution_success': False,
-        'plan_actions': 0,
-        'steps_succeeded': 0,
-        'replans': 0,
-        'total_time_ms': elapsed,
-        'summary': f'No plan found: {{plan_result.error}}',
-        'error': plan_result.error,
-    }}))
-    sys.exit(0)
-
-# Plan found! Report it.
-elapsed = (time.time() - start) * 1000
-actions_summary = '; '.join(
-    ' '.join(str(a) for a in action) for action in plan_result.actions[:5]
-)
-if len(plan_result.actions) > 5:
-    actions_summary += f'... (+{{len(plan_result.actions) - 5}} more)'
-
-print(json.dumps({{
-    'plan_found': True,
-    'execution_success': True,
-    'plan_actions': len(plan_result.actions),
-    'steps_succeeded': len(plan_result.actions),
-    'replans': 0,
-    'total_time_ms': elapsed,
-    'summary': f'HTN plan: {{actions_summary}}',
-    'error': None,
-}}))
-"#,
-        multistate_src_str = multistate_src_str,
-        qontinui_src_str = qontinui_src_str,
-        task_json_py = serde_json::to_string(&task_json)
-            .map_err(|e| format!("Failed to double-serialize task: {}", e))?,
-    );
+    // Build stdin JSON config for the CLI
+    let stdin_config = serde_json::json!({
+        "task": task_description,
+        "ui_bridge_url": config.ui_bridge_url,
+        "target_type": config.target_type.as_deref().unwrap_or("web"),
+        "state_machine_path": config.state_machine_path,
+        "planning_timeout_ms": config.planning_timeout_ms,
+        "max_replans": config.max_replans,
+    });
+    let stdin_json = stdin_config.to_string();
 
     let python = config.python_path.as_deref().unwrap_or("python");
-
     debug!(
-        "Running HTN execute_htn_attempt via: {} -c <script>",
+        "Running HTN via: {} -m qontinui.planning_integration",
         python
     );
 
+    // Build PYTHONPATH with both src trees
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let mut pythonpath = format!(
+        "{}{}{}",
+        qontinui_src.display(),
+        sep,
+        multistate_src.display(),
+    );
+    if let Ok(existing) = std::env::var("PYTHONPATH") {
+        if !existing.is_empty() {
+            pythonpath = format!("{}{}{}", pythonpath, sep, existing);
+        }
+    }
+
     let mut child = tokio::process::Command::new(python)
-        .args(["-c", &python_script])
+        .args(["-m", "qontinui.planning_integration"])
+        .env("PYTHONPATH", pythonpath)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to spawn Python planner: {}", e))?;
+        .map_err(|e| format!("Failed to spawn Python HTN CLI: {}", e))?;
+
+    // Write config to stdin and close it
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        if let Err(e) = stdin.write_all(stdin_json.as_bytes()).await {
+            let _ = child.kill().await;
+            return Err(format!("Failed to write HTN config to stdin: {}", e));
+        }
+        // Dropping stdin closes it, signaling EOF to Python
+        drop(stdin);
+    }
 
     let output = match tokio::time::timeout(
         std::time::Duration::from_millis(config.planning_timeout_ms),
@@ -442,7 +393,7 @@ print(json.dumps({{
     )
     .await
     {
-        Ok(result) => result.map_err(|e| format!("Python HTN attempt failed: {}", e))?,
+        Ok(result) => result.map_err(|e| format!("Python HTN CLI failed: {}", e))?,
         Err(_) => {
             let _ = child.kill().await;
             return Err("HTN execute attempt timed out".to_string());
@@ -451,8 +402,8 @@ print(json.dumps({{
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("HTN execute attempt failed: {}", stderr);
-        return Err(format!("HTN execute attempt failed: {}", stderr));
+        warn!("HTN CLI exited with error: {}", stderr);
+        return Err(format!("HTN CLI failed: {}", stderr));
     }
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
@@ -463,15 +414,22 @@ print(json.dumps({{
         .unwrap_or("");
 
     let result: HtnExecutionResult = serde_json::from_str(json_line).map_err(|e| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         format!(
-            "Failed to parse HTN execution result: {} (raw: {})",
-            e, stdout_str
+            "Failed to parse HTN CLI output: {} (stdout: {}, stderr: {})",
+            e, stdout_str, stderr,
         )
     })?;
 
     info!(
-        "HTN execute result: plan_found={}, exec_success={}, actions={}, time={:.1}ms",
-        result.plan_found, result.execution_success, result.plan_actions, result.total_time_ms,
+        "HTN result: plan_found={}, exec_success={}, actions={}, succeeded={}/{}, replans={}, time={:.1}ms",
+        result.plan_found,
+        result.execution_success,
+        result.plan_actions,
+        result.steps_succeeded,
+        result.plan_actions,
+        result.replans,
+        result.total_time_ms,
     );
 
     Ok(result)

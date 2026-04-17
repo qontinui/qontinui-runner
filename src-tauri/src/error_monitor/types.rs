@@ -45,25 +45,29 @@ impl LogFormat {
     }
 }
 
-/// Parser type for extracting errors from logs
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum ParserType {
-    /// Python tracebacks and exceptions
-    Python,
-    /// JavaScript/TypeScript errors and stack traces
-    #[serde(alias = "java_script", rename = "javascript")]
-    JavaScript,
-    /// Rust panics and errors
-    Rust,
-    /// Generic regex-based pattern matching
-    #[default]
-    Generic,
+/// Parser type for extracting errors from logs.
+///
+/// Re-exported from `qontinui_types::process_management` — moved there because
+/// `ProcessConfig.parser: ParserType` is persisted in settings.json. The
+/// runner-side `as_str`/`from_str` helpers stay here as trait methods on
+/// [`ParserTypeExt`]; existing call sites like `ParserType::from_str(s)` and
+/// `parser.as_str()` keep working as long as [`ParserTypeExt`] is in scope
+/// (glob-importing `crate::error_monitor::types::*` already handles that).
+pub use qontinui_types::process_management::ParserType;
+
+/// Runner-side helpers for [`ParserType`].
+///
+/// Replaces the inherent `impl ParserType { fn as_str; fn from_str; }` block
+/// that existed before the DTO moved to `qontinui-types` (the orphan rule
+/// forbids inherent impls on foreign types). Import this trait (or glob the
+/// parent module) to call these methods exactly as before.
+pub trait ParserTypeExt: Sized {
+    fn as_str(&self) -> &'static str;
+    fn from_str(s: &str) -> Option<Self>;
 }
 
-impl ParserType {
-    pub fn as_str(&self) -> &'static str {
+impl ParserTypeExt for ParserType {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Python => "python",
             Self::JavaScript => "javascript",
@@ -72,7 +76,7 @@ impl ParserType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> Option<Self> {
         match s {
             "python" => Some(Self::Python),
             "javascript" => Some(Self::JavaScript),
