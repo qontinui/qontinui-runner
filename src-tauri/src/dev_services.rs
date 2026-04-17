@@ -22,6 +22,7 @@ use crate::process_capture::ProcessConfig;
 const DOCKER_SERVICE_ID_SUFFIX: &str = "dev-docker";
 const BACKEND_SERVICE_ID_SUFFIX: &str = "dev-backend";
 const FRONTEND_SERVICE_ID_SUFFIX: &str = "dev-frontend";
+const EMBEDDING_SERVICE_ID_SUFFIX: &str = "dev-embedding";
 
 /// Detect the qontinui workspace root by looking for expected directories.
 ///
@@ -176,6 +177,36 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             rebuild_enabled: true,
             build_command: Some("npm".to_string()),
             build_args: vec!["run".to_string(), "build".to_string()],
+        });
+    }
+
+    // Embedding service (MiniLM-L6-v2 on port 8001)
+    // Standalone FastAPI server used by the runner's EmbeddingClient for
+    // hybrid search and knowledge graph embeddings.
+    let runner_dir = workspace.join("qontinui-runner");
+    let embedding_script = runner_dir.join("python-bridge").join("embedding_server.py");
+    if embedding_script.exists() {
+        services.push(ProcessConfig {
+            id: dev_service_id(workspace, EMBEDDING_SERVICE_ID_SUFFIX),
+            name: "Embedding Service (MiniLM-L6-v2)".to_string(),
+            command: "python".to_string(),
+            args: vec![embedding_script.to_string_lossy().to_string()],
+            cwd: runner_dir.join("python-bridge").to_string_lossy().to_string(),
+            env: HashMap::new(),
+            health_port: Some(8001),
+            parser: ParserType::Python,
+            auto_start: true,
+            category: "infrastructure".to_string(),
+            buffer_size: 2000,
+            enabled: true,
+            ignore_patterns: vec![],
+            // start_group 2: after backend (group 1) so the qontinui package
+            // and its sentence-transformers dependency are available.
+            start_group: 2,
+            dev_only: false,  // embeddings are needed in production too
+            rebuild_enabled: false,
+            build_command: None,
+            build_args: vec![],
         });
     }
 

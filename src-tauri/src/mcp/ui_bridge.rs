@@ -161,6 +161,7 @@ pub enum UiBridgeErrorCode {
     CircuitBreakerOpen,
     ConcurrencyLimitReached,
     FrontendUnresponsive,
+    FrontendNotReady,
     WindowNotFound,
     // Element targeting errors
     ElementNotFound,
@@ -275,6 +276,15 @@ impl UiBridgeError {
         }
     }
 
+    pub fn frontend_not_ready(diagnostics: serde_json::Value) -> Self {
+        Self {
+            code: UiBridgeErrorCode::FrontendNotReady,
+            message: "UI Bridge frontend did not become ready".to_string(),
+            recovery: Some(RecoveryHint::RetryAfterMs(2000)),
+            context: Some(diagnostics),
+        }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             code: UiBridgeErrorCode::InternalError,
@@ -291,7 +301,12 @@ impl UiBridgeError {
 /// error messages like "No element found" get the correct error code.
 pub fn classify_transport_error(error_msg: &str) -> UiBridgeError {
     // Transport-level errors
-    if error_msg.contains("timed out") {
+    if error_msg.contains("did not become ready") {
+        // Try to parse the diagnostics JSON that gather_readiness_diagnostics produced
+        let diagnostics = serde_json::from_str::<serde_json::Value>(error_msg)
+            .unwrap_or_else(|_| serde_json::json!({"raw": error_msg}));
+        UiBridgeError::frontend_not_ready(diagnostics)
+    } else if error_msg.contains("timed out") {
         UiBridgeError::timeout(0)
     } else if error_msg.contains("circuit breaker") {
         UiBridgeError::circuit_breaker_open()
@@ -333,6 +348,7 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
         UiBridgeErrorCode::CircuitBreakerOpen => RecoveryHint::WaitForRecovery,
         UiBridgeErrorCode::ConcurrencyLimitReached => RecoveryHint::RetryAfterMs(500),
         UiBridgeErrorCode::FrontendUnresponsive => RecoveryHint::WaitForRecovery,
+        UiBridgeErrorCode::FrontendNotReady => RecoveryHint::RetryAfterMs(2000),
         UiBridgeErrorCode::WindowNotFound => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::ElementNotFound => RecoveryHint::Resnapshot,
         UiBridgeErrorCode::ElementNotVisible => RecoveryHint::ScrollIntoView,
@@ -592,6 +608,12 @@ async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde_json::Valu
         .as_ref()
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false);
+    let sdk_connected = last_pong > 0;
+    let webview_url = main_window
+        .as_ref()
+        .and_then(|w| w.url().ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Build a human-readable hint based on the diagnostic state
     let hint = if !window_exists {
@@ -627,19 +649,21 @@ async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde_json::Valu
     let _ = boot_errors; // reserved for future use when Tauri eval returns values
 
     serde_json::json!({
-        "error": "UI Bridge frontend did not become ready within 10000ms",
+        "error": "frontend_not_ready",
         "diagnostics": {
+            "last_pong_age_ms": last_pong_age_ms,
+            "window_visible": window_visible,
+            "webview_url": webview_url,
+            "sdk_connected": sdk_connected,
+            "uptime_ms": process_uptime_ms,
+            "hint": hint,
             "lastPongMs": last_pong,
-            "lastPongAgeMs": last_pong_age_ms,
             "consoleErrorCount": console_error_count,
             "circuitBreakerState": format!("{:?}", cb_state),
             "circuitBreakerFailures": cb_failures,
-            "processUptimeMs": process_uptime_ms,
             "pendingRequestCount": pending_count,
             "semaphoreAvailablePermits": available_permits,
             "tauriMainWindowExists": window_exists,
-            "tauriMainWindowVisible": window_visible,
-            "hint": hint,
             "bootErrorsNote": "Call GET /ui-bridge/control/page/evaluate with expression 'JSON.stringify(window.__BOOT_ERRORS)' to retrieve boot-time JS errors"
         }
     })
@@ -945,10 +969,11 @@ fn wrap_ipc_result(
         Err(e) => {
             error!("UI Bridge API: {}", e);
             let detail = classify_transport_error(&e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error_detailed(e, detail)),
-            ))
+            let status = match detail.code {
+                UiBridgeErrorCode::FrontendNotReady => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            Err((status, Json(api_error_detailed(e, detail))))
         }
     }
 }
@@ -7524,7 +7549,17 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                     "discover", "find", "components", "component/:id/state", "navigate-and-wait",
                     "page/navigate", "page/refresh",
                     "page/back", "page/forward", "page/evaluate", "forms", "fill", "forms/snapshot", "forms/diff",
-                    "workflows", "specs", "query-selector", "keyboard-shortcuts"],
+                    "workflows", "specs", "query-selector", "keyboard-shortcuts", "batch"],
+                "batch": {
+                    "method": "POST",
+                    "path": "/ui-bridge/control/batch",
+                    "description": "Execute a sequence of element actions with snapshot diff",
+                    "maxBatchSize": 50,
+                    "body": {
+                        "steps": "[{ elementId, action, params? }]",
+                        "stopOnError": "boolean (default: true)"
+                    }
+                },
                 "navigateAndWait": {
                     "method": "POST",
                     "path": "/ui-bridge/control/navigate-and-wait",
@@ -8473,6 +8508,11 @@ pub async fn ui_bridge_diagnostics_handler(
         .as_ref()
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false);
+    let webview_url = main_window
+        .as_ref()
+        .and_then(|w| w.url().ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
     let ready = last_pong > 0;
     let readiness_hint = if !window_exists {
@@ -8504,11 +8544,13 @@ pub async fn ui_bridge_diagnostics_handler(
             "lastPongTimestamp": last_pong,
             "lastPongAgeMs": last_pong_age_ms,
             "ready": ready,
+            "sdkConnected": ready,
             "consoleErrorCount": console_error_count
         },
         "tauriMainWindow": {
             "exists": window_exists,
-            "visible": window_visible
+            "visible": window_visible,
+            "webviewUrl": webview_url
         },
         "pendingRequestCount": pending_count,
         "processUptimeMs": process_uptime_ms,
@@ -8539,9 +8581,10 @@ pub async fn ui_bridge_readiness_handler(
             StatusCode::OK,
             Json(serde_json::json!({
                 "ready": true,
-                "lastPongMs": last_pong,
-                "lastPongAgeMs": age_ms,
-                "processUptimeMs": state.started_at.elapsed().as_millis() as u64
+                "sdk_connected": true,
+                "last_pong_age_ms": age_ms,
+                "uptime_ms": state.started_at.elapsed().as_millis() as u64,
+                "lastPongMs": last_pong
             })),
         )
     } else {
@@ -9224,9 +9267,9 @@ async fn ui_bridge_batch_handler(
 
     if batch.operations.len() > MAX_BATCH_SIZE {
         let error_body = serde_json::json!({
-            "error": "Batch size exceeds maximum",
+            "error": "batch_size_exceeded",
             "max": MAX_BATCH_SIZE,
-            "requested": batch.operations.len()
+            "received": batch.operations.len()
         });
         return Err((
             StatusCode::BAD_REQUEST,
@@ -10461,11 +10504,30 @@ pub async fn ui_bridge_control_batch_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    const MAX_BATCH_SIZE: usize = 50;
+
     let steps = request
         .get("steps")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+
+    if steps.len() > MAX_BATCH_SIZE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(serde_json::to_string(&serde_json::json!({
+                    "error": "batch_size_exceeded",
+                    "max": MAX_BATCH_SIZE,
+                    "received": steps.len()
+                })).unwrap_or_default()),
+                error_detail: None,
+            }),
+        ));
+    }
+
     let stop_on_error = request
         .get("stopOnError")
         .or_else(|| request.get("stopOnFailure"))
