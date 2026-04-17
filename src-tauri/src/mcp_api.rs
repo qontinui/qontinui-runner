@@ -1121,6 +1121,10 @@ pub fn create_router(
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
         .route("/cloud-relay/login", post(cloud_relay_login))
+        .route(
+            "/cloud-relay/poll-devices",
+            get(cloud_relay_poll_devices_diagnostic),
+        )
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))
@@ -1172,6 +1176,139 @@ async fn cloud_relay_login(
 async fn cloud_relay_status() -> axum::Json<serde_json::Value> {
     let status = crate::mcp::backend_relay::commands::get_cloud_relay_status_internal().await;
     axum::Json(status)
+}
+
+/// Diagnostic: manually run one cloud device poll cycle and report what happens.
+async fn cloud_relay_poll_devices_diagnostic(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> axum::Json<serde_json::Value> {
+    let mut steps: Vec<serde_json::Value> = Vec::new();
+
+    // Step 1: Read settings
+    let cloud_settings =
+        crate::config_facade::get_setting::<crate::settings::CloudRelaySettings>();
+    steps.push(serde_json::json!({
+        "step": "settings",
+        "device_bridge_enabled": cloud_settings.device_bridge_enabled,
+        "backend_url": cloud_settings.backend_url,
+        "poll_secs": cloud_settings.cloud_registry_poll_secs,
+    }));
+    if !cloud_settings.device_bridge_enabled {
+        steps.push(serde_json::json!({"step": "ABORT", "reason": "device_bridge_enabled=false"}));
+        return axum::Json(serde_json::json!({"steps": steps}));
+    }
+
+    // Step 2: Get auth token
+    let token = match crate::auth::AuthManager::new().get_access_token() {
+        Ok(t) => {
+            steps.push(serde_json::json!({
+                "step": "auth_token",
+                "status": "ok",
+                "token_len": t.len(),
+                "token_prefix": &t[..20.min(t.len())],
+            }));
+            t
+        }
+        Err(e) => {
+            steps.push(serde_json::json!({
+                "step": "auth_token",
+                "status": "FAILED",
+                "error": e.to_string(),
+            }));
+            return axum::Json(serde_json::json!({"steps": steps}));
+        }
+    };
+
+    // Step 3: Poll available-devices
+    let poller = crate::mcp::discovery::cloud_registry::CloudRegistryPoller::new(
+        cloud_settings.backend_url.clone(),
+        cloud_settings.cloud_registry_poll_secs,
+    );
+    match poller.poll(&token).await {
+        Ok(devices) => {
+            steps.push(serde_json::json!({
+                "step": "poll",
+                "status": "ok",
+                "device_count": devices.len(),
+                "devices": devices.iter().map(|d| serde_json::json!({
+                    "device_id": d.device_id,
+                    "platform": d.platform,
+                    "display_name": d.display_name,
+                })).collect::<Vec<_>>(),
+            }));
+
+            // Step 4: Try to open tunnel for first device
+            if let Some(device) = devices.first() {
+                let cloud_transport = crate::mcp::transport::cloud::CloudTransport::new(
+                    cloud_settings.backend_url.clone(),
+                );
+                match cloud_transport
+                    .open_tunnel(&device.device_id, &token)
+                    .await
+                {
+                    Ok(port) => {
+                        steps.push(serde_json::json!({
+                            "step": "tunnel",
+                            "status": "ok",
+                            "local_port": port,
+                            "device_id": device.device_id,
+                        }));
+
+                        // Step 5: Register in PhysicalDeviceRegistry
+                        let now = chrono::Utc::now().timestamp_millis();
+                        let info = crate::mcp::physical_device::PhysicalDeviceInfo {
+                            id: device.device_id.clone(),
+                            os: crate::mcp::transport::DeviceOs::Android,
+                            device_kind: "physical".to_string(),
+                            model: None,
+                            app_id: None,
+                            ui_bridge_version: None,
+                            first_seen_at: now,
+                            pairing_token: None,
+                        };
+                        let transport = crate::mcp::physical_device::ActiveTransport {
+                            kind: crate::mcp::transport::TransportKind::Cloud,
+                            proxy_url: format!("http://127.0.0.1:{}", port),
+                            established_at: now,
+                            last_healthy_at: now,
+                            fail_count: 0,
+                        };
+                        state.physical_device_registry.register(info, transport).await;
+                        steps.push(serde_json::json!({
+                            "step": "register",
+                            "status": "ok",
+                            "device_id": device.device_id,
+                            "proxy_url": format!("http://127.0.0.1:{}", port),
+                        }));
+                    }
+                    Err(e) => {
+                        steps.push(serde_json::json!({
+                            "step": "tunnel",
+                            "status": "FAILED",
+                            "error": e.to_string(),
+                            "device_id": device.device_id,
+                        }));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            steps.push(serde_json::json!({
+                "step": "poll",
+                "status": "FAILED",
+                "error": e.to_string(),
+            }));
+        }
+    }
+
+    // Final: report registry state
+    let devices = state.physical_device_registry.list_all().await;
+    steps.push(serde_json::json!({
+        "step": "final_registry",
+        "device_count": devices.len(),
+    }));
+
+    axum::Json(serde_json::json!({"steps": steps}))
 }
 
 /// Try to bind to a port with SO_REUSEADDR

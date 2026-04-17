@@ -1954,6 +1954,12 @@ class QontinuiExecutor:
             return self._handle_sm_get_active_states()
         elif cmd_type == "sm_get_available_transitions":
             return self._handle_sm_get_available_transitions()
+        elif cmd_type == "sm_get_permitted_triggers":
+            return self._handle_sm_get_permitted_triggers(params)
+        elif cmd_type == "sm_get_blocked_triggers":
+            return self._handle_sm_get_blocked_triggers(params)
+        elif cmd_type == "sm_get_mermaid_diagram":
+            return self._handle_sm_get_mermaid_diagram(params)
         elif cmd_type == "clear_state_machine":
             return self._handle_clear_state_machine()
 
@@ -5397,6 +5403,60 @@ class QontinuiExecutor:
             return {
                 "success": True,
                 "transitions": transition_list,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _handle_sm_get_permitted_triggers(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return transitions currently permitted from a (hypothetical) active set.
+
+        Accepts optional ``active_state_ids`` list to query a hypothetical
+        state configuration without disturbing the runtime's active set.
+        """
+        if self._ui_bridge_runtime is None:
+            return {"success": False, "error": "No state machine loaded"}
+
+        active_state_ids = params.get("active_state_ids") if params else None
+        try:
+            triggers = self._ui_bridge_runtime.get_permitted_triggers(active_state_ids)
+            return {
+                "success": True,
+                "permitted_triggers": triggers,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _handle_sm_get_blocked_triggers(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return transitions currently blocked, each annotated with a reason."""
+        if self._ui_bridge_runtime is None:
+            return {"success": False, "error": "No state machine loaded"}
+
+        active_state_ids = params.get("active_state_ids") if params else None
+        try:
+            triggers = self._ui_bridge_runtime.get_blocked_triggers(active_state_ids)
+            return {
+                "success": True,
+                "blocked_triggers": triggers,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _handle_sm_get_mermaid_diagram(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return a Mermaid ``stateDiagram-v2`` source for the loaded machine.
+
+        Accepts optional ``active_state_ids`` list to highlight a hypothetical
+        active-state configuration. When absent or empty, the runtime's
+        current active set is highlighted.
+        """
+        if self._ui_bridge_runtime is None:
+            return {"success": False, "error": "No state machine loaded"}
+
+        active_state_ids = params.get("active_state_ids") if params else None
+        try:
+            diagram = self._ui_bridge_runtime.get_mermaid_diagram(active_state_ids)
+            return {
+                "success": True,
+                "diagram": diagram,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}

@@ -5,7 +5,7 @@
  * using the runner's local HTTP API (via getApiBase()).
  */
 
-import type { WorkflowDataAdapter } from "@qontinui/workflow-ui";
+import type { WorkflowDataAdapter, PermittedTrigger, BlockedTrigger } from "@qontinui/workflow-ui";
 import type { UnifiedWorkflow, SkillDefinition } from "@qontinui/shared-types/workflow";
 import type { LibraryItem } from "@qontinui/shared-types/library";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
@@ -173,6 +173,55 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
         return data.workflows ?? data ?? [];
       } catch {
         return [];
+      }
+    },
+
+    async getPermittedTriggers(activeStateIds: string[]): Promise<PermittedTrigger[]> {
+      try {
+        const qs = activeStateIds.length
+          ? `?active_state_ids=${encodeURIComponent(activeStateIds.join(","))}`
+          : "";
+        const res = await tracedFetch(`${getApiBase()}/state-machine/permitted-triggers${qs}`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        // ApiResponse envelope: { success, data: { permitted_triggers: [...] } }
+        const inner = data.data ?? data;
+        const list = inner?.permitted_triggers ?? [];
+        return Array.isArray(list) ? (list as PermittedTrigger[]) : [];
+      } catch {
+        return [];
+      }
+    },
+
+    async getBlockedTriggers(activeStateIds: string[]): Promise<BlockedTrigger[]> {
+      try {
+        const qs = activeStateIds.length
+          ? `?active_state_ids=${encodeURIComponent(activeStateIds.join(","))}`
+          : "";
+        const res = await tracedFetch(`${getApiBase()}/state-machine/blocked-triggers${qs}`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        const inner = data.data ?? data;
+        const list = inner?.blocked_triggers ?? [];
+        return Array.isArray(list) ? (list as BlockedTrigger[]) : [];
+      } catch {
+        return [];
+      }
+    },
+
+    async getMermaidDiagram(activeStateIds?: string[]): Promise<string> {
+      try {
+        const ids = activeStateIds ?? [];
+        const qs = ids.length ? `?active_state_ids=${encodeURIComponent(ids.join(","))}` : "";
+        const res = await tracedFetch(`${getApiBase()}/state-machine/mermaid-diagram${qs}`);
+        if (!res.ok) return "";
+        const data = await res.json();
+        // ApiResponse envelope: { success, data: { diagram: "..." } }
+        const inner = data.data ?? data;
+        const diagram = inner?.diagram;
+        return typeof diagram === "string" ? diagram : "";
+      } catch {
+        return "";
       }
     },
   };

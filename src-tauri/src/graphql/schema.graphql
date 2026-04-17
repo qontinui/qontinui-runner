@@ -45,6 +45,11 @@ enum CircuitBreakerState {
 }
 
 """
+Union of all cost-related events for the `costEvents` subscription.
+"""
+union CostEvent = GqlCostUpdateEvent | GqlBudgetWarningEvent | GqlCostAnomalyEvent
+
+"""
 Input for creating a new task run.
 """
 input CreateTaskRunInput {
@@ -69,6 +74,60 @@ type FindingResolvedEvent {
 type GenericRunnerEvent {
 	eventType: String!
 	data: JSON!
+}
+
+"""
+Budget warning when consumption exceeds a threshold.
+"""
+type GqlBudgetWarningEvent {
+	taskRunId: String!
+	remainingFraction: Float!
+	totalCostUsd: Float!
+	budgetLimitUsd: Float!
+	message: String!
+	timestamp: String!
+}
+
+"""
+Cost anomaly detected via statistical analysis.
+"""
+type GqlCostAnomalyEvent {
+	taskRunId: String!
+	costUsd: Float!
+	meanCostUsd: Float!
+	stdDev: Float!
+	zScore: Float!
+	message: String!
+	timestamp: String!
+}
+
+"""
+Real-time cost update after each AI call.
+"""
+type GqlCostUpdateEvent {
+	taskRunId: String!
+	phase: String!
+	iteration: Int
+	"""
+	Input tokens (u64 as string for GraphQL BigInt compat).
+	"""
+	inputTokens: String!
+	"""
+	Output tokens (u64 as string for GraphQL BigInt compat).
+	"""
+	outputTokens: String!
+	"""
+	Cache creation tokens (u64 as string for GraphQL BigInt compat).
+	"""
+	cacheCreationTokens: String!
+	"""
+	Cache read tokens (u64 as string for GraphQL BigInt compat).
+	"""
+	cacheReadTokens: String!
+	costUsd: Float!
+	cumulativeCostUsd: Float!
+	cacheHitRate: Float!
+	timestamp: String!
 }
 
 """
@@ -143,6 +202,7 @@ Finding action type.
 enum GqlFindingActionType {
 	AUTO_FIX
 	NEEDS_USER_INPUT
+	MANUAL
 	INFORMATIONAL
 }
 
@@ -221,7 +281,10 @@ type GqlLoopInstanceStatus {
 	running: Boolean!
 	phase: String!
 	currentIteration: Int!
-	maxIterations: Int!
+	"""
+	`None` means the loop has no iteration cap (unlimited).
+	"""
+	maxIterations: Int
 	workflowId: String!
 	targetRunnerPort: Int!
 	targetRunnerId: String
@@ -298,6 +361,8 @@ type GqlTaskRun {
 	isFixer: Boolean!
 	fixerSourceTaskRunId: String
 	isMetaOptimizer: Boolean!
+	isReview: Boolean!
+	blocksParent: Boolean!
 	createdAt: String!
 	updatedAt: String!
 	completedAt: String
@@ -342,7 +407,10 @@ type GqlWorkflow {
 	verificationSteps: JSON!
 	agenticSteps: JSON!
 	completionSteps: JSON!
-	maxIterations: Int!
+	"""
+	`None` is rendered as "unlimited" in clients; a positive value is the cap.
+	"""
+	maxIterations: Int
 	timeoutSeconds: Int
 	provider: String
 	model: String
@@ -369,7 +437,10 @@ type GqlWorkflowSummary {
 	description: String!
 	category: String!
 	tags: [String!]!
-	maxIterations: Int!
+	"""
+	`None` is rendered as "unlimited" in clients; a positive value is the cap.
+	"""
+	maxIterations: Int
 	timeoutSeconds: Int
 	provider: String
 	model: String
@@ -639,65 +710,6 @@ Typed runner event for the `runnerEvents` subscription.
 Replaces untyped serde_json::Value events from /ws/events.
 """
 union RunnerEvent = OrchestratorStateChangeEvent | StepProgressEvent | TaskRunUpdateEvent | FindingDetectedEvent | FindingResolvedEvent | AiOutputChunkEvent | GqlCostUpdateEvent | GqlBudgetWarningEvent | GqlCostAnomalyEvent | GenericRunnerEvent
-
-"""
-Union of all cost-related events for the `costEvents` subscription.
-"""
-union CostEvent = GqlCostUpdateEvent | GqlBudgetWarningEvent | GqlCostAnomalyEvent
-
-"""
-Real-time cost update after each AI call.
-"""
-type GqlCostUpdateEvent {
-	taskRunId: String!
-	phase: String!
-	iteration: Int
-	"""
-	Input tokens (u64 as string for GraphQL BigInt compat).
-	"""
-	inputTokens: String!
-	"""
-	Output tokens (u64 as string for GraphQL BigInt compat).
-	"""
-	outputTokens: String!
-	"""
-	Cache creation tokens (u64 as string for GraphQL BigInt compat).
-	"""
-	cacheCreationTokens: String!
-	"""
-	Cache read tokens (u64 as string for GraphQL BigInt compat).
-	"""
-	cacheReadTokens: String!
-	costUsd: Float!
-	cumulativeCostUsd: Float!
-	cacheHitRate: Float!
-	timestamp: String!
-}
-
-"""
-Budget warning when consumption exceeds a threshold.
-"""
-type GqlBudgetWarningEvent {
-	taskRunId: String!
-	remainingFraction: Float!
-	totalCostUsd: Float!
-	budgetLimitUsd: Float!
-	message: String!
-	timestamp: String!
-}
-
-"""
-Cost anomaly detected via statistical analysis.
-"""
-type GqlCostAnomalyEvent {
-	taskRunId: String!
-	costUsd: Float!
-	meanCostUsd: Float!
-	stdDev: Float!
-	zScore: Float!
-	message: String!
-	timestamp: String!
-}
 
 """
 Information about an external SDK app connection.

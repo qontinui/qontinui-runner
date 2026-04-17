@@ -6,7 +6,7 @@
 //! for state machine configs, states, and transitions stored in PostgreSQL.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -439,6 +439,205 @@ pub async fn get_available_transitions(
     ))
 }
 
+/// Query parameters for trigger introspection endpoints.
+///
+/// ``active_state_ids`` is a comma-separated list of state IDs. When absent
+/// or empty, the current active state set is used.
+#[derive(Debug, Deserialize, Default)]
+pub struct TriggerIntrospectionQuery {
+    #[serde(default)]
+    pub active_state_ids: Option<String>,
+}
+
+impl TriggerIntrospectionQuery {
+    fn as_id_list(&self) -> Vec<String> {
+        match &self.active_state_ids {
+            Some(s) if !s.is_empty() => s
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// GET /state-machine/permitted-triggers?active_state_ids=a,b,c
+/// Return transitions currently permitted from the (hypothetical) active set.
+pub async fn get_permitted_triggers(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<TriggerIntrospectionQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let active_state_ids = query.as_id_list();
+    info!(
+        "State Machine API: Getting permitted triggers (active_state_ids={:?})",
+        active_state_ids
+    );
+
+    let app_state = state.app_state.clone();
+    let params = serde_json::json!({ "active_state_ids": active_state_ids });
+    let timeout = std::time::Duration::from_secs(10);
+
+    let result = tokio::task::spawn_blocking(move || {
+        with_default_bridge(&app_state, |bridge| {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("sm_get_permitted_triggers", Some(params), timeout)
+        })?
+    })
+    .await
+    .map_err(|e| {
+        error!("State Machine API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                Ok(Json(ApiResponse::success(
+                    response
+                        .data
+                        .unwrap_or(serde_json::json!({"permitted_triggers": []})),
+                )))
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to get permitted triggers".to_string());
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
+            }
+        }
+        Err(e) => {
+            error!("State Machine API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// GET /state-machine/blocked-triggers?active_state_ids=a,b,c
+/// Return transitions currently blocked, each with a structured reason.
+pub async fn get_blocked_triggers(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<TriggerIntrospectionQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let active_state_ids = query.as_id_list();
+    info!(
+        "State Machine API: Getting blocked triggers (active_state_ids={:?})",
+        active_state_ids
+    );
+
+    let app_state = state.app_state.clone();
+    let params = serde_json::json!({ "active_state_ids": active_state_ids });
+    let timeout = std::time::Duration::from_secs(10);
+
+    let result = tokio::task::spawn_blocking(move || {
+        with_default_bridge(&app_state, |bridge| {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("sm_get_blocked_triggers", Some(params), timeout)
+        })?
+    })
+    .await
+    .map_err(|e| {
+        error!("State Machine API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                Ok(Json(ApiResponse::success(
+                    response
+                        .data
+                        .unwrap_or(serde_json::json!({"blocked_triggers": []})),
+                )))
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to get blocked triggers".to_string());
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
+            }
+        }
+        Err(e) => {
+            error!("State Machine API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// GET /state-machine/mermaid-diagram?active_state_ids=a,b,c
+/// Return a Mermaid ``stateDiagram-v2`` source for the loaded state machine.
+/// When ``active_state_ids`` is absent or empty, the runtime's current active
+/// states are highlighted; otherwise the specified hypothetical set is used.
+pub async fn get_mermaid_diagram(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<TriggerIntrospectionQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let active_state_ids = query.as_id_list();
+    info!(
+        "State Machine API: Getting Mermaid diagram (active_state_ids={:?})",
+        active_state_ids
+    );
+
+    let app_state = state.app_state.clone();
+    let params = serde_json::json!({ "active_state_ids": active_state_ids });
+    let timeout = std::time::Duration::from_secs(10);
+
+    let result = tokio::task::spawn_blocking(move || {
+        with_default_bridge(&app_state, |bridge| {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("sm_get_mermaid_diagram", Some(params), timeout)
+        })?
+    })
+    .await
+    .map_err(|e| {
+        error!("State Machine API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                Ok(Json(ApiResponse::success(
+                    response
+                        .data
+                        .unwrap_or(serde_json::json!({"diagram": ""})),
+                )))
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to get mermaid diagram".to_string());
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
+            }
+        }
+        Err(e) => {
+            error!("State Machine API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// DELETE /state-machine — Clear loaded state machine
 pub async fn clear_state_machine(
     State(state): State<Arc<ApiState>>,
@@ -675,6 +874,18 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/state-machine/available-transitions",
             get(get_available_transitions),
+        )
+        .route(
+            "/state-machine/permitted-triggers",
+            get(get_permitted_triggers),
+        )
+        .route(
+            "/state-machine/blocked-triggers",
+            get(get_blocked_triggers),
+        )
+        .route(
+            "/state-machine/mermaid-diagram",
+            get(get_mermaid_diagram),
         )
         .route("/state-machine", delete(clear_state_machine))
         // CRUD operations for state machine configs (SQLite)

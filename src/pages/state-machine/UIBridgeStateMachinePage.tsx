@@ -21,6 +21,7 @@ import {
   Search,
   Layers,
   ArrowRightLeft,
+  Workflow,
 } from "lucide-react";
 import type {
   StateMachineTransitionCreate,
@@ -33,8 +34,11 @@ import {
   TransitionEditor,
   StateDetailPanel,
   PathfindingPanel,
+  DiagramTab,
 } from "@qontinui/workflow-ui/state-machine";
 import type { CaptureScreenshotMeta } from "@qontinui/workflow-ui/state-machine";
+
+import type { PermittedTrigger, BlockedTrigger } from "@qontinui/workflow-ui";
 
 import { useStateMachineConfig } from "@/hooks/useStateMachineConfig";
 import { useElementDrag } from "@/hooks/useElementDrag";
@@ -45,12 +49,17 @@ import { UIBridgeDiscoveryPanel } from "./UIBridgeDiscoveryPanel";
 import { ExportPanel } from "./ExportPanel";
 import { ToastContainer } from "@/components/ToastContainer";
 import { StateExplorationResultsViewer } from "@/components/state-explorer/StateExplorationResultsViewer";
+import { createRunnerDataAdapter } from "@/lib/workflow-builder/runner-data-adapter";
+
+// Singleton adapter reused across introspection fetches.
+const dataAdapter = createRunnerDataAdapter();
 
 const TABS = [
   { value: "discovery", label: "Discovery", icon: Search },
   { value: "graph", label: "Graph Editor", icon: GitBranch },
   { value: "states", label: "State View", icon: Layers },
   { value: "transitions", label: "Transitions", icon: ArrowRightLeft },
+  { value: "diagram", label: "Diagram", icon: Workflow },
   { value: "pathfinding", label: "Pathfinding", icon: Route },
   { value: "exploration", label: "Exploration Results", icon: Network },
   { value: "export", label: "Export", icon: Download },
@@ -211,6 +220,16 @@ export function UIBridgeStateMachinePage() {
   // Derived state
   const states = sm.activeConfig?.states ?? [];
   const transitions = sm.activeConfig?.transitions ?? [];
+
+  // ======================================================================
+  // Trigger introspection: fetch permitted/blocked when on Transitions tab
+  // ======================================================================
+  const [permittedTriggers, setPermittedTriggers] = useState<PermittedTrigger[]>([]);
+  const [blockedTriggers, setBlockedTriggers] = useState<BlockedTrigger[]>([]);
+  // Hypothetical active state override. Empty means "use runtime's current
+  // active states". Future work: surface a picker; Phase 2 just wires the
+  // data flow end-to-end.
+  const [introspectionActiveIds] = useState<string[]>([]);
   const selectedState =
     states.find((s) => s.id === selectedStateId || s.state_id === selectedStateId) ?? null;
   const selectedTransition = transitions.find((t) => t.id === selectedTransitionId) ?? null;
@@ -219,6 +238,72 @@ export function UIBridgeStateMachinePage() {
   const showTransitionPanel = (selectedTransition || showNewTransition) && !selectedState;
   const noConfig = !sm.activeConfig;
   const hasConfig = !!sm.activeConfig;
+
+  // Refetch permitted/blocked triggers when the Transitions tab opens or
+  // the active config changes. When no config is loaded, clear both lists.
+  useEffect(() => {
+    if (activeTab !== "transitions" || !hasConfig) {
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const [permitted, blocked] = await Promise.all([
+          dataAdapter.getPermittedTriggers
+            ? dataAdapter.getPermittedTriggers(introspectionActiveIds)
+            : Promise.resolve([] as PermittedTrigger[]),
+          dataAdapter.getBlockedTriggers
+            ? dataAdapter.getBlockedTriggers(introspectionActiveIds)
+            : Promise.resolve([] as BlockedTrigger[]),
+        ]);
+        if (cancelled) return;
+        setPermittedTriggers(permitted);
+        setBlockedTriggers(blocked);
+      } catch {
+        if (!cancelled) {
+          setPermittedTriggers([]);
+          setBlockedTriggers([]);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, hasConfig, activeConfigId, introspectionActiveIds]);
+
+  // ======================================================================
+  // Mermaid diagram: fetch when the Diagram tab is selected or the active
+  // state set / config changes.
+  // ======================================================================
+  const [diagramSource, setDiagramSource] = useState<string>("");
+  const [diagramLoading, setDiagramLoading] = useState(false);
+  const [diagramRefreshNonce, setDiagramRefreshNonce] = useState(0);
+
+  useEffect(() => {
+    if (activeTab !== "diagram" || !hasConfig) return;
+    if (!dataAdapter.getMermaidDiagram) return;
+    let cancelled = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch lifecycle
+    setDiagramLoading(true);
+    (async () => {
+      try {
+        const src = await dataAdapter.getMermaidDiagram!(introspectionActiveIds);
+        if (cancelled) return;
+        setDiagramSource(src);
+      } catch {
+        if (!cancelled) setDiagramSource("");
+      } finally {
+        if (!cancelled) setDiagramLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, hasConfig, activeConfigId, introspectionActiveIds, diagramRefreshNonce]);
+
+  const handleRefreshDiagram = useCallback(() => {
+    setDiagramRefreshNonce((n) => n + 1);
+  }, []);
 
   // Transition operations
   const handleCreateTransition = useCallback(
@@ -524,6 +609,30 @@ export function UIBridgeStateMachinePage() {
               setSelectedTransitionId(id);
               setSelectedStateId(null);
             }}
+            activeStateIds={introspectionActiveIds}
+            permittedTriggers={permittedTriggers}
+            blockedTriggers={blockedTriggers}
+          />
+        </div>
+      </div>
+
+      {/* Diagram Tab */}
+      <div className={`flex-1 flex min-h-0 ${activeTab !== "diagram" ? "hidden" : ""}`}>
+        <div
+          className={
+            noConfig && !sm.isLoading
+              ? "flex-1 flex items-center justify-center text-text-muted"
+              : "hidden"
+          }
+        >
+          Select a configuration to view the diagram
+        </div>
+        <div className={hasConfig ? "flex-1 flex" : "hidden"}>
+          <DiagramTab
+            activeStateIds={introspectionActiveIds}
+            diagramSource={diagramSource}
+            isLoading={diagramLoading}
+            onRefresh={handleRefreshDiagram}
           />
         </div>
       </div>
