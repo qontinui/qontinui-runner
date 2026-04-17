@@ -366,6 +366,9 @@ pub fn build_meta_workflow_template(
         security_profile: None,
         max_fix_attempts: 3,
         max_ci_auto_resumes: 10,
+        htn_enabled: false,
+        htn_ui_bridge_url: None,
+        htn_state_machine_path: None,
         created_at: now.clone(),
         updated_at: now,
     }
@@ -609,11 +612,22 @@ Notice `ui_bridge_target` is a STRING containing JSON — NOT an object. The `Ex
         } else {
             project_tree
         };
+        // Resolve the runner's own API port so the Builder can emit commands
+        // that target the correct localhost URL. Without this, the Builder
+        // invents port numbers based on training data, and spec-driven
+        // setup steps like `ensure_runner_up` fail on temp runners
+        // (port 9877-9899). The supervisor sets QONTINUI_PORT on every
+        // spawned runner, so get_mcp_api_port() returns the actual bound
+        // port for both primary and temp runners.
+        let runner_api_port = crate::mcp::types::get_mcp_api_port();
+
         prompt.push_str(&format!(
             r#"
 ## Project Context
 
 Project root: {project_root}
+Runner API: http://localhost:{runner_api_port}
+Runner UI Bridge: http://localhost:{runner_api_port}/ui-bridge
 
 ### Project Structure
 {tree_section}
@@ -621,9 +635,15 @@ Project root: {project_root}
 Use this structure to write accurate file paths in verification commands and working_directory fields.
 The generated workflow has FULL filesystem access when executed — it is NOT restricted to any subdirectory.
 Commands in the generated workflow can read, write, and execute in any directory within the project.
+
+**Runner self-reference:** This workflow will execute ON the runner itself at port {runner_api_port}.
+Any HTTP calls to the runner API or UI Bridge MUST use `http://localhost:{runner_api_port}` — do NOT
+guess or hardcode a different port. For UI Bridge control operations, use
+`http://localhost:{runner_api_port}/ui-bridge/control/...`.
 "#,
             project_root = project_root,
             tree_section = tree_section,
+            runner_api_port = runner_api_port,
         ));
     }
 

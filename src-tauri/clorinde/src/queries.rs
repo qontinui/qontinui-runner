@@ -8,6 +8,7 @@ pub mod checks;
 pub mod decisions;
 pub mod deferred_questions;
 pub mod error_monitor;
+pub mod event_search;
 pub mod findings;
 pub mod graph_ops;
 pub mod learning;

@@ -841,6 +841,9 @@ CREATE TABLE IF NOT EXISTS deferred_questions (
 
 CREATE INDEX IF NOT EXISTS idx_dq_task_run_id ON deferred_questions(task_run_id);
 CREATE INDEX IF NOT EXISTS idx_dq_status ON deferred_questions(status);
+-- Full-text search (question + context_json) — mirrors idx_obs_fts expression-index pattern
+CREATE INDEX IF NOT EXISTS idx_dq_fts ON deferred_questions
+    USING GIN (to_tsvector('english', question || ' ' || COALESCE(context_json, '')));
 
 -- Settings (key-value store with JSON values)
 CREATE TABLE IF NOT EXISTS settings (
@@ -1207,6 +1210,9 @@ CREATE INDEX IF NOT EXISTS idx_error_events_captured ON error_events(captured_at
 CREATE INDEX IF NOT EXISTS idx_error_events_last_seen ON error_events(last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_error_events_source_name ON error_events(log_source_name);
 CREATE INDEX IF NOT EXISTS idx_error_events_trace_id ON error_events(trace_id);
+-- Full-text search (message + stack_trace + context_lines) — mirrors idx_obs_fts expression-index pattern
+CREATE INDEX IF NOT EXISTS idx_ee_fts ON error_events
+    USING GIN (to_tsvector('english', message || ' ' || COALESCE(stack_trace, '') || ' ' || COALESCE(context_lines, '')));
 
 -- Task Run Findings (detected issues within a task run)
 CREATE TABLE IF NOT EXISTS task_run_findings (
