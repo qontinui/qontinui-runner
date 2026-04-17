@@ -15,6 +15,20 @@ requests = "^2.31"
 pynput = "^1.7"
 httpx = "^0.28"
 aiohttp = "^3.9"
+# Pin opencv-python-headless explicitly.
+#
+# IMPORTANT: Do NOT allow `opencv-python` (non-headless) to be installed
+# alongside `opencv-python-headless`. Both ship the same `cv2/` package;
+# having both in the same venv causes Windows crashes at import time:
+#   ImportError: DLL load failed while importing cv2:
+#     Invalid access to memory location.
+#
+# `supervision` (a transitive dep via qontinui) declares `opencv-python`,
+# which will clobber the headless install unless pinned here. If you ever
+# see the above error, run:
+#   poetry run pip uninstall -y opencv-python
+#   poetry run pip install --force-reinstall --no-deps "opencv-python-headless==4.11.0.86"
+opencv-python-headless = "4.11.0.86"
 
 
 [tool.poetry.group.dev.dependencies]
