@@ -15,6 +15,7 @@ pub mod canvas;
 pub mod checkpoints;
 pub mod checks;
 pub mod comparison;
+pub mod compensation;
 pub mod contradiction;
 pub mod decision_trail;
 pub mod deferred_questions;
@@ -868,6 +869,24 @@ const MIGRATIONS: &[Migration] = &[
                     RAISE NOTICE 'Moved public.% to runner schema', tbl;
                 END LOOP;
             END $$;
+        "#,
+    },
+    Migration {
+        version: 21,
+        description: "Add compensation_actions table for LIFO compensation stack (plan: restate-port-part-a §1.3–1.4)",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS compensation_actions (
+                id              BIGSERIAL PRIMARY KEY,
+                execution_id    TEXT NOT NULL,
+                action_index    INT NOT NULL,
+                action_json     JSONB NOT NULL,
+                executed        BOOLEAN NOT NULL DEFAULT FALSE,
+                result_json     JSONB,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                executed_at     TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_ca_execution ON compensation_actions(execution_id);
+            CREATE INDEX IF NOT EXISTS idx_ca_pending ON compensation_actions(execution_id) WHERE NOT executed;
         "#,
     },
 ];

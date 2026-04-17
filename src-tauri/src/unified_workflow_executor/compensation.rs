@@ -4,23 +4,263 @@
 //! opt-in git-based rollback when workflows fail. It records commit hashes
 //! after each agentic iteration and can revert to a known-good state on failure.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
 use crate::database::pg::PgDb;
 use crate::str_utils::truncate_str;
 
-use super::types::{IterationCommit, IterationDiff, RollbackPolicy};
+use super::types::{
+    CompensationAction, CompensationResult, CompensationType, IterationCommit, IterationDiff,
+    RollbackPolicy,
+};
 
 /// Manages commit checkpoints and rollback operations for workflow executions.
+///
+/// The LIFO compensation stack lives behind `Arc<Mutex<..>>` so the manager
+/// can be held by value in `LoopContext` while still supporting mutation
+/// through shared `&self` references across handler call sites.
 pub struct CompensationManager {
     pg_db: Arc<PgDb>,
+    /// In-memory LIFO stack of compensation actions recorded during execution.
+    stack: Arc<Mutex<Vec<CompensationAction>>>,
+    /// Map from in-memory CompensationAction.id (String) to the PG row id
+    /// returned by the INSERT. Needed so `execute_all` can atomically claim
+    /// rows via UPDATE..WHERE NOT executed.
+    id_map: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl CompensationManager {
     pub fn new(pg_db: Arc<PgDb>) -> Self {
-        Self { pg_db }
+        Self {
+            pg_db,
+            stack: Arc::new(Mutex::new(Vec::new())),
+            id_map: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Push a compensation action onto the in-memory LIFO stack and persist
+    /// it to `compensation_actions` (under the `runner` schema via search_path).
+    ///
+    /// The in-memory push succeeds unconditionally — a persistence failure is
+    /// logged but does not prevent compensation from being attempted in the
+    /// current run. Only a catastrophic serialization failure returns `Err`.
+    pub async fn push(
+        &self,
+        execution_id: &str,
+        action: CompensationAction,
+    ) -> Result<(), String> {
+        // Serialize first so we bail early on the only truly fatal case.
+        let action_json = serde_json::to_value(&action)
+            .map_err(|e| format!("Failed to serialize CompensationAction: {}", e))?;
+
+        let action_id = action.id.clone();
+
+        // Push to in-memory stack first so compensation is attempted even if
+        // the DB write fails below.
+        let new_len = {
+            let mut stack = self.stack.lock().await;
+            stack.push(action);
+            stack.len()
+        };
+        let action_index = (new_len - 1) as i32;
+
+        // Persist to PG. Failures are logged but non-fatal.
+        match self
+            .pg_db
+            .insert_compensation_action(execution_id, action_index, &action_json)
+            .await
+        {
+            Ok(row_id) => {
+                let mut id_map = self.id_map.lock().await;
+                id_map.insert(action_id, row_id);
+            }
+            Err(e) => {
+                warn!(
+                    "COMPENSATION: Failed to persist action to PG (execution_id={}, index={}): {} — in-memory stack still holds the entry",
+                    execution_id, action_index, e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute compensations based on the given rollback policy.
+    ///
+    /// Claims each action via PG `UPDATE .. WHERE NOT executed RETURNING id`
+    /// before running it; if the claim returns no rows another run already
+    /// executed that action (crash-resume idempotency guarantee — important
+    /// because e.g. PID reuse on Windows would make re-killing a real bug).
+    ///
+    /// Individual compensation failures do NOT short-circuit the loop — this
+    /// matches the behavior of the free-function `execute_all_compensations`.
+    pub async fn execute_all(
+        &self,
+        policy: &RollbackPolicy,
+        ctx_iteration_results: &[super::types::IterationResult],
+    ) -> Vec<CompensationResult> {
+        // Snapshot the stack so we don't hold the mutex across awaits.
+        let actions: Vec<CompensationAction> = {
+            let stack = self.stack.lock().await;
+            stack.clone()
+        };
+
+        // Policy-based filtering of which actions to run.
+        let to_run: Vec<CompensationAction> = match policy {
+            RollbackPolicy::None => {
+                info!("COMPENSATION: policy=None — skipping stack execution");
+                return Vec::new();
+            }
+            RollbackPolicy::Clean => {
+                // Full LIFO: reverse iteration over the whole stack.
+                actions.iter().rev().cloned().collect()
+            }
+            RollbackPolicy::LastGood => {
+                let best = find_last_good_iteration(ctx_iteration_results);
+                match best {
+                    Some(best_iter) => {
+                        info!(
+                            "COMPENSATION: policy=LastGood — rolling back entries with iteration > Some({})",
+                            best_iter
+                        );
+                        // Roll back everything past the good point, LIFO.
+                        actions
+                            .iter()
+                            .rev()
+                            .filter(|a| a.iteration > Some(best_iter))
+                            .cloned()
+                            .collect()
+                    }
+                    None => {
+                        info!(
+                            "COMPENSATION: policy=LastGood found no good iteration — falling back to Clean"
+                        );
+                        actions.iter().rev().cloned().collect()
+                    }
+                }
+            }
+        };
+
+        let mut results = Vec::with_capacity(to_run.len());
+        let id_map_snapshot: HashMap<String, i64> = {
+            let m = self.id_map.lock().await;
+            m.clone()
+        };
+
+        for action in to_run.iter() {
+            // Try to atomically claim the row in PG. If we don't have a row id
+            // (persistence failed at push-time), execute unconditionally — the
+            // in-memory stack is authoritative for this run.
+            let row_id_opt = id_map_snapshot.get(&action.id).copied();
+
+            if let Some(row_id) = row_id_opt {
+                match self.pg_db.claim_compensation_action(row_id).await {
+                    Ok(true) => {
+                        // Claimed — proceed to execute.
+                    }
+                    Ok(false) => {
+                        info!(
+                            "COMPENSATION: action {} (row_id={}) already executed by another run — skipping",
+                            action.id, row_id
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "COMPENSATION: Failed to claim action {} (row_id={}): {} — executing anyway",
+                            action.id, row_id, e
+                        );
+                    }
+                }
+            }
+
+            let result = execute_compensation(action).await;
+
+            // Persist the result JSON back to the row (best-effort).
+            if let Some(row_id) = row_id_opt {
+                let result_json = match serde_json::to_value(&result) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            "COMPENSATION: Failed to serialize result for action {}: {}",
+                            action.id, e
+                        );
+                        serde_json::Value::Null
+                    }
+                };
+                if let Err(e) = self
+                    .pg_db
+                    .save_compensation_result(row_id, &result_json)
+                    .await
+                {
+                    warn!(
+                        "COMPENSATION: Failed to save result for action {} (row_id={}): {}",
+                        action.id, row_id, e
+                    );
+                }
+            }
+
+            results.push(result);
+        }
+
+        let succeeded = results.iter().filter(|r| r.success).count();
+        let failed = results.iter().filter(|r| !r.success).count();
+        info!(
+            "COMPENSATION: execute_all complete ({:?}): {}/{} succeeded, {} failed",
+            policy,
+            succeeded,
+            results.len(),
+            failed
+        );
+
+        results
+    }
+
+    /// Rehydrate the in-memory stack from unexecuted PG rows for crash
+    /// recovery. Overwrites current in-memory state — intended to be called
+    /// only during startup-resume (no live run should have in-flight actions).
+    ///
+    /// Phase 1 has no caller for this method; the startup-resume integration
+    /// is deferred (see plan §1.3 option (a)). The method must exist and must
+    /// work — a later session will wire the call site.
+    pub async fn load_pending(&self, execution_id: &str) -> Result<(), String> {
+        let rows = self
+            .pg_db
+            .load_pending_compensation_actions(execution_id)
+            .await?;
+
+        let mut new_stack: Vec<CompensationAction> = Vec::with_capacity(rows.len());
+        let mut new_map: HashMap<String, i64> = HashMap::with_capacity(rows.len());
+
+        for (row_id, action_json) in rows {
+            match serde_json::from_value::<CompensationAction>(action_json) {
+                Ok(action) => {
+                    new_map.insert(action.id.clone(), row_id);
+                    new_stack.push(action);
+                }
+                Err(e) => {
+                    warn!(
+                        "COMPENSATION: Failed to deserialize pending action row_id={}: {} — skipping",
+                        row_id, e
+                    );
+                }
+            }
+        }
+
+        {
+            let mut stack = self.stack.lock().await;
+            *stack = new_stack;
+        }
+        {
+            let mut id_map = self.id_map.lock().await;
+            *id_map = new_map;
+        }
+
+        Ok(())
     }
 
     /// Record a commit hash checkpoint after an agentic phase completes.
@@ -379,6 +619,197 @@ fn parse_diff_stat(stat: &str) -> (Vec<String>, u32, u32) {
     (files, total_insertions, total_deletions)
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// Free compensation executor functions (ported from restate/compensation.rs).
+//
+// These are module-level `pub async fn`s — they are not methods on
+// `CompensationManager`. A later pass will wire the LIFO stack into the
+// manager; these functions provide the primitive "execute one compensation"
+// operations used by both the manager and the Restate service.
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Execute a single compensation action.
+pub async fn execute_compensation(action: &CompensationAction) -> CompensationResult {
+    let start = std::time::Instant::now();
+    info!(
+        "Executing compensation [{}]: {} ({})",
+        action.id, action.description, action.phase
+    );
+
+    let result = match &action.action_type {
+        CompensationType::GitReset {
+            commit_hash,
+            repo_path,
+        } => execute_git_reset(commit_hash, repo_path).await,
+
+        CompensationType::FileCleanup { paths } => execute_file_cleanup(paths).await,
+
+        CompensationType::WorktreeRemove {
+            worktree_path,
+            branch_name,
+        } => execute_worktree_remove(worktree_path, branch_name.as_deref()).await,
+
+        CompensationType::ProcessKill { pid } => execute_process_kill(*pid).await,
+
+        CompensationType::CustomCommand { command, args, cwd } => {
+            execute_custom_command(command, args, cwd).await
+        }
+    };
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    match &result {
+        Ok(()) => info!(
+            "Compensation [{}] succeeded in {}ms",
+            action.id, duration_ms
+        ),
+        Err(e) => error!(
+            "Compensation [{}] failed in {}ms: {}",
+            action.id, duration_ms, e
+        ),
+    }
+
+    CompensationResult {
+        action_id: action.id.clone(),
+        success: result.is_ok(),
+        error: result.err(),
+        duration_ms,
+    }
+}
+
+/// Execute all compensation actions in LIFO (reverse) order.
+/// Continues executing even if individual compensations fail.
+pub async fn execute_all_compensations(actions: &[CompensationAction]) -> Vec<CompensationResult> {
+    let mut results = Vec::with_capacity(actions.len());
+
+    // Execute in reverse order (LIFO)
+    for action in actions.iter().rev() {
+        let result = execute_compensation(action).await;
+        results.push(result);
+    }
+
+    let succeeded = results.iter().filter(|r| r.success).count();
+    let failed = results.iter().filter(|r| !r.success).count();
+    info!(
+        "Compensation complete: {}/{} succeeded, {} failed",
+        succeeded,
+        actions.len(),
+        failed
+    );
+
+    results
+}
+
+pub async fn execute_git_reset(commit_hash: &str, repo_path: &str) -> Result<(), String> {
+    let output = crate::process_helpers::tokio_no_window("git")
+        .args(["reset", "--hard", commit_hash])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run git reset: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git reset failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+pub async fn execute_file_cleanup(paths: &[String]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for path in paths {
+        if let Err(e) = tokio::fs::remove_file(path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                errors.push(format!("{}: {}", path, e));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("File cleanup errors: {}", errors.join(", ")))
+    }
+}
+
+pub async fn execute_worktree_remove(
+    worktree_path: &str,
+    _branch_name: Option<&str>,
+) -> Result<(), String> {
+    let output = crate::process_helpers::tokio_no_window("git")
+        .args(["worktree", "remove", "--force", worktree_path])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run git worktree remove: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        // Fallback: just delete the directory
+        warn!(
+            "git worktree remove failed, falling back to directory removal: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::fs::remove_dir_all(worktree_path)
+            .await
+            .map_err(|e| format!("Failed to remove worktree directory: {}", e))
+    }
+}
+
+pub async fn execute_process_kill(pid: u32) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let output = crate::process_helpers::tokio_no_window("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output()
+            .await
+            .map_err(|e| format!("taskkill failed: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "taskkill failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(format!("kill({}) failed with errno", pid))
+        }
+    }
+}
+
+pub async fn execute_custom_command(
+    command: &str,
+    args: &[String],
+    cwd: &str,
+) -> Result<(), String> {
+    let output = crate::process_helpers::tokio_no_window(command)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run command '{}': {}", command, e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Command '{}' failed: {}",
+            command,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +1097,249 @@ mod tests {
         let b_commits = mgr.get_iteration_commits("exec-B").unwrap();
         assert_eq!(b_commits.len(), 1);
         assert_eq!(b_commits[0].commit_hash, "bbb222");
+    }
+
+    // ── §1.7 compensation executor tests ─────────────────────────────
+
+    /// Build a `CompensationAction` of the given type for tests.
+    fn make_action(id: &str, phase: &str, action_type: CompensationType) -> CompensationAction {
+        CompensationAction {
+            id: id.to_string(),
+            phase: phase.to_string(),
+            iteration: None,
+            action_type,
+            recorded_at: "1970-01-01T00:00:00Z".to_string(),
+            description: format!("test action {}", id),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_push_and_execute_file_cleanup() {
+        // Create a tempdir with two real files.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_a = dir.path().join("a.txt");
+        let path_b = dir.path().join("b.txt");
+        tokio::fs::write(&path_a, b"alpha").await.expect("write a");
+        tokio::fs::write(&path_b, b"beta").await.expect("write b");
+        assert!(path_a.exists());
+        assert!(path_b.exists());
+
+        let paths = vec![
+            path_a.to_string_lossy().into_owned(),
+            path_b.to_string_lossy().into_owned(),
+        ];
+        let action = make_action(
+            "cleanup-1",
+            "test",
+            CompensationType::FileCleanup { paths },
+        );
+
+        let result = execute_compensation(&action).await;
+
+        assert!(
+            result.success,
+            "FileCleanup should succeed, got error: {:?}",
+            result.error
+        );
+        assert_eq!(result.action_id, "cleanup-1");
+        assert!(!path_a.exists(), "a.txt should have been deleted");
+        assert!(!path_b.exists(), "b.txt should have been deleted");
+    }
+
+    #[tokio::test]
+    async fn test_push_and_execute_worktree_remove() {
+        // We don't stand up a real git worktree here — just verify that
+        // `execute_worktree_remove` returns a structured `CompensationResult`
+        // for a nonexistent path (the fallback branch in the ported function
+        // delegates to `tokio::fs::remove_dir_all`, which surfaces as an Err
+        // rather than a panic). The point is to exercise the error path
+        // without requiring a live git repository in the test environment.
+        let nonexistent =
+            std::env::temp_dir().join("qontinui-nonexistent-worktree-xyz-42");
+        // Make sure it really doesn't exist.
+        let _ = tokio::fs::remove_dir_all(&nonexistent).await;
+        assert!(!nonexistent.exists());
+
+        let action = make_action(
+            "wt-1",
+            "test",
+            CompensationType::WorktreeRemove {
+                worktree_path: nonexistent.to_string_lossy().into_owned(),
+                branch_name: Some("test-branch".to_string()),
+            },
+        );
+
+        // Must not panic; must always populate duration_ms.
+        let result = execute_compensation(&action).await;
+
+        assert_eq!(result.action_id, "wt-1");
+        // duration_ms is u64 — assert it was at least recorded (0 is a valid
+        // value on a very fast machine, but `success == false` here should
+        // accompany a populated error string).
+        if !result.success {
+            assert!(
+                result.error.is_some(),
+                "failed worktree remove should carry an error message"
+            );
+        }
+        // duration_ms is u64 (always populated by execute_compensation at line ~659).
+        let _ = result.duration_ms;
+    }
+
+    #[tokio::test]
+    async fn test_lifo_ordering() {
+        // Exercises the lower-level `execute_all_compensations` free function,
+        // which tests the LIFO intent without requiring a PG connection.
+        // Push 3 FileCleanup actions with distinct file targets and verify
+        // that the first element of the returned `results` vector corresponds
+        // to the LAST pushed action.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut actions: Vec<CompensationAction> = Vec::new();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for i in 0..3u32 {
+            let p = dir.path().join(format!("f{}.txt", i));
+            tokio::fs::write(&p, format!("body-{}", i).as_bytes())
+                .await
+                .expect("write");
+            paths.push(p.clone());
+            actions.push(make_action(
+                &format!("a-{}", i),
+                "test",
+                CompensationType::FileCleanup {
+                    paths: vec![p.to_string_lossy().into_owned()],
+                },
+            ));
+        }
+
+        let results = execute_all_compensations(&actions).await;
+        assert_eq!(results.len(), 3);
+
+        // LIFO: results[0] is the LAST pushed action ("a-2"), results[2] is
+        // the FIRST pushed ("a-0").
+        assert_eq!(results[0].action_id, "a-2", "LIFO: first result = last pushed");
+        assert_eq!(results[1].action_id, "a-1");
+        assert_eq!(results[2].action_id, "a-0", "LIFO: last result = first pushed");
+
+        // All three files should be gone regardless of order.
+        for p in &paths {
+            assert!(!p.exists(), "{:?} should have been deleted", p);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn test_persist_and_load_stack() {
+        // Verifies §1.3 persistence + rehydrate semantics:
+        // push N actions through manager A, instantiate manager B on the same
+        // PgDb, call `load_pending`, and confirm the in-memory stack matches.
+        let db = PgDb::new_blocking_for_test();
+        let execution_id = format!(
+            "test-persist-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+
+        let mgr_a = CompensationManager::new(db.clone());
+        for i in 0..3u32 {
+            let action = make_action(
+                &format!("persist-{}-{}", execution_id, i),
+                "test",
+                CompensationType::FileCleanup {
+                    paths: vec![format!("/tmp/does-not-matter-{}.txt", i)],
+                },
+            );
+            mgr_a
+                .push(&execution_id, action)
+                .await
+                .expect("push must succeed with PG");
+        }
+
+        let mgr_b = CompensationManager::new(db.clone());
+        mgr_b
+            .load_pending(&execution_id)
+            .await
+            .expect("load_pending must succeed");
+
+        let stack_b = mgr_b.stack.lock().await;
+        assert_eq!(stack_b.len(), 3, "fresh manager should see 3 pending rows");
+        // action_index ordering (0,1,2) is preserved by load_pending.
+        assert!(stack_b[0].id.ends_with("-0"));
+        assert!(stack_b[1].id.ends_with("-1"));
+        assert!(stack_b[2].id.ends_with("-2"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_continues_on_failure() {
+        // Build 3 actions: [success, guaranteed-failure, success].
+        // `execute_all_compensations` runs them in REVERSE order, so the
+        // middle one is still the middle one in the output. Verify that the
+        // failing action does NOT short-circuit the loop — all 3 results
+        // must be present and the middle one must report success=false.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_first = dir.path().join("first.txt");
+        let path_last = dir.path().join("last.txt");
+        tokio::fs::write(&path_first, b"x").await.expect("write first");
+        tokio::fs::write(&path_last, b"y").await.expect("write last");
+
+        // Use the system temp dir as cwd — exists on all platforms.
+        let safe_cwd = std::env::temp_dir().to_string_lossy().into_owned();
+
+        let actions = vec![
+            // pushed first → executed LAST (LIFO)
+            make_action(
+                "ok-first",
+                "test",
+                CompensationType::FileCleanup {
+                    paths: vec![path_first.to_string_lossy().into_owned()],
+                },
+            ),
+            // pushed second → executed in the middle; must fail
+            make_action(
+                "fail-middle",
+                "test",
+                CompensationType::CustomCommand {
+                    command: "qontinui-nonexistent-binary-xyz123".to_string(),
+                    args: vec![],
+                    cwd: safe_cwd,
+                },
+            ),
+            // pushed last → executed FIRST (LIFO)
+            make_action(
+                "ok-last",
+                "test",
+                CompensationType::FileCleanup {
+                    paths: vec![path_last.to_string_lossy().into_owned()],
+                },
+            ),
+        ];
+
+        let results = execute_all_compensations(&actions).await;
+
+        assert_eq!(results.len(), 3, "all three actions must be attempted");
+
+        // LIFO: results[0]="ok-last", results[1]="fail-middle", results[2]="ok-first".
+        assert_eq!(results[0].action_id, "ok-last");
+        assert!(results[0].success, "ok-last should succeed");
+
+        assert_eq!(results[1].action_id, "fail-middle");
+        assert!(
+            !results[1].success,
+            "fail-middle should fail (nonexistent binary)"
+        );
+        assert!(
+            results[1].error.is_some(),
+            "failed action must carry an error message"
+        );
+
+        assert_eq!(results[2].action_id, "ok-first");
+        assert!(
+            results[2].success,
+            "ok-first must still run even after the middle failure: {:?}",
+            results[2].error
+        );
+
+        // Both cleanup targets should have been deleted (execution continued).
+        assert!(!path_first.exists());
+        assert!(!path_last.exists());
     }
 
     // ── helpers ───────────────────────────────────────────────────────

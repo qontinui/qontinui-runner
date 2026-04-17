@@ -731,6 +731,57 @@ impl LoopConfig {
     }
 }
 
+/// A compensation action that can be executed to undo a side effect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompensationAction {
+    /// Unique identifier for this compensation
+    pub id: String,
+    /// Phase that created this compensation
+    pub phase: String,
+    /// Iteration number (if applicable)
+    pub iteration: Option<u32>,
+    /// The type and parameters of the compensation
+    pub action_type: CompensationType,
+    /// When this compensation was recorded
+    pub recorded_at: String,
+    /// Human-readable description
+    pub description: String,
+}
+
+/// Types of compensation actions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CompensationType {
+    /// Reset a git repository to a specific commit
+    GitReset {
+        commit_hash: String,
+        repo_path: String,
+    },
+    /// Remove specific files created during execution
+    FileCleanup { paths: Vec<String> },
+    /// Remove a git worktree
+    WorktreeRemove {
+        worktree_path: String,
+        branch_name: Option<String>,
+    },
+    /// Kill a spawned process
+    ProcessKill { pid: u32 },
+    /// Run a custom shell command for cleanup
+    CustomCommand {
+        command: String,
+        args: Vec<String>,
+        cwd: String,
+    },
+}
+
+/// Result of executing a single compensation action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompensationResult {
+    pub action_id: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
 /// Result of the completion sweep phase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepResult {

@@ -237,6 +237,52 @@ impl LoopController {
                     }
                 }
             }
+
+            // Stack-based compensation: run any per-iteration compensation actions
+            // that were pushed during the loop (currently just pre-agentic GitResets).
+            // This is belt-and-suspenders alongside the single-shot execute_rollback
+            // above — the stack carries iteration-granular commit hashes that
+            // `execute_rollback`'s source_commit/LastGood flow does not manage.
+            let stack_results = ctx
+                .compensation_manager
+                .execute_all(&config.rollback_policy, &loop_result.iteration_results)
+                .await;
+            for result in &stack_results {
+                if !result.success {
+                    warn!(
+                        action_id = %result.action_id,
+                        error = ?result.error,
+                        "COMPENSATION: stack action failed"
+                    );
+                }
+            }
+        }
+
+        // Worktree finalizer: drained AFTER the stack has executed, unconditional
+        // when a rollback policy is active. Keeping worktree removal out-of-stack
+        // avoids two failure modes: (1) LastGood leaking the worktree by only
+        // running the per-iteration resets, and (2) crash-resume trying to
+        // git-reset a path that was already removed.
+        if !matches!(config.rollback_policy, RollbackPolicy::None)
+            && !loop_result.verification_passed
+            && !loop_result.was_stopped
+        {
+            if let Some(finalizer) = ctx.worktree_finalizer.take() {
+                let worktree_path = finalizer.worktree_path.to_string_lossy().to_string();
+                if let Err(e) = compensation::execute_worktree_remove(
+                    &worktree_path,
+                    finalizer.branch_name.as_deref(),
+                )
+                .await
+                {
+                    warn!(
+                        "COMPENSATION: worktree finalizer failed for {}: {}",
+                        worktree_path, e
+                    );
+                } else {
+                    info!("COMPENSATION: worktree finalizer removed {}", worktree_path);
+                }
+            }
         }
 
         // Auto-detect recurring findings → known issues
@@ -1720,6 +1766,30 @@ impl LoopController {
         } else {
             None
         };
+
+        // Push a pre-agentic GitReset onto the compensation stack so a failure
+        // after this iteration's AI changes can be rolled back to the exact
+        // commit observed right now. Uses ctx.commit_before we just captured.
+        if let (Some(wd), Some(commit)) = (working_dir, ctx.commit_before.as_deref()) {
+            let action = crate::unified_workflow_executor::types::CompensationAction {
+                id: format!("comp-{}-iter-{}", config.execution_id, ctx.iteration),
+                phase: "agentic".into(),
+                iteration: Some(ctx.iteration),
+                action_type: crate::unified_workflow_executor::types::CompensationType::GitReset {
+                    commit_hash: commit.to_string(),
+                    repo_path: wd.to_string_lossy().to_string(),
+                },
+                recorded_at: chrono::Utc::now().to_rfc3339(),
+                description: format!("Reset to pre-iteration-{} commit", ctx.iteration),
+            };
+            if let Err(e) = ctx
+                .compensation_manager
+                .push(&config.execution_id, action)
+                .await
+            {
+                warn!("COMPENSATION: failed to push pre-agentic GitReset: {}", e);
+            }
+        }
 
         // Capture error baseline before agentic phase for regression detection.
         // After the AI makes changes, we compare to identify newly introduced errors.

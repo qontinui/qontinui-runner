@@ -13,6 +13,7 @@
 //! Each handler is 30-150 lines (vs 2,000+ in the monolith) and can be tested
 //! independently by constructing its input state and asserting the returned state.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::step_executor::{ExecutionStepConfig, VerificationPhaseResult};
@@ -22,6 +23,17 @@ use super::convergence::{
     ConvergenceAction, ConvergenceConfig, ConvergenceDetector, ConvergenceReport,
 };
 use super::types::{AgenticOutcome, IterationResult, LoopConfig, LoopResult};
+
+/// Drop-style worktree cleanup that runs AFTER the compensation stack.
+///
+/// Worktree removal is a finalizer, not a peer compensation action. If it were
+/// pushed onto the LIFO stack, `RollbackPolicy::LastGood` would run the git
+/// resets but leak the worktree, and crash-resume would try to git-reset a
+/// deleted path. Keeping it out-of-band sidesteps both problems.
+pub(crate) struct WorktreeFinalizer {
+    pub worktree_path: PathBuf,
+    pub branch_name: Option<String>,
+}
 
 // =============================================================================
 // State Machine Types
@@ -138,6 +150,9 @@ pub(crate) struct LoopContext {
 
     // Compensation (git checkpoints, rollback)
     pub compensation_manager: CompensationManager,
+    /// Drop-style worktree cleanup; drained AFTER the compensation stack runs.
+    /// `None` when the workflow didn't create a worktree.
+    pub worktree_finalizer: Option<WorktreeFinalizer>,
     pub accumulated_diffs: Vec<crate::unified_workflow_executor::types::IterationDiff>,
     pub initial_source_commit: Option<String>,
 
@@ -223,6 +238,16 @@ impl LoopContext {
             }
         };
 
+        // Build worktree finalizer from config. The worktree is created upstream
+        // in `LoopController::run_unified_workflow` before this context exists;
+        // `config.worktree_path` / `worktree_branch` are populated there. The
+        // finalizer is drained AFTER the compensation stack runs (see
+        // `run_loop_state_machine` post-loop cleanup in loop_handlers.rs).
+        let worktree_finalizer = config.worktree_path.as_ref().map(|p| WorktreeFinalizer {
+            worktree_path: PathBuf::from(p),
+            branch_name: config.worktree_branch.clone(),
+        });
+
         Self {
             iteration: config.starting_iteration,
             iteration_results: Vec::new(),
@@ -236,6 +261,7 @@ impl LoopContext {
             dynamic_steps: initial_dynamic_steps,
             pending_health_regression: None,
             compensation_manager: CompensationManager::new(pg_db),
+            worktree_finalizer,
             accumulated_diffs: Vec::new(),
             initial_source_commit: None,
             current_passed_checks: 0,
@@ -411,6 +437,7 @@ mod tests {
             compensation_manager: CompensationManager::new(
                 crate::database::pg::PgDb::new_noop_for_test(),
             ),
+            worktree_finalizer: None,
             accumulated_diffs: Vec::new(),
             initial_source_commit: None,
             current_passed_checks: 0,

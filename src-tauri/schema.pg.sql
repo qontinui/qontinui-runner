@@ -3729,3 +3729,20 @@ CREATE TABLE IF NOT EXISTS workflow_event_log (
 CREATE INDEX IF NOT EXISTS idx_event_log_execution ON workflow_event_log(execution_id, cursor);
 CREATE INDEX IF NOT EXISTS idx_event_log_node ON workflow_event_log(execution_id, node_id);
 CREATE INDEX IF NOT EXISTS idx_bps_status ON breakpoint_snapshots(status);
+
+-- Compensation action stack — per-row persistence of the LIFO compensation
+-- stack managed by `unified_workflow_executor::compensation::CompensationManager`.
+-- Lands in the `runner` schema (default) via search_path = runner, public.
+-- See plan: restate-port-part-a-compensation-and-phase-results.md §1.3–1.4.
+CREATE TABLE IF NOT EXISTS compensation_actions (
+    id              BIGSERIAL PRIMARY KEY,
+    execution_id    TEXT NOT NULL,
+    action_index    INT NOT NULL,
+    action_json     JSONB NOT NULL,
+    executed        BOOLEAN NOT NULL DEFAULT FALSE,
+    result_json     JSONB,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    executed_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_ca_execution ON compensation_actions(execution_id);
+CREATE INDEX IF NOT EXISTS idx_ca_pending ON compensation_actions(execution_id) WHERE NOT executed;
