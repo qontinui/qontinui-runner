@@ -13,7 +13,6 @@
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
 
 // ============================================================================
 // Mirror types for schema export
@@ -175,234 +174,7 @@ pub struct AgenticPhaseOutput {
     pub findings: Vec<FindingOutput>,
 }
 
-// --- AppEvent (mirrors event_system::types::AppEvent) ---
-
-/// Events emitted during flow execution for UI updates.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum FlowEvent {
-    FlowStarted {
-        instance_id: String,
-        flow_id: String,
-        flow_name: String,
-    },
-    StepStarted {
-        instance_id: String,
-        step_id: String,
-        step_name: String,
-        step_type: String,
-    },
-    StepCompleted {
-        instance_id: String,
-        step_id: String,
-        success: bool,
-        outputs: HashMap<String, Value>,
-        error: Option<String>,
-        duration_ms: u64,
-    },
-    FlowCompleted {
-        instance_id: String,
-        flow_id: String,
-        success: bool,
-        error: Option<String>,
-        total_steps: usize,
-        duration_ms: u64,
-    },
-    WaitingForInput {
-        instance_id: String,
-        step_id: String,
-        prompt: String,
-        options: Vec<String>,
-    },
-    ParallelProgress {
-        instance_id: String,
-        step_id: String,
-        completed: usize,
-        total: usize,
-    },
-}
-
-/// Unified application events for frontend communication.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(tag = "event_type", content = "data")]
-pub enum AppEvent {
-    ExecutorEvent {
-        event: String,
-        timestamp: i64,
-        sequence: u32,
-        data: Value,
-    },
-    ExecutorTreeEvent {
-        event_type: String,
-        node: Value,
-        path: Vec<String>,
-        timestamp: i64,
-        sequence: u32,
-    },
-    ExecutorError {
-        message: String,
-        details: Option<String>,
-    },
-    ExecutorResponse {
-        id: String,
-        success: bool,
-        data: Option<Value>,
-        error: Option<String>,
-    },
-    ImageRecognition {
-        data: Value,
-    },
-    ExtractionEvent {
-        event: String,
-        timestamp: i64,
-        sequence: u32,
-        data: Value,
-    },
-    ExtractionError {
-        message: String,
-        details: Option<String>,
-    },
-    ExtractionResponse {
-        id: String,
-        success: bool,
-        data: Option<Value>,
-        error: Option<String>,
-    },
-    RagProgress {
-        project_id: String,
-        status: String,
-        message: String,
-        percent: Option<i32>,
-        elements_processed: Option<i32>,
-        total_elements: Option<i32>,
-        error: Option<String>,
-    },
-    RagCompletion {
-        project_id: String,
-        success: bool,
-        total_processed: i32,
-        successful: i32,
-        failed: i32,
-        web_sync_success: bool,
-        web_sync_error: Option<String>,
-    },
-    FlowEvent(FlowEvent),
-    AiOutput {
-        session_id: String,
-        content: String,
-        content_type: Option<String>,
-    },
-    FindingDetected {
-        finding: Value,
-    },
-    FindingResolved {
-        finding: Value,
-    },
-    TestNavigation {
-        data: Value,
-    },
-    UiBridgeRequest {
-        data: Value,
-    },
-    OrchestratorStateChange {
-        task_run_id: String,
-        workflow_stage: String,
-        iteration: u32,
-        phase: String,
-        state_data: Option<Value>,
-    },
-    StepProgress {
-        task_run_id: String,
-        step_index: usize,
-        step_name: String,
-        status: String,
-        details: Option<Value>,
-        timestamp: i64,
-    },
-    TaskRunUpdate {
-        task_run_id: String,
-        status: String,
-        iteration: Option<u32>,
-        details: Option<Value>,
-        timestamp: i64,
-    },
-    ApprovalRequired {
-        task_run_id: String,
-        approval_id: String,
-        iteration: u32,
-        prompt: String,
-    },
-    ApprovalResolved {
-        task_run_id: String,
-        approval_id: String,
-        approved: bool,
-        action: String,
-    },
-    DeferredQuestionCreated {
-        task_run_id: String,
-        question_id: String,
-        iteration: u32,
-        question: String,
-        confidence: f64,
-        risk_level: String,
-    },
-    DeferredQuestionReviewed {
-        task_run_id: String,
-        question_id: String,
-        status: String,
-        rework_triggered: bool,
-    },
-    CanvasUpdate {
-        action: String,
-        panel_id: String,
-        panel: Option<Value>,
-        task_run_id: Option<String>,
-    },
-    AiOutputChunk {
-        task_run_id: String,
-        chunk: String,
-        accumulated_length: usize,
-    },
-    IterationMetrics {
-        task_run_id: String,
-        iteration: u32,
-        failed_step_count: u32,
-        passed_step_count: u32,
-        skipped_step_count: u32,
-        new_failures: u32,
-        repeated_failures: u32,
-        is_stalled: bool,
-    },
-    BlameAttribution {
-        task_run_id: String,
-        iteration: u32,
-        attributed_failures: u32,
-        oscillating_files: u32,
-        revert_patterns: u32,
-        blame_json: String,
-    },
-    ConstraintResults {
-        task_run_id: String,
-        iteration: u32,
-        summary: String,
-        has_blocking: bool,
-        results: Value,
-    },
-    WorkflowQueued {
-        task_run_id: String,
-        workflow_name: String,
-        queue_position: usize,
-    },
-    WorkflowDequeued {
-        task_run_id: String,
-        workflow_name: String,
-        wait_time_ms: u64,
-    },
-    Error {
-        message: String,
-        context: Option<String>,
-    },
-}
+// --- AppEvent + FlowEvent (now re-exported from qontinui-types::app_events) ---
 
 // ============================================================================
 // Export function
@@ -420,10 +192,10 @@ pub enum AppEvent {
 /// remote types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        accessibility as qa, ai_workflows as qaw, config as qcfg, constraints as qc,
-        discovery as qdc, execution as qe, findings as qfn, geometry as qg, mcp_config as qmc,
-        orchestration_config as qoc, process_management as qpm, rag as qr, scheduler as qs,
-        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
+        accessibility as qa, ai_workflows as qaw, app_events as qae, config as qcfg,
+        constraints as qc, discovery as qdc, execution as qe, findings as qfn, geometry as qg,
+        mcp_config as qmc, orchestration_config as qoc, process_management as qpm, rag as qr,
+        scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
         ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
         workflow as qw, workflow_step as qws,
     };
@@ -453,8 +225,8 @@ pub fn export_all_schemas() -> Value {
     add!("FileChange", FileChange);
     add!("FindingOutput", FindingOutput);
     add!("ReflectionFixOutput", ReflectionFixOutput);
-    add!("FlowEvent", FlowEvent);
-    add!("AppEvent", AppEvent);
+    add!("FlowEvent", qae::FlowEvent);
+    add!("AppEvent", qae::AppEvent);
 
     // ── qontinui-types: ai_workflows ──
     add!("ExecutionStep", qaw::ExecutionStep);
