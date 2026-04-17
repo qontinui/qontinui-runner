@@ -411,6 +411,195 @@
       "source": "manual"
     },
     {
+      "id": "wf-htn-planning",
+      "name": "HTN Planning Configuration",
+      "description": "The HTN (Hierarchical Task Network) Planning section within workflow settings allows users to enable structured plan-based fixes that run before the AI agentic session. When enabled, the verification loop attempts to find and execute a deterministic plan using a state machine and method library before falling back to AI. The section has three controls: an enable toggle (off by default), a UI Bridge URL text input (for connecting to the target app's UI Bridge during plan execution), and a state machine path input (for specifying a custom state machine JSON file; defaults to the bundled runner state machine). The URL and path inputs are conditionally visible — they only appear when HTN is enabled.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "wf-htn-section-header",
+          "description": "The HTN Planning section is visible in the workflow settings panel with a section header labeled 'HTN Planning' and an info tooltip icon that explains what HTN planning does",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "HTN Planning"
+            },
+            "label": "HTN Planning section header"
+          },
+          "precondition": "Settings panel is open (gear icon clicked)",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-tooltip",
+          "description": "Hovering the info icon next to the HTN Planning header shows a tooltip explaining: 'Hierarchical Task Network planning uses a state machine to attempt structured fixes before the AI agentic session. Useful when the application has well-defined UI states and transitions.'",
+          "category": "interaction",
+          "severity": "info",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "HTN Planning"
+            },
+            "label": "HTN Planning section with tooltip"
+          },
+          "precondition": "Settings panel is open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-enable-toggle",
+          "description": "A toggle switch labeled 'Enable HTN Planning' is present in the HTN section. It defaults to off (unchecked). The toggle uses a blue background when active and zinc/gray when inactive.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Enable HTN Planning"
+            },
+            "label": "HTN enable toggle label"
+          },
+          "precondition": "Settings panel is open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-toggle-default-off",
+          "description": "The HTN Planning toggle defaults to off (unchecked) for new workflows, since HTN requires app-specific state machines to be useful",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "switch"
+            },
+            "label": "HTN toggle switch"
+          },
+          "precondition": "Settings panel is open and workflow has not been modified",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-conditional-fields-hidden",
+          "description": "When HTN Planning is disabled (toggle off), the UI Bridge URL and State Machine Path text inputs are not visible — only the enable toggle is shown in the HTN section",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "HTN Planning"
+            },
+            "label": "HTN section"
+          },
+          "precondition": "Settings panel is open and HTN toggle is off",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-conditional-fields-shown",
+          "description": "When HTN Planning is enabled (toggle on), two additional text inputs appear below the toggle: 'UI Bridge URL' with placeholder 'http://localhost:1420' and 'State Machine Path' with placeholder 'Default: data/runner_state_machine.json'. Both use monospace font for config values.",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Enable HTN Planning"
+            },
+            "label": "HTN enable toggle"
+          },
+          "precondition": "Settings panel is open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-url-input",
+          "description": "The UI Bridge URL input is a text field with placeholder 'http://localhost:1420' and helper text 'UI Bridge endpoint for querying element state. Leave empty for plan-only mode.' Users can enter the URL of the target application's UI Bridge for live GUI interaction during HTN execution.",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "placeholder": "http://localhost:1420"
+            },
+            "label": "UI Bridge URL input"
+          },
+          "precondition": "Settings panel is open and HTN toggle is on",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-path-input",
+          "description": "The State Machine Path input is a text field with placeholder 'Default: data/runner_state_machine.json' and helper text 'Path to a state machine JSON file. Defaults to the bundled runner state machine.' When left empty, the runner automatically uses its bundled state machine with 14 states covering all runner pages and common dialogs.",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "placeholder": "Default: data/runner_state_machine.json"
+            },
+            "label": "State Machine Path input"
+          },
+          "precondition": "Settings panel is open and HTN toggle is on",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-settings-persist",
+          "description": "HTN settings (enabled, URL, path) are persisted when the workflow is saved. After saving and reloading a workflow with HTN enabled and a custom URL, the toggle should still be on and the URL should be populated with the saved value.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "HTN Planning"
+            },
+            "label": "HTN section"
+          },
+          "precondition": "A workflow with HTN enabled has been saved and reloaded",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-section-design",
+          "description": "The HTN Planning section uses a semi-transparent dark background (bg-zinc-800/50), rounded corners, and consistent spacing matching other advanced settings sections like Health Check. Labels are text-sm font-medium text-zinc-400, helper text is text-xs text-zinc-500, and inputs use bg-zinc-800 with border-zinc-700 borders and blue focus rings.",
+          "category": "design",
+          "severity": "info",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "HTN Planning"
+            },
+            "label": "HTN section container"
+          },
+          "precondition": "Settings panel is open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
       "id": "wf-step-configuration",
       "name": "Step Configuration and Library Integration",
       "description": "Individual workflow steps can be configured with type-specific settings. Command steps have shell commands, working directories, and timeouts. Prompt steps have AI instruction text and context attachments. Check and check group steps reference items from the check library. Playwright test steps reference saved test scripts. Users can also pick steps from library pickers that show saved prompts, shell commands, checks, check groups, tests, and MCP server tools. The step configuration panel opens when a step is selected, showing all relevant fields for that step type. This tight integration with the asset library enables reuse across workflows.",
@@ -607,7 +796,8 @@
         "elements": [
           { "textContent": "Name" },
           { "textContent": "Max Iterations" },
-          { "textContent": "Reflection" }
+          { "textContent": "Reflection" },
+          { "textContent": "HTN Planning" }
         ],
         "transitions": [
           {
