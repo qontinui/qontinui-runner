@@ -695,6 +695,8 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             onCompileStateMachine={handleCompileStateMachine}
             onSyncAllSpecs={specSync.startSync}
             isSyncing={specSync.isSyncing}
+            syncProgress={specSync.state.progress}
+            onCancelSync={specSync.cancel}
             onToggleEditMode={() => state.setEditMode(!state.editMode)}
           />
 

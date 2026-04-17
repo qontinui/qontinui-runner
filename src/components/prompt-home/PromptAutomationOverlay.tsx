@@ -80,7 +80,12 @@ export function PromptAutomationOverlay() {
             {phase === "planning" && "Understanding your request..."}
             {phase === "executing" && (stepLabel || plan?.summary || "Automating...")}
             {isDone && "Done"}
-            {isError && (error || "Something went wrong")}
+            {isError &&
+              (error
+                ? error.includes("State not found")
+                  ? `Could not navigate: ${error}`
+                  : error
+                : "Something went wrong")}
           </div>
         </div>
 

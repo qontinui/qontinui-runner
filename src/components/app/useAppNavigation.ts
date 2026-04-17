@@ -261,6 +261,38 @@ export function useAppNavigation(): UseAppNavigationReturn {
     instanceStorage.setItem("qontinui-main-active-tab", activeTab);
   }, [activeTab]);
 
+  // Register navigateHandler on __UI_BRIDGE__ so that pageNavigate commands
+  // (soft-navigation path) and the NL executor can navigate the runner via
+  // URL-like paths. The runner uses tab-based navigation rather than URL routing,
+  // so we translate paths into tab IDs using PAGE_TO_TAB.
+  useEffect(() => {
+    const g = (window as unknown as Record<string, unknown>).__UI_BRIDGE__ as
+      | Record<string, unknown>
+      | undefined;
+    if (g) {
+      g.navigateHandler = (url: string) => {
+        // Strip leading slash and any query/hash
+        const raw = url.startsWith("/") ? url.slice(1) : url;
+        const path = raw.split(/[?#]/)[0];
+        const tabId = PAGE_TO_TAB[path];
+        if (tabId) {
+          setActiveTab(tabId);
+        } else {
+          // Fall back: try using the path directly as a tab ID
+          setActiveTab(path as MainTabId);
+        }
+      };
+    }
+    return () => {
+      const g2 = (window as unknown as Record<string, unknown>).__UI_BRIDGE__ as
+        | Record<string, unknown>
+        | undefined;
+      if (g2?.navigateHandler) {
+        delete g2.navigateHandler;
+      }
+    };
+  }, [setActiveTab]);
+
   // Bridge the runner's tab-based "navigation" into the UI Bridge registry as
   // navigation:change events. The runner doesn't use react-router or
   // history.pushState, so the SDK's NavigationTracker has nothing to observe;
@@ -279,10 +311,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
     const buildPageInfo = (tab: MainTabId | null) => {
       const path = tab ? `/${tab}` : "/";
       const title = typeof document !== "undefined" ? document.title : "";
-      const url =
-        typeof window !== "undefined"
-          ? `${window.location.origin}${path}`
-          : path;
+      const url = typeof window !== "undefined" ? `${window.location.origin}${path}` : path;
       return { url, pathname: path, search: "", hash: "", title };
     };
 

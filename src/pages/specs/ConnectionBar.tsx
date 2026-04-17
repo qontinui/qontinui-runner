@@ -46,6 +46,8 @@ interface ConnectionBarProps {
   onCompileStateMachine: () => void;
   onSyncAllSpecs: () => void;
   isSyncing: boolean;
+  syncProgress?: { current: number; total: number };
+  onCancelSync?: () => void;
   onToggleEditMode: () => void;
 }
 
@@ -72,6 +74,8 @@ export function ConnectionBar({
   onCompileStateMachine,
   onSyncAllSpecs,
   isSyncing,
+  syncProgress,
+  onCancelSync,
   onToggleEditMode,
 }: ConnectionBarProps) {
   const [url, setUrl] = useState(connection.url || "http://localhost:3001");
@@ -301,17 +305,33 @@ export function ConnectionBar({
             {isGeneratingWithAi ? "Generating…" : "Build Workflow"}
           </button>
         )}
-        <button
-          ref={syncRef}
-          onClick={onSyncAllSpecs}
-          disabled={isLoading || isSyncing || stats.totalSpecs === 0}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
-          bg-teal-600 text-white shadow-xs shadow-teal-600/25
-          hover:bg-teal-700 disabled:opacity-50 transition-colors shrink-0"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? "animate-spin" : ""}`} />
-          Sync All Specs
-        </button>
+        {isSyncing ? (
+          <button
+            ref={syncRef}
+            onClick={onCancelSync}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
+            bg-teal-600 text-white shadow-xs shadow-teal-600/25
+            hover:bg-teal-700 transition-colors shrink-0"
+          >
+            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            {syncProgress && syncProgress.total > 0
+              ? `Syncing ${syncProgress.current}/${syncProgress.total}...`
+              : "Syncing..."}
+            <span className="ml-1 text-[10px] opacity-75">(cancel)</span>
+          </button>
+        ) : (
+          <button
+            ref={syncRef}
+            onClick={onSyncAllSpecs}
+            disabled={isLoading || stats.totalSpecs === 0}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
+            bg-teal-600 text-white shadow-xs shadow-teal-600/25
+            hover:bg-teal-700 disabled:opacity-50 transition-colors shrink-0"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Sync All Specs
+          </button>
+        )}
         <button
           ref={compileRef}
           onClick={onCompileStateMachine}
