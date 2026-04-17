@@ -14,13 +14,12 @@ use tracing::{debug, error, info, warn};
 
 /// Information about a cloud-registered device returned by the relay backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CloudDeviceInfo {
     pub device_id: String,
     pub display_name: String,
     pub platform: String,
     pub app_id: String,
-    pub connected_since: i64,
+    pub connected_since: String,
     pub relay_session_id: String,
 }
 

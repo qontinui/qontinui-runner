@@ -458,7 +458,7 @@ fn build_ws_url(backend_url: &str, device_id: &str, auth_token: &str) -> String 
         .replace("http://", "ws://");
     let ws_base = ws_base.trim_end_matches('/');
     format!(
-        "{}/api/v1/device-bridge/tunnel/{}?token={}",
+        "{}/api/v1/device-bridge/ws/device-bridge/tunnel/{}?token={}",
         ws_base,
         urlencoding::encode(device_id),
         urlencoding::encode(auth_token),
