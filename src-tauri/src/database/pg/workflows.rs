@@ -113,6 +113,9 @@ macro_rules! row_to_workflow {
             security_profile: None, // TODO: read from DB once column is added
             max_fix_attempts: 3,
             max_ci_auto_resumes: 10,
+            htn_enabled: false,
+            htn_ui_bridge_url: None,
+            htn_state_machine_path: None,
         }
     }};
 }

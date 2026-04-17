@@ -477,7 +477,8 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
     if (
       def.key === "skip_ai_summary" ||
       def.key === "health_check_enabled" ||
-      def.key === "log_watch_enabled"
+      def.key === "log_watch_enabled" ||
+      def.key === "htn_enabled"
     ) {
       return (
         <div
@@ -737,6 +738,46 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
       case "resolved_model_preview":
         return <ResolvedModelPreview key={def.key} />;
 
+      case "htn_ui_bridge_url":
+        if (!workflow.htn_enabled) return null;
+        return (
+          <div key={def.key}>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">UI Bridge URL</label>
+            <input
+              type="text"
+              value={workflow.htn_ui_bridge_url ?? ""}
+              onChange={(e) => updateWorkflow({ htn_ui_bridge_url: e.target.value || undefined })}
+              placeholder="http://localhost:1420"
+              className={`${inputClass} font-mono`}
+            />
+            <p className="text-xs text-zinc-500 mt-1">
+              UI Bridge endpoint for querying element state. Leave empty for plan-only mode.
+            </p>
+          </div>
+        );
+
+      case "htn_state_machine_path":
+        if (!workflow.htn_enabled) return null;
+        return (
+          <div key={def.key}>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">
+              State Machine Path
+            </label>
+            <input
+              type="text"
+              value={workflow.htn_state_machine_path ?? ""}
+              onChange={(e) =>
+                updateWorkflow({ htn_state_machine_path: e.target.value || undefined })
+              }
+              placeholder="Default: data/runner_state_machine.json"
+              className={`${inputClass} font-mono`}
+            />
+            <p className="text-xs text-zinc-500 mt-1">
+              Path to a state machine JSON file. Defaults to the bundled runner state machine.
+            </p>
+          </div>
+        );
+
       case "category_input":
         return (
           <div key={def.key}>
@@ -916,6 +957,27 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           )}
           {otherCustom.map(renderSetting)}
         </React.Fragment>
+      );
+    }
+
+    if (section.id === "htn") {
+      return (
+        <div key={section.id} className="space-y-3 p-3 bg-zinc-800/50 rounded-md">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-zinc-300">HTN Planning</span>
+            <div className="relative group">
+              <Info className="w-3.5 h-3.5 text-zinc-500 hover:text-zinc-300 cursor-help" />
+              <div className="absolute left-0 bottom-full mb-2 w-72 p-3 bg-zinc-800 border border-zinc-600 rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50">
+                <p className="text-xs text-zinc-300">
+                  Hierarchical Task Network planning uses a state machine to attempt structured
+                  fixes before the AI agentic session. Useful when the application has well-defined
+                  UI states and transitions.
+                </p>
+              </div>
+            </div>
+          </div>
+          {section.settings.map(renderSetting)}
+        </div>
       );
     }
 

@@ -516,7 +516,20 @@ impl LoopConfig {
             max_fix_attempts: workflow.max_fix_attempts,
             max_ci_auto_resumes: workflow.max_ci_auto_resumes,
             ci_failure_context: None,
-            htn_config: crate::planning_bridge::HtnConfig::default(),
+            htn_config: {
+                let mut htn = crate::planning_bridge::HtnConfig::default();
+                htn.enabled = workflow.htn_enabled;
+                htn.ui_bridge_url = workflow.htn_ui_bridge_url.clone();
+                htn.state_machine_path = workflow.htn_state_machine_path.clone();
+                // Default state_machine_path to bundled runner_state_machine.json when enabled
+                if htn.enabled && htn.state_machine_path.is_none() {
+                    let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+                    htn.state_machine_path = Some(
+                        data_dir.join("runner_state_machine.json").display().to_string(),
+                    );
+                }
+                htn
+            },
         }
     }
 

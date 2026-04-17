@@ -232,6 +232,9 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
         flow_control_json: None,
         phase_timeouts_json: None,
         rollback_policy: None,
+        htn_enabled: false,
+        htn_ui_bridge_url: None,
+        htn_state_machine_path: None,
     }
 }
 

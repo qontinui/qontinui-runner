@@ -934,6 +934,9 @@ function RunnerWorkflowBuilderInner({
         workflow_architecture: workflow.workflow_architecture,
         multi_agent_pipeline_config: workflow.multi_agent_pipeline_config,
         model_overrides: workflow.model_overrides,
+        htn_enabled: workflow.htn_enabled,
+        htn_ui_bridge_url: workflow.htn_ui_bridge_url,
+        htn_state_machine_path: workflow.htn_state_machine_path,
       };
 
       const url = isNew

@@ -225,6 +225,9 @@ fn build_calculator_workflow(
         flow_control_json: None,
         phase_timeouts_json: None,
         rollback_policy: None,
+        htn_enabled: false,
+        htn_ui_bridge_url: None,
+        htn_state_machine_path: None,
     }
 }
 
@@ -318,6 +321,9 @@ fn build_tdd_workflow(
         flow_control_json: None,
         phase_timeouts_json: None,
         rollback_policy: None,
+        htn_enabled: false,
+        htn_ui_bridge_url: None,
+        htn_state_machine_path: None,
     }
 }
 
@@ -412,5 +418,8 @@ fn build_pipeline_workflow(
         flow_control_json: None,
         phase_timeouts_json: None,
         rollback_policy: None,
+        htn_enabled: false,
+        htn_ui_bridge_url: None,
+        htn_state_machine_path: None,
     }
 }

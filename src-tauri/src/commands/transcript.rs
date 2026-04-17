@@ -474,6 +474,9 @@ pub async fn generate_workflow_standalone(
                         flow_control_json: None,
                         phase_timeouts_json: None,
                         rollback_policy: workflow.rollback_policy.clone(),
+                        htn_enabled: workflow.htn_enabled,
+                        htn_ui_bridge_url: workflow.htn_ui_bridge_url.clone(),
+                        htn_state_machine_path: workflow.htn_state_machine_path.clone(),
                     };
 
                     match app_state.pg_db.create_unified_workflow(&create_req).await {

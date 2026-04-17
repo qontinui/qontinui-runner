@@ -19,6 +19,7 @@ export const DEFAULT_WORKFLOW_FLAGS = {
   enable_sweep: false,
   enforce_token_budget: false,
   health_check_enabled: false,
+  htn_enabled: false,
   is_favorite: false,
   log_watch_enabled: true,
   max_ci_auto_resumes: 10,

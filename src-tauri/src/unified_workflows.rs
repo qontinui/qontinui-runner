@@ -252,6 +252,15 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Policy for automatic git rollback on workflow failure.
     #[serde(default)]
     pub rollback_policy: Option<String>,
+    /// Whether HTN planning is enabled for this workflow.
+    #[serde(default)]
+    pub htn_enabled: bool,
+    /// UI Bridge URL for HTN planning.
+    #[serde(default)]
+    pub htn_ui_bridge_url: Option<String>,
+    /// Path to a serialized state machine JSON file for HTN planning.
+    #[serde(default)]
+    pub htn_state_machine_path: Option<String>,
 }
 
 /// Build a [`CreateUnifiedWorkflowRequest`] from a [`UnifiedWorkflow`].
@@ -310,6 +319,9 @@ pub fn unified_workflow_to_create_request(w: &UnifiedWorkflow) -> CreateUnifiedW
         flow_control_json: w.flow_control_json.clone(),
         phase_timeouts_json: w.phase_timeouts_json.clone(),
         rollback_policy: w.rollback_policy.clone(),
+        htn_enabled: w.htn_enabled,
+        htn_ui_bridge_url: w.htn_ui_bridge_url.clone(),
+        htn_state_machine_path: w.htn_state_machine_path.clone(),
     }
 }
 
@@ -391,6 +403,12 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub phase_timeouts_json: Option<String>,
     /// Policy for automatic git rollback on workflow failure.
     pub rollback_policy: Option<String>,
+    /// Whether HTN planning is enabled for this workflow.
+    pub htn_enabled: Option<bool>,
+    /// UI Bridge URL for HTN planning.
+    pub htn_ui_bridge_url: Option<String>,
+    /// Path to a serialized state machine JSON file for HTN planning.
+    pub htn_state_machine_path: Option<String>,
 }
 
 /// Query parameters for searching unified workflows

@@ -311,6 +311,9 @@ pub async fn sync_workflows_from_backend(db: &crate::database::pg::PgDb) -> Resu
                     flow_control_json: workflow.flow_control_json.clone(),
                     phase_timeouts_json: workflow.phase_timeouts_json.clone(),
                     rollback_policy: workflow.rollback_policy.clone(),
+                    htn_enabled: Some(workflow.htn_enabled),
+                    htn_ui_bridge_url: workflow.htn_ui_bridge_url.clone(),
+                    htn_state_machine_path: workflow.htn_state_machine_path.clone(),
                 };
                 if let Err(e) = db.update_unified_workflow(&workflow.id, &update_req).await {
                     warn!("Failed to update cached workflow {}: {}", workflow.id, e);
@@ -364,6 +367,9 @@ pub async fn sync_workflows_from_backend(db: &crate::database::pg::PgDb) -> Resu
                     flow_control_json: None,
                     phase_timeouts_json: None,
                     rollback_policy: workflow.rollback_policy.clone(),
+                    htn_enabled: workflow.htn_enabled,
+                    htn_ui_bridge_url: workflow.htn_ui_bridge_url.clone(),
+                    htn_state_machine_path: workflow.htn_state_machine_path.clone(),
                 };
                 if let Err(e) = db.create_unified_workflow(&create_req).await {
                     warn!("Failed to cache workflow {}: {}", workflow.id, e);

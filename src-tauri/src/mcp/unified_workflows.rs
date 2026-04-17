@@ -1936,6 +1936,9 @@ pub async fn execute_inline_workflow(
         security_profile: None,
         max_fix_attempts: 3,
         max_ci_auto_resumes: 10,
+        htn_enabled: false,
+        htn_ui_bridge_url: None,
+        htn_state_machine_path: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
