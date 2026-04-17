@@ -47,11 +47,24 @@ export {
 // Export individual handlers
 export { CommandHandler, commandHandler } from "./command-handler";
 export { CheckHandler, checkHandler } from "./check-handler";
+export { PromptHandler, promptHandler } from "./prompt-handler";
+export { CodeExecutionHandler, codeExecutionHandler } from "./code-execution-handler";
+export { PathfindingHandler, pathfindingHandler } from "./pathfinding-handler";
+export {
+  NativeAccessibilityHandler,
+  nativeAccessibilityHandler,
+} from "./native-accessibility-handler";
+export { ExecutePlaybookHandler, executePlaybookHandler } from "./execute-playbook-handler";
 
 // Import for registration
 import { stepOutputRegistry } from "./registry";
 import { commandHandler } from "./command-handler";
 import { checkHandler } from "./check-handler";
+import { promptHandler } from "./prompt-handler";
+import { codeExecutionHandler } from "./code-execution-handler";
+import { pathfindingHandler } from "./pathfinding-handler";
+import { nativeAccessibilityHandler } from "./native-accessibility-handler";
+import { executePlaybookHandler } from "./execute-playbook-handler";
 
 // ============================================================================
 // Handler Registration
@@ -69,6 +82,11 @@ function initializeRegistry(): void {
   // Register all built-in handlers
   stepOutputRegistry.register(commandHandler);
   stepOutputRegistry.register(checkHandler);
+  stepOutputRegistry.register(promptHandler);
+  stepOutputRegistry.register(codeExecutionHandler);
+  stepOutputRegistry.register(pathfindingHandler);
+  stepOutputRegistry.register(nativeAccessibilityHandler);
+  stepOutputRegistry.register(executePlaybookHandler);
 
   // Backward compat: also register "shell_command" pointing to the command handler
   const shellCommandAlias = Object.create(commandHandler);
@@ -93,6 +111,16 @@ export type {
   CommandStepOutput,
   CheckStepOutput,
   UiBridgeStepOutput,
+  PromptStepOutput,
+  PromptStepPhase,
+  CodeExecutionStepOutput,
+  CodeExecutionSandboxMode,
+  PathfindingStepOutput,
+  PathfindingPathEntry,
+  NativeAccessibilityStepOutput,
+  NativeAccessibilityAction,
+  ExecutePlaybookStepOutput,
+  PlaybookTransitionRecord,
   CheckIssue,
 } from "../../types/step-output";
 
@@ -101,4 +129,9 @@ export {
   isCommandOutput,
   isCheckOutput,
   isUiBridgeOutput,
+  isPromptOutput,
+  isCodeExecutionOutput,
+  isPathfindingOutput,
+  isNativeAccessibilityOutput,
+  isExecutePlaybookOutput,
 } from "../../types/step-output";

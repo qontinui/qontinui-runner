@@ -19,6 +19,7 @@ import type {
   TestAutoPopulateConfig,
   AssertableField,
 } from "./types";
+import { SCRIPTED_OUTPUT_THRESHOLD_BYTES, ScriptedOutputHandler } from "./scripted-base";
 
 // ============================================================================
 // Raw Input Types
@@ -48,7 +49,10 @@ interface CommandStepConfig {
 // Handler Implementation
 // ============================================================================
 
-export class CommandHandler implements StepOutputHandler<CommandStepOutput> {
+export class CommandHandler
+  extends ScriptedOutputHandler<CommandStepOutput>
+  implements StepOutputHandler<CommandStepOutput>
+{
   readonly stepType: StepOutputType = "command";
   readonly displayName = "Command";
   readonly description = "Command execution with stdout, stderr, and exit code";
@@ -132,6 +136,111 @@ export class CommandHandler implements StepOutputHandler<CommandStepOutput> {
     }
 
     // Extractions
+    if (output.extractions && Object.keys(output.extractions).length > 0) {
+      lines.push("");
+      lines.push("**Extracted Variables:**");
+      for (const [key, value] of Object.entries(output.extractions)) {
+        const valueStr = typeof value === "object" ? JSON.stringify(value) : String(value);
+        lines.push(`- \`${key}\`: ${valueStr.substring(0, 100)}`);
+      }
+    }
+
+    return lines.join("\n");
+  }
+
+  /**
+   * Async variant of {@link summarizeForAI} that routes high-volume stdout
+   * through the scripted extraction worker when enabled.
+   *
+   * Behavior:
+   * - When `output.stdout.length > SCRIPTED_OUTPUT_THRESHOLD_BYTES` (8 KiB)
+   *   and `QONTINUI_SCRIPTED_OUTPUT=1`, ask the registered
+   *   {@link ScriptEmitter} for a JS expression, run it in the sandboxed
+   *   worker, and embed the extracted value in place of the raw stdout.
+   * - Otherwise fall through to the existing sync
+   *   {@link summarizeForAI} (which applies the legacy 4000-char cap).
+   *
+   * Callers that don't need scripted output should keep using the sync
+   * method — this sibling exists so the `summarizeForAI` surface on the
+   * `StepOutputHandler` interface and the registry stays synchronous.
+   */
+  async summarizeForAIAsync(output: CommandStepOutput): Promise<string> {
+    const stdout = output.stdout ?? "";
+    const shouldAttemptScripted = stdout.length > SCRIPTED_OUTPUT_THRESHOLD_BYTES;
+
+    if (!shouldAttemptScripted) {
+      // Below threshold: legacy path, exact behavior preserved.
+      return this.summarizeForAI(output);
+    }
+
+    // summarizeViaScript gates on the env flag itself; if the flag is off
+    // it returns `{ extracted: rawOutput, bytesAvoided: 0, fallback: false }`
+    // which (combined with `shouldAttemptScripted` already being true because
+    // stdout > 8 KiB) means we'd emit the full stdout.  To preserve the
+    // legacy truncation behavior when the flag is off, short-circuit here.
+    if (typeof process === "undefined" || process.env?.QONTINUI_SCRIPTED_OUTPUT !== "1") {
+      return this.summarizeForAI(output);
+    }
+
+    const goal =
+      "Summarize shell command stdout for an AI verifier. Return the " +
+      "smallest JSON-serializable structure that captures: (a) exit signals, " +
+      "(b) errors/warnings, (c) final result lines. Prefer arrays of short strings.";
+
+    const { extracted, bytesAvoided, fallback } = await this.summarizeViaScript(stdout, goal, {
+      command: output.command,
+      exit_code: output.exit_code,
+    });
+
+    // Rebuild the summary using the extracted payload in place of stdout.
+    const lines: string[] = [];
+    lines.push(`### Command: ${output.step_name}`);
+    lines.push("```bash");
+    lines.push(output.command);
+    lines.push("```");
+
+    if (output.working_directory) {
+      lines.push(`- **Working Directory:** ${output.working_directory}`);
+    }
+
+    const statusEmoji = output.exit_code === 0 ? "✅" : "❌";
+    lines.push(`- **Exit Code:** ${statusEmoji} ${output.exit_code}`);
+
+    if (output.duration_ms !== undefined) {
+      lines.push(`- **Duration:** ${output.duration_ms}ms`);
+    }
+
+    if (stdout.trim()) {
+      lines.push("");
+      if (fallback) {
+        lines.push("**Standard Output (truncated; scripted extraction unavailable):**");
+        lines.push("```");
+        lines.push(typeof extracted === "string" ? extracted : JSON.stringify(extracted, null, 2));
+        lines.push("```");
+      } else {
+        lines.push(
+          `**Standard Output (extracted via script; ~${bytesAvoided} bytes elided from ${stdout.length}):**`,
+        );
+        lines.push("```json");
+        lines.push(JSON.stringify(extracted, null, 2));
+        lines.push("```");
+      }
+    }
+
+    // Stderr: keep legacy truncation.
+    if (output.stderr && output.stderr.trim()) {
+      lines.push("");
+      lines.push("**Standard Error:**");
+      lines.push("```");
+      const stderr =
+        output.stderr.length > 2000
+          ? output.stderr.substring(0, 2000) + "\n... (truncated)"
+          : output.stderr;
+      lines.push(stderr);
+      lines.push("```");
+    }
+
+    // Extractions: unchanged.
     if (output.extractions && Object.keys(output.extractions).length > 0) {
       lines.push("");
       lines.push("**Extracted Variables:**");
