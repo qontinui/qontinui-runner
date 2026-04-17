@@ -1897,6 +1897,9 @@ mod tests {
             flow_control_json: None,
             phase_timeouts_json: None,
             security_profile: None,
+            htn_enabled: false,
+            htn_state_machine_path: None,
+            htn_ui_bridge_url: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
         }

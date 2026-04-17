@@ -859,6 +859,9 @@ mod tests {
             flow_control_json: None,
             phase_timeouts_json: None,
             security_profile: None,
+            htn_enabled: false,
+            htn_state_machine_path: None,
+            htn_ui_bridge_url: None,
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -1012,7 +1015,7 @@ mod tests {
         let score = compute_quality_score(&findings);
         assert!((score - 0.4).abs() < 0.001);
 
-        // 1 warning → 1.0 - 0.1 = 0.9
+        // 1 warning → 1.0 - 0.006 = 0.994
         let findings = vec![QualityFinding {
             finding_id: "f1".to_string(),
             step_id: None,
@@ -1022,9 +1025,9 @@ mod tests {
             suggested_fix: None,
         }];
         let score = compute_quality_score(&findings);
-        assert!((score - 0.9).abs() < 0.001);
+        assert!((score - 0.994).abs() < 0.001);
 
-        // 1 info → 1.0 - 0.02 = 0.98
+        // 1 info → 1.0 - 0.002 = 0.998
         let findings = vec![QualityFinding {
             finding_id: "f1".to_string(),
             step_id: None,
@@ -1034,9 +1037,9 @@ mod tests {
             suggested_fix: None,
         }];
         let score = compute_quality_score(&findings);
-        assert!((score - 0.98).abs() < 0.001);
+        assert!((score - 0.998).abs() < 0.001);
 
-        // Mixed: 1 critical + 2 warnings + 3 info → 1.0 - 0.3 - 0.2 - 0.06 = 0.44
+        // Mixed: 1 critical + 2 warnings + 3 info → 1.0 - 0.3 - 0.012 - 0.006 = 0.682
         let findings = vec![
             QualityFinding {
                 finding_id: "f1".to_string(),
@@ -1088,7 +1091,7 @@ mod tests {
             },
         ];
         let score = compute_quality_score(&findings);
-        assert!((score - 0.44).abs() < 0.001);
+        assert!((score - 0.682).abs() < 0.001);
 
         // 4 critical → clamped to 0.0
         let findings: Vec<QualityFinding> = (0..4)

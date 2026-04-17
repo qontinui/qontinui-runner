@@ -1496,6 +1496,9 @@ mod tests {
             flow_control_json: None,
             phase_timeouts_json: None,
             security_profile: None,
+            htn_enabled: false,
+            htn_state_machine_path: None,
+            htn_ui_bridge_url: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1631,6 +1634,9 @@ mod tests {
             flow_control_json: None,
             phase_timeouts_json: None,
             security_profile: None,
+            htn_enabled: false,
+            htn_state_machine_path: None,
+            htn_ui_bridge_url: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -1777,6 +1783,9 @@ mod tests {
             flow_control_json: None,
             phase_timeouts_json: None,
             security_profile: None,
+            htn_enabled: false,
+            htn_state_machine_path: None,
+            htn_ui_bridge_url: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1869,6 +1878,9 @@ mod tests {
             flow_control_json: None,
             phase_timeouts_json: None,
             security_profile: None,
+            htn_enabled: false,
+            htn_state_machine_path: None,
+            htn_ui_bridge_url: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -2118,9 +2130,9 @@ mod tests {
     #[test]
     fn test_phase_constraint_error_kind_wrong_phase() {
         let mut errors = Vec::new();
-        // prompt is valid but not in agentic for... wait, it is. Let me use ui_bridge in agentic.
+        // "command" is not allowed in the agentic phase (only "prompt" and "ui_bridge" are).
         let steps = vec![
-            json!({"type": "ui_bridge", "name": "Not allowed", "id": Uuid::new_v4().to_string(), "phase": "agentic", "action": "snapshot"}),
+            json!({"type": "command", "name": "Not allowed", "id": Uuid::new_v4().to_string(), "phase": "agentic", "command": "echo hi"}),
         ];
         validate_phase_constraints(&steps, "agentic", &mut errors);
         assert_eq!(errors.len(), 1);
@@ -2233,6 +2245,9 @@ mod tests {
             flow_control_json: None,
             phase_timeouts_json: None,
             security_profile: None,
+            htn_enabled: false,
+            htn_state_machine_path: None,
+            htn_ui_bridge_url: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
