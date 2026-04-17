@@ -398,8 +398,7 @@ pub async fn generate_workflow_standalone(
                 // Empty artifact placeholder so the save path can skip cleanly.
                 let artifact =
                     crate::workflow_generation::pipeline_artifacts::PipelineArtifactBuilder::new(
-                        "",
-                        None,
+                        "", None,
                     )
                     .build(0);
                 (response, artifact)

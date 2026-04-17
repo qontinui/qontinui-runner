@@ -314,8 +314,7 @@ pub async fn execute_htn_attempt(
     task_description: &str,
     config: &HtnConfig,
 ) -> Result<HtnExecutionResult, String> {
-    let qontinui_src =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../qontinui/src");
+    let qontinui_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../qontinui/src");
     let multistate_src =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../multistate/src");
 

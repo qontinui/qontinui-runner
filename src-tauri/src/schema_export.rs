@@ -420,11 +420,10 @@ pub enum AppEvent {
 /// remote types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        accessibility as qa, config as qcfg, constraints as qc, discovery as qdc,
-        execution as qe, findings as qfn, geometry as qg, mcp_config as qmc,
-        orchestration_config as qoc, process_management as qpm, rag as qr,
-        scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr,
-        terminal as qtm, ticket_system as qts, tree_events as qte,
+        accessibility as qa, config as qcfg, constraints as qc, discovery as qdc, execution as qe,
+        findings as qfn, geometry as qg, mcp_config as qmc, orchestration_config as qoc,
+        process_management as qpm, rag as qr, scheduler as qs, state_machine as qsm, targets as qt,
+        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
         verification as qv, workflow as qw, workflow_step as qws,
     };
 
@@ -706,18 +705,30 @@ pub fn export_all_schemas() -> Value {
     add!("DiscoverySourceType", qdc::DiscoverySourceType);
     add!("TransitionTriggerType", qdc::TransitionTriggerType);
     add!("DiscoveryBoundingBox", qdc::DiscoveryBoundingBox);
-    add!("DiscoveryTransitionTrigger", qdc::DiscoveryTransitionTrigger);
+    add!(
+        "DiscoveryTransitionTrigger",
+        qdc::DiscoveryTransitionTrigger
+    );
     add!("DiscoveredStateImage", qdc::DiscoveredStateImage);
     add!("DiscoveredState", qdc::DiscoveredState);
     add!("DiscoveredTransition", qdc::DiscoveredTransition);
     add!("StateDiscoveryResult", qdc::StateDiscoveryResult);
-    add!("StateDiscoveryResultSummary", qdc::StateDiscoveryResultSummary);
+    add!(
+        "StateDiscoveryResultSummary",
+        qdc::StateDiscoveryResultSummary
+    );
     add!(
         "StateDiscoveryResultListResponse",
         qdc::StateDiscoveryResultListResponse
     );
-    add!("StateDiscoveryResultCreate", qdc::StateDiscoveryResultCreate);
-    add!("StateDiscoveryResultUpdate", qdc::StateDiscoveryResultUpdate);
+    add!(
+        "StateDiscoveryResultCreate",
+        qdc::StateDiscoveryResultCreate
+    );
+    add!(
+        "StateDiscoveryResultUpdate",
+        qdc::StateDiscoveryResultUpdate
+    );
     add!("StateMachineExport", qdc::StateMachineExport);
     add!("StateMachineImport", qdc::StateMachineImport);
 

@@ -833,23 +833,38 @@ impl PgDb {
         // cast ::TEXT so these decode as Option<String>. Use try_get to avoid panicking
         // the tokio worker if a legacy row or schema drift slips a non-text value through.
         let last_detected_at: Option<String> = row.try_get(22).unwrap_or_else(|e| {
-            tracing::warn!("ki_row_to_known_issue: col 22 (last_detected_at) decode error: {}", e);
+            tracing::warn!(
+                "ki_row_to_known_issue: col 22 (last_detected_at) decode error: {}",
+                e
+            );
             None
         });
         let last_checked_at: Option<String> = row.try_get(23).unwrap_or_else(|e| {
-            tracing::warn!("ki_row_to_known_issue: col 23 (last_checked_at) decode error: {}", e);
+            tracing::warn!(
+                "ki_row_to_known_issue: col 23 (last_checked_at) decode error: {}",
+                e
+            );
             None
         });
         let resolved_at: Option<String> = row.try_get(24).unwrap_or_else(|e| {
-            tracing::warn!("ki_row_to_known_issue: col 24 (resolved_at) decode error: {}", e);
+            tracing::warn!(
+                "ki_row_to_known_issue: col 24 (resolved_at) decode error: {}",
+                e
+            );
             None
         });
         let created_at: String = row.try_get(25).unwrap_or_else(|e| {
-            tracing::warn!("ki_row_to_known_issue: col 25 (created_at) decode error: {}", e);
+            tracing::warn!(
+                "ki_row_to_known_issue: col 25 (created_at) decode error: {}",
+                e
+            );
             String::new()
         });
         let updated_at: String = row.try_get(26).unwrap_or_else(|e| {
-            tracing::warn!("ki_row_to_known_issue: col 26 (updated_at) decode error: {}", e);
+            tracing::warn!(
+                "ki_row_to_known_issue: col 26 (updated_at) decode error: {}",
+                e
+            );
             String::new()
         });
 

@@ -814,10 +814,7 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
             for step in steps.iter() {
                 if let Some(id) = step.get("id").and_then(|v| v.as_str()) {
                     // Use the post-remap id when available
-                    let effective = id_map
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_else(|| id.to_string());
+                    let effective = id_map.get(id).cloned().unwrap_or_else(|| id.to_string());
                     set.insert(effective);
                 }
             }
@@ -932,7 +929,9 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
                 if let Some(Value::Array(deps)) = map.get_mut("depends_on") {
                     let mut kept: Vec<Value> = Vec::with_capacity(deps.len());
                     for dep in deps.iter() {
-                        let Some(old_dep) = dep.as_str() else { continue };
+                        let Some(old_dep) = dep.as_str() else {
+                            continue;
+                        };
                         let remapped = id_map
                             .get(old_dep)
                             .cloned()

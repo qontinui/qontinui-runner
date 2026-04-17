@@ -806,9 +806,10 @@ pub fn create_router(
                 cloud_settings.backend_url.clone(),
                 cloud_settings.cloud_registry_poll_secs,
             );
-            let cloud_transport = std::sync::Arc::new(
-                crate::mcp::transport::cloud::CloudTransport::new(cloud_settings.backend_url.clone()),
-            );
+            let cloud_transport =
+                std::sync::Arc::new(crate::mcp::transport::cloud::CloudTransport::new(
+                    cloud_settings.backend_url.clone(),
+                ));
 
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 cloud_settings.cloud_registry_poll_secs,
@@ -843,27 +844,32 @@ pub fn create_router(
                                             _ => crate::mcp::transport::DeviceOs::Android,
                                         };
                                         let now = chrono::Utc::now().timestamp_millis();
-                                        let info = crate::mcp::physical_device::PhysicalDeviceInfo {
-                                            id: device.device_id.clone(),
-                                            os,
-                                            device_kind: "physical".to_string(),
-                                            model: None,
-                                            app_id: if device.app_id.is_empty() {
-                                                None
-                                            } else {
-                                                Some(device.app_id.clone())
-                                            },
-                                            ui_bridge_version: None,
-                                            first_seen_at: now,
-                                            pairing_token: None,
-                                        };
-                                        let transport = crate::mcp::physical_device::ActiveTransport {
-                                            kind: crate::mcp::transport::TransportKind::Cloud,
-                                            proxy_url: format!("http://127.0.0.1:{}", local_port),
-                                            established_at: now,
-                                            last_healthy_at: now,
-                                            fail_count: 0,
-                                        };
+                                        let info =
+                                            crate::mcp::physical_device::PhysicalDeviceInfo {
+                                                id: device.device_id.clone(),
+                                                os,
+                                                device_kind: "physical".to_string(),
+                                                model: None,
+                                                app_id: if device.app_id.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(device.app_id.clone())
+                                                },
+                                                ui_bridge_version: None,
+                                                first_seen_at: now,
+                                                pairing_token: None,
+                                            };
+                                        let transport =
+                                            crate::mcp::physical_device::ActiveTransport {
+                                                kind: crate::mcp::transport::TransportKind::Cloud,
+                                                proxy_url: format!(
+                                                    "http://127.0.0.1:{}",
+                                                    local_port
+                                                ),
+                                                established_at: now,
+                                                last_healthy_at: now,
+                                                fail_count: 0,
+                                            };
                                         registry.register(info, transport).await;
                                         tracing::info!(
                                             "Cloud device registered: {} via tunnel on port {}",

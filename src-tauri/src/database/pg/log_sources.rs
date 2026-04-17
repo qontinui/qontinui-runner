@@ -1,7 +1,9 @@
 //! PostgreSQL log_sources CRUD operations (raw SQL).
 
 use super::PgDb;
-use crate::error_monitor::types::{LogFormat, LogSourceConfig, ParserType, ParserTypeExt, PathType};
+use crate::error_monitor::types::{
+    LogFormat, LogSourceConfig, ParserType, ParserTypeExt, PathType,
+};
 
 impl PgDb {
     // ========================================================================
