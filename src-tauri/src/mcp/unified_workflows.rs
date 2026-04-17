@@ -1425,24 +1425,21 @@ pub async fn run_unified_workflow(
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
 
-    // Check if any stage has prompt-based steps
+    // Check if any stage has prompt-based steps.
+    // The AI generator (structured_output.rs) emits "step_type" while the
+    // executor expects "type". Check both keys so workflows from either
+    // generation path are correctly routed to the AI execution loop.
+    let step_type_is_prompt = |s: &serde_json::Value| -> bool {
+        s.get("type")
+            .or_else(|| s.get("step_type"))
+            .and_then(|t| t.as_str())
+            == Some("prompt")
+    };
     let has_prompt_steps = normalized_stages.iter().any(|stage| {
-        stage
-            .agentic_steps
-            .iter()
-            .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
-            || stage
-                .setup_steps
-                .iter()
-                .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
-            || stage
-                .verification_steps
-                .iter()
-                .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
-            || stage
-                .completion_steps
-                .iter()
-                .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
+        stage.agentic_steps.iter().any(step_type_is_prompt)
+            || stage.setup_steps.iter().any(step_type_is_prompt)
+            || stage.verification_steps.iter().any(step_type_is_prompt)
+            || stage.completion_steps.iter().any(step_type_is_prompt)
     });
 
     // Determine execution_id for resume support
@@ -1986,24 +1983,21 @@ pub async fn execute_inline_workflow(
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
 
-    // Check if any stage has prompt-based steps
+    // Check if any stage has prompt-based steps.
+    // The AI generator (structured_output.rs) emits "step_type" while the
+    // executor expects "type". Check both keys so workflows from either
+    // generation path are correctly routed to the AI execution loop.
+    let step_type_is_prompt = |s: &serde_json::Value| -> bool {
+        s.get("type")
+            .or_else(|| s.get("step_type"))
+            .and_then(|t| t.as_str())
+            == Some("prompt")
+    };
     let has_prompt_steps = normalized_stages.iter().any(|stage| {
-        stage
-            .agentic_steps
-            .iter()
-            .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
-            || stage
-                .setup_steps
-                .iter()
-                .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
-            || stage
-                .verification_steps
-                .iter()
-                .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
-            || stage
-                .completion_steps
-                .iter()
-                .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
+        stage.agentic_steps.iter().any(step_type_is_prompt)
+            || stage.setup_steps.iter().any(step_type_is_prompt)
+            || stage.verification_steps.iter().any(step_type_is_prompt)
+            || stage.completion_steps.iter().any(step_type_is_prompt)
     });
 
     info!(

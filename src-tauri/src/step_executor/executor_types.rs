@@ -55,8 +55,10 @@ impl std::fmt::Display for StepPhase {
 /// ("test" is dispatched through command handler when test_id/test_type fields are set)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ExecutionStepConfig {
-    /// Step type: "command", "ui_bridge", "prompt" (legacy "test" maps to "command")
-    #[serde(rename = "type")]
+    /// Step type: "command", "ui_bridge", "prompt" (legacy "test" maps to "command").
+    /// The AI workflow generator (structured_output.rs) emits `"step_type"` while
+    /// the execution system expects `"type"`. The alias ensures both deserialize.
+    #[serde(rename = "type", alias = "step_type")]
     pub step_type: String,
 
     /// Explicit command mode: "shell", "check", "check_group", or "test".

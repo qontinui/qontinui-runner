@@ -110,7 +110,7 @@ pub fn convert_json_steps_with_phase(
         .iter()
         // Filter out prompt steps - they're handled separately to avoid duplicate logging
         .filter(|step| {
-            let step_type = step.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let step_type = step.get("type").or_else(|| step.get("step_type")).and_then(|t| t.as_str()).unwrap_or("");
             !matches!(
                 step_type,
                 "prompt" | "ai_session" | "ai_prompt" | "run_prompt_sequence"
@@ -123,7 +123,7 @@ pub fn convert_json_steps_with_phase(
                 } else {
                     // Fall back to manual field extraction — preserve command, working directory,
                     // and other key fields so that check/test steps with inline commands still work
-                    let step_type = step.get("type").and_then(|t| t.as_str())?;
+                    let step_type = step.get("type").or_else(|| step.get("step_type")).and_then(|t| t.as_str())?;
                     ExecutionStepConfig {
                         step_type: step_type.to_string(),
                         name: step
@@ -192,7 +192,7 @@ pub fn convert_all_json_steps_with_phase(
                 } else {
                     // Fall back to manual field extraction — preserve command, working directory,
                     // and other key fields so that check/test steps with inline commands still work
-                    let step_type = step.get("type").and_then(|t| t.as_str())?;
+                    let step_type = step.get("type").or_else(|| step.get("step_type")).and_then(|t| t.as_str())?;
                     ExecutionStepConfig {
                         step_type: step_type.to_string(),
                         name: step
@@ -258,6 +258,7 @@ pub fn extract_prompt_steps_with_phase(
         .iter()
         .filter(|step| {
             step.get("type")
+                .or_else(|| step.get("step_type"))
                 .and_then(|t| t.as_str())
                 .map(|t| matches!(t, "prompt" | "ai_prompt" | "run_prompt_sequence"))
                 .unwrap_or(false)
