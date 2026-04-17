@@ -22,6 +22,7 @@ pub mod entailment_cache;
 pub mod entity_profiles;
 pub mod error_monitor;
 pub mod event_log;
+pub mod event_search;
 pub mod export;
 pub mod findings;
 pub mod flows;

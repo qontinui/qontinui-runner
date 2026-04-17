@@ -75,6 +75,7 @@ pub mod dataset;
 pub mod debug;
 pub mod discoveries;
 pub mod durable_execution; // Conductor-inspired replay, rollback, iteration diffs
+pub mod event_search; // Unified full-text search across activity_timeline, observations, deferred_questions, error_events
 pub mod execution;
 pub mod execution_reporting;
 pub mod execution_variables; // Execution variables (auth source, custom variables)

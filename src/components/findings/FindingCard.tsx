@@ -198,6 +198,7 @@ export function FindingCard({
 
   return (
     <div
+      data-finding-id={finding.id}
       className={`rounded-lg border ${categoryColors.border} ${categoryColors.bg} overflow-hidden transition-all`}
     >
       {/* Header */}

@@ -5,7 +5,7 @@
  * Shows a summary of findings grouped by category with filtering and actions.
  */
 
-import { useState, useMemo, useCallback, useEffect } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import {
   FileText,
   Clock,
@@ -22,12 +22,16 @@ import {
   ToggleRight,
   Wrench,
   X,
+  Search,
+  ExternalLink,
 } from "lucide-react";
 import { getStatusColors, getAccentColors } from "@/design-system";
+import type { AccentColor } from "@/design-system";
 import type { ExecutionReport as ExecutionReportType, Finding } from "../../types/findings";
 import { findingsTracker, getVisibleCategories, getCategoryById } from "../../services";
 import { CategorySection } from "./CategorySection";
-import { useAiTaskPolling } from "../../hooks";
+import { useAiTaskPolling, useSearchEvents } from "../../hooks";
+import type { SearchEventResult, SearchEventSourceTable } from "../../hooks";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
@@ -65,6 +69,25 @@ const SEVERITY_OPTIONS: { value: string; label: string }[] = [
   { value: "info", label: "Info" },
 ];
 
+/**
+ * Design-system accent tokens for the four source-table badges.
+ * Uses `getAccentColors(...)` at render time — no hardcoded hex.
+ */
+const SOURCE_TABLE_META: Record<SearchEventSourceTable, { label: string; accent: AccentColor }> = {
+  deferred_questions: { label: "HITL", accent: "purple" },
+  error_events: { label: "Error", accent: "red" },
+  observations: { label: "Observation", accent: "blue" },
+  activity_timeline: { label: "Activity", accent: "slate" },
+};
+
+/** Format an ISO timestamp as `YYYY-MM-DD HH:mm` in local time. */
+function formatTimestamp(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 export function ExecutionReport({
   report,
   onAnalyzeFinding,
@@ -84,6 +107,11 @@ export function ExecutionReport({
   const [isAnalyzingAll, setIsAnalyzingAll] = useState(false);
   const [autoFixEnabled, setAutoFixEnabled] = useState(false);
   const [autoFixLoading, setAutoFixLoading] = useState(false);
+
+  // Full-text search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [hitlOnly, setHitlOnly] = useState(true);
+  const [snippetModal, setSnippetModal] = useState<SearchEventResult | null>(null);
 
   // Use RunSelectionContext if available
   const runSelection = useRunSelectionOptional();
@@ -159,6 +187,51 @@ export function ExecutionReport({
 
   // Use report findings if available, otherwise use live findings
   const findings = report?.findings || liveFindings;
+
+  // ---------------------------------------------------------------------------
+  // Full-text search (Tauri `search_events` command)
+  // ---------------------------------------------------------------------------
+  const trimmedSearch = searchQuery.trim();
+  const isSearching = trimmedSearch.length > 0;
+
+  const searchResultsQuery = useSearchEvents({
+    query: searchQuery,
+    enabled: isSearching,
+  });
+
+  // Apply source-table filter client-side. Default: HITL queue only.
+  const visibleSearchResults = useMemo<SearchEventResult[]>(() => {
+    const raw = searchResultsQuery.data ?? [];
+    return hitlOnly ? raw.filter((r) => r.source_table === "deferred_questions") : raw;
+  }, [searchResultsQuery.data, hitlOnly]);
+
+  // Ref for the scrollable findings list (so we can query for finding cards)
+  const findingsListRef = useRef<HTMLDivElement | null>(null);
+
+  const handleJumpToFinding = useCallback(
+    (result: SearchEventResult) => {
+      const existing = findings.find((f) => f.id === result.record_id);
+      if (existing && findingsListRef.current) {
+        // Finding cards carry data-finding-id (see FindingCard.tsx).
+        const escapedId =
+          typeof CSS !== "undefined" && "escape" in CSS
+            ? CSS.escape(existing.id)
+            : existing.id.replace(/"/g, '\\"');
+        const el = findingsListRef.current.querySelector<HTMLElement>(
+          `[data-finding-id="${escapedId}"]`,
+        );
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          el.classList.add("ring-2", "ring-primary");
+          window.setTimeout(() => el.classList.remove("ring-2", "ring-primary"), 1600);
+          return;
+        }
+      }
+      // No local finding card — open the inline modal.
+      setSnippetModal(result);
+    },
+    [findings],
+  );
 
   // Get visible categories
   const categories = useMemo(() => getVisibleCategories(), []);
@@ -524,6 +597,63 @@ Work through ALL findings systematically. Fix each one and report your resolutio
             })()}
         </div>
 
+        {/* Full-text Search */}
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search events…"
+                aria-label="Search events"
+                className="w-full bg-muted/50 hover:bg-muted focus:bg-muted rounded-lg pl-8 pr-8 py-1.5 text-sm outline-none focus:ring-2 focus:ring-primary/40 transition-colors"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery("")}
+                  aria-label="Clear search"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+            {/* Source-filter toggle: HITL only vs. All events */}
+            <div className="flex items-center bg-muted/50 rounded-lg p-0.5 text-xs">
+              <button
+                type="button"
+                onClick={() => setHitlOnly(true)}
+                className={`px-2.5 py-1 rounded-md transition-colors ${
+                  hitlOnly
+                    ? "bg-primary/15 text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+                title="Show only deferred-question (HITL) results"
+              >
+                HITL queue only
+              </button>
+              <button
+                type="button"
+                onClick={() => setHitlOnly(false)}
+                className={`px-2.5 py-1 rounded-md transition-colors ${
+                  !hitlOnly
+                    ? "bg-primary/15 text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+                title="Show results from all event sources"
+              >
+                All events
+              </button>
+            </div>
+          </div>
+          <p className="text-[11px] text-muted-foreground pl-8">
+            Searches across deferred questions, errors, observations, and activity (last 7 days)
+          </p>
+        </div>
+
         {/* Filter and Actions */}
         <div className="flex items-center justify-between">
           {/* Filter Dropdowns */}
@@ -756,60 +886,232 @@ Work through ALL findings systematically. Fix each one and report your resolutio
         </div>
       </div>
 
-      {/* Scrollable Category Sections */}
-      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
-        {categories.map((category) => {
-          const categoryFindings = findingsByCategory.get(category.id) || [];
-          if (categoryFindings.length === 0) return null;
+      {/* Scrollable content — search results or live findings */}
+      {isSearching ? (
+        <SearchResultsList
+          query={trimmedSearch}
+          isFetching={searchResultsQuery.isFetching}
+          error={searchResultsQuery.error}
+          results={visibleSearchResults}
+          onJump={handleJumpToFinding}
+        />
+      ) : (
+        <div ref={findingsListRef} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
+          {categories.map((category) => {
+            const categoryFindings = findingsByCategory.get(category.id) || [];
+            if (categoryFindings.length === 0) return null;
 
+            return (
+              <CategorySection
+                key={category.id}
+                category={category}
+                findings={categoryFindings}
+                totalFindingsCount={
+                  totalFindingsByCategory.get(category.id) ?? categoryFindings.length
+                }
+                isFilterActive={isFilterActive}
+                isHighlighted={categoryFilter === category.id}
+                onAnalyze={handleAnalyze}
+                onResolve={onResolveFinding}
+                onProvideInput={handleProvideInput}
+                onDismiss={handleDismiss}
+                processingFindingId={processingFindingId}
+              />
+            );
+          })}
+
+          {/* Show uncategorized findings */}
+          {Array.from(findingsByCategory.entries())
+            .filter(([catId]) => !categories.some((c) => c.id === catId))
+            .map(([categoryId, categoryFindings]) => (
+              <CategorySection
+                key={categoryId}
+                category={{
+                  id: categoryId,
+                  name: categoryId,
+                  description: "Uncategorized findings",
+                  icon: "AlertTriangle",
+                  color: "slate",
+                  isBuiltIn: false,
+                  defaultActionType: "manual",
+                  sortOrder: 999,
+                }}
+                findings={categoryFindings}
+                totalFindingsCount={
+                  totalFindingsByCategory.get(categoryId) ?? categoryFindings.length
+                }
+                isFilterActive={isFilterActive}
+                isHighlighted={categoryFilter === categoryId}
+                onAnalyze={handleAnalyze}
+                onResolve={onResolveFinding}
+                onProvideInput={handleProvideInput}
+                onDismiss={handleDismiss}
+                processingFindingId={processingFindingId}
+              />
+            ))}
+        </div>
+      )}
+
+      {/* Snippet modal — shown when Jump is clicked for a record not present locally */}
+      {snippetModal && <SnippetModal result={snippetModal} onClose={() => setSnippetModal(null)} />}
+    </div>
+  );
+}
+
+// =============================================================================
+// Search result rendering (inline sub-components)
+// =============================================================================
+
+interface SearchResultsListProps {
+  query: string;
+  isFetching: boolean;
+  error: Error | null;
+  results: SearchEventResult[];
+  onJump: (result: SearchEventResult) => void;
+}
+
+function SearchResultsList({ query, isFetching, error, results, onJump }: SearchResultsListProps) {
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-2">
+      {isFetching && (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          <span>Searching…</span>
+        </div>
+      )}
+
+      {error &&
+        !isFetching &&
+        (() => {
+          const errColors = getAccentColors("red");
           return (
-            <CategorySection
-              key={category.id}
-              category={category}
-              findings={categoryFindings}
-              totalFindingsCount={
-                totalFindingsByCategory.get(category.id) ?? categoryFindings.length
-              }
-              isFilterActive={isFilterActive}
-              isHighlighted={categoryFilter === category.id}
-              onAnalyze={handleAnalyze}
-              onResolve={onResolveFinding}
-              onProvideInput={handleProvideInput}
-              onDismiss={handleDismiss}
-              processingFindingId={processingFindingId}
-            />
+            <div
+              className={`flex items-start gap-2 rounded-lg p-3 text-sm ${errColors.bg} ${errColors.text} ${errColors.border} border`}
+            >
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <div>
+                <div className="font-medium">Search failed</div>
+                <div className="text-xs opacity-80">{error.message}</div>
+              </div>
+            </div>
           );
-        })}
+        })()}
 
-        {/* Show uncategorized findings */}
-        {Array.from(findingsByCategory.entries())
-          .filter(([catId]) => !categories.some((c) => c.id === catId))
-          .map(([categoryId, categoryFindings]) => (
-            <CategorySection
-              key={categoryId}
-              category={{
-                id: categoryId,
-                name: categoryId,
-                description: "Uncategorized findings",
-                icon: "AlertTriangle",
-                color: "slate",
-                isBuiltIn: false,
-                defaultActionType: "manual",
-                sortOrder: 999,
-              }}
-              findings={categoryFindings}
-              totalFindingsCount={
-                totalFindingsByCategory.get(categoryId) ?? categoryFindings.length
-              }
-              isFilterActive={isFilterActive}
-              isHighlighted={categoryFilter === categoryId}
-              onAnalyze={handleAnalyze}
-              onResolve={onResolveFinding}
-              onProvideInput={handleProvideInput}
-              onDismiss={handleDismiss}
-              processingFindingId={processingFindingId}
-            />
-          ))}
+      {!isFetching && !error && results.length === 0 && (
+        <div className="text-sm text-muted-foreground py-6 text-center">
+          No events matched {`"${query}"`}.
+        </div>
+      )}
+
+      {results.map((result, idx) => (
+        <SearchResultCard
+          key={`${result.source_table}:${result.record_id}:${idx}`}
+          result={result}
+          onJump={onJump}
+        />
+      ))}
+    </div>
+  );
+}
+
+interface SearchResultCardProps {
+  result: SearchEventResult;
+  onJump: (result: SearchEventResult) => void;
+}
+
+function SearchResultCard({ result, onJump }: SearchResultCardProps) {
+  const meta = SOURCE_TABLE_META[result.source_table];
+  const badge = getAccentColors(meta.accent);
+  const isHitl = result.source_table === "deferred_questions";
+
+  return (
+    <div className="rounded-lg border border-border bg-muted/20 hover:bg-muted/40 transition-colors p-3">
+      <div className="flex items-start gap-3">
+        <span
+          className={`shrink-0 inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium ${badge.bg} ${badge.text} ${badge.border} border`}
+        >
+          {meta.label}
+        </span>
+        <p
+          className="flex-1 text-sm text-foreground overflow-hidden"
+          style={{
+            display: "-webkit-box",
+            WebkitLineClamp: 3,
+            WebkitBoxOrient: "vertical",
+          }}
+          title={result.snippet}
+        >
+          {result.snippet}
+        </p>
+        <div className="shrink-0 flex flex-col items-end gap-1 text-xs text-muted-foreground">
+          <span className="font-mono">{formatTimestamp(result.ts)}</span>
+          <span className="opacity-70">rank {result.score.toFixed(2)}</span>
+          {isHitl && (
+            <button
+              type="button"
+              onClick={() => onJump(result)}
+              className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded bg-primary/15 text-primary hover:bg-primary/25 transition-colors"
+              title="Jump to finding or open snippet"
+            >
+              <ExternalLink className="w-3 h-3" />
+              Jump to finding
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface SnippetModalProps {
+  result: SearchEventResult;
+  onClose: () => void;
+}
+
+function SnippetModal({ result, onClose }: SnippetModalProps) {
+  const meta = SOURCE_TABLE_META[result.source_table];
+  const badge = getAccentColors(meta.accent);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm p-4"
+      role="dialog"
+      aria-modal="true"
+      onClick={onClose}
+    >
+      <div
+        className="max-w-lg w-full bg-popover border border-border rounded-lg shadow-lg p-4 space-y-3"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span
+              className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium ${badge.bg} ${badge.text} ${badge.border} border`}
+            >
+              {meta.label}
+            </span>
+            <span className="text-xs text-muted-foreground font-mono">
+              {formatTimestamp(result.ts)}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="text-muted-foreground hover:text-foreground"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="text-xs text-muted-foreground">
+          Record ID: <span className="font-mono text-foreground">{result.record_id}</span>
+        </div>
+        <pre className="text-sm text-foreground whitespace-pre-wrap break-words max-h-72 overflow-y-auto bg-muted/30 rounded p-3">
+          {result.snippet}
+        </pre>
+        <p className="text-xs text-muted-foreground">
+          No matching finding card is currently in view. The snippet above is shown as-is.
+        </p>
       </div>
     </div>
   );

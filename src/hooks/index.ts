@@ -254,6 +254,13 @@ export { useCloudRelayAutoConnect } from "./useCloudRelayAutoConnect";
 
 export { useGraphDataRefresh } from "./useGraphDataRefresh";
 
+export { useSearchEvents } from "./useSearchEvents";
+export type {
+  SearchEventResult,
+  SearchEventSourceTable,
+  UseSearchEventsParams,
+} from "./useSearchEvents";
+
 export {
   usePromptVersions,
   usePromptVersion,
