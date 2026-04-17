@@ -420,11 +420,12 @@ pub enum AppEvent {
 /// remote types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        accessibility as qa, config as qcfg, constraints as qc, discovery as qdc, execution as qe,
-        findings as qfn, geometry as qg, mcp_config as qmc, orchestration_config as qoc,
-        process_management as qpm, rag as qr, scheduler as qs, state_machine as qsm, targets as qt,
-        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
-        verification as qv, workflow as qw, workflow_step as qws,
+        accessibility as qa, ai_workflows as qaw, config as qcfg, constraints as qc,
+        discovery as qdc, execution as qe, findings as qfn, geometry as qg, mcp_config as qmc,
+        orchestration_config as qoc, process_management as qpm, rag as qr, scheduler as qs,
+        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
+        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
+        workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -454,6 +455,10 @@ pub fn export_all_schemas() -> Value {
     add!("ReflectionFixOutput", ReflectionFixOutput);
     add!("FlowEvent", FlowEvent);
     add!("AppEvent", AppEvent);
+
+    // ── qontinui-types: ai_workflows ──
+    add!("ExecutionStep", qaw::ExecutionStep);
+    add!("AiWorkflow", qaw::AiWorkflow);
 
     // ── qontinui-types: constraints ──
     add!("ConstraintSeverity", qc::ConstraintSeverity);
@@ -949,6 +954,31 @@ pub fn export_all_schemas() -> Value {
     add!("TaskCompletionResult", qv::TaskCompletionResult);
     add!("StageTransition", qv::StageTransition);
 
+    // ── qontinui-types: ui_bridge ──
+    add!("ElementRect", qub::ElementRect);
+    add!("ElementState", qub::ElementState);
+    add!("ElementIdentifier", qub::ElementIdentifier);
+    add!("UIBridgeElement", qub::UIBridgeElement);
+    add!("ComponentActionInfo", qub::ComponentActionInfo);
+    add!("UIBridgeComponent", qub::UIBridgeComponent);
+    add!("WaitOptions", qub::WaitOptions);
+    add!("ElementActionRequest", qub::ElementActionRequest);
+    add!("ComponentActionRequest", qub::ComponentActionRequest);
+    add!("ActionResponse", qub::ActionResponse);
+    add!("DiscoveryRequest", qub::DiscoveryRequest);
+    add!("DiscoveredElement", qub::DiscoveredElement);
+    add!("DiscoveryResponse", qub::DiscoveryResponse);
+    add!("WorkflowInfo", qub::WorkflowInfo);
+    add!("UIBridgeSnapshot", qub::UIBridgeSnapshot);
+
+    // ── qontinui-types: rag (extended) ──
+    add!("ElementType", qr::ElementType);
+    add!("BoundingBox", qr::BoundingBox);
+    add!("GUIElementChunk", qr::GUIElementChunk);
+    add!("EmbeddedElement", qr::EmbeddedElement);
+    add!("VectorSearchResult", qr::VectorSearchResult);
+    add!("ExportResult", qr::ExportResult);
+
     Value::Object(m)
 }
 
@@ -972,7 +1002,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 382, "Expected 382 schema entries");
+        assert_eq!(obj.len(), 405, "Expected 405 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
