@@ -1,180 +1,14 @@
 //! Schema Export Module
 //!
-//! Provides functions to export JSON Schemas for key application types.
-//! Used by the `export_schemas` binary to produce schemas for cross-language
-//! type generation (TypeScript, Python).
+//! Pure re-export aggregator — contains **zero** local type definitions.
+//! All types come from `qontinui-types` (`qontinui-schemas/rust/`).
 //!
-//! The types defined here mirror the canonical types in the main application.
-//! They are kept in sync by deriving `JsonSchema` on both and verifying schema
-//! equivalence in tests. This separation exists because the main application
-//! types live in `main.rs`'s module tree (not the lib crate) due to Tauri's
-//! architecture.
+//! Used by the `export_schemas` binary to produce a single JSON object
+//! mapping type names to their JSON Schemas for cross-language type
+//! generation (TypeScript, Python).
 
-use schemars::{schema_for, JsonSchema};
-use serde::{Deserialize, Serialize};
+use schemars::schema_for;
 use serde_json::{Map, Value};
-
-// ============================================================================
-// Mirror types for schema export
-//
-// These types mirror the canonical types in the main crate. They exist solely
-// for JSON Schema generation. The generated schemas are the contract — not
-// these Rust types. When the canonical types change, update these mirrors
-// and regenerate.
-// ============================================================================
-
-// --- WorkerOutput (mirrors orchestrator::structured_output::WorkerOutput) ---
-
-/// Structured output from an AI worker agent.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct WorkerOutput {
-    /// Summary of work performed in this iteration.
-    pub work_summary: String,
-    /// Signals for orchestrator control flow.
-    #[serde(default)]
-    pub signals: Vec<StructuredSignal>,
-    /// Findings discovered during work.
-    #[serde(default)]
-    pub findings: Vec<StructuredFinding>,
-    /// Files that were modified in this iteration.
-    #[serde(default)]
-    pub files_modified: Vec<String>,
-    /// Criterion overrides with justifications.
-    #[serde(default)]
-    pub criterion_overrides: Vec<StructuredOverride>,
-    /// Confidence level in the work quality.
-    #[serde(default)]
-    pub confidence: ConfidenceLevel,
-    /// Optional suggestion for next action if work continues.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_action_suggestion: Option<String>,
-    /// Optional progress estimate (0.0 to 1.0).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub progress_estimate: Option<f32>,
-    /// Optional notes for debugging or context.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notes: Option<String>,
-}
-
-/// A signal from the worker to the orchestrator.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct StructuredSignal {
-    /// Signal type (e.g., "complete", "blocked", "needs_input").
-    pub signal_type: String,
-    /// Optional message providing context for the signal.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-/// A finding discovered during work.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct StructuredFinding {
-    /// Finding category (e.g., "bug", "security", "performance").
-    pub category: String,
-    /// Severity level.
-    pub severity: String,
-    /// Short title describing the finding.
-    pub title: String,
-    /// Detailed description.
-    #[serde(default)]
-    pub description: String,
-    /// Whether this finding requires human input.
-    #[serde(default)]
-    pub needs_input: bool,
-}
-
-/// A criterion override with justification.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct StructuredOverride {
-    /// The criterion being overridden.
-    pub criterion: String,
-    /// The new status.
-    pub status: String,
-    /// Justification for the override.
-    pub justification: String,
-}
-
-/// Confidence level enum.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ConfidenceLevel {
-    High,
-    #[default]
-    Medium,
-    Low,
-}
-
-// --- AgenticPhaseOutput (mirrors unified_workflow_executor::agentic_output) ---
-
-/// Status of the agentic phase execution.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AgenticStatus {
-    Success,
-    PartialSuccess,
-    Failed,
-    Unfixable,
-}
-
-/// A file change made during the agentic phase.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct FileChange {
-    pub path: String,
-    pub action: String,
-}
-
-/// A finding reported by the AI.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct FindingOutput {
-    pub category: String,
-    pub severity: String,
-    pub title: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub needs_input: bool,
-    #[serde(default)]
-    pub resolved: bool,
-}
-
-/// A reflection fix reported by the AI.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ReflectionFixOutput {
-    pub error_id: String,
-    pub description: String,
-}
-
-/// Canonical structured output from the agentic phase.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AgenticPhaseOutput {
-    /// Overall status of the agentic phase.
-    pub status: AgenticStatus,
-    /// Human-readable summary of what was done.
-    pub summary: String,
-    /// AI's confidence that the fixes will pass verification (0.0-1.0).
-    #[serde(default)]
-    pub confidence: Option<f64>,
-    /// Whether the AI determined errors are unfixable.
-    #[serde(default)]
-    pub unfixable: bool,
-    /// Reason why errors are unfixable (if unfixable is true).
-    #[serde(default)]
-    pub unfixable_reason: Option<String>,
-    /// Files modified during this agentic phase.
-    #[serde(default)]
-    pub files_modified: Vec<FileChange>,
-    /// Dynamically injected verification steps.
-    #[serde(default)]
-    pub injected_steps: Vec<Value>,
-    /// Reflection fixes (when reflection_mode is enabled).
-    #[serde(default)]
-    pub reflection_fixes: Vec<ReflectionFixOutput>,
-    /// Findings reported by the AI.
-    #[serde(default)]
-    pub findings: Vec<FindingOutput>,
-}
-
-// --- AppEvent + FlowEvent (now re-exported from qontinui-types::app_events) ---
 
 // ============================================================================
 // Export function
@@ -185,11 +19,10 @@ pub struct AgenticPhaseOutput {
 /// Keys are type names, values are full JSON Schema objects.
 /// Used by the `export_schemas` binary and the type generation pipeline.
 ///
-/// In addition to the runner-local mirror types above, this re-exports the
-/// canonical DTO schemas from the `qontinui-types` crate
+/// All types are re-exported from the `qontinui-types` crate
 /// (`qontinui-schemas/rust/`). Those types are the source of truth for the
 /// TypeScript and Python bindings; we emit schemas via `schema_for!` on the
-/// remote types directly so there is no duplication.
+/// canonical types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
         accessibility as qa, ai_workflows as qaw, app_events as qae, config as qcfg,
@@ -197,7 +30,7 @@ pub fn export_all_schemas() -> Value {
         mcp_config as qmc, orchestration_config as qoc, process_management as qpm, rag as qr,
         scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
         ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
-        workflow as qw, workflow_step as qws,
+        workflow as qw, worker_output as qwo, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -214,17 +47,17 @@ pub fn export_all_schemas() -> Value {
         };
     }
 
-    // ── Runner-local mirror types ──
-    add!("WorkerOutput", WorkerOutput);
-    add!("StructuredSignal", StructuredSignal);
-    add!("StructuredFinding", StructuredFinding);
-    add!("StructuredOverride", StructuredOverride);
-    add!("ConfidenceLevel", ConfidenceLevel);
-    add!("AgenticPhaseOutput", AgenticPhaseOutput);
-    add!("AgenticStatus", AgenticStatus);
-    add!("FileChange", FileChange);
-    add!("FindingOutput", FindingOutput);
-    add!("ReflectionFixOutput", ReflectionFixOutput);
+    // ── qontinui-types: worker_output ──
+    add!("WorkerOutput", qwo::WorkerOutput);
+    add!("StructuredSignal", qwo::StructuredSignal);
+    add!("StructuredFinding", qwo::StructuredFinding);
+    add!("StructuredOverride", qwo::StructuredOverride);
+    add!("ConfidenceLevel", qwo::ConfidenceLevel);
+    add!("AgenticPhaseOutput", qwo::AgenticPhaseOutput);
+    add!("AgenticStatus", qwo::AgenticStatus);
+    add!("FileChange", qwo::FileChange);
+    add!("FindingOutput", qwo::FindingOutput);
+    add!("ReflectionFixOutput", qwo::ReflectionFixOutput);
     add!("FlowEvent", qae::FlowEvent);
     add!("AppEvent", qae::AppEvent);
 
