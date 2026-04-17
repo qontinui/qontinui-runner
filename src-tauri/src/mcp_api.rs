@@ -214,6 +214,30 @@ async fn health(
         format!(":{}", api_port)
     };
 
+    // AI configuration & runtime status — distinguishes "not configured" from
+    // "configured but idle" from "actively running".
+    let ai_settings = crate::settings::get_ai_settings();
+    let ai_configured = true; // A provider is always selected (enum has a default)
+    let ai_running = {
+        let pids = crate::safe_lock::safe_lock_or_recover(
+            &state.current_ai_pids,
+            "current_ai_pids",
+        );
+        !pids.is_empty()
+    };
+    let ai_provider_name: &str = match &ai_settings.provider {
+        crate::settings::AiProvider::ClaudeCli => "claude_cli",
+        crate::settings::AiProvider::ClaudeApi => "claude_api",
+        crate::settings::AiProvider::GeminiCli => "gemini_cli",
+        crate::settings::AiProvider::GeminiApi => "gemini_api",
+    };
+    let ai_model: Option<String> = match &ai_settings.provider {
+        crate::settings::AiProvider::ClaudeCli => None, // CLI manages its own model selection
+        crate::settings::AiProvider::ClaudeApi => Some(ai_settings.claude_api.model.clone()),
+        crate::settings::AiProvider::GeminiCli => Some(ai_settings.gemini_cli.model.clone()),
+        crate::settings::AiProvider::GeminiApi => Some(ai_settings.gemini_api.model.clone()),
+    };
+
     let mut data = serde_json::json!({
         "status": status,
         "ready": last_pong > 0,
@@ -226,6 +250,12 @@ async fn health(
         "consoleErrorCount": console_errors,
         "aiProviderCircuitBreakers": ai_provider_states,
         "embeddingService": embedding_health,
+        "ai": {
+            "configured": ai_configured,
+            "running": ai_running,
+            "provider": ai_provider_name,
+            "model": ai_model,
+        },
         // Git SHA of the commit this binary was built from (12-char). Embedded
         // by build.rs via QONTINUI_GIT_SHA. Manual-test sessions can assert
         // the temp runner is actually running the commit under debug.

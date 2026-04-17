@@ -855,6 +855,84 @@ pub async fn import_config(
 }
 
 // ============================================================================
+// Compiled state machine persistence
+// ============================================================================
+
+/// Request body for POST /state-machine/save-compiled
+/// Accepts the full compiled state machine (states + transitions) produced by
+/// the frontend's `compileStateMachineFromSpecs`.
+#[derive(Debug, Deserialize)]
+pub struct SaveCompiledRequest {
+    /// Human-readable name (optional; defaults to "Compiled State Machine")
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The full compiled state machine object from the frontend.
+    /// Expected shape: `{ config: {...}, states: [...], transitions: [...] }`
+    pub compiled: serde_json::Value,
+}
+
+/// POST /state-machine/save-compiled — Persist a frontend-compiled state machine
+///
+/// The frontend calls this after `compileStateMachineFromSpecs` to push the
+/// compiled state machine into the backend DB so it is available via the HTTP API.
+pub async fn save_compiled_state_machine(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<SaveCompiledRequest>,
+) -> Result<Json<ApiResponse<SmConfigFull>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let name = request
+        .name
+        .unwrap_or_else(|| "Compiled State Machine".to_string());
+    info!(
+        "State Machine API: Saving compiled state machine '{}'",
+        name
+    );
+
+    let import_req = SmImportRequest {
+        name: Some(name),
+        config: request.compiled,
+    };
+
+    let result = pg_db(&state)
+        .import_sm_config(&import_req)
+        .await
+        .map_err(pg_err)?;
+
+    info!(
+        "State Machine API: Saved compiled config '{}' ({} states, {} transitions)",
+        result.config.name,
+        result.states.len(),
+        result.transitions.len()
+    );
+    Ok(Json(ApiResponse::success(result)))
+}
+
+/// GET /state-machine/current — Return the most recently updated state machine config
+///
+/// Returns the full config (with states and transitions) that was most recently
+/// saved or imported, which is typically the spec-compiled machine pushed by the frontend.
+pub async fn get_current_state_machine(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<SmConfigFull>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let configs = pg_db(&state).list_sm_configs().await.map_err(pg_err)?;
+
+    // Return the most recently updated config that has states/transitions
+    for config in configs.iter() {
+        if let Ok(Some(full)) = pg_db(&state).get_sm_config_full(&config.id).await {
+            if !full.states.is_empty() || !full.transitions.is_empty() {
+                return Ok(Json(ApiResponse::success(full)));
+            }
+        }
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(api_error(
+            "No compiled state machine found. The frontend needs to push the compiled state machine via POST /state-machine/save-compiled.".to_string(),
+        )),
+    ))
+}
+
+// ============================================================================
 // Routes
 // ============================================================================
 
@@ -888,6 +966,15 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(get_mermaid_diagram),
         )
         .route("/state-machine", delete(clear_state_machine))
+        // Compiled state machine persistence (frontend → backend)
+        .route(
+            "/state-machine/save-compiled",
+            post(save_compiled_state_machine),
+        )
+        .route(
+            "/state-machine/current",
+            get(get_current_state_machine),
+        )
         // CRUD operations for state machine configs (SQLite)
         .route("/state-machine/configs", get(list_configs))
         .route("/state-machine/configs", post(create_config))
