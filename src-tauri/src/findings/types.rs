@@ -257,3 +257,84 @@ pub struct ParsedFinding {
     pub question: Option<String>,
     pub options: Option<Vec<String>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that hand-written `as_str()` values match serde's
+    /// `rename_all = "snake_case"` output, and that `from_str` round-trips
+    /// correctly.  If a variant is added to the schemas crate but the ext
+    /// trait returns a different string, this test catches it.
+    macro_rules! assert_serde_parity {
+        ($enum_ty:ty, $ext_trait:ident, [$($variant:expr),+ $(,)?]) => {
+            $(
+                {
+                    let v: $enum_ty = $variant;
+                    let serde_str = serde_json::to_value(&v)
+                        .expect("serde_json::to_value failed")
+                        .as_str()
+                        .expect("serde value was not a string")
+                        .to_owned();
+                    assert_eq!(
+                        <$enum_ty as $ext_trait>::as_str(&v),
+                        serde_str.as_str(),
+                        "as_str mismatch for {:?}",
+                        v,
+                    );
+                    let round_trip: $enum_ty = serde_json::from_value(
+                        serde_json::Value::String(
+                            <$enum_ty as $ext_trait>::as_str(&v).to_owned(),
+                        ),
+                    )
+                    .unwrap_or_else(|e| panic!("from_str round-trip failed for {:?}: {}", v, e));
+                    assert_eq!(v, round_trip, "round-trip mismatch for {:?}", v);
+                }
+            )+
+        };
+    }
+
+    #[test]
+    fn finding_category_serde_parity() {
+        use FindingCategory::*;
+        assert_serde_parity!(FindingCategory, FindingCategoryExt, [
+            CodeBug,
+            Security,
+            Performance,
+            Todo,
+            Enhancement,
+            ConfigIssue,
+            TestIssue,
+            Documentation,
+            RuntimeIssue,
+            AlreadyFixed,
+            ExpectedBehavior,
+            Warning,
+            DataMigration,
+        ]);
+    }
+
+    #[test]
+    fn finding_severity_serde_parity() {
+        use FindingSeverity::*;
+        assert_serde_parity!(FindingSeverity, FindingSeverityExt, [
+            Critical, High, Medium, Low, Info,
+        ]);
+    }
+
+    #[test]
+    fn finding_status_serde_parity() {
+        use FindingStatus::*;
+        assert_serde_parity!(FindingStatus, FindingStatusExt, [
+            Detected, InProgress, NeedsInput, Resolved, WontFix, Deferred,
+        ]);
+    }
+
+    #[test]
+    fn finding_action_type_serde_parity() {
+        use FindingActionType::*;
+        assert_serde_parity!(FindingActionType, FindingActionTypeExt, [
+            AutoFix, NeedsUserInput, Manual, Informational,
+        ]);
+    }
+}
