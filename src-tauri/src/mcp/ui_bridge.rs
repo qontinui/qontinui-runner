@@ -1433,7 +1433,44 @@ pub async fn ui_bridge_execute_action_handler(
 
     let action_name = request.action.clone();
     let task_run_id = query.task_run_id;
-    let expect_change = request.expect_change.clone();
+
+    // Default expectChange=true for click/doubleClick on non-input elements
+    // so callers get a state-change signal instead of bare {success: true}.
+    // Explicit caller values always win.
+    let expect_change = if request.expect_change.is_some() {
+        request.expect_change.clone()
+    } else if matches!(action_name.as_str(), "click" | "doubleClick" | "double_click") {
+        // Check if target is an input-like element (clicks on inputs just
+        // focus; the "change" signal would be misleading).
+        let is_input = match ui_bridge_request_sync(
+            &state,
+            "get_element",
+            serde_json::json!({ "elementId": id }),
+        )
+        .await
+        {
+            Ok(data) => {
+                let tag = data
+                    .get("element_type")
+                    .or_else(|| data.get("tagName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                matches!(
+                    tag.to_uppercase().as_str(),
+                    "INPUT" | "TEXTAREA" | "SELECT"
+                )
+            }
+            Err(_) => false, // can't tell — default to enabling detector
+        };
+        if is_input {
+            None
+        } else {
+            Some(serde_json::Value::Bool(true))
+        }
+    } else {
+        request.expect_change.clone()
+    };
+
     let start = Instant::now();
 
     // Optional pre-action snapshot for the click-had-no-effect detector.
@@ -1953,6 +1990,7 @@ pub async fn ui_bridge_discover_handler(
                         direct_webview_evaluate_with_result(
                             &state,
                             "document.body && document.body.innerText.length > 100",
+                            None,
                         ),
                     )
                     .await
@@ -1962,7 +2000,7 @@ pub async fn ui_bridge_discover_handler(
 
                     let title = tokio::time::timeout(
                         diag_timeout,
-                        direct_webview_evaluate_with_result(&state, "document.title"),
+                        direct_webview_evaluate_with_result(&state, "document.title", None),
                     )
                     .await
                     .ok()
@@ -3126,8 +3164,14 @@ pub struct QuerySelectorRequest {
 
 /// Request for page evaluation
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PageEvaluateRequest {
     pub expression: String,
+    /// Optional timeout override in milliseconds (clamped to [1000, 600000]).
+    /// Default: 10s. Use for long-running async expressions like
+    /// `invoke("generate_workflow_standalone", ...)` that can take minutes.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Request to evaluate multiple JS expressions in one round-trip.
@@ -3408,7 +3452,8 @@ pub async fn ui_bridge_page_evaluate_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    page_evaluate_inner(state, request.expression).await
+    let timeout = request.timeout_ms.map(|ms| ms.clamp(1000, 600_000));
+    page_evaluate_inner(state, request.expression, timeout).await
 }
 
 /// `POST /ui-bridge/control/page/evaluate-raw`
@@ -3434,20 +3479,31 @@ pub async fn ui_bridge_page_evaluate_raw_handler(
             Json(api_error("page/evaluate-raw: body is empty".to_string())),
         ));
     }
-    page_evaluate_inner(state, body).await
+    page_evaluate_inner(state, body, None).await
 }
 
 async fn page_evaluate_inner(
     state: Arc<ApiState>,
     expression: String,
+    timeout_ms: Option<u64>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let preview: String = expression.chars().take(80).collect();
     info!("UI Bridge API: Page evaluate ({}...)", preview);
 
     let payload = serde_json::json!({ "expression": expression });
 
-    // Try IPC path first (fastest, uses SDK event handlers)
-    match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
+    // Try IPC path first (fastest, uses SDK event handlers).
+    // Wrap with caller's timeout_ms when provided (e.g. for 3+ min pipelines).
+    let ipc_future = ui_bridge_request_sync(&state, "page_evaluate", payload);
+    let ipc_result = if let Some(ms) = timeout_ms {
+        match tokio::time::timeout(std::time::Duration::from_millis(ms), ipc_future).await {
+            Ok(result) => result,
+            Err(_) => Err(format!("UI Bridge page_evaluate timed out after {}ms", ms)),
+        }
+    } else {
+        ipc_future.await
+    };
+    match ipc_result {
         Ok(data) => {
             // The SDK may return a payload with `success: false` and an `error`
             // field when the JS expression itself throws (e.g., SyntaxError).
@@ -3474,7 +3530,7 @@ async fn page_evaluate_inner(
                 ipc_err
             );
 
-            match direct_webview_evaluate_with_result(&state, &expression).await {
+            match direct_webview_evaluate_with_result(&state, &expression, timeout_ms).await {
                 Ok(result) => Ok(Json(ApiResponse::success(serde_json::json!({
                     "result": { "value": result },
                     "source": "direct_eval"
@@ -3505,6 +3561,7 @@ async fn page_evaluate_inner(
 async fn direct_webview_evaluate_with_result(
     state: &Arc<ApiState>,
     expression: &str,
+    timeout_override_ms: Option<u64>,
 ) -> Result<String, String> {
     use tauri::Manager;
 
@@ -3578,8 +3635,9 @@ async fn direct_webview_evaluate_with_result(
         .eval(&callback_js)
         .map_err(|e| format!("WebView eval dispatch failed: {}", e))?;
 
-    // Wait for the response with a timeout
-    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+    // Wait for the response with a timeout (caller can override for long async ops)
+    let timeout_secs = timeout_override_ms.map(|ms| ms / 1000).unwrap_or(10);
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(data)) => {
             if let Some(result) = data
                 .get("result")
@@ -3602,7 +3660,7 @@ async fn direct_webview_evaluate_with_result(
                     .ui_bridge_pending_count
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
-            Err("Direct eval timed out after 10s".to_string())
+            Err(format!("Direct eval timed out after {}s", timeout_secs))
         }
     }
 }
@@ -9735,7 +9793,7 @@ async fn evaluate_js_expression(state: &Arc<ApiState>, expression: &str) -> Resu
                 || data.get("error").is_some()
             {
                 // IPC returned an error — fall back to direct eval
-                return direct_webview_evaluate_with_result(state, expression).await;
+                return direct_webview_evaluate_with_result(state, expression, None).await;
             }
             // Extract the result value from the IPC response
             if let Some(result) = data.get("result").and_then(|r| r.get("value")) {
@@ -9749,7 +9807,7 @@ async fn evaluate_js_expression(state: &Arc<ApiState>, expression: &str) -> Resu
         }
         Err(_ipc_err) => {
             // Fallback to direct WebView evaluation
-            direct_webview_evaluate_with_result(state, expression).await
+            direct_webview_evaluate_with_result(state, expression, None).await
         }
     }
 }
