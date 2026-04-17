@@ -564,11 +564,21 @@ fn build_builder_prompt(
 
 If the Additional Context contains a block labeled "Spec Generation Brief (JSON)", parse it and follow these rules strictly:
 
-1. **Navigate first.** If the brief has a `pageUrl`, emit a setup step that navigates to it.
+1. **Navigate first.** If the brief has a `pageUrl`, emit a setup step that navigates to it using the **control** endpoint (see rule 6).
 2. **Preconditions become setup steps.** For each group in `groups[]`, emit one setup step per entry in `preconditions[]` before that group's verification steps. Each precondition describes a required UI state (e.g., "Findings panel is open"); the setup step should click the button or trigger the action that achieves that state. Infer the selector from the assertion descriptions in the group if it is not explicit.
 3. **Deterministic assertions become batched snapshot_assert steps.** For each group, emit ONE `ui_bridge` step with `ui_bridge_action: "snapshot_assert"` whose `ui_bridge_target` is a JSON-stringified array of the group's `deterministicAssertions[]`. Each array element must have the shape `{id, description, severity, assertionType, criteria, expected?, relatedCriteria?, minGap?}`. Use `ui_bridge_snapshot_target` = the brief's `elementSource` ("control" or "external", mapped via `external -> "sdk"`).
 4. **Semantic assertions become prompt or agentic steps.** Each group's `semanticAssertions[]` should become one or more `prompt` steps with a `content` field that includes the assertion descriptions. These may navigate and inspect the UI via the UI Bridge tools.
 5. **Always bias toward determinism.** When an assertion could be either deterministic or semantic, prefer the deterministic form (snapshot_assert).
+6. **Use control endpoints, NOT SDK endpoints.** The UI Bridge has two families:
+   - `/ui-bridge/control/*` — for the runner's own UI (this is what spec-driven workflows use)
+   - `/ui-bridge/sdk/*` — for external apps connected via the SDK (NOT for the runner's own pages)
+   When `elementSource` is `"control"` (which is the default for runner page specs), ALL commands must use `/ui-bridge/control/` paths:
+   - Navigate: `curl POST /ui-bridge/control/page/navigate -d '{"url":"/terminal"}'`
+   - Snapshot: `curl GET /ui-bridge/control/snapshot`
+   - Click: `curl POST /ui-bridge/control/element/<id>/action -d '{"action":"click"}'`
+   - Discover: `curl POST /ui-bridge/control/discover`
+   - Evaluate JS: `curl POST /ui-bridge/control/page/evaluate -d '{"expression":"..."}'`
+   Do NOT use `/ui-bridge/sdk/connect`, `/ui-bridge/sdk/navigate`, or `/ui-bridge/sdk/snapshot` — those are for external app testing only and will fail when targeting the runner's own UI.
 
 ### Canonical snapshot_assert Step Example
 
