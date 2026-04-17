@@ -513,8 +513,8 @@ impl PgDb {
                     tr.id,
                     tr.reflection_source_task_run_id,
                     tr.status,
-                    tr.created_at,
-                    tr.completed_at,
+                    tr.created_at::TEXT,
+                    tr.completed_at::TEXT,
                     (SELECT COUNT(*) FROM reflection_fixes rf WHERE rf.reflection_task_run_id = tr.id) as fix_count
                 FROM task_runs tr
                 WHERE tr.is_reflection = true
@@ -532,8 +532,16 @@ impl PgDb {
                 task_run_id: r.get(0),
                 source_task_run_id: r.get(1),
                 status: r.get(2),
-                created_at: r.get(3),
-                completed_at: r.get(4),
+                // TIMESTAMPTZ columns cast ::TEXT in SQL so they decode as String.
+                // Use try_get to avoid panic if cast is missing or type changes.
+                created_at: r.try_get(3).unwrap_or_else(|e| {
+                    tracing::warn!("get_reflection_history: col 3 (created_at) decode error: {}", e);
+                    String::new()
+                }),
+                completed_at: r.try_get(4).unwrap_or_else(|e| {
+                    tracing::warn!("get_reflection_history: col 4 (completed_at) decode error: {}", e);
+                    None
+                }),
                 fix_count: {
                     let c: i64 = r.get(5);
                     c as u32

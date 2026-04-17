@@ -757,7 +757,7 @@ impl PgDb {
                 r#"SELECT
                        COUNT(DISTINCT ptu.task_run_id) as run_count,
                        COUNT(DISTINCT CASE WHEN lo.status = 'success' THEN ptu.task_run_id END) as success_count,
-                       COALESCE(AVG(lo.iterations), 0) as avg_iterations,
+                       COALESCE(AVG(lo.iterations)::double precision, 0) as avg_iterations,
                        COALESCE(AVG(lo.duration_secs * 1000), 0) as avg_duration_ms
                    FROM phase_token_usage ptu
                    JOIN learning_outcomes lo ON ptu.task_run_id = lo.task_id
@@ -778,8 +778,16 @@ impl PgDb {
             return Ok(None);
         }
         let success_count: i64 = row.get(1);
-        let avg_iterations: f64 = row.get(2);
-        let avg_duration_ms: f64 = row.get(3);
+        // AVG over integer returns numeric in PG; cast ::double precision in SQL,
+        // but still use try_get to avoid panic on unexpected type.
+        let avg_iterations: f64 = row.try_get(2).unwrap_or_else(|e| {
+            tracing::warn!("build_model_profile_data: col 2 (avg_iterations) decode error: {}", e);
+            0.0
+        });
+        let avg_duration_ms: f64 = row.try_get(3).unwrap_or_else(|e| {
+            tracing::warn!("build_model_profile_data: col 3 (avg_duration_ms) decode error: {}", e);
+            0.0
+        });
 
         let avg_cost: f64 = conn
             .query_one(

@@ -220,7 +220,7 @@ impl PgDb {
             let r = conn
                 .query(
                     r#"SELECT feedback_type, COUNT(*) as cnt,
-                              AVG(CASE WHEN rating IS NOT NULL THEN rating END) as avg_rating
+                              AVG(CASE WHEN rating IS NOT NULL THEN rating END)::double precision as avg_rating
                        FROM workflow_generation_feedback
                        WHERE workflow_category = $1
                        GROUP BY feedback_type"#,
@@ -233,7 +233,7 @@ impl PgDb {
             let r = conn
                 .query(
                     r#"SELECT feedback_type, COUNT(*) as cnt,
-                              AVG(CASE WHEN rating IS NOT NULL THEN rating END) as avg_rating
+                              AVG(CASE WHEN rating IS NOT NULL THEN rating END)::double precision as avg_rating
                        FROM workflow_generation_feedback
                        GROUP BY feedback_type"#,
                     &[],
@@ -247,7 +247,12 @@ impl PgDb {
         for row in &rows {
             let ft: String = row.get(0);
             let count: i64 = row.get(1);
-            let avg_rating: Option<f64> = row.get(2);
+            // AVG over integer returns numeric in PG; cast ::double precision in SQL,
+            // but still use try_get to avoid panic on unexpected type.
+            let avg_rating: Option<f64> = row.try_get(2).unwrap_or_else(|e| {
+                tracing::warn!("get_feedback_summary: col 2 (avg_rating) decode error: {}", e);
+                None
+            });
             summary.insert(
                 ft,
                 serde_json::json!({ "count": count, "avg_rating": avg_rating }),

@@ -3488,7 +3488,7 @@ impl PgDb {
             .query_one(
                 r#"SELECT COUNT(*), SUM(CASE WHEN feedback_type = 'edit' THEN 1 ELSE 0 END),
                  SUM(CASE WHEN feedback_type = 'delete' THEN 1 ELSE 0 END),
-                 AVG(CASE WHEN feedback_type = 'rating' THEN rating END)
+                 AVG(CASE WHEN feedback_type = 'rating' THEN rating END)::double precision
              FROM workflow_generation_feedback WHERE created_at > $1"#,
                 &[&since],
             )
@@ -3497,7 +3497,12 @@ impl PgDb {
             generation_quality.total_feedback = r.get(0);
             generation_quality.edits = r.get(1);
             generation_quality.deletes = r.get(2);
-            generation_quality.avg_rating = r.get(3);
+            // AVG over integer rating returns numeric in PG; cast ::double precision in SQL,
+            // but still use try_get to avoid panic on unexpected type.
+            generation_quality.avg_rating = r.try_get(3).unwrap_or_else(|e| {
+                tracing::warn!("collect_generation_quality: col 3 (avg_rating) decode error: {}", e);
+                None
+            });
         }
         if let Ok(rows) = conn
             .query(

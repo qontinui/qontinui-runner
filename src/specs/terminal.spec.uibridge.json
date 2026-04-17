@@ -7,6 +7,12 @@
       "name": "Multi-Tab Terminal Sessions",
       "description": "Users work with multiple concurrent terminal sessions organized as tabs. Each tab is an independent PTY session with its own shell, working directory, command history, and scrollback buffer. Users can create new tabs (Ctrl+Shift+T), close tabs (Ctrl+Shift+W), cycle between tabs (Ctrl+Tab), and rename tabs for better organization. Tabs auto-rename from the first command entered. On mount, the terminal attempts to reconnect to existing Rust PTY sessions from previous page visits, preserving shell state across navigation. When all tabs are closed, a helpful empty state guides users on how to create a new terminal.",
       "category": "semantic",
+      "setupActions": [
+        {
+          "type": "navigate",
+          "url": "/terminal"
+        }
+      ],
       "assertions": [
         {
           "id": "term-tab-bar",
@@ -244,6 +250,7 @@
       "id": "term-workflow-preview",
       "name": "Workflow Generation and Preview",
       "description": "When a workflow is generated (from a session transcript, command history, or findings), a preview panel opens on the right side showing the full workflow structure. Users can review the generated workflow's phases and steps, then choose to execute it immediately, save it to the workflow library for later use, edit it in the Workflow Builder for refinement, or regenerate it with different parameters. The panel shows loading state during generation and error messages if generation fails. This workflow enables a rapid 'do it once in the terminal, then automate it' development pattern.",
+      "_setupNote": "This group requires a workflow to have been generated first (via Sessions > select session > Generate). The deterministic buildSpecWorkflow path cannot reliably trigger generation; the AI path handles this via preconditions.",
       "category": "semantic",
       "assertions": [
         {
@@ -325,6 +332,15 @@
       "name": "Real-Time Findings Detection",
       "description": "The terminal automatically analyzes output in real time to detect errors, warnings, test failures, and other notable findings. These are tracked per-session and displayed in a dedicated findings panel on the right side. Users can respond to findings (sending text back to the terminal), fix findings by spawning a new Claude Code session with the finding context pre-loaded, or batch-generate a workflow from multiple unresolved findings. The findings count badge on the action bar updates live as new issues are detected, keeping users aware of problems without interrupting their terminal workflow.",
       "category": "semantic",
+      "setupActions": [
+        {
+          "type": "click",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Findings" }
+          }
+        }
+      ],
       "assertions": [
         {
           "id": "term-findings-panel",
@@ -405,6 +421,15 @@
       "name": "AI-Powered Terminal Analysis",
       "description": "The terminal integrates AI analysis capabilities that process terminal scrollback, command history, and plan files to produce structured insights. Analysis types include: session summary (what happened in this terminal session), architecture review (system structure from plan files or terminal context), change impact (what files and systems were affected), progress tracking (how far along is the development plan), cross-tab analysis (correlating activity across multiple terminal sessions), and page architecture (analyzing the runner's own frontend). Analysis results appear in a dedicated panel with structured canvas-style panels. This transforms raw terminal output into actionable development intelligence.",
       "category": "semantic",
+      "setupActions": [
+        {
+          "type": "click",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Analyze" }
+          }
+        }
+      ],
       "assertions": [
         {
           "id": "term-analysis-panel",
@@ -778,6 +803,15 @@
       "name": "Session Persistence & Auto-Resume",
       "description": "Claude Code session IDs are persisted alongside terminal tab configurations. When the runner restarts and reconnects to existing PTY sessions, saved claudeSessionId values are merged back into the reconnected tabs and the sessions are auto-resumed with 'claude --resume <id>'. This ensures that Claude Code sessions survive runner restarts without manual intervention. The saved layout includes zone assignments, labels, notes, pins, and Claude session IDs per tab.",
       "category": "state-consistency",
+      "setupActions": [
+        {
+          "type": "click",
+          "target": {
+            "type": "search",
+            "criteria": { "accessibleName": "Zone profiles" }
+          }
+        }
+      ],
       "assertions": [
         {
           "id": "term-session-auto-resume",
@@ -921,6 +955,15 @@
       "name": "Plan Implementation Workflow",
       "description": "Users can build and execute multi-stage plan implementation workflows directly from the Terminal page. Two entry points exist: (1) from a transcript panel, select messages containing a plan and click Implement to build a workflow with implement/review/next-steps stages per phase, or (2) from the status bar, click Implement next to a detected plan file. The Implement button (amber, Rocket icon) is the primary action; the Verify button (gray, ListChecks icon) builds a lighter verification-only workflow. Both parse the plan markdown into phases and tasks, build a multi-stage UnifiedWorkflow, and show it in the workflow preview panel for execution.",
       "category": "behavior",
+      "setupActions": [
+        {
+          "type": "click",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Sessions" }
+          }
+        }
+      ],
       "assertions": [
         {
           "id": "term-plan-impl-transcript-button",
