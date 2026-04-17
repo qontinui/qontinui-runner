@@ -322,6 +322,21 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     name: "Specs Page",
     description:
       "View, edit, and manage project specifications with AI-driven sync and state machine compilation",
+    actions: [
+      {
+        id: "toggle-ai-generation",
+        label: "Toggle AI spec-generation flag",
+        description:
+          "Toggle the useAiGeneration flag (same as clicking the AI toggle button). " +
+          "Invoke via POST /ui-bridge/control/component/specs-page/action/toggle-ai-generation",
+        handler: () => {
+          toggleUseAiSpecGeneration();
+        },
+      },
+    ],
+    state: () => ({
+      useAiSpecGeneration,
+    }),
   });
 
   // Spec sync — batch update all stale specs with AI merge mode
