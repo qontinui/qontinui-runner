@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Isolated component grounding-data capture via UI Bridge + mss.
 
+This is the **STATIC** capture pipeline: records have no ``GroundingAction``
+(``source="static"``) and are therefore not eligible for WSM-based
+``success_source`` stamping. For dynamic action-verification wiring
+(where the WSM judge *is* relevant), see
+``qontinui/src/qontinui/verification/record_action_verification.py`` and
+``qontinui/src/qontinui/verification/wsm_client.py``. The dynamic capture
+path lives in
+``qontinui-runner/python-bridge/services/trajectory_logger.py``.
+
 Connects to a running qontinui-web dev server's UI Bridge API, navigates to
 isolated component pages, captures screenshots of individual component
 configurations, and writes GroundingRecord JSONL for grounding-model

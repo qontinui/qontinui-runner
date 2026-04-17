@@ -1,5 +1,12 @@
 """Trajectory logger for grounding-model fine-tuning data.
 
+This is the dynamic grounding-capture data path — it produces
+``GroundingRecord`` entries with a non-``None`` ``GroundingAction``,
+which is the correct wiring point for ``success_source="wsm"``. The
+static sibling scripts (``capture_grounding_isolated.py``,
+``capture_grounding_static.py``, ``capture_grounding_real.py``) do not
+carry an action and so are not eligible for WSM stamping.
+
 Captures ``(pre_screenshot, action, post_screenshot, success_label)`` tuples
 during native-app workflow execution and writes them as
 :class:`GroundingRecord` entries to ``grounding.jsonl``.
@@ -16,7 +23,9 @@ The logger hooks into the action execution lifecycle at two points:
 
 Success labelling strategy (in priority order):
 
-- World State Verifier (WSM) if reachable.
+- World State Verifier (WSM) — ``qontinui.verification.wsm_client`` if
+  available, or any legacy client passed via the ``wsm_client`` kwarg
+  that exposes ``.verify(pre, post, intent)`` → verdict-with-``.status``.
 - Pixel-diff heuristic: mean pixel change in a 100×100 region around the
   click target.
 - Fallback: the action record's own ``success`` flag.
@@ -230,11 +239,21 @@ class TrajectoryLogger:
         """Determine action success via WSM → pixel-diff → record flag."""
 
         # Strategy 1: World State Verifier
-        if self._wsm_client is not None:
+        if self._wsm_client is not None and pre_bytes is not None:
             try:
                 intent = f"{record.action_type} on {record.config}"
                 verdict = self._wsm_client.verify(pre_bytes, post_bytes, intent)
-                return verdict.status == "pass", "wsm"
+                # Dual-shape handling:
+                #   - qontinui.verification.WSMVerdict exposes .success and
+                #     .source (the canonical new shape — source is already
+                #     "wsm" or "pixel_diff", so we pass it through).
+                #   - Legacy clients (e.g. tests/e2e/broken_accessibility/
+                #     _wsm_client.WsmVerdict) expose .status where "pass" /
+                #     "partial" mean success.
+                if hasattr(verdict, "source") and hasattr(verdict, "success"):
+                    return bool(verdict.success), str(verdict.source)
+                status = str(getattr(verdict, "status", "")).lower()
+                return status in {"pass", "partial"}, "wsm"
             except Exception:
                 logger.debug("WSM verdict failed, falling back", exc_info=True)
 

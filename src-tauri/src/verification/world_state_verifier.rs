@@ -6,6 +6,11 @@
 //! Sends pre- and post-action screenshots plus a text intent, gets back
 //! a structured verdict with a calibrated confidence and a possible
 //! "refused" outcome (action was a no-op on the intended target).
+//!
+//! Python mirror: `qontinui/src/qontinui/verification/wsm_client.py`.
+//! Shared prompt artifact: `qontinui/src/qontinui/verification/wsm_prompt.toml`.
+//! The TOML and the `WSM_SYSTEM_PROMPT` / `build_user_text` below must be
+//! kept in sync; the prompt is the judge's wire contract.
 
 use std::time::Duration;
 
