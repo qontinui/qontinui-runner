@@ -1104,6 +1104,7 @@ pub fn create_router(
         .merge(crate::mcp::unified_workflows::routes())
         .merge(crate::mcp::verification_tests::routes())
         .merge(crate::mcp::websocket::routes())
+        .merge(crate::mcp::window_manager::routes())
         .merge(crate::mcp::worktrees::routes())
         .merge(crate::mcp::token_analytics::routes())
         .merge(crate::mcp::otel_status::routes())

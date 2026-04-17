@@ -127,6 +127,7 @@ pub mod verification;
 pub mod video;
 pub mod watchers; // Screenpipe-inspired scheduled reactive AI agents
 pub mod websocket;
+pub mod window_manager; // OS-level window enumeration and activation
 pub mod workflow_events; // Workflow event emission to backend for mobile push notifications
 
 // Re-export all command functions for easy access in main.rs

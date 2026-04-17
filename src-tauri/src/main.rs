@@ -135,6 +135,7 @@ mod validation;
 mod verification;
 mod video_recorder;
 mod vision;
+mod window_manager;
 mod workflow;
 mod workflow_event_bus;
 mod workflow_generation;
@@ -1316,6 +1317,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Cost dashboard commands (unified token/cache/budget overview)
             commands::cost_dashboard::get_cost_dashboard,
             commands::cost_dashboard::get_active_budget_status,
+            // Window manager commands (OS-level window enumeration/activation)
+            commands::window_manager::list_system_windows,
+            commands::window_manager::activate_system_window,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
