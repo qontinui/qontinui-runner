@@ -1830,6 +1830,13 @@ pub fn generate_workflow(
         hardener_insights.as_deref(),
         request.tool_tags.as_deref(),
         constitution.as_deref(),
+        // Phase B: thread AppState through so the hardener picks up the
+        // actual bound port for runner-self briefs on temp runners (9877+).
+        // This top-level `generate_workflow` currently takes no AppState —
+        // pass `None` here and let `detect_runner_port` fall back to
+        // `get_mcp_api_port()` (env var / default). Test and bootstrap
+        // paths also hit this branch.
+        None,
     );
     artifact_builder.hardener_duration_ms = Some(hardener_start.elapsed().as_millis() as u64);
     artifact_builder.hardening_summary = serde_json::to_value(&hardening_summary).ok();
@@ -2247,6 +2254,8 @@ pub fn generate_workflow(
         None, // model (not needed for FastOnly)
         None, // provider (not needed for FastOnly)
         None, // prm_base_url
+        None, // target_family — auto-detect from description + workflow JSON
+        None, // runner_port — falls back to get_mcp_api_port() (env var QONTINUI_PORT)
     );
     info!(
         "Step quality evaluation: overall={:.3}, gate={}, duration={}ms",

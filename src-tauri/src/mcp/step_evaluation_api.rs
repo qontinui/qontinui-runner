@@ -89,6 +89,8 @@ async fn evaluate_workflow_handler(
         }
     });
 
+    let runner_port = crate::mcp::types::runner_api_port(&state.app_state);
+
     let result = tokio::task::spawn_blocking(move || {
         evaluation::evaluate_workflow(
             &body.workflow,
@@ -98,6 +100,8 @@ async fn evaluate_workflow_handler(
             None, // model
             None, // provider
             prm_url.as_deref(),
+            None, // target_family — auto-detect
+            Some(runner_port),
         )
     })
     .await
@@ -156,6 +160,7 @@ async fn repair_guidance_handler(
 > {
     let doctor_handle = state.doctor_handle.clone();
 
+    let runner_port = crate::mcp::types::runner_api_port(&state.app_state);
     let result = tokio::task::spawn_blocking(move || {
         let eval = evaluation::evaluate_workflow(
             &body.workflow,
@@ -165,6 +170,8 @@ async fn repair_guidance_handler(
             None,
             None,
             None,
+            None, // target_family — auto-detect
+            Some(runner_port),
         );
         evaluation::generate_repair_guidance(&eval)
     })

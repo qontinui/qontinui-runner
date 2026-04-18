@@ -257,6 +257,11 @@ use tracing::info;
 ///
 /// This is the main entry point. It orchestrates all scoring tiers based on
 /// the chosen strategy and produces a complete `WorkflowEvaluation`.
+///
+/// `target_family` / `runner_port` are used by the quality-gate URL invariant
+/// check (Phase D). Pass `None` to auto-detect `target_family` from the
+/// workflow + description and fall back to the env-var port
+/// (`crate::mcp::types::get_mcp_api_port()`).
 pub fn evaluate_workflow(
     workflow: &UnifiedWorkflow,
     criteria: Option<&AcceptanceCriteria>,
@@ -265,6 +270,8 @@ pub fn evaluate_workflow(
     model: Option<&str>,
     provider: Option<&str>,
     prm_base_url: Option<&str>,
+    target_family: Option<crate::mcp::types::UiBridgeFamily>,
+    runner_port: Option<u16>,
 ) -> WorkflowEvaluation {
     let start = Instant::now();
     info!("Starting workflow evaluation with strategy {:?}", strategy);
@@ -396,8 +403,20 @@ pub fn evaluate_workflow(
     // Compute overall score via PURE min-form aggregation
     let overall_score = aggregation::aggregate_evaluation(&step_evaluations);
 
+    // Resolve URL invariant parameters (Phase D defense-in-depth check).
+    let resolved_family =
+        target_family.unwrap_or_else(|| detect_target_family(workflow, &workflow.description));
+    let resolved_port = runner_port.unwrap_or_else(crate::mcp::types::get_mcp_api_port);
+
     // Run quality gate
-    let quality_gate = run_quality_gate(&step_evaluations, &coverage_matrix, criteria);
+    let quality_gate = run_quality_gate(
+        &step_evaluations,
+        &coverage_matrix,
+        criteria,
+        workflow,
+        resolved_family,
+        resolved_port,
+    );
 
     let duration_ms = start.elapsed().as_millis() as u64;
     info!(
@@ -593,13 +612,185 @@ fn resolve_criterion(
     (cid, priority)
 }
 
+/// Detect which UI Bridge family a workflow targets.
+///
+/// This mirrors the Phase B hardener helper. Inlined here because Phase B
+/// may not export it as `pub`; a follow-up can dedupe.
+fn detect_target_family(
+    workflow: &UnifiedWorkflow,
+    description: &str,
+) -> crate::mcp::types::UiBridgeFamily {
+    use crate::mcp::types::UiBridgeFamily;
+    if description.contains("Spec Generation Brief") {
+        return UiBridgeFamily::Control;
+    }
+    let json = serde_json::to_string(workflow).unwrap_or_default();
+    if json.contains("localhost:1420") || json.contains("localhost:3001") {
+        return UiBridgeFamily::Sdk;
+    }
+    UiBridgeFamily::Control
+}
+
+/// Scan a workflow's `command` fields for UI Bridge URL invariant violations.
+///
+/// Two invariants:
+///
+/// 1. If `target_family` is `Control`, no step may reference the
+///    `/ui-bridge/sdk/` path — that endpoint drives external SDK apps, not
+///    the runner's own UI.
+/// 2. Any `localhost:<digits>/ui-bridge/...` occurrence must use
+///    `<digits> == runner_port` — otherwise the workflow talks to a
+///    different runner instance (or the default 9876 while bound elsewhere).
+///
+/// Returns a list of human-readable violation messages. Empty list == pass.
+fn check_ui_bridge_url_invariants(
+    workflow: &UnifiedWorkflow,
+    target_family: crate::mcp::types::UiBridgeFamily,
+    runner_port: u16,
+) -> Vec<String> {
+    use crate::mcp::types::UiBridgeFamily;
+
+    let mut violations: Vec<String> = Vec::new();
+
+    // Regex-free scanner for `localhost:<digits>/ui-bridge/...` so we don't
+    // add a dependency just for this check.
+    fn find_wrong_port_violations(cmd: &str, runner_port: u16) -> Vec<u16> {
+        let mut wrong: Vec<u16> = Vec::new();
+        let needle = "localhost:";
+        let bytes = cmd.as_bytes();
+        let mut i = 0;
+        while i + needle.len() < bytes.len() {
+            if &bytes[i..i + needle.len()] == needle.as_bytes() {
+                let start = i + needle.len();
+                let mut end = start;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > start {
+                    // Must be followed by `/ui-bridge/` to be an invariant
+                    // we care about.
+                    let rest_start = end;
+                    let expected_suffix = "/ui-bridge/";
+                    if rest_start + expected_suffix.len() <= bytes.len()
+                        && &bytes[rest_start..rest_start + expected_suffix.len()]
+                            == expected_suffix.as_bytes()
+                    {
+                        if let Ok(port_str) = std::str::from_utf8(&bytes[start..end]) {
+                            if let Ok(port) = port_str.parse::<u16>() {
+                                if port != runner_port {
+                                    wrong.push(port);
+                                }
+                            }
+                        }
+                    }
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+        wrong
+    }
+
+    let scan_step = |step: &Value, phase: &str, stage_name: Option<&str>, out: &mut Vec<String>| {
+        let cmd = match step.get("command").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let origin = match stage_name {
+            Some(name) => format!("stage '{}' {}", name, phase),
+            None => format!("top-level {}", phase),
+        };
+        let step_id = step
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<no-id>");
+
+        // Invariant 1: Control family must not use `/ui-bridge/sdk/`.
+        if target_family == UiBridgeFamily::Control && cmd.contains("/ui-bridge/sdk/") {
+            out.push(format!(
+                "UI Bridge family mismatch in {} step '{}': workflow targets runner-self (Control), \
+                 but step command contains '/ui-bridge/sdk/' (external SDK family). \
+                 Rewrite to '/ui-bridge/control/'.",
+                origin, step_id
+            ));
+        }
+
+        // Invariant 2: wrong port in `localhost:<n>/ui-bridge/...`.
+        for wrong in find_wrong_port_violations(cmd, runner_port) {
+            out.push(format!(
+                "UI Bridge wrong-port URL in {} step '{}': found 'localhost:{}/ui-bridge/...' \
+                 but this runner is bound to port {}. Phase B's URL rewriter should have \
+                 replaced this.",
+                origin, step_id, wrong, runner_port
+            ));
+        }
+    };
+
+    // Top-level steps: setup, verification, completion.
+    for step in &workflow.setup_steps {
+        scan_step(step, "setup_steps", None, &mut violations);
+    }
+    for step in &workflow.verification_steps {
+        scan_step(step, "verification_steps", None, &mut violations);
+    }
+    for step in &workflow.completion_steps {
+        scan_step(step, "completion_steps", None, &mut violations);
+    }
+
+    // Per-stage steps: same three phases inside each stage.
+    for stage in &workflow.stages {
+        let stage_name = stage.name.as_str();
+        for step in &stage.setup_steps {
+            scan_step(step, "setup_steps", Some(stage_name), &mut violations);
+        }
+        for step in &stage.verification_steps {
+            scan_step(step, "verification_steps", Some(stage_name), &mut violations);
+        }
+        for step in &stage.completion_steps {
+            scan_step(step, "completion_steps", Some(stage_name), &mut violations);
+        }
+    }
+
+    violations
+}
+
 /// Run quality gates at multiple levels, returning the strictest that passes.
 fn run_quality_gate(
     evaluations: &[StepEvaluation],
     coverage: &coverage::SemanticCoverageMatrix,
     _criteria: Option<&AcceptanceCriteria>,
+    workflow: &UnifiedWorkflow,
+    target_family: crate::mcp::types::UiBridgeFamily,
+    runner_port: u16,
 ) -> QualityGateResult {
     let mut failures: Vec<QualityGateFailure> = Vec::new();
+
+    // ── Phase D: UI Bridge URL invariants ────────────────────────────────────
+    // Defense-in-depth: if generation / sanitization emits a workflow that
+    // targets the wrong UI Bridge family or the wrong port for this runner,
+    // fail the gate here so the regression surfaces at generation time rather
+    // than silently at execution time.
+    let url_violations = check_ui_bridge_url_invariants(workflow, target_family, runner_port);
+    if !url_violations.is_empty() {
+        for msg in &url_violations {
+            failures.push(QualityGateFailure {
+                gate_level: QualityGateLevel::Minimum,
+                reason: msg.clone(),
+                step_id: None,
+                criterion_id: None,
+            });
+        }
+        // Both sdk-path (Control mode) and wrong-port violations are treated
+        // as correctness failures — the workflow will target the wrong runner
+        // or wrong endpoint family at execution time.
+        return QualityGateResult {
+            passed: false,
+            gate_level: QualityGateLevel::Minimum,
+            failures,
+        };
+    }
 
     // Check Minimum gate: all critical criteria have entailment > 0.7, no unexecutable flags
     // Note: entailment checks are skipped when no entailment scorer ran (FastOnly strategy)
@@ -733,6 +924,168 @@ fn run_quality_gate(
             QualityGateLevel::Standard
         },
         failures,
+    }
+}
+
+#[cfg(test)]
+mod url_invariant_tests {
+    use super::*;
+    use crate::mcp::types::UiBridgeFamily;
+    use crate::unified_workflows::UnifiedWorkflow;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn make_workflow_with_verification_steps(steps: Vec<Value>) -> UnifiedWorkflow {
+        UnifiedWorkflow {
+            id: "test-wf-url-inv".to_string(),
+            name: "Test URL Invariant Workflow".to_string(),
+            description: "A test workflow for URL invariants".to_string(),
+            category: "test".to_string(),
+            tags: vec![],
+            setup_steps: vec![],
+            verification_steps: steps,
+            agentic_steps: vec![],
+            completion_steps: vec![],
+            max_iterations: Some(10),
+            max_fix_attempts: 3,
+            max_ci_auto_resumes: 10,
+            timeout_seconds: None,
+            provider: None,
+            model: None,
+            model_overrides: HashMap::new(),
+            skip_ai_summary: false,
+            targeted_error_ids: vec![],
+            log_source_selection: Default::default(),
+            context_ids: vec![],
+            disabled_context_ids: vec![],
+            auto_include_contexts: true,
+            prompt_template: None,
+            log_watch_enabled: true,
+            health_check_enabled: false,
+            health_check_urls: vec![],
+            preflight_check_enabled: false,
+            enable_sweep: false,
+            max_sweep_iterations: 5,
+            generated_by_task_run_id: None,
+            stages: vec![],
+            stop_on_failure: false,
+            constraint_overrides: HashMap::new(),
+            approval_gate: false,
+            reflection_mode: true,
+            completion_prompts_first: false,
+            is_favorite: false,
+            dependency_graph: None,
+            cost_annotations: None,
+            quality_report: None,
+            acceptance_criteria: None,
+            multi_agent_mode: true,
+            use_worktree: false,
+            strict_cwd: false,
+            tool_tags: vec![],
+            workflow_architecture: None,
+            rollback_policy: None,
+            enforce_token_budget: false,
+            ai_reviewed: true,
+            flow_control_json: None,
+            phase_timeouts_json: None,
+            security_profile: None,
+            htn_enabled: false,
+            htn_state_machine_path: None,
+            htn_ui_bridge_url: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn control_mode_flags_sdk_path() {
+        let step = json!({
+            "id": "step-1",
+            "name": "Check runner UI",
+            "command": "curl http://localhost:9877/ui-bridge/sdk/snapshot",
+        });
+        let wf = make_workflow_with_verification_steps(vec![step]);
+
+        let violations = check_ui_bridge_url_invariants(&wf, UiBridgeFamily::Control, 9877);
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly one sdk-path violation, got {:?}",
+            violations
+        );
+        assert!(
+            violations[0].contains("/ui-bridge/sdk/"),
+            "violation message should mention the sdk path: {}",
+            violations[0]
+        );
+    }
+
+    #[test]
+    fn control_mode_with_control_paths_passes() {
+        let step1 = json!({
+            "id": "step-1",
+            "name": "Snapshot",
+            "command": "curl http://localhost:9877/ui-bridge/control/snapshot",
+        });
+        let step2 = json!({
+            "id": "step-2",
+            "name": "Discover",
+            "command": "curl http://localhost:9877/ui-bridge/control/elements/discover",
+        });
+        let wf = make_workflow_with_verification_steps(vec![step1, step2]);
+
+        let violations = check_ui_bridge_url_invariants(&wf, UiBridgeFamily::Control, 9877);
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn wrong_port_is_flagged() {
+        // Runner bound to 9877, but the workflow references default 9876.
+        let step = json!({
+            "id": "step-1",
+            "name": "Snapshot wrong port",
+            "command": "curl http://localhost:9876/ui-bridge/control/snapshot",
+        });
+        let wf = make_workflow_with_verification_steps(vec![step]);
+
+        let violations = check_ui_bridge_url_invariants(&wf, UiBridgeFamily::Control, 9877);
+        assert!(
+            !violations.is_empty(),
+            "expected at least one wrong-port violation, got none"
+        );
+        assert!(
+            violations.iter().any(|v| v.contains("9876")
+                && v.contains("9877")
+                && v.to_lowercase().contains("wrong-port")),
+            "expected wrong-port violation mentioning both ports: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn workflow_without_ui_bridge_urls_passes() {
+        let step1 = json!({
+            "id": "step-1",
+            "name": "Run tests",
+            "command": "cargo test --lib",
+        });
+        let step2 = json!({
+            "id": "step-2",
+            "name": "Hit unrelated endpoint",
+            "command": "curl http://example.com/api/status",
+        });
+        let wf = make_workflow_with_verification_steps(vec![step1, step2]);
+
+        // Neither Control nor Sdk should flag anything when no /ui-bridge/
+        // URLs are present.
+        let v_ctl = check_ui_bridge_url_invariants(&wf, UiBridgeFamily::Control, 9877);
+        let v_sdk = check_ui_bridge_url_invariants(&wf, UiBridgeFamily::Sdk, 9877);
+        assert!(v_ctl.is_empty(), "Control mode should have no violations: {:?}", v_ctl);
+        assert!(v_sdk.is_empty(), "Sdk mode should have no violations: {:?}", v_sdk);
     }
 }
 

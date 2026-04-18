@@ -656,6 +656,8 @@ fn score_candidate(
                         model_override,
                         provider_override,
                         None, // no PRM endpoint
+                        None, // target_family — auto-detect
+                        None, // runner_port — auto-detect from env
                     );
 
                     debug!(

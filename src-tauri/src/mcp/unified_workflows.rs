@@ -923,9 +923,15 @@ pub async fn generate_unified_workflow_async_handler(
         )
         .await;
 
-    // Build the meta-workflow
-    let meta_workflow =
-        build_meta_workflow_template(&request, &resolved_contexts, historical_context.as_ref());
+    // Build the meta-workflow. Pass &state.app_state so the Builder prompt
+    // advertises this runner's actually-bound port (handles temp runners
+    // spawned via the supervisor that don't reliably inherit QONTINUI_PORT).
+    let meta_workflow = build_meta_workflow_template(
+        &request,
+        &resolved_contexts,
+        historical_context.as_ref(),
+        Some(&state.app_state),
+    );
 
     // Save the meta-workflow to database (SQLite + PG)
     let mut create_request =

@@ -336,6 +336,60 @@ fn is_ui_verification_test(step: &Value) -> bool {
         || combined.contains("thumbnail")
 }
 
+/// Detect which UI Bridge family a workflow should target.
+///
+/// * Workflows whose description contains `"Spec Generation Brief"` are
+///   brief-mode runner-self workflows and must target `Control`. This
+///   mirrors the detection in `commands/transcript.rs` so both paths stay
+///   aligned.
+/// * Workflows that reference a known web-app target (`localhost:1420` or
+///   `localhost:3001`) target `Sdk`.
+/// * Anything else defaults to `Control` — the runner-self case is by far
+///   the common one, and getting it wrong ships broken `/sdk/` URLs.
+fn detect_target_family(
+    workflow: &UnifiedWorkflow,
+    description: &str,
+) -> crate::mcp::types::UiBridgeFamily {
+    use crate::mcp::types::UiBridgeFamily;
+
+    // Spec-driven workflows always target the runner's own UI (Control). The
+    // Builder LLM can emit commands that reference `localhost:1420/...` inside
+    // URL fields (a navigate target), which would otherwise trip the SDK
+    // heuristic below. Spec signals take precedence.
+    //
+    // Signals, in order:
+    //   1. Explicit `category == "spec-generated"`
+    //   2. `tags` contains `"spec"`
+    //   3. Legacy: description carries the `Spec Generation Brief` header
+    if workflow.category == "spec-generated" {
+        return UiBridgeFamily::Control;
+    }
+    if workflow.tags.iter().any(|t| t == "spec") {
+        return UiBridgeFamily::Control;
+    }
+    if description.contains("Spec Generation Brief") {
+        return UiBridgeFamily::Control;
+    }
+
+    let workflow_json = serde_json::to_string(workflow).unwrap_or_default();
+    if workflow_json.contains("localhost:1420") || workflow_json.contains("localhost:3001") {
+        return UiBridgeFamily::Sdk;
+    }
+    UiBridgeFamily::Control
+}
+
+/// Detect which runner port we should use for UI Bridge URLs.
+///
+/// When `app_state` is `Some`, returns the actually-bound API port via
+/// `runner_api_port`. Otherwise falls back to `get_mcp_api_port()` — only
+/// safe for paths that don't yet have an `AppState` (bootstrap, tests).
+fn detect_runner_port(app_state: Option<&crate::commands::AppState>) -> u16 {
+    match app_state {
+        Some(state) => crate::mcp::types::runner_api_port(state),
+        None => crate::mcp::types::get_mcp_api_port(),
+    }
+}
+
 /// Run the hardener agent to strengthen verification steps.
 ///
 /// Converts prompt steps to deterministic equivalents, replaces Playwright UI
@@ -354,9 +408,15 @@ pub fn run_hardener_agent(
     insights_section: Option<&str>,
     tool_tags: Option<&[String]>,
     constitution: Option<&str>,
+    app_state: Option<&crate::commands::AppState>,
 ) -> (UnifiedWorkflow, Option<HardeningSummary>, Option<String>) {
-    // Step 0: Apply deterministic fixups before AI hardening
-    let mut workflow = fix_sdk_urls(workflow);
+    // Step 0: Apply deterministic fixups before AI hardening.
+    // Detect the target UI Bridge family and runner port so we normalize
+    // URLs correctly for runner-self vs external-app workflows and for
+    // secondary/temp runners on non-default ports.
+    let target_family = detect_target_family(workflow, description);
+    let runner_port = detect_runner_port(app_state);
+    let mut workflow = normalize_ui_bridge_urls(workflow, target_family, runner_port);
 
     // Step 0b: Sanitize Python commands (fix f-string escaping issues)
     let mut sanitize_total = 0;
@@ -411,8 +471,24 @@ pub fn run_hardener_agent(
     // Use middleware chain for deterministic post-processing of AI output.
     // This replaces the ad-hoc sanitize/fix calls that were previously applied
     // after the AI call (the middleware handles them in a composable chain).
+    //
+    // Pass the detected UI Bridge family + runner port through the
+    // middleware context so `SdkUrlSanitizer` rewrites URLs on the AI's
+    // response the same way we did on the pre-AI workflow. Without this,
+    // the post-AI sanitizer would no-op (it now refuses to rewrite blindly).
     let middleware = build_hardener_middleware();
-    let mw_ctx = MiddlewareContext::new("hardener");
+    let mw_ctx = MiddlewareContext::new("hardener")
+        .with_metadata(
+            "sdk_url_sanitizer.target_family",
+            match target_family {
+                crate::mcp::types::UiBridgeFamily::Control => "control",
+                crate::mcp::types::UiBridgeFamily::Sdk => "sdk",
+            },
+        )
+        .with_metadata(
+            "sdk_url_sanitizer.runner_port",
+            &runner_port.to_string(),
+        );
     let ai_result: AiResponse = crate::ai_provider::run_prompt_with_middleware(
         &prompt,
         &task_context,
@@ -585,10 +661,15 @@ impl AiMiddleware for CommandSanitizer {
     }
 }
 
-/// Post-call middleware that fixes SDK URLs in AI-generated workflow JSON.
+/// Post-call middleware that normalizes UI Bridge URLs in AI-generated
+/// workflow JSON.
 ///
-/// Wraps `fix_sdk_urls()` to replace `/control/` with `/sdk/` URLs and
-/// inject missing SDK connect steps.
+/// Reads the target family (`"control"` / `"sdk"`) and runner port from
+/// `MiddlewareContext.metadata`, keyed under
+/// `"sdk_url_sanitizer.target_family"` and `"sdk_url_sanitizer.runner_port"`.
+/// If either is missing the middleware no-ops — blind rewrites (like the
+/// old `fix_sdk_urls` unconditional control→sdk mapping) were the root
+/// cause of Phase B's bug, so we now require the caller to state its intent.
 pub struct SdkUrlSanitizer;
 
 impl AiMiddleware for SdkUrlSanitizer {
@@ -596,20 +677,45 @@ impl AiMiddleware for SdkUrlSanitizer {
         "sdk-url-sanitizer"
     }
 
-    fn post_call(&self, response: &mut AiResponse, _ctx: &MiddlewareContext) {
+    fn post_call(&self, response: &mut AiResponse, ctx: &MiddlewareContext) {
         if !response.success {
             return;
         }
+
+        // Pull configuration from the middleware context. If either value is
+        // missing (i.e. the caller didn't explicitly request this middleware
+        // for their phase), no-op rather than applying a blind rewrite.
+        let target_family = match ctx.metadata_get("sdk_url_sanitizer.target_family") {
+            Some("control") => crate::mcp::types::UiBridgeFamily::Control,
+            Some("sdk") => crate::mcp::types::UiBridgeFamily::Sdk,
+            _ => {
+                debug!("SdkUrlSanitizer: no target_family set in context, skipping");
+                return;
+            }
+        };
+        let runner_port: u16 = match ctx
+            .metadata_get("sdk_url_sanitizer.runner_port")
+            .and_then(|s| s.parse().ok())
+        {
+            Some(p) => p,
+            None => {
+                debug!("SdkUrlSanitizer: no runner_port set in context, skipping");
+                return;
+            }
+        };
 
         let json_text =
             crate::workflow_generation::generator::extract_json_from_response(&response.output);
         if let Ok(workflow) =
             serde_json::from_str::<crate::unified_workflows::UnifiedWorkflow>(&json_text)
         {
-            let fixed = fix_sdk_urls(&workflow);
+            let fixed = normalize_ui_bridge_urls(&workflow, target_family, runner_port);
             if let Ok(fixed_json) = serde_json::to_string_pretty(&fixed) {
                 if fixed_json != response.output {
-                    info!("SdkUrlSanitizer middleware: fixed SDK URLs in AI output");
+                    info!(
+                        "SdkUrlSanitizer middleware: normalized URLs for {:?} on port {}",
+                        target_family, runner_port
+                    );
                     response.output = fixed_json;
                 }
             }
@@ -632,131 +738,315 @@ pub fn build_hardener_middleware() -> AiMiddlewareChain {
         .add(crate::ai_provider::middleware::StructuredOutputMiddleware)
 }
 
-/// Deterministic fixup: replace `/ui-bridge/control/` with `/ui-bridge/sdk/` in command steps
-/// when an SDK connect step is present. Also injects a missing SDK connect step if the workflow
-/// targets a web app but doesn't have one.
+/// Brief-aware bidirectional UI Bridge URL normalizer.
 ///
-/// This catches a common AI generation mistake where the builder agent uses the runner's
-/// own control endpoint instead of the SDK proxy endpoint.
-pub fn fix_sdk_urls(workflow: &UnifiedWorkflow) -> UnifiedWorkflow {
-    let workflow_json = serde_json::to_string(workflow).unwrap_or_default();
-    let has_sdk_connect = workflow_json.contains("ui-bridge/sdk/connect");
-    let targets_web =
-        workflow_json.contains("localhost:3001") || workflow_json.contains("localhost:1420");
-    let has_control_urls = workflow_json.contains("ui-bridge/control/");
-    // Also detect SDK URLs that need a connect step (AI may generate /sdk/ directly)
-    let has_sdk_urls = workflow_json.contains("ui-bridge/sdk/snapshot")
-        || workflow_json.contains("ui-bridge/sdk/elements")
-        || workflow_json.contains("ui-bridge/sdk/ai/")
-        || workflow_json.contains("ui-bridge/sdk/discover")
-        || workflow_json.contains("ui-bridge/sdk/page/navigate");
-
-    // Nothing to fix
-    if !has_control_urls && !has_sdk_urls && !targets_web {
-        return workflow.clone();
-    }
-    if !has_control_urls && has_sdk_connect {
-        return workflow.clone();
-    }
+/// Rewrites workflow command URLs so they target the correct UI Bridge family
+/// (`/ui-bridge/control/...` for the runner's own UI, `/ui-bridge/sdk/...` for
+/// external apps) and so they use the actually-bound port of the current
+/// runner rather than the hardcoded default (`9876`).
+///
+/// For `target_family = Control`:
+/// - Rewrites `/ui-bridge/sdk/<endpoint>` → `/ui-bridge/control/<endpoint>`
+/// - Drops any step whose command calls `/ui-bridge/sdk/connect` (control
+///   mode needs no connect step since it drives the runner's own UI).
+/// - Does NOT inject a connect step.
+///
+/// For `target_family = Sdk`:
+/// - Preserves `/ui-bridge/sdk/...` URLs.
+/// - Injects a missing SDK connect step when the workflow references a web
+///   app target (`localhost:1420` / `localhost:3001`) and none is present,
+///   using `runner_port` (not the legacy hardcoded `9876`) in the injected
+///   step's URL.
+///
+/// In both modes all `localhost:<any>/ui-bridge/...` URLs are migrated to
+/// `localhost:{runner_port}/ui-bridge/...`, so temp runners on non-default
+/// ports produce correct workflows.
+pub fn normalize_ui_bridge_urls(
+    workflow: &UnifiedWorkflow,
+    target_family: crate::mcp::types::UiBridgeFamily,
+    runner_port: u16,
+) -> UnifiedWorkflow {
+    use crate::mcp::types::UiBridgeFamily;
 
     let mut fixed = workflow.clone();
-    let mut fixup_count = 0;
+    let mut fixup_count = 0usize;
 
-    // If targeting web app but missing SDK connect, inject one at the start of setup.
-    // This handles both cases: AI generated /control/ URLs (to be fixed below) or
-    // AI correctly generated /sdk/ URLs but forgot the connect step.
-    if targets_web && !has_sdk_connect && (has_control_urls || has_sdk_urls) {
-        // Determine target URL from the workflow
-        let target_url = if workflow_json.contains("localhost:3001") {
-            "http://localhost:3001"
-        } else {
-            "http://localhost:1420"
-        };
+    // --- Step 1: rewrite step URLs in all step lists (top-level + per-stage) ---
+    //
+    // For Control mode this also drops `/ui-bridge/sdk/connect` steps entirely
+    // (control doesn't need a connect step — the runner drives its own UI).
+    let rewrite_lists = |lists: Vec<&mut Vec<Value>>,
+                         target: UiBridgeFamily,
+                         port: u16|
+     -> usize {
+        let mut touched = 0usize;
+        for steps in lists {
+            // First filter out any "drop" steps (only applies to Control mode
+            // for `sdk/connect`).
+            if matches!(target, UiBridgeFamily::Control) {
+                let before = steps.len();
+                steps.retain(|s| !step_is_sdk_connect(s));
+                touched += before - steps.len();
+            }
 
-        let connect_step = serde_json::json!({
-            "id": uuid::Uuid::new_v4().to_string(),
-            "type": "command",
-            "phase": "setup",
-            "mode": "shell",
-            "name": "Connect UI Bridge SDK",
-            "command": format!(
-                "curl -s -X POST http://localhost:9876/ui-bridge/sdk/connect -H \"Content-Type: application/json\" -d '{{\"url\": \"{}\"}}'",
-                target_url
-            ),
-            "fail_on_error": true
-        });
-        fixed.setup_steps.insert(0, connect_step);
-        fixup_count += 1;
-        info!(
-            "SDK URL fixup: injected missing SDK connect step for {}",
-            target_url
-        );
-    }
-
-    // Replace /ui-bridge/control/ with /ui-bridge/sdk/ in all command steps
-    let fix_steps = |steps: &mut Vec<Value>| -> usize {
-        let mut count = 0;
-        for step in steps.iter_mut() {
-            let changed = fix_control_urls_in_step(step);
-            if changed {
-                count += 1;
+            for step in steps.iter_mut() {
+                if normalize_urls_in_step(step, target, port) {
+                    touched += 1;
+                }
             }
         }
-        count
+        touched
     };
 
-    fixup_count += fix_steps(&mut fixed.setup_steps);
-    fixup_count += fix_steps(&mut fixed.verification_steps);
-    fixup_count += fix_steps(&mut fixed.completion_steps);
-
-    // Fix SDK URLs in stage steps
-    for stage in fixed.stages.iter_mut() {
-        fixup_count += fix_steps(&mut stage.setup_steps);
-        fixup_count += fix_steps(&mut stage.verification_steps);
-        fixup_count += fix_steps(&mut stage.completion_steps);
+    // Build the list of `Vec<Value>` references to rewrite. The closure takes
+    // the lists by mutable reference through a `Vec<&mut Vec<Value>>`.
+    {
+        let mut lists: Vec<&mut Vec<Value>> = Vec::new();
+        lists.push(&mut fixed.setup_steps);
+        lists.push(&mut fixed.verification_steps);
+        lists.push(&mut fixed.completion_steps);
+        for stage in fixed.stages.iter_mut() {
+            lists.push(&mut stage.setup_steps);
+            lists.push(&mut stage.verification_steps);
+            lists.push(&mut stage.completion_steps);
+        }
+        fixup_count += rewrite_lists(lists, target_family, runner_port);
     }
 
-    // Add retry parameters to SDK verification steps after navigation
-    let mut retry_count = inject_retries_after_navigation(&mut fixed.verification_steps);
-    for stage in fixed.stages.iter_mut() {
-        retry_count += inject_retries_after_navigation(&mut stage.verification_steps);
+    // --- Step 2: SDK-mode-only — inject a connect step if a web app target is
+    // referenced and none is present. Always use `runner_port` in the URL.
+    if matches!(target_family, UiBridgeFamily::Sdk) {
+        let workflow_json_after = serde_json::to_string(&fixed).unwrap_or_default();
+        let has_sdk_connect = workflow_json_after.contains("ui-bridge/sdk/connect");
+        let targets_web = workflow_json_after.contains("localhost:3001")
+            || workflow_json_after.contains("localhost:1420");
+        let has_sdk_urls = workflow_json_after.contains("ui-bridge/sdk/snapshot")
+            || workflow_json_after.contains("ui-bridge/sdk/elements")
+            || workflow_json_after.contains("ui-bridge/sdk/ai/")
+            || workflow_json_after.contains("ui-bridge/sdk/discover")
+            || workflow_json_after.contains("ui-bridge/sdk/page/navigate");
+
+        if targets_web && !has_sdk_connect && has_sdk_urls {
+            let target_url = if workflow_json_after.contains("localhost:3001") {
+                "http://localhost:3001"
+            } else {
+                "http://localhost:1420"
+            };
+
+            let connect_step = serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "type": "command",
+                "phase": "setup",
+                "mode": "shell",
+                "name": "Connect UI Bridge SDK",
+                "command": format!(
+                    "curl -s -X POST http://localhost:{}/ui-bridge/sdk/connect -H \"Content-Type: application/json\" -d '{{\"url\": \"{}\"}}'",
+                    runner_port, target_url
+                ),
+                "fail_on_error": true
+            });
+            fixed.setup_steps.insert(0, connect_step);
+            fixup_count += 1;
+            info!(
+                "UI Bridge URL normalizer (sdk): injected missing connect step for {} on port {}",
+                target_url, runner_port
+            );
+        }
     }
-    if retry_count > 0 {
-        info!(
-            "SDK URL fixup: added retries to {} verification steps after navigation",
-            retry_count
-        );
+
+    // --- Step 3: add retry parameters to SDK verification steps after navigation.
+    // Kept for SDK mode only — for control mode the runner's own UI is already
+    // stable and the retry logic here only targets the SDK `/sdk/page/navigate`
+    // path. The existing helper handles the SDK path explicitly.
+    if matches!(target_family, UiBridgeFamily::Sdk) {
+        let mut retry_count = inject_retries_after_navigation(&mut fixed.verification_steps);
+        for stage in fixed.stages.iter_mut() {
+            retry_count += inject_retries_after_navigation(&mut stage.verification_steps);
+        }
+        if retry_count > 0 {
+            info!(
+                "UI Bridge URL normalizer (sdk): added retries to {} verification steps after navigation",
+                retry_count
+            );
+        }
     }
 
     if fixup_count > 0 {
         info!(
-            "SDK URL fixup: corrected {} steps from /control/ to /sdk/ paths",
-            fixup_count
+            "UI Bridge URL normalizer ({:?}): touched {} steps (runner_port={})",
+            target_family, fixup_count, runner_port
         );
     }
 
     fixed
 }
 
-/// Fix `/ui-bridge/control/` URLs to `/ui-bridge/sdk/` in a single step's command fields.
-/// Returns true if any changes were made.
-fn fix_control_urls_in_step(step: &mut Value) -> bool {
-    let mut changed = false;
+/// Returns true if this step's command targets `/ui-bridge/sdk/connect`.
+fn step_is_sdk_connect(step: &Value) -> bool {
+    for field in &["command", "shell_command", "check_url", "check_command"] {
+        if let Some(s) = step.get(*field).and_then(|v| v.as_str()) {
+            if s.contains("/ui-bridge/sdk/connect") {
+                return true;
+            }
+        }
+    }
+    false
+}
 
-    // Fields that may contain URLs (check both "command" and "shell_command" variants)
+/// Normalize UI Bridge URLs inside a single step's command-ish fields.
+///
+/// - Rewrites `/ui-bridge/sdk/<path>` ↔ `/ui-bridge/control/<path>` based on
+///   `target_family`.
+/// - Rewrites `localhost:<any>/ui-bridge/` → `localhost:{runner_port}/ui-bridge/`.
+///
+/// Returns true if any string in the step was modified.
+fn normalize_urls_in_step(
+    step: &mut Value,
+    target: crate::mcp::types::UiBridgeFamily,
+    runner_port: u16,
+) -> bool {
+    use crate::mcp::types::UiBridgeFamily;
+
+    let mut changed = false;
     for field in &["command", "shell_command", "check_url", "check_command"] {
         if let Some(val) = step.get_mut(*field) {
             if let Some(s) = val.as_str() {
-                if s.contains("ui-bridge/control/") {
-                    let fixed = s.replace("ui-bridge/control/", "ui-bridge/sdk/");
-                    *val = Value::String(fixed);
+                let new = rewrite_ui_bridge_url_string(s, target, runner_port);
+                if new != s {
+                    *val = Value::String(new);
                     changed = true;
                 }
             }
         }
     }
-
+    let _ = UiBridgeFamily::Control; // silence unused warning in some builds
     changed
+}
+
+/// Dash-form → canonical slash-form path aliases for UI Bridge endpoints.
+///
+/// The Builder LLM repeatedly hallucinates dash-joined control/sdk endpoint
+/// paths (e.g. `/ui-bridge/control/page-navigate`) that don't exist on the
+/// runner — the actual paths use slashes (`/ui-bridge/control/page/navigate`).
+/// This table maps every observed hallucinated form to the canonical one.
+///
+/// Notes:
+/// - `ai-execute` is mapped to `ai/execute-with-diff` rather than a generic
+///   `ai/execute` because the latter doesn't exist; the LLM's intent is
+///   AI-driven action and `execute-with-diff` is the actual endpoint that
+///   accepts an `instruction` field.
+/// - Aliases are listed for both `/control/` and `/sdk/` because the
+///   hallucination pattern is family-independent (and the sdk → control
+///   family swap happens before this pass, but entries remain for
+///   completeness / defense in depth and so the pass is correct regardless
+///   of where in the pipeline it's called).
+const PATH_ALIASES: &[(&str, &str)] = &[
+    ("/ui-bridge/control/page-navigate", "/ui-bridge/control/page/navigate"),
+    ("/ui-bridge/control/page-evaluate", "/ui-bridge/control/page/evaluate"),
+    ("/ui-bridge/control/ai-execute", "/ui-bridge/control/ai/execute-with-diff"),
+    ("/ui-bridge/control/ai-search", "/ui-bridge/control/ai/search"),
+    // Same set under /sdk/ for completeness:
+    ("/ui-bridge/sdk/page-navigate", "/ui-bridge/sdk/page/navigate"),
+    ("/ui-bridge/sdk/page-evaluate", "/ui-bridge/sdk/page/evaluate"),
+    ("/ui-bridge/sdk/ai-execute", "/ui-bridge/sdk/ai/execute-with-diff"),
+    ("/ui-bridge/sdk/ai-search", "/ui-bridge/sdk/ai/search"),
+];
+
+/// Rewrite a single string containing UI Bridge URLs to match the target
+/// family and runner port. Pure function for easier testing.
+fn rewrite_ui_bridge_url_string(
+    input: &str,
+    target: crate::mcp::types::UiBridgeFamily,
+    runner_port: u16,
+) -> String {
+    use crate::mcp::types::UiBridgeFamily;
+
+    // 1. Swap family segment.
+    let family_swapped = match target {
+        UiBridgeFamily::Control => input.replace("/ui-bridge/sdk/", "/ui-bridge/control/"),
+        UiBridgeFamily::Sdk => input.replace("/ui-bridge/control/", "/ui-bridge/sdk/"),
+    };
+
+    // 2. Path-alias rewrite: map hallucinated dash-form endpoint paths to
+    //    their canonical slash-form equivalents. Applied for BOTH Control
+    //    and Sdk — the alias issue is orthogonal to family.
+    //
+    //    The prefixes in PATH_ALIASES are all distinct (no alias is a
+    //    substring of another's LHS), so simple iterative `.replace()` is
+    //    safe regardless of declaration order.
+    let mut alias_fixed = family_swapped;
+    for (from, to) in PATH_ALIASES {
+        if alias_fixed.contains(from) {
+            alias_fixed = alias_fixed.replace(from, to);
+        }
+    }
+
+    // 3. Migrate localhost port to `runner_port` but only for `/ui-bridge/`
+    // URLs. We don't want to clobber unrelated `localhost:<port>` references
+    // (e.g. a web-app target `http://localhost:3001`).
+    rewrite_localhost_port_for_ui_bridge(&alias_fixed, runner_port)
+}
+
+/// Replace `localhost:<port>/ui-bridge/` **and** `127.0.0.1:<port>/ui-bridge/`
+/// with `localhost:{runner_port}/ui-bridge/` for every occurrence, leaving
+/// non-ui-bridge host references alone.
+///
+/// We standardize the host to `localhost` (matches the rest of the codebase's
+/// convention) regardless of whether the input used `localhost` or `127.0.0.1`.
+fn rewrite_localhost_port_for_ui_bridge(input: &str, runner_port: u16) -> String {
+    // Simple scan — avoid pulling in a regex dep for a pattern this narrow.
+    // At each position we look for whichever host needle comes first, consume
+    // digits after the ":", and rewrite only when the URL path continues with
+    // `/ui-bridge/`.
+    const NEEDLES: &[&str] = &["localhost:", "127.0.0.1:"];
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        // Find the earliest occurrence of any needle in `rest`.
+        let next = NEEDLES
+            .iter()
+            .filter_map(|n| rest.find(*n).map(|idx| (idx, *n)))
+            .min_by_key(|(idx, _)| *idx);
+        let Some((idx, needle)) = next else { break };
+
+        // Push everything up to (but not including) the needle.
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + needle.len()..];
+
+        // Consume digits after the "host:".
+        let digit_end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        let port_str = &after[..digit_end];
+        let tail = &after[digit_end..];
+
+        if tail.starts_with("/ui-bridge/") && !port_str.is_empty() {
+            // Rewrite host to the canonical `localhost:` with our runner_port.
+            out.push_str("localhost:");
+            out.push_str(&runner_port.to_string());
+        } else {
+            // Not a ui-bridge URL — leave host + port as-is.
+            out.push_str(needle);
+            out.push_str(port_str);
+        }
+
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Deprecated thin shim. Use [`normalize_ui_bridge_urls`] with an explicit
+/// target family and runner port instead. Retained so out-of-tree callers
+/// (e.g. `step_executor/handlers/workflow_fixup.rs`) keep compiling this
+/// round — Phase F will remove them.
+#[deprecated(
+    note = "Use normalize_ui_bridge_urls(workflow, target_family, runner_port) — fix_sdk_urls only handled control→sdk rewrites and hardcoded port 9876, which is wrong for runner-self briefs and temp runners."
+)]
+pub fn fix_sdk_urls(workflow: &UnifiedWorkflow) -> UnifiedWorkflow {
+    normalize_ui_bridge_urls(
+        workflow,
+        crate::mcp::types::UiBridgeFamily::Control,
+        crate::mcp::types::get_mcp_api_port(),
+    )
 }
 
 /// Add retry parameters to SDK verification steps that follow a navigation step.
@@ -2271,52 +2561,131 @@ mod tests {
         assert!(prompt.contains("verification coverage"));
     }
 
-    // === fix_sdk_urls tests ===
+    // === normalize_ui_bridge_urls tests ===
+    //
+    // These tests supersede the old `test_fix_sdk_urls_*` suite. The old
+    // tests only covered the one-way `/control/ -> /sdk/` rewrite plus the
+    // hardcoded `9876` connect-step injection. The new normalizer is
+    // bidirectional and port-aware.
+
+    use crate::mcp::types::UiBridgeFamily;
 
     #[test]
-    fn test_fix_sdk_urls_replaces_control_with_sdk() {
-        let mut workflow = make_test_workflow(vec![json!({
+    fn test_normalize_control_rewrites_sdk_to_control() {
+        // Runner-self (brief-mode) workflow: AI generated `/sdk/` URLs for
+        // the runner's own UI — normalizer should flip them to `/control/`.
+        let workflow = make_test_workflow(vec![json!({
             "id": "s1", "type": "command", "mode": "shell",
-            "command": "curl -sf http://localhost:9876/ui-bridge/control/snapshot | grep elements"
+            "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep elements"
         })]);
-        // Add a setup step that references localhost:3001 (targets web)
-        workflow.setup_steps = vec![json!({
-            "id": "setup-sdk", "type": "command", "mode": "shell",
-            "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/connect -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:3001\"}'"
-        })];
 
-        let fixed = fix_sdk_urls(&workflow);
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Control, 9876);
         let cmd = fixed.verification_steps[0]
             .get("command")
             .unwrap()
             .as_str()
             .unwrap();
         assert!(
-            cmd.contains("ui-bridge/sdk/snapshot"),
-            "Should replace /control/ with /sdk/: {}",
+            cmd.contains("ui-bridge/control/snapshot"),
+            "Should rewrite /sdk/ to /control/: {}",
             cmd
         );
         assert!(
-            !cmd.contains("ui-bridge/control/"),
-            "Should not contain /control/: {}",
+            !cmd.contains("ui-bridge/sdk/"),
+            "Should not contain /sdk/ after rewrite: {}",
             cmd
         );
     }
 
     #[test]
-    fn test_fix_sdk_urls_injects_connect_step_when_missing() {
+    fn test_normalize_control_drops_sdk_connect_step() {
+        // Control mode: `sdk/connect` makes no sense — the normalizer must
+        // drop any setup step whose command calls the SDK connect endpoint.
+        let mut workflow = make_test_workflow(vec![]);
+        workflow.setup_steps = vec![
+            json!({
+                "id": "connect", "type": "command", "mode": "shell",
+                "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/connect -H 'Content-Type: application/json' -d '{\"url\":\"http://localhost:3001\"}'"
+            }),
+            json!({
+                "id": "nav", "type": "command", "mode": "shell",
+                "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/page/navigate"
+            }),
+            json!({
+                "id": "discover", "type": "command", "mode": "shell",
+                "command": "curl -s http://localhost:9876/ui-bridge/sdk/discover"
+            }),
+            json!({
+                "id": "snap", "type": "command", "mode": "shell",
+                "command": "curl -s http://localhost:9876/ui-bridge/sdk/snapshot"
+            }),
+        ];
+
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Control, 9876);
+
+        assert_eq!(
+            fixed.setup_steps.len(),
+            3,
+            "sdk/connect step should be dropped, leaving 3 of 4 setup steps"
+        );
+        assert!(
+            !fixed
+                .setup_steps
+                .iter()
+                .any(|s| s.get("id").and_then(|v| v.as_str()) == Some("connect")),
+            "connect step must be removed from the Vec, not just blanked"
+        );
+        // Remaining steps should now be on /control/, not /sdk/.
+        for s in &fixed.setup_steps {
+            let cmd = s.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                !cmd.contains("/ui-bridge/sdk/"),
+                "All remaining steps should use /control/: {}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_control_idempotent_when_already_control() {
+        // Workflow already uses /control/ URLs — normalizer must leave it
+        // unchanged and must not inject a connect step.
+        let workflow = make_test_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -sf http://localhost:9876/ui-bridge/control/snapshot | grep elements"
+        })]);
+
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Control, 9876);
+        assert_eq!(fixed.setup_steps.len(), workflow.setup_steps.len());
+        assert_eq!(
+            fixed.verification_steps.len(),
+            workflow.verification_steps.len()
+        );
+        let cmd = fixed.verification_steps[0]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("ui-bridge/control/snapshot"));
+        assert!(!cmd.contains("ui-bridge/sdk/"));
+    }
+
+    #[test]
+    fn test_normalize_sdk_rewrites_control_and_injects_connect() {
+        // External-app (Sdk) workflow: AI mistakenly generated /control/ URLs
+        // and forgot the connect step. Normalizer should rewrite the URLs
+        // and inject a connect step using the supplied runner_port.
         let mut workflow = make_test_workflow(vec![json!({
             "id": "s1", "type": "command", "mode": "shell",
             "command": "curl -sf http://localhost:9876/ui-bridge/control/snapshot"
         })]);
-        // Setup references localhost:3001 but has no SDK connect
         workflow.setup_steps = vec![json!({
             "id": "nav-1", "type": "command", "mode": "shell",
             "command": "curl -X POST http://localhost:9876/ui-bridge/control/page/navigate -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:3001/build\"}'"
         })];
 
-        let fixed = fix_sdk_urls(&workflow);
-        // Should have injected a connect step at position 0
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Sdk, 9876);
+
         assert!(
             fixed.setup_steps.len() > workflow.setup_steps.len(),
             "Should inject connect step"
@@ -2331,7 +2700,12 @@ mod tests {
             "First setup step should be SDK connect: {}",
             first_cmd
         );
-        // The original nav step should also have /control/ replaced with /sdk/
+        assert!(
+            first_cmd.contains("localhost:9876"),
+            "Injected connect step should use the supplied runner_port: {}",
+            first_cmd
+        );
+        // The original /control/ nav step should now be on /sdk/.
         let nav_cmd = fixed.setup_steps[1]
             .get("command")
             .unwrap()
@@ -2345,81 +2719,143 @@ mod tests {
     }
 
     #[test]
-    fn test_fix_sdk_urls_noop_when_already_correct() {
-        let workflow = make_sdk_workflow(vec![json!({
+    fn test_normalize_migrates_hardcoded_9876_to_runner_port() {
+        // Temp runner on port 9877: all ui-bridge URLs should use 9877,
+        // including the injected connect step.
+        let mut workflow = make_test_workflow(vec![json!({
             "id": "s1", "type": "command", "mode": "shell",
             "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep elements"
         })]);
-        let fixed = fix_sdk_urls(&workflow);
-        assert_eq!(fixed.setup_steps.len(), workflow.setup_steps.len());
-        assert_eq!(
-            fixed.verification_steps.len(),
-            workflow.verification_steps.len()
-        );
-    }
-
-    #[test]
-    fn test_fix_sdk_urls_injects_connect_when_sdk_urls_without_connect() {
-        // AI generates /sdk/ URLs directly but forgets the connect step
-        let mut workflow = make_test_workflow(vec![
-            json!({
-                "id": "s1", "type": "command", "mode": "shell",
-                "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep elements"
-            }),
-            json!({
-                "id": "s2", "type": "command", "mode": "shell",
-                "command": "curl -sf http://localhost:9876/ui-bridge/sdk/elements | python -c \"import sys,json; d=json.load(sys.stdin); assert d.get('total',0)>0\""
-            }),
-        ]);
-        // Setup navigates to localhost:3001 but has no SDK connect
         workflow.setup_steps = vec![json!({
             "id": "nav-1", "type": "command", "mode": "shell",
-            "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/page/navigate -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:3001/build/page-sweep\"}'"
+            "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/page/navigate -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:3001/build\"}'"
         })];
 
-        let fixed = fix_sdk_urls(&workflow);
-        // Should have injected a connect step at position 0
-        assert!(
-            fixed.setup_steps.len() > workflow.setup_steps.len(),
-            "Should inject connect step"
-        );
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Sdk, 9877);
+
+        // The connect step should have been injected with the runner_port=9877.
         let first_cmd = fixed.setup_steps[0]
             .get("command")
             .unwrap()
             .as_str()
             .unwrap();
         assert!(
-            first_cmd.contains("ui-bridge/sdk/connect"),
-            "First setup step should be SDK connect: {}",
+            first_cmd.contains("localhost:9877/ui-bridge/sdk/connect"),
+            "Connect step should target port 9877: {}",
             first_cmd
         );
+
+        // The original nav step's hardcoded 9876 should be migrated to 9877,
+        // but `localhost:3001` (the web app target in the body) must stay.
+        let nav_cmd = fixed.setup_steps[1]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert!(
-            first_cmd.contains("localhost:3001"),
-            "Connect step should target localhost:3001: {}",
-            first_cmd
+            nav_cmd.contains("localhost:9877/ui-bridge/"),
+            "ui-bridge URL should use port 9877: {}",
+            nav_cmd
+        );
+        assert!(
+            nav_cmd.contains("localhost:3001"),
+            "Web app target localhost:3001 must be preserved: {}",
+            nav_cmd
+        );
+        assert!(
+            !nav_cmd.contains("localhost:9876/ui-bridge/"),
+            "Old port 9876 must be gone: {}",
+            nav_cmd
+        );
+
+        // Verification step URL also migrated.
+        let ver_cmd = fixed.verification_steps[0]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            ver_cmd.contains("localhost:9877/ui-bridge/sdk/snapshot"),
+            "Verification URL should use port 9877: {}",
+            ver_cmd
         );
     }
 
     #[test]
-    fn test_fix_sdk_urls_fixes_check_url_field() {
-        let workflow = make_sdk_workflow(vec![json!({
+    fn test_normalize_control_drops_single_connect_step_from_four() {
+        // Explicit drop-step test per Phase B spec: control mode with 4 setup
+        // steps where step 0 is `sdk/connect` → result has 3 setup steps.
+        let mut workflow = make_test_workflow(vec![]);
+        workflow.setup_steps = vec![
+            json!({
+                "id": "sdk-conn", "type": "command", "mode": "shell",
+                "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/connect -d '{\"url\":\"http://localhost:3001\"}'"
+            }),
+            json!({"id": "s2", "type": "command", "mode": "shell", "command": "echo hi"}),
+            json!({"id": "s3", "type": "command", "mode": "shell", "command": "echo hi again"}),
+            json!({"id": "s4", "type": "command", "mode": "shell", "command": "echo done"}),
+        ];
+
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Control, 9876);
+        assert_eq!(
+            fixed.setup_steps.len(),
+            3,
+            "Should have dropped the single sdk/connect step"
+        );
+    }
+
+    #[test]
+    fn test_normalize_control_rewrites_check_url_field() {
+        // `check_url` is one of the fields that hold a URL — must be rewritten too.
+        let workflow = make_test_workflow(vec![json!({
             "id": "s1", "type": "command", "mode": "check",
             "check_type": "http_status",
-            "check_url": "http://localhost:9876/ui-bridge/control/elements",
+            "check_url": "http://localhost:9876/ui-bridge/sdk/elements",
             "expected_status": 200
         })]);
 
-        let fixed = fix_sdk_urls(&workflow);
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Control, 9876);
         let check_url = fixed.verification_steps[0]
             .get("check_url")
             .unwrap()
             .as_str()
             .unwrap();
         assert!(
-            check_url.contains("ui-bridge/sdk/elements"),
-            "check_url should be fixed: {}",
+            check_url.contains("ui-bridge/control/elements"),
+            "check_url should be rewritten to /control/: {}",
             check_url
         );
+    }
+
+    #[test]
+    fn test_detect_target_family_from_brief_description() {
+        // Spec Generation Brief → Control (runner-self workflow).
+        let workflow = make_test_workflow(vec![]);
+        let fam = detect_target_family(
+            &workflow,
+            "Spec Generation Brief: verify the graph editor renders thumbnails.",
+        );
+        assert!(matches!(fam, UiBridgeFamily::Control));
+    }
+
+    #[test]
+    fn test_detect_target_family_sdk_from_web_app_url() {
+        // Non-brief, web-app target → Sdk.
+        let mut workflow = make_test_workflow(vec![]);
+        workflow.setup_steps = vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl http://localhost:3001/api/foo"
+        })];
+        let fam = detect_target_family(&workflow, "Test external web app feature");
+        assert!(matches!(fam, UiBridgeFamily::Sdk));
+    }
+
+    #[test]
+    fn test_detect_target_family_defaults_to_control() {
+        // No brief, no web-app URL → default Control.
+        let workflow = make_test_workflow(vec![]);
+        let fam = detect_target_family(&workflow, "Generic description with no signals");
+        assert!(matches!(fam, UiBridgeFamily::Control));
     }
 
     // === inject_retries_after_navigation tests ===
@@ -2760,6 +3196,187 @@ mod tests {
         let cmd = steps[0].get("command").unwrap().as_str().unwrap();
         assert!(!cmd.contains("-sf"), "Should not contain -sf: {}", cmd);
         assert!(cmd.contains("-s "), "Should contain -s: {}", cmd);
+    }
+
+    // === spec-driven detect_target_family + 127.0.0.1 normalizer tests ===
+
+    #[test]
+    fn test_detect_target_family_returns_control_for_spec_generated_category() {
+        // Spec-driven workflow: Builder LLM emitted a curl command with
+        // `localhost:1420/terminal` as a navigate target inside a URL field.
+        // Despite the presence of `localhost:1420` in the workflow JSON, the
+        // spec-generated category must force Control (runner-self).
+        let mut workflow = make_test_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -X POST http://localhost:9876/ui-bridge/control/page/navigate -d '{\"url\": \"http://localhost:1420/terminal\"}'"
+        })]);
+        workflow.category = "spec-generated".to_string();
+        workflow.tags = vec!["spec".to_string(), "auto-generated".to_string()];
+
+        let fam = detect_target_family(&workflow, "Generated from spec brief");
+        assert!(
+            matches!(fam, UiBridgeFamily::Control),
+            "spec-generated category must force Control even when localhost:1420 is referenced"
+        );
+    }
+
+    #[test]
+    fn test_detect_target_family_returns_control_for_spec_tag() {
+        // Even without the `spec-generated` category, presence of the `spec`
+        // tag should force Control. (And again: localhost:1420 must not trip
+        // the SDK heuristic.)
+        let mut workflow = make_test_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl http://localhost:1420/health"
+        })]);
+        workflow.category = "general".to_string();
+        workflow.tags = vec!["spec".to_string()];
+
+        let fam = detect_target_family(&workflow, "no brief header here");
+        assert!(
+            matches!(fam, UiBridgeFamily::Control),
+            "`spec` tag must force Control"
+        );
+    }
+
+    #[test]
+    fn test_normalize_rewrites_127_0_0_1_to_localhost_runner_port() {
+        // Builder emitted a command using `127.0.0.1:7777/ui-bridge/sdk/...`
+        // instead of `localhost:`. The normalizer must:
+        //   1. rewrite the host from `127.0.0.1` to `localhost`
+        //   2. migrate the port from 7777 to the runner_port (9877)
+        //   3. swap `/sdk/` to `/control/` (Control mode)
+        let workflow = make_test_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -s http://127.0.0.1:7777/ui-bridge/sdk/snapshot | grep elements"
+        })]);
+
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Control, 9877);
+        let cmd = fixed.verification_steps[0]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+
+        assert!(
+            cmd.contains("localhost:9877/ui-bridge/control/snapshot"),
+            "127.0.0.1:7777 should be rewritten to localhost:9877 and /sdk/ to /control/: {}",
+            cmd
+        );
+        assert!(
+            !cmd.contains("127.0.0.1"),
+            "Host must be standardized to localhost (no 127.0.0.1 left): {}",
+            cmd
+        );
+        assert!(
+            !cmd.contains(":7777"),
+            "Old port 7777 must be migrated away: {}",
+            cmd
+        );
+        assert!(
+            !cmd.contains("/ui-bridge/sdk/"),
+            "SDK family segment should be replaced with control: {}",
+            cmd
+        );
+    }
+
+    // === Dash-form hallucination alias rewrite tests ===
+    //
+    // The Builder LLM keeps emitting dash-joined endpoint paths
+    // (e.g. `/ui-bridge/control/page-navigate`) that don't exist. The
+    // normalizer's alias pass maps them to the canonical slash-form paths.
+
+    #[test]
+    fn test_normalize_rewrites_page_navigate_dash_alias() {
+        let workflow = make_test_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -X POST http://localhost:9877/ui-bridge/control/page-navigate -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:1420/\"}'"
+        })]);
+
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Control, 9877);
+        let cmd = fixed.verification_steps[0]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+
+        assert!(
+            cmd.contains("/ui-bridge/control/page/navigate"),
+            "page-navigate should be rewritten to page/navigate: {}",
+            cmd
+        );
+        assert!(
+            !cmd.contains("page-navigate"),
+            "Dash form should be gone: {}",
+            cmd
+        );
+        // Sanity: port migration should also have happened (it's already 9877
+        // here, but the invariant is the URL's host:port is localhost:9877).
+        assert!(
+            cmd.contains("localhost:9877/ui-bridge/"),
+            "URL should use localhost:9877: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_normalize_rewrites_ai_execute_dash_alias() {
+        let workflow = make_test_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -X POST http://localhost:9877/ui-bridge/control/ai-execute -H 'Content-Type: application/json' -d '{\"instruction\": \"Click the save button\"}'"
+        })]);
+
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Control, 9877);
+        let cmd = fixed.verification_steps[0]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+
+        assert!(
+            cmd.contains("/ui-bridge/control/ai/execute-with-diff"),
+            "ai-execute should be rewritten to ai/execute-with-diff: {}",
+            cmd
+        );
+        assert!(
+            !cmd.contains("ai-execute"),
+            "Dash form should be gone: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_normalize_sdk_ai_search_maps_to_control_ai_search_with_slash() {
+        // Builder emitted `/ui-bridge/sdk/ai-search` on a Control-mode
+        // workflow. The normalizer must both flip the family (sdk → control)
+        // AND rewrite the dash-form alias to the slash-form canonical path.
+        let workflow = make_test_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -X POST http://localhost:9877/ui-bridge/sdk/ai-search -H 'Content-Type: application/json' -d '{\"query\": \"save button\"}'"
+        })]);
+
+        let fixed = normalize_ui_bridge_urls(&workflow, UiBridgeFamily::Control, 9877);
+        let cmd = fixed.verification_steps[0]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+
+        assert!(
+            cmd.contains("/ui-bridge/control/ai/search"),
+            "sdk/ai-search on Control mode should become control/ai/search (slash form): {}",
+            cmd
+        );
+        assert!(
+            !cmd.contains("/ui-bridge/sdk/"),
+            "SDK family segment should be replaced with control: {}",
+            cmd
+        );
+        assert!(
+            !cmd.contains("ai-search"),
+            "Dash form alias should be gone: {}",
+            cmd
+        );
     }
 }
 

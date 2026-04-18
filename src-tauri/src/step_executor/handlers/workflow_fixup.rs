@@ -128,7 +128,12 @@ impl WorkflowFixupHandler {
                 }
             };
 
-        // Apply SDK URL fixes (returns a new workflow since fix_sdk_urls takes &self)
+        // Apply SDK URL fixes (returns a new workflow since fix_sdk_urls takes &self).
+        // Uses the deprecated `fix_sdk_urls` shim for now; Phase F will migrate
+        // this caller to `normalize_ui_bridge_urls` with an explicit
+        // target_family + runner_port. For runner-self workflow JSON files
+        // the shim's Control default is the right behavior anyway.
+        #[allow(deprecated)]
         let workflow_after_sdk = crate::workflow_generation::hardener::fix_sdk_urls(&workflow);
         workflow = workflow_after_sdk;
 

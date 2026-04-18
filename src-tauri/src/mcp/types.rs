@@ -53,6 +53,14 @@ pub struct CachedKnowledgeGraph {
 pub const MCP_API_PORT: u16 = 9876;
 
 /// Get the MCP API port, checking `QONTINUI_PORT` env var first.
+///
+/// ⚠️ Only safe to use for **bootstrap** — i.e. binding the HTTP listener
+/// before `AppState` is fully initialized. Once `app_state.api_port` is
+/// populated with the actually-bound port, prefer
+/// [`runner_api_port`] (or [`get_self_base_url`] / [`runner_ui_bridge_base`])
+/// so secondary/temp runners on non-default ports produce correct URLs.
+/// Env-var-only lookup silently falls back to `MCP_API_PORT` (9876), which
+/// is wrong for any runner not bound to the default port.
 pub fn get_mcp_api_port() -> u16 {
     std::env::var("QONTINUI_PORT")
         .ok()
@@ -69,8 +77,76 @@ pub fn get_self_base_url(app_state: &crate::commands::AppState) -> String {
     format!("http://localhost:{}", port)
 }
 
+/// Returns just the actually-bound API port for this runner instance.
+///
+/// Convenience wrapper around `app_state.api_port` for callers that only
+/// need the port number (e.g. prompt substitution / templating) and don't
+/// want to assemble a full base URL.
+pub fn runner_api_port(app_state: &crate::commands::AppState) -> u16 {
+    app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Identifies which UI Bridge endpoint family a URL targets.
+///
+/// The runner exposes two distinct UI Bridge endpoint families that must
+/// not be conflated:
+///
+/// - [`UiBridgeFamily::Control`] (`/ui-bridge/control/...`) — drives the
+///   runner's own React UI (Tauri webview). Used by agents to inspect and
+///   interact with the runner itself.
+/// - [`UiBridgeFamily::Sdk`] (`/ui-bridge/sdk/...`) — drives external apps
+///   that have embedded the UI Bridge SDK (e.g. qontinui-web, mobile
+///   browser sessions, customer apps).
+///
+/// Using the wrong family silently produces responses from the wrong
+/// target, so helpers that build UI Bridge URLs must take this enum
+/// rather than hardcoding the path segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiBridgeFamily {
+    /// Runner's own UI (`/ui-bridge/control/...`).
+    Control,
+    /// External apps embedding the UI Bridge SDK (`/ui-bridge/sdk/...`).
+    Sdk,
+}
+
+impl UiBridgeFamily {
+    /// The path segment used after `/ui-bridge/` for this family.
+    pub fn as_path_segment(&self) -> &'static str {
+        match self {
+            UiBridgeFamily::Control => "control",
+            UiBridgeFamily::Sdk => "sdk",
+        }
+    }
+}
+
+/// Returns the base URL for a UI Bridge endpoint family on this runner
+/// instance, e.g. `"http://localhost:9877/ui-bridge/control"` or
+/// `"http://localhost:9877/ui-bridge/sdk"`.
+///
+/// Reads the actually-bound port from `app_state.api_port` (same source
+/// as [`get_self_base_url`]), so secondary/temp runners on non-default
+/// ports produce correct URLs.
+pub fn runner_ui_bridge_base(
+    app_state: &crate::commands::AppState,
+    family: UiBridgeFamily,
+) -> String {
+    let port = app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "http://localhost:{}/ui-bridge/{}",
+        port,
+        family.as_path_segment()
+    )
+}
+
 /// Returns the base URL using the configured port (env var or default).
 /// Use this in code paths that don't have access to AppState.
+#[deprecated(
+    note = "Use runner_ui_bridge_base or get_self_base_url with AppState — env-var lookup hides the actual bound port for non-default runners"
+)]
 pub fn get_self_base_url_from_env() -> String {
     format!("http://localhost:{}", get_mcp_api_port())
 }
@@ -148,6 +224,8 @@ pub struct ApiState {
     pub physical_device_registry: Arc<crate::mcp::physical_device::PhysicalDeviceRegistry>,
     /// Pairing manager for LAN and Cloud device authentication
     pub pairing_manager: Arc<crate::mcp::transport::pairing::PairingManager>,
+    /// Rathole tunnel client (Plan 1B). Singleton — only one tunnel active.
+    pub tunnel_client: Arc<crate::tunnel::RatholeClient>,
 }
 
 /// Response for API endpoints

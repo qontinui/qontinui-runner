@@ -118,10 +118,14 @@ pub async fn build_historical_context_pg(
 /// * `request` - The original workflow generation request with description, options, etc.
 /// * `resolved_contexts` - Pre-resolved context text to inject into the builder prompt.
 /// * `historical_context` - Optional historical context for enhanced prompts.
+/// * `app_state` - Optional reference to AppState for resolving the actually-bound
+///   API port. When provided, the builder prompt emits URLs with this runner's
+///   real port (handles temp runners on 9877+); when None, falls back to env/default.
 pub fn build_meta_workflow_template(
     request: &GenerateWorkflowRequest,
     resolved_contexts: &str,
     historical_context: Option<&HistoricalContext>,
+    app_state: Option<&crate::commands::AppState>,
 ) -> UnifiedWorkflow {
     let now = chrono::Utc::now().to_rfc3339();
     let is_simple = request.simple_mode == Some(true);
@@ -151,6 +155,7 @@ pub fn build_meta_workflow_template(
         request.category.as_deref(),
         historical_context,
         &referenced_file_contents,
+        app_state,
     );
     let verification_prompt = build_verification_review_prompt(historical_context);
     let fixer_prompt =
@@ -508,6 +513,7 @@ fn build_builder_prompt(
     category: Option<&str>,
     historical: Option<&HistoricalContext>,
     referenced_file_contents: &str,
+    app_state: Option<&crate::commands::AppState>,
 ) -> String {
     let file_section = if referenced_file_contents.is_empty() {
         String::new()
@@ -558,45 +564,51 @@ fn build_builder_prompt(
     // explicit recognition/consumption rules so the Builder emits batched
     // snapshot_assert steps, preconditions, and semantic prompts correctly.
     if resolved_contexts.contains("Spec Generation Brief") {
-        prompt.push_str(
+        // Resolve the runner's own API port so the rules show literal,
+        // working curl examples (e.g. `http://localhost:9877/...`) rather
+        // than a `{port}` placeholder the model is free to misread. Same
+        // selection logic as the Project Context block below.
+        let brief_runner_port = match app_state {
+            Some(s) => crate::mcp::types::runner_api_port(s),
+            None => crate::mcp::types::get_mcp_api_port(),
+        };
+        prompt.push_str(&format!(
             r#"
 ## Spec Generation Brief Recognition
 
 If the Additional Context contains a block labeled "Spec Generation Brief (JSON)", parse it and follow these rules strictly:
 
-1. **Navigate first.** If the brief has a `pageUrl`, emit a setup step that navigates to it using the **control** endpoint (see rule 6).
-2. **Preconditions become setup steps.** For each group in `groups[]`, emit one setup step per entry in `preconditions[]` before that group's verification steps. Each precondition describes a required UI state (e.g., "Findings panel is open"); the setup step should click the button or trigger the action that achieves that state. Infer the selector from the assertion descriptions in the group if it is not explicit.
-3. **Deterministic assertions become batched snapshot_assert steps.** For each group, emit ONE `ui_bridge` step with `ui_bridge_action: "snapshot_assert"` whose `ui_bridge_target` is a JSON-stringified array of the group's `deterministicAssertions[]`. Each array element must have the shape `{id, description, severity, assertionType, criteria, expected?, relatedCriteria?, minGap?}`. Use `ui_bridge_snapshot_target` = the brief's `elementSource` ("control" or "external", mapped via `external -> "sdk"`).
-4. **Semantic assertions become prompt or agentic steps.** Each group's `semanticAssertions[]` should become one or more `prompt` steps with a `content` field that includes the assertion descriptions. These may navigate and inspect the UI via the UI Bridge tools.
-5. **Always bias toward determinism.** When an assertion could be either deterministic or semantic, prefer the deterministic form (snapshot_assert).
-6. **Use control endpoints, NOT SDK endpoints.** The UI Bridge has two families:
-   - `/ui-bridge/control/*` — for the runner's own UI (this is what spec-driven workflows use)
-   - `/ui-bridge/sdk/*` — for external apps connected via the SDK (NOT for the runner's own pages)
-   When `elementSource` is `"control"` (which is the default for runner page specs), ALL commands must use `/ui-bridge/control/` paths:
-   - Navigate: `curl POST /ui-bridge/control/page/navigate -d '{"url":"/terminal"}'`
-   - Snapshot: `curl GET /ui-bridge/control/snapshot`
-   - Click: `curl POST /ui-bridge/control/element/<id>/action -d '{"action":"click"}'`
-   - Discover: `curl POST /ui-bridge/control/discover`
-   - Evaluate JS: `curl POST /ui-bridge/control/page/evaluate -d '{"expression":"..."}'`
-   Do NOT use `/ui-bridge/sdk/connect`, `/ui-bridge/sdk/navigate`, or `/ui-bridge/sdk/snapshot` — those are for external app testing only and will fail when targeting the runner's own UI.
+1. **Navigate first.** If the brief has a `pageUrl`, emit a setup step that navigates to it using the **control** endpoint (see rule 2).
+2. **All HTTP commands MUST use `/ui-bridge/control/` paths.** This brief targets the runner's own UI — never use `/ui-bridge/sdk/*` (that family is reserved for external apps connected via SDK). Do NOT emit a connect step; control mode requires no connect. Endpoint reference:
+   - Navigate: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/page/navigate -d '{{"url":"/terminal"}}'`
+   - Snapshot: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/snapshot -d '{{}}'`
+   - Discover: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/discover -d '{{}}'`
+   - Click: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/element/<id>/action -d '{{"action":"click"}}'`
+   - Evaluate JS: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/page/evaluate -d '{{"expression":"..."}}'`
+   The runner port is provided in the Project Context section below — use it verbatim. Workflows generated with `/sdk/` paths will be rejected by the post-generation validator.
+3. **Preconditions become setup steps.** For each group in `groups[]`, emit one setup step per entry in `preconditions[]` before that group's verification steps. Each precondition describes a required UI state (e.g., "Findings panel is open"); the setup step should click the button or trigger the action that achieves that state. Infer the selector from the assertion descriptions in the group if it is not explicit.
+4. **Deterministic assertions become batched snapshot_assert steps.** For each group, emit ONE `ui_bridge` step with `ui_bridge_action: "snapshot_assert"` whose `ui_bridge_target` is a JSON-stringified array of the group's `deterministicAssertions[]`. Each array element must have the shape `{{id, description, severity, assertionType, criteria, expected?, relatedCriteria?, minGap?}}`. Set `ui_bridge_snapshot_target` to `"control"` for runner-self specs (the default).
+5. **Semantic assertions become prompt or agentic steps.** Each group's `semanticAssertions[]` should become one or more `prompt` steps with a `content` field that includes the assertion descriptions. These may navigate and inspect the UI via the UI Bridge tools.
+6. **Always bias toward determinism.** When an assertion could be either deterministic or semantic, prefer the deterministic form (snapshot_assert).
 
 ### Canonical snapshot_assert Step Example
 
 ```json
-{
+{{
   "id": "<uuid>",
   "type": "ui_bridge",
   "phase": "verification",
   "name": "<group name>",
   "ui_bridge_action": "snapshot_assert",
-  "ui_bridge_target": "[{\"id\":\"<assertion-id>\",\"description\":\"...\",\"severity\":\"critical\",\"assertionType\":\"exists\",\"criteria\":{\"role\":\"button\",\"textContent\":\"+\"}}, ...]",
+  "ui_bridge_target": "[{{\"id\":\"<assertion-id>\",\"description\":\"...\",\"severity\":\"critical\",\"assertionType\":\"exists\",\"criteria\":{{\"role\":\"button\",\"textContent\":\"+\"}}}}, ...]",
   "ui_bridge_snapshot_target": "control"
-}
+}}
 ```
 
 Notice `ui_bridge_target` is a STRING containing JSON — NOT an object. The `ExecutionStepConfig` deserializer on the Rust side expects it in that form.
 "#,
-        );
+            runner_api_port = brief_runner_port,
+        ));
     }
 
     // Add custom template if provided
@@ -626,10 +638,15 @@ Notice `ui_bridge_target` is a STRING containing JSON — NOT an object. The `Ex
         // that target the correct localhost URL. Without this, the Builder
         // invents port numbers based on training data, and spec-driven
         // setup steps like `ensure_runner_up` fail on temp runners
-        // (port 9877-9899). The supervisor sets QONTINUI_PORT on every
-        // spawned runner, so get_mcp_api_port() returns the actual bound
-        // port for both primary and temp runners.
-        let runner_api_port = crate::mcp::types::get_mcp_api_port();
+        // (port 9877-9899). Prefer `app_state.api_port` (actually-bound port)
+        // when available — temp runners spawned via `spawn-test` don't
+        // reliably set QONTINUI_PORT, so env-var lookup silently falls back
+        // to 9876 and the Builder advertises the wrong port. Fall back to
+        // env lookup only when AppState isn't wired through.
+        let runner_api_port = match app_state {
+            Some(s) => crate::mcp::types::runner_api_port(s),
+            None => crate::mcp::types::get_mcp_api_port(),
+        };
 
         prompt.push_str(&format!(
             r#"

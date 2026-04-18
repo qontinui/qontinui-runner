@@ -30,6 +30,10 @@ pub struct MiddlewareContext {
     pub expected_schema_name: Option<String>,
     /// Structured output validation config.
     pub validation_config: Option<crate::validation::StructuredOutputConfig>,
+    /// Arbitrary string metadata that individual middleware can look up.
+    /// Used e.g. by `SdkUrlSanitizer` to carry `target_family` / `runner_port`
+    /// without adding many strongly-typed fields to this context.
+    pub metadata: std::collections::HashMap<String, String>,
 }
 
 impl MiddlewareContext {
@@ -58,6 +62,22 @@ impl MiddlewareContext {
         self.expected_schema_name = Some(schema_name.to_string());
         self.validation_config = Some(config);
         self
+    }
+
+    /// Attach an arbitrary string key/value pair to the context.
+    ///
+    /// Intended for middleware that needs a bit of per-call configuration
+    /// without expanding the strongly-typed fields on `MiddlewareContext`.
+    /// Keys are plain `&str` — callers should pick a stable namespace like
+    /// `"sdk_url_sanitizer.target_family"`.
+    pub fn with_metadata(mut self, key: &str, value: &str) -> Self {
+        self.metadata.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Look up a value previously set via [`with_metadata`].
+    pub fn metadata_get(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(|s| s.as_str())
     }
 }
 
