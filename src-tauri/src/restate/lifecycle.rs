@@ -79,26 +79,32 @@ fn which_binary(name: &str) -> Result<PathBuf, String> {
 }
 
 /// Get the platform-specific target triple for Restate binary downloads.
-fn download_target() -> &'static str {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+///
+/// Returns an `Err` with actionable guidance on platforms where the Restate
+/// project does not publish prebuilt binaries (notably Windows).
+fn download_target() -> Result<&'static str, String> {
+    #[cfg(target_os = "windows")]
     {
-        "x86_64-pc-windows-msvc.exe"
+        Err("Restate does not publish Windows binaries. To use Restate on Windows, either:\n\
+             (a) set RestateSettings.binary_path to a locally-built restate-server.exe, or\n\
+             (b) set RestateSettings.external_admin_url and external_ingress_url to a Docker- or WSL-hosted server.\n\
+             See https://github.com/restatedev/restate/releases for platform availability.".to_string())
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        "x86_64-unknown-linux-musl"
+        Ok("x86_64-unknown-linux-musl")
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        "aarch64-unknown-linux-musl"
+        Ok("aarch64-unknown-linux-musl")
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        "x86_64-apple-darwin"
+        Ok("x86_64-apple-darwin")
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        "aarch64-apple-darwin"
+        Ok("aarch64-apple-darwin")
     }
 }
 
@@ -140,7 +146,7 @@ async fn download_restate_binary(
     config: &RestateSettings,
     app_data_dir: &Path,
 ) -> Result<PathBuf, String> {
-    let target = download_target();
+    let target = download_target()?;
     let url = RESTATE_RELEASE_URL_TEMPLATE
         .replace("{version}", &config.target_version)
         .replace("{target}", target);
@@ -203,10 +209,20 @@ async fn download_restate_binary(
 /// Ensure the Restate binary is available, downloading if necessary.
 ///
 /// Returns the path to the binary, or an error if it cannot be obtained.
+/// When `config.is_external()` is true this returns an error immediately — the
+/// caller treats that as non-fatal and skips local spawning.
 pub async fn ensure_restate_binary(
     config: &RestateSettings,
     app_data_dir: &Path,
 ) -> Result<PathBuf, String> {
+    if config.is_external() {
+        return Err(
+            "Restate is configured to use an external server (external_admin_url/external_ingress_url). \
+             Skipping managed binary resolution."
+                .to_string(),
+        );
+    }
+
     // Check existing binary
     if let Some(path) = resolve_binary_path(config, app_data_dir) {
         // Validate version if it's a managed binary (not custom or system)
@@ -285,8 +301,23 @@ pub fn build_restate_process_config(
 }
 
 /// Check if the Restate server is healthy by querying the admin API.
+///
+/// Targets the local admin port. For external servers use
+/// [`is_restate_healthy_for`] which consults `external_admin_url`.
 pub async fn is_restate_healthy(admin_port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{}/health", admin_port);
+    probe_health(&format!("http://127.0.0.1:{}", admin_port)).await
+}
+
+/// Check Restate health using the effective admin URL from settings.
+///
+/// When `external_admin_url` is set this probes the external server; otherwise
+/// it probes the local admin port.
+pub async fn is_restate_healthy_for(config: &RestateSettings) -> bool {
+    probe_health(&config.admin_url()).await
+}
+
+async fn probe_health(admin_base_url: &str) -> bool {
+    let url = format!("{}/health", admin_base_url.trim_end_matches('/'));
     match reqwest::Client::new()
         .get(&url)
         .timeout(Duration::from_secs(2))
@@ -302,11 +333,16 @@ pub async fn is_restate_healthy(admin_port: u16) -> bool {
 ///
 /// This tells Restate where to find the QontinuiWorkflow and WorkflowStateObject
 /// service handlers. Must be called after both Restate and the service endpoint are ready.
+///
+/// Targets `settings.admin_url()` which honors `external_admin_url` when set.
 pub async fn register_service_endpoint(
-    admin_port: u16,
+    settings: &RestateSettings,
     service_endpoint_port: u16,
 ) -> Result<(), String> {
-    let admin_url = format!("http://127.0.0.1:{}/deployments", admin_port);
+    let admin_url = format!(
+        "{}/deployments",
+        settings.admin_url().trim_end_matches('/')
+    );
     let service_url = format!("http://127.0.0.1:{}", service_endpoint_port);
 
     info!(
@@ -348,7 +384,18 @@ pub async fn register_service_endpoint(
 }
 
 /// Spawn a background watchdog that monitors Restate health and restarts it if needed.
+///
+/// No-op when `config.is_external()` is true — the runner does not own the
+/// lifecycle of an external Restate server.
 pub fn spawn_restate_watchdog(manager: Arc<ProcessCaptureManager>, config: RestateSettings) {
+    if config.is_external() {
+        info!(
+            "Restate configured with external URLs ({}); skipping managed-binary watchdog",
+            config.admin_url()
+        );
+        return;
+    }
+
     tokio::spawn(async move {
         let check_interval = Duration::from_secs(30);
         let mut consecutive_failures = 0u32;
@@ -357,7 +404,7 @@ pub fn spawn_restate_watchdog(manager: Arc<ProcessCaptureManager>, config: Resta
         loop {
             tokio::time::sleep(check_interval).await;
 
-            if is_restate_healthy(config.admin_port).await {
+            if is_restate_healthy_for(&config).await {
                 if consecutive_failures > 0 {
                     info!(
                         "Restate server recovered (was unhealthy for {} checks)",

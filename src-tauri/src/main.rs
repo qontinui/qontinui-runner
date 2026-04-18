@@ -1663,33 +1663,41 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Inject Restate server if durable execution is enabled
                 let restate_settings = settings::load_settings().restate.clone();
                 if restate_settings.enabled {
-                    info!("Restate durable execution enabled — preparing server");
-                    let app_data_dir = dirs::data_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join("qontinui-runner");
-                    match restate::lifecycle::ensure_restate_binary(
-                        &restate_settings,
-                        &app_data_dir,
-                    )
-                    .await
-                    {
-                        Ok(binary_path) => {
-                            let restate_config =
-                                restate::lifecycle::build_restate_process_config(
-                                    &restate_settings,
-                                    &binary_path,
-                                    &app_data_dir,
+                    if restate_settings.is_external() {
+                        info!(
+                            "Restate durable execution enabled — using external server at {} / {}; skipping local spawn",
+                            restate_settings.admin_url(),
+                            restate_settings.ingress_url()
+                        );
+                    } else {
+                        info!("Restate durable execution enabled — preparing server");
+                        let app_data_dir = dirs::data_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join("qontinui-runner");
+                        match restate::lifecycle::ensure_restate_binary(
+                            &restate_settings,
+                            &app_data_dir,
+                        )
+                        .await
+                        {
+                            Ok(binary_path) => {
+                                let restate_config =
+                                    restate::lifecycle::build_restate_process_config(
+                                        &restate_settings,
+                                        &binary_path,
+                                        &app_data_dir,
+                                    );
+                                info!(
+                                    "Restate server config: binary={}, health_port={:?}, group={}",
+                                    restate_config.command,
+                                    restate_config.health_port,
+                                    restate_config.start_group
                                 );
-                            info!(
-                                "Restate server config: binary={}, health_port={:?}, group={}",
-                                restate_config.command,
-                                restate_config.health_port,
-                                restate_config.start_group
-                            );
-                            configs.push(restate_config);
-                        }
-                        Err(e) => {
-                            error!("Failed to prepare Restate binary: {} — workflows will use legacy execution", e);
+                                configs.push(restate_config);
+                            }
+                            Err(e) => {
+                                error!("Failed to prepare Restate binary: {} — workflows will use legacy execution", e);
+                            }
                         }
                     }
                 }
@@ -1745,13 +1753,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // Register our endpoint with the Restate server once both are ready
                     let rs = restate_settings.clone();
                     tokio::spawn(async move {
-                        // Wait for Restate admin port to be ready
-                        if crate::process_capture::health::wait_for_port_ready(
-                            rs.admin_port,
-                            std::time::Duration::from_secs(60),
-                        )
-                        .await
-                        {
+                        // When using an external Restate server we cannot probe a
+                        // local port for it — trust that it's up and skip the wait.
+                        let admin_ready = if rs.is_external() {
+                            true
+                        } else {
+                            crate::process_capture::health::wait_for_port_ready(
+                                rs.admin_port,
+                                std::time::Duration::from_secs(60),
+                            )
+                            .await
+                        };
+
+                        if admin_ready {
                             // Also wait for our service endpoint to be ready
                             if crate::process_capture::health::wait_for_port_ready(
                                 rs.service_endpoint_port,
@@ -1761,7 +1775,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 // Register the runner's service endpoint with Restate
                                 if let Err(e) = restate::lifecycle::register_service_endpoint(
-                                    rs.admin_port,
+                                    &rs,
                                     rs.service_endpoint_port,
                                 )
                                 .await
@@ -1776,7 +1790,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
 
-                    // Start health watchdog
+                    // Start health watchdog (no-op when external)
                     restate::lifecycle::spawn_restate_watchdog(
                         manager.clone(),
                         restate_settings.clone(),

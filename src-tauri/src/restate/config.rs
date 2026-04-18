@@ -41,6 +41,17 @@ pub struct RestateSettings {
     /// Target Restate server version to download (default: latest known compatible).
     #[serde(default = "default_restate_version")]
     pub target_version: String,
+
+    /// When set, skips the managed-server binary path entirely and uses this URL
+    /// for admin-plane calls (health, service registration). Phase 2's supervisor
+    /// port-allocator injects this.
+    #[serde(default)]
+    pub external_admin_url: Option<String>,
+
+    /// Paired with external_admin_url. When set, the runner treats the external
+    /// server as authoritative and bypasses all local spawning.
+    #[serde(default)]
+    pub external_ingress_url: Option<String>,
 }
 
 impl Default for RestateSettings {
@@ -54,6 +65,8 @@ impl Default for RestateSettings {
             auto_download: true,
             data_dir: None,
             target_version: default_restate_version(),
+            external_admin_url: None,
+            external_ingress_url: None,
         }
     }
 }
@@ -79,13 +92,33 @@ impl RestateSettings {
     }
 
     /// Get the ingress URL for workflow invocations.
+    ///
+    /// Prefers `external_ingress_url` when the external pair is configured.
     pub fn ingress_url(&self) -> String {
+        if self.is_external() {
+            if let Some(ref url) = self.external_ingress_url {
+                return url.trim_end_matches('/').to_string();
+            }
+        }
         format!("http://127.0.0.1:{}", self.ingress_port)
     }
 
     /// Get the admin API URL for health checks and deployment management.
+    ///
+    /// Prefers `external_admin_url` when the external pair is configured.
     pub fn admin_url(&self) -> String {
+        if self.is_external() {
+            if let Some(ref url) = self.external_admin_url {
+                return url.trim_end_matches('/').to_string();
+            }
+        }
         format!("http://127.0.0.1:{}", self.admin_port)
+    }
+
+    /// Returns true when both external URLs are set, indicating the runner should
+    /// bypass all local Restate spawning and target the external server instead.
+    pub fn is_external(&self) -> bool {
+        self.external_admin_url.is_some() && self.external_ingress_url.is_some()
     }
 
     /// Get the service endpoint URL that Restate calls back into.
@@ -135,5 +168,5 @@ fn default_true() -> bool {
 }
 
 fn default_restate_version() -> String {
-    "1.1.0".to_string()
+    "1.6.2".to_string()
 }

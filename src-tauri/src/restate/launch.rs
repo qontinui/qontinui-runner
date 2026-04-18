@@ -131,7 +131,7 @@ pub async fn should_use_restate(settings: &RestateSettings) -> bool {
     if !settings.enabled {
         return false;
     }
-    super::lifecycle::is_restate_healthy(settings.admin_port).await
+    super::lifecycle::is_restate_healthy_for(settings).await
 }
 
 /// Build a `WorkflowInput` from the serializable components.

@@ -109,7 +109,7 @@ async fn restate_health(
     let restate_settings = crate::settings::load_settings().restate.clone();
 
     let healthy = if restate_settings.enabled {
-        crate::restate::lifecycle::is_restate_healthy(restate_settings.admin_port).await
+        crate::restate::lifecycle::is_restate_healthy_for(&restate_settings).await
     } else {
         false
     };
