@@ -20,6 +20,7 @@ import {
   GitCommitHorizontal,
   BarChart3,
   DollarSign,
+  ListOrdered,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
@@ -39,6 +40,7 @@ import { ErrorMonitorTab } from "../error-monitor/ErrorMonitorTab";
 import { CanvasRecapTab } from "./CanvasRecapTab";
 import { TaskRunLivePanel } from "../graphql/TaskRunLivePanel";
 import { DurableExecutionTab } from "./DurableExecutionTab";
+import { PhaseTimelineTab } from "./PhaseTimelineTab";
 import { useErrorBadge } from "../../hooks/useErrorMonitor";
 import { FeedbackScoresPanel } from "../feedback-scores/FeedbackScoresPanel";
 import { RunCostBreakdown } from "./RunCostBreakdown";
@@ -96,6 +98,12 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
     id: "run-tab-durable",
     type: "button",
     label: "Diffs and Replay tab",
+    actions: ["click"],
+  });
+  const { ref: phasesRef } = useUIElement({
+    id: "run-tab-phases",
+    type: "button",
+    label: "Phase Timeline tab",
     actions: ["click"],
   });
   const { ref: feedbackRef } = useUIElement({
@@ -255,6 +263,10 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
             <GitCommitHorizontal className="w-3.5 h-3.5" />
             Diffs &amp; Replay
           </TabsTrigger>
+          <TabsTrigger ref={phasesRef} value="phases" className="flex items-center gap-1.5">
+            <ListOrdered className="w-3.5 h-3.5" />
+            Phase Timeline
+          </TabsTrigger>
           <TabsTrigger ref={feedbackRef} value="feedback" className="flex items-center gap-1.5">
             <BarChart3 className="w-3.5 h-3.5" />
             Feedback Scores
@@ -308,6 +320,10 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
 
         <TabsContent value="durable">
           <DurableExecutionTab taskRunId={taskRunId} />
+        </TabsContent>
+
+        <TabsContent value="phases">
+          <PhaseTimelineTab taskRunId={taskRunId} />
         </TabsContent>
 
         <TabsContent value="feedback">

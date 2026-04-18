@@ -160,3 +160,16 @@ pub async fn get_iteration_commits(
 ) -> Result<Vec<crate::unified_workflow_executor::types::IterationCommit>, String> {
     app_state.pg_db.get_iteration_commits(&execution_id).await
 }
+
+/// Get the structured phase-level results for a workflow execution.
+///
+/// Returns the JSON array of PhaseResult objects — one row per phase
+/// executed, with step-level breakdown, timing, and failure context.
+/// Powers the Phase Timeline tab in the run recap.
+#[tauri::command]
+pub async fn get_phase_results(
+    app_state: State<'_, Arc<AppState>>,
+    execution_id: String,
+) -> Result<Vec<crate::unified_workflow_executor::types::PhaseResult>, String> {
+    app_state.pg_db.get_phase_results(&execution_id).await
+}

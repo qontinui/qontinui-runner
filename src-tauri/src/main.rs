@@ -992,6 +992,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::durable_execution::rollback_workflow_to_iteration,
             commands::durable_execution::get_iteration_diffs,
             commands::durable_execution::get_iteration_commits,
+            commands::durable_execution::get_phase_results,
             // Database maintenance commands
             commands::database::optimize_database,
             commands::database::get_database_stats,
