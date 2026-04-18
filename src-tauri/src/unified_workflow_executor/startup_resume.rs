@@ -12,8 +12,9 @@ use crate::config_storage::ConfigStorage;
 use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::AppState;
 
+use super::compensation::CompensationManager;
 use super::loop_controller::LoopController;
-use super::types::LoopResult;
+use super::types::{LoopResult, RollbackPolicy};
 
 // ---------------------------------------------------------------------------
 // WorkflowResult
@@ -272,6 +273,67 @@ pub async fn resume_interrupted_workflows(
             }
         }
 
+        // ── Startup auto-compensation ────────────────────────────────
+        //
+        // Per plan §1.3 option-b: if the crashed run left any unexecuted
+        // compensation rows in `runner.compensation_actions`, run them now —
+        // regardless of `auto_continue`. Compensation is cleanup (undoing
+        // side effects), not resumption, so it applies to ALL crashed runs.
+        //
+        // The presence of unexecuted rows is the signal that there was
+        // pending work. If `load_pending_compensation_actions` returns an
+        // empty Vec, the workflow was running cleanly when the runner
+        // restarted — skip this block entirely, no log noise.
+        let compensation_suffix: String = match app_state
+            .pg_db
+            .load_pending_compensation_actions(&task_run.id)
+            .await
+        {
+            Ok(rows) if rows.is_empty() => String::new(),
+            Ok(rows) => {
+                let total = rows.len();
+                info!(
+                    "Startup compensation: workflow '{}' (id: {}) has {} pending action(s), executing LIFO before resume/fail decision",
+                    task_run.task_name, task_run.id, total
+                );
+                let mgr = CompensationManager::new(app_state.pg_db.clone());
+                match mgr.load_pending(&task_run.id).await {
+                    Ok(()) => {
+                        // RollbackPolicy::Clean runs the full LIFO without
+                        // needing in-memory iteration context. We pass an
+                        // empty IterationResult slice — this is startup
+                        // recovery, the previous run's context is gone.
+                        let results = mgr.execute_all(&RollbackPolicy::Clean, &[]).await;
+                        let attempted = results.len();
+                        let succeeded = results.iter().filter(|r| r.success).count();
+                        let failed = attempted - succeeded;
+                        info!(
+                            "Startup compensation complete for '{}' (id: {}): {}/{} succeeded, {} failed (total pending: {})",
+                            task_run.task_name, task_run.id, succeeded, attempted, failed, total
+                        );
+                        format!(
+                            " [auto-compensated: {}/{} succeeded]",
+                            succeeded, attempted
+                        )
+                    }
+                    Err(e) => {
+                        error!(
+                            "Startup compensation: load_pending failed for task {}: {} — falling through without compensation",
+                            task_run.id, e
+                        );
+                        format!(" [auto-compensation failed: {}]", e)
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Startup compensation: could not query pending actions for task {}: {} — falling through without compensation",
+                    task_run.id, e
+                );
+                String::new()
+            }
+        };
+
         // Programmatic workflows (follow-up, reflection, fixer) are built in-memory
         // and never saved to the workflow library. They cannot be resumed from a DB
         // definition, so stop them cleanly instead of marking as failed — these
@@ -289,8 +351,8 @@ pub async fn resume_interrupted_workflows(
                 kind, task_run.task_name, task_run.id
             );
             let reason = format!(
-                "Interrupted by app restart ({} workflow — not resumable)",
-                kind
+                "Interrupted by app restart ({} workflow — not resumable){}",
+                kind, compensation_suffix
             );
             if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
                 error!(
@@ -316,7 +378,10 @@ pub async fn resume_interrupted_workflows(
                 "Marking interrupted workflow '{}' (id: {}) as failed ({})",
                 task_run.task_name, task_run.id, reason
             );
-            let reason_str = format!("Interrupted workflow marked as failed ({})", reason);
+            let reason_str = format!(
+                "Interrupted workflow marked as failed ({}){}",
+                reason, compensation_suffix
+            );
             if let Err(e) = app_state
                 .pg_db
                 .fail_task_run(&task_run.id, &reason_str)
@@ -327,6 +392,17 @@ pub async fn resume_interrupted_workflows(
                 processed_count += 1;
             }
             continue;
+        }
+
+        // Resume path: compensation has already run (LIFO-undone the crashed
+        // iteration's side effects). If any actions were pending and we
+        // executed them, log that fact; the spawn below then resumes from
+        // the iteration BEFORE those compensations.
+        if !compensation_suffix.is_empty() {
+            info!(
+                "Workflow '{}' (id: {}) resuming after startup compensation:{}",
+                task_run.task_name, task_run.id, compensation_suffix
+            );
         }
 
         // Extract workflow ID from task_run.id (format: unified-workflow-{uuid}-{timestamp})

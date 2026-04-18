@@ -1268,6 +1268,106 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires PG"]
+    async fn test_startup_compensation_load_and_execute() {
+        // Verifies the startup-resume auto-compensation flow (plan §1.3 option-b):
+        // 1. Create CompensationManager A, push 2 FileCleanup actions, don't execute.
+        // 2. Create a fresh CompensationManager B (simulating runner startup).
+        // 3. Call load_pending with the execution_id.
+        // 4. Call execute_all(&RollbackPolicy::Clean, &[]).
+        // 5. Verify both rows are now executed=TRUE in PG
+        //    (by confirming load_pending_compensation_actions returns an empty Vec).
+        let db = PgDb::new_blocking_for_test();
+        let execution_id = format!(
+            "test-startup-compensation-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+
+        // Build two FileCleanup actions against real temp files so that
+        // execute_compensation has something to actually delete and will
+        // report success.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_a = dir.path().join("startup-a.txt");
+        let path_b = dir.path().join("startup-b.txt");
+        tokio::fs::write(&path_a, b"alpha").await.expect("write a");
+        tokio::fs::write(&path_b, b"beta").await.expect("write b");
+
+        // --- Phase 1: push through manager A, simulating a live run ---
+        let mgr_a = CompensationManager::new(db.clone());
+        let action_a = make_action(
+            &format!("startup-{}-0", execution_id),
+            "test",
+            CompensationType::FileCleanup {
+                paths: vec![path_a.to_string_lossy().into_owned()],
+            },
+        );
+        let action_b = make_action(
+            &format!("startup-{}-1", execution_id),
+            "test",
+            CompensationType::FileCleanup {
+                paths: vec![path_b.to_string_lossy().into_owned()],
+            },
+        );
+        mgr_a
+            .push(&execution_id, action_a)
+            .await
+            .expect("push A must succeed with PG");
+        mgr_a
+            .push(&execution_id, action_b)
+            .await
+            .expect("push B must succeed with PG");
+
+        // Drop mgr_a so there's no doubt about which manager is executing.
+        drop(mgr_a);
+
+        // --- Phase 2: fresh manager simulating startup-resume ---
+        let mgr_b = CompensationManager::new(db.clone());
+
+        // Before load_pending: both files still exist, both rows still pending.
+        let pending_before = db
+            .load_pending_compensation_actions(&execution_id)
+            .await
+            .expect("query pending");
+        assert_eq!(
+            pending_before.len(),
+            2,
+            "two rows should be pending before startup compensation runs"
+        );
+
+        // --- Phase 3: load_pending ---
+        mgr_b
+            .load_pending(&execution_id)
+            .await
+            .expect("load_pending must succeed");
+
+        // --- Phase 4: execute_all(Clean, &[]) — startup has no iteration context ---
+        let results = mgr_b.execute_all(&RollbackPolicy::Clean, &[]).await;
+        assert_eq!(results.len(), 2, "both actions should have been attempted");
+        assert!(
+            results.iter().all(|r| r.success),
+            "both FileCleanup actions should succeed: {:?}",
+            results
+        );
+
+        // --- Phase 5: verify both rows are now executed=TRUE in PG ---
+        // `load_pending_compensation_actions` filters on `NOT executed`, so
+        // if both rows were claimed and executed, it should return empty.
+        let pending_after = db
+            .load_pending_compensation_actions(&execution_id)
+            .await
+            .expect("query pending after");
+        assert!(
+            pending_after.is_empty(),
+            "no rows should remain pending after execute_all, got {} row(s)",
+            pending_after.len()
+        );
+
+        // And the files themselves should be gone.
+        assert!(!path_a.exists(), "startup-a.txt should have been deleted");
+        assert!(!path_b.exists(), "startup-b.txt should have been deleted");
+    }
+
+    #[tokio::test]
     async fn test_execute_continues_on_failure() {
         // Build 3 actions: [success, guaranteed-failure, success].
         // `execute_all_compensations` runs them in REVERSE order, so the
