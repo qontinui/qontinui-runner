@@ -27,10 +27,11 @@ use super::convergence::{ConvergenceAction, ConvergencePattern, ConvergenceRepor
 use super::loop_state_machine::{CompletionReason, LoopContext, LoopState};
 use super::states::UnifiedWorkflowState;
 use super::types::{
-    get_parent_task_id, AgenticOutcome, IterationResult, LoopConfig, LoopResult, RollbackPolicy,
+    get_parent_task_id, step_execution_to_record, AgenticOutcome, IterationResult, LoopConfig,
+    LoopResult, PhaseResult, RollbackPolicy, StepResultRecord,
 };
 
-use super::loop_controller::LoopController;
+use super::loop_controller::{emit_and_persist_phase_result, LoopController};
 
 impl LoopController {
     // =========================================================================
@@ -756,6 +757,50 @@ impl LoopController {
                     }
                 }
             }
+        }
+
+        // Build, persist, and emit the verification PhaseResult before the
+        // step_results vec is moved into `all_step_results`.
+        {
+            let failure_context = if verification_result.all_passed {
+                None
+            } else {
+                verification_result
+                    .step_results
+                    .iter()
+                    .find(|r| !r.success)
+                    .map(|r| {
+                        format!(
+                            "Step '{}' failed: {}",
+                            r.step_name,
+                            r.error.as_deref().unwrap_or("unknown")
+                        )
+                    })
+            };
+            let phase_result = PhaseResult {
+                phase: "verification".into(),
+                iteration: Some(ctx.iteration),
+                stage_index: config.stage_index,
+                success: verification_result.all_passed,
+                all_passed: verification_result.all_passed,
+                step_results: verification_result
+                    .step_results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sr)| step_execution_to_record(sr, Some(i)))
+                    .collect(),
+                failure_context,
+                duration_ms: verification_result.total_duration_ms,
+                variables_set: None,
+                commit_hash: None,
+            };
+            emit_and_persist_phase_result(
+                &self.app_state,
+                &self.app_handle,
+                &config.execution_id,
+                phase_result,
+            )
+            .await;
         }
 
         // Add step results to overall results
@@ -1956,6 +2001,60 @@ impl LoopController {
             .agentic_phase_start
             .map(|s| s.elapsed().as_millis() as u64)
             .unwrap_or(0);
+
+        // Build, persist, and emit the agentic PhaseResult.
+        //
+        // AgenticOutcome doesn't carry per-step results (the agent runs a
+        // single session), so populate `step_results` from the injected
+        // steps (preferred) or the accumulated dynamic steps — this keeps
+        // the timeline UI from rendering an empty card for agentic phases.
+        {
+            let agentic_success = agentic_outcome.is_success();
+            let failure_context_opt = match &agentic_outcome {
+                AgenticOutcome::Failed { error, .. } => Some(error.clone()),
+                AgenticOutcome::Error { error } => Some(error.clone()),
+                AgenticOutcome::BudgetExceeded { reason } => Some(reason.clone()),
+                AgenticOutcome::Success { .. } | AgenticOutcome::Skipped => None,
+            };
+            let step_source: &[ExecutionStepConfig] = if !new_injected_steps.is_empty() {
+                &new_injected_steps
+            } else {
+                &ctx.dynamic_steps
+            };
+            let step_records: Vec<StepResultRecord> = step_source
+                .iter()
+                .enumerate()
+                .map(|(i, step)| StepResultRecord {
+                    success: agentic_success,
+                    step_index: i,
+                    step_type: step.step_type.clone(),
+                    step_name: step.name.clone(),
+                    error: None,
+                    output_data: None,
+                    duration_ms: 0,
+                    variables_set: None,
+                })
+                .collect();
+            let phase_result = PhaseResult {
+                phase: "agentic".into(),
+                iteration: Some(ctx.iteration),
+                stage_index: config.stage_index,
+                success: agentic_success,
+                all_passed: agentic_success,
+                step_results: step_records,
+                failure_context: failure_context_opt,
+                duration_ms: agentic_duration_ms,
+                variables_set: None,
+                commit_hash: None,
+            };
+            emit_and_persist_phase_result(
+                &self.app_state,
+                &self.app_handle,
+                &config.execution_id,
+                phase_result,
+            )
+            .await;
+        }
 
         // Feed the resource tracker with this iteration's data.
         // Extract files_modified from the parsed agentic output (if available).

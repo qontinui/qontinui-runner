@@ -28,7 +28,10 @@ use super::canvas_panels::CanvasPanelManager;
 use super::phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, VerificationExecutor};
 use super::resume::{ResumeManager, ResumePoint};
 use super::states::UnifiedWorkflowState;
-use super::types::{AgenticOutcome, LoopConfig, LoopResult, SweepResult};
+use super::types::{
+    get_parent_task_id, step_execution_to_record, AgenticOutcome, LoopConfig, LoopResult,
+    PhaseResult, SweepResult,
+};
 
 /// The main loop controller for unified workflows.
 ///
@@ -936,6 +939,24 @@ impl LoopController {
                     )
                     .await;
 
+                // Build, persist, and emit the setup PhaseResult.
+                {
+                    let phase_result = build_phase_result_from_steps(
+                        "setup",
+                        None,
+                        Some(stage_idx as u32),
+                        setup_ok,
+                        &setup_results,
+                    );
+                    emit_and_persist_phase_result(
+                        &self.app_state,
+                        &self.app_handle,
+                        &config.execution_id,
+                        phase_result,
+                    )
+                    .await;
+                }
+
                 // Emit canvas panel for setup completion
                 self.canvas_manager
                     .lock()
@@ -1501,7 +1522,7 @@ impl LoopController {
                         .or_else(|| stage.provider.clone())
                         .or_else(|| config.provider_override.clone());
 
-                    let (_, completion_results) = self
+                    let (completion_ok, completion_results) = self
                         .completion_executor
                         .run_completion(
                             &stage.completion_automation_steps,
@@ -1519,6 +1540,25 @@ impl LoopController {
                             stage.completion_prompts_first,
                         )
                         .await;
+
+                    // Build, persist, and emit the completion PhaseResult.
+                    {
+                        let phase_result = build_phase_result_from_steps(
+                            "completion",
+                            Some(loop_result.iterations_run),
+                            Some(stage_idx as u32),
+                            completion_ok,
+                            &completion_results,
+                        );
+                        emit_and_persist_phase_result(
+                            &self.app_state,
+                            &self.app_handle,
+                            &config.execution_id,
+                            phase_result,
+                        )
+                        .await;
+                    }
+
                     all_step_results.extend(completion_results);
                 }
 
@@ -3102,6 +3142,73 @@ pub use super::step_conversion::{
     convert_all_json_steps_with_phase, convert_json_steps_with_phase,
     extract_prompt_steps_with_phase, substitute_step_vars,
 };
+
+/// Persist a `PhaseResult` to PG and emit it to the frontend via Tauri.
+///
+/// Best-effort: logs warnings on failure without interrupting the run.
+/// Uses `get_parent_task_id` remapping for composed runs so phase results
+/// align with the parent task the UI filters by (matching the convention
+/// used for `store_verification_phase_result`).
+pub(crate) async fn emit_and_persist_phase_result(
+    app_state: &Arc<AppState>,
+    app_handle: &tauri::AppHandle,
+    execution_id: &str,
+    result: PhaseResult,
+) {
+    let parent_id = get_parent_task_id(execution_id);
+    if let Err(e) = app_state.pg_db.save_phase_result(&parent_id, &result).await {
+        tracing::warn!(
+            "PHASE-RESULT: failed to persist {} phase: {}",
+            result.phase,
+            e
+        );
+    }
+    if let Err(e) = app_handle.emit("phase-result", &result) {
+        tracing::warn!(
+            "PHASE-RESULT: failed to emit {} phase: {}",
+            result.phase,
+            e
+        );
+    }
+}
+
+/// Build a `PhaseResult` for a setup or completion phase from the executor's
+/// `(bool, Vec<StepExecutionResult>)` return.
+pub(crate) fn build_phase_result_from_steps(
+    phase: &str,
+    iteration: Option<u32>,
+    stage_index: Option<u32>,
+    phase_ok: bool,
+    step_results: &[crate::step_executor::StepExecutionResult],
+) -> PhaseResult {
+    let failure_context = if phase_ok {
+        None
+    } else {
+        step_results.iter().find(|r| !r.success).map(|r| {
+            format!(
+                "Step '{}' failed: {}",
+                r.step_name,
+                r.error.as_deref().unwrap_or("unknown")
+            )
+        })
+    };
+    PhaseResult {
+        phase: phase.to_string(),
+        iteration,
+        stage_index,
+        success: phase_ok,
+        all_passed: phase_ok,
+        step_results: step_results
+            .iter()
+            .enumerate()
+            .map(|(i, sr)| step_execution_to_record(sr, Some(i)))
+            .collect(),
+        failure_context,
+        duration_ms: step_results.iter().map(|r| r.duration_ms).sum(),
+        variables_set: None,
+        commit_hash: None,
+    }
+}
 
 // Health monitoring utilities extracted to health_monitor module
 pub(super) use super::health_monitor::build_resume_agentic_context;

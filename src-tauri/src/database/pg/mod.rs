@@ -44,6 +44,7 @@ pub mod misc_crud;
 pub mod observations;
 pub mod online_learning;
 pub mod orchestration_loop;
+pub mod phase_results;
 pub mod pipeline_traces;
 pub mod pr_watch_ops;
 pub mod process_sessions;
@@ -887,6 +888,29 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS idx_ca_execution ON compensation_actions(execution_id);
             CREATE INDEX IF NOT EXISTS idx_ca_pending ON compensation_actions(execution_id) WHERE NOT executed;
+        "#,
+    },
+    Migration {
+        version: 22,
+        description: "Add phase_results table for structured phase-level persistence (plan: restate-port-part-a §2.3)",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS phase_results (
+                id              BIGSERIAL PRIMARY KEY,
+                execution_id    TEXT NOT NULL,
+                phase           TEXT NOT NULL,
+                iteration       INT,
+                stage_index     INT,
+                success         BOOLEAN NOT NULL,
+                all_passed      BOOLEAN NOT NULL,
+                duration_ms     BIGINT NOT NULL,
+                failure_context TEXT,
+                commit_hash     TEXT,
+                step_results    JSONB NOT NULL DEFAULT '[]'::jsonb,
+                variables_set   JSONB,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_pr_execution ON phase_results(execution_id);
+            CREATE INDEX IF NOT EXISTS idx_pr_execution_phase ON phase_results(execution_id, phase, iteration);
         "#,
     },
 ];

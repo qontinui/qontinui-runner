@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::config_storage::ConfigStorage;
@@ -20,20 +19,9 @@ use crate::AppState;
 use super::compensation::{CompensationAction, CompensationType};
 use super::types::{DurableStepResult, WorkflowInput, WorkflowOutput};
 
-/// Serializable result of a single phase execution.
-/// This is what gets stored in the Restate journal via `ctx.run()`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PhaseResult {
-    pub success: bool,
-    pub all_passed: bool,
-    pub step_results: Vec<DurableStepResult>,
-    pub failure_context: Option<String>,
-    pub duration_ms: u64,
-    /// Variables set during this phase (for cross-phase propagation)
-    pub variables_set: Vec<(String, String)>,
-    /// Git commit hash at end of phase (for compensation)
-    pub commit_hash: Option<String>,
-}
+/// Re-export the shared PhaseResult so Restate consumers keep using
+/// `super::durable_executor::PhaseResult`.
+pub use crate::unified_workflow_executor::types::PhaseResult;
 
 /// Executes a batch of steps, returning a serializable `PhaseResult`.
 ///
@@ -66,12 +54,15 @@ pub async fn execute_steps_batch(
                 phase_name, execution_id, e
             );
             return PhaseResult {
+                phase: phase_name.to_string(),
+                iteration,
+                stage_index: None,
                 success: false,
                 all_passed: false,
                 step_results: vec![],
                 failure_context: Some(format!("Step deserialization failed: {}", e)),
                 duration_ms: start.elapsed().as_millis() as u64,
-                variables_set: vec![],
+                variables_set: Some(vec![]),
                 commit_hash: None,
             };
         }
@@ -80,12 +71,15 @@ pub async fn execute_steps_batch(
     if steps.is_empty() {
         debug!("No {} steps to execute for {}", phase_name, execution_id);
         return PhaseResult {
+            phase: phase_name.to_string(),
+            iteration,
+            stage_index: None,
             success: true,
             all_passed: true,
             step_results: vec![],
             failure_context: None,
             duration_ms: 0,
-            variables_set: vec![],
+            variables_set: Some(vec![]),
             commit_hash: None,
         };
     }
@@ -145,7 +139,7 @@ pub async fn execute_steps_batch(
             error: error_msg.clone(),
             output_data,
             duration_ms: step_duration,
-            variables_set: step_vars,
+            variables_set: Some(step_vars),
         };
 
         if !success {
@@ -184,12 +178,15 @@ pub async fn execute_steps_batch(
     );
 
     PhaseResult {
+        phase: phase_name.to_string(),
+        iteration,
+        stage_index: None,
         success: all_passed || phase_name == "verification",
         all_passed,
         step_results,
         failure_context,
         duration_ms,
-        variables_set,
+        variables_set: Some(variables_set),
         commit_hash,
     }
 }

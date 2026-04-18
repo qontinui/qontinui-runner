@@ -105,20 +105,10 @@ impl DurablePhase {
     }
 }
 
-/// Result of executing a single step within a `ctx.run()` side effect.
-/// This is what gets journaled by Restate for replay.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DurableStepResult {
-    pub success: bool,
-    pub step_index: usize,
-    pub step_type: String,
-    pub step_name: Option<String>,
-    pub error: Option<String>,
-    pub output_data: Option<serde_json::Value>,
-    pub duration_ms: u64,
-    /// Variables set by this step (for SharedVariableStore reconstruction on replay)
-    pub variables_set: Vec<(String, String)>,
-}
+/// Re-export the shared StepResultRecord under the legacy DurableStepResult
+/// name so existing Restate consumers keep compiling while we consolidate
+/// the type.
+pub use crate::unified_workflow_executor::types::StepResultRecord as DurableStepResult;
 
 /// Approval response submitted via awakeable resolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]

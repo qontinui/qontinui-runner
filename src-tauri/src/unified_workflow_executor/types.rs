@@ -782,6 +782,75 @@ pub struct CompensationResult {
     pub duration_ms: u64,
 }
 
+/// Structured result of a single workflow phase execution.
+///
+/// Shared between the legacy desktop executor and the Restate durable
+/// executor so both paths persist identical data to `runner.phase_results`
+/// for the UI timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseResult {
+    /// Phase name: "setup", "verification", "agentic", "completion".
+    pub phase: String,
+    /// Iteration number (None for setup/completion phases).
+    pub iteration: Option<u32>,
+    /// Stage index for multi-stage workflows (None = single-stage).
+    pub stage_index: Option<u32>,
+    /// Whether the phase returned success.
+    pub success: bool,
+    /// Whether all steps within the phase passed.
+    pub all_passed: bool,
+    /// Per-step results.
+    pub step_results: Vec<StepResultRecord>,
+    /// Failure context for the run recap error surface.
+    pub failure_context: Option<String>,
+    /// Phase duration in milliseconds.
+    pub duration_ms: u64,
+    /// Variables set during this phase. `None` means "not captured"
+    /// (legacy phase executors don't surface this yet); `Some(vec![])`
+    /// means "ran and captured no variables".
+    pub variables_set: Option<Vec<(String, String)>>,
+    /// Git commit hash at end of phase, for compensation correlation.
+    pub commit_hash: Option<String>,
+}
+
+/// Per-step record persisted as part of a `PhaseResult`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepResultRecord {
+    pub success: bool,
+    pub step_index: usize,
+    pub step_type: String,
+    pub step_name: Option<String>,
+    pub error: Option<String>,
+    pub output_data: Option<serde_json::Value>,
+    pub duration_ms: u64,
+    /// Variables set by this step (for SharedVariableStore reconstruction on replay).
+    /// `None` = not captured.
+    pub variables_set: Option<Vec<(String, String)>>,
+}
+
+/// Map a `StepExecutionResult` (returned by phase executors) into the
+/// `StepResultRecord` shape persisted under `PhaseResult`.
+///
+/// `idx_override` overrides the `step_index`: when `Some(i)`, the record
+/// uses `i`; when `None`, the record uses `r.step_index` as-is. The override
+/// is useful when the caller wants sequential indices independent of the
+/// underlying step's reported index.
+pub fn step_execution_to_record(
+    r: &crate::step_executor::StepExecutionResult,
+    idx_override: Option<usize>,
+) -> StepResultRecord {
+    StepResultRecord {
+        success: r.success,
+        step_index: idx_override.unwrap_or(r.step_index),
+        step_type: r.step_type.clone(),
+        step_name: Some(r.step_name.clone()),
+        error: r.error.clone(),
+        output_data: r.output_data.clone(),
+        duration_ms: r.duration_ms,
+        variables_set: None,
+    }
+}
+
 /// Result of the completion sweep phase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepResult {
@@ -935,4 +1004,238 @@ pub fn get_parent_task_id(execution_id: &str) -> String {
 /// Returns true for IDs like `composed-run-{timestamp}-workflow-{n}`.
 pub fn is_sequence_child(execution_id: &str) -> bool {
     get_parent_task_id(execution_id) != execution_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::step_executor::{StepExecutionConfig, StepExecutionResult, VerificationPhaseResult};
+
+    fn mock_step(
+        step_index: usize,
+        step_type: &str,
+        step_name: &str,
+        success: bool,
+        error: Option<&str>,
+        duration_ms: u64,
+    ) -> StepExecutionResult {
+        StepExecutionResult {
+            step_index,
+            step_type: step_type.to_string(),
+            step_name: step_name.to_string(),
+            step_id: None,
+            success,
+            error: error.map(|s| s.to_string()),
+            screenshot_path: None,
+            started_at: None,
+            ended_at: None,
+            duration_ms,
+            config: StepExecutionConfig::default(),
+            verification_details: None,
+            output_data: None,
+            required: None,
+            resolved_inputs: None,
+            extracted_values: None,
+            failure_category: None,
+            interrupted: None,
+        }
+    }
+
+    fn build_setup_phase_result(
+        setup_ok: bool,
+        setup_results: &[StepExecutionResult],
+        stage_idx: u32,
+    ) -> PhaseResult {
+        PhaseResult {
+            phase: "setup".into(),
+            iteration: None,
+            stage_index: Some(stage_idx),
+            success: setup_ok,
+            all_passed: setup_ok,
+            step_results: setup_results
+                .iter()
+                .enumerate()
+                .map(|(i, sr)| step_execution_to_record(sr, Some(i)))
+                .collect(),
+            failure_context: if setup_ok {
+                None
+            } else {
+                setup_results.iter().find(|r| !r.success).map(|r| {
+                    format!(
+                        "Step '{}' failed: {}",
+                        r.step_name,
+                        r.error.as_deref().unwrap_or("unknown")
+                    )
+                })
+            },
+            duration_ms: setup_results.iter().map(|r| r.duration_ms).sum(),
+            variables_set: None,
+            commit_hash: None,
+        }
+    }
+
+    fn build_verification_phase_result(
+        verification_result: &VerificationPhaseResult,
+        stage_index: Option<u32>,
+    ) -> PhaseResult {
+        PhaseResult {
+            phase: "verification".into(),
+            iteration: Some(verification_result.iteration),
+            stage_index,
+            success: verification_result.all_passed,
+            all_passed: verification_result.all_passed,
+            step_results: verification_result
+                .step_results
+                .iter()
+                .enumerate()
+                .map(|(i, sr)| step_execution_to_record(sr, Some(i)))
+                .collect(),
+            failure_context: if verification_result.all_passed {
+                None
+            } else {
+                verification_result
+                    .step_results
+                    .iter()
+                    .find(|r| !r.success)
+                    .map(|r| {
+                        format!(
+                            "Step '{}' failed: {}",
+                            r.step_name,
+                            r.error.as_deref().unwrap_or("unknown")
+                        )
+                    })
+            },
+            duration_ms: verification_result.total_duration_ms,
+            variables_set: None,
+            commit_hash: None,
+        }
+    }
+
+    #[test]
+    fn test_setup_phase_result_mapping() {
+        let setup_results = vec![
+            mock_step(0, "shell", "install deps", true, None, 100),
+            mock_step(1, "shell", "build", false, Some("compile error"), 250),
+            mock_step(2, "shell", "never runs", true, None, 0),
+        ];
+        let setup_ok = false;
+        let pr = build_setup_phase_result(setup_ok, &setup_results, 2);
+
+        assert_eq!(pr.phase, "setup");
+        assert_eq!(pr.iteration, None);
+        assert_eq!(pr.stage_index, Some(2));
+        assert!(!pr.success);
+        assert!(!pr.all_passed);
+        assert_eq!(pr.step_results.len(), 3);
+        // indices rewritten to sequential
+        assert_eq!(pr.step_results[0].step_index, 0);
+        assert_eq!(pr.step_results[1].step_index, 1);
+        assert_eq!(pr.step_results[1].success, false);
+        assert_eq!(pr.step_results[1].error.as_deref(), Some("compile error"));
+        assert_eq!(pr.step_results[0].step_name.as_deref(), Some("install deps"));
+        assert_eq!(pr.duration_ms, 350);
+        assert_eq!(
+            pr.failure_context.as_deref(),
+            Some("Step 'build' failed: compile error")
+        );
+        assert!(pr.variables_set.is_none());
+        assert!(pr.commit_hash.is_none());
+
+        // Success path: failure_context should be None
+        let ok_results = vec![mock_step(0, "shell", "ok", true, None, 5)];
+        let pr_ok = build_setup_phase_result(true, &ok_results, 0);
+        assert!(pr_ok.success);
+        assert!(pr_ok.all_passed);
+        assert!(pr_ok.failure_context.is_none());
+    }
+
+    #[test]
+    fn test_verification_phase_result_mapping() {
+        let vpr = VerificationPhaseResult {
+            iteration: 3,
+            all_passed: false,
+            total_steps: 2,
+            passed_steps: 1,
+            failed_steps: 1,
+            skipped_steps: 0,
+            total_duration_ms: 500,
+            step_results: vec![
+                mock_step(0, "command", "lint", true, None, 200),
+                mock_step(1, "test", "unit tests", false, Some("assertion failed"), 300),
+            ],
+            critical_failure: false,
+            console_errors: None,
+            app_health: None,
+            browser_events: None,
+            network_failures: None,
+        };
+
+        let pr = build_verification_phase_result(&vpr, Some(1));
+
+        assert_eq!(pr.phase, "verification");
+        assert_eq!(pr.iteration, Some(3));
+        assert_eq!(pr.stage_index, Some(1));
+        assert!(!pr.success);
+        assert!(!pr.all_passed);
+        assert_eq!(pr.step_results.len(), 2);
+        assert_eq!(pr.step_results[0].step_name.as_deref(), Some("lint"));
+        assert_eq!(pr.step_results[1].success, false);
+        assert_eq!(pr.duration_ms, 500);
+        assert_eq!(
+            pr.failure_context.as_deref(),
+            Some("Step 'unit tests' failed: assertion failed")
+        );
+
+        // Passing verification: no failure_context
+        let vpr_ok = VerificationPhaseResult {
+            iteration: 1,
+            all_passed: true,
+            total_steps: 1,
+            passed_steps: 1,
+            failed_steps: 0,
+            skipped_steps: 0,
+            total_duration_ms: 10,
+            step_results: vec![mock_step(0, "command", "ok", true, None, 10)],
+            critical_failure: false,
+            console_errors: None,
+            app_health: None,
+            browser_events: None,
+            network_failures: None,
+        };
+        let pr_ok = build_verification_phase_result(&vpr_ok, None);
+        assert!(pr_ok.success);
+        assert!(pr_ok.all_passed);
+        assert!(pr_ok.failure_context.is_none());
+        assert_eq!(pr_ok.stage_index, None);
+    }
+
+    #[test]
+    fn test_phase_result_round_trip() {
+        let pr = PhaseResult {
+            phase: "setup".into(),
+            iteration: None,
+            stage_index: Some(0),
+            success: true,
+            all_passed: true,
+            step_results: vec![StepResultRecord {
+                success: true,
+                step_index: 0,
+                step_type: "shell".into(),
+                step_name: Some("install".into()),
+                error: None,
+                output_data: None,
+                duration_ms: 123,
+                variables_set: None,
+            }],
+            failure_context: None,
+            duration_ms: 123,
+            variables_set: None,
+            commit_hash: Some("abc123".into()),
+        };
+        let json = serde_json::to_string(&pr).unwrap();
+        let back: PhaseResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.phase, "setup");
+        assert_eq!(back.step_results.len(), 1);
+        assert_eq!(back.variables_set, None);
+    }
 }
