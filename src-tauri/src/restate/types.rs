@@ -5,6 +5,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Generate `restate_sdk::serde::Serialize` and `Deserialize` impls for
+/// a type that already derives `serde::Serialize + serde::Deserialize`.
+/// Restate's serde traits are distinct from serde's (to allow non-serde
+/// serialization formats like protobuf), so we bridge them with JSON.
+///
+/// Only usable when the `restate` Cargo feature is enabled (which is the
+/// default — see `Cargo.toml:[features]`).
+#[cfg(feature = "restate")]
+macro_rules! impl_restate_serde_via_json {
+    ($ty:ty) => {
+        impl restate_sdk::serde::Serialize for $ty {
+            type Error = serde_json::Error;
+            fn serialize(&self) -> Result<bytes::Bytes, Self::Error> {
+                serde_json::to_vec(self).map(bytes::Bytes::from)
+            }
+        }
+        impl restate_sdk::serde::Deserialize for $ty {
+            type Error = serde_json::Error;
+            fn deserialize(bytes: &mut bytes::Bytes) -> Result<Self, Self::Error> {
+                serde_json::from_slice(bytes)
+            }
+        }
+    };
+}
+
 /// Input to the Restate workflow `run()` handler.
 /// Contains everything needed to execute a full workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,3 +152,28 @@ pub struct ApprovalPendingEvent {
     pub awakeable_id: String,
     pub prompt: String,
 }
+
+// ---------------------------------------------------------------------------
+// Restate SDK serde impls.
+//
+// Restate 0.4 defines its own Serialize/Deserialize traits (distinct from
+// serde's) so that non-serde formats (protobuf, etc.) can plug in. Our types
+// are JSON across the boundary, so we bridge via serde_json.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "restate")]
+impl_restate_serde_via_json!(WorkflowInput);
+#[cfg(feature = "restate")]
+impl_restate_serde_via_json!(WorkflowOutput);
+#[cfg(feature = "restate")]
+impl_restate_serde_via_json!(DurableWorkflowState);
+#[cfg(feature = "restate")]
+impl_restate_serde_via_json!(ApprovalResponse);
+
+// Types from sibling modules that cross the Restate boundary.
+// The orphan rule permits these `impl` blocks because the types are
+// owned by this crate.
+#[cfg(feature = "restate")]
+impl_restate_serde_via_json!(crate::unified_workflow_executor::types::PhaseResult);
+#[cfg(feature = "restate")]
+impl_restate_serde_via_json!(crate::unified_workflow_executor::types::CompensationAction);

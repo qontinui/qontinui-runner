@@ -16,7 +16,12 @@ use tracing::{error, info};
 use crate::config_storage::ConfigStorage;
 use crate::AppState;
 
-use super::service::{self, QontinuiWorkflowImpl, WorkflowStateObjectImpl};
+// The `QontinuiWorkflow` and `WorkflowStateObject` traits must be in scope
+// for the `.serve()` method (provided as a default trait method by the
+// `#[restate_sdk::workflow]` / `#[restate_sdk::object]` macros) to resolve.
+use super::service::{
+    self, QontinuiWorkflow, QontinuiWorkflowImpl, WorkflowStateObject, WorkflowStateObjectImpl,
+};
 
 /// Start the Restate service HTTP endpoint.
 ///
@@ -51,18 +56,15 @@ pub async fn start_restate_endpoint(
         "Restate endpoint built, starting HTTP server with QontinuiWorkflow and WorkflowStateObject"
     );
 
-    HttpServer::new(endpoint)
-        .listen_and_serve(
-            format!("127.0.0.1:{}", port)
-                .parse()
-                .map_err(|e| format!("Invalid address: {}", e))?,
-        )
-        .await
-        .map_err(|e| {
-            let msg = format!("Restate HTTP endpoint failed: {}", e);
-            error!("{}", msg);
-            msg
-        })?;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port)
+        .parse()
+        .map_err(|e| format!("Invalid address: {}", e))?;
 
+    // `HttpServer::listen_and_serve` returns `()` — it runs until the server
+    // shuts down or the future is dropped. Any transport error is logged
+    // internally by the SDK. Our caller only observes task exit.
+    HttpServer::new(endpoint).listen_and_serve(addr).await;
+
+    info!(port = port, "Restate HTTP endpoint exited");
     Ok(())
 }

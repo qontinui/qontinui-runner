@@ -1135,6 +1135,7 @@ pub fn create_router(
         .merge(crate::mcp::ui_bridge::routes())
         .merge(crate::mcp::ui_bridge_integration::routes())
         .merge(crate::mcp::unified_workflows::routes())
+        .merge(crate::mcp::workflows_dispatch::routes())
         .merge(crate::mcp::verification_tests::routes())
         .merge(crate::mcp::websocket::routes())
         .merge(crate::mcp::window_manager::routes())

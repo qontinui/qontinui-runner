@@ -64,15 +64,33 @@ pub fn launch_generated_workflow(
         .ok_or("No generated_workflow_id in result_data")?
         .to_string();
 
+    launch_workflow_by_id(deps, &generated_workflow_id, Some(meta_task_run_id))
+}
+
+/// Launch a generated workflow by ID, optionally linked to a parent task run.
+///
+/// Loads the workflow from PG, builds a `LoopConfig`, and dispatches it via
+/// Restate (if enabled) or the legacy executor. Returns the execution ID of
+/// the spawned workflow.
+///
+/// This helper is called from `launch_generated_workflow` (meta-workflow flow)
+/// and from the server-mode HTTP dispatch endpoint.
+pub fn launch_workflow_by_id(
+    deps: AutoRunDeps,
+    generated_workflow_id: &str,
+    parent_task_run_id: Option<&str>,
+) -> Result<String, String> {
+    let pg_db = &deps.app_state.pg_db;
+
     info!(
-        "Auto-running generated workflow {} from meta-workflow {}",
-        generated_workflow_id, meta_task_run_id
+        "Auto-running generated workflow {} (parent={:?})",
+        generated_workflow_id, parent_task_run_id
     );
 
     // 2b. Check for DAG workflow routing
     {
         let pg = pg_db.clone();
-        let wf_id = generated_workflow_id.clone();
+        let wf_id = generated_workflow_id.to_string();
         let handle =
             tokio::runtime::Handle::try_current().map_err(|_| "No tokio runtime".to_string())?;
         let dag_def = handle.block_on(async move {
@@ -86,13 +104,15 @@ pub fn launch_generated_workflow(
                 chrono::Utc::now().timestamp_millis()
             );
 
-            let input = crate::database::CreateTaskRunInput::new(&execution_id, &dag_def.name)
+            let mut input = crate::database::CreateTaskRunInput::new(&execution_id, &dag_def.name)
                 .with_prompt(format!("DAG workflow: {}", dag_def.name))
                 .with_task_type("ai")
                 .with_workflow_name(&dag_def.name)
-                .with_workflow_id(&generated_workflow_id)
-                .with_workflow_type("dag")
-                .with_parent_task_run_id(meta_task_run_id);
+                .with_workflow_id(generated_workflow_id)
+                .with_workflow_type("dag");
+            if let Some(parent) = parent_task_run_id {
+                input = input.with_parent_task_run_id(parent);
+            }
 
             let pg_create = pg_db.clone();
             let input_clone = input.clone();
@@ -144,7 +164,7 @@ pub fn launch_generated_workflow(
     // 3. Load the generated workflow (via PG)
     let workflow = {
         let pg = pg_db.clone();
-        let wf_id = generated_workflow_id.clone();
+        let wf_id = generated_workflow_id.to_string();
         let handle =
             tokio::runtime::Handle::try_current().map_err(|_| "No tokio runtime".to_string())?;
         handle
@@ -189,15 +209,17 @@ pub fn launch_generated_workflow(
 
     let run_agentic_first = !workflow.targeted_error_ids.is_empty();
 
-    let input = crate::database::CreateTaskRunInput::new(&execution_id, &workflow.name)
+    let mut input = crate::database::CreateTaskRunInput::new(&execution_id, &workflow.name)
         .with_prompt(&combined_prompt)
         .with_task_type("ai")
         .with_workflow_name(&workflow.name)
         .with_workflow_id(&workflow.id)
         .with_max_sessions(workflow.iter_cap())
         .with_auto_continue(true)
-        .with_workflow_type("unified")
-        .with_parent_task_run_id(meta_task_run_id);
+        .with_workflow_type("unified");
+    if let Some(parent) = parent_task_run_id {
+        input = input.with_parent_task_run_id(parent);
+    }
 
     {
         let pg = pg_db.clone();

@@ -123,5 +123,6 @@ pub mod unified_workflows;
 pub mod verification_tests;
 pub mod web_backend_workflows;
 pub mod websocket;
+pub mod workflows_dispatch;
 pub mod window_manager;
 pub mod worktrees;

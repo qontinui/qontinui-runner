@@ -122,9 +122,10 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
 
         ctx.set(STATE_KEY, initial_state);
 
-        // Initialize empty compensation stack
+        // Initialize empty compensation stack (wrapped in `Json<…>` because
+        // `Vec<T>` has no direct `restate_sdk::serde` impl for generic `T`).
         let compensations: Vec<CompensationAction> = Vec::new();
-        ctx.set(COMPENSATIONS_KEY, compensations);
+        ctx.set(COMPENSATIONS_KEY, restate_sdk::serde::Json(compensations));
 
         // Get global state references
         let app_state = get_app_state()?;
@@ -168,10 +169,10 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             let steps = input.setup_automation_steps_json.clone();
             let eid = execution_id.clone();
             ctx.run(|| async move {
-                super::durable_executor::execute_steps_batch(
+                Ok(super::durable_executor::execute_steps_batch(
                     &as_clone, &cs_clone, &steps, "setup", None, &eid, None,
                 )
-                .await
+                .await)
             })
             .name("phase-setup-auto")
             .await
@@ -202,7 +203,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             let steps = input.setup_prompt_steps_json.clone();
             let eid = execution_id.clone();
             ctx.run(|| async move {
-                super::durable_executor::execute_steps_batch(
+                Ok(super::durable_executor::execute_steps_batch(
                     &as_clone,
                     &cs_clone,
                     &steps,
@@ -211,7 +212,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                     &eid,
                     None,
                 )
-                .await
+                .await)
             })
             .name("phase-setup-prompt")
             .await
@@ -256,7 +257,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                 let eid = execution_id.clone();
                 let iter = iteration;
                 ctx.run(|| async move {
-                    super::durable_executor::execute_steps_batch(
+                    Ok(super::durable_executor::execute_steps_batch(
                         &as_clone,
                         &cs_clone,
                         &steps,
@@ -265,7 +266,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                         &eid,
                         None,
                     )
-                    .await
+                    .await)
                 })
                 .name(&format!("phase-verify-{}", iteration))
                 .await
@@ -305,7 +306,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                     let iter = iteration;
                     let fail_ctx = failure_ctx.clone();
                     ctx.run(|| async move {
-                        super::durable_executor::execute_steps_batch(
+                        Ok(super::durable_executor::execute_steps_batch(
                             &as_clone,
                             &cs_clone,
                             &steps,
@@ -314,7 +315,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                             &eid,
                             Some(&fail_ctx),
                         )
-                        .await
+                        .await)
                     })
                     .name(&format!("phase-agentic-{}", iteration))
                     .await
@@ -348,7 +349,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                 let steps = input.completion_automation_steps_json.clone();
                 let eid = execution_id.clone();
                 ctx.run(|| async move {
-                    super::durable_executor::execute_steps_batch(
+                    Ok(super::durable_executor::execute_steps_batch(
                         &as_clone,
                         &cs_clone,
                         &steps,
@@ -357,7 +358,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                         &eid,
                         None,
                     )
-                    .await
+                    .await)
                 })
                 .name("phase-completion-auto")
                 .await
@@ -371,7 +372,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                 let steps = input.completion_prompt_steps_json.clone();
                 let eid = execution_id.clone();
                 ctx.run(|| async move {
-                    super::durable_executor::execute_steps_batch(
+                    Ok(super::durable_executor::execute_steps_batch(
                         &as_clone,
                         &cs_clone,
                         &steps,
@@ -380,7 +381,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                         &eid,
                         None,
                     )
-                    .await
+                    .await)
                 })
                 .name("phase-completion-prompt")
                 .await
@@ -396,11 +397,18 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
 
         // Collect modified files via git
         let files_modified: Vec<String> = {
-            let as_clone = app_state.clone();
-            ctx.run(|| async move { super::durable_executor::get_modified_files().await })
-                .name("collect-modified-files")
-                .await
-                .unwrap_or_default()
+            let _as_clone = app_state.clone();
+            // `Vec<String>` lacks a direct `restate_sdk::serde` impl, so wrap
+            // it in `Json<…>` for the journal payload and unwrap after.
+            ctx.run(|| async move {
+                Ok(restate_sdk::serde::Json(
+                    super::durable_executor::get_modified_files().await,
+                ))
+            })
+            .name("collect-modified-files")
+            .await
+            .map(|j: restate_sdk::serde::Json<Vec<String>>| j.into_inner())
+            .unwrap_or_default()
         };
 
         let final_status = if success {
@@ -441,12 +449,12 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
 
         // If failed, execute saga compensations
         if !success && !was_stopped {
-            let compensations: Option<Vec<CompensationAction>> =
+            let compensations: Option<restate_sdk::serde::Json<Vec<CompensationAction>>> =
                 ctx.get(COMPENSATIONS_KEY).await.map_err(|e| {
                     TerminalError::new(format!("Failed to read compensations: {}", e))
                 })?;
 
-            if let Some(actions) = compensations {
+            if let Some(actions) = compensations.map(|j| j.into_inner()) {
                 if !actions.is_empty() {
                     info!(execution_id = %execution_id, count = actions.len(),
                         "Executing saga compensations for failed workflow");
@@ -618,8 +626,13 @@ pub trait WorkflowStateObject {
 
     /// Retrieve the full compensation stack (in recording order;
     /// caller is responsible for reversing for LIFO execution).
+    ///
+    /// Returned as `Json<Vec<CompensationAction>>` because `Vec<T>` has no
+    /// direct `restate_sdk::serde` impl for generic `T`. Callers should call
+    /// `.into_inner()` to access the vec.
     #[shared]
-    async fn get_compensations() -> Result<Vec<CompensationAction>, TerminalError>;
+    async fn get_compensations(
+    ) -> Result<restate_sdk::serde::Json<Vec<CompensationAction>>, TerminalError>;
 }
 
 pub struct WorkflowStateObjectImpl;
@@ -668,13 +681,14 @@ impl WorkflowStateObject for WorkflowStateObjectImpl {
         );
 
         let mut compensations: Vec<CompensationAction> = ctx
-            .get(COMPENSATIONS_KEY)
+            .get::<restate_sdk::serde::Json<Vec<CompensationAction>>>(COMPENSATIONS_KEY)
             .await
             .map_err(|e| TerminalError::new(format!("Failed to read compensations: {}", e)))?
+            .map(|j| j.into_inner())
             .unwrap_or_default();
 
         compensations.push(action);
-        ctx.set(COMPENSATIONS_KEY, compensations);
+        ctx.set(COMPENSATIONS_KEY, restate_sdk::serde::Json(compensations));
 
         Ok(())
     }
@@ -682,13 +696,14 @@ impl WorkflowStateObject for WorkflowStateObjectImpl {
     async fn get_compensations(
         &self,
         ctx: SharedObjectContext<'_>,
-    ) -> Result<Vec<CompensationAction>, TerminalError> {
+    ) -> Result<restate_sdk::serde::Json<Vec<CompensationAction>>, TerminalError> {
         let compensations: Vec<CompensationAction> = ctx
-            .get(COMPENSATIONS_KEY)
+            .get::<restate_sdk::serde::Json<Vec<CompensationAction>>>(COMPENSATIONS_KEY)
             .await
             .map_err(|e| TerminalError::new(format!("Failed to read compensations: {}", e)))?
+            .map(|j| j.into_inner())
             .unwrap_or_default();
 
-        Ok(compensations)
+        Ok(restate_sdk::serde::Json(compensations))
     }
 }

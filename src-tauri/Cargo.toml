@@ -103,6 +103,10 @@ rmcp = "0.1"
 
 # Restate durable execution (optional — behind `restate` feature flag)
 restate-sdk = { version = "0.4", optional = true }
+# Required when the `restate` feature is on so local types can implement
+# `restate_sdk::serde::Serialize`/`Deserialize` (whose signatures use
+# `bytes::Bytes`). restate-sdk 1.10 is the compatible range.
+bytes = "1"
 
 # Code analysis (tree-sitter for parsing)
 tree-sitter = "0.24"
@@ -148,7 +152,7 @@ atspi = "0.22"
 zbus = "4"
 
 [features]
-default = []
+default = ["restate"]
 restate = ["restate-sdk"]
 # Tells Tauri to embed the frontend from dist/ instead of loading from devUrl.
 # Without this, debug builds load from localhost:1420 (Vite dev server).

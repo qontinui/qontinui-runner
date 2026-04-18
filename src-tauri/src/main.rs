@@ -1331,6 +1331,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .setup(|app| {
             info!("Tauri application setup starting");
 
+            let server_mode = std::env::var("QONTINUI_SERVER_MODE")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false);
+            if server_mode {
+                info!("QONTINUI_SERVER_MODE is set - running as headless server (no window, Restate forced on)");
+            }
+
             // ── Programmatic window creation ───────────────────────────
             //
             // The declarative `windows[]` in tauri.conf.json is empty.
@@ -1364,37 +1371,43 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // has "windows": [] so there's no declarative window.
                 // This lets us set data_directory() for test runners
                 // (isolated WebView2 profiles) using the same code path.
-                let url = tauri::WebviewUrl::App("index.html".into());
-                let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
-                    .title("Qontinui Runner")
-                    .inner_size(1400.0, 800.0)
-                    .min_inner_size(1200.0, 700.0)
-                    .fullscreen(false)
-                    .resizable(true)
-                    .decorations(true);
-
-                if let Some(ref dir) = data_dir {
-                    builder = builder.data_directory(std::path::PathBuf::from(dir));
-                }
-
-                if is_secondary {
-                    builder = builder.position(100.0, 100.0);
+                if server_mode {
+                    info!("Skipping main window creation (server mode)");
+                    // If Tauri's Win32 event loop exits immediately without any window, fall back
+                    // to a hidden 0x0 tool window here. See plan Phase 1.5 validation.
                 } else {
-                    builder = builder.maximized(true);
-                }
+                    let url = tauri::WebviewUrl::App("index.html".into());
+                    let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
+                        .title("Qontinui Runner")
+                        .inner_size(1400.0, 800.0)
+                        .min_inner_size(1200.0, 700.0)
+                        .fullscreen(false)
+                        .resizable(true)
+                        .decorations(true);
 
-                match builder.build() {
-                    Ok(win) => {
-                        let _ = win.show();
-                        let _ = win.set_focus();
-                        info!(
-                            "Main window created (secondary={}, isolated={})",
-                            is_secondary, data_dir.is_some()
-                        );
+                    if let Some(ref dir) = data_dir {
+                        builder = builder.data_directory(std::path::PathBuf::from(dir));
                     }
-                    Err(e) => {
-                        error!("Failed to create main window: {}", e);
-                        return Err(Box::new(e));
+
+                    if is_secondary {
+                        builder = builder.position(100.0, 100.0);
+                    } else {
+                        builder = builder.maximized(true);
+                    }
+
+                    match builder.build() {
+                        Ok(win) => {
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                            info!(
+                                "Main window created (secondary={}, isolated={})",
+                                is_secondary, data_dir.is_some()
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to create main window: {}", e);
+                            return Err(Box::new(e));
+                        }
                     }
                 }
             }
@@ -1459,12 +1472,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Check for headless-only mode from environment variable
             // This is intended for server deployments where GUI is not available
-            let headless_only = std::env::var("QONTINUI_HEADLESS_ONLY")
+            let headless_only_env = std::env::var("QONTINUI_HEADLESS_ONLY")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false);
+            let headless_only = server_mode || headless_only_env;
 
             if headless_only {
-                info!("QONTINUI_HEADLESS_ONLY is set - enabling headless-only mode for server deployment");
+                info!(
+                    "Headless-only mode enabled (server_mode={}, QONTINUI_HEADLESS_ONLY={})",
+                    server_mode, headless_only_env
+                );
                 bridge_manager.set_headless_only(true);
             }
 
@@ -1558,6 +1575,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 *handle_lock = Some(error_monitor_handle);
                 info!("Error monitor service started and handle stored in AppState");
             });
+
+            if server_mode {
+                // Server mode forces Restate on; persist so the block below picks it up.
+                let mut s = crate::settings::load_settings();
+                if !s.restate.enabled {
+                    s.restate.enabled = true;
+                    if let Err(e) = crate::settings::save_settings(&s) {
+                        warn!("Failed to persist restate.enabled=true for server mode: {}", e);
+                    } else {
+                        info!("Server mode: forced restate.enabled=true");
+                    }
+                }
+            }
 
             // Initialize process capture manager
             info!("Initializing process capture manager");
