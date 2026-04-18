@@ -568,15 +568,35 @@ class QontinuiExecutor:
                         os.getenv("QONTINUI_TRAJECTORY_MAX_RECORDS", "500")
                     )
 
-                    # Optional WSM client
+                    # WSM is the preferred success-labelling source for
+                    # grounding records. Gated by QONTINUI_WSM_ENABLED
+                    # (default "1") so a prod regression can be rolled
+                    # back without a code change. When enabled and no
+                    # explicit client is provided, TrajectoryLogger
+                    # lazy-constructs a canonical WSMClient whose
+                    # endpoint is resolved from env vars.
+                    wsm_enabled = os.getenv("QONTINUI_WSM_ENABLED", "1").lower() not in {
+                        "0",
+                        "false",
+                        "off",
+                        "no",
+                    }
                     wsm_client = None
+                    # Preserve the legacy override: if the old env var is
+                    # set AND the legacy client is importable, honour it
+                    # so existing E2E rigs keep working. Otherwise rely
+                    # on TrajectoryLogger's lazy construction.
                     try:
-                        wsm_endpoint = os.getenv("QONTINUI_WORLD_STATE_VERIFIER_ENDPOINT")
-                        if wsm_endpoint:
+                        legacy_endpoint = os.getenv(
+                            "QONTINUI_WORLD_STATE_VERIFIER_LEGACY_ENDPOINT"
+                        )
+                        if legacy_endpoint:
                             from tests.e2e.broken_accessibility._wsm_client import (
                                 WorldStateVerifierClient,
                             )
-                            wsm_client = WorldStateVerifierClient(endpoint=wsm_endpoint)
+                            wsm_client = WorldStateVerifierClient(
+                                endpoint=legacy_endpoint
+                            )
                     except ImportError:
                         pass
 
@@ -596,6 +616,7 @@ class QontinuiExecutor:
                         max_records_per_session=max_records,
                         wsm_client=wsm_client,
                         omniparser_detector=omniparser,
+                        wsm_enabled=wsm_enabled,
                     )
                     self.event_manager.emit_log(
                         "info",

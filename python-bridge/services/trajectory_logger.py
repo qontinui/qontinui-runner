@@ -33,6 +33,7 @@ Success labelling strategy (in priority order):
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import uuid
@@ -62,6 +63,17 @@ except ImportError:
     _GROUNDING_AVAILABLE = False
     logger.debug("qontinui_train.export.grounding_record not available")
 
+# Import the canonical WSM client lazily so absence doesn't break startup.
+# The logger is instantiable without the WSM stack present (wsm_enabled=False).
+try:
+    from qontinui.verification.wsm_client import WSMClient as _CanonicalWSMClient
+
+    _WSM_AVAILABLE = True
+except ImportError:
+    _CanonicalWSMClient = None  # type: ignore[assignment,misc]
+    _WSM_AVAILABLE = False
+    logger.debug("qontinui.verification.wsm_client not available")
+
 # Pixel-diff threshold: mean absolute difference per channel per pixel.
 _PIXEL_DIFF_THRESHOLD = 5.0
 
@@ -79,8 +91,17 @@ class TrajectoryLogger:
     max_records_per_session:
         Safety cap to prevent disk fill.  Default 500.
     wsm_client:
-        Optional World State Verifier client.  If ``None`` or unreachable,
-        the pixel-diff heuristic is used instead.
+        Optional World State Verifier client.  If ``None`` and
+        ``wsm_enabled`` is true, a default :class:`qontinui.verification.
+        wsm_client.WSMClient` is lazy-constructed (endpoint resolved from
+        env vars — see ``resolve_endpoint``).  If the WSM call fails at
+        runtime, the pixel-diff heuristic is used instead.
+    wsm_enabled:
+        Master switch for WSM-based labelling.  When ``False``, no client
+        is constructed and any passed-in client is ignored — success
+        falls through directly to the pixel-diff heuristic.  Callers that
+        gate on the ``QONTINUI_WSM_ENABLED`` env var can pass the
+        resolved boolean here.
     omniparser_detector:
         Optional ``OmniParserDetector`` for enriching records with
         interactability labels via the fast YOLO-only path.
@@ -92,6 +113,7 @@ class TrajectoryLogger:
         max_records_per_session: int = 500,
         wsm_client: Any | None = None,
         omniparser_detector: Any | None = None,
+        wsm_enabled: bool = True,
     ) -> None:
         if not _GROUNDING_AVAILABLE:
             raise ImportError(
@@ -102,8 +124,25 @@ class TrajectoryLogger:
         self._max_records = max_records_per_session
         self._record_count = 0
         self._session_id = str(uuid.uuid4())
-        self._wsm_client = wsm_client
         self._omniparser = omniparser_detector
+        self._wsm_enabled = wsm_enabled
+
+        # Resolve WSM client per the wiring contract:
+        #   - wsm_enabled=False → never touch WSM, even if a client is passed.
+        #   - explicit client given → trust it (legacy or canonical).
+        #   - otherwise, lazy-construct the canonical WSMClient if available.
+        if not wsm_enabled:
+            self._wsm_client = None
+        elif wsm_client is not None:
+            self._wsm_client = wsm_client
+        elif _WSM_AVAILABLE and _CanonicalWSMClient is not None:
+            try:
+                self._wsm_client = _CanonicalWSMClient()
+            except Exception:
+                logger.debug("Default WSMClient construction failed", exc_info=True)
+                self._wsm_client = None
+        else:
+            self._wsm_client = None
 
         # Pre-action state — set by on_action_start, consumed by on_record_created
         self._pre_png_bytes: bytes | None = None
@@ -242,7 +281,7 @@ class TrajectoryLogger:
         if self._wsm_client is not None and pre_bytes is not None:
             try:
                 intent = f"{record.action_type} on {record.config}"
-                verdict = self._wsm_client.verify(pre_bytes, post_bytes, intent)
+                verdict = self._verify_sync(pre_bytes, post_bytes, intent)
                 # Dual-shape handling:
                 #   - qontinui.verification.WSMVerdict exposes .success and
                 #     .source (the canonical new shape — source is already
@@ -250,10 +289,13 @@ class TrajectoryLogger:
                 #   - Legacy clients (e.g. tests/e2e/broken_accessibility/
                 #     _wsm_client.WsmVerdict) expose .status where "pass" /
                 #     "partial" mean success.
-                if hasattr(verdict, "source") and hasattr(verdict, "success"):
+                if verdict is not None and hasattr(verdict, "source") and hasattr(
+                    verdict, "success"
+                ):
                     return bool(verdict.success), str(verdict.source)
-                status = str(getattr(verdict, "status", "")).lower()
-                return status in {"pass", "partial"}, "wsm"
+                if verdict is not None:
+                    status = str(getattr(verdict, "status", "")).lower()
+                    return status in {"pass", "partial"}, "wsm"
             except Exception:
                 logger.debug("WSM verdict failed, falling back", exc_info=True)
 
@@ -279,6 +321,48 @@ class TrajectoryLogger:
 
         # Strategy 3: Record's own flag
         return record.success, "record_flag"
+
+    def _verify_sync(
+        self,
+        pre_bytes: bytes,
+        post_bytes: bytes,
+        intent: str,
+    ) -> Any:
+        """Call ``self._wsm_client.verify`` from sync code.
+
+        The canonical :class:`qontinui.verification.wsm_client.WSMClient`
+        exposes ``verify`` as an ``async`` coroutine, while the legacy
+        ``WorldStateVerifierClient`` exposes it as a sync method.  This
+        helper normalises the call:
+
+        - If ``verify`` returns a non-coroutine, return it as-is.
+        - Otherwise drive the coroutine on a fresh event loop via
+          :func:`asyncio.run`.  If that raises ``RuntimeError`` because
+          we're already inside a running loop (rare — the record
+          callback fires from a sync worker thread in the runner), fall
+          back to ``asyncio.new_event_loop().run_until_complete(...)`` on
+          a throwaway loop so we don't deadlock the outer loop.
+        """
+        if self._wsm_client is None:
+            return None
+
+        verify = self._wsm_client.verify  # type: ignore[attr-defined]
+        result = verify(pre_bytes, post_bytes, intent)
+
+        if not asyncio.iscoroutine(result):
+            return result
+
+        # Drive the coroutine to completion. Prefer asyncio.run (creates
+        # and tears down its own loop); if that fails because a loop is
+        # already running on this thread, spin up a throwaway loop.
+        try:
+            return asyncio.run(result)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(result)
+            finally:
+                loop.close()
 
     # ------------------------------------------------------------------
     # Helpers
