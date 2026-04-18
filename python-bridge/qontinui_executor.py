@@ -640,10 +640,8 @@ class QontinuiExecutor:
 
                 # Call trajectory logger callback
                 if self._trajectory_logger:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._trajectory_logger.on_record_created(record)
-                    except Exception:
-                        pass
 
                 # Report action data for historical indexing (Config Testing)
                 if self.test_results_handler and self.test_results_handler.is_enabled():
