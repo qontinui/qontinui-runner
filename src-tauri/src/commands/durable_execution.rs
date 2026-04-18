@@ -166,10 +166,16 @@ pub async fn get_iteration_commits(
 /// Returns the JSON array of PhaseResult objects — one row per phase
 /// executed, with step-level breakdown, timing, and failure context.
 /// Powers the Phase Timeline tab in the run recap.
+///
+/// Applies `get_parent_task_id` remapping to mirror the write side
+/// (`emit_and_persist_phase_result` keys on the parent task id) so that
+/// composed-run children surface their parent's phase timeline rather
+/// than returning an empty list.
 #[tauri::command]
 pub async fn get_phase_results(
     app_state: State<'_, Arc<AppState>>,
     execution_id: String,
 ) -> Result<Vec<crate::unified_workflow_executor::types::PhaseResult>, String> {
-    app_state.pg_db.get_phase_results(&execution_id).await
+    let parent_id = crate::unified_workflow_executor::types::get_parent_task_id(&execution_id);
+    app_state.pg_db.get_phase_results(&parent_id).await
 }

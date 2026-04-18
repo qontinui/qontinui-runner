@@ -255,17 +255,25 @@ export function PhaseTimelineTab({ taskRunId }: { taskRunId: string }) {
 
   useEffect(() => {
     if (!taskRunId) return;
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     listen("phase-result", () => {
+      if (cancelled) return;
       queryClient.invalidateQueries({ queryKey: ["phase-results", taskRunId] });
     })
       .then((fn) => {
+        if (cancelled) {
+          // Effect was torn down before listen() resolved — detach immediately.
+          fn();
+          return;
+        }
         unlisten = fn;
       })
       .catch(() => {
         // Tauri event bus unavailable; leave as-is
       });
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, [taskRunId, queryClient]);
