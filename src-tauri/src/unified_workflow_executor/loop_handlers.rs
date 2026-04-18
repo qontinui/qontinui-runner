@@ -151,6 +151,7 @@ impl LoopController {
                         config,
                         outcome,
                         injected_steps,
+                        agentic_steps,
                         &failure_context,
                         has_agentic_steps,
                     )
@@ -1994,6 +1995,7 @@ impl LoopController {
         config: &mut LoopConfig,
         agentic_outcome: AgenticOutcome,
         new_injected_steps: Vec<ExecutionStepConfig>,
+        agentic_steps: &[ExecutionStepConfig],
         failure_context: &str,
         has_agentic_steps: bool,
     ) -> LoopState {
@@ -2018,8 +2020,10 @@ impl LoopController {
             };
             let step_source: &[ExecutionStepConfig] = if !new_injected_steps.is_empty() {
                 &new_injected_steps
-            } else {
+            } else if !ctx.dynamic_steps.is_empty() {
                 &ctx.dynamic_steps
+            } else {
+                agentic_steps
             };
             let step_records: Vec<StepResultRecord> = step_source
                 .iter()

@@ -81,6 +81,25 @@ function prettyPhase(phase: string): string {
   return phase.charAt(0).toUpperCase() + phase.slice(1);
 }
 
+/**
+ * Port of `get_parent_task_id` from
+ * `src-tauri/src/unified_workflow_executor/types.rs`. If the execution id is
+ * a composed-run child (e.g. `composed-run-{ts}-workflow-{n}`), returns the
+ * parent id; otherwise returns the id unchanged. Used to match `phase-result`
+ * event payloads (which always carry the parent id) against the tab's
+ * `taskRunId` prop (which may be a child id).
+ */
+function getParentTaskId(executionId: string): string {
+  const pos = executionId.lastIndexOf("-workflow-");
+  if (pos !== -1) {
+    const potentialParent = executionId.substring(0, pos);
+    if (potentialParent.startsWith("composed-run-")) {
+      return potentialParent;
+    }
+  }
+  return executionId;
+}
+
 // ============================================================================
 // Sub-components
 // ============================================================================
@@ -108,6 +127,27 @@ function CommitBadge({ hash }: { hash: string | null }) {
       <GitCommitHorizontal className="w-3 h-3" />
       {hash.substring(0, 8)}
     </span>
+  );
+}
+
+function VariablesSetList({ variables }: { variables: Array<[string, string]> | null }) {
+  // Tristate:
+  //   null  → "not captured" (legacy path). Render nothing.
+  //   []    → "captured, none set" (Restate path, no writes). Render nothing.
+  //   [...] → render each name/value pair.
+  if (!variables || variables.length === 0) return null;
+  return (
+    <div>
+      <h4 className="text-xs font-medium text-muted-foreground mb-1.5">Variables Set</h4>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+        {variables.map(([name, value], idx) => (
+          <div key={`${name}-${idx}`} className="contents">
+            <dt className="text-muted-foreground font-mono text-[11px] truncate">{name}</dt>
+            <dd className="font-mono text-[11px] break-all">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
   );
 }
 
@@ -154,6 +194,8 @@ function PhaseCard({ result }: { result: PhaseResult }) {
   const totalSteps = result.step_results.length;
   const successfulSteps = result.step_results.filter((s) => s.success).length;
   const hasSteps = totalSteps > 0;
+  const hasVariables = !!result.variables_set && result.variables_set.length > 0;
+  const hasDetails = hasSteps || !!result.failure_context || hasVariables;
 
   return (
     <div className="border border-border rounded-lg overflow-hidden">
@@ -161,9 +203,9 @@ function PhaseCard({ result }: { result: PhaseResult }) {
         type="button"
         className="w-full flex items-center gap-3 p-3 hover:bg-muted/30 transition-colors text-left"
         onClick={() => setExpanded(!expanded)}
-        disabled={!hasSteps && !result.failure_context}
+        disabled={!hasDetails}
       >
-        {hasSteps || result.failure_context ? (
+        {hasDetails ? (
           expanded ? (
             <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
           ) : (
@@ -191,7 +233,7 @@ function PhaseCard({ result }: { result: PhaseResult }) {
         <CommitBadge hash={result.commit_hash} />
       </button>
 
-      {expanded && (hasSteps || result.failure_context) && (
+      {expanded && hasDetails && (
         <div className="border-t border-border p-3 space-y-3 bg-muted/10">
           {result.failure_context && !result.success && (
             <div className="border border-red-500/40 rounded bg-red-500/5 p-2">
@@ -214,6 +256,7 @@ function PhaseCard({ result }: { result: PhaseResult }) {
               </div>
             </div>
           )}
+          <VariablesSetList variables={result.variables_set} />
         </div>
       )}
     </div>
@@ -255,10 +298,15 @@ export function PhaseTimelineTab({ taskRunId }: { taskRunId: string }) {
 
   useEffect(() => {
     if (!taskRunId) return;
+    // Backend emits phase-result events keyed by the PARENT task id
+    // (via get_parent_task_id on the Rust side). Our taskRunId prop may be
+    // a composed-run CHILD id, so normalize before comparing.
+    const parentId = getParentTaskId(taskRunId);
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    listen("phase-result", () => {
+    listen<{ execution_id: string; result: PhaseResult }>("phase-result", (event) => {
       if (cancelled) return;
+      if (event.payload?.execution_id !== parentId) return;
       queryClient.invalidateQueries({ queryKey: ["phase-results", taskRunId] });
     })
       .then((fn) => {

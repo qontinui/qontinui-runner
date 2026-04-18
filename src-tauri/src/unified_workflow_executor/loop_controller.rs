@@ -3163,7 +3163,10 @@ pub(crate) async fn emit_and_persist_phase_result(
             e
         );
     }
-    if let Err(e) = app_handle.emit("phase-result", &result) {
+    if let Err(e) = app_handle.emit(
+        "phase-result",
+        serde_json::json!({ "execution_id": parent_id, "result": &result }),
+    ) {
         tracing::warn!(
             "PHASE-RESULT: failed to emit {} phase: {}",
             result.phase,
