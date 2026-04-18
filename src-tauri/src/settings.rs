@@ -1076,12 +1076,12 @@ fn get_settings_path() -> Result<PathBuf, String> {
 
 /// Load settings from file
 pub fn load_settings() -> Settings {
-    match get_settings_path() {
+    let mut settings = match get_settings_path() {
         Ok(path) => {
             if path.exists() {
                 match fs::read_to_string(&path) {
-                    Ok(contents) => match serde_json::from_str(&contents) {
-                        Ok(settings) => settings,
+                    Ok(contents) => match serde_json::from_str::<Settings>(&contents) {
+                        Ok(s) => s,
                         Err(e) => {
                             error!("Failed to parse settings file: {}", e);
                             Settings::default()
@@ -1100,7 +1100,37 @@ pub fn load_settings() -> Settings {
             error!("Failed to get settings path: {}", e);
             Settings::default()
         }
+    };
+
+    // Supervisor-injected Restate port/URL overrides (Phase 2 plumbing).
+    // These apply only to the in-memory settings for the current process;
+    // they are never saved back to the JSON file.
+    if let Some(p) = std::env::var("QONTINUI_RESTATE_INGRESS_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        settings.restate.ingress_port = p;
     }
+    if let Some(p) = std::env::var("QONTINUI_RESTATE_ADMIN_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        settings.restate.admin_port = p;
+    }
+    if let Some(p) = std::env::var("QONTINUI_RESTATE_SERVICE_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        settings.restate.service_endpoint_port = p;
+    }
+    if let Ok(u) = std::env::var("QONTINUI_RESTATE_EXTERNAL_ADMIN_URL") {
+        settings.restate.external_admin_url = Some(u);
+    }
+    if let Ok(u) = std::env::var("QONTINUI_RESTATE_EXTERNAL_INGRESS_URL") {
+        settings.restate.external_ingress_url = Some(u);
+    }
+
+    settings
 }
 
 /// Atomically write data to a file using a temp-file-then-rename pattern.
