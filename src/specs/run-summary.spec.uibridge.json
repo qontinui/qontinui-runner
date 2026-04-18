@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Run Summary page — the primary post-run analysis view where users understand what happened during a workflow run. Combines AI-generated summaries, status banners, token usage, failure details, and tabbed deep-dive sections (Timeline, Verification, Knowledge, Context, Canvas, Errors).",
+  "description": "Run Summary page — the primary post-run analysis view where users understand what happened during a workflow run. Combines AI-generated summaries, status banners, token usage, failure details, and tabbed deep-dive sections (Timeline, Verification, Knowledge, Context, Canvas, Diffs & Replay, Phase Timeline, Feedback Scores, LLM Costs, Errors).",
   "groups": [
     {
       "id": "summary-run-outcome",
@@ -231,9 +231,236 @@
           "source": "manual",
           "reviewed": true,
           "enabled": true
+        },
+        {
+          "id": "summary-tabs-phases-available",
+          "description": "The user can switch to the Phase Timeline tab to see structured per-phase execution results — one card per workflow phase (setup, verification, agentic, completion) with iteration number, stage index, duration, success badge, step-level breakdown, and commit hash. The tab reflects rows the loop controller persists to runner.phase_results after each phase completes, and updates in real time via the Tauri 'phase-result' event.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Phase Timeline"
+            },
+            "label": "Phase Timeline tab trigger"
+          },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "phase-timeline-content",
+      "name": "Phase Timeline Tab — Content & Structure",
+      "description": "When the Phase Timeline tab is active, the user sees one collapsible card per PhaseResult row. Each card shows the phase name (Setup / Verification / Agentic / Completion), optional iteration number, optional stage index, a success/failure badge, the phase duration, step count (successful/total), and an optional abbreviated 8-char commit hash. Iteration separators appear between cards whenever the iteration field changes, so multi-iteration runs read chronologically. The tab is backed by the get_phase_results Tauri command reading from the runner.phase_results PG table (plan: restate-port-part-a-compensation-and-phase-results.md §2.5).",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "phase-timeline-card-per-row",
+          "description": "For each row in runner.phase_results keyed by the current task_run_id, the Phase Timeline tab renders exactly one collapsible card. If get_phase_results returns K rows, the user sees K phase cards.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "precondition": "Phase Timeline tab is active and at least one phase_result row exists for the selected run",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Phase Timeline" },
+            "label": "Phase Timeline tab panel"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-card-header-fields",
+          "description": "Every phase card header displays: phase name (capitalized — Setup / Verification / Agentic / Completion), a success/failure badge ('Success' in green or 'Failed' in red), and the phase duration formatted as ms / s / m. When present on the row, the header also shows: stage index ('Stage N'), step count ('X/Y steps' where X is successes and Y is total), and abbreviated 8-char commit hash.",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "precondition": "Phase Timeline tab is active with at least one card visible",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "step" },
+            "label": "Phase card header"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-iteration-separator",
+          "description": "An 'Iteration N' separator header appears between phase cards whenever the iteration field changes from one card to the next (or transitions from null to a number). Multi-iteration runs therefore read as a sequence of iteration sections rather than an undifferentiated list.",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "precondition": "Phase Timeline tab is active and the selected run has multiple iterations",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Iteration" },
+            "label": "Iteration separator header"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-expand-step-breakdown",
+          "description": "Clicking a phase card toggles an expansion that reveals the step-level breakdown: one row per StepResultRecord with step_index (#N), step_name (falling back to step_type when absent), step_type label, a success/failure icon, error text (when non-null), and duration. Cards with zero step_results AND no failure_context render without an expand chevron — there's nothing to reveal.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "precondition": "Phase Timeline tab is active with at least one card that has step_results",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Step Breakdown" },
+            "label": "Step breakdown section"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-failure-context",
+          "description": "When a card's success is false and failure_context is non-null, expanding the card reveals a red-bordered block labeled 'Failure Context' containing the failure_context text in monospace. This surfaces the first failed step's error message (or the AgenticOutcome error / BudgetExceeded reason) so users diagnose what went wrong without navigating to the Errors tab.",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "precondition": "Phase Timeline tab is active and at least one failed phase has populated failure_context",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Failure Context" },
+            "label": "Failure context block"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-empty-state",
+          "description": "When get_phase_results returns an empty array (pre-Phase-2 legacy run, or a run that hasn't started yet, or a run whose phase_results rows were written under a different execution_id), the tab renders 'No phase results yet for this run.' with a subtitle explaining that setup, verification, agentic, and completion phases will appear as they run. No cards render.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "precondition": "Phase Timeline tab is active for a run with zero phase_result rows",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No phase results yet for this run" },
+            "label": "Empty state message"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "phase-timeline-correctness",
+      "name": "Phase Timeline — PhaseResult Data Correctness",
+      "description": "The Phase Timeline is a window into the loop controller's structured PhaseResult output. The controller builds one PhaseResult after each phase executor returns (setup, verification, agentic, completion) at four insertion points in loop_controller.rs and loop_handlers.rs, persists it via save_phase_result, and emits it on the Tauri 'phase-result' event. Persistence and emit both key on get_parent_task_id(&config.execution_id) so composed-run children surface under their parent task_run. Correctness assertions describe what the persisted data must look like on the page — deviations indicate bugs in the loop controller's mapping logic, not the UI.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "phase-timeline-phase-name-valid",
+          "description": "Every card's phase name (after UI capitalization) must be exactly one of: Setup, Verification, Agentic, Completion. Any other label indicates the loop controller wrote an unexpected phase string to runner.phase_results.phase — the column accepts arbitrary text but only those four values are legitimate.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "precondition": "Phase Timeline tab is active with at least one card",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Setup" },
+            "label": "Phase card phase name"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-iteration-presence",
+          "description": "Setup and Completion cards must NOT appear under an 'Iteration N' separator — their iteration field is null because those phases run once per stage, not per iteration. Verification and Agentic cards MUST appear under an iteration separator. If Setup appears under an iteration or Verification appears without one, the loop controller's iteration mapping at the insertion point is wrong.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "precondition": "Phase Timeline tab is active with at least one Setup/Completion card AND at least one Verification/Agentic card",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Phase Timeline" },
+            "label": "Phase Timeline tab panel"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-agentic-step-non-empty",
+          "description": "Agentic phase cards must render at least one step row in their step breakdown — the loop controller populates step_results from ctx.dynamic_steps / new_injected_steps specifically so Agentic cards are never blank (plan §2.2 UX note). An empty Agentic card is a regression against the existing Diffs & Replay view. Only legitimate exception: AgenticOutcome::Skipped (no agentic steps defined for the stage), in which case the card may be empty but still exists.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "precondition": "Phase Timeline tab is active with at least one Agentic card whose phase actually ran",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Agentic" },
+            "label": "Agentic phase card"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-step-count-matches",
+          "description": "The 'X/Y steps' label in each card header must match the step rows shown on expansion. X equals the count of step_results with success=true, Y equals total step_results length. If the header shows '3/5' but only 4 step rows render on expansion, a step was lost between the DB row's step_results JSONB and the rendered list — indicates a serialization or React rendering bug.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "precondition": "Phase Timeline tab is active with at least one card that has steps > 0 and is expanded",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "steps" },
+            "label": "Step count label"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-realtime-update",
+          "description": "While a workflow is running, new PhaseResult cards should appear in the tab within ~1 second of the loop controller emitting the Tauri 'phase-result' event — the tab's useEffect listens to that event and invalidates the ['phase-results', taskRunId] react-query cache. Users should not need a manual refresh to see the latest phase. If new phases don't appear live, either the loop controller failed to emit, the listener is not attached, or the query key doesn't match.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "precondition": "A workflow is currently executing and the Phase Timeline tab is active for that run",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Phase Timeline" },
+            "label": "Phase Timeline tab panel"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "phase-timeline-execution-id-remap",
+          "description": "For composed-run child workflows (IDs like composed-run-{ts}-workflow-{n}), the loop controller persists phase_results rows under the parent task_run_id via get_parent_task_id remapping — matching the same remap applied by store_verification_phase_result. The tab must show the parent's phase cards (aggregating all children) when the user opens the recap for the parent. If the parent's Phase Timeline is empty despite children running, either the loop controller skipped the remap on write, or RunRecapTab.tsx is querying with the child id instead of parent.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "precondition": "A composed-run parent task is selected in the run list",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Phase Timeline" },
+            "label": "Phase Timeline tab panel"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     },
     {
       "id": "summary-empty-and-loading-states",
@@ -422,7 +649,8 @@
           { "textContains": "Verification" },
           { "textContains": "Knowledge" },
           { "textContains": "Context" },
-          { "textContains": "Canvas" }
+          { "textContains": "Canvas" },
+          { "textContains": "Phase Timeline" }
         ],
         "isInitial": false,
         "transitions": [
@@ -556,6 +784,20 @@
               {
                 "action": "click",
                 "target": { "role": "tab", "textContains": "Errors" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "run-loaded-to-tab-phases",
+            "name": "Switch to Phase Timeline tab",
+            "activateStates": ["tab-phases"],
+            "deactivateStates": ["run-loaded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Phase Timeline" },
                 "waitAfter": { "type": "idle", "timeout": 1000 }
               }
             ]
@@ -866,6 +1108,39 @@
             "process": []
           }
         ]
+      },
+      {
+        "id": "tab-phases",
+        "name": "Tab — Phase Timeline Active",
+        "description": "The Phase Timeline tab is selected, showing structured per-phase execution results as collapsible cards grouped by iteration. Cards cover Setup, Verification, Agentic, and Completion phases with step-level breakdowns, duration, success badges, and commit hashes. Empty state appears for runs with no phase_result rows.",
+        "elements": [
+          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Phase Timeline" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "tab-phases-to-tab-timeline",
+            "name": "Switch to Timeline tab",
+            "activateStates": ["tab-timeline"],
+            "deactivateStates": ["tab-phases"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "tab", "textContent": "Timeline" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "tab-phases-to-loading",
+            "name": "User selects a different run",
+            "activateStates": ["loading"],
+            "deactivateStates": ["tab-phases"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
       }
     ]
   },
@@ -882,7 +1157,8 @@
       "post-run-analysis",
       "observe",
       "pagination",
-      "memory-protection"
+      "memory-protection",
+      "phase-timeline"
     ]
   }
 }
