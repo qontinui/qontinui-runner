@@ -73,6 +73,7 @@ pub mod dag_workflows; // DAG workflow import, export, and validation
 pub mod database; // Database maintenance and optimization
 pub mod dataset;
 pub mod debug;
+pub mod dev_findings; // Dev-only: seed synthetic findings into the frontend tracker
 pub mod discoveries;
 pub mod durable_execution; // Conductor-inspired replay, rollback, iteration diffs
 pub mod event_search; // Unified full-text search across activity_timeline, observations, deferred_questions, error_events

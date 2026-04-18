@@ -3892,6 +3892,224 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
 }
 
 // ============================================================================
+// Direct tab navigation (dispatches CustomEvent("ui-bridge-set-tab") + pageId
+// read-back). Exists alongside `navigate_tab` — which routes through the SDK
+// IPC event bus — so callers can force a tab change synchronously from HTTP
+// without depending on the SDK being responsive, and get back the resulting
+// `data-page-id` as a verification signal.
+// ============================================================================
+
+/// Valid `MainTabId` values, mirroring `src/components/app/tab-types.ts`.
+/// Kept in sync manually; the frontend's `migrateTabId()` also handles
+/// legacy aliases, so callers can pass either a canonical id or a known
+/// legacy alias — the JS callback will re-normalize through `migrateTabId`.
+const VALID_TAB_IDS: &[&str] = &[
+    "prompt-home",
+    "gui-automation",
+    "workflow-queue",
+    "active",
+    "runs",
+    "history",
+    "error-monitor",
+    "processes",
+    "reflection",
+    "observations",
+    "architecture",
+    "generator-eval",
+    "meta-optimizer",
+    "run-recap",
+    "run-actions",
+    "run-image",
+    "run-findings",
+    "run-state-explorer",
+    "run-tests",
+    "run-ai-output",
+    "run-statistics",
+    "run-ai-data",
+    "run-traces",
+    "ai",
+    "logs",
+    "run-summary",
+    "monitor-summary",
+    "monitor-findings",
+    "monitor-issues",
+    "monitor-learnings",
+    "monitor-state-explorer",
+    "monitor-statistics",
+    "monitor-discoveries",
+    "library",
+    "step-builders",
+    "check-builder",
+    "check-group-builder",
+    "shell-command-builder",
+    "task-builder",
+    "context-builder",
+    "playwright-test-builder",
+    "unified-workflow-builder",
+    "state-machine",
+    "specs",
+    "capture",
+    "config-log-sources",
+    "config-findings",
+    "config-hooks",
+    "config-ui-bridge",
+    "triggers",
+    "tasks",
+    "settings",
+    "settings-account",
+    "settings-ai",
+    "settings-agentic",
+    "settings-self-healing",
+    "settings-world-state-verifier",
+    "settings-playwright",
+    "settings-mobile",
+    "settings-cloud-relay",
+    "settings-mcp",
+    "settings-log-sources",
+    "settings-execution-variables",
+    "settings-general",
+    "settings-storage",
+    "settings-backup",
+    "settings-instances",
+    "settings-debug",
+    "settings-security",
+    "accessibility-explorer",
+    "settings-updates",
+    "orchestration-loop",
+    "image-quality-tests",
+    "terminal",
+    "llm-analytics",
+    "cost-control",
+    "evaluation",
+    "skills",
+    "help",
+    "automation-health",
+    "activity-timeline",
+    "watchers",
+    "knowledge-explorer",
+    "event-history",
+    "development-intelligence",
+    "demo-video",
+    "product-tours",
+    "session-recap",
+    "api-surface",
+    "decision-trail",
+    "memory-search",
+    "online-learning",
+    "dag-workflow-editor",
+];
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTabRequest {
+    pub tab: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTabResponse {
+    pub success: bool,
+    pub tab: String,
+    /// Value of `[data-page-id]` on the active page after the tab change
+    /// (null if no element with that attribute is present — rare but legal).
+    pub page_id: Option<String>,
+}
+
+/// POST /ui-bridge/control/page/set-tab
+///
+/// Directly dispatch `CustomEvent("ui-bridge-set-tab", { detail: { tab } })`
+/// on the webview window (handled by `useAppNavigation`'s `directHandler`),
+/// wait 100ms for React to re-render, then read back `[data-page-id]` so the
+/// caller can verify the navigation took effect.
+///
+/// This is a simpler, more direct alternative to `POST /navigate-tab`:
+/// - no IPC round-trip through the SDK event bus (works even when SDK is
+///   unresponsive), and
+/// - returns the resulting `pageId` as a verification signal, so callers
+///   don't have to follow up with a separate `page/evaluate` call.
+///
+/// Request: `{ "tab": "<MainTabId>" }`
+/// Response: `{ "success": true, "tab": "<resolved>", "pageId": "<id>" | null }`
+/// Errors: 400 if `tab` is missing or not a known `MainTabId`.
+pub async fn ui_bridge_page_set_tab_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<SetTabRequest>,
+) -> Result<Json<ApiResponse<SetTabResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let tab = request.tab.trim().to_string();
+    if tab.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "page/set-tab: `tab` is required (non-empty string)".to_string(),
+            )),
+        ));
+    }
+
+    if !VALID_TAB_IDS.contains(&tab.as_str()) {
+        let preview: Vec<&str> = VALID_TAB_IDS.iter().take(12).copied().collect();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "page/set-tab: unknown tab `{}`. Valid tabs include: {} (and {} more — see \
+                 src/components/app/tab-types.ts for the full list).",
+                tab,
+                preview.join(", "),
+                VALID_TAB_IDS.len() - preview.len()
+            ))),
+        ));
+    }
+
+    info!("UI Bridge API: page/set-tab → {}", tab);
+
+    // Dispatch the event, wait 100ms for React to re-render, then read back
+    // the active page id. We wrap everything in one async IIFE so the
+    // webview performs the whole sequence before reporting back.
+    //
+    // `JSON.stringify(...)` wraps the tab so embedded quotes can never break
+    // the generated JS; the result is JSON-serializable.
+    let escaped_tab = serde_json::to_string(&tab).unwrap_or_else(|_| "\"\"".to_string());
+    let expression = format!(
+        r#"(async () => {{
+            window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", {{ detail: {{ tab: {} }} }}));
+            await new Promise(r => setTimeout(r, 100));
+            var el = document.querySelector("[data-page-id]");
+            var pageId = el && el.getAttribute ? el.getAttribute("data-page-id") : null;
+            return JSON.stringify({{ pageId: pageId }});
+        }})()"#,
+        escaped_tab
+    );
+
+    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000)).await {
+        Ok(result_str) => {
+            // direct_webview_evaluate_with_result returns the JS-side
+            // JSON.stringify output. Parse it back out to get pageId.
+            let page_id = serde_json::from_str::<serde_json::Value>(&result_str)
+                .ok()
+                .and_then(|v| {
+                    v.get("pageId")
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.to_string())
+                });
+            Ok(Json(ApiResponse::success(SetTabResponse {
+                success: true,
+                tab,
+                page_id,
+            })))
+        }
+        Err(e) => {
+            error!("UI Bridge API: page/set-tab direct eval failed: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "page/set-tab: failed to dispatch event: {}",
+                    e
+                ))),
+            ))
+        }
+    }
+}
+
+// ============================================================================
 // Structured Assert (Task 18: declarative assertions)
 // ============================================================================
 
@@ -10775,6 +10993,7 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/page/evaluate-raw"),
         ("POST", "/ui-bridge/control/page/evaluate-safe"),
         ("POST", "/ui-bridge/control/page/evaluate-batch"),
+        ("POST", "/ui-bridge/control/page/set-tab"),
         ("POST", "/ui-bridge/control/page/find-by-text"),
         ("POST", "/ui-bridge/control/page/click-by-text"),
         ("POST", "/ui-bridge/control/page/click-by-selector"),
@@ -11193,6 +11412,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/page/evaluate-batch",
             post(ui_bridge_page_evaluate_batch_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/set-tab",
+            post(ui_bridge_page_set_tab_handler),
         )
         // Convenience DOM interaction endpoints
         .route(

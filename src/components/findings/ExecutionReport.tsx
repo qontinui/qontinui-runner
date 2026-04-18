@@ -485,20 +485,12 @@ Work through ALL findings systematically. Fix each one and report your resolutio
     );
   }
 
-  // Empty state
-  if (findings.length === 0) {
-    return (
-      <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground p-8">
-        <FileText className="w-12 h-12 mb-4 opacity-50" />
-        <p className="text-lg font-medium">No Findings Yet</p>
-        <p className="text-sm mt-2 text-center">
-          Run an AI analysis to detect and categorize findings.
-          <br />
-          Findings will be grouped by category with action recommendations.
-        </p>
-      </div>
-    );
-  }
+  // Empty state is rendered inline below (in the main return) so the header
+  // region — title, status, summary stats, AND the full-text search panel —
+  // remains visible and interactive even when there are no live findings.
+  // Search spans historical events unrelated to the currently-selected run's
+  // live findings, so reviewers must be able to search in the empty state.
+  const hasFindings = findings.length > 0;
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -608,6 +600,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search events…"
                 aria-label="Search events"
+                data-testid="search-events-input"
                 className="w-full bg-muted/50 hover:bg-muted focus:bg-muted rounded-lg pl-8 pr-8 py-1.5 text-sm outline-none focus:ring-2 focus:ring-primary/40 transition-colors"
               />
               {searchQuery && (
@@ -615,6 +608,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
                   type="button"
                   onClick={() => setSearchQuery("")}
                   aria-label="Clear search"
+                  data-testid="search-events-clear"
                   className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                 >
                   <X className="w-3.5 h-3.5" />
@@ -626,6 +620,8 @@ Work through ALL findings systematically. Fix each one and report your resolutio
               <button
                 type="button"
                 onClick={() => setHitlOnly(true)}
+                aria-pressed={hitlOnly}
+                data-testid="search-events-hitl-only"
                 className={`px-2.5 py-1 rounded-md transition-colors ${
                   hitlOnly
                     ? "bg-primary/15 text-primary"
@@ -638,6 +634,8 @@ Work through ALL findings systematically. Fix each one and report your resolutio
               <button
                 type="button"
                 onClick={() => setHitlOnly(false)}
+                aria-pressed={!hitlOnly}
+                data-testid="search-events-all-events"
                 className={`px-2.5 py-1 rounded-md transition-colors ${
                   !hitlOnly
                     ? "bg-primary/15 text-primary"
@@ -886,7 +884,10 @@ Work through ALL findings systematically. Fix each one and report your resolutio
         </div>
       </div>
 
-      {/* Scrollable content — search results or live findings */}
+      {/* Scrollable content — search results or live findings.
+          When there are no live findings and no active search query, we render
+          the empty-state message in the same slot the findings list would
+          occupy, so the header + search region stays visible and usable. */}
       {isSearching ? (
         <SearchResultsList
           query={trimmedSearch}
@@ -895,6 +896,23 @@ Work through ALL findings systematically. Fix each one and report your resolutio
           results={visibleSearchResults}
           onJump={handleJumpToFinding}
         />
+      ) : !hasFindings ? (
+        <div
+          ref={findingsListRef}
+          className="flex-1 flex flex-col items-center justify-center text-muted-foreground p-8"
+        >
+          <FileText className="w-12 h-12 mb-4 opacity-50" />
+          <p className="text-lg font-medium">No Findings Yet</p>
+          <p className="text-sm mt-2 text-center">
+            Run an AI analysis to detect and categorize findings.
+            <br />
+            Findings will be grouped by category with action recommendations.
+          </p>
+          <p className="text-xs mt-4 text-center max-w-sm opacity-80">
+            Use the search box above to look across deferred questions, errors, observations, and
+            activity from the last 7 days.
+          </p>
+        </div>
       ) : (
         <div ref={findingsListRef} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
           {categories.map((category) => {

@@ -9,6 +9,7 @@
  */
 
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
 import type {
   Finding,
@@ -54,6 +55,44 @@ interface FindingResolvedPayload {
   id: string;
   task_run_id: string;
   resolution?: string;
+}
+
+/**
+ * Payload emitted by the dev-only `dev_seed_finding` Tauri command.
+ * Uses camelCase fields so they can be mapped directly onto a `Finding`.
+ */
+interface DevSeedFindingPayload {
+  id: string;
+  categoryId: string;
+  severity: string;
+  status: string;
+  title: string;
+  description: string;
+  detectedAt: number;
+  actionType: string;
+  actionable: boolean;
+  sourceSessionId?: string;
+}
+
+/**
+ * Convert a dev-seed payload into a `Finding` shape.
+ * The tracker's `createFinding` is used for registration; this helper just
+ * normalizes the shape so downstream consumers see the same structure as
+ * real findings.
+ */
+function seedPayloadToFinding(payload: DevSeedFindingPayload): Finding {
+  return {
+    id: payload.id,
+    categoryId: payload.categoryId,
+    severity: payload.severity as FindingSeverity,
+    status: payload.status as FindingStatus,
+    title: payload.title,
+    description: payload.description,
+    sourceSessionId: payload.sourceSessionId,
+    detectedAt: payload.detectedAt,
+    actionType: payload.actionType as ActionType,
+    actionable: payload.actionable,
+  };
 }
 
 /**
@@ -172,6 +211,33 @@ class TauriFindingsListener {
         }
       });
       this.unlistenFunctions.push(unlistenResolved);
+
+      // Dev-only: listen for dev:seed-finding events when the backend is running
+      // with QONTINUI_DEV_ENDPOINTS=1. The env gate is read on the Rust side
+      // via the is_dev_endpoints_enabled command, so the frontend doesn't have
+      // direct access to the env var itself.
+      let devEnabled = false;
+      try {
+        devEnabled = await invoke<boolean>("is_dev_endpoints_enabled");
+      } catch (error) {
+        logger.debug("is_dev_endpoints_enabled not available; skipping dev listener", error);
+      }
+
+      if (devEnabled) {
+        const unlistenSeed = await listen<DevSeedFindingPayload>("dev:seed-finding", (event) => {
+          logger.info("Received dev:seed-finding event:", event.payload.id);
+          const finding = seedPayloadToFinding(event.payload);
+          findingsTracker.createFinding({
+            categoryId: finding.categoryId,
+            severity: finding.severity,
+            title: finding.title,
+            description: finding.description,
+            codeContext: finding.codeContext,
+          });
+        });
+        this.unlistenFunctions.push(unlistenSeed);
+        logger.info("Dev findings seed listener registered (QONTINUI_DEV_ENDPOINTS=1)");
+      }
 
       this.isListening = true;
       logger.info("Event listeners started");

@@ -127,6 +127,7 @@ mod tiered_info;
 mod timeout_config;
 mod tracing_layers;
 mod trigger_system;
+mod tunnel;
 mod ui_bridge_plugin;
 mod unified_ai_session;
 mod unified_workflow_executor;
@@ -451,6 +452,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::is_api_ready,
             commands::auth::get_api_port,
             commands::auth::get_test_auto_login,
+            // Dev-only: seed synthetic findings (gated on QONTINUI_DEV_ENDPOINTS=1)
+            commands::dev_findings::is_dev_endpoints_enabled,
+            commands::dev_findings::dev_seed_finding,
             // Clipboard sync and file sharing commands
             commands::clipboard::share_to_mobile,
             commands::clipboard::share_file_to_mobile,
