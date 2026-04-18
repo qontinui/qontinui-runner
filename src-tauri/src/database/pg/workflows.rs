@@ -113,9 +113,9 @@ macro_rules! row_to_workflow {
             security_profile: None, // TODO: read from DB once column is added
             max_fix_attempts: 3,
             max_ci_auto_resumes: 10,
-            htn_enabled: false,
-            htn_ui_bridge_url: None,
-            htn_state_machine_path: None,
+            htn_enabled: $r.htn_enabled,
+            htn_ui_bridge_url: non_empty($r.htn_ui_bridge_url),
+            htn_state_machine_path: non_empty($r.htn_state_machine_path),
         }
     }};
 }
@@ -302,6 +302,9 @@ impl PgDb {
                 &request.enforce_token_budget.unwrap_or(false),
                 &request.flow_control_json.as_deref(),
                 &request.phase_timeouts_json.as_deref(),
+                &request.htn_enabled,
+                &request.htn_ui_bridge_url.as_deref(),
+                &request.htn_state_machine_path.as_deref(),
             )
             .one()
             .await
@@ -451,6 +454,15 @@ impl PgDb {
             .phase_timeouts_json
             .as_ref()
             .or(existing.phase_timeouts_json.as_ref());
+        let htn_enabled = request.htn_enabled.unwrap_or(existing.htn_enabled);
+        let htn_ui_bridge_url = request
+            .htn_ui_bridge_url
+            .as_ref()
+            .or(existing.htn_ui_bridge_url.as_ref());
+        let htn_state_machine_path = request
+            .htn_state_machine_path
+            .as_ref()
+            .or(existing.htn_state_machine_path.as_ref());
         let workflow_architecture = request
             .workflow_architecture
             .as_ref()
@@ -549,6 +561,9 @@ impl PgDb {
                 &enforce_token_budget,
                 &flow_control_json.map(|s| s.as_str()),
                 &phase_timeouts_json.map(|s| s.as_str()),
+                &htn_enabled,
+                &htn_ui_bridge_url.map(|s| s.as_str()),
+                &htn_state_machine_path.map(|s| s.as_str()),
                 &id,
             )
             .opt()

@@ -425,6 +425,11 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     flow_control_json TEXT,
     phase_timeouts_json TEXT,
 
+    -- HTN Planning (v23)
+    htn_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    htn_ui_bridge_url TEXT,
+    htn_state_machine_path TEXT,
+
     -- DAG workflows (v17)
     source_yaml TEXT,
 

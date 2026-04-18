@@ -913,6 +913,15 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_pr_execution_phase ON phase_results(execution_id, phase, iteration);
         "#,
     },
+    Migration {
+        version: 23,
+        description: "Add HTN planning config columns to unified_workflows",
+        sql: r#"
+            ALTER TABLE unified_workflows ADD COLUMN IF NOT EXISTS htn_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE unified_workflows ADD COLUMN IF NOT EXISTS htn_ui_bridge_url TEXT;
+            ALTER TABLE unified_workflows ADD COLUMN IF NOT EXISTS htn_state_machine_path TEXT;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.

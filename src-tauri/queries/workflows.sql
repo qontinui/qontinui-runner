@@ -29,7 +29,8 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(rollback_policy, '') as rollback_policy,
        COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags,
        COALESCE(enforce_token_budget, false) as enforce_token_budget,
-       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json
+       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json,
+       COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path
 FROM unified_workflows
 ORDER BY is_favorite DESC, updated_at DESC;
 
@@ -62,7 +63,8 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(rollback_policy, '') as rollback_policy,
        COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags,
        COALESCE(enforce_token_budget, false) as enforce_token_budget,
-       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json
+       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json,
+       COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path
 FROM unified_workflows
 WHERE id = :id;
 
@@ -95,12 +97,13 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(rollback_policy, '') as rollback_policy,
        COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags,
        COALESCE(enforce_token_budget, false) as enforce_token_budget,
-       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json
+       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json,
+       COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path
 FROM unified_workflows
 WHERE name = :name
 LIMIT 1;
 
---! create_unified_workflow (max_iterations?, description?, provider?, model?, timeout_seconds?, prompt_template?, generated_by_task_run_id?, dependency_graph?, cost_annotations?, quality_report?, acceptance_criteria?, workflow_architecture?, rollback_policy?, flow_control_json?, phase_timeouts_json?)
+--! create_unified_workflow (max_iterations?, description?, provider?, model?, timeout_seconds?, prompt_template?, generated_by_task_run_id?, dependency_graph?, cost_annotations?, quality_report?, acceptance_criteria?, workflow_architecture?, rollback_policy?, flow_control_json?, phase_timeouts_json?, htn_ui_bridge_url?, htn_state_machine_path?)
 INSERT INTO unified_workflows (
     id, name, description, category, tags, setup_steps, verification_steps,
     agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model,
@@ -112,7 +115,8 @@ INSERT INTO unified_workflows (
     completion_prompts_first, dependency_graph, cost_annotations, quality_report,
     acceptance_criteria, constraint_overrides, ai_reviewed, workflow_architecture,
     strict_cwd, tool_tags, rollback_policy, enforce_token_budget,
-    flow_control_json, phase_timeouts_json
+    flow_control_json, phase_timeouts_json,
+    htn_enabled, htn_ui_bridge_url, htn_state_machine_path
 ) VALUES (
     :id, :name, :description, :category, :tags, :setup_steps, :verification_steps,
     :agentic_steps, :completion_steps, :max_iterations, :timeout_seconds, :provider, :model,
@@ -124,11 +128,12 @@ INSERT INTO unified_workflows (
     :completion_prompts_first, :dependency_graph, :cost_annotations, :quality_report,
     :acceptance_criteria, :constraint_overrides, :ai_reviewed, :workflow_architecture,
     :strict_cwd, :tool_tags, :rollback_policy, :enforce_token_budget,
-    :flow_control_json, :phase_timeouts_json
+    :flow_control_json, :phase_timeouts_json,
+    :htn_enabled, :htn_ui_bridge_url, :htn_state_machine_path
 )
 RETURNING id;
 
---! update_unified_workflow (max_iterations?, description?, provider?, model?, timeout_seconds?, prompt_template?, dependency_graph?, cost_annotations?, quality_report?, acceptance_criteria?, workflow_architecture?, rollback_policy?, flow_control_json?, phase_timeouts_json?)
+--! update_unified_workflow (max_iterations?, description?, provider?, model?, timeout_seconds?, prompt_template?, dependency_graph?, cost_annotations?, quality_report?, acceptance_criteria?, workflow_architecture?, rollback_policy?, flow_control_json?, phase_timeouts_json?, htn_ui_bridge_url?, htn_state_machine_path?)
 UPDATE unified_workflows SET
     name = :name,
     description = :description,
@@ -173,7 +178,10 @@ UPDATE unified_workflows SET
     rollback_policy = :rollback_policy,
     enforce_token_budget = :enforce_token_budget,
     flow_control_json = :flow_control_json,
-    phase_timeouts_json = :phase_timeouts_json
+    phase_timeouts_json = :phase_timeouts_json,
+    htn_enabled = :htn_enabled,
+    htn_ui_bridge_url = :htn_ui_bridge_url,
+    htn_state_machine_path = :htn_state_machine_path
 WHERE id = :id
 RETURNING id;
 
@@ -209,7 +217,8 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(rollback_policy, '') as rollback_policy,
        COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags,
        COALESCE(enforce_token_budget, false) as enforce_token_budget,
-       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json
+       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json,
+       COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path
 FROM unified_workflows
 WHERE to_tsvector('english', name || ' ' || COALESCE(description, '')) @@ plainto_tsquery('english', :query)
    OR name ILIKE '%' || :query || '%'
@@ -251,7 +260,8 @@ SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'g
        COALESCE(rollback_policy, '') as rollback_policy,
        COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags,
        COALESCE(enforce_token_budget, false) as enforce_token_budget,
-       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json
+       COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json,
+       COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path
 FROM unified_workflows
 WHERE sync_pending = true;
 

@@ -31,6 +31,8 @@ pub struct CreateUnifiedWorkflowParams<
     T27: crate::StringSql,
     T28: crate::StringSql,
     T29: crate::StringSql,
+    T30: crate::StringSql,
+    T31: crate::StringSql,
 > {
     pub id: T1,
     pub name: T2,
@@ -77,6 +79,9 @@ pub struct CreateUnifiedWorkflowParams<
     pub enforce_token_budget: bool,
     pub flow_control_json: Option<T28>,
     pub phase_timeouts_json: Option<T29>,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: Option<T30>,
+    pub htn_state_machine_path: Option<T31>,
 }
 #[derive(Debug)]
 pub struct UpdateUnifiedWorkflowParams<
@@ -108,6 +113,8 @@ pub struct UpdateUnifiedWorkflowParams<
     T26: crate::StringSql,
     T27: crate::StringSql,
     T28: crate::StringSql,
+    T29: crate::StringSql,
+    T30: crate::StringSql,
 > {
     pub name: T1,
     pub description: Option<T2>,
@@ -152,7 +159,10 @@ pub struct UpdateUnifiedWorkflowParams<
     pub enforce_token_budget: bool,
     pub flow_control_json: Option<T26>,
     pub phase_timeouts_json: Option<T27>,
-    pub id: T28,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: Option<T28>,
+    pub htn_state_machine_path: Option<T29>,
+    pub id: T30,
 }
 #[derive(Debug)]
 pub struct UpsertSlashCommandWorkflowParams<
@@ -230,6 +240,9 @@ pub struct ListUnifiedWorkflows {
     pub enforce_token_budget: bool,
     pub flow_control_json: String,
     pub phase_timeouts_json: String,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: String,
+    pub htn_state_machine_path: String,
 }
 pub struct ListUnifiedWorkflowsBorrowed<'a> {
     pub id: &'a str,
@@ -280,6 +293,9 @@ pub struct ListUnifiedWorkflowsBorrowed<'a> {
     pub enforce_token_budget: bool,
     pub flow_control_json: &'a str,
     pub phase_timeouts_json: &'a str,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: &'a str,
+    pub htn_state_machine_path: &'a str,
 }
 impl<'a> From<ListUnifiedWorkflowsBorrowed<'a>> for ListUnifiedWorkflows {
     fn from(
@@ -332,6 +348,9 @@ impl<'a> From<ListUnifiedWorkflowsBorrowed<'a>> for ListUnifiedWorkflows {
             enforce_token_budget,
             flow_control_json,
             phase_timeouts_json,
+            htn_enabled,
+            htn_ui_bridge_url,
+            htn_state_machine_path,
         }: ListUnifiedWorkflowsBorrowed<'a>,
     ) -> Self {
         Self {
@@ -383,6 +402,9 @@ impl<'a> From<ListUnifiedWorkflowsBorrowed<'a>> for ListUnifiedWorkflows {
             enforce_token_budget,
             flow_control_json: flow_control_json.into(),
             phase_timeouts_json: phase_timeouts_json.into(),
+            htn_enabled,
+            htn_ui_bridge_url: htn_ui_bridge_url.into(),
+            htn_state_machine_path: htn_state_machine_path.into(),
         }
     }
 }
@@ -436,6 +458,9 @@ pub struct GetUnifiedWorkflow {
     pub enforce_token_budget: bool,
     pub flow_control_json: String,
     pub phase_timeouts_json: String,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: String,
+    pub htn_state_machine_path: String,
 }
 pub struct GetUnifiedWorkflowBorrowed<'a> {
     pub id: &'a str,
@@ -486,6 +511,9 @@ pub struct GetUnifiedWorkflowBorrowed<'a> {
     pub enforce_token_budget: bool,
     pub flow_control_json: &'a str,
     pub phase_timeouts_json: &'a str,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: &'a str,
+    pub htn_state_machine_path: &'a str,
 }
 impl<'a> From<GetUnifiedWorkflowBorrowed<'a>> for GetUnifiedWorkflow {
     fn from(
@@ -538,6 +566,9 @@ impl<'a> From<GetUnifiedWorkflowBorrowed<'a>> for GetUnifiedWorkflow {
             enforce_token_budget,
             flow_control_json,
             phase_timeouts_json,
+            htn_enabled,
+            htn_ui_bridge_url,
+            htn_state_machine_path,
         }: GetUnifiedWorkflowBorrowed<'a>,
     ) -> Self {
         Self {
@@ -589,6 +620,9 @@ impl<'a> From<GetUnifiedWorkflowBorrowed<'a>> for GetUnifiedWorkflow {
             enforce_token_budget,
             flow_control_json: flow_control_json.into(),
             phase_timeouts_json: phase_timeouts_json.into(),
+            htn_enabled,
+            htn_ui_bridge_url: htn_ui_bridge_url.into(),
+            htn_state_machine_path: htn_state_machine_path.into(),
         }
     }
 }
@@ -642,6 +676,9 @@ pub struct GetUnifiedWorkflowByName {
     pub enforce_token_budget: bool,
     pub flow_control_json: String,
     pub phase_timeouts_json: String,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: String,
+    pub htn_state_machine_path: String,
 }
 pub struct GetUnifiedWorkflowByNameBorrowed<'a> {
     pub id: &'a str,
@@ -692,6 +729,9 @@ pub struct GetUnifiedWorkflowByNameBorrowed<'a> {
     pub enforce_token_budget: bool,
     pub flow_control_json: &'a str,
     pub phase_timeouts_json: &'a str,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: &'a str,
+    pub htn_state_machine_path: &'a str,
 }
 impl<'a> From<GetUnifiedWorkflowByNameBorrowed<'a>> for GetUnifiedWorkflowByName {
     fn from(
@@ -744,6 +784,9 @@ impl<'a> From<GetUnifiedWorkflowByNameBorrowed<'a>> for GetUnifiedWorkflowByName
             enforce_token_budget,
             flow_control_json,
             phase_timeouts_json,
+            htn_enabled,
+            htn_ui_bridge_url,
+            htn_state_machine_path,
         }: GetUnifiedWorkflowByNameBorrowed<'a>,
     ) -> Self {
         Self {
@@ -795,6 +838,9 @@ impl<'a> From<GetUnifiedWorkflowByNameBorrowed<'a>> for GetUnifiedWorkflowByName
             enforce_token_budget,
             flow_control_json: flow_control_json.into(),
             phase_timeouts_json: phase_timeouts_json.into(),
+            htn_enabled,
+            htn_ui_bridge_url: htn_ui_bridge_url.into(),
+            htn_state_machine_path: htn_state_machine_path.into(),
         }
     }
 }
@@ -848,6 +894,9 @@ pub struct SearchUnifiedWorkflows {
     pub enforce_token_budget: bool,
     pub flow_control_json: String,
     pub phase_timeouts_json: String,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: String,
+    pub htn_state_machine_path: String,
 }
 pub struct SearchUnifiedWorkflowsBorrowed<'a> {
     pub id: &'a str,
@@ -898,6 +947,9 @@ pub struct SearchUnifiedWorkflowsBorrowed<'a> {
     pub enforce_token_budget: bool,
     pub flow_control_json: &'a str,
     pub phase_timeouts_json: &'a str,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: &'a str,
+    pub htn_state_machine_path: &'a str,
 }
 impl<'a> From<SearchUnifiedWorkflowsBorrowed<'a>> for SearchUnifiedWorkflows {
     fn from(
@@ -950,6 +1002,9 @@ impl<'a> From<SearchUnifiedWorkflowsBorrowed<'a>> for SearchUnifiedWorkflows {
             enforce_token_budget,
             flow_control_json,
             phase_timeouts_json,
+            htn_enabled,
+            htn_ui_bridge_url,
+            htn_state_machine_path,
         }: SearchUnifiedWorkflowsBorrowed<'a>,
     ) -> Self {
         Self {
@@ -1001,6 +1056,9 @@ impl<'a> From<SearchUnifiedWorkflowsBorrowed<'a>> for SearchUnifiedWorkflows {
             enforce_token_budget,
             flow_control_json: flow_control_json.into(),
             phase_timeouts_json: phase_timeouts_json.into(),
+            htn_enabled,
+            htn_ui_bridge_url: htn_ui_bridge_url.into(),
+            htn_state_machine_path: htn_state_machine_path.into(),
         }
     }
 }
@@ -1054,6 +1112,9 @@ pub struct GetPendingSyncWorkflows {
     pub enforce_token_budget: bool,
     pub flow_control_json: String,
     pub phase_timeouts_json: String,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: String,
+    pub htn_state_machine_path: String,
 }
 pub struct GetPendingSyncWorkflowsBorrowed<'a> {
     pub id: &'a str,
@@ -1104,6 +1165,9 @@ pub struct GetPendingSyncWorkflowsBorrowed<'a> {
     pub enforce_token_budget: bool,
     pub flow_control_json: &'a str,
     pub phase_timeouts_json: &'a str,
+    pub htn_enabled: bool,
+    pub htn_ui_bridge_url: &'a str,
+    pub htn_state_machine_path: &'a str,
 }
 impl<'a> From<GetPendingSyncWorkflowsBorrowed<'a>> for GetPendingSyncWorkflows {
     fn from(
@@ -1156,6 +1220,9 @@ impl<'a> From<GetPendingSyncWorkflowsBorrowed<'a>> for GetPendingSyncWorkflows {
             enforce_token_budget,
             flow_control_json,
             phase_timeouts_json,
+            htn_enabled,
+            htn_ui_bridge_url,
+            htn_state_machine_path,
         }: GetPendingSyncWorkflowsBorrowed<'a>,
     ) -> Self {
         Self {
@@ -1207,6 +1274,9 @@ impl<'a> From<GetPendingSyncWorkflowsBorrowed<'a>> for GetPendingSyncWorkflows {
             enforce_token_budget,
             flow_control_json: flow_control_json.into(),
             phase_timeouts_json: phase_timeouts_json.into(),
+            htn_enabled,
+            htn_ui_bridge_url: htn_ui_bridge_url.into(),
+            htn_state_machine_path: htn_state_machine_path.into(),
         }
     }
 }
@@ -1882,7 +1952,7 @@ where
 pub struct ListUnifiedWorkflowsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_unified_workflows() -> ListUnifiedWorkflowsStmt {
     ListUnifiedWorkflowsStmt(
-        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json FROM unified_workflows ORDER BY is_favorite DESC, updated_at DESC",
+        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json, COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path FROM unified_workflows ORDER BY is_favorite DESC, updated_at DESC",
         None,
     )
 }
@@ -1955,6 +2025,9 @@ impl ListUnifiedWorkflowsStmt {
                     enforce_token_budget: row.try_get(45)?,
                     flow_control_json: row.try_get(46)?,
                     phase_timeouts_json: row.try_get(47)?,
+                    htn_enabled: row.try_get(48)?,
+                    htn_ui_bridge_url: row.try_get(49)?,
+                    htn_state_machine_path: row.try_get(50)?,
                 })
             },
             mapper: |it| ListUnifiedWorkflows::from(it),
@@ -1964,7 +2037,7 @@ impl ListUnifiedWorkflowsStmt {
 pub struct GetUnifiedWorkflowStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_unified_workflow() -> GetUnifiedWorkflowStmt {
     GetUnifiedWorkflowStmt(
-        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json FROM unified_workflows WHERE id = $1",
+        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json, COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path FROM unified_workflows WHERE id = $1",
         None,
     )
 }
@@ -2038,6 +2111,9 @@ impl GetUnifiedWorkflowStmt {
                     enforce_token_budget: row.try_get(45)?,
                     flow_control_json: row.try_get(46)?,
                     phase_timeouts_json: row.try_get(47)?,
+                    htn_enabled: row.try_get(48)?,
+                    htn_ui_bridge_url: row.try_get(49)?,
+                    htn_state_machine_path: row.try_get(50)?,
                 })
             },
             mapper: |it| GetUnifiedWorkflow::from(it),
@@ -2047,7 +2123,7 @@ impl GetUnifiedWorkflowStmt {
 pub struct GetUnifiedWorkflowByNameStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_unified_workflow_by_name() -> GetUnifiedWorkflowByNameStmt {
     GetUnifiedWorkflowByNameStmt(
-        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json FROM unified_workflows WHERE name = $1 LIMIT 1",
+        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json, COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path FROM unified_workflows WHERE name = $1 LIMIT 1",
         None,
     )
 }
@@ -2121,6 +2197,9 @@ impl GetUnifiedWorkflowByNameStmt {
                     enforce_token_budget: row.try_get(45)?,
                     flow_control_json: row.try_get(46)?,
                     phase_timeouts_json: row.try_get(47)?,
+                    htn_enabled: row.try_get(48)?,
+                    htn_ui_bridge_url: row.try_get(49)?,
+                    htn_state_machine_path: row.try_get(50)?,
                 })
             },
             mapper: |it| GetUnifiedWorkflowByName::from(it),
@@ -2130,7 +2209,7 @@ impl GetUnifiedWorkflowByNameStmt {
 pub struct CreateUnifiedWorkflowStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn create_unified_workflow() -> CreateUnifiedWorkflowStmt {
     CreateUnifiedWorkflowStmt(
-        "INSERT INTO unified_workflows ( id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model, skip_ai_summary, log_source_selection, context_ids, disabled_context_ids, auto_include_contexts, prompt_template, log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides, approval_gate, completion_prompts_first, dependency_graph, cost_annotations, quality_report, acceptance_criteria, constraint_overrides, ai_reviewed, workflow_architecture, strict_cwd, tool_tags, rollback_policy, enforce_token_budget, flow_control_json, phase_timeouts_json ) VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45 ) RETURNING id",
+        "INSERT INTO unified_workflows ( id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model, skip_ai_summary, log_source_selection, context_ids, disabled_context_ids, auto_include_contexts, prompt_template, log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides, approval_gate, completion_prompts_first, dependency_graph, cost_annotations, quality_report, acceptance_criteria, constraint_overrides, ai_reviewed, workflow_architecture, strict_cwd, tool_tags, rollback_policy, enforce_token_budget, flow_control_json, phase_timeouts_json, htn_enabled, htn_ui_bridge_url, htn_state_machine_path ) VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48 ) RETURNING id",
         None,
     )
 }
@@ -2176,6 +2255,8 @@ impl CreateUnifiedWorkflowStmt {
         T27: crate::StringSql,
         T28: crate::StringSql,
         T29: crate::StringSql,
+        T30: crate::StringSql,
+        T31: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
@@ -2224,7 +2305,10 @@ impl CreateUnifiedWorkflowStmt {
         enforce_token_budget: &'a bool,
         flow_control_json: &'a Option<T28>,
         phase_timeouts_json: &'a Option<T29>,
-    ) -> StringQuery<'c, 'a, 's, C, String, 45> {
+        htn_enabled: &'a bool,
+        htn_ui_bridge_url: &'a Option<T30>,
+        htn_state_machine_path: &'a Option<T31>,
+    ) -> StringQuery<'c, 'a, 's, C, String, 48> {
         StringQuery {
             client,
             params: [
@@ -2273,6 +2357,9 @@ impl CreateUnifiedWorkflowStmt {
                 enforce_token_budget,
                 flow_control_json,
                 phase_timeouts_json,
+                htn_enabled,
+                htn_ui_bridge_url,
+                htn_state_machine_path,
             ],
             query: self.0,
             cached: self.1.as_ref(),
@@ -2315,6 +2402,8 @@ impl<
     T27: crate::StringSql,
     T28: crate::StringSql,
     T29: crate::StringSql,
+    T30: crate::StringSql,
+    T31: crate::StringSql,
 >
     crate::client::async_::Params<
         'c,
@@ -2350,8 +2439,10 @@ impl<
             T27,
             T28,
             T29,
+            T30,
+            T31,
         >,
-        StringQuery<'c, 'a, 's, C, String, 45>,
+        StringQuery<'c, 'a, 's, C, String, 48>,
         C,
     > for CreateUnifiedWorkflowStmt
 {
@@ -2388,8 +2479,10 @@ impl<
             T27,
             T28,
             T29,
+            T30,
+            T31,
         >,
-    ) -> StringQuery<'c, 'a, 's, C, String, 45> {
+    ) -> StringQuery<'c, 'a, 's, C, String, 48> {
         self.bind(
             client,
             &params.id,
@@ -2437,13 +2530,16 @@ impl<
             &params.enforce_token_budget,
             &params.flow_control_json,
             &params.phase_timeouts_json,
+            &params.htn_enabled,
+            &params.htn_ui_bridge_url,
+            &params.htn_state_machine_path,
         )
     }
 }
 pub struct UpdateUnifiedWorkflowStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn update_unified_workflow() -> UpdateUnifiedWorkflowStmt {
     UpdateUnifiedWorkflowStmt(
-        "UPDATE unified_workflows SET name = $1, description = $2, category = $3, tags = $4, setup_steps = $5, verification_steps = $6, agentic_steps = $7, completion_steps = $8, max_iterations = $9, timeout_seconds = $10, provider = $11, model = $12, skip_ai_summary = $13, updated_at = NOW(), log_source_selection = $14, prompt_template = $15, context_ids = $16, disabled_context_ids = $17, auto_include_contexts = $18, log_watch_enabled = $19, health_check_enabled = $20, health_check_urls = $21, preflight_check_enabled = $22, enable_sweep = $23, max_sweep_iterations = $24, stages = $25, stop_on_failure = $26, approval_gate = $27, reflection_mode = $28, model_overrides = $29, completion_prompts_first = $30, dependency_graph = $31, cost_annotations = $32, quality_report = $33, acceptance_criteria = $34, constraint_overrides = $35, ai_reviewed = $36, workflow_architecture = $37, strict_cwd = $38, tool_tags = $39, rollback_policy = $40, enforce_token_budget = $41, flow_control_json = $42, phase_timeouts_json = $43 WHERE id = $44 RETURNING id",
+        "UPDATE unified_workflows SET name = $1, description = $2, category = $3, tags = $4, setup_steps = $5, verification_steps = $6, agentic_steps = $7, completion_steps = $8, max_iterations = $9, timeout_seconds = $10, provider = $11, model = $12, skip_ai_summary = $13, updated_at = NOW(), log_source_selection = $14, prompt_template = $15, context_ids = $16, disabled_context_ids = $17, auto_include_contexts = $18, log_watch_enabled = $19, health_check_enabled = $20, health_check_urls = $21, preflight_check_enabled = $22, enable_sweep = $23, max_sweep_iterations = $24, stages = $25, stop_on_failure = $26, approval_gate = $27, reflection_mode = $28, model_overrides = $29, completion_prompts_first = $30, dependency_graph = $31, cost_annotations = $32, quality_report = $33, acceptance_criteria = $34, constraint_overrides = $35, ai_reviewed = $36, workflow_architecture = $37, strict_cwd = $38, tool_tags = $39, rollback_policy = $40, enforce_token_budget = $41, flow_control_json = $42, phase_timeouts_json = $43, htn_enabled = $44, htn_ui_bridge_url = $45, htn_state_machine_path = $46 WHERE id = $47 RETURNING id",
         None,
     )
 }
@@ -2488,6 +2584,8 @@ impl UpdateUnifiedWorkflowStmt {
         T26: crate::StringSql,
         T27: crate::StringSql,
         T28: crate::StringSql,
+        T29: crate::StringSql,
+        T30: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
@@ -2534,8 +2632,11 @@ impl UpdateUnifiedWorkflowStmt {
         enforce_token_budget: &'a bool,
         flow_control_json: &'a Option<T26>,
         phase_timeouts_json: &'a Option<T27>,
-        id: &'a T28,
-    ) -> StringQuery<'c, 'a, 's, C, String, 44> {
+        htn_enabled: &'a bool,
+        htn_ui_bridge_url: &'a Option<T28>,
+        htn_state_machine_path: &'a Option<T29>,
+        id: &'a T30,
+    ) -> StringQuery<'c, 'a, 's, C, String, 47> {
         StringQuery {
             client,
             params: [
@@ -2582,6 +2683,9 @@ impl UpdateUnifiedWorkflowStmt {
                 enforce_token_budget,
                 flow_control_json,
                 phase_timeouts_json,
+                htn_enabled,
+                htn_ui_bridge_url,
+                htn_state_machine_path,
                 id,
             ],
             query: self.0,
@@ -2624,6 +2728,8 @@ impl<
     T26: crate::StringSql,
     T27: crate::StringSql,
     T28: crate::StringSql,
+    T29: crate::StringSql,
+    T30: crate::StringSql,
 >
     crate::client::async_::Params<
         'c,
@@ -2658,8 +2764,10 @@ impl<
             T26,
             T27,
             T28,
+            T29,
+            T30,
         >,
-        StringQuery<'c, 'a, 's, C, String, 44>,
+        StringQuery<'c, 'a, 's, C, String, 47>,
         C,
     > for UpdateUnifiedWorkflowStmt
 {
@@ -2695,8 +2803,10 @@ impl<
             T26,
             T27,
             T28,
+            T29,
+            T30,
         >,
-    ) -> StringQuery<'c, 'a, 's, C, String, 44> {
+    ) -> StringQuery<'c, 'a, 's, C, String, 47> {
         self.bind(
             client,
             &params.name,
@@ -2742,6 +2852,9 @@ impl<
             &params.enforce_token_budget,
             &params.flow_control_json,
             &params.phase_timeouts_json,
+            &params.htn_enabled,
+            &params.htn_ui_bridge_url,
+            &params.htn_state_machine_path,
             &params.id,
         )
     }
@@ -2779,7 +2892,7 @@ impl DeleteUnifiedWorkflowStmt {
 pub struct SearchUnifiedWorkflowsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn search_unified_workflows() -> SearchUnifiedWorkflowsStmt {
     SearchUnifiedWorkflowsStmt(
-        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json FROM unified_workflows WHERE to_tsvector('english', name || ' ' || COALESCE(description, '')) @@ plainto_tsquery('english', $1) OR name ILIKE '%' || $1 || '%' OR category ILIKE '%' || $1 || '%' ORDER BY is_favorite DESC, updated_at DESC",
+        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json, COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path FROM unified_workflows WHERE to_tsvector('english', name || ' ' || COALESCE(description, '')) @@ plainto_tsquery('english', $1) OR name ILIKE '%' || $1 || '%' OR category ILIKE '%' || $1 || '%' ORDER BY is_favorite DESC, updated_at DESC",
         None,
     )
 }
@@ -2853,6 +2966,9 @@ impl SearchUnifiedWorkflowsStmt {
                     enforce_token_budget: row.try_get(45)?,
                     flow_control_json: row.try_get(46)?,
                     phase_timeouts_json: row.try_get(47)?,
+                    htn_enabled: row.try_get(48)?,
+                    htn_ui_bridge_url: row.try_get(49)?,
+                    htn_state_machine_path: row.try_get(50)?,
                 })
             },
             mapper: |it| SearchUnifiedWorkflows::from(it),
@@ -2892,7 +3008,7 @@ impl ToggleFavoriteStmt {
 pub struct GetPendingSyncWorkflowsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_pending_sync_workflows() -> GetPendingSyncWorkflowsStmt {
     GetPendingSyncWorkflowsStmt(
-        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json FROM unified_workflows WHERE sync_pending = true",
+        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, 'general') as category, COALESCE(tags, '[]') as tags, COALESCE(setup_steps, '[]') as setup_steps, COALESCE(verification_steps, '[]') as verification_steps, COALESCE(agentic_steps, '[]') as agentic_steps, COALESCE(completion_steps, '[]') as completion_steps, COALESCE(max_iterations, 0) as max_iterations, COALESCE(provider, '') as provider, COALESCE(model, '') as model, skip_ai_summary, created_at, updated_at, COALESCE(log_source_selection, '\"default\"') as log_source_selection, COALESCE(context_ids, '[]') as context_ids, COALESCE(disabled_context_ids, '[]') as disabled_context_ids, COALESCE(auto_include_contexts, true) as auto_include_contexts, COALESCE(prompt_template, '') as prompt_template, COALESCE(log_watch_enabled, true) as log_watch_enabled, COALESCE(health_check_enabled, true) as health_check_enabled, COALESCE(health_check_urls, '[]') as health_check_urls, COALESCE(timeout_seconds, 0) as timeout_seconds, COALESCE(preflight_check_enabled, true) as preflight_check_enabled, COALESCE(generated_by_task_run_id, '') as generated_by_task_run_id, COALESCE(enable_sweep, false) as enable_sweep, COALESCE(max_sweep_iterations, 5) as max_sweep_iterations, COALESCE(stages, '[]') as stages, COALESCE(stop_on_failure, false) as stop_on_failure, COALESCE(reflection_mode, true) as reflection_mode, COALESCE(model_overrides, '{}') as model_overrides, COALESCE(approval_gate, false) as approval_gate, COALESCE(completion_prompts_first, false) as completion_prompts_first, COALESCE(is_favorite, false) as is_favorite, COALESCE(dependency_graph, '') as dependency_graph, COALESCE(cost_annotations, '') as cost_annotations, COALESCE(quality_report, '') as quality_report, COALESCE(acceptance_criteria, '') as acceptance_criteria, COALESCE(constraint_overrides, '{}') as constraint_overrides, COALESCE(ai_reviewed, true) as ai_reviewed, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(rollback_policy, '') as rollback_policy, COALESCE(strict_cwd, false) as strict_cwd, COALESCE(tool_tags, '[]') as tool_tags, COALESCE(enforce_token_budget, false) as enforce_token_budget, COALESCE(flow_control_json, '') as flow_control_json, COALESCE(phase_timeouts_json, '') as phase_timeouts_json, COALESCE(htn_enabled, false) as htn_enabled, COALESCE(htn_ui_bridge_url, '') as htn_ui_bridge_url, COALESCE(htn_state_machine_path, '') as htn_state_machine_path FROM unified_workflows WHERE sync_pending = true",
         None,
     )
 }
@@ -2965,6 +3081,9 @@ impl GetPendingSyncWorkflowsStmt {
                     enforce_token_budget: row.try_get(45)?,
                     flow_control_json: row.try_get(46)?,
                     phase_timeouts_json: row.try_get(47)?,
+                    htn_enabled: row.try_get(48)?,
+                    htn_ui_bridge_url: row.try_get(49)?,
+                    htn_state_machine_path: row.try_get(50)?,
                 })
             },
             mapper: |it| GetPendingSyncWorkflows::from(it),
