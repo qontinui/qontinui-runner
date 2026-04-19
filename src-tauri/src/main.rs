@@ -101,6 +101,7 @@ mod screen;
 mod secure_storage;
 mod security;
 mod semantic_conventions;
+mod server_mode;
 mod settings;
 mod skills;
 mod slash_commands;
@@ -335,6 +336,41 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         crate::mcp::sdk_client::SdkConnectionManager::new(),
     ));
 
+    // Server-mode web-backend integration — only active when all three env
+    // vars are set. The state is constructed here (synchronously) so that
+    // workflow-execution code paths can see an `Option<ServerModeState>` on
+    // `AppState`; the actual registration + heartbeat tasks are spawned from
+    // `setup()` below, after the async runtime is up.
+    let server_mode_is_on = std::env::var("QONTINUI_SERVER_MODE")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let server_mode_state: Option<crate::server_mode::ServerModeState> = if server_mode_is_on {
+        match crate::server_mode::ServerModeConfig::from_env() {
+            Some(cfg) => {
+                info!(
+                    "Server-mode web-backend integration enabled (backend={})",
+                    cfg.web_backend_url
+                );
+                Some(crate::server_mode::ServerModeState::new(cfg))
+            }
+            None => {
+                if std::env::var("QONTINUI_WEB_BACKEND_URL").is_ok() {
+                    warn!(
+                        "QONTINUI_WEB_BACKEND_URL set but QONTINUI_RUNNER_TOKEN is missing — \
+                         phase events and heartbeats will NOT be reported to the web backend"
+                    );
+                } else {
+                    warn!(
+                        "server mode without web-backend URL: phase events and heartbeats will not be reported"
+                    );
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let shared_app_state = Arc::new(AppState {
         bridge_manager: TokioMutex::new(None), // Initialized in setup() when app_handle is available
         extraction_executor: Mutex::new(None), // Initialized on-demand
@@ -375,6 +411,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             );
             cache
         },
+        server_mode: server_mode_state,
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -1527,6 +1564,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Start heartbeat background task for fleet registration
             heartbeat::start_heartbeat(heartbeat_app_state);
+
+            // Start server-mode web-backend registration + heartbeat loop
+            // (only when `QONTINUI_SERVER_MODE=1` and the token/URL pair was
+            // supplied — see `server_mode_state` construction above).
+            if let Some(ref sm_state) = app.state::<Arc<AppState>>().inner().server_mode {
+                let restate_enabled = crate::settings::load_settings().restate.enabled;
+                crate::server_mode::spawn_background_tasks(sm_state.clone(), restate_enabled);
+            }
 
             // Register this runner in the PostgreSQL instance registry.
             // Primary registers itself; secondaries register via heartbeat to the primary.

@@ -3143,12 +3143,19 @@ pub use super::step_conversion::{
     extract_prompt_steps_with_phase, substitute_step_vars,
 };
 
-/// Persist a `PhaseResult` to PG and emit it to the frontend via Tauri.
+/// Persist a `PhaseResult` to PG, emit it to the frontend via Tauri, and —
+/// when server-mode web-backend integration is configured — fire-and-forget
+/// POST it to `/api/v1/events/phase-completed`.
 ///
 /// Best-effort: logs warnings on failure without interrupting the run.
 /// Uses `get_parent_task_id` remapping for composed runs so phase results
 /// align with the parent task the UI filters by (matching the convention
 /// used for `store_verification_phase_result`).
+///
+/// The web-backend POST is internally `tokio::spawn`ed so workflow execution
+/// never blocks on web latency. On non-2xx or network error the call logs at
+/// `warn!` and drops — phase results are still persisted to local PG and can
+/// be backfilled later if a batch-sync endpoint is ever added.
 pub(crate) async fn emit_and_persist_phase_result(
     app_state: &Arc<AppState>,
     app_handle: &tauri::AppHandle,
@@ -3172,6 +3179,12 @@ pub(crate) async fn emit_and_persist_phase_result(
             result.phase,
             e
         );
+    }
+    // Server-mode: fire-and-forget POST to qontinui-web. The helper internally
+    // `tokio::spawn`s so this call returns immediately even when the web
+    // backend is slow or down.
+    if let Some(sm_state) = app_state.server_mode.clone() {
+        crate::server_mode::post_phase_result(sm_state, parent_id, result);
     }
 }
 

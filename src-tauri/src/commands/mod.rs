@@ -232,6 +232,12 @@ pub struct AppState {
     /// Avoids rebuilding expensive parallel PG queries on every prompt construction.
     pub working_representation_cache:
         Arc<crate::memory::working_representation::WorkingRepresentationCache>,
+    /// Server-mode web-backend integration state.
+    /// `Some` only when `QONTINUI_SERVER_MODE=1` and both
+    /// `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN` are set. Holds the
+    /// runner_id assigned by `/api/v1/runners/register` and the token needed
+    /// for authenticated POSTs to the web backend. Cheap to clone.
+    pub server_mode: Option<crate::server_mode::ServerModeState>,
 }
 
 impl AppState {

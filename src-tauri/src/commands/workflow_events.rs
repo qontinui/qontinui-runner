@@ -25,6 +25,10 @@ pub enum WorkflowEventType {
     RunnerRecovered,
     BuildFailed,
     VerificationFailed,
+    /// Emitted once per phase (setup/verification/agentic/completion) with
+    /// the serialized `PhaseResult`. Ingested by the web backend's
+    /// `POST /api/v1/events/phase-completed` endpoint.
+    PhaseCompleted,
 }
 
 /// Payload sent to `POST /api/v1/events/workflow`.
@@ -281,6 +285,7 @@ pub async fn emit_workflow_event(
         "runner_recovered" => WorkflowEventType::RunnerRecovered,
         "build_failed" => WorkflowEventType::BuildFailed,
         "verification_failed" => WorkflowEventType::VerificationFailed,
+        "phase_completed" => WorkflowEventType::PhaseCompleted,
         _ => return Err(format!("Invalid event_type: {}", event_type)),
     };
 
