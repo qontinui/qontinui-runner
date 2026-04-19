@@ -1674,11 +1674,14 @@ impl PgDb {
         // 1. Performance Summary
         let result = conn
             .query_one(
+                // SUM returns NULL (not 0) when zero rows match, which
+                // panics on r.get::<_, i64>. COALESCE keeps the Rust side
+                // NULL-free even if the `if total > 0` guard below drifts.
                 r#"SELECT
                     COUNT(*) as total_runs,
-                    SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as successful,
-                    SUM(CASE WHEN status='partial' THEN 1 ELSE 0 END) as partial,
-                    SUM(CASE WHEN status='failure' THEN 1 ELSE 0 END) as failed,
+                    COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END), 0)::BIGINT as successful,
+                    COALESCE(SUM(CASE WHEN status='partial' THEN 1 ELSE 0 END), 0)::BIGINT as partial,
+                    COALESCE(SUM(CASE WHEN status='failure' THEN 1 ELSE 0 END), 0)::BIGINT as failed,
                     COALESCE(ROUND(AVG(duration_secs)::numeric, 1), 0) as avg_duration,
                     COALESCE(ROUND(AVG(iterations)::numeric, 1), 0) as avg_iterations
                 FROM learning_outcomes
@@ -2521,11 +2524,13 @@ impl PgDb {
 
         // Aggregate metrics from learning_outcomes
         let agg_sql = format!(
+            // COALESCE on every SUM — unguarded query_one with no rows would
+            // otherwise panic on r.get::<_, i64> reads at lines 2542–2544.
             r#"SELECT
                    COUNT(*),
-                   SUM(CASE WHEN lo.status = 'success' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN lo.status = 'failure' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN lo.status = 'partial' THEN 1 ELSE 0 END),
+                   COALESCE(SUM(CASE WHEN lo.status = 'success' THEN 1 ELSE 0 END), 0)::BIGINT,
+                   COALESCE(SUM(CASE WHEN lo.status = 'failure' THEN 1 ELSE 0 END), 0)::BIGINT,
+                   COALESCE(SUM(CASE WHEN lo.status = 'partial' THEN 1 ELSE 0 END), 0)::BIGINT,
                    COALESCE(AVG(lo.duration_secs), 0.0),
                    COALESCE(AVG(lo.iterations::double precision), 0.0)
                FROM learning_outcomes lo
@@ -3486,9 +3491,12 @@ impl PgDb {
             };
         if let Ok(r) = conn
             .query_one(
-                r#"SELECT COUNT(*), SUM(CASE WHEN feedback_type = 'edit' THEN 1 ELSE 0 END),
-                 SUM(CASE WHEN feedback_type = 'delete' THEN 1 ELSE 0 END),
-                 AVG(CASE WHEN feedback_type = 'rating' THEN rating END)::double precision
+                // COALESCE on both SUMs — unguarded query_one panics on r.get::<_, i64>
+                // at lines 3498–3499 when the date filter matches zero rows.
+                r#"SELECT COUNT(*),
+                          COALESCE(SUM(CASE WHEN feedback_type = 'edit' THEN 1 ELSE 0 END), 0)::BIGINT,
+                          COALESCE(SUM(CASE WHEN feedback_type = 'delete' THEN 1 ELSE 0 END), 0)::BIGINT,
+                          AVG(CASE WHEN feedback_type = 'rating' THEN rating END)::double precision
              FROM workflow_generation_feedback WHERE created_at > $1"#,
                 &[&since],
             )
