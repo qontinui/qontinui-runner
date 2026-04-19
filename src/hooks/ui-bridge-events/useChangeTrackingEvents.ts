@@ -29,6 +29,15 @@ let liveTrackerSetter: TrackerSetter | null = null;
  * from the runner backend. Idempotent and safe to call multiple times.
  */
 export function setPendingTauriEventNames(names: string[]): void {
+  // Dedupe: skip when the list hasn't changed. StrictMode double-invokes
+  // the TauriEventNamesLoader effect in dev, so this would otherwise call
+  // the live setter twice on startup and race the initial subscribe.
+  if (
+    pendingTauriEventNames.length === names.length &&
+    pendingTauriEventNames.every((n, i) => n === names[i])
+  ) {
+    return;
+  }
   pendingTauriEventNames = [...names];
   if (liveTrackerSetter) {
     // Fire-and-forget — the ChangeTracker resubscribes asynchronously.
