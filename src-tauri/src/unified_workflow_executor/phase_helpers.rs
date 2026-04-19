@@ -11,7 +11,7 @@
 //! - **Response mode execution** — `execute_prompt_response_mode()`, finding parsing/storage
 //! - **Token estimation** — `estimate_tokens()`, `compute_embedding_sync()`
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
@@ -494,9 +494,54 @@ pub struct EnvironmentReadinessResult {
 /// If issues are detected, it attempts automated recovery (reconnect SDK, refresh page)
 /// before returning. This separates "is the environment working?" from "did the code
 /// change work?" — preventing wasted agentic iterations on environment problems.
+/// Inspect a workflow's stages to decide whether it talks to the UI Bridge
+/// SDK. Control-mode workflows (runner's own UI, `/ui-bridge/control/*`)
+/// never need an external SDK connection, so their pre-flight should NOT
+/// fail with "SDK app is not connected" — that check is only meaningful
+/// for workflows that actually drive an SDK-connected external app.
+///
+/// Returns true iff at least one command / shell_command / check_command /
+/// ui_bridge_snapshot_target references the SDK family. Empty stage list →
+/// false (can't be SDK-dependent if there's nothing to execute).
+pub fn workflow_uses_sdk_endpoints(
+    stages: &[crate::unified_workflow_executor::StageConfig],
+) -> bool {
+    fn step_uses_sdk(step: &crate::step_executor::ExecutionStepConfig) -> bool {
+        // Collect all string fields that could carry a URL or SDK-mode flag.
+        // `prompt_content` carries agentic prompts (which may embed SDK curl
+        // snippets the agent is told to run). `ui_bridge_snapshot_target`
+        // is the ui_bridge step's explicit opt-in to SDK snapshot semantics
+        // (`"sdk"` vs `"control"`).
+        let candidates: [Option<&str>; 5] = [
+            step.shell_command.as_deref(),
+            step.check_command.as_deref(),
+            step.prompt_content.as_deref(),
+            step.ui_bridge_target.as_deref(),
+            step.ui_bridge_snapshot_target.as_deref(),
+        ];
+        candidates
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .any(|s| s.contains("/ui-bridge/sdk/") || s.trim() == "sdk")
+    }
+
+    stages.iter().any(|stage| {
+        stage
+            .setup_automation_steps
+            .iter()
+            .chain(stage.setup_prompt_steps.iter())
+            .chain(stage.verification_steps.iter())
+            .chain(stage.agentic_steps.iter())
+            .chain(stage.completion_automation_steps.iter())
+            .chain(stage.completion_prompt_steps.iter())
+            .any(step_uses_sdk)
+    })
+}
+
 pub async fn check_environment_readiness(
     iteration: u32,
     workflow_name: &str,
+    check_sdk: bool,
 ) -> EnvironmentReadinessResult {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
@@ -556,31 +601,50 @@ pub async fn check_environment_readiness(
     }
 
     // ── Check 2: SDK connection status ──
-    let sdk_connected = match client
-        .get(format!("{}/ui-bridge/sdk/status", base_url))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            if let Ok(body) = resp.json::<serde_json::Value>().await {
-                let connected = body
-                    .get("data")
-                    .and_then(|d| d.get("connected"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if !connected {
-                    issues.push("SDK app is not connected".to_string());
+    //
+    // Skipped for control-mode workflows. `check_sdk=false` is passed when
+    // the workflow's stages contain zero /ui-bridge/sdk/ references — the
+    // verification run operates entirely on the runner's own UI via
+    // /ui-bridge/control/*, so an external SDK connection is irrelevant and
+    // previously failed the pre-flight with a spurious "SDK app is not
+    // connected" error (workflow_uses_sdk_endpoints decides the bypass).
+    let sdk_connected = if check_sdk {
+        match client
+            .get(format!("{}/ui-bridge/sdk/status", base_url))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let connected = body
+                        .get("data")
+                        .and_then(|d| d.get("connected"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if !connected {
+                        issues.push("SDK app is not connected".to_string());
+                    }
+                    connected
+                } else {
+                    issues.push("SDK status response not parseable".to_string());
+                    false
                 }
-                connected
-            } else {
-                issues.push("SDK status response not parseable".to_string());
+            }
+            _ => {
+                issues.push("SDK status endpoint not available".to_string());
                 false
             }
         }
-        _ => {
-            issues.push("SDK status endpoint not available".to_string());
-            false
-        }
+    } else {
+        debug!(
+            "ENV-DOCTOR (iter {}): skipping SDK connection check — workflow \
+             is control-mode (no /ui-bridge/sdk/ references in stages)",
+            iteration
+        );
+        // For control-mode workflows the SDK is simply not in play; record
+        // `false` so the downstream SDK health / reconnect branches short
+        // circuit, and keep `issues` empty so the pre-flight stays green.
+        false
     };
 
     // ── Check 3: SDK app health (only if connected) ──
@@ -622,8 +686,12 @@ pub async fn check_environment_readiness(
     );
     let mut recovery_actions: Vec<String> = Vec::new();
 
-    // Recovery 1: If SDK not connected, try reconnecting
-    if !sdk_connected {
+    // Recovery 1: If SDK not connected, try reconnecting.
+    // Skipped in control mode — see check_sdk rationale above. Without this
+    // guard, a control-mode workflow hitting an unrelated issue (runner
+    // health blip, missing app) would waste time probing SDK reconnect
+    // endpoints that will never help it.
+    if check_sdk && !sdk_connected {
         info!("ENV-DOCTOR: Attempting SDK reconnect...");
         // Try to get the last known connected URL from connections list
         let reconnect_url = match client

@@ -511,8 +511,16 @@ impl LoopController {
         ctx: &mut LoopContext,
         config: &mut LoopConfig,
     ) -> LoopState {
+        // Detect whether this workflow actually talks to the SDK. Control-mode
+        // workflows (runner's own UI via /ui-bridge/control/*) don't — gating
+        // both SDK auto-connect and the SDK arm of the pre-flight on this
+        // prevents spurious "SDK app is not connected" failures and avoids
+        // opening a browser tab the workflow will never use.
+        let workflow_uses_sdk =
+            super::phases::workflow_uses_sdk_endpoints(&config.stages);
+
         // AUTO-CONNECT SDK FOR UI-FOCUSED WORKFLOWS (first iteration only)
-        if ctx.iteration == 1 {
+        if ctx.iteration == 1 && workflow_uses_sdk {
             super::phases::try_auto_connect_sdk_for_ui_workflow(&config.workflow_name).await;
         }
 
@@ -522,9 +530,12 @@ impl LoopController {
         // automated recovery (reconnect SDK, refresh page). This prevents wasting
         // agentic iterations on environment problems vs actual code issues.
         {
-            let env_result =
-                super::phases::check_environment_readiness(ctx.iteration, &config.workflow_name)
-                    .await;
+            let env_result = super::phases::check_environment_readiness(
+                ctx.iteration,
+                &config.workflow_name,
+                workflow_uses_sdk,
+            )
+            .await;
 
             if !env_result.ready {
                 // Log environment issue to task output
