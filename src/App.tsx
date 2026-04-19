@@ -650,7 +650,14 @@ function TauriEventNamesLoader() {
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const attempt = async (delayMs: number): Promise<void> => {
+    // Bounded retry: cap attempts so we never spin forever when the backend
+    // is permanently unreachable (e.g., a non-runner host consuming this
+    // build). With initial 500ms and clamped exponential backoff to 4000ms,
+    // 8 attempts span roughly 500 + 1000 + 2000 + 4000*5 = 23.5s — plenty
+    // to cover a temp-runner warm-up without leaking a perpetual timer.
+    const MAX_ATTEMPTS = 8;
+
+    const attempt = async (delayMs: number, attemptNum: number): Promise<void> => {
       if (cancelled) return;
       try {
         const { getApiBase } = await import("@/lib/runner-api");
@@ -661,17 +668,17 @@ function TauriEventNamesLoader() {
         // getApiBase() still returns the default primary-runner port
         // (http://localhost:9876), which doesn't serve this route for
         // a temp runner and returns 404. Retry until we hit an actual
-        // success or give up after a reasonable number of attempts.
+        // success or give up after MAX_ATTEMPTS.
         const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/tauri-event-names`);
         if (!resp.ok) {
           if (!cancelled) {
-            // Likely port not yet published or temp runner still warming up.
-            // Retry with exponential-ish backoff up to ~16s total.
-            const nextDelay = Math.min(delayMs * 2, 4000);
-            if (nextDelay <= 8000) {
-              retryTimer = setTimeout(() => void attempt(nextDelay), nextDelay);
+            if (attemptNum + 1 < MAX_ATTEMPTS) {
+              const nextDelay = Math.min(delayMs * 2, 4000);
+              retryTimer = setTimeout(() => void attempt(nextDelay, attemptNum + 1), nextDelay);
             } else {
-              console.warn(`[TauriEventNamesLoader] fetch failed after retries: ${resp.status}`);
+              console.warn(
+                `[TauriEventNamesLoader] fetch failed after ${MAX_ATTEMPTS} attempts: ${resp.status}`,
+              );
             }
           }
           return;
@@ -685,17 +692,20 @@ function TauriEventNamesLoader() {
         }
       } catch (err) {
         if (!cancelled) {
-          const nextDelay = Math.min(delayMs * 2, 4000);
-          if (nextDelay <= 8000) {
-            retryTimer = setTimeout(() => void attempt(nextDelay), nextDelay);
+          if (attemptNum + 1 < MAX_ATTEMPTS) {
+            const nextDelay = Math.min(delayMs * 2, 4000);
+            retryTimer = setTimeout(() => void attempt(nextDelay, attemptNum + 1), nextDelay);
           } else {
-            console.warn("[TauriEventNamesLoader] failed to load tauri event names:", err);
+            console.warn(
+              `[TauriEventNamesLoader] failed to load tauri event names after ${MAX_ATTEMPTS} attempts:`,
+              err,
+            );
           }
         }
       }
     };
 
-    void attempt(500);
+    void attempt(500, 0);
     return () => {
       cancelled = true;
       if (retryTimer) clearTimeout(retryTimer);
