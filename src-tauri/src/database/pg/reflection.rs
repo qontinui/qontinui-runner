@@ -803,11 +803,15 @@ impl PgDb {
         // 3. Effective fix rate
         let rate_row = conn
             .query_one(
+                // COALESCE wraps every SUM because Postgres returns NULL (not
+                // 0) for SUM when the WHERE clause filters out every row — and
+                // `r.get::<_, i64>(col)` panics on NULL with no nullable type.
+                // COUNT(*) is safe (always 0+) so it's left bare.
                 r#"SELECT
                      COUNT(*),
-                     SUM(CASE WHEN rf.effectiveness = 'effective' THEN 1 ELSE 0 END),
-                     SUM(CASE WHEN rf.effectiveness = 'ineffective' THEN 1 ELSE 0 END),
-                     SUM(CASE WHEN rf.effectiveness = 'caused_regression' THEN 1 ELSE 0 END)
+                     COALESCE(SUM(CASE WHEN rf.effectiveness = 'effective' THEN 1 ELSE 0 END), 0)::BIGINT,
+                     COALESCE(SUM(CASE WHEN rf.effectiveness = 'ineffective' THEN 1 ELSE 0 END), 0)::BIGINT,
+                     COALESCE(SUM(CASE WHEN rf.effectiveness = 'caused_regression' THEN 1 ELSE 0 END), 0)::BIGINT
                    FROM reflection_fixes rf
                    INNER JOIN task_runs tr ON tr.id = rf.source_task_run_id
                    WHERE tr.workflow_name = $1
