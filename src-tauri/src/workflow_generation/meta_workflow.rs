@@ -504,6 +504,60 @@ Return ONLY valid JSON matching this structure. No markdown code blocks, no expl
     )
 }
 
+/// Build the "Spec Generation Brief Recognition" section injected into any
+/// Builder prompt when the inline context carries a Spec Generation Brief.
+///
+/// Exposed as `pub` because TWO codepaths invoke the Builder and both must
+/// include these rules:
+/// - The async HTTP handler `/unified-workflows/generate-async` which calls
+///   `build_meta_workflow_template` → `build_builder_prompt` (local caller).
+/// - The synchronous Tauri command `generate_workflow_standalone` (invoked by
+///   the Specs page AI toggle) which calls `generator::run_builder_agent`.
+///
+/// Keeping the rules in one place ensures both paths stay in sync when the
+/// control endpoint reference evolves.
+pub fn build_spec_brief_recognition_prompt(runner_api_port: u16) -> String {
+    format!(
+        r#"
+## Spec Generation Brief Recognition
+
+If the Additional Context contains a block labeled "Spec Generation Brief (JSON)", parse it and follow these rules strictly:
+
+1. **Navigate first.** If the brief has a `pageUrl`, emit a setup step that navigates to it using the **control** endpoint (see rule 2).
+2. **All HTTP commands MUST use `/ui-bridge/control/` paths.** This brief targets the runner's own UI — never use `/ui-bridge/sdk/*` (that family is reserved for external apps connected via SDK). Do NOT emit a connect step; control mode requires no connect. Endpoint reference:
+   - Navigate (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/page/navigate -H "Content-Type: application/json" -d '{{"url":"/terminal"}}'` — payload MUST use `"url"`, not `"path"`.
+   - Snapshot (GET, no body): `curl -sS http://localhost:{runner_api_port}/ui-bridge/control/snapshot` — the snapshot endpoint is GET-only; do NOT send `-X POST` or `-d`.
+   - Discover (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/discover -H "Content-Type: application/json" -d '{{}}'`
+   - Find elements (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/find -H "Content-Type: application/json" -d '{{"criteria":{{"role":"button"}},"limit":5}}'` — prefer `/control/find` over `/control/elements` when filtering by criteria.
+   - Click (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/element/<id>/action -H "Content-Type: application/json" -d '{{"action":"click"}}'`
+   - Evaluate JS (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/page/evaluate -H "Content-Type: application/json" -d '{{"expression":"..."}}'`
+   - AI search (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/ai/search -H "Content-Type: application/json" -d '{{"query":"..."}}'` — note the slash: `/ai/search`, not `/ai-search`.
+   **Always emit the full URL** — `curl http://localhost:{runner_api_port}/ui-bridge/control/<endpoint>`, never a shortened `/sdk/<endpoint>` or `/control/<endpoint>` without the `/ui-bridge/` prefix. Workflows missing the `/ui-bridge/` prefix will fail with 404 at runtime.
+3. **Preconditions become setup steps.** For each group in `groups[]`, emit one setup step per entry in `preconditions[]` before that group's verification steps. Each precondition describes a required UI state (e.g., "Findings panel is open"); the setup step should click the button or trigger the action that achieves that state. Infer the selector from the assertion descriptions in the group if it is not explicit.
+4. **Deterministic assertions become batched snapshot_assert steps.** For each group, emit ONE `ui_bridge` step with `ui_bridge_action: "snapshot_assert"` whose `ui_bridge_target` is a JSON-stringified array of the group's `deterministicAssertions[]`. Each array element must have the shape `{{id, description, severity, assertionType, criteria, expected?, relatedCriteria?, minGap?}}`. Set `ui_bridge_snapshot_target` to `"control"` for runner-self specs (the default).
+5. **Semantic assertions become prompt or agentic steps.** Each group's `semanticAssertions[]` should become one or more `prompt` steps with a `content` field that includes the assertion descriptions. These may navigate and inspect the UI via the UI Bridge tools.
+6. **Always bias toward determinism.** When an assertion could be either deterministic or semantic, prefer the deterministic form (snapshot_assert).
+
+### Canonical snapshot_assert Step Example
+
+```json
+{{
+  "id": "<uuid>",
+  "type": "ui_bridge",
+  "phase": "verification",
+  "name": "<group name>",
+  "ui_bridge_action": "snapshot_assert",
+  "ui_bridge_target": "[{{\"id\":\"<assertion-id>\",\"description\":\"...\",\"severity\":\"critical\",\"assertionType\":\"exists\",\"criteria\":{{\"role\":\"button\",\"textContent\":\"+\"}}}}, ...]",
+  "ui_bridge_snapshot_target": "control"
+}}
+```
+
+Notice `ui_bridge_target` is a STRING containing JSON — NOT an object. The `ExecutionStepConfig` deserializer on the Rust side expects it in that form.
+"#,
+        runner_api_port = runner_api_port,
+    )
+}
+
 /// Build the prompt for the builder agent that generates the initial workflow JSON.
 fn build_builder_prompt(
     description: &str,
@@ -572,43 +626,7 @@ fn build_builder_prompt(
             Some(s) => crate::mcp::types::runner_api_port(s),
             None => crate::mcp::types::get_mcp_api_port(),
         };
-        prompt.push_str(&format!(
-            r#"
-## Spec Generation Brief Recognition
-
-If the Additional Context contains a block labeled "Spec Generation Brief (JSON)", parse it and follow these rules strictly:
-
-1. **Navigate first.** If the brief has a `pageUrl`, emit a setup step that navigates to it using the **control** endpoint (see rule 2).
-2. **All HTTP commands MUST use `/ui-bridge/control/` paths.** This brief targets the runner's own UI — never use `/ui-bridge/sdk/*` (that family is reserved for external apps connected via SDK). Do NOT emit a connect step; control mode requires no connect. Endpoint reference:
-   - Navigate: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/page/navigate -d '{{"url":"/terminal"}}'`
-   - Snapshot: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/snapshot -d '{{}}'`
-   - Discover: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/discover -d '{{}}'`
-   - Click: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/element/<id>/action -d '{{"action":"click"}}'`
-   - Evaluate JS: `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/page/evaluate -d '{{"expression":"..."}}'`
-   The runner port is provided in the Project Context section below — use it verbatim. Workflows generated with `/sdk/` paths will be rejected by the post-generation validator.
-3. **Preconditions become setup steps.** For each group in `groups[]`, emit one setup step per entry in `preconditions[]` before that group's verification steps. Each precondition describes a required UI state (e.g., "Findings panel is open"); the setup step should click the button or trigger the action that achieves that state. Infer the selector from the assertion descriptions in the group if it is not explicit.
-4. **Deterministic assertions become batched snapshot_assert steps.** For each group, emit ONE `ui_bridge` step with `ui_bridge_action: "snapshot_assert"` whose `ui_bridge_target` is a JSON-stringified array of the group's `deterministicAssertions[]`. Each array element must have the shape `{{id, description, severity, assertionType, criteria, expected?, relatedCriteria?, minGap?}}`. Set `ui_bridge_snapshot_target` to `"control"` for runner-self specs (the default).
-5. **Semantic assertions become prompt or agentic steps.** Each group's `semanticAssertions[]` should become one or more `prompt` steps with a `content` field that includes the assertion descriptions. These may navigate and inspect the UI via the UI Bridge tools.
-6. **Always bias toward determinism.** When an assertion could be either deterministic or semantic, prefer the deterministic form (snapshot_assert).
-
-### Canonical snapshot_assert Step Example
-
-```json
-{{
-  "id": "<uuid>",
-  "type": "ui_bridge",
-  "phase": "verification",
-  "name": "<group name>",
-  "ui_bridge_action": "snapshot_assert",
-  "ui_bridge_target": "[{{\"id\":\"<assertion-id>\",\"description\":\"...\",\"severity\":\"critical\",\"assertionType\":\"exists\",\"criteria\":{{\"role\":\"button\",\"textContent\":\"+\"}}}}, ...]",
-  "ui_bridge_snapshot_target": "control"
-}}
-```
-
-Notice `ui_bridge_target` is a STRING containing JSON — NOT an object. The `ExecutionStepConfig` deserializer on the Rust side expects it in that form.
-"#,
-            runner_api_port = brief_runner_port,
-        ));
+        prompt.push_str(&build_spec_brief_recognition_prompt(brief_runner_port));
     }
 
     // Add custom template if provided

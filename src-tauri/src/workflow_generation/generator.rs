@@ -2400,6 +2400,30 @@ fn run_builder_agent(
         }
     }
 
+    // If the inline context carries a Spec Generation Brief, inject the same
+    // recognition/consumption rules the async HTTP path uses. Without this,
+    // the Builder defaults to the "connect via SDK" guidance baked into
+    // UI_BRIDGE_INSTRUCTIONS further down and emits `/ui-bridge/sdk/*` (or
+    // worse, shortened `/sdk/*`) paths for runner-self briefs. See
+    // `meta_workflow::build_spec_brief_recognition_prompt` for rationale.
+    if request
+        .inline_context
+        .as_deref()
+        .map(|c| c.contains("Spec Generation Brief"))
+        .unwrap_or(false)
+    {
+        // This synchronous path has no AppState — fall back to the env /
+        // default port lookup used elsewhere in generator.rs. Temp runners
+        // spawned via the supervisor may advertise 9876 here instead of
+        // their real bound port; the hardener's URL normalizer will migrate
+        // them to the actual runner port when it runs.
+        let runner_port = crate::mcp::types::get_mcp_api_port();
+        context_section.push_str(&super::meta_workflow::build_spec_brief_recognition_prompt(
+            runner_port,
+        ));
+        context_section.push_str("\n\n");
+    }
+
     let user_prompt = format!(
         r#"## User's Request
 {description}

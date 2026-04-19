@@ -1099,6 +1099,52 @@ pub fn sanitize_commands_in_steps(steps: &mut [Value]) -> usize {
     let mut count = 0;
 
     for step in steps.iter_mut() {
+        // Inject missing `mode` on command steps. The executor requires `mode` to be
+        // one of: shell, check, check_group, test. Builder output (and older stored
+        // workflows from before mode was mandatory) occasionally omits this field,
+        // which surfaces as "invalid or missing mode: '<missing>'" at execution
+        // time. Infer the intended mode from sibling fields rather than failing
+        // the whole workflow:
+        //   - `test_type` present        → mode: "test"
+        //   - `check_type` present       → mode: "check"
+        //   - `check_group` array present→ mode: "check_group"
+        //   - otherwise                  → mode: "shell"
+        let is_command_step = step
+            .get("type")
+            .or_else(|| step.get("step_type"))
+            .and_then(|v| v.as_str())
+            == Some("command");
+        let has_mode = step
+            .get("mode")
+            .or_else(|| step.get("command_mode"))
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if is_command_step && !has_mode {
+            let inferred = if step.get("test_type").is_some() {
+                "test"
+            } else if step
+                .get("check_group")
+                .map(|v| v.is_array())
+                .unwrap_or(false)
+            {
+                "check_group"
+            } else if step.get("check_type").is_some() {
+                "check"
+            } else {
+                "shell"
+            };
+            if let Some(obj) = step.as_object_mut() {
+                obj.insert("mode".to_string(), Value::String(inferred.to_string()));
+                count += 1;
+                info!(
+                    "Injected missing mode='{}' on command step '{}'",
+                    inferred,
+                    step.get("name").and_then(|v| v.as_str()).unwrap_or("?")
+                );
+            }
+        }
+
         // Fix nested retry format: {"retry": {"count": N, "delay_ms": M}} -> retry_count/retry_delay_ms
         if let Some(retry_obj) = step.get("retry").cloned() {
             if let Some(obj) = step.as_object_mut() {
