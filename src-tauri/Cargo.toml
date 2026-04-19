@@ -51,6 +51,7 @@ mdns-sd = "0.11"
 reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form"] }
 open = "5"
 hostname = "0.4"
+subtle = "2"
 mime_guess = "2"
 base64 = "0.22"
 bollard = "0.18"

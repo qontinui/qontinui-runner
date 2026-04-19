@@ -67,12 +67,20 @@ impl ServerModeConfig {
 
 /// Shared state for the server-mode integration.
 ///
-/// Holds the assigned `runner_id` (populated after a successful registration)
-/// and the `ServerModeConfig` itself. Clones cheaply (`Arc` under the hood).
+/// Holds the assigned `runner_id` (populated after a successful registration),
+/// the `dispatch_secret` (a per-runner bearer value returned by web at
+/// registration time), and the `ServerModeConfig` itself. Clones cheaply
+/// (`Arc` under the hood).
+///
+/// `dispatch_secret` is a machine-to-machine credential web uses when it
+/// POSTs to `/api/workflows/run` on this runner — distinct from
+/// `config.runner_token` (which the runner uses to authenticate *to* web).
+/// The runner accepts either value as a bearer on `/api/workflows/run`.
 #[derive(Debug, Clone)]
 pub struct ServerModeState {
     pub config: ServerModeConfig,
     runner_id: Arc<RwLock<Option<Uuid>>>,
+    dispatch_secret: Arc<RwLock<Option<String>>>,
 }
 
 impl ServerModeState {
@@ -80,6 +88,7 @@ impl ServerModeState {
         Self {
             config,
             runner_id: Arc::new(RwLock::new(None)),
+            dispatch_secret: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -92,6 +101,20 @@ impl ServerModeState {
     async fn set_runner_id(&self, id: Uuid) {
         let mut guard = self.runner_id.write().await;
         *guard = Some(id);
+    }
+
+    /// Current dispatch_secret (if registration has succeeded at least once
+    /// *and* the web backend returned one). Returns `None` until the first
+    /// successful registration response has been parsed.
+    pub async fn dispatch_secret(&self) -> Option<String> {
+        self.dispatch_secret.read().await.clone()
+    }
+
+    /// Set the dispatch_secret. Called once from the registration task on the
+    /// first successful registration response.
+    async fn set_dispatch_secret(&self, secret: String) {
+        let mut guard = self.dispatch_secret.write().await;
+        *guard = Some(secret);
     }
 }
 
@@ -117,6 +140,12 @@ struct RegistrationResponse {
     #[serde(default)]
     #[allow(dead_code)]
     registered_at: Option<String>,
+    /// Per-runner machine-to-machine secret the web backend signs dispatch
+    /// requests with. Optional for forward-compatibility: if a future web
+    /// version omits it the runner simply falls back to verifying
+    /// `QONTINUI_RUNNER_TOKEN` on dispatch calls.
+    #[serde(default)]
+    dispatch_secret: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,9 +237,14 @@ async fn register_with_retry(state: &ServerModeState, restate_enabled: bool) {
                 match resp.json::<RegistrationResponse>().await {
                     Ok(body) => {
                         state.set_runner_id(body.runner_id).await;
+                        let has_secret = body.dispatch_secret.is_some();
+                        if let Some(secret) = body.dispatch_secret {
+                            state.set_dispatch_secret(secret).await;
+                        }
                         info!(
                             runner_id = %body.runner_id,
                             name = %payload.name,
+                            dispatch_secret_received = has_secret,
                             "Server-mode runner registered with web backend"
                         );
                         return;

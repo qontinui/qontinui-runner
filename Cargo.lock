@@ -5694,6 +5694,7 @@ dependencies = [
  "sha2 0.10.9",
  "socket2 0.6.3",
  "streaming-iterator",
+ "subtle",
  "syn 2.0.117",
  "tauri",
  "tauri-build",
