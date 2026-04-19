@@ -5,11 +5,13 @@
 //! - Launching Chrome with remote debugging enabled
 //! - Native accessibility tree capture, querying, and interaction via AccessibilityManager
 
+use crate::event_system::EventEmitter;
 use crate::settings::{self, AccessibilitySettings};
 use qontinui_runner_lib::accessibility::model::UnifiedRole;
 use qontinui_runner_lib::accessibility::traits::ConnectionTarget;
 use qontinui_runner_lib::accessibility::AccessibilityManager;
 
+use tauri::AppHandle;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
 
@@ -263,6 +265,7 @@ pub fn check_chrome_available() -> Result<CommandResponse, String> {
 pub async fn a11y_connect(
     target: String,
     backend: String,
+    app: AppHandle,
     state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
 ) -> Result<serde_json::Value, String> {
     info!("a11y_connect: target={}, backend={}", target, backend);
@@ -274,9 +277,16 @@ pub async fn a11y_connect(
         .await
         .map_err(|e| format!("Failed to connect: {}", e))?;
 
+    let backend_name = mgr.backend_name().to_string();
+    drop(mgr);
+
+    // Emit tauri event so UI Bridge observers (e.g., Accessibility Explorer) can react.
+    let emitter = EventEmitter::new(app);
+    emitter.accessibility_connected(&backend_name, Some(&target));
+
     Ok(serde_json::json!({
         "connected": true,
-        "backend": mgr.backend_name(),
+        "backend": backend_name,
     }))
 }
 
@@ -293,6 +303,7 @@ pub async fn a11y_connect(
 pub async fn a11y_capture(
     include_hidden: bool,
     max_depth: Option<u32>,
+    app: AppHandle,
     state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
 ) -> Result<serde_json::Value, String> {
     info!(
@@ -300,11 +311,22 @@ pub async fn a11y_capture(
         include_hidden, max_depth
     );
 
+    let start = std::time::Instant::now();
+
     let mut mgr = state.lock().await;
     let snapshot = mgr
         .capture(max_depth, include_hidden)
         .await
         .map_err(|e| format!("Capture failed: {}", e))?;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let node_count = snapshot.total_nodes;
+    let backend_name = mgr.backend_name().to_string();
+    drop(mgr);
+
+    // Emit tauri event so UI Bridge observers can surface capture completion.
+    let emitter = EventEmitter::new(app);
+    emitter.accessibility_capture_complete(&backend_name, node_count, duration_ms);
 
     serde_json::to_value(&snapshot).map_err(|e| format!("Serialization failed: {}", e))
 }

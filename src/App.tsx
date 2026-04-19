@@ -639,6 +639,71 @@ function CtrAutoPopulator() {
   return null;
 }
 
+/**
+ * Fetches the list of Tauri event channel names emitted by the runner
+ * backend (from GET /ui-bridge/sdk/tauri-event-names) and registers them
+ * with the change-tracking subsystem so the change buffer subscribes to
+ * backend events when enabled. Safe: logs and no-ops on fetch failure.
+ */
+function TauriEventNamesLoader() {
+  useEffect(() => {
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const attempt = async (delayMs: number): Promise<void> => {
+      if (cancelled) return;
+      try {
+        const { getApiBase } = await import("@/lib/runner-api");
+        const { setPendingTauriEventNames } =
+          await import("./hooks/ui-bridge-events/useChangeTrackingEvents");
+        // The API base URL is set asynchronously after the Tauri backend
+        // publishes its bound port (see useApiReady). Until that resolves,
+        // getApiBase() still returns the default primary-runner port
+        // (http://localhost:9876), which doesn't serve this route for
+        // a temp runner and returns 404. Retry until we hit an actual
+        // success or give up after a reasonable number of attempts.
+        const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/tauri-event-names`);
+        if (!resp.ok) {
+          if (!cancelled) {
+            // Likely port not yet published or temp runner still warming up.
+            // Retry with exponential-ish backoff up to ~16s total.
+            const nextDelay = Math.min(delayMs * 2, 4000);
+            if (nextDelay <= 8000) {
+              retryTimer = setTimeout(() => void attempt(nextDelay), nextDelay);
+            } else {
+              console.warn(`[TauriEventNamesLoader] fetch failed after retries: ${resp.status}`);
+            }
+          }
+          return;
+        }
+        const body = (await resp.json()) as { event_names?: unknown };
+        const names = Array.isArray(body.event_names)
+          ? body.event_names.filter((n): n is string => typeof n === "string")
+          : [];
+        if (!cancelled && names.length > 0) {
+          setPendingTauriEventNames(names);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          const nextDelay = Math.min(delayMs * 2, 4000);
+          if (nextDelay <= 8000) {
+            retryTimer = setTimeout(() => void attempt(nextDelay), nextDelay);
+          } else {
+            console.warn("[TauriEventNamesLoader] failed to load tauri event names:", err);
+          }
+        }
+      }
+    };
+
+    void attempt(500);
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+  }, []);
+  return null;
+}
+
 export default function App() {
   return (
     <ApolloProvider client={getGraphQLClient()}>
@@ -650,6 +715,7 @@ export default function App() {
         <SpecExecutionHandler />
         <BundledSpecsLoader />
         <CtrAutoPopulator />
+        <TauriEventNamesLoader />
         {/*
           Auto-register every interactive element in the runner app so that
           GET /ui-bridge/control/elements and snapshot reflect the live DOM,

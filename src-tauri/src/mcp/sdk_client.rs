@@ -3210,6 +3210,20 @@ async fn handle_diff_baseline(
 }
 
 // =============================================================================
+// Discovery Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/tauri-event-names — List all Tauri event channel names
+/// emitted by the runner (for SDK clients subscribing to backend events).
+///
+/// Returns the list from `ALL_EVENT_NAMES`, which is kept in sync with the
+/// `AppEvent::event_name()` arms by a unit test.
+pub async fn handle_tauri_event_names() -> Json<serde_json::Value> {
+    use crate::event_system::ALL_EVENT_NAMES;
+    Json(serde_json::json!({ "event_names": ALL_EVENT_NAMES }))
+}
+
+// =============================================================================
 // Router
 // =============================================================================
 
@@ -3225,6 +3239,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // Health
         .route("/ui-bridge/sdk/health", get(handle_health))
         .route("/ui-bridge/sdk/capabilities", get(handle_capabilities))
+        // Discovery — list all Tauri event channel names emitted by the runner
+        .route(
+            "/ui-bridge/sdk/tauri-event-names",
+            get(handle_tauri_event_names),
+        )
         // Elements
         .route("/ui-bridge/sdk/elements", get(handle_elements))
         .route("/ui-bridge/sdk/element/{id}", get(handle_element))

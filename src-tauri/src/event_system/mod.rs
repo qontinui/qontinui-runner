@@ -94,3 +94,4 @@ pub use broadcaster::{
 pub use emitter::EventEmitter;
 #[allow(unused_imports)]
 pub use types::AppEvent;
+pub use types::ALL_EVENT_NAMES;

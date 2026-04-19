@@ -227,6 +227,28 @@ impl EventEmitter {
         ));
     }
 
+    /// Emit an accessibility-connected event.
+    pub fn accessibility_connected(&self, backend: &str, target: Option<&str>) {
+        self.emit_or_warn(AppEvent::accessibility_connected(
+            backend,
+            target.map(String::from),
+        ));
+    }
+
+    /// Emit an accessibility-capture-complete event.
+    pub fn accessibility_capture_complete(
+        &self,
+        backend: &str,
+        node_count: u32,
+        duration_ms: u64,
+    ) {
+        self.emit_or_warn(AppEvent::accessibility_capture_complete(
+            backend,
+            node_count,
+            duration_ms,
+        ));
+    }
+
     /// Emit a generic error event.
     pub fn error(&self, message: impl Into<String>) {
         self.emit_or_warn(AppEvent::error(message));

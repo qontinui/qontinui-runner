@@ -2,6 +2,40 @@ import { useCallback } from "react";
 import { handleChangeTrackingCommand } from "../changeTrackingHandler";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 
+// ---------------------------------------------------------------------------
+// Tauri event-name registry (module-global).
+//
+// The runner frontend fetches the list of Tauri event channel names from
+// GET /ui-bridge/sdk/tauri-event-names at startup (see App.tsx) and calls
+// `setPendingTauriEventNames(...)`. When the ChangeTracker is lazily created
+// for the first change-buffer request, the pending names are applied via
+// `ChangeTracker.setTauriEventNames(...)`, so the buffer picks up backend
+// events on the next `enable_change_buffer`.
+//
+// If the ChangeTracker already exists when the frontend receives updated
+// names (e.g., on hot-reload), the setter also propagates to it directly.
+// ---------------------------------------------------------------------------
+
+let pendingTauriEventNames: string[] = [];
+// Weak reference to the live ChangeTracker so updates after creation propagate.
+// We keep a function-typed setter rather than a direct ref to avoid adding
+// a second source of truth for the tracker instance.
+type TrackerSetter = (names: string[]) => void | Promise<void>;
+let liveTrackerSetter: TrackerSetter | null = null;
+
+/**
+ * Record the list of Tauri event names to subscribe to when the change
+ * buffer is enabled. Called once at app startup after discovering names
+ * from the runner backend. Idempotent and safe to call multiple times.
+ */
+export function setPendingTauriEventNames(names: string[]): void {
+  pendingTauriEventNames = [...names];
+  if (liveTrackerSetter) {
+    // Fire-and-forget — the ChangeTracker resubscribes asynchronously.
+    void liveTrackerSetter(pendingTauriEventNames);
+  }
+}
+
 /**
  * Handles: save_bookmark, get_bookmark, delete_bookmark, list_bookmarks,
  *          diff_from_bookmark, execute_with_diff, execute_batch_with_diff, wait_for_change, categorize_last_diff,
@@ -118,6 +152,19 @@ export function useChangeTrackingEvents(
                 defaultPollInterval: 200,
               },
             );
+
+            // Wire the tauri-event-names registry: seed with any names
+            // already discovered, and register a live setter so future
+            // updates propagate to this tracker instance.
+            const tracker = changeTrackerRef.current as unknown as {
+              setTauriEventNames?: (names: string[]) => Promise<void> | void;
+            };
+            if (typeof tracker.setTauriEventNames === "function") {
+              if (pendingTauriEventNames.length > 0) {
+                void tracker.setTauriEventNames(pendingTauriEventNames);
+              }
+              liveTrackerSetter = (names) => tracker.setTauriEventNames!(names);
+            }
           }
 
           const ct = changeTrackerRef.current;
@@ -137,7 +184,9 @@ export function useChangeTrackingEvents(
               registry?: {
                 on?: (
                   type: string,
-                  cb: (event: { data?: { from?: { url?: string }; to?: { url?: string } } }) => void,
+                  cb: (event: {
+                    data?: { from?: { url?: string }; to?: { url?: string } };
+                  }) => void,
                 ) => () => void;
               };
             };

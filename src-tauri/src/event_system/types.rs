@@ -393,6 +393,31 @@ pub enum AppEvent {
     },
 
     // ========================================================================
+    // Accessibility Events
+    // ========================================================================
+    /// Accessibility backend connected to a target.
+    AccessibilityConnected {
+        /// Name of the backend that was connected (e.g., "uia", "cdp", "atspi", "ax").
+        backend: String,
+        /// Target descriptor (e.g., "desktop", window title, "pid:1234"), if known.
+        target: Option<String>,
+        /// Unix timestamp in milliseconds.
+        timestamp: i64,
+    },
+
+    /// Accessibility tree capture completed.
+    AccessibilityCaptureComplete {
+        /// Name of the backend that performed the capture.
+        backend: String,
+        /// Number of nodes in the captured snapshot.
+        node_count: u32,
+        /// Duration of the capture in milliseconds.
+        duration_ms: u64,
+        /// Unix timestamp in milliseconds.
+        timestamp: i64,
+    },
+
+    // ========================================================================
     // Generic Events
     // ========================================================================
     /// Generic error event.
@@ -401,6 +426,74 @@ pub enum AppEvent {
         context: Option<String>,
     },
 }
+
+/// All distinct event channel names produced by `AppEvent::event_name()`.
+///
+/// Hand-maintained to match the match arms in `AppEvent::event_name()`. Several
+/// variants map to the same channel (`executor-event`, `extraction-event`, etc.)
+/// — those are deduplicated here.
+///
+/// This constant is exposed over HTTP (`GET /ui-bridge/sdk/tauri-event-names`)
+/// so SDK clients can subscribe to runner-emitted Tauri events by name.
+///
+/// The unit test `every_event_name_is_in_all_event_names` in this file
+/// asserts drift: if anyone adds a variant without updating this list, CI
+/// fails.
+pub const ALL_EVENT_NAMES: &[&str] = &[
+    // Executor
+    "executor-event",
+    "executor-error",
+    "executor-response",
+    // Extraction
+    "extraction-event",
+    "extraction-error",
+    "extraction-response",
+    // RAG
+    "rag-progress",
+    "rag-completion",
+    // Flow
+    "flow-event",
+    // AI output
+    "ai-output",
+    // Findings
+    "finding_detected",
+    "finding_resolved",
+    // Navigation
+    "test-navigation",
+    "ui-bridge-request",
+    // Orchestrator
+    "orchestrator-state-change",
+    "step-progress",
+    "task-run-update",
+    // Approval
+    "approval-required",
+    "approval-resolved",
+    // Deferred feedback
+    "deferred-question-created",
+    "deferred-question-reviewed",
+    // Canvas
+    "canvas-update",
+    // AI streaming
+    "ai-output-chunk",
+    // Convergence
+    "iteration-metrics",
+    // Blame
+    "blame-attribution",
+    // Constraints
+    "constraint-results",
+    // Queue
+    "workflow-queued",
+    "workflow-dequeued",
+    // Cost
+    "cost-update",
+    "budget-warning",
+    "cost-anomaly",
+    // Accessibility
+    "a11y-connected",
+    "a11y-capture-complete",
+    // Generic
+    "error",
+];
 
 impl AppEvent {
     /// Get the Tauri event channel name for this event type.
@@ -474,6 +567,10 @@ impl AppEvent {
             AppEvent::CostUpdate { .. } => "cost-update",
             AppEvent::BudgetWarning { .. } => "budget-warning",
             AppEvent::CostAnomaly { .. } => "cost-anomaly",
+
+            // Accessibility events
+            AppEvent::AccessibilityConnected { .. } => "a11y-connected",
+            AppEvent::AccessibilityCaptureComplete { .. } => "a11y-capture-complete",
 
             // Generic events
             AppEvent::Error { .. } => "error",
@@ -1012,6 +1109,32 @@ impl AppEvent {
             timestamp: chrono::Utc::now().timestamp_millis(),
         }
     }
+
+    /// Create an accessibility-connected event.
+    pub fn accessibility_connected(
+        backend: impl Into<String>,
+        target: Option<String>,
+    ) -> Self {
+        AppEvent::AccessibilityConnected {
+            backend: backend.into(),
+            target,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// Create an accessibility-capture-complete event.
+    pub fn accessibility_capture_complete(
+        backend: impl Into<String>,
+        node_count: u32,
+        duration_ms: u64,
+    ) -> Self {
+        AppEvent::AccessibilityCaptureComplete {
+            backend: backend.into(),
+            node_count,
+            duration_ms,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
 }
 
 /// Payload structure for executor events (for serialization compatibility).
@@ -1076,5 +1199,304 @@ mod tests {
             }
             _ => panic!("Wrong event type"),
         }
+    }
+
+    /// Drift guard: every variant's `event_name()` must be listed in
+    /// `ALL_EVENT_NAMES`, and the set of names in `ALL_EVENT_NAMES` must
+    /// exactly equal the set of names produced by the enum.
+    ///
+    /// Add new `AppEvent` variants → this test forces you to add an arm to
+    /// both `event_name()` and `ALL_EVENT_NAMES`.
+    #[test]
+    fn every_event_name_is_in_all_event_names() {
+        use std::collections::{BTreeSet, HashMap};
+
+        // Construct one concrete instance of every `AppEvent` variant.
+        // Fields use minimal / default values — the test only exercises
+        // `event_name()`, not serialization.
+        let events: Vec<AppEvent> = vec![
+            // Executor
+            AppEvent::ExecutorEvent {
+                event: String::new(),
+                timestamp: 0,
+                sequence: 0,
+                data: serde_json::Value::Null,
+            },
+            AppEvent::ExecutorTreeEvent {
+                event_type: String::new(),
+                node: serde_json::Value::Null,
+                path: Vec::new(),
+                timestamp: 0,
+                sequence: 0,
+            },
+            AppEvent::ExecutorError {
+                message: String::new(),
+                details: None,
+            },
+            AppEvent::ExecutorResponse {
+                id: String::new(),
+                success: true,
+                data: None,
+                error: None,
+            },
+            AppEvent::ImageRecognition {
+                data: serde_json::Value::Null,
+            },
+            // Extraction
+            AppEvent::ExtractionEvent {
+                event: String::new(),
+                timestamp: 0,
+                sequence: 0,
+                data: serde_json::Value::Null,
+            },
+            AppEvent::ExtractionError {
+                message: String::new(),
+                details: None,
+            },
+            AppEvent::ExtractionResponse {
+                id: String::new(),
+                success: true,
+                data: None,
+                error: None,
+            },
+            // RAG
+            AppEvent::RagProgress {
+                project_id: String::new(),
+                status: String::new(),
+                message: String::new(),
+                percent: None,
+                elements_processed: None,
+                total_elements: None,
+                error: None,
+            },
+            AppEvent::RagCompletion {
+                project_id: String::new(),
+                success: true,
+                total_processed: 0,
+                successful: 0,
+                failed: 0,
+                web_sync_success: false,
+                web_sync_error: None,
+            },
+            // Flow
+            AppEvent::FlowEvent(FlowEventData::FlowStarted {
+                instance_id: String::new(),
+                flow_id: String::new(),
+                flow_name: String::new(),
+            }),
+            // AI output
+            AppEvent::AiOutput {
+                session_id: String::new(),
+                content: String::new(),
+                content_type: None,
+            },
+            // Findings
+            AppEvent::FindingDetected {
+                finding: serde_json::Value::Null,
+            },
+            AppEvent::FindingResolved {
+                finding: serde_json::Value::Null,
+            },
+            // Navigation
+            AppEvent::TestNavigation {
+                data: serde_json::Value::Null,
+            },
+            AppEvent::UiBridgeRequest {
+                data: serde_json::Value::Null,
+            },
+            // Orchestrator
+            AppEvent::OrchestratorStateChange {
+                task_run_id: String::new(),
+                workflow_stage: String::new(),
+                iteration: 0,
+                phase: String::new(),
+                state_data: None,
+            },
+            AppEvent::StepProgress {
+                task_run_id: String::new(),
+                step_index: 0,
+                step_name: String::new(),
+                status: String::new(),
+                details: None,
+                timestamp: 0,
+            },
+            AppEvent::TaskRunUpdate {
+                task_run_id: String::new(),
+                status: String::new(),
+                iteration: None,
+                details: None,
+                timestamp: 0,
+            },
+            // Approval
+            AppEvent::ApprovalRequired {
+                task_run_id: String::new(),
+                approval_id: String::new(),
+                iteration: 0,
+                prompt: String::new(),
+            },
+            AppEvent::ApprovalResolved {
+                task_run_id: String::new(),
+                approval_id: String::new(),
+                approved: true,
+                action: String::new(),
+            },
+            // Deferred feedback
+            AppEvent::DeferredQuestionCreated {
+                task_run_id: String::new(),
+                question_id: String::new(),
+                iteration: 0,
+                question: String::new(),
+                confidence: 0.0,
+                risk_level: String::new(),
+            },
+            AppEvent::DeferredQuestionReviewed {
+                task_run_id: String::new(),
+                question_id: String::new(),
+                status: String::new(),
+                rework_triggered: false,
+            },
+            // Canvas
+            AppEvent::CanvasUpdate {
+                action: String::new(),
+                panel_id: String::new(),
+                panel: None,
+                task_run_id: None,
+            },
+            // AI streaming
+            AppEvent::AiOutputChunk {
+                task_run_id: String::new(),
+                chunk: String::new(),
+                accumulated_length: 0,
+            },
+            // Convergence
+            AppEvent::IterationMetrics {
+                task_run_id: String::new(),
+                iteration: 0,
+                failed_step_count: 0,
+                passed_step_count: 0,
+                skipped_step_count: 0,
+                new_failures: 0,
+                repeated_failures: 0,
+                is_stalled: false,
+            },
+            // Blame
+            AppEvent::BlameAttribution {
+                task_run_id: String::new(),
+                iteration: 0,
+                attributed_failures: 0,
+                oscillating_files: 0,
+                revert_patterns: 0,
+                blame_json: String::new(),
+            },
+            // Constraints
+            AppEvent::ConstraintResults {
+                task_run_id: String::new(),
+                iteration: 0,
+                summary: String::new(),
+                has_blocking: false,
+                results: serde_json::Value::Null,
+            },
+            // Queue
+            AppEvent::WorkflowQueued {
+                task_run_id: String::new(),
+                workflow_name: String::new(),
+                queue_position: 0,
+            },
+            AppEvent::WorkflowDequeued {
+                task_run_id: String::new(),
+                workflow_name: String::new(),
+                wait_time_ms: 0,
+            },
+            // Cost
+            AppEvent::CostUpdate {
+                task_run_id: String::new(),
+                phase: String::new(),
+                iteration: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                cost_usd: 0.0,
+                cumulative_cost_usd: 0.0,
+                cache_hit_rate: 0.0,
+                timestamp: 0,
+            },
+            AppEvent::BudgetWarning {
+                task_run_id: String::new(),
+                remaining_fraction: 0.0,
+                total_cost_usd: 0.0,
+                budget_limit_usd: 0.0,
+                message: String::new(),
+                timestamp: 0,
+            },
+            AppEvent::CostAnomaly {
+                task_run_id: String::new(),
+                cost_usd: 0.0,
+                mean_cost_usd: 0.0,
+                std_dev: 0.0,
+                z_score: 0.0,
+                message: String::new(),
+                timestamp: 0,
+            },
+            // Accessibility
+            AppEvent::AccessibilityConnected {
+                backend: String::new(),
+                target: None,
+                timestamp: 0,
+            },
+            AppEvent::AccessibilityCaptureComplete {
+                backend: String::new(),
+                node_count: 0,
+                duration_ms: 0,
+                timestamp: 0,
+            },
+            // Generic
+            AppEvent::Error {
+                message: String::new(),
+                context: None,
+            },
+        ];
+
+        // Every produced name must be in ALL_EVENT_NAMES.
+        for e in &events {
+            let name = e.event_name();
+            assert!(
+                ALL_EVENT_NAMES.contains(&name),
+                "event name '{}' produced by enum is not declared in ALL_EVENT_NAMES",
+                name,
+            );
+        }
+
+        // Count how many variants we instantiated per name, and confirm every
+        // name in ALL_EVENT_NAMES is produced by at least one variant.
+        let mut produced_counts: HashMap<&'static str, u32> = HashMap::new();
+        for e in &events {
+            *produced_counts.entry(e.event_name()).or_insert(0) += 1;
+        }
+        let produced: BTreeSet<&'static str> = produced_counts.keys().copied().collect();
+        let declared: BTreeSet<&'static str> = ALL_EVENT_NAMES.iter().copied().collect();
+
+        // Detect drift in either direction.
+        let missing_in_declared: Vec<&'static str> =
+            produced.difference(&declared).copied().collect();
+        let missing_in_produced: Vec<&'static str> =
+            declared.difference(&produced).copied().collect();
+        assert!(
+            missing_in_declared.is_empty(),
+            "enum produces names that ALL_EVENT_NAMES is missing: {:?}",
+            missing_in_declared,
+        );
+        assert!(
+            missing_in_produced.is_empty(),
+            "ALL_EVENT_NAMES declares names that no enum variant produces: {:?}",
+            missing_in_produced,
+        );
+
+        // ALL_EVENT_NAMES must have no duplicates.
+        assert_eq!(
+            ALL_EVENT_NAMES.len(),
+            declared.len(),
+            "ALL_EVENT_NAMES contains duplicate entries",
+        );
     }
 }
