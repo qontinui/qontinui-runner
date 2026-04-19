@@ -1445,12 +1445,14 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool: {e}"))?;
+        // COALESCE on each SUM — query_one with no matching rows would
+        // otherwise return NULL and panic on r.get::<_, i64> below.
         let row = conn.query_one(
             r#"SELECT
                 COUNT(DISTINCT tr.id) AS runs_processed,
                 COUNT(*) AS artifact_count,
-                SUM(CASE WHEN tr.verification_passed = true AND tr.status = 'complete' THEN 1 ELSE 0 END) AS passed_runs,
-                SUM(CASE WHEN tr.status = 'failed' THEN 1 ELSE 0 END) AS failed_runs,
+                COALESCE(SUM(CASE WHEN tr.verification_passed = true AND tr.status = 'complete' THEN 1 ELSE 0 END), 0)::BIGINT AS passed_runs,
+                COALESCE(SUM(CASE WHEN tr.status = 'failed' THEN 1 ELSE 0 END), 0)::BIGINT AS failed_runs,
                 ARRAY_AGG(DISTINCT gpa.category) FILTER (WHERE gpa.category IS NOT NULL) AS domains
             FROM task_runs tr
             INNER JOIN generation_pipeline_artifacts gpa
@@ -1494,11 +1496,14 @@ impl PgDb {
         let since_ts = chrono::DateTime::from_timestamp_millis(since_epoch_ms)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        // COALESCE the SUM: when no rows match, `query_one` still returns
+        // a row but SUM is NULL → panics on r.get::<_, i64>(1) below.
+        // The `if total > 0` guard comes AFTER the SUM read so it can't save us.
         let row = conn
             .query_one(
                 r#"SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN success = true THEN 1 ELSE 0 END) as successful,
+                COALESCE(SUM(CASE WHEN success = true THEN 1 ELSE 0 END), 0)::BIGINT as successful,
                 AVG(duration_ms) as avg_duration
                FROM task_run_automation
                WHERE started_at::TEXT > $1"#,
@@ -1674,8 +1679,12 @@ impl PgDb {
         let since = (chrono::Utc::now() - chrono::Duration::days(range_days)).to_rfc3339();
 
         // Summary
+        // COALESCE the SUM: unguarded query_one — line 1686 reads successful
+        // as i64 unconditionally, would panic when no automation runs exist
+        // for this config in the window.
         let summary_row = conn.query_one(
-            r#"SELECT COUNT(*) as total, SUM(CASE WHEN tra.success THEN 1 ELSE 0 END) as successful,
+            r#"SELECT COUNT(*) as total,
+                      COALESCE(SUM(CASE WHEN tra.success THEN 1 ELSE 0 END), 0)::BIGINT as successful,
                       AVG(tra.duration_ms) as avg_duration
                FROM task_run_automation tra
                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
