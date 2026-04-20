@@ -2018,9 +2018,11 @@ impl LoopController {
         // Build, persist, and emit the agentic PhaseResult.
         //
         // AgenticOutcome doesn't carry per-step results (the agent runs a
-        // single session), so populate `step_results` from the injected
-        // steps (preferred) or the accumulated dynamic steps — this keeps
-        // the timeline UI from rendering an empty card for agentic phases.
+        // single session), so populate `step_results` from the best
+        // available source: AI-injected steps from this iteration first,
+        // then the accumulated dynamic stack, then the stage's static
+        // agentic_steps config — this keeps the timeline UI from rendering
+        // an empty card for agentic phases regardless of configuration.
         {
             let agentic_success = agentic_outcome.is_success();
             let failure_context_opt = match &agentic_outcome {
