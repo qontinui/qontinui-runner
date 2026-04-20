@@ -12,32 +12,32 @@
  * `#[serde(default)]` attributes. Safe to spread into any workflow literal.
  */
 export const DEFAULT_WORKFLOW_FLAGS = {
-  ai_reviewed: false,
-  approval_gate: false,
-  auto_include_contexts: true,
-  completion_prompts_first: false,
-  enable_sweep: false,
-  enforce_token_budget: false,
-  health_check_enabled: false,
-  htn_enabled: false,
-  is_favorite: false,
-  log_watch_enabled: true,
-  max_ci_auto_resumes: 10,
-  max_fix_attempts: 3,
-  max_sweep_iterations: 5,
-  multi_agent_mode: true,
-  preflight_check_enabled: true,
-  reflection_mode: true,
-  skip_ai_summary: false,
-  stop_on_failure: false,
-  strict_cwd: false,
-  use_worktree: false,
+  aiReviewed: false,
+  approvalGate: false,
+  autoIncludeContexts: true,
+  completionPromptsFirst: false,
+  enableSweep: false,
+  enforceTokenBudget: false,
+  healthCheckEnabled: false,
+  htnEnabled: false,
+  isFavorite: false,
+  logWatchEnabled: true,
+  maxCiAutoResumes: 10,
+  maxFixAttempts: 3,
+  maxSweepIterations: 5,
+  multiAgentMode: true,
+  preflightCheckEnabled: true,
+  reflectionMode: true,
+  skipAiSummary: false,
+  stopOnFailure: false,
+  strictCwd: false,
+  useWorktree: false,
 } as const;
 
 /**
  * Required boolean fields on WorkflowStage (from `#[serde(default)]`).
  */
 export const DEFAULT_STAGE_FLAGS = {
-  approval_gate: false,
-  completion_prompts_first: false,
+  approvalGate: false,
+  completionPromptsFirst: false,
 } as const;

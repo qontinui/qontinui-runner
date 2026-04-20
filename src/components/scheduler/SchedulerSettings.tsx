@@ -26,15 +26,15 @@ export function SchedulerSettings({
   loading,
 }: SchedulerSettingsProps) {
   const [enabled, setEnabled] = useState(settings.enabled);
-  const [maxConcurrent, setMaxConcurrent] = useState(settings.max_concurrent);
-  const [defaultAutoFix, setDefaultAutoFix] = useState(settings.default_auto_fix_on_failure);
+  const [maxConcurrent, setMaxConcurrent] = useState(settings.maxConcurrent);
+  const [defaultAutoFix, setDefaultAutoFix] = useState(settings.defaultAutoFixOnFailure);
   const [timezone, setTimezone] = useState(settings.timezone || "");
   // Track changes (derived from current form state vs props)
   const hasChanges = useMemo(
     () =>
       enabled !== settings.enabled ||
-      maxConcurrent !== settings.max_concurrent ||
-      defaultAutoFix !== settings.default_auto_fix_on_failure ||
+      maxConcurrent !== settings.maxConcurrent ||
+      defaultAutoFix !== settings.defaultAutoFixOnFailure ||
       timezone !== (settings.timezone || ""),
     [enabled, maxConcurrent, defaultAutoFix, timezone, settings],
   );
@@ -42,8 +42,8 @@ export function SchedulerSettings({
   const handleSave = async () => {
     await onUpdateSettings({
       enabled,
-      max_concurrent: maxConcurrent,
-      default_auto_fix_on_failure: defaultAutoFix,
+      maxConcurrent: maxConcurrent,
+      defaultAutoFixOnFailure: defaultAutoFix,
       timezone: timezone || undefined,
     });
     // hasChanges resets automatically when parent updates the settings prop
@@ -86,19 +86,19 @@ export function SchedulerSettings({
             </div>
             <div>
               <span className="text-muted-foreground">Running Tasks:</span>{" "}
-              <span className={status.running_tasks > 0 ? getStatusColors("running").text : ""}>
-                {status.running_tasks}
+              <span className={status.runningTasks > 0 ? getStatusColors("running").text : ""}>
+                {status.runningTasks}
               </span>
             </div>
             <div>
-              <span className="text-muted-foreground">Pending Tasks:</span> {status.pending_tasks}
+              <span className="text-muted-foreground">Pending Tasks:</span> {status.pendingTasks}
             </div>
-            {status.next_task && (
+            {status.nextTask && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">Next Task:</span>{" "}
-                <span className="text-primary">{status.next_task.name}</span>
+                <span className="text-primary">{status.nextTask.name}</span>
                 <span className="text-muted-foreground"> at </span>
-                {new Date(status.next_task.next_run).toLocaleString()}
+                {new Date(status.nextTask.nextRun).toLocaleString()}
               </div>
             )}
           </div>

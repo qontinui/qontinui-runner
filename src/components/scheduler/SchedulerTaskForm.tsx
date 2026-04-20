@@ -76,13 +76,13 @@ export function SchedulerTaskForm({
   const [name, setName] = useState(src?.name || "");
   const [description, setDescription] = useState(src?.description || "");
   const [skipIfCompleted, setSkipIfCompleted] = useState(
-    (task ? task.skip_if_completed : prefill?.skip_if_completed) || false,
+    (task ? task.skipIfCompleted : prefill?.skipIfCompleted) || false,
   );
   const [autoFixOnFailure, setAutoFixOnFailure] = useState(
-    (task ? task.auto_fix_on_failure : prefill?.auto_fix_on_failure) || false,
+    (task ? task.autoFixOnFailure : prefill?.autoFixOnFailure) || false,
   );
   const [successCriteria, setSuccessCriteria] = useState(
-    (task ? task.success_criteria : prefill?.success_criteria) || "",
+    (task ? task.successCriteria : prefill?.successCriteria) || "",
   );
 
   // Schedule state
@@ -117,7 +117,7 @@ export function SchedulerTaskForm({
     initSchedule?.type === "Interval" ? initSchedule.value : 3600,
   );
   const [rearmDelay, setRearmDelay] = useState(
-    initSchedule?.type === "Condition" ? (initSchedule.value?.rearm_delay_minutes ?? 60) : 60,
+    initSchedule?.type === "Condition" ? (initSchedule.value?.rearmDelayMinutes ?? 60) : 60,
   );
 
   // Task type state
@@ -166,18 +166,18 @@ export function SchedulerTaskForm({
 
   // Conditions state
   const initConditions = task?.conditions ?? prefill?.conditions;
-  const [requireIdle, setRequireIdle] = useState(initConditions?.require_idle?.enabled ?? false);
+  const [requireIdle, setRequireIdle] = useState(initConditions?.requireIdle?.enabled ?? false);
   const [requireRepoInactive, setRequireRepoInactive] = useState(
-    initConditions?.require_repo_inactive?.enabled ?? false,
+    initConditions?.requireRepoInactive?.enabled ?? false,
   );
   const [repositories, setRepositories] = useState<RepositoryWatchWithId[]>(() =>
-    (initConditions?.require_repo_inactive?.repositories ?? []).map((r) => ({
+    (initConditions?.requireRepoInactive?.repositories ?? []).map((r) => ({
       ...r,
       _formId: crypto.randomUUID(),
     })),
   );
   const [timeoutMinutes, setTimeoutMinutes] = useState<number | undefined>(
-    initConditions?.timeout_minutes ?? undefined,
+    initConditions?.timeoutMinutes ?? undefined,
   );
 
   // Auto-enable conditions when Condition schedule type is selected
@@ -228,7 +228,7 @@ export function SchedulerTaskForm({
   const filteredWorkflows = useMemo(() => {
     let list = unifiedWorkflows;
     if (workflowFilter === "favorites") {
-      list = list.filter((w) => w.is_favorite);
+      list = list.filter((w) => w.isFavorite);
     } else if (workflowFilter === "commands") {
       list = list.filter((w) => w.category === "slash-command");
     }
@@ -297,7 +297,7 @@ export function SchedulerTaskForm({
       case "condition":
         return {
           type: "Condition",
-          value: { rearm_delay_minutes: rearmDelay ?? 0 },
+          value: { rearmDelayMinutes: rearmDelay ?? 0 },
         };
     }
   };
@@ -338,11 +338,11 @@ export function SchedulerTaskForm({
     const conditions: ScheduleConditions = {};
 
     if (requireIdle) {
-      conditions.require_idle = { enabled: true };
+      conditions.requireIdle = { enabled: true };
     }
 
     if (requireRepoInactive && repositories.length > 0) {
-      conditions.require_repo_inactive = {
+      conditions.requireRepoInactive = {
         enabled: true,
         repositories: repositories
           .filter((r) => r.path.trim() !== "")
@@ -351,7 +351,7 @@ export function SchedulerTaskForm({
     }
 
     if (timeoutMinutes !== undefined && timeoutMinutes > 0) {
-      conditions.timeout_minutes = timeoutMinutes;
+      conditions.timeoutMinutes = timeoutMinutes;
     }
 
     return conditions;
@@ -361,7 +361,7 @@ export function SchedulerTaskForm({
   const addRepository = () => {
     setRepositories([
       ...repositories,
-      { path: "", inactive_minutes: 10, _formId: crypto.randomUUID() },
+      { path: "", inactiveMinutes: 10, _formId: crypto.randomUUID() },
     ]);
   };
 
@@ -402,9 +402,9 @@ export function SchedulerTaskForm({
       schedule: buildSchedule(),
       task: buildTaskType(),
       conditions: buildConditions(),
-      skip_if_completed: skipIfCompleted,
-      auto_fix_on_failure: autoFixOnFailure,
-      success_criteria: successCriteria || undefined,
+      skipIfCompleted: skipIfCompleted,
+      autoFixOnFailure: autoFixOnFailure,
+      successCriteria: successCriteria || undefined,
     });
   };
 
@@ -634,7 +634,7 @@ export function SchedulerTaskForm({
                     {selectedWorkflow.category === "slash-command" && (
                       <Terminal className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
                     )}
-                    {selectedWorkflow.is_favorite && (
+                    {selectedWorkflow.isFavorite && (
                       <Star className="w-3.5 h-3.5 text-amber-400 fill-amber-400 shrink-0" />
                     )}
                     <span className="truncate">{selectedWorkflow.name}</span>
@@ -714,7 +714,7 @@ export function SchedulerTaskForm({
                             {wf.category === "slash-command" && (
                               <Terminal className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
                             )}
-                            {wf.is_favorite && (
+                            {wf.isFavorite && (
                               <Star className="w-3 h-3 text-amber-400 fill-amber-400 shrink-0" />
                             )}
                             <div className="min-w-0 flex-1">
@@ -903,9 +903,9 @@ export function SchedulerTaskForm({
                   </button>
                   <input
                     type="number"
-                    value={repo.inactive_minutes}
+                    value={repo.inactiveMinutes}
                     onChange={(e) =>
-                      updateRepository(idx, "inactive_minutes", parseInt(e.target.value, 10) || 1)
+                      updateRepository(idx, "inactiveMinutes", parseInt(e.target.value, 10) || 1)
                     }
                     min={1}
                     className="w-20 px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"

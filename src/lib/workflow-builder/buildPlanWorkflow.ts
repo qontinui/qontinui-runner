@@ -235,10 +235,10 @@ export function buildVerificationStep(
  * Build a multi-stage UnifiedWorkflow from a structured implementation plan.
  *
  * Each PlanPhase becomes a WorkflowStage. Within each stage:
- *   - setup_steps: empty (plan work is done by the agentic phase)
- *   - verification_steps: one step per TaskVerification across all tasks
- *   - agentic_steps: one prompt describing the phase's tasks
- *   - completion_steps: empty (summary is at workflow level)
+ *   - setupSteps: empty (plan work is done by the agentic phase)
+ *   - verificationSteps: one step per TaskVerification across all tasks
+ *   - agenticSteps: one prompt describing the phase's tasks
+ *   - completionSteps: empty (summary is at workflow level)
  */
 export function buildPlanWorkflow(input: BuildPlanWorkflowInput): UnifiedWorkflow {
   const {
@@ -283,11 +283,11 @@ export function buildPlanWorkflow(input: BuildPlanWorkflowInput): UnifiedWorkflo
       id: phase.id,
       name: phase.name,
       description: phase.description,
-      setup_steps: [],
-      verification_steps: verificationSteps,
-      agentic_steps: agenticSteps,
-      completion_steps: [],
-      max_iterations: phase.max_iterations ?? maxIterations,
+      setupSteps: [],
+      verificationSteps: verificationSteps,
+      agenticSteps: agenticSteps,
+      completionSteps: [],
+      maxIterations: phase.max_iterations ?? maxIterations,
       ...DEFAULT_STAGE_FLAGS,
     };
   });
@@ -306,15 +306,15 @@ export function buildPlanWorkflow(input: BuildPlanWorkflowInput): UnifiedWorkflo
     name,
     description: `Auto-generated from implementation plan. ${phases.length} phases, ${totalTasks} tasks, ${totalVerifications} verification checks.`,
     // Top-level steps are empty — all work is in stages
-    setup_steps: [],
-    verification_steps: [],
-    agentic_steps: [],
-    completion_steps: [createSummaryStep()],
-    max_iterations: maxIterations,
+    setupSteps: [],
+    verificationSteps: [],
+    agenticSteps: [],
+    completionSteps: [createSummaryStep()],
+    maxIterations: maxIterations,
     stages,
     category: "plan-generated",
     tags: ["plan", "auto-generated", "multi-stage"],
-    created_at: now,
+    createdAt: now,
     modified_at: now,
     ...DEFAULT_WORKFLOW_FLAGS,
   };

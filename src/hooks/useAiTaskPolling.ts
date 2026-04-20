@@ -124,7 +124,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
           if (taskStatus === "complete") {
             onCompleteRef.current?.(task);
           } else {
-            const errorMsg = task.error_message || `Task ${taskStatus}`;
+            const errorMsg = task.errorMessage || `Task ${taskStatus}`;
             setError(errorMsg);
             onErrorRef.current?.(errorMsg, task);
           }
@@ -204,7 +204,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
           if (task.status === "complete") {
             onCompleteRef.current?.(task);
           } else {
-            const errorMsg = task.error_message || `Task ${task.status}`;
+            const errorMsg = task.errorMessage || `Task ${task.status}`;
             setError(errorMsg);
             onErrorRef.current?.(errorMsg, task);
           }
@@ -248,12 +248,12 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
         }
 
         // Check for task_run_id (async mode)
-        if (result.task_run_id) {
+        if (result.taskRunId) {
           // Fetch initial task state and start polling
-          const task = await fetchTaskRun(result.task_run_id);
+          const task = await fetchTaskRun(result.taskRunId);
           if (task) {
             setCurrentTask(task);
-            startPolling(result.task_run_id);
+            startPolling(result.taskRunId);
             return task;
           } else {
             const errorMsg = "Failed to fetch initial task state";
@@ -269,16 +269,16 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
         const output = result.output || result.data?.output || result.data?.response || "";
         const syntheticTask: TaskRun = {
           id: `legacy-${Date.now()}`,
-          task_name: request.display_prompt || "AI Analysis",
+          taskName: request.displayPrompt || "AI Analysis",
           prompt: request.content,
-          task_type: "task",
+          taskType: "task",
           status: "complete",
-          sessions_count: 1,
-          auto_continue: true,
-          output_log: output,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
+          sessionsCount: 1,
+          autoContinue: true,
+          outputLog: output,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
         };
         setCurrentTask(syntheticTask);
         setIsRunning(false);
@@ -367,9 +367,9 @@ export async function executeAiTask(
   }
 
   // Handle async mode
-  if (result.task_run_id) {
+  if (result.taskRunId) {
     const startTime = Date.now();
-    const taskId = result.task_run_id;
+    const taskId = result.taskRunId;
 
     // Poll until complete or timeout
     while (Date.now() - startTime < timeoutMs) {
@@ -389,7 +389,7 @@ export async function executeAiTask(
         if (task.status === "complete") {
           return task;
         }
-        throw new Error(task.error_message || `Task ${task.status}`);
+        throw new Error(task.errorMessage || `Task ${task.status}`);
       }
 
       // Wait before next poll
@@ -403,15 +403,15 @@ export async function executeAiTask(
   const output = result.output || result.data?.output || result.data?.response || "";
   return {
     id: `legacy-${Date.now()}`,
-    task_name: request.display_prompt || "AI Analysis",
+    taskName: request.displayPrompt || "AI Analysis",
     prompt: request.content,
-    task_type: "task" as const,
+    taskType: "task" as const,
     status: "complete" as const,
-    sessions_count: 1,
-    auto_continue: true,
-    output_log: output,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    completed_at: new Date().toISOString(),
+    sessionsCount: 1,
+    autoContinue: true,
+    outputLog: output,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
   };
 }

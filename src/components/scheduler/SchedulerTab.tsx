@@ -142,9 +142,9 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
                 className={`w-2 h-2 rounded-full ${status.enabled ? getStatusColors("success").icon.replace("text-", "bg-") : "bg-text-muted"}`}
               />
               <span>{status.enabled ? "Running" : "Paused"}</span>
-              {status.running_tasks > 0 && (
+              {status.runningTasks > 0 && (
                 <span className={getStatusColors("running").text}>
-                  ({status.running_tasks} running)
+                  ({status.runningTasks} running)
                 </span>
               )}
             </div>

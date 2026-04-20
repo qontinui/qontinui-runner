@@ -185,23 +185,23 @@ class ExecutionReportingServiceImpl {
       logger.debug(`workflowMetadata: ${JSON.stringify(workflowMetadata, null, 2)}`);
 
       const input: ExecutionRunCreate = {
-        project_id: projectId,
-        run_type: runType,
-        run_name: runName,
-        runner_metadata: runnerMetadata,
-        workflow_metadata: workflowMetadata,
+        projectId: projectId,
+        runType: runType,
+        runName: runName,
+        runnerMetadata: runnerMetadata,
+        workflowMetadata: workflowMetadata,
         configuration,
       };
 
       const response = await invoke<ExecutionRunResponse>("create_execution_run", { input });
 
-      this.activeRunId = response.run_id;
+      this.activeRunId = response.runId;
       this.activeProjectId = projectId;
       this.activeRunType = runType;
       this.resetStats();
 
-      logger.info(`Run created: ${response.run_id}`);
-      return response.run_id;
+      logger.info(`Run created: ${response.runId}`);
+      return response.runId;
     } catch (error) {
       console.error("[ExecutionReporting] Failed to create run:", error);
       return null;
@@ -324,18 +324,18 @@ class ExecutionReportingServiceImpl {
     const durationMs = data.duration_ms ?? endTime.getTime() - data.startTime.getTime();
 
     const action: ActionExecutionCreate = {
-      sequence_number: this.getNextActionSequenceNumber(),
-      action_type: ActionType.AI_PROMPT,
-      action_name: data.name,
+      sequenceNumber: this.getNextActionSequenceNumber(),
+      actionType: ActionType.AI_PROMPT,
+      actionName: data.name,
       status: statusMap[data.status],
-      started_at: data.startTime.toISOString(),
-      completed_at: endTime.toISOString(),
-      duration_ms: durationMs,
-      input_data: data.input,
-      output_data: data.output,
-      error_message: data.error,
-      llm_metrics: data.llmMetrics,
-      span_type: "llm_call",
+      startedAt: data.startTime.toISOString(),
+      completedAt: endTime.toISOString(),
+      durationMs: durationMs,
+      inputData: data.input,
+      outputData: data.output,
+      errorMessage: data.error,
+      llmMetrics: data.llmMetrics,
+      spanType: "llm_call",
       metadata: data.metadata,
     };
 
@@ -380,23 +380,23 @@ class ExecutionReportingServiceImpl {
       const durationMs = data.duration_ms ?? endTime.getTime() - data.startTime.getTime();
 
       return {
-        sequence_number: this.getNextActionSequenceNumber(),
-        action_type: ActionType.AI_PROMPT,
-        action_name: data.name,
+        sequenceNumber: this.getNextActionSequenceNumber(),
+        actionType: ActionType.AI_PROMPT,
+        actionName: data.name,
         status: statusMap[data.status],
-        started_at: data.startTime.toISOString(),
-        completed_at: endTime.toISOString(),
-        duration_ms: durationMs,
-        input_data: data.input,
-        output_data: data.output,
-        error_message: data.error,
-        llm_metrics: data.llmMetrics,
-        span_type: "llm_call",
-        trace_id: traceId,
+        startedAt: data.startTime.toISOString(),
+        completedAt: endTime.toISOString(),
+        durationMs: durationMs,
+        inputData: data.input,
+        outputData: data.output,
+        errorMessage: data.error,
+        llmMetrics: data.llmMetrics,
+        spanType: "llm_call",
+        traceId: traceId,
         metadata: {
           ...data.metadata,
           parent_span_id: clientSpanId,
-          parent_sequence_number: parentSequenceNumber,
+          parent_sequenceNumber: parentSequenceNumber,
         },
       };
     });
@@ -426,16 +426,16 @@ class ExecutionReportingServiceImpl {
     // Build parent action — includes client_span_id so children can be correlated
     // via metadata.parent_span_id == metadata.client_span_id
     const parentAction: ActionExecutionCreate = {
-      sequence_number: parentSequenceNumber,
-      action_type: ActionType.RUN_PROMPT_SEQUENCE,
-      action_name: sequenceName,
+      sequenceNumber: parentSequenceNumber,
+      actionType: ActionType.RUN_PROMPT_SEQUENCE,
+      actionName: sequenceName,
       status: parentStatus,
-      started_at: earliestStart.toISOString(),
-      completed_at: latestEnd.toISOString(),
-      duration_ms: parentDurationMs,
-      llm_metrics: aggregatedMetrics,
-      span_type: "agent",
-      trace_id: traceId,
+      startedAt: earliestStart.toISOString(),
+      completedAt: latestEnd.toISOString(),
+      durationMs: parentDurationMs,
+      llmMetrics: aggregatedMetrics,
+      spanType: "agent",
+      traceId: traceId,
       metadata: {
         child_count: actions.length,
         is_parent_span: true,
@@ -482,18 +482,18 @@ class ExecutionReportingServiceImpl {
 
     // Map ImageRecognitionData to ActionExecutionCreate
     const action: ActionExecutionCreate = {
-      sequence_number: this.getNextActionSequenceNumber(),
-      action_type: ActionType.FIND,
-      action_name: recognition.pattern_name || recognition.pattern_id,
+      sequenceNumber: this.getNextActionSequenceNumber(),
+      actionType: ActionType.FIND,
+      actionName: recognition.pattern_name || recognition.pattern_id,
       status: recognition.success ? ActionStatus.SUCCESS : ActionStatus.FAILED,
-      started_at: new Date().toISOString(),
-      completed_at: new Date().toISOString(),
-      duration_ms: recognition.duration_ms || 0,
-      pattern_id: recognition.pattern_id,
-      pattern_name: recognition.pattern_name,
-      active_states: recognition.active_states,
-      confidence_score: recognition.best_match_score,
-      match_location:
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      durationMs: recognition.duration_ms || 0,
+      patternId: recognition.pattern_id,
+      patternName: recognition.pattern_name,
+      activeStates: recognition.active_states,
+      confidenceScore: recognition.best_match_score,
+      matchLocation:
         recognition.match_x !== undefined
           ? {
               x: recognition.match_x,
@@ -502,7 +502,7 @@ class ExecutionReportingServiceImpl {
               height: recognition.match_height,
             }
           : undefined,
-      output_data: {
+      outputData: {
         match_count: recognition.match_count,
         ...recognition.result_data,
       },
@@ -535,17 +535,17 @@ class ExecutionReportingServiceImpl {
 
     // Map TransitionData to ActionExecutionCreate
     const action: ActionExecutionCreate = {
-      sequence_number: transition.sequence_number,
-      action_type: ActionType.TRANSITION,
-      action_name: transition.transition_name,
+      sequenceNumber: transition.sequence_number,
+      actionType: ActionType.TRANSITION,
+      actionName: transition.transition_name,
       status: statusMap[transition.status],
-      started_at: transition.started_at,
-      completed_at: transition.completed_at,
-      duration_ms: transition.duration_ms,
-      from_state: transition.from_state,
-      to_state: transition.to_state,
-      error_message: transition.error_message,
-      screenshot_id: transition.screenshot_id,
+      startedAt: transition.started_at,
+      completedAt: transition.completed_at,
+      durationMs: transition.duration_ms,
+      fromState: transition.from_state,
+      toState: transition.to_state,
+      errorMessage: transition.error_message,
+      screenshotId: transition.screenshot_id,
       metadata: transition.metadata,
     };
 
@@ -582,10 +582,10 @@ class ExecutionReportingServiceImpl {
 
       const input: ExecutionRunComplete = {
         status,
-        ended_at: new Date().toISOString(),
+        endedAt: new Date().toISOString(),
         stats: finalStats,
         coverage: finalCoverage,
-        error_message: errorMessage,
+        errorMessage: errorMessage,
       };
 
       const response = await invoke<ExecutionRunCompleteResponse>("complete_execution_run", {
@@ -593,7 +593,7 @@ class ExecutionReportingServiceImpl {
         input,
       });
 
-      logger.info(`Run completed: ${response.status}, duration: ${response.duration_seconds}s`);
+      logger.info(`Run completed: ${response.status}, duration: ${response.durationSeconds}s`);
 
       // Reset state
       this.activeRunId = null;
@@ -717,35 +717,35 @@ class ExecutionReportingServiceImpl {
     }
 
     // Accumulate action duration for accurate averaging
-    if (action.duration_ms) {
-      this.executionStats.totalActionDurationMs += action.duration_ms;
+    if (action.durationMs) {
+      this.executionStats.totalActionDurationMs += action.durationMs;
     }
 
     // Track states covered
-    if (action.from_state) {
-      this.executionStats.statesCovered.add(action.from_state);
+    if (action.fromState) {
+      this.executionStats.statesCovered.add(action.fromState);
     }
-    if (action.to_state) {
-      this.executionStats.statesCovered.add(action.to_state);
+    if (action.toState) {
+      this.executionStats.statesCovered.add(action.toState);
     }
-    if (action.active_states) {
-      for (const state of action.active_states) {
+    if (action.activeStates) {
+      for (const state of action.activeStates) {
         this.executionStats.statesCovered.add(state);
       }
     }
 
     // Track transitions covered
-    if (action.from_state && action.to_state) {
-      const transitionKey = `${action.from_state}->${action.to_state}`;
+    if (action.fromState && action.toState) {
+      const transitionKey = `${action.fromState}->${action.toState}`;
       this.executionStats.transitionsCovered.add(transitionKey);
     }
 
     // Accumulate LLM metrics
-    if (action.llm_metrics) {
+    if (action.llmMetrics) {
       this.executionStats.llmActionCount++;
-      this.executionStats.totalTokensInput += action.llm_metrics.tokens_input ?? 0;
-      this.executionStats.totalTokensOutput += action.llm_metrics.tokens_output ?? 0;
-      this.executionStats.totalCostUsd += action.llm_metrics.cost_usd ?? 0;
+      this.executionStats.totalTokensInput += action.llmMetrics.tokensInput ?? 0;
+      this.executionStats.totalTokensOutput += action.llmMetrics.tokensOutput ?? 0;
+      this.executionStats.totalCostUsd += action.llmMetrics.costUsd ?? 0;
     }
   }
 
@@ -754,18 +754,18 @@ class ExecutionReportingServiceImpl {
     const totalActions = this.executionStats.totalActions;
 
     return {
-      total_actions: totalActions,
-      successful_actions: this.executionStats.successfulActions,
-      failed_actions: this.executionStats.failedActions,
-      timeout_actions: this.executionStats.timeoutActions,
-      skipped_actions: this.executionStats.skippedActions,
-      total_duration_ms: durationMs,
-      avg_action_duration_ms:
+      totalActions: totalActions,
+      successfulActions: this.executionStats.successfulActions,
+      failedActions: this.executionStats.failedActions,
+      timeoutActions: this.executionStats.timeoutActions,
+      skippedActions: this.executionStats.skippedActions,
+      totalDurationMs: durationMs,
+      avgActionDurationMs:
         totalActions > 0 ? Math.round(this.executionStats.totalActionDurationMs / totalActions) : 0,
-      llm_action_count: this.executionStats.llmActionCount,
-      total_tokens_input: this.executionStats.totalTokensInput,
-      total_tokens_output: this.executionStats.totalTokensOutput,
-      total_cost_usd: this.executionStats.totalCostUsd,
+      llmActionCount: this.executionStats.llmActionCount,
+      totalTokensInput: this.executionStats.totalTokensInput,
+      totalTokensOutput: this.executionStats.totalTokensOutput,
+      totalCostUsd: this.executionStats.totalCostUsd,
     };
   }
 
@@ -779,11 +779,11 @@ class ExecutionReportingServiceImpl {
     }
 
     return {
-      coverage_percentage: 0, // Would need total to calculate
-      states_covered: statesCovered,
-      total_states: 0, // Would need workflow metadata
-      transitions_covered: transitionsCovered,
-      total_transitions: 0, // Would need workflow metadata
+      coveragePercentage: 0, // Would need total to calculate
+      statesCovered: statesCovered,
+      totalStates: 0, // Would need workflow metadata
+      transitionsCovered: transitionsCovered,
+      totalTransitions: 0, // Would need workflow metadata
     };
   }
 
@@ -802,16 +802,16 @@ class ExecutionReportingServiceImpl {
 
     for (const action of metricsActions) {
       const m = action.llmMetrics!;
-      tokensInput += m.tokens_input ?? 0;
-      tokensOutput += m.tokens_output ?? 0;
-      costUsd += m.cost_usd ?? 0;
+      tokensInput += m.tokensInput ?? 0;
+      tokensOutput += m.tokensOutput ?? 0;
+      costUsd += m.costUsd ?? 0;
     }
 
     return {
-      tokens_input: tokensInput,
-      tokens_output: tokensOutput,
-      tokens_total: tokensInput + tokensOutput,
-      cost_usd: costUsd,
+      tokensInput: tokensInput,
+      tokensOutput: tokensOutput,
+      tokensTotal: tokensInput + tokensOutput,
+      costUsd: costUsd,
     };
   }
 

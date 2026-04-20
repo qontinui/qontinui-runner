@@ -201,7 +201,7 @@ function reportToExecutionService(
 ): void {
   // Map node type to ActionType (using node_type and action_type from metadata)
   let actionType: ActionType = ActionType.CUSTOM;
-  const nodeTypeStr = (node.node_type || "").toLowerCase();
+  const nodeTypeStr = (node.nodeType || "").toLowerCase();
   const actionTypeFromMeta = metadata.action_type as string | undefined;
   const actionTypeStr =
     typeof actionTypeFromMeta === "string" ? actionTypeFromMeta.toLowerCase() : "";
@@ -240,26 +240,26 @@ function reportToExecutionService(
   const llmMetrics = extractLLMMetrics(metadata, runtime);
 
   const actionExecution: ActionExecutionCreate = {
-    sequence_number: executionReportingService.getNextActionSequenceNumber(),
-    action_type: actionType,
-    action_name: node.name || "Unknown Action",
+    sequenceNumber: executionReportingService.getNextActionSequenceNumber(),
+    actionType: actionType,
+    actionName: node.name || "Unknown Action",
     status: actionStatus,
-    started_at: startedAt.toISOString(),
-    completed_at: completedAt.toISOString(),
-    duration_ms: durationMs,
-    from_state: stateContext?.active_before?.[0],
-    to_state: stateContext?.active_after?.[0],
-    active_states: stateContext?.active_after,
-    confidence_score: confidenceScore,
-    error_message: node.error ?? undefined,
-    error_type: node.error ? ErrorType.OTHER : undefined,
-    screenshot_id: metadata.screenshot_reference as string | undefined,
-    llm_metrics: llmMetrics,
-    span_type: spanType,
-    trace_id: metadata.trace_id as string | undefined,
+    startedAt: startedAt.toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs: durationMs,
+    fromState: stateContext?.active_before?.[0],
+    toState: stateContext?.active_after?.[0],
+    activeStates: stateContext?.active_after,
+    confidenceScore: confidenceScore,
+    errorMessage: node.error ?? undefined,
+    errorType: node.error ? ErrorType.OTHER : undefined,
+    screenshotId: metadata.screenshot_reference as string | undefined,
+    llmMetrics: llmMetrics,
+    spanType: spanType,
+    traceId: metadata.trace_id as string | undefined,
     metadata: {
       node_id: node.id,
-      node_type: node.node_type,
+      node_type: node.nodeType,
       // Store parent linkage in metadata rather than parent_id FK column,
       // since we don't have the server-assigned UUID for the parent action.
       ...(metadata.parent_id ? { parent_span_id: metadata.parent_id } : {}),

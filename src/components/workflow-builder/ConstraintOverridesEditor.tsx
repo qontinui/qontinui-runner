@@ -48,7 +48,7 @@ const STATE_COLORS: Record<OverrideState, string> = {
 export function ConstraintOverridesEditor() {
   const { state, updateWorkflow } = useWorkflowBuilder();
   const { workflow } = state;
-  const overrides = workflow.constraint_overrides;
+  const overrides = workflow.constraintOverrides;
 
   const [constraints, setConstraints] = useState<Constraint[]>([]);
   const [loading, setLoading] = useState(true);
@@ -92,7 +92,7 @@ export function ConstraintOverridesEditor() {
 
     // Clean up: only store if there are actual overrides
     updateWorkflow({
-      constraint_overrides: Object.keys(updated).length > 0 ? updated : undefined,
+      constraintOverrides: Object.keys(updated).length > 0 ? updated : undefined,
     });
   };
 

@@ -75,10 +75,26 @@ export class ExecutionTreeManager {
    * @returns The DisplayNode that was created or updated
    */
   handleTreeEvent(event: TreeEventData): DisplayNode {
-    const { node: nodeData, event_type } = event;
+    // TreeEvent wire types use camelCase (eventType, node.nodeType, etc.);
+    // the runner's internal DisplayNode still uses snake_case for historical
+    // reasons. Translate wire -> internal here so the rest of the manager
+    // continues to work unchanged.
+    const wireNode = event.node;
+    const nodeData = {
+      id: wireNode.id,
+      node_type: wireNode.nodeType,
+      name: wireNode.name,
+      timestamp: wireNode.timestamp,
+      end_timestamp: wireNode.endTimestamp,
+      duration: wireNode.duration,
+      status: wireNode.status,
+      metadata: wireNode.metadata as ExtendedNodeMetadata | undefined,
+      error: wireNode.error,
+      parent_id: wireNode.parentId as string | null | undefined,
+    };
 
     logger.debug(
-      `Handling ${event_type} for ${nodeData.node_type} "${nodeData.name}" (id: ${nodeData.id})`,
+      `Handling ${event.eventType} for ${nodeData.node_type} "${nodeData.name}" (id: ${nodeData.id})`,
     );
 
     // Get or create node
@@ -135,12 +151,12 @@ export class ExecutionTreeManager {
     // Flatten execution_record metadata into top-level metadata
     // Backend sends: metadata.execution_record.metadata.runtime
     // Frontend expects: metadata.runtime
-    // is_expandable / is_inline are required on NodeMetadata (the Rust type
+    // isExpandable / isInline are required on NodeMetadata (the Rust type
     // has `#[serde(default)]` on both — after deserialization they're
     // always present). Default to false when the backend omits them.
     const flattenedMetadata: ExtendedNodeMetadata = {
-      is_expandable: false,
-      is_inline: false,
+      isExpandable: false,
+      isInline: false,
       ...(nodeData.metadata || {}),
     };
     const executionRecord = flattenedMetadata.execution_record;
@@ -254,8 +270,8 @@ export class ExecutionTreeManager {
     if (nodeData.metadata) {
       // Flatten execution_record metadata before merging
       const flattenedMetadata: ExtendedNodeMetadata = {
-        is_expandable: false,
-        is_inline: false,
+        isExpandable: false,
+        isInline: false,
         ...nodeData.metadata,
       };
       const executionRecord = flattenedMetadata.execution_record;

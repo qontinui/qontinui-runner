@@ -74,7 +74,7 @@ export function WorkflowPreview({ workflow, onApply }: WorkflowPreviewProps) {
 
       {/* Settings summary */}
       <div className="flex gap-4 text-xs text-muted-foreground">
-        {workflow.max_iterations && <span>Max iterations: {workflow.max_iterations}</span>}
+        {workflow.maxIterations && <span>Max iterations: {workflow.maxIterations}</span>}
         {workflow.tags.length > 0 && <span>Tags: {workflow.tags.join(", ")}</span>}
       </div>
 

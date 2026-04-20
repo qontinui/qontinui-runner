@@ -156,7 +156,7 @@ Return this exact JSON format:
       );
 
       // Parse the AI response
-      const output = task.output_log || "";
+      const output = task.outputLog || "";
       const jsonMatch = output.match(/\{[\s\S]*"pages"[\s\S]*\}/);
       if (!jsonMatch) {
         throw new Error("AI did not return valid JSON. Response: " + output.slice(0, 200));

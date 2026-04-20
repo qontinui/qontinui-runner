@@ -149,13 +149,13 @@ function getPhaseSteps(
   // strict `UnifiedStep[]` (= CanonicalStep[]) the builder expects.
   switch (phase) {
     case "setup":
-      return (source.setup_steps ?? []) as UnifiedStep[];
+      return (source.setupSteps ?? []) as UnifiedStep[];
     case "verification":
-      return (source.verification_steps ?? []) as UnifiedStep[];
+      return (source.verificationSteps ?? []) as UnifiedStep[];
     case "agentic":
-      return (source.agentic_steps ?? []) as UnifiedStep[];
+      return (source.agenticSteps ?? []) as UnifiedStep[];
     case "completion":
-      return (source.completion_steps ?? []) as UnifiedStep[];
+      return (source.completionSteps ?? []) as UnifiedStep[];
     default:
       return [];
   }
@@ -174,16 +174,16 @@ function setPhaseSteps(
       const updated = { ...s };
       switch (phase) {
         case "setup":
-          updated.setup_steps = steps as SetupStep[];
+          updated.setupSteps = steps as SetupStep[];
           break;
         case "verification":
-          updated.verification_steps = steps as VerificationStep[];
+          updated.verificationSteps = steps as VerificationStep[];
           break;
         case "agentic":
-          updated.agentic_steps = steps as AgenticStep[];
+          updated.agenticSteps = steps as AgenticStep[];
           break;
         case "completion":
-          updated.completion_steps = steps as CompletionStep[];
+          updated.completionSteps = steps as CompletionStep[];
           break;
       }
       return updated;
@@ -192,13 +192,13 @@ function setPhaseSteps(
   }
   switch (phase) {
     case "setup":
-      return { ...workflow, setup_steps: steps as SetupStep[] };
+      return { ...workflow, setupSteps: steps as SetupStep[] };
     case "verification":
-      return { ...workflow, verification_steps: steps as VerificationStep[] };
+      return { ...workflow, verificationSteps: steps as VerificationStep[] };
     case "agentic":
-      return { ...workflow, agentic_steps: steps as AgenticStep[] };
+      return { ...workflow, agenticSteps: steps as AgenticStep[] };
     case "completion":
-      return { ...workflow, completion_steps: steps as CompletionStep[] };
+      return { ...workflow, completionSteps: steps as CompletionStep[] };
     default:
       return workflow;
   }
@@ -256,7 +256,7 @@ function workflowBuilderReducer(
 
       if (phase === "completion") {
         const summaryIndex = existing.findIndex(
-          (s) => s.type === "prompt" && (s as PromptStep).is_summary_step === true,
+          (s) => s.type === "prompt" && (s as PromptStep).isSummaryStep === true,
         );
         if (summaryIndex >= 0) {
           newSteps = [
@@ -312,7 +312,7 @@ function workflowBuilderReducer(
         if (
           stepToMove &&
           stepToMove.type === "prompt" &&
-          (stepToMove as PromptStep).is_summary_step
+          (stepToMove as PromptStep).isSummaryStep
         ) {
           return state;
         }
@@ -321,7 +321,7 @@ function workflowBuilderReducer(
         if (direction === "down") {
           const idx = steps.findIndex((s) => s.id === stepId);
           const nextStep = steps[idx + 1];
-          if (nextStep && nextStep.type === "prompt" && (nextStep as PromptStep).is_summary_step) {
+          if (nextStep && nextStep.type === "prompt" && (nextStep as PromptStep).isSummaryStep) {
             return state;
           }
         }
@@ -383,16 +383,21 @@ function workflowBuilderReducer(
       return { ...state, error: action.payload };
 
     case "RESET_TO_NEW": {
-      // createDefaultWorkflow()'s declared return type is an Omit of the new
-      // strict UnifiedWorkflow, but UnifiedWorkflow's index signature defeats
-      // spread inference; cast to assemble the full workflow.
+      // NOTE: createDefaultWorkflow() (from @qontinui/workflow-utils) still
+      // returns snake_case step arrays; remap to the canonical camelCase
+      // UnifiedWorkflow shape the runner's in-memory types expect.
+      const emptyBase = createDefaultWorkflow() as unknown as Record<string, unknown>;
       const emptyWorkflow: UnifiedWorkflow = {
         ...DEFAULT_WORKFLOW_FLAGS,
-        ...createDefaultWorkflow(),
+        ...emptyBase,
+        setupSteps: (emptyBase.setup_steps ?? []) as UnifiedStep[],
+        verificationSteps: (emptyBase.verification_steps ?? []) as UnifiedStep[],
+        agenticSteps: (emptyBase.agentic_steps ?? []) as UnifiedStep[],
+        completionSteps: (emptyBase.completion_steps ?? []) as UnifiedStep[],
         id: generateStepId(),
-        created_at: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
         modified_at: new Date().toISOString(),
-      } as UnifiedWorkflow;
+      } as unknown as UnifiedWorkflow;
       return {
         ...state,
         workflow: emptyWorkflow,
@@ -422,22 +427,22 @@ function workflowBuilderReducer(
           id: generateStepId(),
           name: state.workflow.name || "Phase 1",
           description: "",
-          setup_steps: state.workflow.setup_steps,
-          verification_steps: state.workflow.verification_steps,
-          agentic_steps: state.workflow.agentic_steps,
-          completion_steps: state.workflow.completion_steps ?? [],
-          max_iterations: state.workflow.max_iterations ?? 10,
+          setupSteps: state.workflow.setupSteps,
+          verificationSteps: state.workflow.verificationSteps,
+          agenticSteps: state.workflow.agenticSteps,
+          completionSteps: state.workflow.completionSteps ?? [],
+          maxIterations: state.workflow.maxIterations ?? 10,
           ...DEFAULT_STAGE_FLAGS,
         };
         const newStage: WorkflowStage = {
           id: generateStepId(),
           name: action.payload.name,
           description: "",
-          setup_steps: [],
-          verification_steps: [],
-          agentic_steps: [],
-          completion_steps: [],
-          max_iterations: state.workflow.max_iterations ?? 10,
+          setupSteps: [],
+          verificationSteps: [],
+          agenticSteps: [],
+          completionSteps: [],
+          maxIterations: state.workflow.maxIterations ?? 10,
           ...DEFAULT_STAGE_FLAGS,
         };
         return {
@@ -445,10 +450,10 @@ function workflowBuilderReducer(
           workflow: {
             ...state.workflow,
             stages: [phase1, newStage],
-            setup_steps: [],
-            verification_steps: [],
-            agentic_steps: [],
-            completion_steps: [],
+            setupSteps: [],
+            verificationSteps: [],
+            agenticSteps: [],
+            completionSteps: [],
           },
           currentStageIndex: 1, // Select the newly added phase
         };
@@ -457,11 +462,11 @@ function workflowBuilderReducer(
         id: generateStepId(),
         name: action.payload.name,
         description: "",
-        setup_steps: [],
-        verification_steps: [],
-        agentic_steps: [],
-        completion_steps: [],
-        max_iterations: state.workflow.max_iterations ?? 10,
+        setupSteps: [],
+        verificationSteps: [],
+        agenticSteps: [],
+        completionSteps: [],
+        maxIterations: state.workflow.maxIterations ?? 10,
         ...DEFAULT_STAGE_FLAGS,
       };
       return {
@@ -492,10 +497,10 @@ function workflowBuilderReducer(
           workflow: {
             ...state.workflow,
             stages: undefined,
-            setup_steps: sole.setup_steps ?? [],
-            verification_steps: sole.verification_steps ?? [],
-            agentic_steps: sole.agentic_steps ?? [],
-            completion_steps: sole.completion_steps ?? [],
+            setupSteps: sole.setupSteps ?? [],
+            verificationSteps: sole.verificationSteps ?? [],
+            agenticSteps: sole.agenticSteps ?? [],
+            completionSteps: sole.completionSteps ?? [],
           },
           currentStageIndex: null,
           selectedStepId: null,
@@ -643,7 +648,11 @@ function loadFromStorage(): UnifiedWorkflow | null {
   try {
     const parsed = instanceStorage.getJSON<UnifiedWorkflow | null>(STORAGE_KEY, null);
     // Validate it has the required structure
-    if (parsed && typeof parsed === "object" && "setup_steps" in parsed) {
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      ("setupSteps" in parsed || "setup_steps" in parsed)
+    ) {
       return parsed as UnifiedWorkflow;
     }
   } catch (e) {
@@ -656,7 +665,11 @@ function loadFromStorage(): UnifiedWorkflow | null {
 function loadOriginalFromStorage(): UnifiedWorkflow | null {
   try {
     const parsed = instanceStorage.getJSON<UnifiedWorkflow | null>(STORAGE_KEY_ORIGINAL, null);
-    if (parsed && typeof parsed === "object" && "setup_steps" in parsed) {
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      ("setupSteps" in parsed || "setup_steps" in parsed)
+    ) {
       return parsed as UnifiedWorkflow;
     }
   } catch (e) {
@@ -701,17 +714,24 @@ function RunnerWorkflowBuilderInner({
   // Also load the original workflow to preserve update vs create state
   const storedOriginalWorkflow = !initialWorkflow && !startEmpty ? loadOriginalFromStorage() : null;
 
-  // createDefaultWorkflow() returns a partial with runtime-only fields; its
-  // declared type is `Omit<UnifiedWorkflow, "id"|"created_at"|"modified_at">`
-  // but the index signature on UnifiedWorkflow defeats precise spread
-  // inference, so cast to assemble the full workflow.
+  // NOTE: createDefaultWorkflow() (from @qontinui/workflow-utils) still
+  // returns snake_case step arrays; the runner's in-memory UnifiedWorkflow
+  // uses camelCase. Remap step keys before widening to UnifiedWorkflow so
+  // consumers see the canonical shape. `unknown` cast is required because
+  // the source type's stale snake_case fields don't overlap with the
+  // destination type.
+  const emptyBase = createDefaultWorkflow() as unknown as Record<string, unknown>;
   const emptyWorkflow: UnifiedWorkflow = {
     ...DEFAULT_WORKFLOW_FLAGS,
-    ...createDefaultWorkflow(),
+    ...emptyBase,
+    setupSteps: (emptyBase.setup_steps ?? []) as UnifiedStep[],
+    verificationSteps: (emptyBase.verification_steps ?? []) as UnifiedStep[],
+    agenticSteps: (emptyBase.agentic_steps ?? []) as UnifiedStep[],
+    completionSteps: (emptyBase.completion_steps ?? []) as UnifiedStep[],
     id: generateStepId(),
-    created_at: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
     modified_at: new Date().toISOString(),
-  } as UnifiedWorkflow;
+  } as unknown as UnifiedWorkflow;
 
   const initialState: WorkflowBuilderState = {
     workflow: initialWorkflow ?? storedWorkflow ?? emptyWorkflow,
@@ -902,41 +922,46 @@ function RunnerWorkflowBuilderInner({
       const workflow = state.workflow;
       const isNew = !state.originalWorkflow || state.originalWorkflow.id !== workflow.id;
 
-      // Prepare the request body
+      // Prepare the request body.
+      // NOTE: The runner's HTTP endpoint (CreateUnifiedWorkflowRequest in
+      // unified_workflows.rs) still accepts snake_case fields, so map from
+      // the in-memory camelCase UnifiedWorkflow to the wire's snake_case
+      // body here. This is the single runner<->HTTP translation point.
       const body = {
         name: workflow.name || "Untitled Workflow",
         description: workflow.description,
         category: workflow.category,
         tags: workflow.tags,
-        setup_steps: workflow.setup_steps,
-        verification_steps: workflow.verification_steps,
-        agentic_steps: workflow.agentic_steps,
-        completion_steps: workflow.completion_steps ?? [],
-        max_iterations: workflow.max_iterations,
+        setup_steps: workflow.setupSteps,
+        verification_steps: workflow.verificationSteps,
+        agentic_steps: workflow.agenticSteps,
+        completion_steps: workflow.completionSteps ?? [],
+        max_iterations: workflow.maxIterations,
         provider: workflow.provider,
         model: workflow.model,
-        skip_ai_summary: workflow.skip_ai_summary,
-        log_source_selection: workflow.log_source_selection,
-        context_ids: workflow.context_ids,
-        disabled_context_ids: workflow.disabled_context_ids,
-        auto_include_contexts: workflow.auto_include_contexts,
-        prompt_template: workflow.prompt_template,
-        log_watch_enabled: workflow.log_watch_enabled,
-        health_check_enabled: workflow.health_check_enabled,
-        health_check_urls: workflow.health_check_urls,
+        skip_ai_summary: workflow.skipAiSummary,
+        log_source_selection: workflow.logSourceSelection,
+        context_ids: workflow.contextIds,
+        disabled_context_ids: workflow.disabledContextIds,
+        auto_include_contexts: workflow.autoIncludeContexts,
+        prompt_template: workflow.promptTemplate,
+        log_watch_enabled: workflow.logWatchEnabled,
+        health_check_enabled: workflow.healthCheckEnabled,
+        health_check_urls: workflow.healthCheckUrls,
         stages: workflow.stages,
-        stop_on_failure: workflow.stop_on_failure,
-        reflection_mode: workflow.reflection_mode,
-        strict_cwd: workflow.strict_cwd,
-        tool_tags: workflow.tool_tags,
-        use_worktree: workflow.use_worktree,
-        multi_agent_mode: workflow.multi_agent_mode,
-        workflow_architecture: workflow.workflow_architecture,
-        multi_agent_pipeline_config: workflow.multi_agent_pipeline_config,
-        model_overrides: workflow.model_overrides,
-        htn_enabled: workflow.htn_enabled,
-        htn_ui_bridge_url: workflow.htn_ui_bridge_url,
-        htn_state_machine_path: workflow.htn_state_machine_path,
+        stop_on_failure: workflow.stopOnFailure,
+        reflection_mode: workflow.reflectionMode,
+        strict_cwd: workflow.strictCwd,
+        tool_tags: workflow.toolTags,
+        use_worktree: workflow.useWorktree,
+        multi_agent_mode: workflow.multiAgentMode,
+        workflow_architecture: workflow.workflowArchitecture,
+        multi_agent_pipeline_config: (workflow as { multi_agent_pipeline_config?: unknown })
+          .multi_agent_pipeline_config,
+        model_overrides: workflow.modelOverrides,
+        htn_enabled: workflow.htnEnabled,
+        htn_ui_bridge_url: workflow.htnUiBridgeUrl,
+        htn_state_machine_path: workflow.htnStateMachinePath,
       };
 
       const url = isNew

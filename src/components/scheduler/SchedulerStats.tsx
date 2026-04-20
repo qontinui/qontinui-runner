@@ -91,13 +91,13 @@ export function SchedulerStats({ tasks, taskHistory, status: _status }: Schedule
 
     // Average duration calculation
     let avgDurationValue: string;
-    const completedRecords = taskHistory.filter((r) => r.ended_at);
+    const completedRecords = taskHistory.filter((r) => r.endedAt);
     if (completedRecords.length === 0) {
       avgDurationValue = "\u2014";
     } else {
       const totalDuration = completedRecords.reduce((sum, r) => {
-        const start = new Date(r.started_at).getTime();
-        const end = new Date(r.ended_at!).getTime();
+        const start = new Date(r.startedAt).getTime();
+        const end = new Date(r.endedAt!).getTime();
         return sum + (end - start) / 1000;
       }, 0);
       avgDurationValue = formatDuration(totalDuration / completedRecords.length);

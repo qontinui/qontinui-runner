@@ -599,8 +599,8 @@ test('${form.name || "test"}', async ({ page }) => {
         timeout_seconds: 300,
       });
 
-      if (task.output_log) {
-        const codeMatch = task.output_log.match(/```(?:typescript|ts)?\s*([\s\S]*?)```/);
+      if (task.outputLog) {
+        const codeMatch = task.outputLog.match(/```(?:typescript|ts)?\s*([\s\S]*?)```/);
         if (codeMatch) {
           const generatedCode = codeMatch[1].trim();
           dispatch({ type: "SET_SCRIPT_CONTENT", value: generatedCode });
@@ -792,8 +792,8 @@ test('${form.name || "test"}', async ({ page }) => {
         timeout_seconds: 120,
       });
 
-      if (task.output_log) {
-        const generatedCode = extractPlaywrightCode(task.output_log);
+      if (task.outputLog) {
+        const generatedCode = extractPlaywrightCode(task.outputLog);
         if (generatedCode) {
           dispatch({ type: "SET_SCRIPT_CONTENT", value: generatedCode });
           setLastGeneratedFromDescription(form.description);
@@ -897,8 +897,8 @@ Be thorough - check each action, assertion, and behavior mentioned in the descri
         timeout_seconds: 60,
       });
 
-      if (task.output_log) {
-        const output = task.output_log;
+      if (task.outputLog) {
+        const output = task.outputLog;
         if (output.includes("COVERAGE: COMPLETE")) {
           onLog("success", "Script implements all requirements from description!");
           return [];
@@ -994,8 +994,8 @@ import { test, expect } from '@playwright/test';
         timeout_seconds: 120,
       });
 
-      if (task.output_log) {
-        const generatedCode = extractPlaywrightCode(task.output_log);
+      if (task.outputLog) {
+        const generatedCode = extractPlaywrightCode(task.outputLog);
         if (generatedCode) {
           dispatch({ type: "SET_SCRIPT_CONTENT", value: generatedCode });
           setViewMode("code");
@@ -1073,8 +1073,8 @@ OR
         image_paths: testResult.screenshots || [],
       });
 
-      if (task.output_log) {
-        const jsonMatch = task.output_log.match(/\{[\s\S]*\}/);
+      if (task.outputLog) {
+        const jsonMatch = task.outputLog.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           const parsed = JSON.parse(jsonMatch[0]);
           return {
@@ -1339,13 +1339,13 @@ import { test, expect } from '@playwright/test';
           break;
         }
 
-        if (!aiTask.output_log) {
+        if (!aiTask.outputLog) {
           log("AI refinement failed: No output");
           console.error("[AUTO-REFINE] AI failed: No output_log");
           break;
         }
 
-        const output = aiTask.output_log;
+        const output = aiTask.outputLog;
         logger.debug("AUTO-REFINE AI output length:", output?.length);
 
         const changesMatch = output.match(/CHANGES:\s*(.+?)(?:\n|$)/i);
@@ -1484,8 +1484,8 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
         timeout_seconds: 60,
       });
 
-      if (task.output_log) {
-        const output = task.output_log.trim();
+      if (task.outputLog) {
+        const output = task.outputLog.trim();
         const cleanDescription = output
           .replace(/^```[\s\S]*?```$/gm, "")
           .replace(/^\*\*.*?\*\*:?\s*/gm, "")

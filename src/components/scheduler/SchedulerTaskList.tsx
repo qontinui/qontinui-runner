@@ -58,9 +58,9 @@ export function SchedulerTaskList({
   }
 
   const getStatusIcon = (task: ScheduledTask) => {
-    if (!task.last_run) return null;
+    if (!task.lastRun) return null;
 
-    const status = task.last_run.status;
+    const status = task.lastRun.status;
     switch (status) {
       case "running":
         return <Loader2 className={`w-4 h-4 ${getStatusColors("running").icon} animate-spin`} />;
@@ -105,14 +105,14 @@ export function SchedulerTaskList({
                   {!task.enabled && (
                     <span className="px-2 py-0.5 text-xs bg-muted rounded">Disabled</span>
                   )}
-                  {task.skip_if_completed && task.last_run?.success && (
+                  {task.skipIfCompleted && task.lastRun?.success && (
                     <span
                       className={`px-2 py-0.5 text-xs ${getAccentColors("green").bg} ${getAccentColors("green").text} rounded`}
                     >
                       Completed
                     </span>
                   )}
-                  {task.auto_fix_on_failure && (
+                  {task.autoFixOnFailure && (
                     <span
                       className={`px-2 py-0.5 text-xs ${getAccentColors("orange").bg} ${getAccentColors("orange").text} rounded`}
                     >
@@ -198,45 +198,45 @@ export function SchedulerTaskList({
             </div>
 
             {/* Expanded details when selected */}
-            {isSelected && task.last_run && (
+            {isSelected && task.lastRun && (
               <div className="mt-4 pt-4 border-t border-border">
                 <h4 className="text-sm font-medium mb-2">Last Execution</h4>
                 <div className="grid grid-cols-2 gap-2 text-sm">
                   <div>
                     <span className="text-muted-foreground">Started:</span>{" "}
-                    {new Date(task.last_run.started_at).toLocaleString()}
+                    {new Date(task.lastRun.startedAt).toLocaleString()}
                   </div>
-                  {task.last_run.ended_at && (
+                  {task.lastRun.endedAt && (
                     <div>
                       <span className="text-muted-foreground">Ended:</span>{" "}
-                      {new Date(task.last_run.ended_at).toLocaleString()}
+                      {new Date(task.lastRun.endedAt).toLocaleString()}
                     </div>
                   )}
                   <div>
                     <span className="text-muted-foreground">Status:</span>{" "}
-                    <span className={getStatusColor(task.last_run.status)}>
-                      {task.last_run.status}
+                    <span className={getStatusColor(task.lastRun.status)}>
+                      {task.lastRun.status}
                     </span>
                   </div>
                   <div>
                     <span className="text-muted-foreground">Success:</span>{" "}
                     <span
                       className={
-                        task.last_run.success
+                        task.lastRun.success
                           ? getAccentColors("green").text
                           : getAccentColors("red").text
                       }
                     >
-                      {task.last_run.success ? "Yes" : "No"}
+                      {task.lastRun.success ? "Yes" : "No"}
                     </span>
                   </div>
-                  {task.last_run.error_message && (
+                  {task.lastRun.errorMessage && (
                     <div className="col-span-2">
                       <span className="text-muted-foreground">Error:</span>{" "}
-                      <span className="text-destructive">{task.last_run.error_message}</span>
+                      <span className="text-destructive">{task.lastRun.errorMessage}</span>
                     </div>
                   )}
-                  {task.last_run.triggered_auto_fix && (
+                  {task.lastRun.triggeredAutoFix && (
                     <div className={`col-span-2 ${getAccentColors("orange").text}`}>
                       Auto-fix was triggered
                     </div>

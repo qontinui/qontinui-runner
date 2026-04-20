@@ -38,9 +38,9 @@ export function SchedulerHistory({
   };
 
   const formatDuration = (record: TaskExecutionRecord): string | null => {
-    if (!record.ended_at) return null;
-    const start = new Date(record.started_at).getTime();
-    const end = new Date(record.ended_at).getTime();
+    if (!record.endedAt) return null;
+    const start = new Date(record.startedAt).getTime();
+    const end = new Date(record.endedAt).getTime();
     const diff = Math.floor((end - start) / 1000);
 
     if (diff < 60) return `${diff}s`;
@@ -92,7 +92,7 @@ export function SchedulerHistory({
               .reverse()
               .map((record) => (
                 <div
-                  key={record.execution_id}
+                  key={record.executionId}
                   className="p-3 border border-border rounded-lg hover:bg-muted/50 transition-colors"
                 >
                   <div className="flex items-start justify-between">
@@ -108,7 +108,7 @@ export function SchedulerHistory({
                           Success
                         </span>
                       )}
-                      {record.triggered_auto_fix && (
+                      {record.triggeredAutoFix && (
                         <span
                           className={`px-2 py-0.5 text-xs ${getAccentColors("orange").bg} ${getAccentColors("orange").text} rounded`}
                         >
@@ -123,19 +123,19 @@ export function SchedulerHistory({
                     </div>
                   </div>
                   <div className="mt-2 grid grid-cols-2 gap-2 text-sm text-muted-foreground">
-                    <div>Started: {new Date(record.started_at).toLocaleString()}</div>
-                    {record.ended_at && (
-                      <div>Ended: {new Date(record.ended_at).toLocaleString()}</div>
+                    <div>Started: {new Date(record.startedAt).toLocaleString()}</div>
+                    {record.endedAt && (
+                      <div>Ended: {new Date(record.endedAt).toLocaleString()}</div>
                     )}
                   </div>
-                  {record.error_message && (
+                  {record.errorMessage && (
                     <div className="mt-2 text-sm text-destructive">
-                      Error: {record.error_message}
+                      Error: {record.errorMessage}
                     </div>
                   )}
-                  {record.session_id && (
+                  {record.sessionId && (
                     <div className="mt-2 text-xs text-muted-foreground">
-                      Session: {record.session_id}
+                      Session: {record.sessionId}
                     </div>
                   )}
                 </div>

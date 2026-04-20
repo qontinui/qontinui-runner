@@ -57,17 +57,17 @@ export function ContextManagement() {
   });
 
   // Get context management values from workflow
-  const contextIds = useMemo(() => workflow.context_ids ?? [], [workflow.context_ids]);
+  const contextIds = useMemo(() => workflow.contextIds ?? [], [workflow.contextIds]);
   const disabledContextIds = useMemo(
-    () => new Set(workflow.disabled_context_ids ?? []),
-    [workflow.disabled_context_ids],
+    () => new Set(workflow.disabledContextIds ?? []),
+    [workflow.disabledContextIds],
   );
-  const autoIncludeContexts = workflow.auto_include_contexts ?? true;
+  const autoIncludeContexts = workflow.autoIncludeContexts ?? true;
 
   // Helper to update context IDs
   const setContextIds = useCallback(
     (ids: string[]) => {
-      updateWorkflow({ context_ids: ids });
+      updateWorkflow({ contextIds: ids });
     },
     [updateWorkflow],
   );
@@ -75,7 +75,7 @@ export function ContextManagement() {
   // Helper to update disabled context IDs
   const setDisabledContextIds = useCallback(
     (ids: string[]) => {
-      updateWorkflow({ disabled_context_ids: ids });
+      updateWorkflow({ disabledContextIds: ids });
     },
     [updateWorkflow],
   );
@@ -83,7 +83,7 @@ export function ContextManagement() {
   // Helper to update auto-include setting
   const setAutoIncludeContexts = useCallback(
     (value: boolean) => {
-      updateWorkflow({ auto_include_contexts: value });
+      updateWorkflow({ autoIncludeContexts: value });
     },
     [updateWorkflow],
   );

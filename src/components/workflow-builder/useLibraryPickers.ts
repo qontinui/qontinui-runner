@@ -342,8 +342,8 @@ export function useLibraryPickers({ addStep, updateStep, getSelectedStep }: UseL
         const updatedStep = {
           ...selected,
           name: workflow.name,
-          workflow_id: workflow.id,
-          workflow_name: workflow.name,
+          workflowId: workflow.id,
+          workflowName: workflow.name,
         } as UnifiedStep;
         const stepPhase = (selected as WorkflowStep).phase as WorkflowPhase;
         updateStep(updatedStep, stepPhase);
@@ -353,8 +353,8 @@ export function useLibraryPickers({ addStep, updateStep, getSelectedStep }: UseL
           type: "workflow",
           phase: phase as "setup" | "verification" | "completion",
           name: workflow.name,
-          workflow_id: workflow.id,
-          workflow_name: workflow.name,
+          workflowId: workflow.id,
+          workflowName: workflow.name,
         };
         addStep(step as UnifiedStep, phase);
       }

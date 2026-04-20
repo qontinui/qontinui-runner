@@ -158,7 +158,7 @@ function ConstraintRow({ result }: { result: ConstraintResult }) {
             result.passed ? "text-zinc-300" : "text-zinc-200",
           )}
         >
-          {result.constraint_name}
+          {result.constraintName}
         </span>
 
         {/* Severity badge (only for failures) */}
@@ -329,7 +329,7 @@ export function ConstraintResultsWidget() {
         /* Single iteration: show results directly */
         <div className="flex flex-col max-h-64 overflow-y-auto">
           {data.latest!.results.map((result) => (
-            <ConstraintRow key={result.constraint_id} result={result} />
+            <ConstraintRow key={result.constraintId} result={result} />
           ))}
         </div>
       ) : (
@@ -354,7 +354,7 @@ export function ConstraintResultsWidget() {
                 {isExpanded && (
                   <div className="flex flex-col">
                     {iteration.results.map((result) => (
-                      <ConstraintRow key={result.constraint_id} result={result} />
+                      <ConstraintRow key={result.constraintId} result={result} />
                     ))}
                   </div>
                 )}

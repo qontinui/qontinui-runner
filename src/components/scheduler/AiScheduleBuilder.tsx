@@ -42,7 +42,7 @@ interface SelectedWorkflow {
   name: string;
   description?: string;
   category?: string;
-  is_favorite?: boolean | null;
+  isFavorite?: boolean | null;
 }
 
 interface AiGeneratedTask {
@@ -138,7 +138,7 @@ export function AiScheduleBuilder({
   // Filtered workflows for picker
   const filteredWorkflows = useMemo(() => {
     let list = workflows;
-    if (workflowFilter === "favorites") list = list.filter((w) => w.is_favorite);
+    if (workflowFilter === "favorites") list = list.filter((w) => w.isFavorite);
     else if (workflowFilter === "commands")
       list = list.filter((w) => w.category === "slash-command");
     if (workflowSearch) {
@@ -161,7 +161,7 @@ export function AiScheduleBuilder({
         name: wf.name,
         description: wf.description,
         category: wf.category,
-        is_favorite: wf.is_favorite,
+        isFavorite: wf.isFavorite,
       },
     ]);
     setPickerOpen(false);
@@ -222,8 +222,8 @@ Respond ONLY with a JSON array. Each element must have this exact shape:
     "schedule": <one of the schedule types below>,
     "task": <task type>,
     "conditions": <optional conditions>,
-    "skip_if_completed": false,
-    "auto_fix_on_failure": false
+    "skipIfCompleted": false,
+    "autoFixOnFailure": false
   }
 }
 
@@ -231,16 +231,16 @@ Schedule types (pick the best fit):
 - {"type":"Cron","value":"<cron expression>"} — for recurring time-based (use 5-field cron: min hour dom month dow)
 - {"type":"Once","value":"<ISO 8601 datetime>"} — for one-time
 - {"type":"Interval","value":<seconds>} — for simple intervals
-- {"type":"Condition","value":{"rearm_delay_minutes":<number>}} — for condition-triggered (no time, runs when conditions met)
+- {"type":"Condition","value":{"rearmDelayMinutes":<number>}} — for condition-triggered (no time, runs when conditions met)
 
 Task type (use Workflow if workflows are selected):
 - {"task_type":"Workflow","workflow_name":"<name>","workflow_id":"<id>"}
 - {"task_type":"AutoFix","check_findings":true,"force_run":false}
 
 Conditions (optional, include when user mentions idle/inactivity):
-- {"require_idle":{"enabled":true}} — wait for runner to be idle
-- {"require_repo_inactive":{"enabled":true,"repositories":[{"path":"<path>","inactive_minutes":<min>}]}} — wait for repo inactivity
-- {"timeout_minutes":<number>} — max wait time
+- {"requireIdle":{"enabled":true}} — wait for runner to be idle
+- {"requireRepoInactive":{"enabled":true,"repositories":[{"path":"<path>","inactiveMinutes":<min>}]}} — wait for repo inactivity
+- {"timeoutMinutes":<number>} — max wait time
 
 If multiple workflows are selected, create one task per workflow in order.
 If the user mentions sequencing or ordering, use appropriate scheduling (stagger by delay or use conditions).
@@ -361,7 +361,7 @@ Only output the JSON array, nothing else.`;
                 {wf.category === "slash-command" && (
                   <Terminal className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
                 )}
-                {wf.is_favorite && (
+                {wf.isFavorite && (
                   <Star className="w-3 h-3 text-amber-400 fill-amber-400 shrink-0" />
                 )}
                 <span className="text-sm truncate flex-1">{wf.name}</span>
@@ -444,7 +444,7 @@ Only output the JSON array, nothing else.`;
                         {wf.category === "slash-command" && (
                           <Terminal className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
                         )}
-                        {wf.is_favorite && (
+                        {wf.isFavorite && (
                           <Star className="w-3 h-3 text-amber-400 fill-amber-400 shrink-0" />
                         )}
                         <div className="min-w-0 flex-1">
@@ -563,12 +563,12 @@ Only output the JSON array, nothing else.`;
                     {task.request.task.task_type === "Workflow" &&
                       `: ${task.request.task.workflow_name}`}
                   </span>
-                  {task.request.conditions?.require_idle?.enabled && (
+                  {task.request.conditions?.requireIdle?.enabled && (
                     <span className="px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
                       Wait for idle
                     </span>
                   )}
-                  {task.request.conditions?.require_repo_inactive?.enabled && (
+                  {task.request.conditions?.requireRepoInactive?.enabled && (
                     <span className="px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
                       Wait for repo inactive
                     </span>

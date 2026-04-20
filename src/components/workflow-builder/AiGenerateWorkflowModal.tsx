@@ -519,16 +519,16 @@ export function AiGenerateWorkflowModal({
                     {getStepCount(generatedWorkflow)} steps
                   </span>
                   <span data-content-role="metric" data-content-label="setup step count">
-                    Setup: {generatedWorkflow.setup_steps?.length || 0}
+                    Setup: {generatedWorkflow.setupSteps?.length || 0}
                   </span>
                   <span data-content-role="metric" data-content-label="verification step count">
-                    Verification: {generatedWorkflow.verification_steps?.length || 0}
+                    Verification: {generatedWorkflow.verificationSteps?.length || 0}
                   </span>
                   <span data-content-role="metric" data-content-label="agentic step count">
-                    Agentic: {generatedWorkflow.agentic_steps?.length || 0}
+                    Agentic: {generatedWorkflow.agenticSteps?.length || 0}
                   </span>
                   <span data-content-role="metric" data-content-label="completion step count">
-                    Completion: {generatedWorkflow.completion_steps?.length || 0}
+                    Completion: {generatedWorkflow.completionSteps?.length || 0}
                   </span>
                 </div>
               </div>

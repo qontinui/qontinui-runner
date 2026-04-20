@@ -65,12 +65,12 @@ export function buildSpecExpansionWorkflow(
     description: `Expand coverage of spec "${specId}" by discovering uncovered elements and adding new assertion groups.`,
     category: "spec-expansion",
     tags: ["spec", "expansion", "coverage", "auto-generated"],
-    created_at: now,
+    createdAt: now,
     modified_at: now,
 
-    setup_steps: [],
+    setupSteps: [],
 
-    verification_steps: [
+    verificationSteps: [
       {
         id: crypto.randomUUID(),
         type: "ui_bridge",
@@ -79,7 +79,7 @@ export function buildSpecExpansionWorkflow(
         ui_bridge_action: "snapshot",
         ui_bridge_snapshot_target: snapshotTarget,
         ...(resolvedPageUrl ? { ui_bridge_navigate_url: resolvedPageUrl } : {}),
-      } as unknown as UnifiedWorkflow["verification_steps"][number],
+      } as unknown as UnifiedWorkflow["verificationSteps"][number],
       {
         id: crypto.randomUUID(),
         type: "prompt",
@@ -105,7 +105,7 @@ If there are gaps, report FAIL and list the specific gaps.`,
       },
     ],
 
-    agentic_steps: [
+    agenticSteps: [
       {
         id: crypto.randomUUID(),
         type: "prompt",
@@ -135,23 +135,23 @@ Focus on quality over quantity — each assertion should verify something meanin
       },
     ],
 
-    completion_steps: [createSummaryStep()],
+    completionSteps: [createSummaryStep()],
 
-    max_iterations: maxIterations,
+    maxIterations: maxIterations,
     ...DEFAULT_WORKFLOW_FLAGS,
-    reflection_mode: true,
+    reflectionMode: true,
   };
 
   // Add navigation setup step if we have a page URL
   if (resolvedPageUrl) {
-    workflow.setup_steps.push({
+    workflow.setupSteps.push({
       id: crypto.randomUUID(),
       type: "command",
       phase: "setup",
       name: "Navigate to target page",
       command: "",
       content: `Navigate to ${resolvedPageUrl} and wait for the page to load.`,
-    } as unknown as UnifiedWorkflow["setup_steps"][number]);
+    } as unknown as UnifiedWorkflow["setupSteps"][number]);
   }
 
   return workflow;

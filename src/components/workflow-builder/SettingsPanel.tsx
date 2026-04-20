@@ -78,7 +78,7 @@ function ToggleSwitch({
 function ResolvedModelPreview() {
   const { state } = useWorkflowBuilder();
   const { workflow } = state;
-  const overrides: ModelOverrides = (workflow.model_overrides as ModelOverrides) ?? {};
+  const overrides: ModelOverrides = (workflow.modelOverrides as ModelOverrides) ?? {};
 
   const rows = MODEL_OVERRIDE_PHASES.map((phase) => ({
     ...phase,
@@ -123,7 +123,7 @@ function PerPhaseModelSelect() {
   const { workflow } = state;
   const [isExpanded, setIsExpanded] = useState(false);
 
-  const overrides: ModelOverrides = (workflow.model_overrides as ModelOverrides) ?? {};
+  const overrides: ModelOverrides = (workflow.modelOverrides as ModelOverrides) ?? {};
   const hasOverrides = MODEL_OVERRIDE_PHASES.some((phase) => {
     const cfg = overrides[phase.key as keyof ModelOverrides];
     return cfg?.provider || cfg?.model;
@@ -146,7 +146,7 @@ function PerPhaseModelSelect() {
     } else {
       (current as Record<string, ModelOverrideConfig>)[phaseKey] = phaseCfg;
     }
-    updateWorkflow({ model_overrides: Object.keys(current).length > 0 ? current : undefined });
+    updateWorkflow({ modelOverrides: Object.keys(current).length > 0 ? current : undefined });
   };
 
   const applyPreset = (presetId: string) => {
@@ -154,13 +154,13 @@ function PerPhaseModelSelect() {
     const preset = MODEL_PRESETS.find((p) => p.id === presetId);
     if (preset) {
       updateWorkflow({
-        model_overrides: Object.keys(preset.overrides).length > 0 ? preset.overrides : undefined,
+        modelOverrides: Object.keys(preset.overrides).length > 0 ? preset.overrides : undefined,
       });
     }
   };
 
   const resetAll = () => {
-    updateWorkflow({ model_overrides: undefined });
+    updateWorkflow({ modelOverrides: undefined });
   };
 
   const copyFromLastGeneration = () => {
@@ -173,7 +173,7 @@ function PerPhaseModelSelect() {
       // ModelOverrideConfig map. The persisted shape was written by this
       // panel, so narrow back to the expected type at the read site.
       updateWorkflow({
-        model_overrides: parsed as { [k: string]: ModelOverrideConfig },
+        modelOverrides: parsed as { [k: string]: ModelOverrideConfig },
       });
     }
   };
@@ -338,7 +338,7 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium text-zinc-300 truncate">{healthCheck.name}</span>
-            {(healthCheck.is_critical ?? true) && (
+            {(healthCheck.isCritical ?? true) && (
               <span className="flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-medium bg-red-500/20 text-red-400 rounded">
                 <AlertCircle className="w-3 h-3" />
                 Critical
@@ -349,9 +349,9 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
         </div>
 
         <div className="flex items-center gap-1 text-xs text-zinc-500">
-          <span>{healthCheck.expected_status ?? 200}</span>
+          <span>{healthCheck.expectedStatus ?? 200}</span>
           <span className="text-zinc-600">|</span>
-          <span>{healthCheck.timeout_seconds ?? 5}s</span>
+          <span>{healthCheck.timeoutSeconds ?? 5}s</span>
         </div>
 
         <button
@@ -400,8 +400,8 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
               </label>
               <input
                 type="number"
-                value={healthCheck.expected_status ?? 200}
-                onChange={(e) => updateField("expected_status", parseInt(e.target.value) || 200)}
+                value={healthCheck.expectedStatus ?? 200}
+                onChange={(e) => updateField("expectedStatus", parseInt(e.target.value) || 200)}
                 className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
                            text-zinc-200 focus:outline-hidden focus:border-blue-500"
                 min={100}
@@ -414,8 +414,8 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
               </label>
               <input
                 type="number"
-                value={healthCheck.timeout_seconds ?? 5}
-                onChange={(e) => updateField("timeout_seconds", parseInt(e.target.value) || 5)}
+                value={healthCheck.timeoutSeconds ?? 5}
+                onChange={(e) => updateField("timeoutSeconds", parseInt(e.target.value) || 5)}
                 className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
                            text-zinc-200 focus:outline-hidden focus:border-blue-500"
                 min={1}
@@ -432,19 +432,19 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
             <button
               type="button"
               role="switch"
-              aria-checked={healthCheck.is_critical ?? true}
-              onClick={() => updateField("is_critical", !(healthCheck.is_critical ?? true))}
+              aria-checked={healthCheck.isCritical ?? true}
+              onClick={() => updateField("isCritical", !(healthCheck.isCritical ?? true))}
               className={`
                 relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent
                 transition-colors duration-200 ease-in-out focus:outline-hidden focus:ring-2 focus:ring-blue-500/50
-                ${(healthCheck.is_critical ?? true) ? "bg-red-600" : "bg-zinc-600"}
+                ${(healthCheck.isCritical ?? true) ? "bg-red-600" : "bg-zinc-600"}
               `}
             >
               <span
                 className={`
                   pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0
                   transition duration-200 ease-in-out
-                  ${(healthCheck.is_critical ?? true) ? "translate-x-4" : "translate-x-0"}
+                  ${(healthCheck.isCritical ?? true) ? "translate-x-4" : "translate-x-0"}
                 `}
               />
             </button>
@@ -531,7 +531,9 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
   }
 
   function renderNumberSetting(def: NumberSettingDef) {
-    if (def.key === "timeout_seconds") {
+    // workflow-utils uses snake_case def.key identifiers; the UnifiedWorkflow
+    // field is camelCase `timeoutSeconds`. Keep both in sync here.
+    if (def.key === "timeout_seconds" || def.key === "timeoutSeconds") {
       return (
         <div key={def.key}>
           <label className="block text-sm font-medium text-zinc-400 mb-1">AI Session Timeout</label>
@@ -539,23 +541,23 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             <input
               type="checkbox"
               id="timeout-enabled"
-              checked={workflow.timeout_seconds != null}
+              checked={workflow.timeoutSeconds != null}
               onChange={(e) => {
-                updateWorkflow({ timeout_seconds: e.target.checked ? 300 : null });
+                updateWorkflow({ timeoutSeconds: e.target.checked ? 300 : null });
               }}
               className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-blue-500 focus:ring-blue-500/50"
             />
             <label htmlFor="timeout-enabled" className="text-sm text-zinc-400">
               Enable timeout
             </label>
-            {workflow.timeout_seconds != null && (
+            {workflow.timeoutSeconds != null && (
               <>
                 <input
                   type="number"
-                  value={workflow.timeout_seconds}
+                  value={workflow.timeoutSeconds}
                   onChange={(e) =>
                     updateWorkflow({
-                      timeout_seconds: Math.max(def.min ?? 60, parseInt(e.target.value) || 300),
+                      timeoutSeconds: Math.max(def.min ?? 60, parseInt(e.target.value) || 300),
                     })
                   }
                   min={def.min}
@@ -567,8 +569,8 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             )}
           </div>
           <p className="text-xs text-zinc-500 mt-1">
-            {workflow.timeout_seconds != null
-              ? `Kill AI session after ${workflow.timeout_seconds}s of inactivity`
+            {workflow.timeoutSeconds != null
+              ? `Kill AI session after ${workflow.timeoutSeconds}s of inactivity`
               : "No timeout - runs until completion or manual stop (recommended)"}
           </p>
         </div>
@@ -625,11 +627,14 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
         );
 
       case "pipeline_config":
-        if (workflow.workflow_architecture !== "multi_agent_pipeline") return null;
+        if (workflow.workflowArchitecture !== "multi_agent_pipeline") return null;
         return (
           <PipelineConfigPanel
             key={def.key}
-            config={workflow.multi_agent_pipeline_config as Record<string, unknown> | undefined}
+            config={
+              (workflow as { multi_agent_pipeline_config?: unknown })
+                .multi_agent_pipeline_config as Record<string, unknown> | undefined
+            }
             onChange={(c) => updateWorkflow({ multi_agent_pipeline_config: c })}
           />
         );
@@ -645,11 +650,11 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             <label className="block text-sm font-medium text-zinc-400 mb-1">Log Sources</label>
             <select
               value={_getLogSourceValue(
-                workflow.log_source_selection as LogSourceSelection | undefined,
+                workflow.logSourceSelection as LogSourceSelection | undefined,
               )}
               onChange={(e) => {
                 const parsed = _parseLogSourceValue(e.target.value);
-                updateWorkflow({ log_source_selection: parsed ?? "default" });
+                updateWorkflow({ logSourceSelection: parsed ?? "default" });
               }}
               className={selectClass}
             >
@@ -669,27 +674,27 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
         );
 
       case "health_check_urls": {
-        if (!(workflow.health_check_enabled ?? true)) return null;
+        if (!(workflow.healthCheckEnabled ?? true)) return null;
         return (
           <div key={def.key} className="pl-3 space-y-2">
             <div className="text-xs text-zinc-500">
-              {(workflow.health_check_urls ?? []).length === 0
+              {(workflow.healthCheckUrls ?? []).length === 0
                 ? "No health check URLs configured. Add URLs to check server availability."
-                : `${(workflow.health_check_urls ?? []).length} health check URL(s) configured`}
+                : `${(workflow.healthCheckUrls ?? []).length} health check URL(s) configured`}
             </div>
-            {(workflow.health_check_urls ?? []).map((hc, index) => (
+            {(workflow.healthCheckUrls ?? []).map((hc, index) => (
               <HealthCheckUrlEditor
                 key={`hc-${hc.url ?? ""}-${index}`}
                 healthCheck={hc}
                 onChange={(updated) => {
-                  const urls = [...(workflow.health_check_urls ?? [])];
+                  const urls = [...(workflow.healthCheckUrls ?? [])];
                   urls[index] = updated;
-                  updateWorkflow({ health_check_urls: urls });
+                  updateWorkflow({ healthCheckUrls: urls });
                 }}
                 onDelete={() => {
-                  const urls = [...(workflow.health_check_urls ?? [])];
+                  const urls = [...(workflow.healthCheckUrls ?? [])];
                   urls.splice(index, 1);
-                  updateWorkflow({ health_check_urls: urls });
+                  updateWorkflow({ healthCheckUrls: urls });
                 }}
               />
             ))}
@@ -699,12 +704,12 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                 const newUrl: HealthCheckUrl = {
                   name: "New Health Check",
                   url: "http://localhost:8000/health",
-                  expected_status: 200,
-                  timeout_seconds: 5,
-                  is_critical: true,
+                  expectedStatus: 200,
+                  timeoutSeconds: 5,
+                  isCritical: true,
                 };
                 updateWorkflow({
-                  health_check_urls: [...(workflow.health_check_urls ?? []), newUrl],
+                  healthCheckUrls: [...(workflow.healthCheckUrls ?? []), newUrl],
                 });
               }}
               className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300 transition-colors"
@@ -720,8 +725,8 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
         return (
           <PromptTemplateEditor
             key={def.key}
-            workflowTemplate={workflow.prompt_template}
-            onWorkflowTemplateChange={(template) => updateWorkflow({ prompt_template: template })}
+            workflowTemplate={workflow.promptTemplate}
+            onWorkflowTemplateChange={(template) => updateWorkflow({ promptTemplate: template })}
             hasAgenticSteps={true}
           />
         );
@@ -739,14 +744,14 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
         return <ResolvedModelPreview key={def.key} />;
 
       case "htn_ui_bridge_url":
-        if (!workflow.htn_enabled) return null;
+        if (!workflow.htnEnabled) return null;
         return (
           <div key={def.key}>
             <label className="block text-sm font-medium text-zinc-400 mb-1">UI Bridge URL</label>
             <input
               type="text"
-              value={workflow.htn_ui_bridge_url ?? ""}
-              onChange={(e) => updateWorkflow({ htn_ui_bridge_url: e.target.value || undefined })}
+              value={workflow.htnUiBridgeUrl ?? ""}
+              onChange={(e) => updateWorkflow({ htnUiBridgeUrl: e.target.value || undefined })}
               placeholder="http://localhost:1420"
               className={`${inputClass} font-mono`}
             />
@@ -757,7 +762,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
         );
 
       case "htn_state_machine_path":
-        if (!workflow.htn_enabled) return null;
+        if (!workflow.htnEnabled) return null;
         return (
           <div key={def.key}>
             <label className="block text-sm font-medium text-zinc-400 mb-1">
@@ -765,10 +770,8 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             </label>
             <input
               type="text"
-              value={workflow.htn_state_machine_path ?? ""}
-              onChange={(e) =>
-                updateWorkflow({ htn_state_machine_path: e.target.value || undefined })
-              }
+              value={workflow.htnStateMachinePath ?? ""}
+              onChange={(e) => updateWorkflow({ htnStateMachinePath: e.target.value || undefined })}
               placeholder="Default: data/runner_state_machine.json"
               className={`${inputClass} font-mono`}
             />
@@ -819,10 +822,10 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             <label className="block text-sm font-medium text-zinc-400 mb-1">Tool tags</label>
             <input
               type="text"
-              value={(workflow.tool_tags ?? []).join(", ")}
+              value={(workflow.toolTags ?? []).join(", ")}
               onChange={(e) =>
                 updateWorkflow({
-                  tool_tags: e.target.value
+                  toolTags: e.target.value
                     .split(",")
                     .map((t: string) => t.trim())
                     .filter(Boolean),

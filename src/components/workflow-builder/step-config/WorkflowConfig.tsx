@@ -17,10 +17,10 @@ export function WorkflowConfig({
         </div>
         <div className="flex-1 min-w-0">
           <div className="font-medium text-zinc-200">
-            {wfStep.workflow_name || "No workflow selected"}
+            {wfStep.workflowName || "No workflow selected"}
           </div>
-          {wfStep.workflow_id && (
-            <p className="text-xs text-zinc-500 mt-0.5 font-mono truncate">{wfStep.workflow_id}</p>
+          {wfStep.workflowId && (
+            <p className="text-xs text-zinc-500 mt-0.5 font-mono truncate">{wfStep.workflowId}</p>
           )}
         </div>
       </div>
@@ -34,7 +34,7 @@ export function WorkflowConfig({
         </button>
       )}
 
-      {!wfStep.workflow_id && (
+      {!wfStep.workflowId && (
         <p className="text-sm text-amber-400/80">
           No workflow selected. Click &quot;Change Workflow&quot; to pick one.
         </p>

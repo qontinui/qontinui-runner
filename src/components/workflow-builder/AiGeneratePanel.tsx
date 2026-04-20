@@ -477,7 +477,7 @@ export function AiGeneratePanel({
             "Spec workflow built deterministically:",
             workflow.name,
             "—",
-            workflow.verification_steps.length,
+            workflow.verificationSteps.length,
             "verification steps",
           );
           onLoadSpecWorkflow(workflow);
@@ -555,7 +555,7 @@ export function AiGeneratePanel({
             "Spec workflow built + run:",
             workflow.name,
             "—",
-            workflow.verification_steps.length,
+            workflow.verificationSteps.length,
             "verification steps",
           );
           onSaveAndRunSpecWorkflow(workflow);

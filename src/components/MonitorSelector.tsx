@@ -160,7 +160,7 @@ export function MonitorSelector({
                 {multiSelect && isSelected && <Check className={`${iconSize} text-primary`} />}
               </div>
               <div className={`${textSize} text-muted-foreground space-y-0.5`}>
-                {monitor.is_primary && <div className="text-primary font-medium">Primary</div>}
+                {monitor.isPrimary && <div className="text-primary font-medium">Primary</div>}
                 {position && !compact && <div>{position}</div>}
                 <div>
                   {monitor.width}x{monitor.height}

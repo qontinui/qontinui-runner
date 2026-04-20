@@ -92,16 +92,16 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
 
         // Get runner metadata
         const runnerMetadata = {
-          runner_version: APP_VERSION,
+          runnerVersion: APP_VERSION,
           os: navigator.platform || "unknown",
           hostname: "qontinui-runner",
         };
 
         // Get workflow metadata including initial states
         const workflowMetadata = {
-          workflow_id: workflowId,
-          workflow_name: workflowName,
-          initial_state_ids: initialStateIds.length > 0 ? initialStateIds : undefined,
+          workflowId: workflowId,
+          workflowName: workflowName,
+          initialStateIds: initialStateIds.length > 0 ? initialStateIds : undefined,
         };
 
         logger.debug(

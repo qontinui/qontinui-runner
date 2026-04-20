@@ -110,10 +110,10 @@ export function UiBridgeConfig({
             </label>
             <select
               id="uibridge-assert-type-select"
-              value={step.assert_type || "exists"}
+              value={step.assertType || "exists"}
               onChange={(e) =>
                 onUpdate({
-                  assert_type: e.target.value as
+                  assertType: e.target.value as
                     | "exists"
                     | "text_equals"
                     | "contains"
@@ -186,8 +186,8 @@ export function UiBridgeConfig({
             </label>
             <select
               id="uibridge-snapshot-target-select"
-              value={step.ui_bridge_snapshot_target || "control"}
-              onChange={(e) => onUpdate({ ui_bridge_snapshot_target: e.target.value })}
+              value={step.uiBridgeSnapshotTarget || "control"}
+              onChange={(e) => onUpdate({ uiBridgeSnapshotTarget: e.target.value })}
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
             >
               <option value="control">Control (Runner UI)</option>
@@ -207,8 +207,8 @@ export function UiBridgeConfig({
         <input
           id="uibridge-timeout-input"
           type="number"
-          value={step.timeout_ms ?? 5000}
-          onChange={(e) => onUpdate({ timeout_ms: parseInt(e.target.value) || 5000 })}
+          value={step.timeoutMs ?? 5000}
+          onChange={(e) => onUpdate({ timeoutMs: parseInt(e.target.value) || 5000 })}
           min={1000}
           max={60000}
           step={1000}

@@ -22,10 +22,10 @@ export function ResourceLimitsSection({ resourceLimits, onUpdate }: ResourceLimi
   const [expanded, setExpanded] = useState(false);
 
   const hasAnyLimit =
-    resourceLimits.max_wall_time_secs != null ||
-    resourceLimits.max_files_modified != null ||
-    resourceLimits.max_agentic_time_ms != null ||
-    resourceLimits.warning_threshold != null;
+    resourceLimits.maxWallTimeSecs != null ||
+    resourceLimits.maxFilesModified != null ||
+    resourceLimits.maxAgenticTimeMs != null ||
+    resourceLimits.warningThreshold != null;
 
   return (
     <div>
@@ -59,10 +59,10 @@ export function ResourceLimitsSection({ resourceLimits, onUpdate }: ResourceLimi
             </label>
             <input
               type="number"
-              value={resourceLimits.max_wall_time_secs ?? ""}
+              value={resourceLimits.maxWallTimeSecs ?? ""}
               onChange={(e) => {
                 const val = e.target.value ? parseInt(e.target.value, 10) : undefined;
-                onUpdate({ max_wall_time_secs: val });
+                onUpdate({ maxWallTimeSecs: val });
               }}
               placeholder="No limit"
               min={0}
@@ -80,10 +80,10 @@ export function ResourceLimitsSection({ resourceLimits, onUpdate }: ResourceLimi
             </label>
             <input
               type="number"
-              value={resourceLimits.max_files_modified ?? ""}
+              value={resourceLimits.maxFilesModified ?? ""}
               onChange={(e) => {
                 const val = e.target.value ? parseInt(e.target.value, 10) : undefined;
-                onUpdate({ max_files_modified: val });
+                onUpdate({ maxFilesModified: val });
               }}
               placeholder="No limit"
               min={0}
@@ -101,10 +101,10 @@ export function ResourceLimitsSection({ resourceLimits, onUpdate }: ResourceLimi
             </label>
             <input
               type="number"
-              value={resourceLimits.max_agentic_time_ms ?? ""}
+              value={resourceLimits.maxAgenticTimeMs ?? ""}
               onChange={(e) => {
                 const val = e.target.value ? parseInt(e.target.value, 10) : undefined;
-                onUpdate({ max_agentic_time_ms: val });
+                onUpdate({ maxAgenticTimeMs: val });
               }}
               placeholder="No limit"
               min={0}
@@ -122,10 +122,10 @@ export function ResourceLimitsSection({ resourceLimits, onUpdate }: ResourceLimi
             </label>
             <input
               type="number"
-              value={resourceLimits.warning_threshold ?? ""}
+              value={resourceLimits.warningThreshold ?? ""}
               onChange={(e) => {
                 const val = e.target.value ? parseFloat(e.target.value) : undefined;
-                onUpdate({ warning_threshold: val });
+                onUpdate({ warningThreshold: val });
               }}
               placeholder={String(DEFAULT_WARNING_THRESHOLD)}
               min={0}

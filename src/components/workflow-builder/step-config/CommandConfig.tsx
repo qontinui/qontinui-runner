@@ -14,8 +14,8 @@ function TestFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate:
         </label>
         <select
           id="test-type-select"
-          value={step.test_type ?? ""}
-          onChange={(e) => onUpdate({ test_type: e.target.value as TestType })}
+          value={step.testType ?? ""}
+          onChange={(e) => onUpdate({ testType: e.target.value as TestType })}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
         >
           <option value="playwright">Playwright (Browser)</option>
@@ -26,9 +26,9 @@ function TestFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate:
         </select>
       </div>
 
-      {(step.test_type === "custom_command" ||
-        step.test_type === "python" ||
-        step.test_type === "repository") && (
+      {(step.testType === "custom_command" ||
+        step.testType === "python" ||
+        step.testType === "repository") && (
         <div>
           <label
             htmlFor="test-command-input"
@@ -42,9 +42,9 @@ function TestFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate:
             value={step.command || ""}
             onChange={(e) => onUpdate({ command: e.target.value })}
             placeholder={
-              step.test_type === "python"
+              step.testType === "python"
                 ? "python test_script.py"
-                : step.test_type === "repository"
+                : step.testType === "repository"
                   ? "npm test"
                   : "command to run"
             }
@@ -53,7 +53,7 @@ function TestFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate:
         </div>
       )}
 
-      {step.test_type === "playwright" && (
+      {step.testType === "playwright" && (
         <>
           <div>
             <label
@@ -64,9 +64,9 @@ function TestFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate:
             </label>
             <select
               id="execution-mode-select"
-              value={step.execution_mode || "independent"}
+              value={step.executionMode || "independent"}
               onChange={(e) =>
-                onUpdate({ execution_mode: e.target.value as PlaywrightExecutionMode })
+                onUpdate({ executionMode: e.target.value as PlaywrightExecutionMode })
               }
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             >
@@ -88,8 +88,8 @@ function TestFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate:
             <input
               id="fused-script-id-input"
               type="text"
-              value={step.fused_script_id || ""}
-              onChange={(e) => onUpdate({ fused_script_id: e.target.value || undefined })}
+              value={step.fusedScriptId || ""}
+              onChange={(e) => onUpdate({ fusedScriptId: e.target.value || undefined })}
               placeholder="script-uuid"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             />
@@ -104,11 +104,11 @@ function TestFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate:
 }
 
 function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate: StepUpdater }) {
-  const availableTools = CHECK_TOOLS.filter((t) => t.check_type === step.check_type);
+  const availableTools = CHECK_TOOLS.filter((t) => t.check_type === step.checkType);
   const selectedTool = CHECK_TOOLS.find((t) => t.tool === step.tool);
-  const _checkTypeInfo = CHECK_TYPE_INFO.find((t) => t.type === step.check_type);
+  const _checkTypeInfo = CHECK_TYPE_INFO.find((t) => t.type === step.checkType);
 
-  const isCiCd = step.check_type === "ci_cd";
+  const isCiCd = step.checkType === "ci_cd";
 
   return (
     <div className="space-y-4">
@@ -118,10 +118,10 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
         </label>
         <select
           id="check-type-select"
-          value={step.check_type ?? ""}
+          value={step.checkType ?? ""}
           onChange={(e) => {
             const newType = e.target.value as CheckType;
-            onUpdate({ check_type: newType, tool: undefined, command: undefined });
+            onUpdate({ checkType: newType, tool: undefined, command: undefined });
           }}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
         >
@@ -169,8 +169,8 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
               <input
                 id="cicd-working-dir-input"
                 type="text"
-                value={step.working_directory || ""}
-                onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
+                value={step.workingDirectory || ""}
+                onChange={(e) => onUpdate({ workingDirectory: e.target.value || undefined })}
                 placeholder="Path to git repo root"
                 className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
               />
@@ -190,8 +190,8 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
             <input
               id="cicd-workflow-name-input"
               type="text"
-              value={step.workflow_name || ""}
-              onChange={(e) => onUpdate({ workflow_name: e.target.value || undefined })}
+              value={step.workflowName || ""}
+              onChange={(e) => onUpdate({ workflowName: e.target.value || undefined })}
               placeholder="CI"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             />
@@ -219,8 +219,8 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
             <input
               type="checkbox"
               id="wait_for_completion"
-              checked={step.wait_for_completion ?? false}
-              onChange={(e) => onUpdate({ wait_for_completion: e.target.checked })}
+              checked={step.waitForCompletion ?? false}
+              onChange={(e) => onUpdate({ waitForCompletion: e.target.checked })}
               className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
             />
             <label htmlFor="wait_for_completion" className="text-sm text-zinc-300">
@@ -241,8 +241,8 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
             <input
               id="cicd-timeout-input"
               type="number"
-              value={step.timeout_seconds ?? 300}
-              onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 300 })}
+              value={step.timeoutSeconds ?? 300}
+              onChange={(e) => onUpdate({ timeoutSeconds: parseInt(e.target.value) || 300 })}
               min={15}
               max={600}
               className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
@@ -251,7 +251,7 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
         </>
       ) : (
         <>
-          {step.check_type !== "custom_command" && availableTools.length > 0 && (
+          {step.checkType !== "custom_command" && availableTools.length > 0 && (
             <div>
               <label
                 htmlFor="check-tool-select"
@@ -292,7 +292,7 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
               htmlFor="check-command-input"
               className="block text-sm font-medium text-zinc-400 mb-1"
             >
-              Command {step.check_type === "custom_command" ? "(required)" : "(optional override)"}
+              Command {step.checkType === "custom_command" ? "(required)" : "(optional override)"}
             </label>
             <input
               id="check-command-input"
@@ -320,20 +320,20 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
             <input
               id="check-working-dir-input"
               type="text"
-              value={step.working_directory || ""}
-              onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
+              value={step.workingDirectory || ""}
+              onChange={(e) => onUpdate({ workingDirectory: e.target.value || undefined })}
               placeholder="Leave empty for project root"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             />
           </div>
 
-          {(selectedTool?.supports_auto_fix || step.check_type === "format") && (
+          {(selectedTool?.supports_auto_fix || step.checkType === "format") && (
             <div className="flex items-center gap-2">
               <input
                 type="checkbox"
                 id="auto_fix"
-                checked={step.auto_fix ?? false}
-                onChange={(e) => onUpdate({ auto_fix: e.target.checked })}
+                checked={step.autoFix ?? false}
+                onChange={(e) => onUpdate({ autoFix: e.target.checked })}
                 className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
               />
               <label htmlFor="auto_fix" className="text-sm text-zinc-300">
@@ -352,8 +352,8 @@ function CheckFieldsConfig({ step, onUpdate }: { step: CommandStepType; onUpdate
             <input
               id="check-timeout-input"
               type="number"
-              value={step.timeout_seconds ?? 60}
-              onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 60 })}
+              value={step.timeoutSeconds ?? 60}
+              onChange={(e) => onUpdate({ timeoutSeconds: parseInt(e.target.value) || 60 })}
               min={5}
               max={600}
               className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
@@ -425,8 +425,8 @@ export function CommandConfig({
           <input
             id="check-group-id-input"
             type="text"
-            value={step.check_group_id || ""}
-            onChange={(e) => onUpdate({ check_group_id: e.target.value })}
+            value={step.checkGroupId || ""}
+            onChange={(e) => onUpdate({ checkGroupId: e.target.value })}
             placeholder="check-group-uuid"
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
           />
@@ -435,9 +435,9 @@ export function CommandConfig({
           </p>
         </div>
 
-        {step.check_group_id && (
+        {step.checkGroupId && (
           <div className="p-2 bg-cyan-500/10 border border-cyan-500/30 rounded-md">
-            <p className="text-xs text-cyan-400 font-mono">{step.check_group_id}</p>
+            <p className="text-xs text-cyan-400 font-mono">{step.checkGroupId}</p>
           </div>
         )}
       </div>
@@ -495,8 +495,8 @@ export function CommandConfig({
         <input
           id="shell-working-dir-input"
           type="text"
-          value={step.working_directory || ""}
-          onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
+          value={step.workingDirectory || ""}
+          onChange={(e) => onUpdate({ workingDirectory: e.target.value || undefined })}
           placeholder="Leave empty for project root"
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
         />
@@ -512,8 +512,8 @@ export function CommandConfig({
         <input
           id="shell-timeout-input"
           type="number"
-          value={step.timeout_seconds ?? 60}
-          onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 60 })}
+          value={step.timeoutSeconds ?? 60}
+          onChange={(e) => onUpdate({ timeoutSeconds: parseInt(e.target.value) || 60 })}
           min={5}
           max={600}
           className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
@@ -524,8 +524,8 @@ export function CommandConfig({
         <input
           type="checkbox"
           id="fail_on_error"
-          checked={step.fail_on_error ?? true}
-          onChange={(e) => onUpdate({ fail_on_error: e.target.checked })}
+          checked={step.failOnError ?? true}
+          onChange={(e) => onUpdate({ failOnError: e.target.checked })}
           className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
         />
         <label htmlFor="fail_on_error" className="text-sm text-zinc-300">

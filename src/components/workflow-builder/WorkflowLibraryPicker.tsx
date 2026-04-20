@@ -231,10 +231,10 @@ export function WorkflowLibraryPicker({
                             </span>
                           </>
                         )}
-                        {workflow.max_iterations && workflow.max_iterations > 1 && (
+                        {workflow.maxIterations && workflow.maxIterations > 1 && (
                           <>
                             <span className="text-border">|</span>
-                            <span>Max {workflow.max_iterations} iterations</span>
+                            <span>Max {workflow.maxIterations} iterations</span>
                           </>
                         )}
                       </div>

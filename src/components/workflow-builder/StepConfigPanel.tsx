@@ -15,16 +15,16 @@ function findStepPhase(
   // Wire-side step arrays (UnifiedStep) carry an open `Other` variant whose
   // `id` is typed `unknown`; widen the predicate shape here.
   workflow: {
-    setup_steps: ReadonlyArray<{ id?: unknown }>;
-    verification_steps: ReadonlyArray<{ id?: unknown }>;
-    agentic_steps: ReadonlyArray<{ id?: unknown }>;
-    completion_steps?: ReadonlyArray<{ id?: unknown }>;
+    setupSteps: ReadonlyArray<{ id?: unknown }>;
+    verificationSteps: ReadonlyArray<{ id?: unknown }>;
+    agenticSteps: ReadonlyArray<{ id?: unknown }>;
+    completionSteps?: ReadonlyArray<{ id?: unknown }>;
   },
 ): WorkflowPhase | null {
-  if (workflow.setup_steps.some((s) => s.id === stepId)) return "setup";
-  if (workflow.verification_steps.some((s) => s.id === stepId)) return "verification";
-  if (workflow.agentic_steps.some((s) => s.id === stepId)) return "agentic";
-  if (workflow.completion_steps?.some((s) => s.id === stepId)) return "completion";
+  if (workflow.setupSteps.some((s) => s.id === stepId)) return "setup";
+  if (workflow.verificationSteps.some((s) => s.id === stepId)) return "verification";
+  if (workflow.agenticSteps.some((s) => s.id === stepId)) return "agentic";
+  if (workflow.completionSteps?.some((s) => s.id === stepId)) return "completion";
   return null;
 }
 
@@ -69,7 +69,7 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
     switch (selectedStep.type) {
       case "command": {
         const cmd = selectedStep as CommandStep;
-        return cmd.test_type || cmd.test_id ? "Test" : "Command";
+        return cmd.testType || cmd.testId ? "Test" : "Command";
       }
       case "prompt":
         return "AI Prompt";
@@ -85,10 +85,10 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
   // Wire-side UnifiedStep arrays include an open `Other` variant; narrow to
   // the runner-strict form so DataFlowSection can read `id`/`name`.
   const allSteps = [
-    ...state.workflow.setup_steps,
-    ...state.workflow.verification_steps,
-    ...state.workflow.agentic_steps,
-    ...(state.workflow.completion_steps || []),
+    ...state.workflow.setupSteps,
+    ...state.workflow.verificationSteps,
+    ...state.workflow.agenticSteps,
+    ...(state.workflow.completionSteps || []),
   ] as UnifiedStep[];
 
   return (
@@ -109,7 +109,7 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
       </div>
 
       <div className="flex-1 overflow-y-auto p-4">
-        {selectedStep.skill_origin && (
+        {selectedStep.skillOrigin && (
           <div className="mb-3 flex items-center justify-between gap-2 px-2.5 py-1.5 bg-zinc-800/50 border border-zinc-700/50 rounded-md">
             <span className="text-xs text-zinc-400">
               From skill:{" "}
@@ -117,7 +117,7 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
                 {/* skill_origin is typed as an opaque map on the wire, but
                     all runner-produced origins include `skill_slug`. */}
                 {String(
-                  (selectedStep.skill_origin as { skill_slug?: string } | undefined)?.skill_slug ??
+                  (selectedStep.skillOrigin as { skill_slug?: string } | undefined)?.skill_slug ??
                     "",
                 )}
               </span>
@@ -125,7 +125,7 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
             <button
               className="text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors"
               onClick={() =>
-                handleUpdate({ skill_origin: undefined } as unknown as Partial<UnifiedStep>)
+                handleUpdate({ skillOrigin: undefined } as unknown as Partial<UnifiedStep>)
               }
               title="Detach from skill — converts to raw step"
             >
@@ -172,14 +172,14 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
             <div className="flex items-center gap-2">
               <input
                 type="checkbox"
-                id="fail_on_console_errors"
-                checked={(selectedStep as BaseStep).fail_on_console_errors ?? false}
+                id="failOnConsoleErrors"
+                checked={(selectedStep as BaseStep).failOnConsoleErrors ?? false}
                 onChange={(e) =>
-                  handleUpdate({ fail_on_console_errors: e.target.checked } as Partial<UnifiedStep>)
+                  handleUpdate({ failOnConsoleErrors: e.target.checked } as Partial<UnifiedStep>)
                 }
                 className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
               />
-              <label htmlFor="fail_on_console_errors" className="text-sm text-zinc-300">
+              <label htmlFor="failOnConsoleErrors" className="text-sm text-zinc-300">
                 Fail on console errors
               </label>
             </div>

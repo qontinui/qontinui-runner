@@ -73,10 +73,10 @@ export function StageSelector() {
             index={index}
             isActive={currentStageIndex === index}
             stepCount={
-              (stage.setup_steps?.length ?? 0) +
-              (stage.verification_steps?.length ?? 0) +
-              (stage.agentic_steps?.length ?? 0) +
-              (stage.completion_steps?.length ?? 0)
+              (stage.setupSteps?.length ?? 0) +
+              (stage.verificationSteps?.length ?? 0) +
+              (stage.agenticSteps?.length ?? 0) +
+              (stage.completionSteps?.length ?? 0)
             }
             onSelect={() => selectStage(index)}
             onRename={(name) => updateStage(index, { name })}
@@ -101,8 +101,8 @@ export function StageSelector() {
               Stop on failure
               <input
                 type="checkbox"
-                checked={state.workflow.stop_on_failure ?? false}
-                onChange={(e) => updateWorkflow({ stop_on_failure: e.target.checked })}
+                checked={state.workflow.stopOnFailure ?? false}
+                onChange={(e) => updateWorkflow({ stopOnFailure: e.target.checked })}
                 className="size-3"
               />
             </label>
@@ -311,10 +311,10 @@ function StageSettings({
   stage: {
     description?: string;
     /** `null` = unlimited; a positive value caps the verification-agentic loop. */
-    max_iterations?: number | null;
+    maxIterations?: number | null;
     provider?: string | null;
     model?: string | null;
-    model_overrides?: ModelOverrides;
+    modelOverrides?: ModelOverrides;
   };
   onUpdate: (updates: Record<string, unknown>) => void;
 }) {
@@ -324,7 +324,7 @@ function StageSettings({
   const selectClass =
     "w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-1 focus:ring-zinc-600";
 
-  const stageOverrides: ModelOverrides = (stage.model_overrides as ModelOverrides) ?? {};
+  const stageOverrides: ModelOverrides = (stage.modelOverrides as ModelOverrides) ?? {};
   const hasPhaseOverrides = MODEL_OVERRIDE_PHASES.some((phase) => {
     const cfg = stageOverrides[phase.key as keyof ModelOverrides];
     return cfg?.provider || cfg?.model;
@@ -349,7 +349,7 @@ function StageSettings({
     } else {
       (current as Record<string, ModelOverrideConfig>)[phaseKey] = phaseCfg;
     }
-    onUpdate({ model_overrides: Object.keys(current).length > 0 ? current : undefined });
+    onUpdate({ modelOverrides: Object.keys(current).length > 0 ? current : undefined });
   };
 
   return (
@@ -383,15 +383,15 @@ function StageSettings({
               </label>
               <input
                 type="number"
-                value={stage.max_iterations ?? ""}
+                value={stage.maxIterations ?? ""}
                 onChange={(e) => {
                   const raw = e.target.value.trim();
                   if (raw === "") {
-                    onUpdate({ max_iterations: null });
+                    onUpdate({ maxIterations: null });
                   } else {
                     const parsed = parseInt(raw, 10);
                     onUpdate({
-                      max_iterations: Number.isFinite(parsed) && parsed >= 1 ? parsed : null,
+                      maxIterations: Number.isFinite(parsed) && parsed >= 1 ? parsed : null,
                     });
                   }
                 }}
@@ -471,7 +471,7 @@ function StageSettings({
                       const preset = MODEL_PRESETS.find((p) => p.id === e.target.value);
                       if (preset)
                         onUpdate({
-                          model_overrides:
+                          modelOverrides:
                             Object.keys(preset.overrides).length > 0 ? preset.overrides : undefined,
                         });
                     }}
@@ -487,7 +487,7 @@ function StageSettings({
                   {hasPhaseOverrides && (
                     <button
                       type="button"
-                      onClick={() => onUpdate({ model_overrides: undefined })}
+                      onClick={() => onUpdate({ modelOverrides: undefined })}
                       className="h-6 px-1.5 text-[10px] text-zinc-400 hover:text-red-400 border border-zinc-700 rounded"
                     >
                       Reset
