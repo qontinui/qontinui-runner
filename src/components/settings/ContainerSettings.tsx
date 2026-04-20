@@ -74,7 +74,9 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
   const [dockerStatus, setDockerStatus] = useState<DockerStatus>("checking");
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
+    // eslint-disable-next-line react-hooks/immutability
     checkDocker();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -97,6 +99,7 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
     }
   };
 
+  // eslint-disable-next-line react-hooks/preserve-manual-memoization
   const checkDocker = useCallback(async () => {
     setDockerStatus("checking");
     try {

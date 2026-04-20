@@ -194,9 +194,8 @@ pub async fn execute_htn_attempt(
         drop(stdin);
     }
 
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_millis(config.timeout_ms),
-        async {
+    let output =
+        match tokio::time::timeout(std::time::Duration::from_millis(config.timeout_ms), async {
             let stdout_handle = child.stdout.take();
             let stderr_handle = child.stderr.take();
 
@@ -206,14 +205,18 @@ pub async fn execute_htn_attempt(
                 async {
                     let mut bytes = Vec::new();
                     if let Some(mut out) = stdout_handle {
-                        tokio::io::AsyncReadExt::read_to_end(&mut out, &mut bytes).await.ok();
+                        tokio::io::AsyncReadExt::read_to_end(&mut out, &mut bytes)
+                            .await
+                            .ok();
                     }
                     bytes
                 },
                 async {
                     let mut bytes = Vec::new();
                     if let Some(mut err) = stderr_handle {
-                        tokio::io::AsyncReadExt::read_to_end(&mut err, &mut bytes).await.ok();
+                        tokio::io::AsyncReadExt::read_to_end(&mut err, &mut bytes)
+                            .await
+                            .ok();
                     }
                     bytes
                 },
@@ -227,16 +230,15 @@ pub async fn execute_htn_attempt(
                 stdout: stdout_result,
                 stderr: stderr_result,
             })
-        },
-    )
-    .await
-    {
-        Ok(result) => result.map_err(|e| format!("Python HTN CLI failed: {}", e))?,
-        Err(_) => {
-            let _ = child.kill().await;
-            return Err("HTN execute attempt timed out".to_string());
-        }
-    };
+        })
+        .await
+        {
+            Ok(result) => result.map_err(|e| format!("Python HTN CLI failed: {}", e))?,
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err("HTN execute attempt timed out".to_string());
+            }
+        };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

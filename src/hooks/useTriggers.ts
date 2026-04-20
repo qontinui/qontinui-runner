@@ -250,6 +250,7 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
 
   // Initial load
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
   }, [refresh]);
 
@@ -262,6 +263,7 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
 
   // Real-time Tauri event subscription for immediate updates when triggers fire
   const refreshRef = useRef(refresh);
+  // eslint-disable-next-line react-hooks/refs
   refreshRef.current = refresh;
 
   useEffect(() => {

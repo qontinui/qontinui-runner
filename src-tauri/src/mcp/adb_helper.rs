@@ -11,9 +11,9 @@
 use std::io::Cursor;
 use std::net::SocketAddrV4;
 
-use adb_client::ADBDeviceExt;
 use adb_client::server::ADBServer;
 use adb_client::server_device::ADBServerDevice;
+use adb_client::ADBDeviceExt;
 
 // ----------------------------------------------------------------------------
 // Types

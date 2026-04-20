@@ -191,9 +191,7 @@ pub async fn restart_executor(
     let spawn_result = match manager.start_default_bridge().await {
         Ok(true) => Ok(()),
         Ok(false) => {
-            info!(
-                "Executor API: no existing default bridge to start, creating one"
-            );
+            info!("Executor API: no existing default bridge to start, creating one");
             manager.get_or_create_default_bridge().await.map(|_| ())
         }
         Err(e) => Err(e),

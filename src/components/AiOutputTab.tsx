@@ -98,6 +98,7 @@ export function AiOutputTab({
       const latestLoop = loops[loops.length - 1];
       // Only auto-select if we don't have a selection or the selected loop no longer exists
       if (!selectedLoopId || !loops.find((l) => l.id === selectedLoopId)) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setSelectedLoopId(latestLoop.id);
       }
     }
@@ -213,9 +214,9 @@ export function AiOutputTab({
       const task = await triggerTask({
         name: "ai-analysis",
         content: fullPrompt,
-        max_sessions: 1,
-        display_prompt: trimmedPrompt, // Only show the new message in UI
-        timeout_seconds: 600,
+        maxSessions: 1,
+        displayPrompt: trimmedPrompt, // Only show the new message in UI
+        timeoutSeconds: 600,
       });
 
       if (task) {
@@ -317,6 +318,7 @@ export function AiOutputTab({
   // Poll executor status when we have lines
   useEffect(() => {
     if (lines.length === 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsAiWorking(false);
       return;
     }

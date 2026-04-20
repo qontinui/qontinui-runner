@@ -95,8 +95,7 @@ fn list_windows_windows(filter: Option<&str>) -> Vec<WindowInfo> {
 
     unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         // Safety: lparam carries a pointer to our (Mutex<Vec<WindowInfo>>, Option<String>) tuple.
-        let context =
-            &*(lparam.0 as *const (Mutex<Vec<WindowInfo>>, Option<String>));
+        let context = &*(lparam.0 as *const (Mutex<Vec<WindowInfo>>, Option<String>));
 
         // Skip invisible windows.
         if !IsWindowVisible(hwnd).as_bool() {
@@ -155,10 +154,7 @@ fn list_windows_windows(filter: Option<&str>) -> Vec<WindowInfo> {
 
     let context = (results, filter_lower);
     unsafe {
-        let _ = EnumWindows(
-            Some(enum_callback),
-            LPARAM(&context as *const _ as isize),
-        );
+        let _ = EnumWindows(Some(enum_callback), LPARAM(&context as *const _ as isize));
     }
     context.0.into_inner().unwrap_or_default()
 }
@@ -168,8 +164,8 @@ fn activate_window_windows_by_pid(pid: u32) -> bool {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
     use windows::Win32::UI::Input::KeyboardAndMouse::keybd_event;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
-        ShowWindow, SW_RESTORE, GetWindowTextLengthW,
+        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
+        SetForegroundWindow, ShowWindow, SW_RESTORE,
     };
 
     // First find an appropriate HWND for the given PID.
@@ -202,10 +198,7 @@ fn activate_window_windows_by_pid(pid: u32) -> bool {
 
     let context = (found, target_pid);
     unsafe {
-        let _ = EnumWindows(
-            Some(find_callback),
-            LPARAM(&context as *const _ as isize),
-        );
+        let _ = EnumWindows(Some(find_callback), LPARAM(&context as *const _ as isize));
     }
 
     let hwnd = match context.0.into_inner().unwrap_or(None) {
@@ -267,7 +260,10 @@ fn parse_wmctrl_output(stdout: &str, filter: Option<&str>) -> Vec<WindowInfo> {
         if non_empty.len() < 4 {
             continue;
         }
-        let pid = non_empty.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let pid = non_empty
+            .get(2)
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
         // Title is everything after the 4th whitespace-separated token
         let title = non_empty[4..].join(" ");
 

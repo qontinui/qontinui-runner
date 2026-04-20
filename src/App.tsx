@@ -226,6 +226,7 @@ function AppContent() {
 
   useEffect(() => {
     if (activeTab !== "unified-workflow-builder") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setEditWorkflowId(null);
     }
   }, [activeTab]);
@@ -291,6 +292,7 @@ function AppContent() {
       try {
         startBackgroundObserver();
       } catch (e) {
+        // eslint-disable-next-line no-console
         console.debug("[App] BackgroundObserver start deferred:", e);
       }
     }, 5000);

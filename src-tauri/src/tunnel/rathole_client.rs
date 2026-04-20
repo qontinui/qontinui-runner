@@ -164,7 +164,11 @@ pub fn resolve_rathole_binary() -> Option<PathBuf> {
         }
     }
 
-    let bin_name = if cfg!(windows) { "rathole.exe" } else { "rathole" };
+    let bin_name = if cfg!(windows) {
+        "rathole.exe"
+    } else {
+        "rathole"
+    };
 
     // Alongside the runner executable (bundled resource).
     if let Ok(exe_path) = std::env::current_exe() {

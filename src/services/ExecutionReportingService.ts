@@ -262,7 +262,7 @@ class ExecutionReportingServiceImpl {
     }
 
     try {
-      logger.info(`Uploading screenshot ${screenshot.screenshot_id} for run ${this.activeRunId}`);
+      logger.info(`Uploading screenshot ${screenshot.screenshotId} for run ${this.activeRunId}`);
 
       const response = await invoke<ExecutionScreenshotResponse>("upload_execution_screenshot", {
         runId: this.activeRunId,
@@ -270,7 +270,7 @@ class ExecutionReportingServiceImpl {
         imageData: Array.from(imageData),
       });
 
-      logger.info(`Screenshot uploaded: ${response.image_url}`);
+      logger.info(`Screenshot uploaded: ${response.imageUrl}`);
       return response;
     } catch (error) {
       console.error("[ExecutionReporting] Failed to upload screenshot:", error);

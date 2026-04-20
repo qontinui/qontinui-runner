@@ -201,7 +201,11 @@ function TimelineView({ features }: { features: FeatureHealth[] }) {
 // Main Panel
 // =============================================================================
 
-export function FeatureHealthPanel({ data, loading, onRefresh: _onRefresh }: FeatureHealthPanelProps) {
+export function FeatureHealthPanel({
+  data,
+  loading,
+  onRefresh: _onRefresh,
+}: FeatureHealthPanelProps) {
   const [view, setView] = useState<"board" | "timeline">("board");
   const [filter, setFilter] = useState<FeatureHealth["status"] | "all">("all");
 

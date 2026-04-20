@@ -117,6 +117,7 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
 
   // Load settings on mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

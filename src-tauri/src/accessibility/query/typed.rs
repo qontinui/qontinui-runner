@@ -15,9 +15,7 @@
 //! layering: typed wrappers stay on the pure side of the Rust boundary,
 //! and the async adapter layer stays the single place COM is touched.
 
-use super::super::model::{
-    ControlType, InteractionPattern, TriBool, UnifiedNode, UnifiedRole,
-};
+use super::super::model::{ControlType, InteractionPattern, TriBool, UnifiedNode, UnifiedRole};
 use super::super::traits::InteractionParams;
 
 /// Error returned when a typed wrapper is constructed from a node whose
@@ -144,9 +142,7 @@ impl<'a> TextBox<'a> {
     pub fn try_new(node: &'a UnifiedNode) -> Result<Self, TypedError> {
         // All three roles (Edit, Textbox, Searchbox) share ControlType::Edit.
         match node.role {
-            UnifiedRole::Edit | UnifiedRole::Textbox | UnifiedRole::Searchbox => {
-                Ok(Self { node })
-            }
+            UnifiedRole::Edit | UnifiedRole::Textbox | UnifiedRole::Searchbox => Ok(Self { node }),
             other => Err(TypedError {
                 expected: ControlType::Edit,
                 actual: other,

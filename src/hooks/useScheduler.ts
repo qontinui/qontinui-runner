@@ -311,6 +311,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
 
   // Initial load
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
   }, [refresh]);
 

@@ -68,12 +68,14 @@ export function AgenticMetricsPanel({ selectedTaskRunId, days = 30 }: AgenticMet
 
   // Load aggregates and trend on mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadData();
   }, [loadData]);
 
   // Load per-run scores when a task run is selected
   useEffect(() => {
     if (!selectedTaskRunId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setRunScores([]);
       return;
     }

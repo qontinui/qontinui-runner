@@ -485,10 +485,7 @@ pub fn run_hardener_agent(
                 crate::mcp::types::UiBridgeFamily::Sdk => "sdk",
             },
         )
-        .with_metadata(
-            "sdk_url_sanitizer.runner_port",
-            &runner_port.to_string(),
-        );
+        .with_metadata("sdk_url_sanitizer.runner_port", &runner_port.to_string());
     let ai_result: AiResponse = crate::ai_provider::run_prompt_with_middleware(
         &prompt,
         &task_context,
@@ -775,10 +772,7 @@ pub fn normalize_ui_bridge_urls(
     //
     // For Control mode this also drops `/ui-bridge/sdk/connect` steps entirely
     // (control doesn't need a connect step — the runner drives its own UI).
-    let rewrite_lists = |lists: Vec<&mut Vec<Value>>,
-                         target: UiBridgeFamily,
-                         port: u16|
-     -> usize {
+    let rewrite_lists = |lists: Vec<&mut Vec<Value>>, target: UiBridgeFamily, port: u16| -> usize {
         let mut touched = 0usize;
         for steps in lists {
             // First filter out any "drop" steps (only applies to Control mode
@@ -941,14 +935,35 @@ fn normalize_urls_in_step(
 ///   completeness / defense in depth and so the pass is correct regardless
 ///   of where in the pipeline it's called).
 const PATH_ALIASES: &[(&str, &str)] = &[
-    ("/ui-bridge/control/page-navigate", "/ui-bridge/control/page/navigate"),
-    ("/ui-bridge/control/page-evaluate", "/ui-bridge/control/page/evaluate"),
-    ("/ui-bridge/control/ai-execute", "/ui-bridge/control/ai/execute-with-diff"),
-    ("/ui-bridge/control/ai-search", "/ui-bridge/control/ai/search"),
+    (
+        "/ui-bridge/control/page-navigate",
+        "/ui-bridge/control/page/navigate",
+    ),
+    (
+        "/ui-bridge/control/page-evaluate",
+        "/ui-bridge/control/page/evaluate",
+    ),
+    (
+        "/ui-bridge/control/ai-execute",
+        "/ui-bridge/control/ai/execute-with-diff",
+    ),
+    (
+        "/ui-bridge/control/ai-search",
+        "/ui-bridge/control/ai/search",
+    ),
     // Same set under /sdk/ for completeness:
-    ("/ui-bridge/sdk/page-navigate", "/ui-bridge/sdk/page/navigate"),
-    ("/ui-bridge/sdk/page-evaluate", "/ui-bridge/sdk/page/evaluate"),
-    ("/ui-bridge/sdk/ai-execute", "/ui-bridge/sdk/ai/execute-with-diff"),
+    (
+        "/ui-bridge/sdk/page-navigate",
+        "/ui-bridge/sdk/page/navigate",
+    ),
+    (
+        "/ui-bridge/sdk/page-evaluate",
+        "/ui-bridge/sdk/page/evaluate",
+    ),
+    (
+        "/ui-bridge/sdk/ai-execute",
+        "/ui-bridge/sdk/ai/execute-with-diff",
+    ),
     ("/ui-bridge/sdk/ai-search", "/ui-bridge/sdk/ai/search"),
 ];
 
@@ -1014,7 +1029,9 @@ fn rewrite_localhost_port_for_ui_bridge(input: &str, runner_port: u16) -> String
         let after = &rest[idx + needle.len()..];
 
         // Consume digits after the "host:".
-        let digit_end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        let digit_end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
         let port_str = &after[..digit_end];
         let tail = &after[digit_end..];
 

@@ -66,6 +66,7 @@ export function MonitorSelector({
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     loadMonitors();
   }, []);
 

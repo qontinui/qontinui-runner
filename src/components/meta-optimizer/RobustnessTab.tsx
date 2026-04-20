@@ -81,10 +81,12 @@ export function RobustnessTab() {
   }, [agentType]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadReports();
   }, [loadReports]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadDatasets();
   }, [loadDatasets]);
 

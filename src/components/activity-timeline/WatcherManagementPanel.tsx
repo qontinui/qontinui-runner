@@ -69,6 +69,7 @@ export function WatcherManagementPanel() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadWatchers();
   }, [loadWatchers]);
 

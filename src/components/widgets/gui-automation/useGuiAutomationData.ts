@@ -103,6 +103,7 @@ export function useGuiAutomationData(): GuiAutomationData {
 
   // Initial fetch and polling
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
     const interval = setInterval(refresh, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
@@ -111,6 +112,7 @@ export function useGuiAutomationData(): GuiAutomationData {
   // Update elapsed time
   useEffect(() => {
     if (!startTime) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setElapsedTime(0);
       return;
     }

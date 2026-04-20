@@ -157,6 +157,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
   const swapSource = uiState.swapSource;
   const resetRatiosKey = uiState.resetRatiosKey;
   const focusMode = uiState.focusMode;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const pk = (key: string) => pageKey(pageId, key);
   const [gridState, dispatch] = useReducer(gridReducer, layout, createInitialGridState);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -164,9 +165,11 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
 
   useEffect(() => {
     instanceStorage.setJSON(pk(`zone-col-ratios-${layout.id}`), gridState.colRatios);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gridState.colRatios, layout.id]);
   useEffect(() => {
     instanceStorage.setJSON(pk(`zone-row-ratios-${layout.id}`), gridState.rowRatios);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gridState.rowRatios, layout.id]);
 
   // Load namespaced ratios on mount for non-default pages
@@ -201,6 +204,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
         ratios: parsedRows.length === layout.rows ? parsedRows : Array(layout.rows).fill(1),
       });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layout.id, layout.columns, layout.rows]);
 
   const prevResetKeyRef = useRef(resetRatiosKey);

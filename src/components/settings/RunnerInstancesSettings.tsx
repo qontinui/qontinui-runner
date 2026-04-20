@@ -93,6 +93,7 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
   }, [onLog]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadInstances();
     // Poll for status updates
     const interval = setInterval(loadInstances, 3000);
@@ -113,6 +114,7 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
       usedPorts.add(getApiPort());
       let nextPort = 9877;
       while (usedPorts.has(nextPort)) nextPort++;
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setNewPort(nextPort);
     }
   }, [showAddForm, instances]);

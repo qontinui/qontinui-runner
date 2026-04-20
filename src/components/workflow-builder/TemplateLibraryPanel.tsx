@@ -39,6 +39,7 @@ export const TemplateLibraryPanel: React.FC<TemplateLibraryPanelProps> = ({ doma
   }, [domain, apiBase]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchTemplates();
   }, [fetchTemplates]);
 

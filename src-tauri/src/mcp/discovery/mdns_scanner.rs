@@ -248,19 +248,18 @@ impl MdnsScanner {
                         let payload = MdnsDeviceEventPayload {
                             device_id: info.device_id,
                             port: info.port,
-                            addresses: info
-                                .addresses
-                                .iter()
-                                .map(|a| a.to_string())
-                                .collect(),
+                            addresses: info.addresses.iter().map(|a| a.to_string()).collect(),
                             txt_records: info.txt_records,
                         };
                         let _ = app.emit("device-discovered", &payload);
                     }
                     MdnsEvent::Removed(fullname) => {
-                        let _ = app.emit("device-removed", serde_json::json!({
-                            "fullname": fullname,
-                        }));
+                        let _ = app.emit(
+                            "device-removed",
+                            serde_json::json!({
+                                "fullname": fullname,
+                            }),
+                        );
                     }
                 }
             }

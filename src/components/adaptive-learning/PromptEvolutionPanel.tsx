@@ -56,6 +56,7 @@ export function PromptEvolutionPanel() {
 
   // Initial load + auto-refresh interval
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadRuns();
     intervalRef.current = setInterval(loadRuns, AUTO_REFRESH_MS);
     return () => {

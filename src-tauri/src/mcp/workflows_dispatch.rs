@@ -66,7 +66,10 @@ fn server_mode_enabled() -> bool {
 /// Accepts `Authorization: Bearer <token>` with the literal word `Bearer`
 /// (case-insensitive) and one space. Returns `None` on any malformed value.
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let trimmed = raw.trim();
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     let scheme = parts.next()?;
@@ -120,7 +123,10 @@ async fn run_workflow(
     };
 
     // 503 if neither secret is known yet.
-    if runner_token_env.as_deref().map(str::is_empty).unwrap_or(true)
+    if runner_token_env
+        .as_deref()
+        .map(str::is_empty)
+        .unwrap_or(true)
         && dispatch_secret.is_none()
     {
         warn!(

@@ -33,8 +33,7 @@ use crate::settings::{
     CloudRelaySettings, DebugSettings, ExecutionVariablesSettings, GlobalLogSource,
     GlobalLogSourceSettings, LogSourceAiSelectionMode, LogSourceCategory, MobileSettings,
     PathSettings, PlaywrightSettings, RunnerInstanceConfig, SelfHealingSettings, Settings,
-    TunnelSettings,
-    VariableSource, WorldStateVerifierSettings,
+    TunnelSettings, VariableSource, WorldStateVerifierSettings,
 };
 
 // ============================================================================

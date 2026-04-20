@@ -141,6 +141,7 @@ export function WsvCalibrationSection({ mode, onLog }: WsvCalibrationSectionProp
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadRows(true);
     const timer = setInterval(() => {
       loadRows(false);

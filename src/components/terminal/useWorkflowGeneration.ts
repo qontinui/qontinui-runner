@@ -133,6 +133,7 @@ export function useWorkflowGeneration({
 
   // Load plan content once on mount (best-effort)
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadPlanContent();
   }, [loadPlanContent]);
 

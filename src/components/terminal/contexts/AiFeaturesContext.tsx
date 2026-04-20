@@ -180,7 +180,9 @@ export function AiFeaturesProvider({
   );
 
   // Wire the cross-hook refs now that workflowGen is defined
+  // eslint-disable-next-line react-hooks/refs
   rightPanelModeSetterRef.current = workflowGen.setRightPanelMode;
+  // eslint-disable-next-line react-hooks/refs
   selectedSessionSetterRef.current = workflowGen.setSelectedTranscriptSessionId;
 
   const value = useMemo<AiFeaturesContextValue>(

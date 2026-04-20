@@ -617,9 +617,7 @@ pub async fn get_mermaid_diagram(
         Ok(response) => {
             if response.success {
                 Ok(Json(ApiResponse::success(
-                    response
-                        .data
-                        .unwrap_or(serde_json::json!({"diagram": ""})),
+                    response.data.unwrap_or(serde_json::json!({"diagram": ""})),
                 )))
             } else {
                 let error_msg = response
@@ -957,24 +955,15 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/state-machine/permitted-triggers",
             get(get_permitted_triggers),
         )
-        .route(
-            "/state-machine/blocked-triggers",
-            get(get_blocked_triggers),
-        )
-        .route(
-            "/state-machine/mermaid-diagram",
-            get(get_mermaid_diagram),
-        )
+        .route("/state-machine/blocked-triggers", get(get_blocked_triggers))
+        .route("/state-machine/mermaid-diagram", get(get_mermaid_diagram))
         .route("/state-machine", delete(clear_state_machine))
         // Compiled state machine persistence (frontend → backend)
         .route(
             "/state-machine/save-compiled",
             post(save_compiled_state_machine),
         )
-        .route(
-            "/state-machine/current",
-            get(get_current_state_machine),
-        )
+        .route("/state-machine/current", get(get_current_state_machine))
         // CRUD operations for state machine configs (SQLite)
         .route("/state-machine/configs", get(list_configs))
         .route("/state-machine/configs", post(create_config))

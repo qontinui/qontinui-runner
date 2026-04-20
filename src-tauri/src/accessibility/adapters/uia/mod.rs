@@ -178,8 +178,8 @@ impl PlatformAdapter for UiaAdapter {
 
         // Resolve the root element on a blocking thread.
         let find_state = state.clone();
-        let send_root = tokio::task::spawn_blocking(move || uia3::find_root(&find_state, target))
-            .await??;
+        let send_root =
+            tokio::task::spawn_blocking(move || uia3::find_root(&find_state, target)).await??;
 
         // Rebuild the Arc<UiaState> with the root element set, keeping the
         // existing handle table.

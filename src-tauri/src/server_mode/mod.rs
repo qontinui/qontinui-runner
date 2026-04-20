@@ -339,7 +339,11 @@ async fn run_heartbeat_loop(state: ServerModeState, restate_enabled: bool) {
                     .text()
                     .await
                     .unwrap_or_else(|_| "<no body>".to_string());
-                warn!("Server-mode heartbeat failed ({}): {}", s, truncate(&t, 200));
+                warn!(
+                    "Server-mode heartbeat failed ({}): {}",
+                    s,
+                    truncate(&t, 200)
+                );
             }
             Err(e) => {
                 warn!("Server-mode heartbeat network error: {}", e);
@@ -386,11 +390,7 @@ struct PhaseResultIngest<'a> {
 /// Spawns a tokio task internally so the caller — `emit_and_persist_phase_result`
 /// — never blocks on web latency. On non-2xx or network error the call just
 /// logs a warning; local persistence already happened upstream.
-pub fn post_phase_result(
-    state: ServerModeState,
-    execution_id: String,
-    result: PhaseResult,
-) {
+pub fn post_phase_result(state: ServerModeState, execution_id: String, result: PhaseResult) {
     tokio::spawn(async move {
         let runner_id = state.runner_id().await;
         if runner_id.is_none() {

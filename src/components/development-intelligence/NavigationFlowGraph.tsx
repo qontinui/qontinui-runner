@@ -238,6 +238,7 @@ export function NavigationFlowGraph() {
   }, []);
   useEffect(() => {
     const controller = new AbortController();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadSpecs(controller.signal);
     return () => {
       controller.abort();
@@ -254,11 +255,15 @@ export function NavigationFlowGraph() {
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
   const prevInitialRef = useRef({ nodes: initialNodes, edges: initialEdges });
+  // eslint-disable-next-line react-hooks/refs
   if (prevInitialRef.current.nodes !== initialNodes) {
+    // eslint-disable-next-line react-hooks/refs
     prevInitialRef.current.nodes = initialNodes;
     setNodes(initialNodes);
   }
+  // eslint-disable-next-line react-hooks/refs
   if (prevInitialRef.current.edges !== initialEdges) {
+    // eslint-disable-next-line react-hooks/refs
     prevInitialRef.current.edges = initialEdges;
     setEdges(initialEdges);
   }

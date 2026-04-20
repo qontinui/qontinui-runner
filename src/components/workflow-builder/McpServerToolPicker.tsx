@@ -104,6 +104,7 @@ export function McpServerToolPicker({
   // Reset state when modal opens
   useEffect(() => {
     if (isOpen) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setMode("servers");
       setSelectedServer(null);
       setSelectedToolName(null);

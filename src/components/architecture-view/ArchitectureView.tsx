@@ -67,6 +67,7 @@ export function ArchitectureView() {
 
   useEffect(() => {
     if (sdkArch.specs.length > 0 && workflows.length === 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setViewMode("developer");
     }
   }, [sdkArch.specs.length, workflows.length]);

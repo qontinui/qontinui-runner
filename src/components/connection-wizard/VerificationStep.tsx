@@ -76,6 +76,7 @@ export function VerificationStep({
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
+    // eslint-disable-next-line react-hooks/immutability
     void runCheck();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);

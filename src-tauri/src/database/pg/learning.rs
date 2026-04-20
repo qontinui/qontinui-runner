@@ -499,13 +499,19 @@ impl PgDb {
             .map_err(|e| format!("PG get_learning_stats_by_date_range (avg): {}", e))?;
 
         let avg_duration: Option<f64> = avg_row.try_get(0).unwrap_or_else(|e| {
-            tracing::warn!("get_learning_stats_by_date_range: col 0 (avg_duration) decode error: {}", e);
+            tracing::warn!(
+                "get_learning_stats_by_date_range: col 0 (avg_duration) decode error: {}",
+                e
+            );
             None
         });
         // AVG over integer iterations returns numeric in PG; cast ::double precision in SQL,
         // but still use try_get to avoid panic on unexpected type.
         let avg_iterations: Option<f64> = avg_row.try_get(1).unwrap_or_else(|e| {
-            tracing::warn!("get_learning_stats_by_date_range: col 1 (avg_iterations) decode error: {}", e);
+            tracing::warn!(
+                "get_learning_stats_by_date_range: col 1 (avg_iterations) decode error: {}",
+                e
+            );
             None
         });
         let total: i64 = avg_row.get(2);

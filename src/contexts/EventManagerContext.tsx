@@ -80,9 +80,9 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
             const task = await executeAiTask({
               name: "ai-analysis",
               content: fullPrompt,
-              max_sessions: 1,
-              display_prompt: "Verification: Checking if the fix worked...",
-              timeout_seconds: 600,
+              maxSessions: 1,
+              displayPrompt: "Verification: Checking if the fix worked...",
+              timeoutSeconds: 600,
             });
             log.debug("Verification prompt completed, task status:", task.status);
           } catch (error) {

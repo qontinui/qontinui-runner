@@ -14,7 +14,7 @@ import type {
   ConstraintSeverity,
 } from "@qontinui/shared-types/constraints";
 
-type ConstraintCheckType = ConstraintCheck["type"];
+type _ConstraintCheckType = ConstraintCheck["type"];
 import {
   severityBadgeColor,
   severityLabel,

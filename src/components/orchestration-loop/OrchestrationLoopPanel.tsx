@@ -336,6 +336,7 @@ export function OrchestrationLoopPanel() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchStatus();
     loadSavedConfigs();
     loadRunnerInstances();
@@ -823,9 +824,7 @@ export function OrchestrationLoopPanel() {
                           return;
                         }
                         const parsed = parseInt(raw, 10);
-                        setMaxIter(
-                          Number.isFinite(parsed) && parsed >= 1 ? parsed : null,
-                        );
+                        setMaxIter(Number.isFinite(parsed) && parsed >= 1 ? parsed : null);
                       }}
                       placeholder="∞"
                       title="Blank = unlimited iterations"

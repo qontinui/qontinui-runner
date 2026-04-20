@@ -660,6 +660,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "get_diagnostics": {
           try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const globalBridge = (window as any).__UI_BRIDGE__;
             const registeredCount = globalBridge?.registry?.getAllElements?.()?.length ?? 0;
             const interactiveSelectors =

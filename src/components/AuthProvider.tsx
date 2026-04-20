@@ -205,6 +205,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
    */
   useEffect(() => {
     log.debug("useEffect[checkAuthStatus] - checking auth status on mount");
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     checkAuthStatus();
   }, [checkAuthStatus]);
 
@@ -263,6 +264,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     // If already authenticated, clear pending flag (covers both initial auth and successful auto-login)
     if (authStatus?.authenticated) {
       log.debug("Dev mode: Authenticated, clearing devAutoLoginPending");
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setDevAutoLoginPending(false);
       if (devLoginRetryTimer.current) {
         clearTimeout(devLoginRetryTimer.current);

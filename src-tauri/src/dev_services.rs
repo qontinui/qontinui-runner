@@ -191,7 +191,10 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             name: "Embedding Service (MiniLM-L6-v2)".to_string(),
             command: "python".to_string(),
             args: vec![embedding_script.to_string_lossy().to_string()],
-            cwd: runner_dir.join("python-bridge").to_string_lossy().to_string(),
+            cwd: runner_dir
+                .join("python-bridge")
+                .to_string_lossy()
+                .to_string(),
             env: HashMap::new(),
             health_port: Some(8001),
             parser: ParserType::Python,
@@ -203,7 +206,7 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             // start_group 2: after backend (group 1) so the qontinui package
             // and its sentence-transformers dependency are available.
             start_group: 2,
-            dev_only: false,  // embeddings are needed in production too
+            dev_only: false, // embeddings are needed in production too
             rebuild_enabled: false,
             build_command: None,
             build_args: vec![],

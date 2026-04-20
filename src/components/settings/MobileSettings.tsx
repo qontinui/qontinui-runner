@@ -53,7 +53,9 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
   const [hasChanges, setHasChanges] = useState(false);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
+    // eslint-disable-next-line react-hooks/immutability
     refreshDevices();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

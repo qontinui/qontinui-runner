@@ -297,44 +297,54 @@ mod tests {
     #[test]
     fn finding_category_serde_parity() {
         use FindingCategory::*;
-        assert_serde_parity!(FindingCategory, FindingCategoryExt, [
-            CodeBug,
-            Security,
-            Performance,
-            Todo,
-            Enhancement,
-            ConfigIssue,
-            TestIssue,
-            Documentation,
-            RuntimeIssue,
-            AlreadyFixed,
-            ExpectedBehavior,
-            Warning,
-            DataMigration,
-        ]);
+        assert_serde_parity!(
+            FindingCategory,
+            FindingCategoryExt,
+            [
+                CodeBug,
+                Security,
+                Performance,
+                Todo,
+                Enhancement,
+                ConfigIssue,
+                TestIssue,
+                Documentation,
+                RuntimeIssue,
+                AlreadyFixed,
+                ExpectedBehavior,
+                Warning,
+                DataMigration,
+            ]
+        );
     }
 
     #[test]
     fn finding_severity_serde_parity() {
         use FindingSeverity::*;
-        assert_serde_parity!(FindingSeverity, FindingSeverityExt, [
-            Critical, High, Medium, Low, Info,
-        ]);
+        assert_serde_parity!(
+            FindingSeverity,
+            FindingSeverityExt,
+            [Critical, High, Medium, Low, Info,]
+        );
     }
 
     #[test]
     fn finding_status_serde_parity() {
         use FindingStatus::*;
-        assert_serde_parity!(FindingStatus, FindingStatusExt, [
-            Detected, InProgress, NeedsInput, Resolved, WontFix, Deferred,
-        ]);
+        assert_serde_parity!(
+            FindingStatus,
+            FindingStatusExt,
+            [Detected, InProgress, NeedsInput, Resolved, WontFix, Deferred,]
+        );
     }
 
     #[test]
     fn finding_action_type_serde_parity() {
         use FindingActionType::*;
-        assert_serde_parity!(FindingActionType, FindingActionTypeExt, [
-            AutoFix, NeedsUserInput, Manual, Informational,
-        ]);
+        assert_serde_parity!(
+            FindingActionType,
+            FindingActionTypeExt,
+            [AutoFix, NeedsUserInput, Manual, Informational,]
+        );
     }
 }

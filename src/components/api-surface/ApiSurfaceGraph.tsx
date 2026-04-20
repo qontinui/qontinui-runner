@@ -377,11 +377,15 @@ function ApiSurfaceGraphInner({
   const [, setHoveredId] = useState<string | null>(null);
 
   // Sync layout during render when data changes
+  // eslint-disable-next-line react-hooks/refs
   if (prevLayoutNodesRef.current !== layoutNodes) {
+    // eslint-disable-next-line react-hooks/refs
     prevLayoutNodesRef.current = layoutNodes;
     setNodes(layoutNodes);
   }
+  // eslint-disable-next-line react-hooks/refs
   if (prevLayoutEdgesRef.current !== layoutEdges) {
+    // eslint-disable-next-line react-hooks/refs
     prevLayoutEdgesRef.current = layoutEdges;
     setEdges(layoutEdges);
   }

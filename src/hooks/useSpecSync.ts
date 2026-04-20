@@ -273,6 +273,7 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
 
     // Process next spec or finish
     processNextSpecRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ai.sessionState, ai.messages.length, state.phase]);
 
   const processNextSpec = useCallback(async () => {

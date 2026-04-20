@@ -517,22 +517,26 @@ impl LoopConfig {
             max_ci_auto_resumes: workflow.max_ci_auto_resumes,
             ci_failure_context: None,
             htn_config: {
-                let mut htn = crate::planning_bridge::HtnConfig::default();
-                htn.enabled = workflow.htn_enabled;
-                htn.ui_bridge_url = workflow.htn_ui_bridge_url.clone();
-                htn.state_machine_path = workflow.htn_state_machine_path.clone();
+                let mut htn = crate::planning_bridge::HtnConfig {
+                    enabled: workflow.htn_enabled,
+                    ui_bridge_url: workflow.htn_ui_bridge_url.clone(),
+                    state_machine_path: workflow.htn_state_machine_path.clone(),
+                    ..crate::planning_bridge::HtnConfig::default()
+                };
                 // Default state_machine_path and methods_directory to bundled data when enabled
                 if htn.enabled {
                     let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
                     if htn.state_machine_path.is_none() {
                         htn.state_machine_path = Some(
-                            data_dir.join("runner_state_machine.json").display().to_string(),
+                            data_dir
+                                .join("runner_state_machine.json")
+                                .display()
+                                .to_string(),
                         );
                     }
                     if htn.methods_directory.is_none() {
-                        htn.methods_directory = Some(
-                            data_dir.join("htn_methods").display().to_string(),
-                        );
+                        htn.methods_directory =
+                            Some(data_dir.join("htn_methods").display().to_string());
                     }
                 }
                 htn
@@ -1132,7 +1136,10 @@ mod tests {
         assert_eq!(pr.step_results[1].step_index, 1);
         assert_eq!(pr.step_results[1].success, false);
         assert_eq!(pr.step_results[1].error.as_deref(), Some("compile error"));
-        assert_eq!(pr.step_results[0].step_name.as_deref(), Some("install deps"));
+        assert_eq!(
+            pr.step_results[0].step_name.as_deref(),
+            Some("install deps")
+        );
         assert_eq!(pr.duration_ms, 350);
         assert_eq!(
             pr.failure_context.as_deref(),
@@ -1161,7 +1168,14 @@ mod tests {
             total_duration_ms: 500,
             step_results: vec![
                 mock_step(0, "command", "lint", true, None, 200),
-                mock_step(1, "test", "unit tests", false, Some("assertion failed"), 300),
+                mock_step(
+                    1,
+                    "test",
+                    "unit tests",
+                    false,
+                    Some("assertion failed"),
+                    300,
+                ),
             ],
             critical_failure: false,
             console_errors: None,

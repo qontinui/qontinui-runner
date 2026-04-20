@@ -594,9 +594,9 @@ test('${form.name || "test"}', async ({ page }) => {
       const task = await executeAiTask({
         name: "ai-analysis",
         content: prompt,
-        max_sessions: 1,
-        display_prompt: `Generate Playwright: ${form.name || form.description.substring(0, 50)}`,
-        timeout_seconds: 300,
+        maxSessions: 1,
+        displayPrompt: `Generate Playwright: ${form.name || form.description.substring(0, 50)}`,
+        timeoutSeconds: 300,
       });
 
       if (task.outputLog) {
@@ -787,9 +787,9 @@ test('${form.name || "test"}', async ({ page }) => {
       const task = await executeAiTask({
         name: "ai-analysis",
         content: prompt,
-        max_sessions: 1,
-        display_prompt: `Generate Playwright: ${form.name || form.description.substring(0, 50)}`,
-        timeout_seconds: 120,
+        maxSessions: 1,
+        displayPrompt: `Generate Playwright: ${form.name || form.description.substring(0, 50)}`,
+        timeoutSeconds: 120,
       });
 
       if (task.outputLog) {
@@ -892,9 +892,9 @@ Be thorough - check each action, assertion, and behavior mentioned in the descri
       const task = await executeAiTask({
         name: "ai-analysis",
         content: prompt,
-        max_sessions: 1,
-        display_prompt: "Validating script coverage",
-        timeout_seconds: 60,
+        maxSessions: 1,
+        displayPrompt: "Validating script coverage",
+        timeoutSeconds: 60,
       });
 
       if (task.outputLog) {
@@ -989,9 +989,9 @@ import { test, expect } from '@playwright/test';
       const task = await executeAiTask({
         name: "ai-analysis",
         content: prompt,
-        max_sessions: 1,
-        display_prompt: `Refine Playwright: ${form.name || "script"}`,
-        timeout_seconds: 120,
+        maxSessions: 1,
+        displayPrompt: `Refine Playwright: ${form.name || "script"}`,
+        timeoutSeconds: 120,
       });
 
       if (task.outputLog) {
@@ -1067,10 +1067,10 @@ OR
       const task = await executeAiTask({
         name: "ai-analysis",
         content: prompt,
-        max_sessions: 1,
-        display_prompt: `Verifying: ${objective.substring(0, 50)}...`,
-        timeout_seconds: 60,
-        image_paths: testResult.screenshots || [],
+        maxSessions: 1,
+        displayPrompt: `Verifying: ${objective.substring(0, 50)}...`,
+        timeoutSeconds: 60,
+        imagePaths: testResult.screenshots || [],
       });
 
       if (task.outputLog) {
@@ -1311,14 +1311,14 @@ import { test, expect } from '@playwright/test';
           aiTask = await executeAiTask({
             name: "ai-analysis",
             content: refinePrompt,
-            max_sessions: 1,
-            display_prompt: `Auto-refine iteration ${iteration}: ${form.name || "script"}`,
-            timeout_seconds: 120,
-            image_paths: imagePaths,
-            video_paths: videoPaths,
-            trace_path: tracePath,
-            max_video_frames: 3,
-            max_trace_screenshots: 5,
+            maxSessions: 1,
+            displayPrompt: `Auto-refine iteration ${iteration}: ${form.name || "script"}`,
+            timeoutSeconds: 120,
+            imagePaths: imagePaths,
+            videoPaths: videoPaths,
+            tracePath: tracePath,
+            maxVideoFrames: 3,
+            maxTraceScreenshots: 5,
           });
         } catch (error) {
           setIsGenerating(false);
@@ -1479,9 +1479,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
       const task = await executeAiTask({
         name: "ai-analysis",
         content: prompt,
-        max_sessions: 1,
-        display_prompt: `Generate description for: ${form.name || "script"}`,
-        timeout_seconds: 60,
+        maxSessions: 1,
+        displayPrompt: `Generate description for: ${form.name || "script"}`,
+        timeoutSeconds: 60,
       });
 
       if (task.outputLog) {

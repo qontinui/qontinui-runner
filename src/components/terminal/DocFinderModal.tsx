@@ -242,6 +242,7 @@ export function DocFinderModal({ onSelect, onClose, defaultRoot }: DocFinderModa
 
   // Scan on mount and root change
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     runScan(root);
   }, [root, runScan]);
 

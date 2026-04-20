@@ -215,6 +215,7 @@ export function useOrchestratorState(
   useEffect(() => {
     if (useUnifiedContext) return;
     if (taskId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsLoading(true);
       fetchState().finally(() => setIsLoading(false));
     } else {

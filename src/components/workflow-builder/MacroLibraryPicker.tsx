@@ -82,6 +82,7 @@ export function MacroLibraryPicker({ isOpen, onClose, onSelect, phase }: MacroLi
   // Reset selection when modal opens
   useEffect(() => {
     if (isOpen) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedId(null);
       setSearchQuery("");
       setFilterCategory(null);

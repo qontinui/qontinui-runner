@@ -210,6 +210,7 @@ export function DecompositionView({ running }: DecompositionViewProps) {
       return;
     }
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true);
     fetchPlan();
     const interval = setInterval(fetchPlan, 3000);

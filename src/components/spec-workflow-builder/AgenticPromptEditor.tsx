@@ -105,9 +105,7 @@ export function AgenticPromptEditor({
               return;
             }
             const parsed = parseInt(raw, 10);
-            onMaxIterationsChange(
-              Number.isFinite(parsed) && parsed >= 1 ? parsed : null,
-            );
+            onMaxIterationsChange(Number.isFinite(parsed) && parsed >= 1 ? parsed : null);
           }}
           placeholder="Unlimited"
           min={1}

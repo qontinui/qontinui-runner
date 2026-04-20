@@ -204,6 +204,7 @@ export function MultiLoopPanel() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchMultiStatus();
     loadRunnerInstances();
     loadWorkflows();
@@ -583,8 +584,7 @@ export function MultiLoopPanel() {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className={labelCls}>
-                Max Iterations{" "}
-                <span className="text-muted-foreground/60">(blank = unlimited)</span>
+                Max Iterations <span className="text-muted-foreground/60">(blank = unlimited)</span>
               </label>
               <input
                 type="number"

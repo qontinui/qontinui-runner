@@ -103,6 +103,7 @@ export function useElementThumbnails(
 
   // Persistent cache instance that tracks both element ID and bounds
   const cacheRef = useRef<ThumbnailCache | null>(null);
+  // eslint-disable-next-line react-hooks/refs
   if (!cacheRef.current) {
     cacheRef.current = new ThumbnailCache();
   }
@@ -182,6 +183,7 @@ export function useElementThumbnails(
 
     // Clear thumbnails if no screenshot or elements
     if (!screenshotBase64 || elements.length === 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setThumbnails(new Map());
       setError(null);
       setProgress(null);
@@ -306,6 +308,7 @@ export function useElementThumbnails(
   // Note: We intentionally trigger recomputation based on thumbnails state changes
   // even though we read from cacheRef - this ensures the returned Map is fresh
   const thumbnailCache = useMemo(() => {
+    // eslint-disable-next-line react-hooks/refs
     return cacheRef.current?.getAllThumbnails() ?? new Map<string, string>();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- thumbnails triggers cache refresh
   }, [thumbnails]);

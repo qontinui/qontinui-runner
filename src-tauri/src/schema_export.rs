@@ -30,7 +30,7 @@ pub fn export_all_schemas() -> Value {
         mcp_config as qmc, orchestration_config as qoc, process_management as qpm, rag as qr,
         scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
         ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
-        workflow as qw, worker_output as qwo, workflow_step as qws,
+        worker_output as qwo, workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the

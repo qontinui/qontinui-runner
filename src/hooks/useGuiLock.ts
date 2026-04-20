@@ -95,6 +95,7 @@ export function useGuiLock(enabled = true): UseGuiLockResult {
   // Initial fetch and polling
   useEffect(() => {
     if (!enabled) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsLoading(false);
       return;
     }

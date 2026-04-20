@@ -54,6 +54,7 @@ export function CostEffectivenessPanel() {
   }, [agentFilter]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
 

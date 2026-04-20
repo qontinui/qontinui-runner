@@ -86,12 +86,8 @@ fn all_event_names_source_lists_accessibility_events() {
     // Sanity: the constant's slice body should contain at least 30 distinct
     // quoted event names (we've declared 34 at time of writing). We count
     // lines of the form `    "name",` inside the constant body.
-    let body = extract_between(
-        &src,
-        "pub const ALL_EVENT_NAMES: &[&str] = &[",
-        "];",
-    )
-    .expect("ALL_EVENT_NAMES body not found");
+    let body = extract_between(&src, "pub const ALL_EVENT_NAMES: &[&str] = &[", "];")
+        .expect("ALL_EVENT_NAMES body not found");
     let quoted: Vec<&str> = body
         .lines()
         .filter(|l| {
@@ -185,9 +181,7 @@ fn accessibility_app_event_variants_declared() {
         "event_name() arm for AccessibilityConnected missing"
     );
     assert!(
-        src.contains(
-            "AppEvent::AccessibilityCaptureComplete { .. } => \"a11y-capture-complete\""
-        ),
+        src.contains("AppEvent::AccessibilityCaptureComplete { .. } => \"a11y-capture-complete\""),
         "event_name() arm for AccessibilityCaptureComplete missing"
     );
 

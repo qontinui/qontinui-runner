@@ -69,6 +69,7 @@ export function OtelSettings({ onLog }: OtelSettingsProps) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

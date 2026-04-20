@@ -430,11 +430,9 @@ export function useDebugInspectEvents(
           // Both shapes accepted, plus both array and record forms for fields:
           //   { fields: [{elementId, value}, ...] }   (manual-test/HTTP convention)
           //   { fields: { fieldId: value, ... } }     (SDK fillFormFields convention)
-          const fillParams = (
-            (payload.params as Record<string, unknown> | undefined) ??
+          const fillParams = ((payload.params as Record<string, unknown> | undefined) ??
             (payload.body as Record<string, unknown> | undefined) ??
-            (payload as unknown as Record<string, unknown>)
-          ) as Record<string, unknown>;
+            (payload as unknown as Record<string, unknown>)) as Record<string, unknown>;
           const rawFields = fillParams.fields;
           const triggerValidation = fillParams.triggerValidation as boolean | undefined;
           const clearFirst = fillParams.clearFirst as boolean | undefined;
@@ -459,10 +457,8 @@ export function useDebugInspectEvents(
           // registry IDs (e.g. "input-my-runner"). Going through the
           // registry's executeAction handles both naming schemes and runs
           // the proper type/check/select action based on element type.
-          const perField: Record<
-            string,
-            { success: boolean; error?: string; action?: string }
-          > = {};
+          const perField: Record<string, { success: boolean; error?: string; action?: string }> =
+            {};
           let filledCount = 0;
           let errorCount = 0;
 
@@ -470,7 +466,10 @@ export function useDebugInspectEvents(
             const el = currentBridge.elements.find((e) => e.id === fieldId);
             const elType = el?.type ?? "input";
             let action = "type";
-            let params: Record<string, unknown> = { text: String(value), clear: clearFirst !== false };
+            let params: Record<string, unknown> = {
+              text: String(value),
+              clear: clearFirst !== false,
+            };
 
             if (elType === "checkbox" || elType === "radio") {
               const checked = typeof value === "boolean" ? value : value === "true";

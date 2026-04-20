@@ -62,6 +62,7 @@ export function useInitialStatesOverride(
   useEffect(() => {
     if (overrideStateIds !== null) {
       log.debug("Clearing override due to workflow change");
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setOverrideStateIdsInternal(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- Only trigger on workflow change, not on overrideStateIds
@@ -71,6 +72,7 @@ export function useInitialStatesOverride(
   useEffect(() => {
     if (configVersion > 0 && overrideStateIds !== null) {
       log.debug("Clearing override due to config reload");
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setOverrideStateIdsInternal(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- Only trigger on config version change

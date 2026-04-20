@@ -127,6 +127,7 @@ export function ProcessManagerTab() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadProcesses();
     invoke<RunnerIdentity>("get_runner_identity")
       .then(setIdentity)

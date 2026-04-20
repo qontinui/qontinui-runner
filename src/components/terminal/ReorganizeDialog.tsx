@@ -54,6 +54,7 @@ export function ReorganizeDialog({ pages, onClose, onApply }: ReorganizeDialogPr
     });
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const getPageName = (pageId: string): string =>
     pages.find((p) => p.id === pageId)?.name ?? pageId;
 
@@ -148,9 +149,9 @@ Return this exact JSON format:
         {
           name: "session-reorganization",
           content: prompt,
-          display_prompt: "Analyzing sessions for topic-based reorganization...",
-          max_sessions: 1,
-          timeout_seconds: 60,
+          displayPrompt: "Analyzing sessions for topic-based reorganization...",
+          maxSessions: 1,
+          timeoutSeconds: 60,
         },
         { timeoutMs: 90_000 },
       );

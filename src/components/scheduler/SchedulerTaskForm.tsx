@@ -184,6 +184,7 @@ export function SchedulerTaskForm({
   useEffect(() => {
     if (scheduleType === "condition") {
       if (!requireIdle && !requireRepoInactive) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setRequireIdle(true);
       }
     }

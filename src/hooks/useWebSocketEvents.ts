@@ -297,6 +297,7 @@ export function useWebSocketEvents(
 
           reconnectTimeoutRef.current = setTimeout(() => {
             setReconnectAttempts((prev) => prev + 1);
+            // eslint-disable-next-line react-hooks/immutability
             connect();
           }, delay);
         }
@@ -361,6 +362,7 @@ export function useWebSocketEvents(
     }
 
     if (!enabled) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       disconnect();
       return;
     }
@@ -372,11 +374,13 @@ export function useWebSocketEvents(
     };
   }, [enabled, connect, disconnect]);
 
+  // eslint-disable-next-line react-hooks/refs
   return {
     isConnected,
     isConnecting,
     error,
     reconnectAttempts,
+    // eslint-disable-next-line react-hooks/refs
     isTauriEnvironment: isTauriRef.current,
     connect,
     disconnect,

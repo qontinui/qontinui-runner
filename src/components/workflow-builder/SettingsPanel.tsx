@@ -635,7 +635,11 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
               (workflow as { multi_agent_pipeline_config?: unknown })
                 .multi_agent_pipeline_config as Record<string, unknown> | undefined
             }
-            onChange={(c) => updateWorkflow({ multi_agent_pipeline_config: c })}
+            onChange={(c) =>
+              (updateWorkflow as (updates: Record<string, unknown>) => void)({
+                multi_agent_pipeline_config: c,
+              })
+            }
           />
         );
 

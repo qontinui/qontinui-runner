@@ -398,6 +398,7 @@ export function LearningDashboard() {
 
   // Auto-refresh: event listener + 60s interval
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadData();
 
     let unlisten: UnlistenFn | null = null;

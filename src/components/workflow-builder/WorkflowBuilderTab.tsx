@@ -165,15 +165,15 @@ function WorkflowBuilderContent({
         description: workflow.description,
         category: workflow.category,
         tags: workflow.tags,
-        setup_steps: workflow.setup_steps,
-        verification_steps: workflow.verification_steps,
-        agentic_steps: workflow.agentic_steps,
-        completion_steps: workflow.completion_steps,
-        max_iterations: workflow.max_iterations,
+        setupSteps: workflow.setupSteps,
+        verificationSteps: workflow.verificationSteps,
+        agenticSteps: workflow.agenticSteps,
+        completionSteps: workflow.completionSteps,
+        maxIterations: workflow.maxIterations,
         provider: workflow.provider ?? undefined,
         model: workflow.model ?? undefined,
-        skip_ai_summary: workflow.skip_ai_summary,
-        log_source_selection: workflow.log_source_selection,
+        skipAiSummary: workflow.skipAiSummary,
+        logSourceSelection: workflow.logSourceSelection,
       });
       setShowSettings(true);
       setShowConstraints(false);

@@ -96,6 +96,7 @@ export function useWebSocketLatency(
   const messageTimesRef = useRef<number[]>([]);
   const reconnectsRef = useRef(0);
   const connectedRef = useRef(false);
+  // eslint-disable-next-line react-hooks/purity
   const startTimeRef = useRef(Date.now());
 
   // Calculate latency from server timestamp

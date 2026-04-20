@@ -62,6 +62,7 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
 
   // Load projects on mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchProjects();
   }, [fetchProjects]);
 

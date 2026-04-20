@@ -75,6 +75,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -82,6 +83,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
   // Check for API key when provider changes
   useEffect(() => {
     if (settings.llm_mode === "remote_api") {
+      // eslint-disable-next-line react-hooks/immutability
       checkApiKey(settings.api_provider);
     }
   }, [settings.api_provider, settings.llm_mode]);

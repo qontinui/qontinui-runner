@@ -77,6 +77,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
   // Auto-analyze when path is set from outside (initialProjectPath)
   useEffect(() => {
     if (initialProjectPath && projectPath === initialProjectPath && !analysis && !analyzing) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       analyze();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

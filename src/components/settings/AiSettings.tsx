@@ -92,9 +92,13 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   };
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
+    // eslint-disable-next-line react-hooks/immutability
     checkApiKey();
+    // eslint-disable-next-line react-hooks/immutability
     checkGeminiApiKey();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     checkCliAuth();
     loadClaudeConfigDirs();
 

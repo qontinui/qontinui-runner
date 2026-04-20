@@ -90,7 +90,7 @@ export const setupReportingHandlers: HandlerSetupFunction = (context) => {
       const treeEventData = payload as unknown as TreeEventData | undefined;
       if (treeEventData) {
         const eventData = treeEventData;
-        const eventType = eventData.event_type;
+        const eventType = eventData.eventType;
 
         // Report on action completion (success or failure)
         if ((eventType === "action_completed" || eventType === "action_failed") && eventData.node) {
@@ -147,6 +147,7 @@ function processTreeEventForReporting(eventData: TreeEventData): void {
 /**
  * Extract LLM metrics from action metadata/runtime if available.
  */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractLLMMetrics(metadata: any, runtime?: any): LLMMetrics | undefined {
   // Check for pre-structured llm_metrics
   if (metadata?.llm_metrics) {
@@ -180,10 +181,10 @@ function extractLLMMetrics(metadata: any, runtime?: any): LLMMetrics | undefined
   return {
     model: typeof model === "string" ? model : undefined,
     provider: typeof provider === "string" ? provider : undefined,
-    tokens_input: inputTokens,
-    tokens_output: outputTokens,
-    tokens_total: inputTokens + outputTokens,
-    cost_usd: typeof costUsd === "number" ? costUsd : undefined,
+    tokensInput: inputTokens,
+    tokensOutput: outputTokens,
+    tokensTotal: inputTokens + outputTokens,
+    costUsd: typeof costUsd === "number" ? costUsd : undefined,
   };
 }
 

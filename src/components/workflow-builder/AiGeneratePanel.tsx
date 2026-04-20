@@ -325,6 +325,7 @@ export function AiGeneratePanel({
   // Hydrate description from storage after mount
   useEffect(() => {
     const saved = instanceStorage.getItem("generate-workflow-prompt");
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (saved) setDescription(saved);
   }, []);
 

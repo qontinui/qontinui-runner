@@ -84,6 +84,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
   const [envVarStatus, setEnvVarStatus] = useState<Record<string, boolean | null>>({});
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

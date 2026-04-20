@@ -1111,10 +1111,7 @@ impl AppEvent {
     }
 
     /// Create an accessibility-connected event.
-    pub fn accessibility_connected(
-        backend: impl Into<String>,
-        target: Option<String>,
-    ) -> Self {
+    pub fn accessibility_connected(backend: impl Into<String>, target: Option<String>) -> Self {
         AppEvent::AccessibilityConnected {
             backend: backend.into(),
             target,

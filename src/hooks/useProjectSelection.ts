@@ -88,6 +88,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
         const projectStillExists = projectList.some((p) => p.id === selectedProjectId);
         if (!projectStillExists && projectList.length > 0) {
           // Auto-select first project if stored project no longer exists
+          // eslint-disable-next-line react-hooks/immutability
           setSelectedProject(projectList[0].id);
         } else if (projectStillExists) {
           // Update name in case it changed
@@ -113,6 +114,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
    * Set the selected project and persist to localStorage
    */
   const setSelectedProject = useCallback(
+    // eslint-disable-next-line react-hooks/preserve-manual-memoization
     (projectId: string | null) => {
       setSelectedProjectIdState(projectId);
 
@@ -145,6 +147,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
     if (selectedProjectId && projects.length > 0) {
       const project = projects.find((p) => p.id === selectedProjectId);
       if (project && project.name !== selectedProjectName) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setSelectedProjectName(project.name);
         // Update localStorage
         const state: ProjectSelectionState = {

@@ -74,18 +74,20 @@ export function useWorkflowLibrary(
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchWorkflows();
   }, [fetchWorkflows]);
 
   useEffect(() => {
     if (!isSaving && currentWorkflowId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       fetchWorkflows();
     }
   }, [isSaving, currentWorkflowId, fetchWorkflows]);
 
   const toggleFavorite = useCallback(async (workflowId: string) => {
     setSavedWorkflows((prev) =>
-      prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: !w.is_favorite } : w)),
+      prev.map((w) => (w.id === workflowId ? { ...w, isFavorite: !w.isFavorite } : w)),
     );
     try {
       const response = await tracedFetch(
@@ -94,24 +96,24 @@ export function useWorkflowLibrary(
       );
       const result = await response.json();
       if (result.success) {
-        const newState = result.data.is_favorite;
+        const newState = result.data.isFavorite;
         setSavedWorkflows((prev) =>
-          prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: newState } : w)),
+          prev.map((w) => (w.id === workflowId ? { ...w, isFavorite: newState } : w)),
         );
       } else {
         setSavedWorkflows((prev) =>
-          prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: !w.is_favorite } : w)),
+          prev.map((w) => (w.id === workflowId ? { ...w, isFavorite: !w.isFavorite } : w)),
         );
       }
     } catch (error) {
       console.error("Failed to toggle favorite:", error);
       setSavedWorkflows((prev) =>
-        prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: !w.is_favorite } : w)),
+        prev.map((w) => (w.id === workflowId ? { ...w, isFavorite: !w.isFavorite } : w)),
       );
     }
   }, []);
 
-  const hasFavorites = useMemo(() => savedWorkflows.some((w) => w.is_favorite), [savedWorkflows]);
+  const hasFavorites = useMemo(() => savedWorkflows.some((w) => w.isFavorite), [savedWorkflows]);
 
   const toggleWorkflowSelection = useCallback((workflowId: string) => {
     setSelectedWorkflowIds((prev) => {
@@ -372,7 +374,7 @@ export function useWorkflowLibrary(
 
   const filteredWorkflows = savedWorkflows
     .filter((w) => {
-      if (showFavoritesOnly && !w.is_favorite) return false;
+      if (showFavoritesOnly && !w.isFavorite) return false;
       if (!searchQuery) return true;
       const query = searchQuery.toLowerCase();
       return (
@@ -382,8 +384,8 @@ export function useWorkflowLibrary(
       );
     })
     .sort((a, b) => {
-      const favA = a.is_favorite ? 1 : 0;
-      const favB = b.is_favorite ? 1 : 0;
+      const favA = a.isFavorite ? 1 : 0;
+      const favB = b.isFavorite ? 1 : 0;
       return favB - favA;
     });
 

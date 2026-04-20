@@ -452,10 +452,12 @@ mod tests {
         stats.first_run_at = Some(chrono::Utc::now().to_rfc3339());
 
         // Add a flaky transition (50% success rate)
-        let mut trans_stats = TransitionStats::default();
-        trans_stats.total = 20;
-        trans_stats.success = 10;
-        trans_stats.failure = 10;
+        let trans_stats = TransitionStats {
+            total: 20,
+            success: 10,
+            failure: 10,
+            ..TransitionStats::default()
+        };
         stats
             .transition_stats
             .insert("StateA|StateB".to_string(), trans_stats);
@@ -477,10 +479,12 @@ mod tests {
         let mut stats = create_test_stats();
 
         // Add transition with too few runs
-        let mut trans_stats = TransitionStats::default();
-        trans_stats.total = 5; // Below threshold
-        trans_stats.success = 2;
-        trans_stats.failure = 3;
+        let trans_stats = TransitionStats {
+            total: 5, // Below threshold
+            success: 2,
+            failure: 3,
+            ..TransitionStats::default()
+        };
         stats
             .transition_stats
             .insert("StateA|StateB".to_string(), trans_stats);

@@ -250,7 +250,10 @@ impl PgDb {
             // AVG over integer returns numeric in PG; cast ::double precision in SQL,
             // but still use try_get to avoid panic on unexpected type.
             let avg_rating: Option<f64> = row.try_get(2).unwrap_or_else(|e| {
-                tracing::warn!("get_feedback_summary: col 2 (avg_rating) decode error: {}", e);
+                tracing::warn!(
+                    "get_feedback_summary: col 2 (avg_rating) decode error: {}",
+                    e
+                );
                 None
             });
             summary.insert(

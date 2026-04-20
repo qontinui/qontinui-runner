@@ -324,6 +324,129 @@ declare module "@qontinui/ui-bridge/contracts" {
 }
 
 // =============================================================================
+// @qontinui/ui-bridge-auto (package directory does not exist yet)
+// Stub types based on usage in useStateMachineRegistration.ts and
+// compile-state-machine.ts
+// =============================================================================
+
+declare module "@qontinui/ui-bridge-auto" {
+  export interface ElementQuery {
+    role?: string;
+    text?: string;
+    textContains?: string;
+    ariaLabel?: string;
+    tagName?: string;
+    attributes?: Record<string, string>;
+    placeholder?: string;
+    id?: string;
+    [key: string]: unknown;
+  }
+
+  export interface TransitionAction {
+    target: ElementQuery;
+    action: string;
+    params?: Record<string, unknown>;
+    waitAfter?: { timeout?: number; [key: string]: unknown };
+  }
+
+  export interface StateDefinition {
+    id: string;
+    name: string;
+    requiredElements: ElementQuery[];
+    pathCost?: number;
+    [key: string]: unknown;
+  }
+
+  export interface TransitionDefinition {
+    id: string;
+    name: string;
+    fromStates: string[];
+    activateStates: string[];
+    exitStates: string[];
+    actions: TransitionAction[];
+    pathCost?: number;
+    [key: string]: unknown;
+  }
+
+  export interface PersistedStateMachine {
+    version: string;
+    createdAt: number;
+    updatedAt: number;
+    states: StateDefinition[];
+    transitions: TransitionDefinition[];
+  }
+
+  export interface RegistryLike {
+    getAllElements(): Array<{
+      id: string;
+      element: Element;
+      type: string;
+      label?: string;
+      getState: () => Record<string, unknown>;
+      getIdentifier?: () => Record<string, string | undefined>;
+    }>;
+    on(type: string, listener: (...args: unknown[]) => void): () => void;
+  }
+
+  export interface NavigationResult {
+    path: TransitionDefinition[];
+    totalCost: number;
+  }
+
+  export interface NavigateToStateResult {
+    path: Array<{ id: string; [key: string]: unknown }>;
+    totalCost: number;
+    targetsReached: Set<string>;
+    strategy: string;
+  }
+
+  export interface StateMachineController {
+    getAllStateDefinitions(): StateDefinition[];
+    getTransitionDefinitions(): TransitionDefinition[];
+    setActiveStates(states: Set<string>): void;
+  }
+
+  export interface StateDetector {
+    dispose(): void;
+  }
+
+  export interface AutomationEngineOptions {
+    registry: RegistryLike;
+    executor: DefaultDOMExecutor;
+    enableHighlights?: boolean;
+    enableReliabilityTracking?: boolean;
+    [key: string]: unknown;
+  }
+
+  export class AutomationEngine {
+    stateMachine: StateMachineController;
+    stateDetector: StateDetector;
+    constructor(options: AutomationEngineOptions);
+    defineStates(states: StateDefinition[]): void;
+    defineTransitions(transitions: TransitionDefinition[]): void;
+    detectActiveStates(): void;
+    getActiveStates(): Set<string>;
+    navigateToState(stateId: string): Promise<NavigateToStateResult>;
+  }
+
+  export class DefaultDOMExecutor {
+    constructor(registry: RegistryLike);
+    findElement(query: ElementQuery): { id: string; [key: string]: unknown } | null;
+    executeAction(
+      elementId: string,
+      action: string,
+      params?: Record<string, unknown>,
+    ): Promise<void>;
+  }
+
+  export function navigate(
+    activeStates: Set<string>,
+    targetStateId: string,
+    transitions: TransitionDefinition[],
+  ): NavigationResult;
+}
+
+// =============================================================================
 // @qontinui/ui-bridge/core — getGlobalRegistry (exported in source, missing in dist)
 // Note: Augmented via ui-bridge-augments.d.ts (module file)
 // =============================================================================

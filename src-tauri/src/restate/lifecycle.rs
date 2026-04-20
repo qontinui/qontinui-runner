@@ -339,10 +339,7 @@ pub async fn register_service_endpoint(
     settings: &RestateSettings,
     service_endpoint_port: u16,
 ) -> Result<(), String> {
-    let admin_url = format!(
-        "{}/deployments",
-        settings.admin_url().trim_end_matches('/')
-    );
+    let admin_url = format!("{}/deployments", settings.admin_url().trim_end_matches('/'));
     let service_url = format!("http://127.0.0.1:{}", service_endpoint_port);
 
     info!(

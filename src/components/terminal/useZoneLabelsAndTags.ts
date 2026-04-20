@@ -81,14 +81,17 @@ export function useZoneLabelsAndTags(
 
   useEffect(() => {
     instanceStorage.setJSON(pk(`zone-labels-${layoutId}`), zoneLabels);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [zoneLabels, layoutId]);
 
   useEffect(() => {
     instanceStorage.setJSON(pk(`zone-notes-${layoutId}`), zoneNotes);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [zoneNotes, layoutId]);
 
   useEffect(() => {
     instanceStorage.setJSON(pk(`zone-pinned-${layoutId}`), [...pinnedZones]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pinnedZones, layoutId]);
 
   // ── Reload labels/pins when layout changes, with pin migration ────────────
@@ -108,7 +111,6 @@ export function useZoneLabelsAndTags(
       prevLayoutIdRef2.current = layoutId;
       prevAssignmentsRef.current = assignments;
 
-      /* eslint-disable react-hooks/set-state-in-effect -- layout change migration */
       setZoneLabels(
         instanceStorage.getJSON<Record<number, string>>(pk(`zone-labels-${layoutId}`), {}),
       );
@@ -128,7 +130,6 @@ export function useZoneLabelsAndTags(
       setZoneNotes(
         instanceStorage.getJSON<Record<number, string>>(pk(`zone-notes-${layoutId}`), {}),
       );
-      /* eslint-enable react-hooks/set-state-in-effect */
     } else {
       // Keep assignments ref in sync for non-layout-change updates (e.g., tab swaps)
       prevAssignmentsRef.current = assignments;

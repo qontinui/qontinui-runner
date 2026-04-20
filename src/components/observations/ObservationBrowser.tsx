@@ -97,6 +97,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
 
   // Auto-load stats on mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadStats();
   }, [loadStats]);
 

@@ -144,9 +144,8 @@ pub fn runner_ui_bridge_base(
 
 /// Returns the base URL using the configured port (env var or default).
 /// Use this in code paths that don't have access to AppState.
-#[deprecated(
-    note = "Use runner_ui_bridge_base or get_self_base_url with AppState — env-var lookup hides the actual bound port for non-default runners"
-)]
+/// For code paths that do have AppState, prefer `get_self_base_url` which
+/// uses the actual bound port and works correctly with multi-instance runners.
 pub fn get_self_base_url_from_env() -> String {
     format!("http://localhost:{}", get_mcp_api_port())
 }

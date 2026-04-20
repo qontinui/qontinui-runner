@@ -171,7 +171,7 @@ export function ConstraintOverridesEditor() {
       {overrideCount > 0 && (
         <button
           type="button"
-          onClick={() => updateWorkflow({ constraint_overrides: undefined })}
+          onClick={() => updateWorkflow({ constraintOverrides: undefined })}
           className="text-[10px] text-zinc-500 hover:text-red-400 transition-colors"
         >
           Clear all overrides

@@ -48,11 +48,7 @@ impl CompensationManager {
     /// The in-memory push succeeds unconditionally — a persistence failure is
     /// logged but does not prevent compensation from being attempted in the
     /// current run. Only a catastrophic serialization failure returns `Err`.
-    pub async fn push(
-        &self,
-        execution_id: &str,
-        action: CompensationAction,
-    ) -> Result<(), String> {
+    pub async fn push(&self, execution_id: &str, action: CompensationAction) -> Result<(), String> {
         // Serialize first so we bail early on the only truly fatal case.
         let action_json = serde_json::to_value(&action)
             .map_err(|e| format!("Failed to serialize CompensationAction: {}", e))?;
@@ -1128,11 +1124,7 @@ mod tests {
             path_a.to_string_lossy().into_owned(),
             path_b.to_string_lossy().into_owned(),
         ];
-        let action = make_action(
-            "cleanup-1",
-            "test",
-            CompensationType::FileCleanup { paths },
-        );
+        let action = make_action("cleanup-1", "test", CompensationType::FileCleanup { paths });
 
         let result = execute_compensation(&action).await;
 
@@ -1154,8 +1146,7 @@ mod tests {
         // delegates to `tokio::fs::remove_dir_all`, which surfaces as an Err
         // rather than a panic). The point is to exercise the error path
         // without requiring a live git repository in the test environment.
-        let nonexistent =
-            std::env::temp_dir().join("qontinui-nonexistent-worktree-xyz-42");
+        let nonexistent = std::env::temp_dir().join("qontinui-nonexistent-worktree-xyz-42");
         // Make sure it really doesn't exist.
         let _ = tokio::fs::remove_dir_all(&nonexistent).await;
         assert!(!nonexistent.exists());
@@ -1216,9 +1207,15 @@ mod tests {
 
         // LIFO: results[0] is the LAST pushed action ("a-2"), results[2] is
         // the FIRST pushed ("a-0").
-        assert_eq!(results[0].action_id, "a-2", "LIFO: first result = last pushed");
+        assert_eq!(
+            results[0].action_id, "a-2",
+            "LIFO: first result = last pushed"
+        );
         assert_eq!(results[1].action_id, "a-1");
-        assert_eq!(results[2].action_id, "a-0", "LIFO: last result = first pushed");
+        assert_eq!(
+            results[2].action_id, "a-0",
+            "LIFO: last result = first pushed"
+        );
 
         // All three files should be gone regardless of order.
         for p in &paths {
@@ -1377,8 +1374,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path_first = dir.path().join("first.txt");
         let path_last = dir.path().join("last.txt");
-        tokio::fs::write(&path_first, b"x").await.expect("write first");
-        tokio::fs::write(&path_last, b"y").await.expect("write last");
+        tokio::fs::write(&path_first, b"x")
+            .await
+            .expect("write first");
+        tokio::fs::write(&path_last, b"y")
+            .await
+            .expect("write last");
 
         // Use the system temp dir as cwd — exists on all platforms.
         let safe_cwd = std::env::temp_dir().to_string_lossy().into_owned();

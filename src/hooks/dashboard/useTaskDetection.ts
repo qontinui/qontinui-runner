@@ -427,6 +427,7 @@ export function useTaskDetection(options?: UseTaskDetectionOptions): UseTaskDete
 
   // Initial fetch and fallback polling (reduced frequency since we have real-time events)
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
     const interval = setInterval(refresh, POLL_INTERVAL_MS);
     return () => clearInterval(interval);

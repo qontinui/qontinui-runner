@@ -3174,11 +3174,7 @@ pub(crate) async fn emit_and_persist_phase_result(
         "phase-result",
         serde_json::json!({ "execution_id": parent_id, "result": &result }),
     ) {
-        tracing::warn!(
-            "PHASE-RESULT: failed to emit {} phase: {}",
-            result.phase,
-            e
-        );
+        tracing::warn!("PHASE-RESULT: failed to emit {} phase: {}", result.phase, e);
     }
     // Server-mode: fire-and-forget POST to qontinui-web. The helper internally
     // `tokio::spawn`s so this call returns immediately even when the web

@@ -21,6 +21,7 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     discoverDirs();
   }, []);
 

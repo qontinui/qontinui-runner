@@ -781,11 +781,17 @@ impl PgDb {
         // AVG over integer returns numeric in PG; cast ::double precision in SQL,
         // but still use try_get to avoid panic on unexpected type.
         let avg_iterations: f64 = row.try_get(2).unwrap_or_else(|e| {
-            tracing::warn!("build_model_profile_data: col 2 (avg_iterations) decode error: {}", e);
+            tracing::warn!(
+                "build_model_profile_data: col 2 (avg_iterations) decode error: {}",
+                e
+            );
             0.0
         });
         let avg_duration_ms: f64 = row.try_get(3).unwrap_or_else(|e| {
-            tracing::warn!("build_model_profile_data: col 3 (avg_duration_ms) decode error: {}", e);
+            tracing::warn!(
+                "build_model_profile_data: col 3 (avg_duration_ms) decode error: {}",
+                e
+            );
             0.0
         });
 

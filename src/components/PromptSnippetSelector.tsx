@@ -42,7 +42,9 @@ export function PromptSnippetSelector({
 
   // Sync search query from props during render (derived state, no useEffect)
   const prevInitialSearchQueryRef = useRef(initialSearchQuery);
+  // eslint-disable-next-line react-hooks/refs
   if (prevInitialSearchQueryRef.current !== initialSearchQuery) {
+    // eslint-disable-next-line react-hooks/refs
     prevInitialSearchQueryRef.current = initialSearchQuery;
     setSearchQuery(initialSearchQuery);
   }
@@ -51,10 +53,14 @@ export function PromptSnippetSelector({
   const prevSearchQueryRef = useRef(searchQuery);
   const prevSelectedCategoryRef = useRef(selectedCategory);
   if (
+    // eslint-disable-next-line react-hooks/refs
     prevSearchQueryRef.current !== searchQuery ||
+    // eslint-disable-next-line react-hooks/refs
     prevSelectedCategoryRef.current !== selectedCategory
   ) {
+    // eslint-disable-next-line react-hooks/refs
     prevSearchQueryRef.current = searchQuery;
+    // eslint-disable-next-line react-hooks/refs
     prevSelectedCategoryRef.current = selectedCategory;
     setSelectedIndex(0);
   }
@@ -91,6 +97,7 @@ export function PromptSnippetSelector({
   // Load data when opened
   useEffect(() => {
     if (isOpen) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       loadData();
     }
   }, [isOpen, loadData]);

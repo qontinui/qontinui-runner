@@ -17,8 +17,8 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationTreeWalker, TreeScope_Children,
-    UIA_NamePropertyId, UIA_ProcessIdPropertyId,
+    CUIAutomation, IUIAutomation, IUIAutomationTreeWalker, TreeScope_Children, UIA_NamePropertyId,
+    UIA_ProcessIdPropertyId,
 };
 
 use super::common::{SendElement, UiaHandleTable, UiaState};

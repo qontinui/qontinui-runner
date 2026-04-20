@@ -311,10 +311,7 @@ pub async fn resume_interrupted_workflows(
                             "Startup compensation complete for '{}' (id: {}): {}/{} succeeded, {} failed (total pending: {})",
                             task_run.task_name, task_run.id, succeeded, attempted, failed, total
                         );
-                        format!(
-                            " [auto-compensated: {}/{} succeeded]",
-                            succeeded, attempted
-                        )
+                        format!(" [auto-compensated: {}/{} succeeded]", succeeded, attempted)
                     }
                     Err(e) => {
                         error!(

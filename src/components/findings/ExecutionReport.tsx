@@ -131,6 +131,7 @@ export function ExecutionReport({
     });
 
     // Initialize with current findings
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLiveFindings(findingsTracker.getAllFindings());
 
     return unsubscribe;
@@ -458,9 +459,9 @@ Work through ALL findings systematically. Fix each one and report your resolutio
     await triggerAnalyzeAll({
       name: "ai-analysis",
       content: prompt,
-      max_sessions: 1,
-      display_prompt: `Fixing ${autoFixableFindings.length} auto-fixable findings`,
-      timeout_seconds: 600,
+      maxSessions: 1,
+      displayPrompt: `Fixing ${autoFixableFindings.length} auto-fixable findings`,
+      timeoutSeconds: 600,
     });
   }, [autoFixableFindings, triggerAnalyzeAll]);
 

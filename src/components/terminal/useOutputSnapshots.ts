@@ -20,6 +20,7 @@ export function useOutputSnapshots(lastOutputLines: Record<string, string[]>): {
 
   // Set of tab IDs that have output snapshots stored
   const snapshotZones = useMemo(
+    // eslint-disable-next-line react-hooks/refs
     () => new Set(Object.keys(outputSnapshotsRef.current)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [snapshotCounter],

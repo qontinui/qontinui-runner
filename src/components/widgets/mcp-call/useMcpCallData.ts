@@ -94,6 +94,7 @@ export function useMcpCallData(): McpCallData {
 
   // Initial fetch and polling
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchCalls();
     const interval = setInterval(fetchCalls, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
@@ -102,6 +103,7 @@ export function useMcpCallData(): McpCallData {
   // Update elapsed time
   useEffect(() => {
     if (!startTime) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setElapsedTime(0);
       return;
     }

@@ -210,6 +210,7 @@ export function useStateToWorkflow(): UseStateToWorkflowReturn {
 
   // Load states on mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refreshStates();
   }, [refreshStates]);
 

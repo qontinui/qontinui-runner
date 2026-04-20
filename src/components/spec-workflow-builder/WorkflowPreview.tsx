@@ -36,10 +36,10 @@ export function WorkflowPreview({ workflow, onApply }: WorkflowPreviewProps) {
   // Wire-side UnifiedStep[] has an open `Other` variant; runner-produced
   // workflows only contain canonical steps, so narrow to the strict view.
   const phases: { key: WorkflowPhase; steps: UnifiedStep[] }[] = [
-    { key: "setup", steps: workflow.setup_steps as UnifiedStep[] },
-    { key: "verification", steps: workflow.verification_steps as UnifiedStep[] },
-    { key: "agentic", steps: workflow.agentic_steps as UnifiedStep[] },
-    { key: "completion", steps: workflow.completion_steps as UnifiedStep[] },
+    { key: "setup", steps: workflow.setupSteps as UnifiedStep[] },
+    { key: "verification", steps: workflow.verificationSteps as UnifiedStep[] },
+    { key: "agentic", steps: workflow.agenticSteps as UnifiedStep[] },
+    { key: "completion", steps: workflow.completionSteps as UnifiedStep[] },
   ];
 
   const totalSteps = phases.reduce((sum, p) => sum + p.steps.length, 0);

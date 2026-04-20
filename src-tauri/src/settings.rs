@@ -437,7 +437,7 @@ impl Default for MobileSettings {
 
 /// Settings for the rathole-based reverse tunnel that lets off-network devices
 /// reach the runner. Replaces the ephemeral Cloudflare quick-tunnel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TunnelSettings {
     /// Whether tunnel wiring is allowed at all.
     #[serde(default)]
@@ -454,17 +454,6 @@ pub struct TunnelSettings {
     /// If true, start the rathole client on runner boot when `enabled`.
     #[serde(default)]
     pub auto_connect: bool,
-}
-
-impl Default for TunnelSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            server_addr: String::new(),
-            default_token: None,
-            auto_connect: false,
-        }
-    }
 }
 
 // ============================================================================

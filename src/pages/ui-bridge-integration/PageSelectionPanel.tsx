@@ -74,6 +74,7 @@ export function PageSelectionPanel({
 
   useEffect(() => {
     if (projectPath) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       discoverPages();
     }
   }, [projectPath, discoverPages]);

@@ -181,17 +181,17 @@ function WorkflowStageIndicator({
       {iteration !== undefined &&
         maxIterations !== undefined &&
         (maxIterations === null || maxIterations > 1) && (
-        <>
-          <IterationBadge
-            iteration={iteration}
-            maxIterations={maxIterations}
-            isRunning={
-              isRunning && (effectiveStage === "verification" || effectiveStage === "agentic")
-            }
-          />
-          <span className="w-4" /> {/* Spacer to match arrow width */}
-        </>
-      )}
+          <>
+            <IterationBadge
+              iteration={iteration}
+              maxIterations={maxIterations}
+              isRunning={
+                isRunning && (effectiveStage === "verification" || effectiveStage === "agentic")
+              }
+            />
+            <span className="w-4" /> {/* Spacer to match arrow width */}
+          </>
+        )}
 
       {/* Workflow stage pills */}
       <div className="flex items-center gap-1.5">

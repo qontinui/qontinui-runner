@@ -80,11 +80,15 @@ export function SessionGraphView({ recap }: Props) {
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
   // Sync flow state during render when derived graph data changes
+  // eslint-disable-next-line react-hooks/refs
   if (prevInitialNodesRef.current !== initialNodes) {
+    // eslint-disable-next-line react-hooks/refs
     prevInitialNodesRef.current = initialNodes;
     setNodes(initialNodes);
   }
+  // eslint-disable-next-line react-hooks/refs
   if (prevInitialEdgesRef.current !== initialEdges) {
+    // eslint-disable-next-line react-hooks/refs
     prevInitialEdgesRef.current = initialEdges;
     setEdges(initialEdges);
   }

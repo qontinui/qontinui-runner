@@ -98,7 +98,6 @@ export function RunSelectionProvider({ children }: RunSelectionProviderProps) {
 
     // If there's a running run that wasn't in previous list, auto-select it
     if (runningRun && !prevRunIdsRef.current.has(runningRun.id)) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- auto-select newly detected running run
       setSelectedRunIdState(runningRun.id);
       // Also persist to instanceStorage
       try {

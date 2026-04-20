@@ -104,6 +104,7 @@ export function PromptSnippetBuilderTab({
   }, [onLog]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchPromptSnippets();
   }, [fetchPromptSnippets]);
 
@@ -135,6 +136,7 @@ export function PromptSnippetBuilderTab({
     if (editPromptSnippetId && promptSnippets.length > 0) {
       const snippet = promptSnippets.find((s) => s.id === editPromptSnippetId);
       if (snippet) {
+        // eslint-disable-next-line react-hooks/immutability
         selectSnippet(snippet);
       }
     }

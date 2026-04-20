@@ -1464,7 +1464,10 @@ pub async fn ui_bridge_execute_action_handler(
     // Explicit caller values always win.
     let expect_change = if request.expect_change.is_some() {
         request.expect_change.clone()
-    } else if matches!(action_name.as_str(), "click" | "doubleClick" | "double_click") {
+    } else if matches!(
+        action_name.as_str(),
+        "click" | "doubleClick" | "double_click"
+    ) {
         // Check if target is an input-like element (clicks on inputs just
         // focus; the "change" signal would be misleading).
         let is_input = match ui_bridge_request_sync(
@@ -1480,10 +1483,7 @@ pub async fn ui_bridge_execute_action_handler(
                     .or_else(|| data.get("tagName"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                matches!(
-                    tag.to_uppercase().as_str(),
-                    "INPUT" | "TEXTAREA" | "SELECT"
-                )
+                matches!(tag.to_uppercase().as_str(), "INPUT" | "TEXTAREA" | "SELECT")
             }
             Err(_) => false, // can't tell — default to enabling detector
         };
@@ -10751,11 +10751,14 @@ pub async fn ui_bridge_control_batch_handler(
             Json(ApiResponse {
                 success: false,
                 data: None,
-                error: Some(serde_json::to_string(&serde_json::json!({
-                    "error": "batch_size_exceeded",
-                    "max": MAX_BATCH_SIZE,
-                    "received": steps.len()
-                })).unwrap_or_default()),
+                error: Some(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": "batch_size_exceeded",
+                        "max": MAX_BATCH_SIZE,
+                        "received": steps.len()
+                    }))
+                    .unwrap_or_default(),
+                ),
                 error_detail: None,
             }),
         ));

@@ -100,6 +100,7 @@ export function useShellCommandData(): ShellCommandData {
 
   // Initial fetch and polling
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchCommands();
     const interval = setInterval(fetchCommands, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
@@ -108,6 +109,7 @@ export function useShellCommandData(): ShellCommandData {
   // Update elapsed time
   useEffect(() => {
     if (!startTime) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setElapsedTime(0);
       return;
     }

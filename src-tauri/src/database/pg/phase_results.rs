@@ -25,8 +25,7 @@ impl PgDb {
             .map_err(|e| format!("serialize step_results: {}", e))?;
         let variables_set_json = match &result.variables_set {
             Some(v) => Some(
-                serde_json::to_value(v)
-                    .map_err(|e| format!("serialize variables_set: {}", e))?,
+                serde_json::to_value(v).map_err(|e| format!("serialize variables_set: {}", e))?,
             ),
             None => None,
         };
@@ -62,10 +61,7 @@ impl PgDb {
     }
 
     /// Load all phase results for an execution, ordered by creation time.
-    pub async fn get_phase_results(
-        &self,
-        execution_id: &str,
-    ) -> Result<Vec<PhaseResult>, String> {
+    pub async fn get_phase_results(&self, execution_id: &str) -> Result<Vec<PhaseResult>, String> {
         let conn = self
             .pool
             .get()

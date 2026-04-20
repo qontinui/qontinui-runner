@@ -516,8 +516,7 @@ impl LoopController {
         // both SDK auto-connect and the SDK arm of the pre-flight on this
         // prevents spurious "SDK app is not connected" failures and avoids
         // opening a browser tab the workflow will never use.
-        let workflow_uses_sdk =
-            super::phases::workflow_uses_sdk_endpoints(&config.stages);
+        let workflow_uses_sdk = super::phases::workflow_uses_sdk_endpoints(&config.stages);
 
         // AUTO-CONNECT SDK FOR UI-FOCUSED WORKFLOWS (first iteration only)
         if ctx.iteration == 1 && workflow_uses_sdk {
@@ -758,15 +757,13 @@ impl LoopController {
                     {
                         tracing::debug!("Failed to increment detected for {}: {}", issue_id, e);
                     }
-                } else {
-                    if let Err(e) = self
-                        .app_state
-                        .pg_db
-                        .decay_known_issue_confidence(issue_id)
-                        .await
-                    {
-                        tracing::debug!("Failed to decay confidence for {}: {}", issue_id, e);
-                    }
+                } else if let Err(e) = self
+                    .app_state
+                    .pg_db
+                    .decay_known_issue_confidence(issue_id)
+                    .await
+                {
+                    tracing::debug!("Failed to decay confidence for {}: {}", issue_id, e);
                 }
             }
         }

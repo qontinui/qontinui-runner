@@ -679,6 +679,7 @@ export default function ActionLogTable({
     }
 
     // Only update if the ideal state differs from current state
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setCollapsedActions((prev) => {
       const needsUpdate =
         idealCollapsed.size !== prev.size || Array.from(idealCollapsed).some((id) => !prev.has(id));

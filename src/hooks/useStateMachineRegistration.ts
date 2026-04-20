@@ -426,6 +426,7 @@ export function useStateMachineRegistration(): void {
         const transitions = (stateMachine.transitions ?? []) as TransitionDefinition[];
         if (states.length > 0) {
           engineRef.current = createAndRegisterEngine(states, transitions, engineRef.current);
+          // eslint-disable-next-line no-console
           console.info(
             `[StateMachine] Auto-compiled from bundled specs: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions`,
           );

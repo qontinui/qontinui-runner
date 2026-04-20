@@ -535,11 +535,17 @@ impl PgDb {
                 // TIMESTAMPTZ columns cast ::TEXT in SQL so they decode as String.
                 // Use try_get to avoid panic if cast is missing or type changes.
                 created_at: r.try_get(3).unwrap_or_else(|e| {
-                    tracing::warn!("get_reflection_history: col 3 (created_at) decode error: {}", e);
+                    tracing::warn!(
+                        "get_reflection_history: col 3 (created_at) decode error: {}",
+                        e
+                    );
                     String::new()
                 }),
                 completed_at: r.try_get(4).unwrap_or_else(|e| {
-                    tracing::warn!("get_reflection_history: col 4 (completed_at) decode error: {}", e);
+                    tracing::warn!(
+                        "get_reflection_history: col 4 (completed_at) decode error: {}",
+                        e
+                    );
                     None
                 }),
                 fix_count: {

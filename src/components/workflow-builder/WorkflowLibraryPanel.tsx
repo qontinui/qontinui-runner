@@ -261,10 +261,10 @@ export function WorkflowLibraryPanel({
                           onToggleFavorite(workflow.id);
                         }}
                         className="shrink-0 p-0.5 rounded transition-colors hover:bg-white/10"
-                        title={workflow.is_favorite ? "Remove from favorites" : "Add to favorites"}
+                        title={workflow.isFavorite ? "Remove from favorites" : "Add to favorites"}
                       >
                         <Star
-                          className={`w-3.5 h-3.5 ${workflow.is_favorite ? "text-amber-400 fill-amber-400" : "text-muted-foreground"}`}
+                          className={`w-3.5 h-3.5 ${workflow.isFavorite ? "text-amber-400 fill-amber-400" : "text-muted-foreground"}`}
                         />
                       </button>
                     )}

@@ -702,10 +702,7 @@ fn check_ui_bridge_url_invariants(
             Some(name) => format!("stage '{}' {}", name, phase),
             None => format!("top-level {}", phase),
         };
-        let step_id = step
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<no-id>");
+        let step_id = step.get("id").and_then(|v| v.as_str()).unwrap_or("<no-id>");
 
         // Invariant 1: Control family must not use `/ui-bridge/sdk/`.
         if target_family == UiBridgeFamily::Control && cmd.contains("/ui-bridge/sdk/") {
@@ -746,7 +743,12 @@ fn check_ui_bridge_url_invariants(
             scan_step(step, "setup_steps", Some(stage_name), &mut violations);
         }
         for step in &stage.verification_steps {
-            scan_step(step, "verification_steps", Some(stage_name), &mut violations);
+            scan_step(
+                step,
+                "verification_steps",
+                Some(stage_name),
+                &mut violations,
+            );
         }
         for step in &stage.completion_steps {
             scan_step(step, "completion_steps", Some(stage_name), &mut violations);
@@ -1084,8 +1086,16 @@ mod url_invariant_tests {
         // URLs are present.
         let v_ctl = check_ui_bridge_url_invariants(&wf, UiBridgeFamily::Control, 9877);
         let v_sdk = check_ui_bridge_url_invariants(&wf, UiBridgeFamily::Sdk, 9877);
-        assert!(v_ctl.is_empty(), "Control mode should have no violations: {:?}", v_ctl);
-        assert!(v_sdk.is_empty(), "Sdk mode should have no violations: {:?}", v_sdk);
+        assert!(
+            v_ctl.is_empty(),
+            "Control mode should have no violations: {:?}",
+            v_ctl
+        );
+        assert!(
+            v_sdk.is_empty(),
+            "Sdk mode should have no violations: {:?}",
+            v_sdk
+        );
     }
 }
 

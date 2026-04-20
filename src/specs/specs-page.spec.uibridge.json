@@ -1154,12 +1154,8 @@
           {
             "id": "empty-to-specs-loaded",
             "name": "Load bundled specs",
-            "activateStates": [
-              "specs-loaded-no-selection"
-            ],
-            "deactivateStates": [
-              "empty"
-            ],
+            "activateStates": ["specs-loaded-no-selection"],
+            "deactivateStates": ["empty"],
             "staysVisible": false,
             "process": [
               {
@@ -1177,12 +1173,8 @@
           {
             "id": "empty-to-discovering",
             "name": "Start app discovery via Discover button",
-            "activateStates": [
-              "discovering"
-            ],
-            "deactivateStates": [
-              "empty"
-            ],
+            "activateStates": ["discovering"],
+            "deactivateStates": ["empty"],
             "staysVisible": false,
             "process": [
               {
@@ -1200,12 +1192,8 @@
           {
             "id": "empty-to-specs-loaded-file",
             "name": "Load spec from file",
-            "activateStates": [
-              "specs-loaded-no-selection"
-            ],
-            "deactivateStates": [
-              "empty"
-            ],
+            "activateStates": ["specs-loaded-no-selection"],
+            "deactivateStates": ["empty"],
             "staysVisible": false,
             "process": [
               {
@@ -1236,24 +1224,16 @@
           {
             "id": "discovering-to-specs-loaded",
             "name": "Discovery succeeds and specs are loaded (automatic transition)",
-            "activateStates": [
-              "specs-loaded-no-selection"
-            ],
-            "deactivateStates": [
-              "discovering"
-            ],
+            "activateStates": ["specs-loaded-no-selection"],
+            "deactivateStates": ["discovering"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "discovering-to-previous",
             "name": "Discovery fails with error (automatic transition back to previous state)",
-            "activateStates": [
-              "empty"
-            ],
-            "deactivateStates": [
-              "discovering"
-            ],
+            "activateStates": ["empty"],
+            "deactivateStates": ["discovering"],
             "staysVisible": false,
             "process": []
           }
@@ -1279,12 +1259,8 @@
           {
             "id": "specs-loaded-to-spec-selected",
             "name": "Click a spec node in the tree",
-            "activateStates": [
-              "spec-selected-viewer"
-            ],
-            "deactivateStates": [
-              "specs-loaded-no-selection"
-            ],
+            "activateStates": ["spec-selected-viewer"],
+            "deactivateStates": ["specs-loaded-no-selection"],
             "staysVisible": false,
             "process": [
               {
@@ -1302,12 +1278,8 @@
           {
             "id": "specs-loaded-to-discovering",
             "name": "Start app discovery",
-            "activateStates": [
-              "discovering"
-            ],
-            "deactivateStates": [
-              "specs-loaded-no-selection"
-            ],
+            "activateStates": ["discovering"],
+            "deactivateStates": ["specs-loaded-no-selection"],
             "staysVisible": false,
             "process": [
               {
@@ -1344,12 +1316,8 @@
           {
             "id": "spec-viewer-to-editor",
             "name": "Toggle edit mode via Edit button",
-            "activateStates": [
-              "spec-selected-editor"
-            ],
-            "deactivateStates": [
-              "spec-selected-viewer"
-            ],
+            "activateStates": ["spec-selected-editor"],
+            "deactivateStates": ["spec-selected-viewer"],
             "staysVisible": false,
             "process": [
               {
@@ -1367,12 +1335,8 @@
           {
             "id": "spec-viewer-to-group-viewer",
             "name": "Click a group node in the expanded spec tree",
-            "activateStates": [
-              "group-selected-viewer"
-            ],
-            "deactivateStates": [
-              "spec-selected-viewer"
-            ],
+            "activateStates": ["group-selected-viewer"],
+            "deactivateStates": ["spec-selected-viewer"],
             "staysVisible": false,
             "process": [
               {
@@ -1390,9 +1354,7 @@
           {
             "id": "spec-viewer-to-chat-review",
             "name": "Activate AI chat review mode",
-            "activateStates": [
-              "ai-chat-review"
-            ],
+            "activateStates": ["ai-chat-review"],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -1411,9 +1373,7 @@
           {
             "id": "spec-viewer-to-chat-create",
             "name": "Activate AI chat create mode",
-            "activateStates": [
-              "ai-chat-create"
-            ],
+            "activateStates": ["ai-chat-create"],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -1432,12 +1392,8 @@
           {
             "id": "spec-viewer-to-no-selection",
             "name": "Click a different spec or deselect",
-            "activateStates": [
-              "specs-loaded-no-selection"
-            ],
-            "deactivateStates": [
-              "spec-selected-viewer"
-            ],
+            "activateStates": ["specs-loaded-no-selection"],
+            "deactivateStates": ["spec-selected-viewer"],
             "staysVisible": false,
             "process": []
           }
@@ -1463,12 +1419,8 @@
           {
             "id": "spec-editor-to-viewer",
             "name": "Exit edit mode via Done button",
-            "activateStates": [
-              "spec-selected-viewer"
-            ],
-            "deactivateStates": [
-              "spec-selected-editor"
-            ],
+            "activateStates": ["spec-selected-viewer"],
+            "deactivateStates": ["spec-selected-editor"],
             "staysVisible": false,
             "process": [
               {
@@ -1486,12 +1438,8 @@
           {
             "id": "spec-editor-to-group-editor",
             "name": "Click a group node while in edit mode",
-            "activateStates": [
-              "group-selected-editor"
-            ],
-            "deactivateStates": [
-              "spec-selected-editor"
-            ],
+            "activateStates": ["group-selected-editor"],
+            "deactivateStates": ["spec-selected-editor"],
             "staysVisible": false,
             "process": [
               {
@@ -1525,12 +1473,8 @@
           {
             "id": "group-viewer-to-editor",
             "name": "Toggle edit mode via Edit button",
-            "activateStates": [
-              "group-selected-editor"
-            ],
-            "deactivateStates": [
-              "group-selected-viewer"
-            ],
+            "activateStates": ["group-selected-editor"],
+            "deactivateStates": ["group-selected-viewer"],
             "staysVisible": false,
             "process": [
               {
@@ -1548,12 +1492,8 @@
           {
             "id": "group-viewer-to-spec-viewer",
             "name": "Click the parent spec node in the tree",
-            "activateStates": [
-              "spec-selected-viewer"
-            ],
-            "deactivateStates": [
-              "group-selected-viewer"
-            ],
+            "activateStates": ["spec-selected-viewer"],
+            "deactivateStates": ["group-selected-viewer"],
             "staysVisible": false,
             "process": [
               {
@@ -1590,12 +1530,8 @@
           {
             "id": "group-editor-to-viewer",
             "name": "Exit edit mode via Done button",
-            "activateStates": [
-              "group-selected-viewer"
-            ],
-            "deactivateStates": [
-              "group-selected-editor"
-            ],
+            "activateStates": ["group-selected-viewer"],
+            "deactivateStates": ["group-selected-editor"],
             "staysVisible": false,
             "process": [
               {
@@ -1613,12 +1549,8 @@
           {
             "id": "group-editor-to-spec-editor",
             "name": "Click the parent spec node while in edit mode",
-            "activateStates": [
-              "spec-selected-editor"
-            ],
-            "deactivateStates": [
-              "group-selected-editor"
-            ],
+            "activateStates": ["spec-selected-editor"],
+            "deactivateStates": ["group-selected-editor"],
             "staysVisible": false,
             "process": [
               {
@@ -1652,12 +1584,8 @@
           {
             "id": "chat-review-to-create",
             "name": "Switch to create mode",
-            "activateStates": [
-              "ai-chat-create"
-            ],
-            "deactivateStates": [
-              "ai-chat-review"
-            ],
+            "activateStates": ["ai-chat-create"],
+            "deactivateStates": ["ai-chat-review"],
             "staysVisible": false,
             "process": [
               {
@@ -1676,9 +1604,7 @@
             "id": "chat-review-to-default",
             "name": "Deactivate review mode by clicking Review again",
             "activateStates": [],
-            "deactivateStates": [
-              "ai-chat-review"
-            ],
+            "deactivateStates": ["ai-chat-review"],
             "staysVisible": false,
             "process": [
               {
@@ -1712,12 +1638,8 @@
           {
             "id": "chat-create-to-review",
             "name": "Switch to review mode",
-            "activateStates": [
-              "ai-chat-review"
-            ],
-            "deactivateStates": [
-              "ai-chat-create"
-            ],
+            "activateStates": ["ai-chat-review"],
+            "deactivateStates": ["ai-chat-create"],
             "staysVisible": false,
             "process": [
               {
@@ -1736,9 +1658,7 @@
             "id": "chat-create-to-default",
             "name": "Deactivate create mode by clicking Create again",
             "activateStates": [],
-            "deactivateStates": [
-              "ai-chat-create"
-            ],
+            "deactivateStates": ["ai-chat-create"],
             "staysVisible": false,
             "process": [
               {
@@ -1764,15 +1684,7 @@
     "updatedAt": "2026-03-06T00:00:00.000Z",
     "pageUrl": "/specs",
     "elementSource": "sdk",
-    "tags": [
-      "specs",
-      "viewer",
-      "editor",
-      "ai-chat",
-      "workflow-builder",
-      "spec-tree",
-      "ui-bridge"
-    ],
+    "tags": ["specs", "viewer", "editor", "ai-chat", "workflow-builder", "spec-tree", "ui-bridge"],
     "specType": "semantic"
   }
 }

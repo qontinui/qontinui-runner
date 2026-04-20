@@ -72,6 +72,7 @@ export function usePromptCanaryList(): UsePromptCanaryListReturn {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
     intervalRef.current = setInterval(refresh, 30000);
     return () => {

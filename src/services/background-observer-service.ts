@@ -64,6 +64,7 @@ export function startBackgroundObserver(): void {
       const workflows = registry.getAllWorkflows();
       return {
         timestamp: Date.now(),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         elements: elements.map((el: any) => ({
           id: el.id,
           type: el.type,
@@ -74,11 +75,14 @@ export function startBackgroundObserver(): void {
           contentMetadata: el.contentMetadata,
           mediaMetadata: el.mediaMetadata,
         })),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         components: components.map((comp: any) => ({
           id: comp.id,
           name: comp.name,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           actions: comp.actions.map((a: any) => a.id),
         })),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         workflows: workflows.map((wf: any) => ({
           id: wf.id,
           name: wf.name,

@@ -244,7 +244,6 @@ function MarkdownDiv({ className, ...props }: Record<string, unknown>) {
  */
 function MarkdownImg({ src, alt, ...rest }: React.ImgHTMLAttributes<HTMLImageElement>) {
   return (
-    // eslint-disable-next-line
     <img
       src={src}
       alt={alt ?? ""}

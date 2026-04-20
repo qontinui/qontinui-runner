@@ -149,7 +149,6 @@ export function useStateTransitionEffects(
 
   useEffect(() => {
     if (needsInputCount > prevNeedsInputCountRef.current) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset dismissal when new input needed
       setBatchBarDismissed(false);
     }
     prevNeedsInputCountRef.current = needsInputCount;

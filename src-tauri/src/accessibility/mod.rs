@@ -438,14 +438,14 @@ mod win32_routing {
     use std::sync::Mutex;
 
     use once_cell::sync::Lazy;
-    use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HMODULE, HWND, LPARAM};
+    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HMODULE, HWND, LPARAM};
     use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleFileNameExW};
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, IsWindowVisible,
+        EnumWindows, GetClassNameW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+        IsWindowVisible,
     };
 
     use super::ConnectionTarget;
@@ -481,9 +481,7 @@ mod win32_routing {
     pub(super) fn is_java_window_class(class: &str) -> bool {
         // Swing/AWT prefixes: SunAwtFrame, SunAwtDialog, SunAwtWindow,
         // SunAwtCanvas. SWT uses SWT_Window0. Eclipse JRE uses JavaEmbedded.
-        class.starts_with("SunAwt")
-            || class == "SWT_Window0"
-            || class == "JavaEmbeddedFrame"
+        class.starts_with("SunAwt") || class == "SWT_Window0" || class == "JavaEmbeddedFrame"
     }
 
     /// Probe the last-connected PID for `jvm.dll`. Returns `false` if we've

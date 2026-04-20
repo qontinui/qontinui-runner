@@ -103,6 +103,7 @@ export function CheckGroupLibraryPicker({
   // Reset selection when modal opens
   useEffect(() => {
     if (isOpen) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedId(null);
       setSearchQuery("");
     }

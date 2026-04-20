@@ -6,8 +6,6 @@
 //! This module is gated behind `#[cfg(feature = "restate")]` because it depends
 //! on the `restate-sdk` crate.
 
-#![cfg(feature = "restate")]
-
 use std::sync::Arc;
 
 use restate_sdk::prelude::*;

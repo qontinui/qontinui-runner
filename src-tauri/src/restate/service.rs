@@ -9,8 +9,6 @@
 //! This entire module is gated behind `#[cfg(feature = "restate")]` because
 //! it depends on the `restate-sdk` crate's proc macros.
 
-#![cfg(feature = "restate")]
-
 use std::sync::Arc;
 
 use restate_sdk::prelude::*;
@@ -449,10 +447,10 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
 
         // If failed, execute saga compensations
         if !success && !was_stopped {
-            let compensations: Option<restate_sdk::serde::Json<Vec<CompensationAction>>> =
-                ctx.get(COMPENSATIONS_KEY).await.map_err(|e| {
-                    TerminalError::new(format!("Failed to read compensations: {}", e))
-                })?;
+            let compensations: Option<restate_sdk::serde::Json<Vec<CompensationAction>>> = ctx
+                .get(COMPENSATIONS_KEY)
+                .await
+                .map_err(|e| TerminalError::new(format!("Failed to read compensations: {}", e)))?;
 
             if let Some(actions) = compensations.map(|j| j.into_inner()) {
                 if !actions.is_empty() {

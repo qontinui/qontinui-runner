@@ -1114,7 +1114,11 @@
         "name": "Tab — Phase Timeline Active",
         "description": "The Phase Timeline tab is selected, showing structured per-phase execution results as collapsible cards grouped by iteration. Cards cover Setup, Verification, Agentic, and Completion phases with step-level breakdowns, duration, success badges, and commit hashes. Empty state appears for runs with no phase_result rows.",
         "elements": [
-          { "tagName": "div", "dataAttributes": { "state": "active" }, "textContains": "Phase Timeline" }
+          {
+            "tagName": "div",
+            "dataAttributes": { "state": "active" },
+            "textContains": "Phase Timeline"
+          }
         ],
         "isInitial": false,
         "transitions": [

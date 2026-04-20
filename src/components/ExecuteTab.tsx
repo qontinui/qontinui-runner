@@ -71,6 +71,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchMacros();
   }, [fetchMacros]);
 

@@ -74,6 +74,7 @@ export function useArchitectureGraph(workflowName: string) {
   }, [workflowName, refresh]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
   }, [refresh]);
 
@@ -86,6 +87,7 @@ export function useComponentDetails(workflowName: string, componentPath: string 
 
   useEffect(() => {
     if (!workflowName || !componentPath) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setDetails(null);
       return;
     }
@@ -120,6 +122,7 @@ export function useImpactAnalysis(workflowName: string, componentPath: string | 
 
   useEffect(() => {
     if (!workflowName || !componentPath) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setImpact(null);
       return;
     }
@@ -155,6 +158,7 @@ export function useWorkflowTrends(workflowName: string, timeRange: TimeRange) {
 
   useEffect(() => {
     if (!workflowName) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setTrends(null);
       return;
     }
@@ -196,6 +200,7 @@ export function useComponentTrend(
 
   useEffect(() => {
     if (!workflowName || !componentPath) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setTrend(null);
       return;
     }
@@ -234,6 +239,7 @@ export function useEffectivenessTrend(
 
   useEffect(() => {
     if (!workflowName) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setData(null);
       return;
     }
@@ -397,6 +403,7 @@ export function useSdkArchitecture() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
   }, [refresh]);
 

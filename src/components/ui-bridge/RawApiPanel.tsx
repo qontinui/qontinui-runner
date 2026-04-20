@@ -5,7 +5,7 @@
  * Allows sending arbitrary commands and viewing responses.
  */
 
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback } from "react";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
 import {
@@ -62,22 +62,18 @@ export function RawApiPanel({
 }: RawApiPanelProps) {
   const [action, setAction] = useState("getElements");
   const [paramsJson, setParamsJson] = useState("{}");
-  const [paramsError, setParamsError] = useState<string | null>(null);
   const [isExecuting, setIsExecuting] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [copiedId, setCopiedId] = useState<number | null>(null);
 
-  // Validate JSON params
-  const parsedParams = useMemo(() => {
-    try {
-      const parsed = JSON.parse(paramsJson);
-      setParamsError(null);
-      return parsed;
-    } catch (err) {
-      setParamsError(err instanceof Error ? err.message : "Invalid JSON");
-      return null;
-    }
-  }, [paramsJson]);
+  // Validate JSON params (derived during render — no setState needed)
+  let parsedParams: Record<string, unknown> | null = null;
+  let paramsError: string | null = null;
+  try {
+    parsedParams = JSON.parse(paramsJson) as Record<string, unknown>;
+  } catch (err) {
+    paramsError = err instanceof Error ? err.message : "Invalid JSON";
+  }
 
   // Execute command
   const handleExecute = useCallback(async () => {

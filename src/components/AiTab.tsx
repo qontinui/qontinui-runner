@@ -175,7 +175,7 @@ export function AiTab({
       );
     }
     return aiOutputLines;
-  }, [aiOutputLines, selectedRun?.id]);
+  }, [aiOutputLines, selectedRun]);
 
   // Group AI output lines into loops
   const loops = useMemo(
@@ -221,6 +221,7 @@ export function AiTab({
       }
 
       if (matchedLoop) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setSelectedSessionId(matchedLoop.id);
       }
     } catch {
@@ -354,6 +355,7 @@ export function AiTab({
   // Load per-run auto-continue setting when a specific run is selected
   useEffect(() => {
     if (!selectedSessionId || selectedSessionId === ALL_SESSIONS) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setRunAutoContinue(null);
       return;
     }

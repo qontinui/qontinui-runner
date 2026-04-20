@@ -456,8 +456,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dead_process_auto_unregisters() {
-        let mut config = DoctorConfig::default();
-        config.check_interval = std::time::Duration::from_millis(50);
+        let config = DoctorConfig {
+            check_interval: std::time::Duration::from_millis(50),
+            ..DoctorConfig::default()
+        };
 
         let (handle, _event_rx) = start_doctor_async(config).await;
 
@@ -516,9 +518,11 @@ mod tests {
 
     #[test]
     fn test_evaluate_health_escalation() {
-        let mut config = DoctorConfig::default();
-        config.suspicious_threshold = 2;
-        config.stuck_threshold = 4;
+        let config = DoctorConfig {
+            suspicious_threshold: 2,
+            stuck_threshold: 4,
+            ..DoctorConfig::default()
+        };
 
         let (event_tx, _) = mpsc::channel(64);
         let service = DoctorService {

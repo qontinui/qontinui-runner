@@ -219,10 +219,8 @@ async fn health(
     let ai_settings = crate::settings::get_ai_settings();
     let ai_configured = true; // A provider is always selected (enum has a default)
     let ai_running = {
-        let pids = crate::safe_lock::safe_lock_or_recover(
-            &state.current_ai_pids,
-            "current_ai_pids",
-        );
+        let pids =
+            crate::safe_lock::safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
         !pids.is_empty()
     };
     let ai_provider_name: &str = match &ai_settings.provider {
@@ -1221,8 +1219,7 @@ async fn cloud_relay_poll_devices_diagnostic(
     let mut steps: Vec<serde_json::Value> = Vec::new();
 
     // Step 1: Read settings
-    let cloud_settings =
-        crate::config_facade::get_setting::<crate::settings::CloudRelaySettings>();
+    let cloud_settings = crate::config_facade::get_setting::<crate::settings::CloudRelaySettings>();
     steps.push(serde_json::json!({
         "step": "settings",
         "device_bridge_enabled": cloud_settings.device_bridge_enabled,
@@ -1279,13 +1276,9 @@ async fn cloud_relay_poll_devices_diagnostic(
             // which may reject WS upgrades from non-browser clients (403).
             if let Some(device) = devices.first() {
                 let local_backend = "http://127.0.0.1:8000".to_string();
-                let cloud_transport = crate::mcp::transport::cloud::CloudTransport::new(
-                    local_backend,
-                );
-                match cloud_transport
-                    .open_tunnel(&device.device_id, &token)
-                    .await
-                {
+                let cloud_transport =
+                    crate::mcp::transport::cloud::CloudTransport::new(local_backend);
+                match cloud_transport.open_tunnel(&device.device_id, &token).await {
                     Ok(port) => {
                         steps.push(serde_json::json!({
                             "step": "tunnel",
@@ -1313,7 +1306,10 @@ async fn cloud_relay_poll_devices_diagnostic(
                             last_healthy_at: now,
                             fail_count: 0,
                         };
-                        state.physical_device_registry.register(info, transport).await;
+                        state
+                            .physical_device_registry
+                            .register(info, transport)
+                            .await;
                         steps.push(serde_json::json!({
                             "step": "register",
                             "status": "ok",

@@ -56,9 +56,7 @@ fn make_rich_tree() -> UnifiedNode {
                 class_name: Some("Button".into()),
                 is_interactive: true,
                 platform_handle: Some(2),
-                supported_patterns: vec![
-                    crate::accessibility::model::InteractionPattern::Invoke,
-                ],
+                supported_patterns: vec![crate::accessibility::model::InteractionPattern::Invoke],
                 ..Default::default()
             },
             // Cancel button with Invoke pattern
@@ -238,10 +236,7 @@ fn by_text_differs_from_by_label_contains_on_value_field() {
         .is_empty());
     // by_text widens to value/description and should hit.
     assert_eq!(
-        QueryBuilder::new()
-            .by_text("alice@")
-            .find_all(&tree)
-            .len(),
+        QueryBuilder::new().by_text("alice@").find_all(&tree).len(),
         1
     );
 }

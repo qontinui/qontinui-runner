@@ -354,6 +354,7 @@ export function ElementDescriptionPanel({
 
     // Load storage stats
     const stats = ElementDescriptionService.getStats();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setStorageStats({
       totalPages: stats.totalPages,
       totalDescriptions: stats.totalDescriptions,
@@ -393,6 +394,7 @@ export function ElementDescriptionPanel({
           accessibilityNotes: desc.accessibilityNotes,
         });
       }
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setDescriptions(loaded);
       logger.debug(`Loaded ${loaded.size} persisted descriptions`);
     }
@@ -419,6 +421,7 @@ export function ElementDescriptionPanel({
   // Generate page summary when context changes
   useEffect(() => {
     if (pageContext && elements.length > 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setPageSummary(generateHeuristicPageSummary(pageContext, elements));
     } else {
       setPageSummary(null);

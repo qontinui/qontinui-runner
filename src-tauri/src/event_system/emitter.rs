@@ -236,12 +236,7 @@ impl EventEmitter {
     }
 
     /// Emit an accessibility-capture-complete event.
-    pub fn accessibility_capture_complete(
-        &self,
-        backend: &str,
-        node_count: u32,
-        duration_ms: u64,
-    ) {
+    pub fn accessibility_capture_complete(&self, backend: &str, node_count: u32, duration_ms: u64) {
         self.emit_or_warn(AppEvent::accessibility_capture_complete(
             backend,
             node_count,

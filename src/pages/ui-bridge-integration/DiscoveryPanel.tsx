@@ -52,6 +52,7 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
   // Collapse "Your Projects" when a project is selected
   useEffect(() => {
     if (selectedProjectPath) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setProjectsExpanded(false);
     }
   }, [selectedProjectPath]);

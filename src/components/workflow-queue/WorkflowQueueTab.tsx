@@ -154,13 +154,14 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
   }, [onLog]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchWorkflows();
   }, [fetchWorkflows]);
 
   // Toggle favorite on a workflow (optimistic update with rollback)
   const toggleFavorite = useCallback(async (workflowId: string) => {
     setWorkflows((prev) =>
-      prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: !w.is_favorite } : w)),
+      prev.map((w) => (w.id === workflowId ? { ...w, isFavorite: !w.isFavorite } : w)),
     );
     try {
       const response = await tracedFetch(
@@ -169,25 +170,25 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
       );
       const result = await response.json();
       if (result.success) {
-        const newState = result.data.is_favorite;
+        const newState = result.data.isFavorite;
         setWorkflows((prev) =>
-          prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: newState } : w)),
+          prev.map((w) => (w.id === workflowId ? { ...w, isFavorite: newState } : w)),
         );
       } else {
         setWorkflows((prev) =>
-          prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: !w.is_favorite } : w)),
+          prev.map((w) => (w.id === workflowId ? { ...w, isFavorite: !w.isFavorite } : w)),
         );
       }
     } catch (error) {
       console.error("Failed to toggle favorite:", error);
       setWorkflows((prev) =>
-        prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: !w.is_favorite } : w)),
+        prev.map((w) => (w.id === workflowId ? { ...w, isFavorite: !w.isFavorite } : w)),
       );
     }
   }, []);
 
   // Check if any workflows are favorited
-  const hasFavorites = useMemo(() => workflows.some((w) => w.is_favorite), [workflows]);
+  const hasFavorites = useMemo(() => workflows.some((w) => w.isFavorite), [workflows]);
 
   // Auto-enable favorites filter when favorites exist on first load only
   const hasInitializedFavorites = useRef(false);
@@ -334,7 +335,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
           w.name.toLowerCase().includes(search.toLowerCase()) ||
           w.description.toLowerCase().includes(search.toLowerCase());
         const matchesCategory = category === "all" || w.category === category;
-        const matchesFavorites = !showFavoritesOnly || w.is_favorite;
+        const matchesFavorites = !showFavoritesOnly || w.isFavorite;
         return matchesSearch && matchesCategory && matchesFavorites;
       }),
     [workflows, search, category, showFavoritesOnly],

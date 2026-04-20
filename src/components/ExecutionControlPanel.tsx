@@ -124,6 +124,7 @@ export function ExecutionControlPanel({
   // Calculate required screens when workflow changes
   useEffect(() => {
     if (!selectedWorkflow || !configLoaded) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setCalculatedScreens([]);
       return;
     }

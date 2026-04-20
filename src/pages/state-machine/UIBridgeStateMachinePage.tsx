@@ -368,6 +368,7 @@ export function UIBridgeStateMachinePage() {
         transitionCount: number;
       };
       try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         await sm.importConfig(detail.name, detail.config as any);
         showToast(
           `Imported static state machine: ${detail.stateCount} states, ${detail.transitionCount} transitions`,

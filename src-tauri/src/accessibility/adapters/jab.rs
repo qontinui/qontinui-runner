@@ -183,11 +183,8 @@ impl Default for AccessibleActionsToDo {
 
 type FnWindowsRun = unsafe extern "C" fn();
 type FnIsJavaWindow = unsafe extern "C" fn(hwnd: HWND) -> JabBool;
-type FnGetAccessibleContextFromHWND = unsafe extern "C" fn(
-    hwnd: HWND,
-    vm_id: *mut VmId,
-    ac: *mut AccessibleContext,
-) -> JabBool;
+type FnGetAccessibleContextFromHWND =
+    unsafe extern "C" fn(hwnd: HWND, vm_id: *mut VmId, ac: *mut AccessibleContext) -> JabBool;
 type FnReleaseJavaObject = unsafe extern "C" fn(vm_id: VmId, obj: AccessibleContext);
 type FnGetAccessibleContextInfo = unsafe extern "C" fn(
     vm_id: VmId,
@@ -245,39 +242,32 @@ impl JabDll {
     /// the expected entry points — both of which usually mean the user needs
     /// to run `jabswitch -enable` and/or install a JRE that ships JAB.
     fn load() -> anyhow::Result<Self> {
-        let lib = unsafe { Library::new(OsStr::new(DLL_NAME_64)) }
-            .with_context(|| format!(
+        let lib = unsafe { Library::new(OsStr::new(DLL_NAME_64)) }.with_context(|| {
+            format!(
                 "Failed to load {DLL_NAME_64}. Ensure a 64-bit JRE is installed and \
                  `jabswitch -enable` has been run (ships with the JDK)."
-            ))?;
+            )
+        })?;
 
         // Resolve each symbol. We copy them out into plain function pointers
         // so the caller doesn't have to juggle `Symbol<'_>` lifetimes.
         unsafe {
             let windows_run = get_sym::<FnWindowsRun>(&lib, b"Windows_run\0")?;
             let is_java_window = get_sym::<FnIsJavaWindow>(&lib, b"isJavaWindow\0")?;
-            let get_accessible_context_from_hwnd = get_sym::<FnGetAccessibleContextFromHWND>(
-                &lib,
-                b"getAccessibleContextFromHWND\0",
-            )?;
-            let release_java_object =
-                get_sym::<FnReleaseJavaObject>(&lib, b"releaseJavaObject\0")?;
-            let get_accessible_context_info = get_sym::<FnGetAccessibleContextInfo>(
-                &lib,
-                b"getAccessibleContextInfo\0",
-            )?;
+            let get_accessible_context_from_hwnd =
+                get_sym::<FnGetAccessibleContextFromHWND>(&lib, b"getAccessibleContextFromHWND\0")?;
+            let release_java_object = get_sym::<FnReleaseJavaObject>(&lib, b"releaseJavaObject\0")?;
+            let get_accessible_context_info =
+                get_sym::<FnGetAccessibleContextInfo>(&lib, b"getAccessibleContextInfo\0")?;
             let get_accessible_child_from_context = get_sym::<FnGetAccessibleChildFromContext>(
                 &lib,
                 b"getAccessibleChildFromContext\0",
             )?;
-            let get_accessible_actions = get_sym::<FnGetAccessibleActions>(
-                &lib,
-                b"getAccessibleActionsFromContext\0",
-            )?;
+            let get_accessible_actions =
+                get_sym::<FnGetAccessibleActions>(&lib, b"getAccessibleActionsFromContext\0")?;
             let do_accessible_actions =
                 get_sym::<FnDoAccessibleActions>(&lib, b"doAccessibleActions\0")?;
-            let set_text_contents =
-                get_sym::<FnSetTextContents>(&lib, b"setTextContents\0")?;
+            let set_text_contents = get_sym::<FnSetTextContents>(&lib, b"setTextContents\0")?;
 
             Ok(Self {
                 _library: lib,
@@ -299,12 +289,12 @@ impl JabDll {
 /// wrapper. The returned function pointer outlives the `Symbol<'_>` because
 /// the `Library` itself is kept alive inside `JabDll`.
 unsafe fn get_sym<T: Copy>(lib: &Library, name: &[u8]) -> anyhow::Result<T> {
-    let sym: Symbol<'_, T> = lib
-        .get(name)
-        .with_context(|| format!(
+    let sym: Symbol<'_, T> = lib.get(name).with_context(|| {
+        format!(
             "JAB DLL is missing export `{}` — DLL version mismatch?",
             String::from_utf8_lossy(name).trim_end_matches('\0')
-        ))?;
+        )
+    })?;
     Ok(*sym)
 }
 
@@ -498,8 +488,10 @@ fn patterns_for(info: &AccessibleContextInfo, role: UnifiedRole) -> Vec<Interact
     }
     // Editable text fields accept `setTextContents` regardless of whether the
     // action interface is populated.
-    if matches!(role, UnifiedRole::Edit | UnifiedRole::Textbox | UnifiedRole::Searchbox)
-        || info.accessible_text != 0
+    if matches!(
+        role,
+        UnifiedRole::Edit | UnifiedRole::Textbox | UnifiedRole::Searchbox
+    ) || info.accessible_text != 0
     {
         out.push(InteractionPattern::Value);
     }
@@ -565,7 +557,10 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 }
 
 fn find_window(target: EnumTarget) -> Option<HWND> {
-    let mut ctx = EnumContext { target, found: None };
+    let mut ctx = EnumContext {
+        target,
+        found: None,
+    };
     unsafe {
         let _ = EnumWindows(
             Some(enum_proc),
@@ -663,9 +658,7 @@ impl JabAdapter {
         }
 
         let mut info = AccessibleContextInfo::default();
-        let ok = unsafe {
-            (dll.get_accessible_context_info)(handle.vm_id, handle.ac, &mut info)
-        };
+        let ok = unsafe { (dll.get_accessible_context_info)(handle.vm_id, handle.ac, &mut info) };
         if ok == 0 {
             unsafe { (dll.release_java_object)(handle.vm_id, handle.ac) };
             return None;
@@ -682,9 +675,17 @@ impl JabAdapter {
         }
 
         let name_str = decode_utf16_z(&info.name);
-        let name = if name_str.is_empty() { None } else { Some(name_str) };
+        let name = if name_str.is_empty() {
+            None
+        } else {
+            Some(name_str)
+        };
         let desc_str = decode_utf16_z(&info.description);
-        let description = if desc_str.is_empty() { None } else { Some(desc_str) };
+        let description = if desc_str.is_empty() {
+            None
+        } else {
+            Some(desc_str)
+        };
 
         let bounds = if info.width > 0 && info.height > 0 {
             Some(UnifiedBounds {
@@ -707,9 +708,8 @@ impl JabAdapter {
         let recurse = max_depth.is_none_or(|m| depth < m);
         if recurse {
             for i in 0..info.children_count {
-                let child_ac = unsafe {
-                    (dll.get_accessible_child_from_context)(handle.vm_id, handle.ac, i)
-                };
+                let child_ac =
+                    unsafe { (dll.get_accessible_child_from_context)(handle.vm_id, handle.ac, i) };
                 if child_ac == 0 {
                     continue;
                 }
@@ -717,13 +717,9 @@ impl JabAdapter {
                     vm_id: handle.vm_id,
                     ac: child_ac,
                 };
-                if let Some(child) = self.build_node(
-                    dll,
-                    child_handle,
-                    depth + 1,
-                    max_depth,
-                    include_hidden,
-                ) {
+                if let Some(child) =
+                    self.build_node(dll, child_handle, depth + 1, max_depth, include_hidden)
+                {
                     children.push(child);
                 }
             }
@@ -782,8 +778,10 @@ impl PlatformAdapter for JabAdapter {
 
         // Resolve the target to an HWND.
         let hwnd: HWND = match target {
-            ConnectionTarget::WindowTitle(title) => find_window(EnumTarget::Title(title.clone()))
-                .ok_or_else(|| anyhow!("No visible window matches title {title:?}"))?,
+            ConnectionTarget::WindowTitle(title) => {
+                find_window(EnumTarget::Title(title.clone()))
+                    .ok_or_else(|| anyhow!("No visible window matches title {title:?}"))?
+            }
             ConnectionTarget::ProcessId(pid) => find_window(EnumTarget::Pid(pid))
                 .ok_or_else(|| anyhow!("No visible window found for PID {pid}"))?,
             ConnectionTarget::Desktop => {
@@ -807,9 +805,7 @@ impl PlatformAdapter for JabAdapter {
         // Grab the root accessible context.
         let mut vm_id: VmId = 0;
         let mut ac: AccessibleContext = 0;
-        let got = unsafe {
-            (dll.get_accessible_context_from_hwnd)(hwnd, &mut vm_id, &mut ac)
-        };
+        let got = unsafe { (dll.get_accessible_context_from_hwnd)(hwnd, &mut vm_id, &mut ac) };
         if got == 0 || ac == 0 {
             bail!(
                 "getAccessibleContextFromHWND failed for Java window {:?} — is assistive \
@@ -936,9 +932,7 @@ impl PlatformAdapter for JabAdapter {
                 // Read the list of available actions and perform the one
                 // named "click" (or the first action if none match).
                 let mut actions = AccessibleActions::default();
-                let got = unsafe {
-                    (dll.get_accessible_actions)(h.vm_id, h.ac, &mut actions)
-                };
+                let got = unsafe { (dll.get_accessible_actions)(h.vm_id, h.ac, &mut actions) };
                 if got == 0 || actions.actions_count == 0 {
                     return Ok(InteractionResult::err(
                         pattern,
@@ -964,9 +958,8 @@ impl PlatformAdapter for JabAdapter {
                 request.actions[0] = picked;
 
                 let mut failure: i32 = -1;
-                let ok = unsafe {
-                    (dll.do_accessible_actions)(h.vm_id, h.ac, &request, &mut failure)
-                };
+                let ok =
+                    unsafe { (dll.do_accessible_actions)(h.vm_id, h.ac, &request, &mut failure) };
                 if ok == 0 {
                     return Ok(InteractionResult::err(
                         pattern,
@@ -982,9 +975,7 @@ impl PlatformAdapter for JabAdapter {
                     _ => bail!("Value pattern requires Text params"),
                 };
                 let wide = encode_utf16_z(&text);
-                let ok = unsafe {
-                    (dll.set_text_contents)(h.vm_id, h.ac, wide.as_ptr())
-                };
+                let ok = unsafe { (dll.set_text_contents)(h.vm_id, h.ac, wide.as_ptr()) };
                 if ok == 0 {
                     return Ok(InteractionResult::err(
                         pattern,
