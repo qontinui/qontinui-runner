@@ -1,24 +1,33 @@
-//! Server-mode workflow dispatch HTTP endpoint.
+//! Workflow dispatch HTTP endpoint.
 //!
-//! Exposes `POST /api/workflows/run` for headless server runners started with
-//! `QONTINUI_SERVER_MODE=1`. The handler loads the workflow by ID and spawns
+//! Exposes `POST /api/workflows/run` as a first-class capability of any
+//! authenticated runner. The handler loads the workflow by ID and spawns
 //! it via `unified_workflow_executor::auto_run::launch_workflow_by_id`.
 //!
-//! The route is always registered, but the handler returns 404 when the
-//! runner is not in server mode so desktop builds do not expose remote
-//! dispatch.
+//! Dispatch is no longer gated on `QONTINUI_SERVER_MODE` (Phase 3G). Any
+//! runner that has a valid bearer credential configured — via
+//! `WebIntegrationSettings.runner_token`, the `QONTINUI_RUNNER_TOKEN` env
+//! var, or a `dispatch_secret` obtained from a prior web registration —
+//! can accept dispatch calls.
 //!
-//! # Authentication (server mode only)
+//! # Authentication
 //!
-//! When server mode is enabled the handler requires
-//! `Authorization: Bearer <token>`. The presented token must match **either**:
+//! The handler requires `Authorization: Bearer <token>`. The presented
+//! token must match at least one of:
 //!
-//! * `QONTINUI_RUNNER_TOKEN` (the shared secret between this runner and web —
-//!   also used by supervisor-triggered local dispatch), **or**
-//! * the `dispatch_secret` returned by the web backend on the registration
-//!   response (stored in [`ServerModeState`]).
+//! * The runner token currently configured in
+//!   [`crate::settings::WebIntegrationSettings::runner_token`] (populated
+//!   from settings or the `QONTINUI_RUNNER_TOKEN` env overlay).
+//! * `QONTINUI_RUNNER_TOKEN` read directly from the process env
+//!   (back-compat for existing Phase 2/3 deployments that don't rely on
+//!   settings persistence).
+//! * The `dispatch_secret` returned by the web backend on the registration
+//!   response (stored in [`crate::server_mode::ServerModeState`]), used by
+//!   web-triggered dispatch.
 //!
-//! Both comparisons are done in constant time via [`subtle::ConstantTimeEq`].
+//! When none of the three are configured the handler returns 503 so the
+//! caller can distinguish "dispatch is not wired up" from "auth failed".
+//! All comparisons are done in constant time via [`subtle::ConstantTimeEq`].
 
 use axum::{
     extract::State,
@@ -56,12 +65,6 @@ struct ErrorBody {
     error: String,
 }
 
-fn server_mode_enabled() -> bool {
-    std::env::var("QONTINUI_SERVER_MODE")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false)
-}
-
 /// Extract the plain bearer token value from an `Authorization` header.
 /// Accepts `Authorization: Bearer <token>` with the literal word `Bearer`
 /// (case-insensitive) and one space. Returns `None` on any malformed value.
@@ -94,15 +97,6 @@ async fn run_workflow(
     headers: HeaderMap,
     Json(body): Json<RunWorkflowRequest>,
 ) -> Result<(StatusCode, Json<RunWorkflowResponse>), (StatusCode, Json<ErrorBody>)> {
-    if !server_mode_enabled() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: "Not found".to_string(),
-            }),
-        ));
-    }
-
     // ----- Authentication -------------------------------------------------
     let presented = match extract_bearer(&headers) {
         Some(t) => t,
@@ -116,41 +110,60 @@ async fn run_workflow(
         }
     };
 
+    // Three auth sources (any match accepts the request):
+    //   1. Runner token from live settings (populated from WebIntegrationSettings
+    //      or the QONTINUI_RUNNER_TOKEN env overlay at load time).
+    //   2. QONTINUI_RUNNER_TOKEN read directly from the process env
+    //      (back-compat path that doesn't require a settings read).
+    //   3. The dispatch_secret captured from a prior web registration.
+    let settings_runner_token = crate::settings::load_settings()
+        .web_integration
+        .runner_token
+        .clone();
     let runner_token_env = std::env::var("QONTINUI_RUNNER_TOKEN").ok();
-    let dispatch_secret = match state.app_state.server_mode.as_ref() {
+    let dispatch_secret = match state.app_state.current_server_mode().await {
         Some(sm) => sm.dispatch_secret().await,
         None => None,
     };
 
-    // 503 if neither secret is known yet.
-    if runner_token_env
+    let have_settings_token = !settings_runner_token.is_empty();
+    let have_env_token = runner_token_env
         .as_deref()
-        .map(str::is_empty)
-        .unwrap_or(true)
-        && dispatch_secret.is_none()
-    {
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    let have_dispatch_secret = dispatch_secret
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    // 503 when the runner is not yet wired up for dispatch at all.
+    if !have_settings_token && !have_env_token && !have_dispatch_secret {
         warn!(
-            "Server-mode dispatch rejected: no QONTINUI_RUNNER_TOKEN env var and no \
-             dispatch_secret yet (runner has not completed web registration)"
+            "Workflow dispatch rejected: no runner_token in settings, no \
+             QONTINUI_RUNNER_TOKEN env var, and no dispatch_secret yet \
+             (web integration may be disabled)"
         );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
-                error: "server mode without runner token — dispatch disabled".to_string(),
+                error: "runner has no dispatch auth configured — enable Web \
+                        Integration in settings"
+                    .to_string(),
             }),
         ));
     }
 
+    let settings_match = have_settings_token && ct_eq(&settings_runner_token, &presented);
     let env_match = runner_token_env
         .as_deref()
         .map(|t| !t.is_empty() && ct_eq(t, &presented))
         .unwrap_or(false);
     let secret_match = dispatch_secret
         .as_deref()
-        .map(|s| ct_eq(s, &presented))
+        .map(|s| !s.is_empty() && ct_eq(s, &presented))
         .unwrap_or(false);
 
-    if !env_match && !secret_match {
+    if !settings_match && !env_match && !secret_match {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorBody {

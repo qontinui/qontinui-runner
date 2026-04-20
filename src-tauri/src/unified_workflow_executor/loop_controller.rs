@@ -3177,10 +3177,10 @@ pub(crate) async fn emit_and_persist_phase_result(
     ) {
         tracing::warn!("PHASE-RESULT: failed to emit {} phase: {}", result.phase, e);
     }
-    // Server-mode: fire-and-forget POST to qontinui-web. The helper internally
-    // `tokio::spawn`s so this call returns immediately even when the web
-    // backend is slow or down.
-    if let Some(sm_state) = app_state.server_mode.clone() {
+    // Web integration: fire-and-forget POST to qontinui-web. The helper
+    // internally `tokio::spawn`s so this call returns immediately even when
+    // the web backend is slow or down.
+    if let Some(sm_state) = app_state.current_server_mode().await {
         crate::server_mode::post_phase_result(sm_state, parent_id, result);
     }
 }

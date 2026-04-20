@@ -785,6 +785,35 @@ impl Default for DebugSettings {
 }
 
 // ============================================================================
+// Web Integration Settings (Phase 3G)
+// ============================================================================
+
+/// Web-integration (qontinui-web backend) settings.
+///
+/// Controls whether this runner registers with the web backend, sends
+/// heartbeats, and posts phase-completion events. Decoupled from the
+/// `QONTINUI_SERVER_MODE` env var so any runner (primary, secondary, or
+/// headless) can enable web integration independently of headless-window
+/// behavior. Env vars `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN`
+/// still work as runtime-only overrides for headless deploys.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WebIntegrationSettings {
+    /// Master toggle. When false, the runner does not register, heartbeat, or emit events.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Base URL of qontinui-web, e.g. "https://api.qontinui.io" or "http://127.0.0.1:8000".
+    /// No trailing slash required.
+    #[serde(default)]
+    pub backend_url: String,
+
+    /// Plain runner token (qontinui_runner_<64hex>) created via the web UI or API.
+    /// Stored plaintext — acceptable since the settings file is user-local.
+    #[serde(default)]
+    pub runner_token: String,
+}
+
+// ============================================================================
 // Cloud Relay Settings
 // ============================================================================
 
@@ -985,6 +1014,13 @@ pub struct Settings {
     /// to compare pre/post screenshots against declared intent.
     #[serde(default)]
     pub world_state_verifier: WorldStateVerifierSettings,
+    /// Web-integration (qontinui-web backend) configuration. When
+    /// `web_integration.enabled` is true and both `backend_url` + `runner_token`
+    /// are set, the runner registers with web, sends heartbeats, and posts
+    /// phase events — independent of `QONTINUI_SERVER_MODE` (which now only
+    /// controls headless-window behavior).
+    #[serde(default)]
+    pub web_integration: WebIntegrationSettings,
 }
 
 // ============================================================================
@@ -1156,6 +1192,36 @@ pub fn load_settings() -> Settings {
     }
     if let Ok(u) = std::env::var("QONTINUI_RESTATE_EXTERNAL_INGRESS_URL") {
         settings.restate.external_ingress_url = Some(u);
+    }
+
+    // Web-integration env-var overrides (Phase 3G).
+    // In-memory overlay only; never persisted to disk. If either variable
+    // is set via env and a non-empty value is present in settings, the env
+    // wins. If both env vars are set and the persisted `enabled` flag is
+    // false, default to enabled (headless deploys shouldn't have to save
+    // settings to activate web integration).
+    let env_backend_url = std::env::var("QONTINUI_WEB_BACKEND_URL").ok();
+    let env_runner_token = std::env::var("QONTINUI_RUNNER_TOKEN").ok();
+    if let Some(v) = env_backend_url.as_ref() {
+        if !v.is_empty() {
+            settings.web_integration.backend_url = v.clone();
+        }
+    }
+    if let Some(v) = env_runner_token.as_ref() {
+        if !v.is_empty() {
+            settings.web_integration.runner_token = v.clone();
+        }
+    }
+    let has_env_pair = env_backend_url
+        .as_deref()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+        && env_runner_token
+            .as_deref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+    if has_env_pair && !settings.web_integration.enabled {
+        settings.web_integration.enabled = true;
     }
 
     settings

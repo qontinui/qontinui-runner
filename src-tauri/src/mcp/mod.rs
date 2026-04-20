@@ -18,6 +18,7 @@ pub mod adb_helper;
 pub mod ai_generation;
 pub mod ai_session;
 pub mod api_requests;
+pub mod auth_callback;
 pub mod api_spec_verify;
 pub mod api_surface;
 pub mod api_surface_diff;

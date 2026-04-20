@@ -80,6 +80,7 @@ const TAB_GROUPS = {
     "settings-playwright",
     "settings-mobile",
     "settings-cloud-relay",
+    "settings-web-integration",
     "settings-mcp",
     "settings-log-sources",
     "settings-execution-variables",

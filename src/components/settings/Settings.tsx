@@ -21,6 +21,7 @@ import { SelfHealingSettings } from "./SelfHealingSettings";
 import { WorldStateVerifierSettings } from "./WorldStateVerifierSettings";
 import { MobileSettings } from "./MobileSettings";
 import { CloudRelaySettings } from "./CloudRelaySettings";
+import { WebIntegrationSettings } from "./WebIntegrationSettings";
 import { LogSourcesSettings } from "./LogSourcesSettings";
 import { McpSettings } from "./McpSettings";
 import { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
@@ -61,6 +62,7 @@ type SettingsTab =
   | "playwright"
   | "mobile"
   | "cloud-relay"
+  | "web-integration"
   | "mcp"
   | "log-sources"
   | "execution-variables"
@@ -86,6 +88,7 @@ const VALID_TABS = [
   "playwright",
   "mobile",
   "cloud-relay",
+  "web-integration",
   "mcp",
   "log-sources",
   "execution-variables",
@@ -198,6 +201,8 @@ export function Settings({
         return <MobileSettings onLog={onLog} />;
       case "cloud-relay":
         return <CloudRelaySettings onLog={onLog} />;
+      case "web-integration":
+        return <WebIntegrationSettings onLog={onLog} />;
       case "mcp":
         return <McpSettings onLog={onLog} />;
       case "log-sources":

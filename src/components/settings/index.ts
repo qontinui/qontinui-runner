@@ -12,4 +12,5 @@ export { ContainerSettings } from "./ContainerSettings";
 export { SecuritySettings } from "./SecuritySettings";
 export { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
 export { SectionHeader } from "./SectionHeader";
+export { WebIntegrationSettings } from "./WebIntegrationSettings";
 export * from "./types";

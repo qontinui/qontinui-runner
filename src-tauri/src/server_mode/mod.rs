@@ -1,8 +1,7 @@
-//! Server-mode web-backend integration.
+//! Web-backend integration (Phase 3G: settings-driven).
 //!
-//! When the runner is launched with `QONTINUI_SERVER_MODE=1` **and**
-//! `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN` are both provided,
-//! this module:
+//! When [`WebIntegrationSettings::enabled`] is true and `backend_url` +
+//! `runner_token` are both non-empty, this module:
 //!
 //! 1. Registers the runner with `POST /api/v1/runners/register` (with
 //!    exponential backoff until success).
@@ -16,7 +15,22 @@
 //! All HTTP failures are non-fatal. The runner continues to execute locally
 //! even when the web backend is unreachable — events are still persisted to
 //! PG and can be backfilled later.
+//!
+//! # Env var compatibility
+//!
+//! `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN` still work: the
+//! settings loader applies them as an in-memory overlay at boot, defaulting
+//! `enabled` to true when both are present. Desktop UIs can also persist
+//! this state via [`WebIntegrationSettings`] without env vars.
+//!
+//! # Hot reload
+//!
+//! [`ServerModeState::shutdown`] signals background tasks to exit via an
+//! `Arc<AtomicBool>`. Call it from the settings-save command before swapping
+//! in a freshly-constructed state; the old heartbeat/registration tasks
+//! observe the flag and return cleanly.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,17 +40,22 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::settings::WebIntegrationSettings;
 use crate::unified_workflow_executor::types::PhaseResult;
+
+pub mod token_flow;
+
+pub use token_flow::{PendingTokenFlow, TokenFlowStore};
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Environment-sourced configuration for server-mode web-backend integration.
+/// Resolved configuration for web-backend integration.
 ///
-/// Present only when **both** `QONTINUI_WEB_BACKEND_URL` and
-/// `QONTINUI_RUNNER_TOKEN` are set. Callers that see `None` should skip all
-/// web-side reporting (phase events, registration, heartbeats).
+/// Produced from [`WebIntegrationSettings`] via [`ServerModeConfig::from_settings`].
+/// Callers that see `None` should skip all web-side reporting (phase events,
+/// registration, heartbeats).
 #[derive(Debug, Clone)]
 pub struct ServerModeConfig {
     /// Base URL of the qontinui-web API, e.g. `"https://api.qontinui.io"`.
@@ -48,19 +67,23 @@ pub struct ServerModeConfig {
 }
 
 impl ServerModeConfig {
-    /// Build from env vars. Returns `None` when either var is missing.
+    /// Build from the persisted [`WebIntegrationSettings`].
     ///
-    /// Callers must log the warning themselves; this helper is silent so it
-    /// can be called from multiple sites without double-logging.
-    pub fn from_env() -> Option<Self> {
-        let web_backend_url = std::env::var("QONTINUI_WEB_BACKEND_URL").ok()?;
-        let runner_token = std::env::var("QONTINUI_RUNNER_TOKEN").ok()?;
-        if web_backend_url.trim().is_empty() || runner_token.trim().is_empty() {
+    /// Returns `None` unless `enabled=true` AND `backend_url` is non-empty
+    /// AND `runner_token` is non-empty. Trims a trailing slash from
+    /// `backend_url` so callers can safely append `/api/v1/...` paths.
+    pub fn from_settings(settings: &WebIntegrationSettings) -> Option<Self> {
+        if !settings.enabled {
+            return None;
+        }
+        let backend_url = settings.backend_url.trim();
+        let runner_token = settings.runner_token.trim();
+        if backend_url.is_empty() || runner_token.is_empty() {
             return None;
         }
         Some(Self {
-            web_backend_url: web_backend_url.trim_end_matches('/').to_string(),
-            runner_token,
+            web_backend_url: backend_url.trim_end_matches('/').to_string(),
+            runner_token: runner_token.to_string(),
         })
     }
 }
@@ -81,6 +104,17 @@ pub struct ServerModeState {
     pub config: ServerModeConfig,
     runner_id: Arc<RwLock<Option<Uuid>>>,
     dispatch_secret: Arc<RwLock<Option<String>>>,
+    /// ISO-8601 timestamp of the last successful heartbeat. Populated by the
+    /// heartbeat loop; read by the `get_web_integration_status` command.
+    last_heartbeat_at: Arc<RwLock<Option<String>>>,
+    /// Last registration error message (from `register_with_retry`). Cleared
+    /// to `None` on successful registration.
+    registration_error: Arc<RwLock<Option<String>>>,
+    /// Shutdown flag for hot-reload: when settings change, the settings-save
+    /// command calls [`ServerModeState::shutdown`] to flip this to `true`;
+    /// the registration retry and heartbeat loops check between iterations
+    /// and return cleanly.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl ServerModeState {
@@ -89,6 +123,9 @@ impl ServerModeState {
             config,
             runner_id: Arc::new(RwLock::new(None)),
             dispatch_secret: Arc::new(RwLock::new(None)),
+            last_heartbeat_at: Arc::new(RwLock::new(None)),
+            registration_error: Arc::new(RwLock::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -115,6 +152,39 @@ impl ServerModeState {
     async fn set_dispatch_secret(&self, secret: String) {
         let mut guard = self.dispatch_secret.write().await;
         *guard = Some(secret);
+    }
+
+    /// Timestamp (ISO-8601) of the last successful heartbeat. `None` when the
+    /// heartbeat loop has not yet recorded a success.
+    pub async fn last_heartbeat_at(&self) -> Option<String> {
+        self.last_heartbeat_at.read().await.clone()
+    }
+
+    async fn set_last_heartbeat_at(&self, ts: String) {
+        let mut guard = self.last_heartbeat_at.write().await;
+        *guard = Some(ts);
+    }
+
+    /// Most recent registration error, or `None` if the last attempt
+    /// succeeded (or none has been made yet).
+    pub async fn registration_error(&self) -> Option<String> {
+        self.registration_error.read().await.clone()
+    }
+
+    async fn set_registration_error(&self, err: Option<String>) {
+        let mut guard = self.registration_error.write().await;
+        *guard = err;
+    }
+
+    /// Signal the background tasks to exit cleanly. After calling this the
+    /// state can be dropped; the registration retry loop and heartbeat loop
+    /// will observe the flag on their next iteration and return.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
     }
 }
 
@@ -178,15 +248,17 @@ fn get_runner_port() -> u16 {
         .unwrap_or(9876)
 }
 
-/// Spawn the server-mode registration + heartbeat tasks on the tauri async
-/// runtime.
+/// Spawn the web-integration registration + heartbeat tasks on the tauri
+/// async runtime.
 ///
-/// Call this from `.setup()` (i.e. after the tauri runtime is up). The state
-/// itself is constructed earlier via [`ServerModeState::new`] and attached to
+/// Call this from `.setup()` (i.e. after the tauri runtime is up) or from
+/// the web-integration settings-save command during hot-reload. The state
+/// itself is constructed via [`ServerModeState::new`] and stored on
 /// `AppState`; `spawn_background_tasks` takes a clone and drives the HTTP
 /// work in the background. The registration task fills in `runner_id`
 /// asynchronously, then chains into the heartbeat loop so the heartbeat
-/// never runs without a registered id.
+/// never runs without a registered id. Both loops observe
+/// [`ServerModeState::shutdown`] and exit cleanly when it is set.
 ///
 /// `restate_enabled` is captured up front from the live `RestateSettings`;
 /// registration reports the static value (the dynamic health is reported on
@@ -195,15 +267,22 @@ pub fn spawn_background_tasks(state: ServerModeState, restate_enabled: bool) {
     let state_for_register = state.clone();
     tauri::async_runtime::spawn(async move {
         register_with_retry(&state_for_register, restate_enabled).await;
+        // Abort the chain if shutdown happened during registration.
+        if state_for_register.is_shutting_down() {
+            return;
+        }
         // Once registered, start heartbeats. We chain them so the heartbeat
         // loop never runs without a runner_id (which would 404 every tick).
         run_heartbeat_loop(state_for_register, restate_enabled).await;
     });
 }
 
-/// Register with exponential backoff. Retries forever until success — the
-/// runner runs locally even when registration keeps failing, so blocking
+/// Register with exponential backoff. Retries until success or shutdown —
+/// the runner runs locally even when registration keeps failing, so blocking
 /// workflow execution here is wrong.
+///
+/// Records the latest error via [`ServerModeState::set_registration_error`]
+/// on each non-2xx/network failure; clears it on success.
 async fn register_with_retry(state: &ServerModeState, restate_enabled: bool) {
     let client = build_http_client();
     let url = format!("{}/api/v1/runners/register", state.config.web_backend_url);
@@ -226,6 +305,11 @@ async fn register_with_retry(state: &ServerModeState, restate_enabled: bool) {
     let max_delay = Duration::from_secs(300); // 5 min cap
 
     loop {
+        if state.is_shutting_down() {
+            debug!("Server-mode registration: shutdown requested, exiting loop");
+            return;
+        }
+
         match client
             .post(&url)
             .bearer_auth(&state.config.runner_token)
@@ -241,19 +325,19 @@ async fn register_with_retry(state: &ServerModeState, restate_enabled: bool) {
                         if let Some(secret) = body.dispatch_secret {
                             state.set_dispatch_secret(secret).await;
                         }
+                        state.set_registration_error(None).await;
                         info!(
                             runner_id = %body.runner_id,
                             name = %payload.name,
                             dispatch_secret_received = has_secret,
-                            "Server-mode runner registered with web backend"
+                            "Web-integration runner registered with web backend"
                         );
                         return;
                     }
                     Err(e) => {
-                        warn!(
-                            "Server-mode registration: 2xx body did not decode as RegistrationResponse: {}",
-                            e
-                        );
+                        let msg = format!("2xx body did not decode as RegistrationResponse: {}", e);
+                        warn!("Server-mode registration: {}", msg);
+                        state.set_registration_error(Some(msg)).await;
                     }
                 }
             }
@@ -263,25 +347,36 @@ async fn register_with_retry(state: &ServerModeState, restate_enabled: bool) {
                     .text()
                     .await
                     .unwrap_or_else(|_| "<no body>".to_string());
-                warn!(
-                    "Server-mode registration failed ({}): {}",
-                    status,
-                    truncate(&body_preview, 200)
-                );
+                let msg = format!("HTTP {}: {}", status, truncate(&body_preview, 200));
+                warn!("Server-mode registration failed: {}", msg);
+                state.set_registration_error(Some(msg)).await;
             }
             Err(e) => {
-                warn!("Server-mode registration network error: {}", e);
+                let msg = format!("network error: {}", e);
+                warn!("Server-mode registration {}", msg);
+                state.set_registration_error(Some(msg)).await;
             }
         }
 
-        tokio::time::sleep(delay).await;
+        // Sleep with shutdown-responsive polling so hot-reload isn't blocked
+        // by the next retry delay (can reach 5 minutes).
+        let mut slept = Duration::from_secs(0);
+        let poll = Duration::from_millis(250);
+        while slept < delay {
+            if state.is_shutting_down() {
+                return;
+            }
+            tokio::time::sleep(poll).await;
+            slept += poll;
+        }
         // Exponential backoff (2s -> 4s -> 8s -> ... -> 300s cap).
         delay = std::cmp::min(delay.saturating_mul(2), max_delay);
     }
 }
 
 /// Heartbeat loop: every 30s while `runner_id` is set. Network errors warn
-/// but never back off — a missed heartbeat is fine.
+/// but never back off — a missed heartbeat is fine. Exits when
+/// [`ServerModeState::shutdown`] has been called.
 async fn run_heartbeat_loop(state: ServerModeState, restate_enabled: bool) {
     let client = build_http_client();
     let mut ticker = tokio::time::interval(Duration::from_secs(30));
@@ -290,6 +385,11 @@ async fn run_heartbeat_loop(state: ServerModeState, restate_enabled: bool) {
 
     loop {
         ticker.tick().await;
+
+        if state.is_shutting_down() {
+            debug!("Server-mode heartbeat: shutdown requested, exiting loop");
+            return;
+        }
 
         let runner_id = match state.runner_id().await {
             Some(id) => id,
@@ -332,6 +432,8 @@ async fn run_heartbeat_loop(state: ServerModeState, restate_enabled: bool) {
         {
             Ok(resp) if resp.status().is_success() => {
                 debug!("Server-mode heartbeat sent (status={})", status);
+                let ts = chrono::Utc::now().to_rfc3339();
+                state.set_last_heartbeat_at(ts).await;
             }
             Ok(resp) => {
                 let s = resp.status();

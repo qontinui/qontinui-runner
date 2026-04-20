@@ -61,6 +61,7 @@ export type MainTabId =
   | "settings-playwright"
   | "settings-mobile"
   | "settings-cloud-relay"
+  | "settings-web-integration"
   | "settings-mcp"
   | "settings-log-sources"
   | "settings-execution-variables"
@@ -156,6 +157,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-playwright",
   "settings-mobile",
   "settings-cloud-relay",
+  "settings-web-integration",
   "settings-mcp",
   "settings-log-sources",
   "settings-execution-variables",

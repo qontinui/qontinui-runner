@@ -336,40 +336,39 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         crate::mcp::sdk_client::SdkConnectionManager::new(),
     ));
 
-    // Server-mode web-backend integration — only active when all three env
-    // vars are set. The state is constructed here (synchronously) so that
-    // workflow-execution code paths can see an `Option<ServerModeState>` on
-    // `AppState`; the actual registration + heartbeat tasks are spawned from
-    // `setup()` below, after the async runtime is up.
+    // Headless window control — `QONTINUI_SERVER_MODE=1` now ONLY governs
+    // whether the main window is created and whether Restate is auto-enabled.
+    // Web-backend integration (Phase 3G) is driven entirely by the
+    // persisted `WebIntegrationSettings` (with env-var overlay support in
+    // `settings::load_settings`). A desktop runner can register with web
+    // via the Settings UI; a headless deploy can set
+    // `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN` and get the same
+    // behavior without touching settings.
     let server_mode_is_on = std::env::var("QONTINUI_SERVER_MODE")
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
-    let server_mode_state: Option<crate::server_mode::ServerModeState> = if server_mode_is_on {
-        match crate::server_mode::ServerModeConfig::from_env() {
-            Some(cfg) => {
-                info!(
-                    "Server-mode web-backend integration enabled (backend={})",
-                    cfg.web_backend_url
-                );
-                Some(crate::server_mode::ServerModeState::new(cfg))
-            }
-            None => {
-                if std::env::var("QONTINUI_WEB_BACKEND_URL").is_ok() {
-                    warn!(
-                        "QONTINUI_WEB_BACKEND_URL set but QONTINUI_RUNNER_TOKEN is missing — \
-                         phase events and heartbeats will NOT be reported to the web backend"
-                    );
-                } else {
-                    warn!(
-                        "server mode without web-backend URL: phase events and heartbeats will not be reported"
-                    );
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let web_integration_settings = crate::settings::load_settings().web_integration.clone();
+    let initial_server_mode_state: Option<crate::server_mode::ServerModeState> =
+        crate::server_mode::ServerModeConfig::from_settings(&web_integration_settings).map(|cfg| {
+            info!(
+                "Web-backend integration enabled (backend={})",
+                cfg.web_backend_url
+            );
+            crate::server_mode::ServerModeState::new(cfg)
+        });
+    if initial_server_mode_state.is_none()
+        && (!web_integration_settings.backend_url.is_empty()
+            || !web_integration_settings.runner_token.is_empty())
+    {
+        warn!(
+            "Web-integration partially configured (enabled={}, backend_url_empty={}, runner_token_empty={}) — phase events and heartbeats will NOT be reported until all three are set",
+            web_integration_settings.enabled,
+            web_integration_settings.backend_url.is_empty(),
+            web_integration_settings.runner_token.is_empty(),
+        );
+    }
+    let server_mode_state: Arc<tokio::sync::RwLock<Option<crate::server_mode::ServerModeState>>> =
+        Arc::new(tokio::sync::RwLock::new(initial_server_mode_state));
 
     let shared_app_state = Arc::new(AppState {
         bridge_manager: TokioMutex::new(None), // Initialized in setup() when app_handle is available
@@ -411,7 +410,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             );
             cache
         },
-        server_mode: server_mode_state,
+        server_mode: server_mode_state.clone(),
+        token_flow: Arc::new(crate::server_mode::TokenFlowStore::new()),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -1364,6 +1364,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Window manager commands (OS-level window enumeration/activation)
             commands::window_manager::list_system_windows,
             commands::window_manager::activate_system_window,
+            // Web-integration settings commands (Phase 3G: runner↔web toggle)
+            commands::web_integration::get_web_integration_status,
+            commands::web_integration::save_web_integration_settings,
+            commands::web_integration::test_web_integration_connection,
+            // Browser-login one-click token flow (Phase 3G-web-polish)
+            commands::web_integration::start_web_token_flow,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -1565,12 +1571,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Start heartbeat background task for fleet registration
             heartbeat::start_heartbeat(heartbeat_app_state);
 
-            // Start server-mode web-backend registration + heartbeat loop
-            // (only when `QONTINUI_SERVER_MODE=1` and the token/URL pair was
-            // supplied — see `server_mode_state` construction above).
-            if let Some(ref sm_state) = app.state::<Arc<AppState>>().inner().server_mode {
-                let restate_enabled = crate::settings::load_settings().restate.enabled;
-                crate::server_mode::spawn_background_tasks(sm_state.clone(), restate_enabled);
+            // Start web-backend registration + heartbeat loop when
+            // WebIntegrationSettings are configured. Runs independently of
+            // QONTINUI_SERVER_MODE — any runner (desktop, secondary, or
+            // headless) that has web integration enabled participates.
+            {
+                let startup_app_state = app.state::<Arc<AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let sm_state_opt = startup_app_state.current_server_mode().await;
+                    if let Some(sm_state) = sm_state_opt {
+                        let restate_enabled = crate::settings::load_settings().restate.enabled;
+                        crate::server_mode::spawn_background_tasks(sm_state, restate_enabled);
+                    }
+                });
             }
 
             // Register this runner in the PostgreSQL instance registry.
