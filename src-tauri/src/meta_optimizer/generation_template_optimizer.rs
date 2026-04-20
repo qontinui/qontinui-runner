@@ -90,8 +90,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -
 }
 
 /// Build setup steps that load generation feedback and rules data.
-pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_setup_steps(app_state: &crate::commands::AppState) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 0: Load optimizer context (history, baselines, quality trends)

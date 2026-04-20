@@ -32,8 +32,13 @@ const PIPELINE_THINKING_STYLES: &[&str] = &[
 ];
 
 /// Build the LoopConfig for the pipeline prompt optimizer.
-pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -> LoopConfig {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_config(
+    execution_id: &str,
+    workflow_name: &str,
+    style_index: u32,
+    app_state: &crate::commands::AppState,
+) -> LoopConfig {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
     let style = PIPELINE_THINKING_STYLES[(style_index as usize) % PIPELINE_THINKING_STYLES.len()];
     LoopConfig {
         max_iterations: 5,
@@ -91,8 +96,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -
 }
 
 /// Build setup steps that load analysis data via curl.
-pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_setup_steps(app_state: &crate::commands::AppState) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 0: Load optimizer context (history, baselines, failure patterns)

@@ -224,7 +224,7 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
     let loop_config =
         super::workflow::build_follow_up_config(&follow_up_id, &follow_up_name, &workflow_name);
 
-    let setup_steps = super::workflow::build_setup_steps(&source_task_run_id);
+    let setup_steps = super::workflow::build_setup_steps(&source_task_run_id, &deps.app_state);
     let verification_steps = super::workflow::build_verification_steps();
 
     // Build LoopController with full deps

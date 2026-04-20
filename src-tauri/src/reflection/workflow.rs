@@ -84,7 +84,11 @@ fn file_path_regex() -> &'static Regex {
 ///
 /// Use this for all workflows that need basic project orientation (paths, tree)
 /// without the heavier reflection-specific enrichment.
-pub fn enrich_project_context(shared_vars: &SharedVariableStore, project_path: Option<&str>) {
+pub fn enrich_project_context(
+    shared_vars: &SharedVariableStore,
+    project_path: Option<&str>,
+    app_state: &crate::commands::AppState,
+) {
     // Skip if already set
     if shared_vars.get("project_root").is_some() {
         return;
@@ -122,7 +126,7 @@ pub fn enrich_project_context(shared_vars: &SharedVariableStore, project_path: O
     if shared_vars.get("runner_api_url").is_none() {
         shared_vars.set(
             "runner_api_url",
-            crate::mcp::types::get_self_base_url_from_env(),
+            crate::mcp::types::get_self_base_url(app_state),
         );
     }
 }
@@ -507,8 +511,9 @@ pub fn build_reflection_config(
 pub fn build_setup_steps(
     source_task_run_id: &str,
     source_workflow_name: &str,
+    app_state: &crate::commands::AppState,
 ) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 1: Load findings from source run
@@ -595,8 +600,11 @@ pub fn build_setup_steps(
 }
 
 /// Build verification steps for the reflection workflow.
-pub fn build_verification_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_verification_steps(
+    source_task_run_id: &str,
+    app_state: &crate::commands::AppState,
+) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 1: Verify reflection fixes were recorded via API
@@ -638,8 +646,9 @@ If any issues are found, report them. Otherwise, confirm the reflection is safe.
 pub fn build_completion_steps(
     source_workflow_name: &str,
     source_task_run_id: &str,
+    app_state: &crate::commands::AppState,
 ) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 1: Batch evaluate previous fixes (automation step)
@@ -1130,8 +1139,9 @@ pub fn build_project_reflection_config(
 pub fn build_project_setup_steps(
     source_task_run_id: &str,
     source_workflow_name: &str,
+    app_state: &crate::commands::AppState,
 ) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 1: Load findings from source run
@@ -1217,8 +1227,11 @@ pub fn build_project_setup_steps(
 }
 
 /// Build verification steps for project reflection (simplified — safety check only).
-pub fn build_project_verification_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_project_verification_steps(
+    source_task_run_id: &str,
+    app_state: &crate::commands::AppState,
+) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 1: HTTP health check (non-blocking — AI step below provides fallback)
@@ -1256,8 +1269,11 @@ If any issues are found, report them. Otherwise, confirm the project reflection 
 }
 
 /// Build completion steps for project reflection.
-pub fn build_project_completion_steps(source_workflow_name: &str) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_project_completion_steps(
+    source_workflow_name: &str,
+    app_state: &crate::commands::AppState,
+) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 1: Batch evaluate previous fixes
@@ -1544,8 +1560,9 @@ pub fn build_ui_bridge_reflection_config(
 pub fn build_ui_bridge_setup_steps(
     source_task_run_id: &str,
     source_workflow_name: &str,
+    app_state: &crate::commands::AppState,
 ) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 1: Load AI conversation output (primary data source)
@@ -1631,8 +1648,11 @@ pub fn build_ui_bridge_setup_steps(
 }
 
 /// Build verification steps for UI Bridge reflection.
-pub fn build_ui_bridge_verification_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_ui_bridge_verification_steps(
+    source_task_run_id: &str,
+    app_state: &crate::commands::AppState,
+) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // HTTP health check
@@ -1671,8 +1691,11 @@ Report any compilation errors or issues found."#,
 ///
 /// Includes: effectiveness evaluation, implementation workflow generation from the
 /// plan produced by the agentic phase, and a summary.
-pub fn build_ui_bridge_completion_steps(source_workflow_name: &str) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_ui_bridge_completion_steps(
+    source_workflow_name: &str,
+    app_state: &crate::commands::AppState,
+) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 1: Batch evaluate previous fixes (automation)

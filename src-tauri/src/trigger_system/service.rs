@@ -55,13 +55,14 @@ impl TriggerService {
     /// Create a new trigger service.
     pub fn new(deps: TriggerExecutorDeps) -> Self {
         let (event_tx, event_rx) = mpsc::channel(256);
+        let evaluator = Arc::new(TriggerEvaluator::with_app_state(deps.app_state.clone()));
 
         Self {
             stop_signal: Arc::new(AtomicBool::new(false)),
             watcher_stop_signals: RwLock::new(HashMap::new()),
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
-            evaluator: Arc::new(TriggerEvaluator::new()),
+            evaluator,
             deps,
             watcher_handles: RwLock::new(HashMap::new()),
             dropped_events: std::sync::atomic::AtomicU64::new(0),

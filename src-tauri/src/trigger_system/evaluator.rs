@@ -1,8 +1,11 @@
 //! Trigger evaluation: debounce, throttle, and condition checking.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+use crate::commands::AppState;
 
 use super::types::{TriggerCondition, TriggerEvent, WorkflowTrigger};
 
@@ -17,6 +20,8 @@ pub struct TriggerEvaluator {
     last_execution_times: RwLock<HashMap<String, std::time::Instant>>,
     /// Currently running execution count per trigger
     active_executions: RwLock<HashMap<String, u32>>,
+    /// AppState for port-aware URL construction (optional for tests)
+    app_state: Option<Arc<AppState>>,
 }
 
 /// Result of evaluating a trigger event.
@@ -59,6 +64,17 @@ impl TriggerEvaluator {
             last_event_times: RwLock::new(HashMap::new()),
             last_execution_times: RwLock::new(HashMap::new()),
             active_executions: RwLock::new(HashMap::new()),
+            app_state: None,
+        }
+    }
+
+    /// Create a new evaluator with AppState for port-aware URL construction.
+    pub fn with_app_state(app_state: Arc<AppState>) -> Self {
+        Self {
+            last_event_times: RwLock::new(HashMap::new()),
+            last_execution_times: RwLock::new(HashMap::new()),
+            active_executions: RwLock::new(HashMap::new()),
+            app_state: Some(app_state),
         }
     }
 
@@ -225,7 +241,14 @@ impl TriggerEvaluator {
     /// Check if the runner is idle (no workflows running).
     async fn check_idle_condition(&self) -> bool {
         let client = reqwest::Client::new();
-        let status_url = format!("{}/status", crate::mcp::types::get_self_base_url_from_env());
+        let base = match &self.app_state {
+            Some(state) => crate::mcp::types::get_self_base_url(state),
+            None => {
+                #[allow(deprecated)]
+                crate::mcp::types::get_self_base_url_from_env()
+            }
+        };
+        let status_url = format!("{}/status", base);
         match client
             .get(&status_url)
             .timeout(std::time::Duration::from_secs(5))

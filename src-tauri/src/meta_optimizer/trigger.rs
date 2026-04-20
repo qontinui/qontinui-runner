@@ -530,14 +530,19 @@ fn launch_optimizer_internal(
                 &task_run_id,
                 &task_name,
                 style_index,
+                &deps.app_state,
             );
-            let setup = super::pipeline_prompt_optimizer::build_setup_steps();
+            let setup = super::pipeline_prompt_optimizer::build_setup_steps(&deps.app_state);
             let verify = super::pipeline_prompt_optimizer::build_verification_steps();
             (config, setup, verify)
         }
         OptimizerType::Architecture => {
-            let config = super::architecture_optimizer::build_config(&task_run_id, &task_name);
-            let setup = super::architecture_optimizer::build_setup_steps();
+            let config = super::architecture_optimizer::build_config(
+                &task_run_id,
+                &task_name,
+                &deps.app_state,
+            );
+            let setup = super::architecture_optimizer::build_setup_steps(&deps.app_state);
             let verify = super::architecture_optimizer::build_verification_steps();
             (config, setup, verify)
         }
@@ -547,14 +552,18 @@ fn launch_optimizer_internal(
                 &task_name,
                 style_index,
             );
-            let setup = super::generation_template_optimizer::build_setup_steps();
+            let setup = super::generation_template_optimizer::build_setup_steps(&deps.app_state);
             let verify = super::generation_template_optimizer::build_verification_steps();
             (config, setup, verify)
         }
         OptimizerType::MetaPrompt => {
-            let config =
-                super::meta_prompt_optimizer::build_config(&task_run_id, &task_name, style_index);
-            let setup = super::meta_prompt_optimizer::build_setup_steps();
+            let config = super::meta_prompt_optimizer::build_config(
+                &task_run_id,
+                &task_name,
+                style_index,
+                &deps.app_state,
+            );
+            let setup = super::meta_prompt_optimizer::build_setup_steps(&deps.app_state);
             let verify = super::meta_prompt_optimizer::build_verification_steps();
             (config, setup, verify)
         }

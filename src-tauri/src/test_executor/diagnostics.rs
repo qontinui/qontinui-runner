@@ -10,10 +10,11 @@ use tracing::{debug, warn};
 
 /// Extension endpoint for diagnostic checks (uses default port; runtime code should use dynamic port)
 fn extension_endpoint() -> String {
-    format!(
-        "{}/extension/command",
-        crate::mcp::types::get_self_base_url_from_env()
-    )
+    // NOTE: no AppState in scope here — this is a diagnostic helper with no
+    // caller-supplied context. Kept on deprecated env-var lookup.
+    #[allow(deprecated)]
+    let base = crate::mcp::types::get_self_base_url_from_env();
+    format!("{}/extension/command", base)
 }
 
 /// Diagnostic information collected when a test times out

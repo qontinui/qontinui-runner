@@ -566,8 +566,12 @@ fn extract_origin(url: &str) -> String {
     if url.contains(':') {
         return format!("http://{}", url.split('/').next().unwrap_or(url));
     }
-    // Fallback
-    crate::mcp::types::get_self_base_url_from_env()
+    // Fallback — NOTE: no AppState in scope here (pure URL parsing helper);
+    // kept on deprecated env-var lookup.
+    #[allow(deprecated)]
+    {
+        crate::mcp::types::get_self_base_url_from_env()
+    }
 }
 
 // ---------------------------------------------------------------------------

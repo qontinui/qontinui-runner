@@ -1596,11 +1596,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Secondary instance — skipping scheduler service");
             } else {
                 info!("Starting scheduler service");
-                let scheduler_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                let scheduler_app_state: Arc<commands::AppState> =
+                    app.state::<Arc<commands::AppState>>().inner().clone();
+                let scheduler_pg = scheduler_app_state.pg_db.clone();
                 tauri::async_runtime::spawn(async move {
                     // Wait briefly for MCP API server to bind
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    scheduler_service::start_scheduler_service(scheduler_pg).await;
+                    scheduler_service::start_scheduler_service(scheduler_pg, scheduler_app_state)
+                        .await;
                 });
             }
 

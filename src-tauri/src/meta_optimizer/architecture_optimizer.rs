@@ -12,10 +12,14 @@ use crate::step_executor::ExecutionStepConfig;
 use crate::unified_workflow_executor::LoopConfig;
 
 /// Build the LoopConfig for the architecture optimizer.
-pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
+pub fn build_config(
+    execution_id: &str,
+    workflow_name: &str,
+    app_state: &crate::commands::AppState,
+) -> LoopConfig {
     LoopConfig {
         max_iterations: 3,
-        base_prompt: build_agentic_prompt(&crate::mcp::types::get_self_base_url_from_env()),
+        base_prompt: build_agentic_prompt(&crate::mcp::types::get_self_base_url(app_state)),
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("meta-opt-arch-{}", execution_id),
         execution_id: execution_id.to_string(),
@@ -69,8 +73,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
 }
 
 /// Build setup steps that load cross-architecture analysis data.
-pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_setup_steps(app_state: &crate::commands::AppState) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 0: Load optimizer context (history, baselines, failure patterns)

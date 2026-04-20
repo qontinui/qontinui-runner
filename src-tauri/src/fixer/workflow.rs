@@ -72,8 +72,11 @@ pub fn build_fixer_config(
 }
 
 /// Build setup steps that load source run data and child outputs via curl commands.
-pub fn build_setup_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
-    let base_url = crate::mcp::types::get_self_base_url_from_env();
+pub fn build_setup_steps(
+    source_task_run_id: &str,
+    app_state: &crate::commands::AppState,
+) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url(app_state);
 
     vec![
         // Step 1: Load AI conversation output from source run

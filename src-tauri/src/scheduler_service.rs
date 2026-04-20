@@ -4,6 +4,7 @@
 //! at their scheduled times. Integrates with existing workflow and prompt
 //! execution infrastructure.
 
+use crate::commands::AppState;
 use crate::database::pg::PgDb;
 use crate::scheduler::{
     compute_next_run, condition_status_default, ConditionStatus, RepositoryWatch, ScheduledTask,
@@ -24,6 +25,8 @@ use walkdir::WalkDir;
 pub struct SchedulerService {
     /// PostgreSQL database for activity timeline and watchers (optional)
     pg_db: Option<Arc<PgDb>>,
+    /// AppState for reading the actually-bound API port (optional for tests)
+    app_state: Option<Arc<AppState>>,
     /// Flag to stop the service
     stop_signal: Arc<AtomicBool>,
     /// Currently running task IDs
@@ -37,9 +40,36 @@ impl SchedulerService {
     pub fn new(pg_db: impl Into<Option<Arc<PgDb>>>) -> Self {
         Self {
             pg_db: pg_db.into(),
+            app_state: None,
             stop_signal: Arc::new(AtomicBool::new(false)),
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60, // Check every minute
+        }
+    }
+
+    /// Create a new scheduler service with AppState for port-aware URL construction.
+    pub fn with_app_state(
+        pg_db: impl Into<Option<Arc<PgDb>>>,
+        app_state: Arc<AppState>,
+    ) -> Self {
+        Self {
+            pg_db: pg_db.into(),
+            app_state: Some(app_state),
+            stop_signal: Arc::new(AtomicBool::new(false)),
+            running_tasks: Arc::new(RwLock::new(Vec::new())),
+            check_interval_secs: 60,
+        }
+    }
+
+    /// Build the runner's own base URL, preferring AppState's bound port when
+    /// available and falling back to the env-var lookup otherwise.
+    fn self_base_url(&self) -> String {
+        match &self.app_state {
+            Some(state) => crate::mcp::types::get_self_base_url(state),
+            None => {
+                #[allow(deprecated)]
+                crate::mcp::types::get_self_base_url_from_env()
+            }
         }
     }
 
@@ -756,7 +786,7 @@ impl SchedulerService {
 
         // Build the request to run workflow via HTTP API
         let client = reqwest::Client::new();
-        let base_url = crate::mcp::types::get_self_base_url_from_env();
+        let base_url = self.self_base_url();
 
         // Load config if specified
         if let Some(path) = config_path {
@@ -835,7 +865,7 @@ impl SchedulerService {
         );
 
         let client = reqwest::Client::new();
-        let base_url = crate::mcp::types::get_self_base_url_from_env();
+        let base_url = self.self_base_url();
 
         let mut request_body = serde_json::json!({});
         if let Some(monitor) = monitor_index {
@@ -897,7 +927,7 @@ impl SchedulerService {
         );
 
         let client = reqwest::Client::new();
-        let base_url = crate::mcp::types::get_self_base_url_from_env();
+        let base_url = self.self_base_url();
 
         let mut request_body = serde_json::json!({
             "prompt_id": prompt_id
@@ -941,7 +971,7 @@ impl SchedulerService {
         info!("Launching auto-fix (check_findings: {})", check_findings);
 
         let client = reqwest::Client::new();
-        let base_url = crate::mcp::types::get_self_base_url_from_env();
+        let base_url = self.self_base_url();
 
         let prompt = if check_findings {
             r#"You are in auto-fix mode. Check for any auto-fixable findings (code_bug, security, test_issue, documentation) and fix them.
@@ -1092,7 +1122,7 @@ After making fixes, run tests if applicable to verify the fixes work."#
 
         // 4. Send to AI for reasoning via the runner's prompt execution API
         let client = reqwest::Client::new();
-        let base_url = crate::mcp::types::get_self_base_url_from_env();
+        let base_url = self.self_base_url();
 
         let request_body = serde_json::json!({
             "name": format!("watcher-{}", watcher.name),
@@ -1233,7 +1263,7 @@ impl SchedulerService {
     /// Check if runner is idle (not executing workflows or AI tasks)
     async fn check_idle(&self) -> bool {
         let client = reqwest::Client::new();
-        let status_url = format!("{}/status", crate::mcp::types::get_self_base_url_from_env());
+        let status_url = format!("{}/status", self.self_base_url());
         match client.get(&status_url).send().await {
             Ok(resp) => {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
@@ -1387,7 +1417,7 @@ static SCHEDULER_SERVICE: Lazy<Mutex<Option<Arc<SchedulerService>>>> =
     Lazy::new(|| Mutex::new(None));
 
 /// Start the global scheduler service
-pub async fn start_scheduler_service(pg_db: Arc<PgDb>) {
+pub async fn start_scheduler_service(pg_db: Arc<PgDb>, app_state: Arc<AppState>) {
     let mut service_guard = SCHEDULER_SERVICE.lock().await;
 
     if service_guard.is_some() {
@@ -1395,7 +1425,7 @@ pub async fn start_scheduler_service(pg_db: Arc<PgDb>) {
         return;
     }
 
-    let service = Arc::new(SchedulerService::new(pg_db));
+    let service = Arc::new(SchedulerService::with_app_state(pg_db, app_state));
     *service_guard = Some(service.clone());
     drop(service_guard);
 

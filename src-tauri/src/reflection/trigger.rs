@@ -119,10 +119,18 @@ pub fn launch_reflection(
     let loop_config =
         super::workflow::build_reflection_config(&reflection_id, &reflection_name, &workflow_name);
 
-    let setup_steps = super::workflow::build_setup_steps(&source_task_run_id, &workflow_name);
-    let verification_steps = super::workflow::build_verification_steps(&source_task_run_id);
-    let mut completion_steps =
-        super::workflow::build_completion_steps(&workflow_name, &source_task_run_id);
+    let setup_steps = super::workflow::build_setup_steps(
+        &source_task_run_id,
+        &workflow_name,
+        &deps.app_state,
+    );
+    let verification_steps =
+        super::workflow::build_verification_steps(&source_task_run_id, &deps.app_state);
+    let mut completion_steps = super::workflow::build_completion_steps(
+        &workflow_name,
+        &source_task_run_id,
+        &deps.app_state,
+    );
     // Split completion steps: first is automation (api_request), rest are prompt steps
     let completion_prompt_steps = completion_steps.split_off(1);
     let completion_automation_steps = completion_steps;
@@ -318,10 +326,15 @@ pub fn launch_project_reflection(
         project_path.clone(),
     );
 
-    let setup_steps =
-        super::workflow::build_project_setup_steps(&source_task_run_id, &workflow_name);
-    let verification_steps = super::workflow::build_project_verification_steps(&source_task_run_id);
-    let mut completion_steps = super::workflow::build_project_completion_steps(&workflow_name);
+    let setup_steps = super::workflow::build_project_setup_steps(
+        &source_task_run_id,
+        &workflow_name,
+        &deps.app_state,
+    );
+    let verification_steps =
+        super::workflow::build_project_verification_steps(&source_task_run_id, &deps.app_state);
+    let mut completion_steps =
+        super::workflow::build_project_completion_steps(&workflow_name, &deps.app_state);
     let completion_prompt_steps = completion_steps.split_off(1);
     let completion_automation_steps = completion_steps;
 
@@ -504,11 +517,15 @@ pub fn launch_ui_bridge_reflection(
         &workflow_name,
     );
 
-    let setup_steps =
-        super::workflow::build_ui_bridge_setup_steps(&source_task_run_id, &workflow_name);
+    let setup_steps = super::workflow::build_ui_bridge_setup_steps(
+        &source_task_run_id,
+        &workflow_name,
+        &deps.app_state,
+    );
     let verification_steps =
-        super::workflow::build_ui_bridge_verification_steps(&source_task_run_id);
-    let mut completion_steps = super::workflow::build_ui_bridge_completion_steps(&workflow_name);
+        super::workflow::build_ui_bridge_verification_steps(&source_task_run_id, &deps.app_state);
+    let mut completion_steps =
+        super::workflow::build_ui_bridge_completion_steps(&workflow_name, &deps.app_state);
     let completion_prompt_steps = completion_steps.split_off(1);
     let completion_automation_steps = completion_steps;
 

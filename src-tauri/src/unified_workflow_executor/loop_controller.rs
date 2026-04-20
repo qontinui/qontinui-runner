@@ -1150,6 +1150,7 @@ impl LoopController {
                 crate::reflection::workflow::enrich_project_context(
                     self.setup_executor.shared_variables(),
                     config.project_path.as_deref(),
+                    &self.app_state,
                 );
                 // Substitute the new variables into base_prompt
                 let project_vars = self.setup_executor.shared_variables().get_all();
@@ -1165,7 +1166,7 @@ impl LoopController {
 
             // ─── Validate critical shared variables ───
             {
-                let base_url = crate::mcp::types::get_self_base_url_from_env();
+                let base_url = crate::mcp::types::get_self_base_url(&self.app_state);
                 let critical_vars = [
                     "source_findings",
                     "source_ai_output",

@@ -598,7 +598,7 @@ pub async fn generate_workflow_from_session(
     // When generating from a specific message, fetch existing specs and build
     // enriched context with spec generation instructions
     let inline_context = if source_content.is_some() {
-        let existing_specs = fetch_existing_specs().await;
+        let existing_specs = fetch_existing_specs(&app_state).await;
         build_spec_aware_context(plan_text, &existing_specs)
     } else {
         format!(
@@ -1130,7 +1130,7 @@ pub async fn resume_ai_sessions(
 
 /// Tries both the cached external app specs and the runner's own specs.
 /// Returns a JSON string of whatever specs are available, or an empty message.
-pub(crate) async fn fetch_existing_specs() -> String {
+pub(crate) async fn fetch_existing_specs(app_state: &AppState) -> String {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -1138,7 +1138,7 @@ pub(crate) async fn fetch_existing_specs() -> String {
 
     let mut specs_parts: Vec<String> = Vec::new();
 
-    let self_base = crate::mcp::types::get_self_base_url_from_env();
+    let self_base = crate::mcp::types::get_self_base_url(app_state);
 
     // Fetch cached external app specs — separate architecture specs from page specs
     match client

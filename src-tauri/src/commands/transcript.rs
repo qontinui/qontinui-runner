@@ -299,7 +299,7 @@ pub async fn generate_workflow_standalone(
         // "Spec Generation Brief Recognition" rules section.
         inline_context.clone()
     } else {
-        let existing_specs = crate::commands::ai_session::fetch_existing_specs().await;
+        let existing_specs = crate::commands::ai_session::fetch_existing_specs(&app_state).await;
         if existing_specs != "No existing specs found" {
             crate::commands::ai_session::build_spec_aware_context(&inline_context, &existing_specs)
         } else {
