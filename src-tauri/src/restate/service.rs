@@ -268,7 +268,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                     )
                     .await)
                 })
-                .name(&format!("phase-verify-{}", iteration))
+                .name(format!("phase-verify-{}", iteration))
                 .await
                 .map_err(|e| TerminalError::new(format!("Verification failed: {}", e)))?
             };
@@ -317,7 +317,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                         )
                         .await)
                     })
-                    .name(&format!("phase-agentic-{}", iteration))
+                    .name(format!("phase-agentic-{}", iteration))
                     .await
                     .map_err(|e| TerminalError::new(format!("Agentic failed: {}", e)))?
                 };
