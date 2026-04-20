@@ -720,13 +720,34 @@ impl DeterministicVerifier {
         // and use Git Bash instead of cmd.exe to avoid quote-handling issues.
         let output = if cfg!(target_os = "windows") {
             if ShellCommandHandler::is_bash_command(command) {
-                let bash_path =
-                    ShellCommandHandler::find_git_bash().unwrap_or_else(|| "bash".to_string());
+                // Use Git Bash AND ensure MSYS /usr/bin is on PATH so the
+                // spawned bash can resolve ls/grep/cat/... shared logic with
+                // ShellCommandHandler so only one place maintains the lookup.
+                let (bash_path, augmented_path) =
+                    ShellCommandHandler::resolve_git_bash_with_msys_path();
                 info!("Using Git Bash for verification command: {}", bash_path);
+                // Prepend /usr/bin (from the git bash dir) ahead of the
+                // enhanced_path so MSYS utilities win over any same-named
+                // Windows binaries discovered by the enhancer.
+                let final_path = match augmented_path {
+                    Some(p) => {
+                        // augmented_path already starts with the usr_bin dir
+                        // followed by the parent PATH. Combine with the
+                        // enhanced Node-aware path so Node tools remain
+                        // resolvable too.
+                        let usr_bin = p.split(';').next().unwrap_or("").to_string();
+                        if enhanced_path.contains(&usr_bin) {
+                            enhanced_path.clone()
+                        } else {
+                            format!("{};{}", usr_bin, enhanced_path)
+                        }
+                    }
+                    None => enhanced_path.clone(),
+                };
                 crate::process_helpers::no_window(&bash_path)
                     .args(["-c", command])
                     .current_dir(&resolved_wd)
-                    .env("PATH", &enhanced_path)
+                    .env("PATH", &final_path)
                     .output()
             } else {
                 crate::process_helpers::cmd_no_window()

@@ -353,6 +353,53 @@ impl ShellCommandHandler {
         (envs, remaining.to_string())
     }
 
+    /// Resolve the Git-for-Windows bash path and the `PATH` value that should
+    /// be handed to that bash process.
+    ///
+    /// Returns `(bash_path, augmented_path_opt)`. `augmented_path_opt` is
+    /// `Some` when the parent's `PATH` is missing `/usr/bin` (so the caller
+    /// should set it on the child) and `None` when `PATH` already contains
+    /// it (so the caller can inherit parent `PATH` unchanged).
+    ///
+    /// Why this matters: without the PATH prepend, bash spawned via
+    /// `Command::new(bash.exe)` inherits only the parent process's PATH,
+    /// which on Windows typically lacks `/usr/bin`. Scripts calling plain
+    /// Unix utilities (`ls`, `grep`, `cat`, `sed`, …) then fail with
+    /// `command not found` even though bash itself is running. Previously
+    /// this logic lived only in `ShellCommandHandler::run_command`; every
+    /// other site that spawned bash (check.rs, legacy_steps.rs, orchestrator
+    /// verification) skipped the prepend and exit-code checks like
+    /// `ls <path>` silently returned 127.
+    pub fn resolve_git_bash_with_msys_path() -> (String, Option<String>) {
+        let bash_path = Self::find_git_bash().unwrap_or_else(|| "bash".to_string());
+        let augmented = std::path::Path::new(&bash_path)
+            .parent()
+            .and_then(|usr_bin| {
+                let usr_bin_str = usr_bin.to_string_lossy().to_string();
+                let current_path = std::env::var("PATH").unwrap_or_default();
+                if current_path.contains(&usr_bin_str) {
+                    None
+                } else {
+                    Some(format!("{};{}", usr_bin_str, current_path))
+                }
+            });
+        (bash_path, augmented)
+    }
+
+    /// Convenience wrapper around [`resolve_git_bash_with_msys_path`] for
+    /// callers building a tokio `Command`. The `-c <script>` arg is NOT
+    /// appended — the caller is responsible for that (so the script can be
+    /// logged or wrapped as needed).
+    #[cfg(target_os = "windows")]
+    pub(crate) fn spawn_git_bash_with_msys_path() -> (String, tokio::process::Command) {
+        let (bash_path, augmented) = Self::resolve_git_bash_with_msys_path();
+        let mut c = crate::process_helpers::tokio_no_window(&bash_path);
+        if let Some(path_value) = augmented {
+            c.env("PATH", path_value);
+        }
+        (bash_path, c)
+    }
+
     /// Find Git for Windows bash.exe, preferring it over WSL's bash.
     ///
     /// Checks common Git install locations. Returns None if not found,
@@ -587,22 +634,8 @@ impl ShellCommandHandler {
                 c
             } else if is_bash {
                 // Use Git Bash for Unix-style commands on Windows.
-                // Resolve the full path to avoid accidentally picking up WSL's
-                // bash.exe (C:\Windows\System32\bash.exe) which can fail with
-                // "execvpe(/bin/bash) failed" when WSL has no distro installed.
-                let bash_path = Self::find_git_bash().unwrap_or_else(|| "bash".to_string());
-                let mut c = crate::process_helpers::tokio_no_window(&bash_path);
-                // Ensure MSYS2 /usr/bin is on PATH so tools like cat, grep, sed
-                // are available even when bash is invoked non-interactively.
-                if let Some(usr_bin) = std::path::Path::new(&bash_path).parent()
-                // e.g. C:\Program Files\Git\usr\bin
-                {
-                    let usr_bin_str = usr_bin.to_string_lossy();
-                    let current_path = std::env::var("PATH").unwrap_or_default();
-                    if !current_path.contains(&*usr_bin_str) {
-                        c.env("PATH", format!("{};{}", usr_bin_str, current_path));
-                    }
-                }
+                let (bash_path, mut c) = Self::spawn_git_bash_with_msys_path();
+                let _ = bash_path; // silence unused when logging changes
                 c.args(["-c", command]);
                 c
             } else {

@@ -61,7 +61,7 @@ impl StepExecutor {
         script_id: &str,
     ) -> (bool, Option<String>, Option<String>) {
         let client = reqwest::Client::new();
-        let base_url = crate::mcp::types::get_self_base_url_from_env();
+        let base_url = crate::mcp::types::get_self_base_url(&self.app_state);
         let url = format!("{}/playwright/tests/{}/run", base_url, script_id);
 
         match client
@@ -636,22 +636,8 @@ impl StepExecutor {
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
                 c
             } else if is_bash {
-                // Use Git Bash for Unix-style commands on Windows.
-                // Resolve the full path to avoid accidentally picking up WSL's
-                // bash.exe which can fail when no WSL distro is installed.
-                let bash_path =
-                    super::handlers::shell_command::ShellCommandHandler::find_git_bash()
-                        .unwrap_or_else(|| "bash".to_string());
-                let mut c = crate::process_helpers::tokio_no_window(&bash_path);
-                // Ensure MSYS2 /usr/bin is on PATH so tools like cat, grep, sed
-                // are available even when bash is invoked non-interactively.
-                if let Some(usr_bin) = std::path::Path::new(&bash_path).parent() {
-                    let usr_bin_str = usr_bin.to_string_lossy();
-                    let current_path = std::env::var("PATH").unwrap_or_default();
-                    if !current_path.contains(&*usr_bin_str) {
-                        c.env("PATH", format!("{};{}", usr_bin_str, current_path));
-                    }
-                }
+                let (_bash_path, mut c) =
+                    super::handlers::shell_command::ShellCommandHandler::spawn_git_bash_with_msys_path();
                 c.args(["-c", &command]);
                 c
             } else {
@@ -1271,19 +1257,8 @@ impl StepExecutor {
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &final_command]);
                 c
             } else if is_bash {
-                // Use Git Bash for Unix-style commands on Windows.
-                let bash_path =
-                    super::handlers::shell_command::ShellCommandHandler::find_git_bash()
-                        .unwrap_or_else(|| "bash".to_string());
-                let mut c = crate::process_helpers::tokio_no_window(&bash_path);
-                // Ensure MSYS2 /usr/bin is on PATH for cat, grep, etc.
-                if let Some(usr_bin) = std::path::Path::new(&bash_path).parent() {
-                    let usr_bin_str = usr_bin.to_string_lossy();
-                    let current_path = std::env::var("PATH").unwrap_or_default();
-                    if !current_path.contains(&*usr_bin_str) {
-                        c.env("PATH", format!("{};{}", usr_bin_str, current_path));
-                    }
-                }
+                let (_bash_path, mut c) =
+                    super::handlers::shell_command::ShellCommandHandler::spawn_git_bash_with_msys_path();
                 c.args(["-c", &final_command]);
                 c
             } else {

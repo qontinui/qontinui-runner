@@ -162,11 +162,13 @@ impl StepHandler for CheckHandler {
                 c
             } else if is_bash {
                 // Bash/Unix syntax detected (curl, pipes with single quotes, etc.)
-                // Use Git Bash which handles single quotes correctly, unlike cmd.exe
-                // which strips them and breaks inline Python/jq commands.
-                let bash_path = super::shell_command::ShellCommandHandler::find_git_bash()
-                    .unwrap_or_else(|| "bash".to_string());
-                let mut c = crate::process_helpers::tokio_no_window(&bash_path);
+                // Use Git Bash with MSYS `/usr/bin` prepended to PATH — see
+                // ShellCommandHandler::spawn_git_bash_with_msys_path rationale.
+                // Previously this branch called find_git_bash() directly and
+                // omitted the PATH prepend, so `ls`/`grep`/`cat` exit-code
+                // checks silently failed with 127.
+                let (_bash_path, mut c) =
+                    super::shell_command::ShellCommandHandler::spawn_git_bash_with_msys_path();
                 c.args(["-c", &shell_command]);
                 c
             } else {
