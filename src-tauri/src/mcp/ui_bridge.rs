@@ -11185,8 +11185,6 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/undo-state"),
         ("POST", "/ui-bridge/control/error-baselines/capture"),
         ("POST", "/ui-bridge/control/error-baselines/compare"),
-        // Tier 2.1 — safelisted Tauri command proxy
-        ("POST", "/ui-bridge/tauri/invoke"),
     ]
 }
 

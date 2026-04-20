@@ -284,8 +284,23 @@ fn merge_small_blocks(blocks: &[String]) -> Vec<String> {
     let mut result = Vec::new();
     let mut accumulator = String::new();
 
+    let flush_accumulator = |accumulator: &mut String, result: &mut Vec<String>| {
+        if !accumulator.is_empty() {
+            result.push(std::mem::take(accumulator));
+        }
+    };
+
     for block in blocks {
         if block.is_empty() {
+            continue;
+        }
+
+        // Blocks already large enough to cache on their own are passed
+        // through unchanged — merging them with unrelated small blocks
+        // would invalidate cache keys whenever the small blocks change.
+        if block.len() >= MIN_CACHEABLE_CHARS {
+            flush_accumulator(&mut accumulator, &mut result);
+            result.push(block.clone());
             continue;
         }
 
@@ -296,17 +311,13 @@ fn merge_small_blocks(blocks: &[String]) -> Vec<String> {
             accumulator.push_str(block);
         }
 
-        // Flush if the accumulator is large enough to cache on its own
+        // Flush once the merged small blocks cross the cache threshold.
         if accumulator.len() >= MIN_CACHEABLE_CHARS {
-            result.push(accumulator);
-            accumulator = String::new();
+            flush_accumulator(&mut accumulator, &mut result);
         }
     }
 
-    // Flush remaining
-    if !accumulator.is_empty() {
-        result.push(accumulator);
-    }
+    flush_accumulator(&mut accumulator, &mut result);
 
     result
 }

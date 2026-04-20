@@ -440,15 +440,19 @@ mod tests {
 
     #[test]
     fn test_strict_policy_blocks_escape() {
-        // Create a strict policy rooted at a specific directory
-        let strict_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Use the actual resolution of "." as the strict boundary so the test
+        // is independent of cargo's invocation directory.  resolve_working_directory(".")
+        // returns the workspace root (or runner dir fallback); rooting the boundary
+        // there guarantees "." resolves within its own boundary.
+        let strict_root = resolve_working_directory(".");
         let policy = PathScopePolicy::Strict(strict_root.clone());
 
         // "." should resolve within the boundary
         let result = resolve_working_directory_scoped(".", &policy);
         assert!(
             result.is_ok(),
-            "Current dir should be within its own boundary: {:?}",
+            "'.' should be within its own resolved boundary {:?}: {:?}",
+            strict_root,
             result
         );
     }

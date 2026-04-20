@@ -875,8 +875,9 @@ mod tests {
         assert!(grammar.contains("root ::="));
         assert!(grammar.contains("verification-steps-field"));
         assert!(grammar.contains("step-type"));
-        assert!(grammar.contains("\"command\""));
-        assert!(grammar.contains("\"prompt\""));
+        // GBNF literals use backslash-escaped quotes, e.g. `"\"command\""`
+        assert!(grammar.contains("\\\"command\\\""));
+        assert!(grammar.contains("\\\"prompt\\\""));
     }
 
     #[test]

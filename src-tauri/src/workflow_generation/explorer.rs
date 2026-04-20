@@ -1336,7 +1336,7 @@ mod tests {
         assert!(GenerationVariant::MaxCoverage
             .system_instruction()
             .unwrap()
-            .contains("one step per criterion"));
+            .contains("one verification step per acceptance criterion"));
     }
 
     #[test]

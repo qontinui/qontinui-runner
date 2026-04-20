@@ -870,14 +870,14 @@ mod tests {
     #[test]
     fn test_load_builtin_skills() {
         let skills = load_builtin_skills();
-        assert_eq!(skills.len(), 15, "Should have 15 built-in skills");
+        assert_eq!(skills.len(), 16, "Should have 16 built-in skills");
     }
 
     #[test]
     fn test_registry_new() {
         let registry = SkillRegistry::new();
-        assert_eq!(registry.builtin_count(), 15);
-        assert_eq!(registry.all().len(), 15);
+        assert_eq!(registry.builtin_count(), 16);
+        assert_eq!(registry.all().len(), 16);
     }
 
     #[test]
@@ -930,7 +930,7 @@ mod tests {
         }
 
         let testing = registry.by_category("testing");
-        assert_eq!(testing.len(), 2);
+        assert_eq!(testing.len(), 3);
     }
 
     #[test]
@@ -942,16 +942,16 @@ mod tests {
         assert_eq!(all.len(), registry.all().len());
 
         // Filter by a tag that exists on some skills
-        let testing_tags = vec!["testing".to_string()];
+        let testing_tags = vec!["test".to_string()];
         let filtered = registry.skills_for_context(None, &testing_tags, None);
         assert!(
             !filtered.is_empty(),
-            "Should find skills tagged with 'testing'"
+            "Should find skills tagged with 'test'"
         );
         for skill in &filtered {
             assert!(
-                skill.tags.contains(&"testing".to_string()),
-                "Skill '{}' should have 'testing' tag but has {:?}",
+                skill.tags.contains(&"test".to_string()),
+                "Skill '{}' should have 'test' tag but has {:?}",
                 skill.slug,
                 skill.tags
             );
@@ -1011,7 +1011,7 @@ mod tests {
 
         // Empty query returns all
         let results = registry.search("");
-        assert_eq!(results.len(), 15);
+        assert_eq!(results.len(), 16);
     }
 
     #[test]
@@ -1092,7 +1092,7 @@ mod tests {
     #[test]
     fn test_user_skills() {
         let mut registry = SkillRegistry::new();
-        assert_eq!(registry.all().len(), 15);
+        assert_eq!(registry.all().len(), 16);
 
         let user_skill = SkillDefinition {
             id: "user:my-skill".into(),
@@ -1125,7 +1125,7 @@ mod tests {
         };
 
         registry.set_user_skills(vec![user_skill]);
-        assert_eq!(registry.all().len(), 16);
+        assert_eq!(registry.all().len(), 17);
         assert!(registry.get("user:my-skill").is_some());
     }
 

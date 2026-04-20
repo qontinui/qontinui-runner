@@ -2119,8 +2119,12 @@ mod tests {
     #[test]
     fn test_phase_constraint_error_kind_invalid_type() {
         let mut errors = Vec::new();
+        // "gui_workflow" is a recognized but non-core step type that is not
+        // allowed in the setup phase (setup only permits command/prompt/ui_bridge).
+        // Unlike "api_request", it is NOT an alias of a core type so alias
+        // normalization won't reclassify it as a wrong-phase error.
         let steps = vec![
-            json!({"type": "api_request", "name": "Legacy", "id": Uuid::new_v4().to_string(), "phase": "setup"}),
+            json!({"type": "gui_workflow", "name": "Legacy", "id": Uuid::new_v4().to_string(), "phase": "setup"}),
         ];
         validate_phase_constraints(&steps, "setup", &mut errors);
         assert_eq!(errors.len(), 1);

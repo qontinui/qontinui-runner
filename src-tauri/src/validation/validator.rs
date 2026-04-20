@@ -157,20 +157,24 @@ impl SchemaValidator {
     ///
     /// Returns a `ValidationResult` with structured errors if validation fails.
     pub fn validate(&self, value: &Value) -> ValidationResult {
-        let evaluation = self.compiled.evaluate(value);
-
-        let errors: Vec<ValidationError> = evaluation
-            .iter_errors()
-            .map(|entry| {
-                let loc = entry.instance_location.as_str();
+        // NOTE: We use `iter_errors` rather than `evaluate().iter_errors()` because
+        // the annotation-based `evaluate` API in jsonschema 0.45 does not report
+        // structural errors like missing `required` properties — only schema-violation
+        // annotations. `iter_errors` reports all validation errors faithfully.
+        let errors: Vec<ValidationError> = self
+            .compiled
+            .iter_errors(value)
+            .map(|err| {
+                let loc = err.instance_path().to_string();
                 let path = if loc.is_empty() {
                     String::new()
+                } else if loc.starts_with('/') {
+                    loc
                 } else {
-                    let trimmed = loc.trim_start_matches('/');
-                    format!("/{}", trimmed)
+                    format!("/{}", loc)
                 };
 
-                let desc = entry.error.to_string();
+                let desc = err.to_string();
                 let (error_kind, expected, actual) = classify_error_desc(&desc);
 
                 ValidationError {

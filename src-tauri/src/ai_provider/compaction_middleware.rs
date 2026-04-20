@@ -453,8 +453,16 @@ mod tests {
     fn test_compact_json_arrays_in_text() {
         let text = r#"Here is some data: [{"name":"alice","age":30},{"name":"bob","age":25},{"name":"carol","age":35}] and more text"#;
         let compacted = compact_json_arrays(text);
-        assert!(compacted.contains("name|age"));
-        assert!(compacted.contains("alice|30"));
+        // serde_json::Map is a BTreeMap without the `preserve_order` feature,
+        // so keys iterate alphabetically ("age", "name") regardless of input order.
+        assert!(
+            compacted.contains("age|name"),
+            "header missing in compacted output: {compacted}"
+        );
+        assert!(
+            compacted.contains("30|alice"),
+            "first row missing in compacted output: {compacted}"
+        );
         assert!(compacted.len() < text.len());
     }
 
