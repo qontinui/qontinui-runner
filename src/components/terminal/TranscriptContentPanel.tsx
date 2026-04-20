@@ -139,9 +139,8 @@ export function TranscriptContentPanel({
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-[#2a2d3d]">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="text-xs font-semibold text-[#c0caf5] truncate">
-            {sessionId.slice(0, 12)}...
-          </span>
+          <h3 className="text-xs font-semibold text-[#c0caf5] shrink-0">Transcript</h3>
+          <span className="text-[10px] text-[#565f89] truncate">{sessionId.slice(0, 12)}...</span>
           <span className="text-[10px] text-[#565f89] shrink-0">{messages.length} messages</span>
         </div>
         <div className="flex items-center gap-1 shrink-0">
@@ -160,16 +159,23 @@ export function TranscriptContentPanel({
               {summaryLoading ? "Summarizing..." : "Summarize"}
             </button>
           )}
-          {session && (
-            <button
-              onClick={() => onResume(session)}
-              className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium bg-[#9ece6a]/10 text-[#9ece6a] hover:bg-[#9ece6a]/20 transition-colors"
-              title={`Resume in terminal: claude --resume ${session.session_id}`}
-            >
-              <TerminalSquare className="w-3 h-3" />
-              Resume
-            </button>
-          )}
+          <button
+            onClick={() => session && onResume(session)}
+            disabled={!session}
+            className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+              session
+                ? "bg-[#9ece6a]/10 text-[#9ece6a] hover:bg-[#9ece6a]/20"
+                : "bg-[#2a2d3d] text-[#414868] cursor-not-allowed"
+            }`}
+            title={
+              session
+                ? `Resume in terminal: claude --resume ${session.session_id}`
+                : "Resume session (unavailable — session not loaded)"
+            }
+          >
+            <TerminalSquare className="w-3 h-3" />
+            Resume
+          </button>
           <button
             onClick={onClose}
             className="p-1 rounded hover:bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] transition-colors"
@@ -365,6 +371,8 @@ export function TranscriptContentPanel({
             <button
               onClick={handleBuildPlan}
               disabled={selectedMessageIds.size === 0}
+              aria-label="Verify"
+              data-testid="term-plan-verify-transcript-button"
               className={`
                 flex items-center justify-center gap-1 px-2.5 py-1.5 rounded text-xs font-medium transition-colors
                 ${

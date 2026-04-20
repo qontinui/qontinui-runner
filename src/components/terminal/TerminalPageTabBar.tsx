@@ -122,6 +122,7 @@ export function TerminalPageTabBar({
       })}
       <button
         onClick={handleAdd}
+        aria-label="Add terminal page"
         className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#9ece6a] hover:bg-[#9ece6a]/10 transition-colors"
         title="Add terminal page"
       >

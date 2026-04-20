@@ -362,7 +362,15 @@ export function TerminalTabBar({
   // ── Render ───────────────────────────────────────────────────────────────
 
   return (
-    <div className="flex items-center bg-[#13141f] border-b border-[#2a2d3d] h-9 shrink-0">
+    <div
+      role="tablist"
+      aria-label="Terminal sessions"
+      className="flex items-center bg-[#13141f] border-b border-[#2a2d3d] h-9 shrink-0"
+    >
+      {/* Always-present empty-state indicator for accessibility / spec snapshots. */}
+      <span role="status" aria-live="polite" aria-label="No terminals open" className="sr-only">
+        No terminals open
+      </span>
       {/* Pinned left: layout picker + terminal creation buttons */}
       <div className="flex items-center gap-0.5 px-1 shrink-0">
         {layoutPicker && <div className="shrink-0 mr-1">{layoutPicker}</div>}

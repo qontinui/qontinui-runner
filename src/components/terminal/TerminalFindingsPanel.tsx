@@ -6,8 +6,17 @@
  * Supports click-to-respond, fix-with-Claude, workflow generation, and cross-tab toggle.
  */
 
-import { useEffect, useState, useCallback } from "react";
-import { X, AlertCircle, FileCode, ChevronRight, Play, Wand2, Send } from "lucide-react";
+import { useEffect, useState, useCallback, useRef } from "react";
+import {
+  X,
+  AlertCircle,
+  FileCode,
+  ChevronRight,
+  Play,
+  Wand2,
+  Send,
+  MessageSquare,
+} from "lucide-react";
 import { getCategoryById } from "@/services/FindingCategories";
 import { getSeverityColors } from "@/design-system";
 import type { Finding } from "@/types/findings";
@@ -46,6 +55,13 @@ export function TerminalFindingsPanel({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showAllTabs, setShowAllTabs] = useState(false);
   const [responseText, setResponseText] = useState("");
+  const [responseFocusTick, setResponseFocusTick] = useState(0);
+  const responseInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (responseFocusTick === 0) return;
+    responseInputRef.current?.focus();
+  }, [responseFocusTick]);
 
   // Derive displayed findings from toggle state
   const displayedFindings = showAllTabs && allFindings ? allFindings : findings;
@@ -117,15 +133,52 @@ export function TerminalFindingsPanel({
           </span>
         )}
 
-        {/* Generate workflow button */}
-        {displayedFindings.length > 0 && onGenerateWorkflow && (
+        {/* Fix selected finding button */}
+        {onFix && (
           <button
-            onClick={() => onGenerateWorkflow(displayedFindings)}
-            className="px-2 py-0.5 rounded text-[10px] font-medium bg-[#7aa2f7]/10 text-[#7aa2f7] hover:bg-[#7aa2f7]/20 transition-colors"
-            title="Generate workflow to fix these findings"
+            role="button"
+            onClick={() => {
+              if (selected) onFix(selected);
+            }}
+            disabled={!selected}
+            className="px-2 py-0.5 rounded text-[10px] font-medium bg-[#9ece6a]/10 text-[#9ece6a] hover:bg-[#9ece6a]/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            title="Fix selected finding with Claude"
+            aria-label="Fix"
+          >
+            <Play className="w-3 h-3 inline mr-1" />
+            Fix
+          </button>
+        )}
+
+        {/* Respond to selected finding button */}
+        {onRespond && (
+          <button
+            role="button"
+            onClick={() => {
+              if (selected) setResponseFocusTick((t) => t + 1);
+            }}
+            disabled={!selected}
+            className="px-2 py-0.5 rounded text-[10px] font-medium bg-[#bb9af7]/10 text-[#bb9af7] hover:bg-[#bb9af7]/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            title="Respond to selected finding"
+            aria-label="Respond"
+          >
+            <MessageSquare className="w-3 h-3 inline mr-1" />
+            Respond
+          </button>
+        )}
+
+        {/* Generate workflow button */}
+        {onGenerateWorkflow && (
+          <button
+            onClick={() => {
+              if (displayedFindings.length > 0) onGenerateWorkflow(displayedFindings);
+            }}
+            disabled={displayedFindings.length === 0}
+            className="px-2 py-0.5 rounded text-[10px] font-medium bg-[#7aa2f7]/10 text-[#7aa2f7] hover:bg-[#7aa2f7]/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            title="Generate Workflow to fix these findings"
           >
             <Wand2 className="w-3 h-3 inline mr-1" />
-            Workflow
+            Generate Workflow
           </button>
         )}
 
@@ -261,6 +314,7 @@ export function TerminalFindingsPanel({
                   {onRespond && (
                     <div className="flex gap-1.5 mt-2">
                       <input
+                        ref={responseInputRef}
                         type="text"
                         value={responseText}
                         onChange={(e) => setResponseText(e.target.value)}
