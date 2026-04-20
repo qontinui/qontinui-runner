@@ -630,6 +630,23 @@ async fn execute_loop_node(
 
         // Check until_bash: exit code 0 means the termination condition is met.
         if let Some(ref bash_cmd) = node_def.until_bash {
+            // On Windows, bare "bash" resolves via PATH and often lands on
+            // WSL's C:\Windows\System32\bash.exe, which errors with
+            // `execvpe(/bin/bash) failed` when no WSL distro is installed.
+            // Route through ShellCommandHandler so we get Git Bash with
+            // MSYS /usr/bin on PATH; on non-Windows the "bash" binary is
+            // available on the standard shell PATH so bare invocation is
+            // fine.
+            #[cfg(target_os = "windows")]
+            let exit_code = {
+                let (_bash_path, mut c) = crate::step_executor::handlers::shell_command::ShellCommandHandler::spawn_git_bash_with_msys_path();
+                c.args(["-c", bash_cmd])
+                    .status()
+                    .await
+                    .map(|s| s.code().unwrap_or(1))
+                    .unwrap_or(1)
+            };
+            #[cfg(not(target_os = "windows"))]
             let exit_code = tokio::process::Command::new("bash")
                 .arg("-c")
                 .arg(bash_cmd)

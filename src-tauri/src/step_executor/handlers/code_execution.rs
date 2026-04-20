@@ -262,12 +262,13 @@ impl CodeExecutionHandler {
         command: &str,
         timeout_secs: Option<u64>,
     ) -> (bool, Option<i32>, String, String) {
-        // Use bash on Windows (via Git Bash) for consistent behavior,
-        // matching the pattern from ShellCommandHandler.
+        // Use bash on Windows (via Git Bash) with MSYS /usr/bin on PATH so
+        // Python one-liners that shell out (e.g. `subprocess.run(['grep',…])`
+        // or piped-in utilities) can resolve standard Unix tools. See
+        // ShellCommandHandler::spawn_git_bash_with_msys_path.
         let mut cmd = if cfg!(target_os = "windows") {
-            let bash_path = super::shell_command::ShellCommandHandler::find_git_bash()
-                .unwrap_or_else(|| "bash".to_string());
-            let mut c = crate::process_helpers::tokio_no_window(&bash_path);
+            let (_bash_path, mut c) =
+                super::shell_command::ShellCommandHandler::spawn_git_bash_with_msys_path();
             c.args(["-c", command]);
             c
         } else {

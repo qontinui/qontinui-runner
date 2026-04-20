@@ -372,17 +372,8 @@ impl ShellCommandHandler {
     /// `ls <path>` silently returned 127.
     pub fn resolve_git_bash_with_msys_path() -> (String, Option<String>) {
         let bash_path = Self::find_git_bash().unwrap_or_else(|| "bash".to_string());
-        let augmented = std::path::Path::new(&bash_path)
-            .parent()
-            .and_then(|usr_bin| {
-                let usr_bin_str = usr_bin.to_string_lossy().to_string();
-                let current_path = std::env::var("PATH").unwrap_or_default();
-                if current_path.contains(&usr_bin_str) {
-                    None
-                } else {
-                    Some(format!("{};{}", usr_bin_str, current_path))
-                }
-            });
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let augmented = compute_msys_augmented_path(&bash_path, &current_path);
         (bash_path, augmented)
     }
 
@@ -734,9 +725,67 @@ impl ShellCommandHandler {
     }
 }
 
+/// Pure helper backing [`ShellCommandHandler::resolve_git_bash_with_msys_path`].
+///
+/// Given a Git-Bash path and the caller's current `PATH`, decide whether the
+/// child bash needs an augmented `PATH` (with the bash's parent directory —
+/// i.e. MSYS `/usr/bin` — prepended) or can inherit the parent's `PATH`
+/// unchanged.
+///
+/// Returns:
+/// - `Some(new_path)` when the bash parent dir is NOT already present in
+///   `current_path` (caller should set `env("PATH", new_path)`).
+/// - `None` when `current_path` already contains the bash parent dir
+///   (caller can inherit parent `PATH`).
+///
+/// Extracted as a free fn so it can be unit-tested without reading the real
+/// `PATH` env var.
+fn compute_msys_augmented_path(bash_path: &str, current_path: &str) -> Option<String> {
+    let parent = std::path::Path::new(bash_path).parent()?;
+    let parent_str = parent.to_string_lossy().to_string();
+    if parent_str.is_empty() || current_path.contains(&parent_str) {
+        None
+    } else {
+        Some(format!("{};{}", parent_str, current_path))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compute_msys_augmented_path_prepends_when_missing() {
+        let bash = r"C:\Program Files\Git\usr\bin\bash.exe";
+        let path = r"C:\Windows\System32;C:\Windows";
+        let got = compute_msys_augmented_path(bash, path).expect("expected augmentation");
+        assert!(
+            got.starts_with(r"C:\Program Files\Git\usr\bin;"),
+            "augmented path should start with the bash parent dir, got: {got}"
+        );
+        assert!(got.ends_with(path), "augmented path should end with the original PATH");
+    }
+
+    #[test]
+    fn test_compute_msys_augmented_path_noop_when_present() {
+        let bash = r"C:\Program Files\Git\usr\bin\bash.exe";
+        // Current PATH already has the bash dir.
+        let path = r"C:\Program Files\Git\usr\bin;C:\Windows";
+        assert_eq!(
+            compute_msys_augmented_path(bash, path),
+            None,
+            "should return None when bash parent dir already on PATH"
+        );
+    }
+
+    #[test]
+    fn test_compute_msys_augmented_path_bare_bash_fallback() {
+        // When `find_git_bash()` can't locate bash.exe it falls back to the
+        // bare name "bash". That has no parent directory, so we can't compute
+        // a meaningful prepend — return None and let the caller rely on the
+        // inherited PATH to resolve "bash" at spawn time.
+        assert_eq!(compute_msys_augmented_path("bash", "C:\\Windows"), None);
+    }
 
     #[test]
     fn test_shell_command_handler_step_type() {
