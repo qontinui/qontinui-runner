@@ -1014,6 +1014,12 @@ pub struct Settings {
     /// to compare pre/post screenshots against declared intent.
     #[serde(default)]
     pub world_state_verifier: WorldStateVerifierSettings,
+    /// Scripted-output (think-in-code) emitter kill switch and model
+    /// override. When `enabled` is false, or the `QONTINUI_SCRIPTED_OUTPUT`
+    /// env var is not "1", the TS `ScriptedOutputHandler` falls back to
+    /// plain truncation. See `step_output::script_emitter`.
+    #[serde(default)]
+    pub scripted_output: crate::step_output::script_emitter::ScriptedOutputSettings,
     /// Web-integration (qontinui-web backend) configuration. When
     /// `web_integration.enabled` is true and both `backend_url` + `runner_token`
     /// are set, the runner registers with web, sends heartbeats, and posts

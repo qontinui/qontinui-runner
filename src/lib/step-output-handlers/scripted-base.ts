@@ -26,6 +26,7 @@ import type {
 import { createLogger } from "../logger";
 import { runScript, DEFAULT_SCRIPT_TIMEOUT_MS, ScriptWorkerError } from "./script-worker";
 import { getScriptEmitter } from "./script-emitter";
+import { emitScriptedOutputEvent } from "./scripted-output-telemetry";
 
 const log = createLogger("scripted-output-handler");
 
@@ -93,14 +94,30 @@ export abstract class ScriptedOutputHandler<
    * @param rawOutput   The raw output string that may be too large.
    * @param goal        Human-readable description of what the summary
    *                    needs (drives the emitter prompt).
-   * @param schemaHint  Optional schema hint passed to the emitter.
-   *                    Currently used only for log context; reserved for
-   *                    when the emitter interface grows a schema param.
+   * @param schemaHint  Optional schema hint forwarded to the emitter. The
+   *                    Rust emitter uses this to stabilize cache keys and
+   *                    as an LLM prompt hint.  Historically this was only
+   *                    used for log context; as of Phase B of the
+   *                    script-emitter-wiring plan it is threaded all the
+   *                    way through to {@link ScriptEmitter.emit}.
+   * @param taskRunId   Optional task-run identifier used by the Rust
+   *                    emitter to enforce per-run cost ceilings (20 calls
+   *                    / 10k input tokens / 2k output tokens per run).
+   *                    Pass the real task_run_id from the step execution
+   *                    context when available; `null`/`undefined` is safe
+   *                    (budgets simply aren't enforced for unassigned
+   *                    calls).
+   *
+   * TODO: concrete handlers (`CommandHandler.summarizeForAIAsync`, etc.)
+   * should plumb the real task_run_id from the step execution context
+   * through this parameter so the Rust budget actually kicks in.  For now
+   * the door is open but all callers pass `undefined`.
    */
   protected async summarizeViaScript(
     rawOutput: string,
     goal: string,
     schemaHint?: object,
+    taskRunId?: string | null,
   ): Promise<ScriptedSummarizationResult> {
     const byteLength = rawOutput.length;
 
@@ -113,10 +130,20 @@ export abstract class ScriptedOutputHandler<
 
     const preview = rawOutput.slice(0, SCRIPT_EMITTER_PREVIEW_BYTES);
 
+    // The threshold gate above already screened below-8KB / flag-off runs;
+    // every call past here is a real attempt.
+    emitScriptedOutputEvent(
+      "scripted_output.attempted",
+      { bytes_total: byteLength, step_type: this.stepType },
+      taskRunId,
+    );
+
     let expr: string;
     try {
-      expr = await getScriptEmitter().emit(goal, preview);
+      expr = await getScriptEmitter().emit(goal, preview, { schemaHint, taskRunId });
     } catch (err) {
+      // The emitter emits its own `scripted_output.fallback` (with reason)
+      // from the Rust side; we don't duplicate it here.
       log.warn(
         "Script emitter rejected; falling back to truncation. goal=%s err=%s",
         goal,
@@ -129,8 +156,22 @@ export abstract class ScriptedOutputHandler<
       const extracted = await runScript(expr, rawOutput, DEFAULT_SCRIPT_TIMEOUT_MS);
       const outputBytes = approximateJsonByteLength(extracted);
       const bytesAvoided = Math.max(0, byteLength - outputBytes);
+      emitScriptedOutputEvent("scripted_output.worker_ok", { step_type: this.stepType }, taskRunId);
+      emitScriptedOutputEvent(
+        "scripted_output.bytes_avoided",
+        { bytes_avoided: bytesAvoided, bytes_total: byteLength },
+        taskRunId,
+      );
       return { extracted, bytesAvoided, fallback: false };
     } catch (err) {
+      // Worker-side fallback — distinct from an emitter rejection. Emit an
+      // explicit `bad_expression` reason so the Analytics widget's
+      // fallback-reason breakdown attributes this correctly.
+      emitScriptedOutputEvent(
+        "scripted_output.fallback",
+        { reason: "bad_expression", step_type: this.stepType },
+        taskRunId,
+      );
       log.warn(
         "Scripted extraction failed; falling back to truncation. goal=%s schema=%s expr=%s err=%s",
         goal,

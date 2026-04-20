@@ -20,6 +20,7 @@ import { ProviderLatencyChart } from "./ProviderLatencyChart";
 import { TaskRunCostTable } from "./TaskRunCostTable";
 import { CostByTargetAppChart } from "./CostByTargetAppChart";
 import { AccountUsageCard } from "./AccountUsageCard";
+import { ScriptedOutputPanel } from "./ScriptedOutputPanel";
 
 const TIME_RANGE_OPTIONS: LlmTimeRange[] = ["1d", "7d", "30d", "all"];
 
@@ -68,13 +69,17 @@ export default function LlmObservabilityDashboard() {
     return (
       <div className="h-full overflow-auto p-4 space-y-6">
         <AccountUsageCard />
-        <div className="flex items-center justify-center text-muted-foreground pt-8">
+        <div className="flex items-center justify-center text-muted-foreground pt-4">
           <div className="text-center">
             <CreditCard className="w-12 h-12 mx-auto mb-4 opacity-50" />
             <p>No LLM usage data available</p>
             <p className="text-sm mt-2">Run some workflows to start collecting LLM analytics</p>
           </div>
         </div>
+        {/* Scripted-output still renders in the zero-usage empty state: the
+            think-in-code path can record fallback/attempted events even when
+            no LLM call has succeeded yet. */}
+        <ScriptedOutputPanel />
       </div>
     );
   }
@@ -139,6 +144,9 @@ export default function LlmObservabilityDashboard() {
 
       {/* Cost Trend (fetches its own data from the web backend) */}
       <CostTrendChart />
+
+      {/* Scripted-output (think-in-code) aggregates — Phase C of script-emitter-wiring */}
+      <ScriptedOutputPanel />
 
       {/* Charts Row 2 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

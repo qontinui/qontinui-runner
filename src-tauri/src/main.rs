@@ -114,6 +114,7 @@ mod step_event_builder;
 mod step_executor;
 mod step_injection;
 mod step_metadata;
+mod step_output;
 mod step_registry;
 mod step_types;
 mod steps;
@@ -597,6 +598,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::screenshot::capture_screenshot,
             commands::screenshot::capture_and_upload_screenshot,
             commands::screenshot::capture_screenshot_via_python,
+            // Scripted-output emitter (think-in-code extraction script)
+            commands::script_emitter::emit_extraction_script,
             // Logging commands
             commands::logging::append_ai_output_log,
             commands::logging::clear_ai_output_log,
@@ -1341,6 +1344,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::activity_timeline::get_activity_timeline_for_task_run,
             commands::activity_timeline::delete_activity_timeline_entry,
             commands::activity_timeline::get_activity_timeline_stats,
+            commands::activity_timeline::get_scripted_output_stats,
             // Unified event search across activity_timeline, observations, deferred_questions, error_events
             commands::event_search::search_events,
             // Watcher commands (screenpipe-inspired reactive AI agents)

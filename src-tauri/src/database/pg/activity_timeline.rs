@@ -278,6 +278,58 @@ impl PgDb {
             .collect())
     }
 
+    /// Return every `scripted_output` activity-timeline row's event name
+    /// (`text_content`) and `metadata_json`, optionally scoped to a single
+    /// `task_run_id`. Returns tuples `(text_content, metadata_json)` with
+    /// `metadata_json` as an optional JSON string.
+    ///
+    /// Used by the LLM-analytics scripted-output widget to aggregate per-run
+    /// counters. The query is a single indexed scan on `source_type`; the
+    /// caller aggregates in memory so we don't have to codegen a bespoke
+    /// clorinde query for a one-off dashboard surface.
+    pub async fn get_scripted_output_rows(
+        &self,
+        task_run_id: Option<&str>,
+    ) -> Result<Vec<(String, Option<String>)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = if let Some(tr) = task_run_id {
+            conn.query(
+                "SELECT text_content, metadata_json \
+                 FROM activity_timeline \
+                 WHERE source_type = 'scripted_output' \
+                   AND NOT is_deleted \
+                   AND task_run_id = $1",
+                &[&tr],
+            )
+            .await
+            .map_err(|e| format!("PG get_scripted_output_rows(task_run): {}", e))?
+        } else {
+            conn.query(
+                "SELECT text_content, metadata_json \
+                 FROM activity_timeline \
+                 WHERE source_type = 'scripted_output' \
+                   AND NOT is_deleted",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_scripted_output_rows(all): {}", e))?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let text: String = row.get(0);
+                let meta: Option<String> = row.get(1);
+                (text, meta)
+            })
+            .collect())
+    }
+
     /// Permanently delete soft-deleted entries older than retention_days.
     pub async fn cleanup_old_timeline_entries(&self, retention_days: i32) -> Result<u64, String> {
         let conn = self

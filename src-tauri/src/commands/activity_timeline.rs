@@ -144,3 +144,138 @@ pub async fn get_activity_timeline_stats(
 
     pg.get_timeline_stats().await
 }
+
+// ============================================================================
+// Scripted-output aggregates (Phase C of script-emitter-wiring plan)
+// ============================================================================
+
+/// Per-run (or global) aggregate counters for `source_type = 'scripted_output'`
+/// activity-timeline events.
+///
+/// Fed by [`get_scripted_output_stats`] and consumed by the
+/// `ScriptedOutputPanel` widget on the LLM Analytics page.
+///
+/// **Event shapes** (Phase A — see `step_output/script_emitter.rs`):
+/// - `scripted_output.cache_hit` — metadata `{ "tier": 1 }`
+/// - `scripted_output.llm_ok` — metadata `{ "tokens_in", "tokens_out", "model" }`
+/// - `scripted_output.fallback` — metadata `{ "reason": <string> }`
+///
+/// **Event shapes** (Phase B, not yet emitted — we tolerate their absence):
+/// - `scripted_output.attempted`
+/// - `scripted_output.worker_ok`
+/// - `scripted_output.bytes_avoided` — metadata `{ "bytes_avoided": <number> }`
+///
+/// If Phase B never lands, the TS-side counts just stay 0.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptedOutputStats {
+    /// Count of `scripted_output.attempted` events (Phase B — may be 0).
+    pub attempted: u64,
+    /// Count of `scripted_output.cache_hit` events.
+    pub cache_hit: u64,
+    /// Count of `scripted_output.llm_ok` events.
+    pub llm_ok: u64,
+    /// Count of `scripted_output.worker_ok` events (Phase B — may be 0).
+    pub worker_ok: u64,
+    /// Total `bytes_avoided` summed across both Phase-B
+    /// `scripted_output.bytes_avoided` events (if emitted) AND any
+    /// `scripted_output.llm_ok` events that carry a `bytes_avoided` field.
+    pub bytes_avoided: u64,
+    /// Map of `scripted_output.fallback`'s `reason` → count.
+    pub fallbacks: std::collections::HashMap<String, u64>,
+    /// Total input tokens summed across `scripted_output.llm_ok` events.
+    pub total_tokens_in: u64,
+    /// Total output tokens summed across `scripted_output.llm_ok` events.
+    pub total_tokens_out: u64,
+}
+
+/// Aggregate scripted-output activity-timeline events into a single
+/// stat block. If `task_run_id` is `Some`, scopes to that run; otherwise
+/// aggregates across all runs (including the "unassigned" bucket).
+///
+/// This does one indexed scan of `activity_timeline` and aggregates in
+/// memory — cheap for current volumes (expect <1k rows per task_run).
+#[tauri::command]
+pub async fn get_scripted_output_stats(
+    task_run_id: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ScriptedOutputStats, String> {
+    let pg = &state.pg_db;
+    let rows = pg
+        .get_scripted_output_rows(task_run_id.as_deref())
+        .await?;
+
+    let mut stats = ScriptedOutputStats {
+        attempted: 0,
+        cache_hit: 0,
+        llm_ok: 0,
+        worker_ok: 0,
+        bytes_avoided: 0,
+        fallbacks: std::collections::HashMap::new(),
+        total_tokens_in: 0,
+        total_tokens_out: 0,
+    };
+
+    for (text_content, metadata_json) in rows {
+        // Parse metadata lazily — many events have None or unparseable JSON.
+        let meta: Option<serde_json::Value> = metadata_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+
+        match text_content.as_str() {
+            "scripted_output.attempted" => stats.attempted += 1,
+            "scripted_output.cache_hit" => stats.cache_hit += 1,
+            "scripted_output.worker_ok" => stats.worker_ok += 1,
+            "scripted_output.bytes_avoided" => {
+                if let Some(n) = meta.as_ref().and_then(read_bytes_avoided) {
+                    stats.bytes_avoided = stats.bytes_avoided.saturating_add(n);
+                }
+            }
+            "scripted_output.llm_ok" => {
+                stats.llm_ok += 1;
+                if let Some(m) = meta.as_ref() {
+                    if let Some(n) = m
+                        .get("tokens_in")
+                        .and_then(|v| v.as_u64())
+                    {
+                        stats.total_tokens_in = stats.total_tokens_in.saturating_add(n);
+                    }
+                    if let Some(n) = m
+                        .get("tokens_out")
+                        .and_then(|v| v.as_u64())
+                    {
+                        stats.total_tokens_out = stats.total_tokens_out.saturating_add(n);
+                    }
+                    // Some Phase-B builds may roll `bytes_avoided` into the
+                    // llm_ok event. Include it here defensively.
+                    if let Some(n) = read_bytes_avoided(m) {
+                        stats.bytes_avoided = stats.bytes_avoided.saturating_add(n);
+                    }
+                }
+            }
+            "scripted_output.fallback" => {
+                let reason = meta
+                    .as_ref()
+                    .and_then(|m| m.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                *stats.fallbacks.entry(reason).or_insert(0) += 1;
+            }
+            _ => {
+                // Ignore unknown `scripted_output.*` events — forward compat.
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Extract a `bytes_avoided` integer from a metadata JSON object, tolerating
+/// both integer and floating-point representations.
+fn read_bytes_avoided(meta: &serde_json::Value) -> Option<u64> {
+    meta.get("bytes_avoided").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_f64().map(|f| f.max(0.0) as u64))
+    })
+}

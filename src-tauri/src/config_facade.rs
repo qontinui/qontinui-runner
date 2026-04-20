@@ -241,6 +241,20 @@ impl SettingsField for WorldStateVerifierSettings {
     }
 }
 
+impl SettingsField for crate::step_output::script_emitter::ScriptedOutputSettings {
+    fn get_from(settings: &Settings) -> &Self {
+        &settings.scripted_output
+    }
+
+    fn set_in(settings: &mut Settings, value: Self) {
+        settings.scripted_output = value;
+    }
+
+    fn field_name() -> &'static str {
+        "scripted_output"
+    }
+}
+
 // ============================================================================
 // Generic Settings Functions
 // ============================================================================
