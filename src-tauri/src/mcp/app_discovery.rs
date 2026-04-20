@@ -284,69 +284,36 @@ fn find_adb() -> Option<std::path::PathBuf> {
     }))
 }
 
-/// List connected ADB devices
+/// List connected ADB devices via the pure-Rust `adb_client` crate.
 async fn list_adb_devices() -> Vec<MobileDevice> {
-    let adb_path = match find_adb() {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
-
-    let output = match crate::process_helpers::tokio_no_window(&adb_path)
-        .args(["devices", "-l"])
-        .output()
+    crate::mcp::adb_helper::list_devices()
         .await
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return Vec::new(),
-    };
+        .into_iter()
+        .map(|d| {
+            let device_type = if d.serial.starts_with("emulator-") {
+                "emulator"
+            } else {
+                "device"
+            }
+            .to_string();
 
-    let mut devices = Vec::new();
-    for line in output.lines().skip(1) {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+            let status = match d.state.as_str() {
+                "device" => "online",
+                "offline" => "offline",
+                "unauthorized" => "unauthorized",
+                _ => "offline",
+            }
+            .to_string();
 
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-
-        let device_id = parts[0].to_string();
-        let state = parts[1].to_string();
-
-        // Determine device type
-        let device_type = if device_id.starts_with("emulator-") {
-            "emulator"
-        } else {
-            "device"
-        }
-        .to_string();
-
-        // Extract model from properties
-        let model = parts
-            .iter()
-            .find(|p| p.starts_with("model:"))
-            .map(|p| p.trim_start_matches("model:").to_string());
-
-        let status = match state.as_str() {
-            "device" => "online",
-            "offline" => "offline",
-            "unauthorized" => "unauthorized",
-            _ => "offline",
-        }
-        .to_string();
-
-        devices.push(MobileDevice {
-            device_id,
-            device_type,
-            model,
-            status,
-            ui_bridge: None,
-        });
-    }
-
-    devices
+            MobileDevice {
+                device_id: d.serial,
+                device_type,
+                model: d.model,
+                status,
+                ui_bridge: None,
+            }
+        })
+        .collect()
 }
 
 /// Check if a mobile device has UI Bridge by port forwarding

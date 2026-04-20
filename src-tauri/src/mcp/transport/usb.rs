@@ -1,8 +1,8 @@
 //! USB/ADB transport for physical Android device connections.
 //!
-//! Establishes ADB port forwarding so a device's UI Bridge HTTP server
-//! appears on a local 127.0.0.1 port, matching the pattern used by LAN
-//! and Cloud transports.
+//! Plan 1A refactor: device listing and shell commands use the pure-Rust
+//! `adb_client` crate via `mcp::adb_helper`. Port forwarding still shells out
+//! because `adb_client` 3.x does not expose the `host:forward` service.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,12 +11,17 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::TransportError;
+use crate::mcp::adb_helper;
 
 // ============================================================================
 // UsbTransport
 // ============================================================================
 
 /// Manages ADB port forwards for connected Android devices.
+///
+/// `adb_path` is still used by `establish_forward` / `release_forward` because
+/// the `adb_client` crate has no wrapper for `adb forward`. Everything else
+/// (device listing, shell, screenshot, logcat) goes through `adb_helper`.
 pub struct UsbTransport {
     /// Path to the `adb` (or `adb.exe`) binary.
     pub adb_path: PathBuf,
@@ -138,52 +143,29 @@ impl UsbTransport {
         forwards.get(adb_serial).copied()
     }
 
-    /// Run `adb devices -l` and parse the output.
-    ///
-    /// Returns a list of `(device_id, status, model_option)` tuples.
-    /// This mirrors the parsing logic used in `app_discovery::list_adb_devices`.
+    /// Enumerate connected ADB devices via the pure-Rust `adb_client` crate.
+    /// Returns `(serial, state, model_option)` tuples so callers remain compatible
+    /// with the previous subprocess-based API.
     pub async fn scan_devices(&self) -> Vec<(String, String, Option<String>)> {
-        let output = match crate::process_helpers::tokio_no_window(&self.adb_path)
-            .args(["devices", "-l"])
-            .output()
+        adb_helper::list_devices()
             .await
-        {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-            Ok(o) => {
-                warn!(
-                    stderr = %String::from_utf8_lossy(&o.stderr),
-                    "adb devices -l returned non-zero status"
-                );
-                return Vec::new();
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to run adb devices");
-                return Vec::new();
-            }
-        };
+            .into_iter()
+            .map(|d| (d.serial, d.state, d.model))
+            .collect()
+    }
 
-        let mut devices = Vec::new();
-        for line in output.lines().skip(1) {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+    /// Enable ADB TCP/IP mode on the device so it can be reached over Wi-Fi.
+    /// After this succeeds, `{device_ip}:{port}` accepts `adb connect` requests.
+    pub async fn enable_tcpip(&self, adb_serial: &str, port: u16) -> Result<(), TransportError> {
+        adb_helper::enable_tcpip(adb_serial.to_string(), port)
+            .await
+            .map_err(|e| TransportError::AdbCommandFailed(e))
+    }
 
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                continue;
-            }
-
-            let device_id = parts[0].to_string();
-            let status = parts[1].to_string();
-            let model = parts
-                .iter()
-                .find(|p| p.starts_with("model:"))
-                .map(|p| p.trim_start_matches("model:").to_string());
-
-            devices.push((device_id, status, model));
-        }
-
-        devices
+    /// Read the device's Wi-Fi IPv4 address (via `ip route` / `ip addr`).
+    pub async fn device_wlan_ip(&self, adb_serial: &str) -> Result<Option<String>, TransportError> {
+        adb_helper::get_wlan_ipv4(adb_serial.to_string())
+            .await
+            .map_err(|e| TransportError::AdbCommandFailed(e))
     }
 }

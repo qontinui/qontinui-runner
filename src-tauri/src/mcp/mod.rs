@@ -14,6 +14,7 @@
 
 pub mod accessibility;
 pub mod action_plan_cache;
+pub mod adb_helper;
 pub mod ai_generation;
 pub mod ai_session;
 pub mod api_requests;
@@ -116,6 +117,7 @@ pub mod token_analytics;
 pub mod trace_verification;
 pub mod transport;
 pub mod triggers;
+pub mod tunnel_api;
 pub mod types;
 pub mod ui_bridge;
 pub mod ui_bridge_integration;

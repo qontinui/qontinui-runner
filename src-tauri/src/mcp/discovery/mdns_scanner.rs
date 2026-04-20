@@ -5,7 +5,8 @@
 //! and emits `MdnsEvent`s so the physical device registry can add LAN
 //! transports automatically.
 
-use mdns_sd::{ServiceDaemon, ServiceEvent};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use tokio::sync::mpsc;
@@ -17,6 +18,11 @@ use tracing::{debug, info, warn};
 
 /// mDNS service type advertised by UI Bridge instances on the local network.
 pub const MDNS_SERVICE_TYPE: &str = "_uibridge._tcp.local.";
+
+/// Plan 1C: the runner also advertises itself under this service type so phones
+/// can find the runner. Separate from the device-side `_uibridge._tcp.local.`
+/// so mutual discovery doesn't cause a feedback loop.
+pub const RUNNER_MDNS_SERVICE_TYPE: &str = "_qontinui._tcp.local.";
 
 // ============================================================================
 // Types
@@ -167,6 +173,110 @@ impl MdnsScanner {
             }
         }
     }
+}
+
+impl MdnsScanner {
+    /// Plan 1C: register the runner itself under `RUNNER_MDNS_SERVICE_TYPE` so
+    /// phones on the same LAN can discover it.
+    ///
+    /// `instance_name` should be unique per runner (hostname or machine id).
+    /// `port` is the MCP API port the runner is listening on.
+    /// `properties` become TXT records (device_id, version, auth_mode, …).
+    pub fn register_runner(
+        &self,
+        instance_name: &str,
+        port: u16,
+        properties: HashMap<String, String>,
+    ) -> Result<(), String> {
+        let daemon = self.daemon.as_ref().ok_or("mDNS daemon unavailable")?;
+
+        // ServiceInfo::new expects host IPs; use local hostname so clients resolve.
+        let host = hostname::get()
+            .ok()
+            .and_then(|h| h.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "qontinui".to_string());
+        let host = format!("{}.local.", host);
+
+        let svc = ServiceInfo::new(
+            RUNNER_MDNS_SERVICE_TYPE,
+            instance_name,
+            &host,
+            "",
+            port,
+            properties,
+        )
+        .map_err(|e| format!("invalid ServiceInfo: {e}"))?
+        .enable_addr_auto();
+
+        daemon
+            .register(svc)
+            .map_err(|e| format!("mDNS register failed: {e}"))?;
+        info!(
+            service = RUNNER_MDNS_SERVICE_TYPE,
+            instance = instance_name,
+            port,
+            "runner registered under mDNS"
+        );
+        Ok(())
+    }
+
+    /// Unregister the runner's own advertisement. Best-effort.
+    pub fn unregister_runner(&self, instance_name: &str) {
+        if let Some(daemon) = &self.daemon {
+            let fullname = format!("{}.{}", instance_name, RUNNER_MDNS_SERVICE_TYPE);
+            if let Err(e) = daemon.unregister(&fullname) {
+                debug!(error = %e, "mDNS unregister returned");
+            }
+        }
+    }
+
+    /// Plan 1C: start scanning and fan out every event as a Tauri event so the
+    /// wizard's React UI can update in real-time.
+    ///
+    /// Events emitted to the frontend:
+    /// - `device-discovered` — payload is [`MdnsDeviceEventPayload`]
+    /// - `device-removed` — payload is `{ fullname }`
+    pub fn start_with_tauri_events(&self, app: tauri::AppHandle) {
+        let (tx, mut rx) = mpsc::channel::<MdnsEvent>(64);
+        self.start(tx);
+
+        tokio::spawn(async move {
+            use tauri::Emitter;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    MdnsEvent::Discovered(info) => {
+                        let payload = MdnsDeviceEventPayload {
+                            device_id: info.device_id,
+                            port: info.port,
+                            addresses: info
+                                .addresses
+                                .iter()
+                                .map(|a| a.to_string())
+                                .collect(),
+                            txt_records: info.txt_records,
+                        };
+                        let _ = app.emit("device-discovered", &payload);
+                    }
+                    MdnsEvent::Removed(fullname) => {
+                        let _ = app.emit("device-removed", serde_json::json!({
+                            "fullname": fullname,
+                        }));
+                    }
+                }
+            }
+            debug!("mDNS Tauri event bridge ended");
+        });
+    }
+}
+
+/// Payload shape emitted to the frontend on `device-discovered`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MdnsDeviceEventPayload {
+    pub device_id: String,
+    pub port: u16,
+    pub addresses: Vec<String>,
+    pub txt_records: HashMap<String, String>,
 }
 
 impl Default for MdnsScanner {

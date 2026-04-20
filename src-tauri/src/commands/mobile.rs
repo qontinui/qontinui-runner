@@ -215,46 +215,25 @@ pub async fn list_mobile_devices(
 ) -> Result<CommandResponse, String> {
     info!("Listing connected mobile devices");
 
-    let output = run_adb_command(&["devices", "-l"]).await?;
-
-    let mut devices: Vec<MobileDevice> = Vec::new();
-
-    for line in output.lines().skip(1) {
-        // Skip header
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-
-        let device_id = parts[0].to_string();
-        let state = parts[1].to_string();
-
-        // Determine device type
-        let device_type = if device_id.starts_with("emulator-") {
-            "emulator"
-        } else {
-            "physical"
-        }
-        .to_string();
-
-        // Try to extract model from the line
-        let model = parts
-            .iter()
-            .find(|p| p.starts_with("model:"))
-            .map(|p| p.trim_start_matches("model:").to_string());
-
-        devices.push(MobileDevice {
-            device_id,
-            device_type,
-            model,
-            state,
-        });
-    }
+    // Plan 1A: use pure-Rust adb_client via mcp::adb_helper instead of shelling out.
+    let devices: Vec<MobileDevice> = crate::mcp::adb_helper::list_devices()
+        .await
+        .into_iter()
+        .map(|d| {
+            let device_type = if d.serial.starts_with("emulator-") {
+                "emulator"
+            } else {
+                "physical"
+            }
+            .to_string();
+            MobileDevice {
+                device_id: d.serial,
+                device_type,
+                model: d.model,
+                state: d.state,
+            }
+        })
+        .collect();
 
     info!("Found {} connected devices", devices.len());
 
@@ -270,21 +249,17 @@ pub async fn list_mobile_devices(
 
 /// Get the first connected device ID, or None if no devices are connected.
 async fn get_default_device() -> Option<String> {
-    // First, check if a default device is configured in settings
+    // Plan 1A: library-backed device listing replaces `adb devices` subprocess.
+    let devices = crate::mcp::adb_helper::list_devices().await;
+
     let mobile_settings = settings::get_mobile_settings();
     if let Some(default_device) = mobile_settings.default_device_id {
-        // Verify the device is actually connected
-        let output = run_adb_command(&["devices"]).await.ok()?;
-        for line in output.lines().skip(1) {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[0] == default_device && parts[1] == "device" {
-                debug!("Using default device from settings: {}", default_device);
-                return Some(default_device);
-            }
+        if devices
+            .iter()
+            .any(|d| d.serial == default_device && d.state == "device")
+        {
+            debug!("Using default device from settings: {}", default_device);
+            return Some(default_device);
         }
         warn!(
             "Default device from settings ({}) is not connected, falling back to first device",
@@ -292,22 +267,10 @@ async fn get_default_device() -> Option<String> {
         );
     }
 
-    // Fall back to first connected device
-    let output = run_adb_command(&["devices"]).await.ok()?;
-
-    for line in output.lines().skip(1) {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 && parts[1] == "device" {
-            return Some(parts[0].to_string());
-        }
-    }
-
-    None
+    devices
+        .into_iter()
+        .find(|d| d.state == "device")
+        .map(|d| d.serial)
 }
 
 // ============================================================================
@@ -364,41 +327,13 @@ pub async fn capture_mobile_screenshot(
     let filename = format!("screenshot_{}.png", timestamp);
     let local_path = output_path.join(&filename);
 
-    // Capture screenshot on device
-    let device_path = "/sdcard/screenshot_temp.png";
+    // Plan 1A: pure-Rust framebuffer capture — no screencap / pull / rm dance.
+    let png_bytes = crate::mcp::adb_helper::screenshot_png(device.clone())
+        .await
+        .map_err(|e| format!("Failed to capture framebuffer: {}", e))?;
 
-    // Run screencap
-    let screencap_args = if device == get_default_device().await.unwrap_or_default() {
-        vec!["shell", "screencap", "-p", device_path]
-    } else {
-        vec!["-s", &device, "shell", "screencap", "-p", device_path]
-    };
-
-    run_adb_command(&screencap_args).await?;
-
-    // Pull screenshot to local
-    let pull_args = if device == get_default_device().await.unwrap_or_default() {
-        vec!["pull", device_path, local_path.to_str().unwrap()]
-    } else {
-        vec![
-            "-s",
-            &device,
-            "pull",
-            device_path,
-            local_path.to_str().unwrap(),
-        ]
-    };
-
-    run_adb_command(&pull_args).await?;
-
-    // Clean up device file
-    let rm_args = if device == get_default_device().await.unwrap_or_default() {
-        vec!["shell", "rm", device_path]
-    } else {
-        vec!["-s", &device, "shell", "rm", device_path]
-    };
-
-    let _ = run_adb_command(&rm_args).await; // Ignore cleanup errors
+    std::fs::write(&local_path, &png_bytes)
+        .map_err(|e| format!("Failed to write screenshot file: {}", e))?;
 
     let screenshot_path = local_path.to_string_lossy().to_string();
     info!("Screenshot captured: {}", screenshot_path);
@@ -493,11 +428,13 @@ pub async fn capture_mobile_logcat(
     let line_count = lines.unwrap_or(mobile_settings.logcat_lines);
     let _filter = filter_app.unwrap_or(mobile_settings.filter_react_native);
 
-    // Build and run logcat command
-    let logcat_args_str = line_count.to_string();
-    let logcat_args: Vec<&str> = vec!["-s", &device, "logcat", "-d", "-t", &logcat_args_str];
-
-    let output = run_adb_command(&logcat_args).await?;
+    // Plan 1A: run logcat via adb_client shell wrapper (sync API, spawn_blocking).
+    let output = crate::mcp::adb_helper::shell_capture_string(
+        device.clone(),
+        format!("logcat -d -t {}", line_count),
+    )
+    .await
+    .map_err(|e| format!("Failed to capture logcat: {}", e))?;
 
     // Determine output path (parameter > settings > default)
     let output_path = match output_dir {

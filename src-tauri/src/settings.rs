@@ -432,6 +432,42 @@ impl Default for MobileSettings {
 }
 
 // ============================================================================
+// Tunnel Settings (Plan 1B)
+// ============================================================================
+
+/// Settings for the rathole-based reverse tunnel that lets off-network devices
+/// reach the runner. Replaces the ephemeral Cloudflare quick-tunnel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelSettings {
+    /// Whether tunnel wiring is allowed at all.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Rathole server address, e.g. `"relay.qontinui.io:2333"`.
+    #[serde(default)]
+    pub server_addr: String,
+
+    /// Shared secret with the rathole server. Per-service tokens inherit this.
+    #[serde(default)]
+    pub default_token: Option<String>,
+
+    /// If true, start the rathole client on runner boot when `enabled`.
+    #[serde(default)]
+    pub auto_connect: bool,
+}
+
+impl Default for TunnelSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_addr: String::new(),
+            default_token: None,
+            auto_connect: false,
+        }
+    }
+}
+
+// ============================================================================
 // Global Log Source Settings
 // ============================================================================
 
@@ -926,6 +962,9 @@ pub struct Settings {
     /// Cloud relay settings for remote mobile access via backend WebSocket
     #[serde(default)]
     pub cloud_relay: CloudRelaySettings,
+    /// Rathole reverse-tunnel settings (Plan 1B, replaces Cloudflare quick-tunnel)
+    #[serde(default)]
+    pub tunnel: TunnelSettings,
     /// Configured runner instances for multi-instance dev workflows
     #[serde(default)]
     pub runner_instances: Vec<RunnerInstanceConfig>,
@@ -1439,6 +1478,20 @@ pub fn get_mobile_settings() -> MobileSettings {
 /// Save Mobile settings
 pub fn save_mobile_settings(mobile_settings: MobileSettings) -> Result<(), String> {
     crate::config_facade::save_setting(mobile_settings)
+}
+
+// ============================================================================
+// Tunnel Settings (Plan 1B)
+// ============================================================================
+
+/// Get the current Tunnel settings
+pub fn get_tunnel_settings() -> TunnelSettings {
+    crate::config_facade::get_setting::<TunnelSettings>()
+}
+
+/// Save Tunnel settings
+pub fn save_tunnel_settings(tunnel: TunnelSettings) -> Result<(), String> {
+    crate::config_facade::save_setting(tunnel)
 }
 
 // ============================================================================

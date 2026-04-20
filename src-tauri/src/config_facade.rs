@@ -33,6 +33,7 @@ use crate::settings::{
     CloudRelaySettings, DebugSettings, ExecutionVariablesSettings, GlobalLogSource,
     GlobalLogSourceSettings, LogSourceAiSelectionMode, LogSourceCategory, MobileSettings,
     PathSettings, PlaywrightSettings, RunnerInstanceConfig, SelfHealingSettings, Settings,
+    TunnelSettings,
     VariableSource, WorldStateVerifierSettings,
 };
 
@@ -98,6 +99,20 @@ impl SettingsField for MobileSettings {
 
     fn field_name() -> &'static str {
         "mobile"
+    }
+}
+
+impl SettingsField for TunnelSettings {
+    fn get_from(settings: &Settings) -> &Self {
+        &settings.tunnel
+    }
+
+    fn set_in(settings: &mut Settings, value: Self) {
+        settings.tunnel = value;
+    }
+
+    fn field_name() -> &'static str {
+        "tunnel"
     }
 }
 

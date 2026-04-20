@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { getApiBase } from "@/lib/runner-api";
 import { tracedFetch } from "@/lib/runner-api";
+import { ConnectionWizard } from "../connection-wizard/ConnectionWizard";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -136,6 +137,7 @@ export function PhysicalDeviceManager() {
 
   // Pairing state
   const [showPairSection, setShowPairSection] = useState(false);
+  const [showWizard, setShowWizard] = useState(false);
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [pairingLoading, setPairingLoading] = useState(false);
@@ -307,6 +309,13 @@ export function PhysicalDeviceManager() {
 
   return (
     <div className="space-y-4">
+      <ConnectionWizard
+        open={showWizard}
+        onClose={() => {
+          setShowWizard(false);
+          fetchDevices();
+        }}
+      />
       {/* Header row */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -474,16 +483,24 @@ export function PhysicalDeviceManager() {
             </p>
           </div>
           {!showPairSection && (
-            <button
-              onClick={() => {
-                setShowPairSection(true);
-                initiatePairing();
-              }}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
-            >
-              <Plus className="w-3 h-3" />
-              Pair New Device
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowWizard(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+              >
+                <Plus className="w-3 h-3" />
+                Connection Wizard
+              </button>
+              <button
+                onClick={() => {
+                  setShowPairSection(true);
+                  initiatePairing();
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-border bg-transparent text-foreground hover:bg-muted/30 transition-colors"
+              >
+                Pair by code
+              </button>
+            </div>
           )}
         </div>
 

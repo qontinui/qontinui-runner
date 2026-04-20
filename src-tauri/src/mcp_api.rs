@@ -363,6 +363,7 @@ pub fn create_router(
             crate::mcp::physical_device::PhysicalDeviceRegistry::new(),
         ),
         pairing_manager: Arc::new(crate::mcp::transport::pairing::PairingManager::new()),
+        tunnel_client: Arc::new(crate::tunnel::RatholeClient::new()),
     });
 
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
@@ -1063,6 +1064,7 @@ pub fn create_router(
         .merge(crate::mcp::api_requests::routes())
         .merge(crate::mcp::app_discovery::routes())
         .merge(crate::mcp::physical_device_api::routes())
+        .merge(crate::mcp::tunnel_api::routes())
         .merge(crate::mcp::automation_runs::routes())
         .merge(crate::mcp::comparison_api::routes())
         .merge(crate::mcp::checks::routes())

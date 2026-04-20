@@ -2,6 +2,14 @@
 //!
 //! Creates a local TCP listener that tunnels HTTP requests through a WebSocket
 //! connection to the qontinui.io backend, which relays them to the mobile device.
+//!
+//! Plan 1B: for installations with a self-hosted rathole server, prefer the
+//! `crate::tunnel` module — rathole forwards raw TCP end-to-end (supports WS
+//! upgrades, stable URLs, per-service tokens). This file retains the WS-over-
+//! HTTPS relay path for backward compatibility and for deployments without a
+//! rathole server.
+//!
+//! Selection logic lives in [`select_cloud_path`] below.
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -463,6 +471,27 @@ fn build_ws_url(backend_url: &str, device_id: &str, auth_token: &str) -> String 
         urlencoding::encode(device_id),
         urlencoding::encode(auth_token),
     )
+}
+
+/// Which cloud-relay path a given device should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudPath {
+    /// Legacy HTTP-over-WebSocket relay to qontinui.io backend.
+    WebSocketRelay,
+    /// Rathole tunnel (raw TCP forwarded by a self-hosted relay). Requires
+    /// `TunnelSettings.enabled` and a started rathole client.
+    Rathole,
+}
+
+/// Prefer rathole when the tunnel is enabled and currently connected; otherwise
+/// fall back to the WS relay. Plan 1B routing hook — callers that open a
+/// device connection can branch on this.
+pub fn select_cloud_path(tunnel_enabled: bool, tunnel_connected: bool) -> CloudPath {
+    if tunnel_enabled && tunnel_connected {
+        CloudPath::Rathole
+    } else {
+        CloudPath::WebSocketRelay
+    }
 }
 
 /// Map a status code to its standard reason phrase.

@@ -4,11 +4,12 @@
 //! health check, then starts a local TCP proxy so the device's UI Bridge
 //! HTTP server appears on `127.0.0.1:{port}` — matching the USB/Cloud pattern.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use super::TransportError;
+use crate::mcp::adb_helper;
 use crate::mcp::app_discovery::DiscoveredApp;
 
 // ============================================================================
@@ -151,6 +152,40 @@ impl Default for LanTransport {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Plan 1A: enable ADB TCP/IP mode on a USB-connected device and return the
+/// `{ip}:{port}` address the runner can reach it on over Wi-Fi.
+///
+/// Steps:
+/// 1. `setprop service.adb.tcp.port {port}` on the device
+/// 2. restart adbd (`stop adbd` + `start adbd`)
+/// 3. discover the device's Wi-Fi IPv4 via `ip route` / `ip addr`
+///
+/// The caller should wait ~2-3 seconds after the restart before trying to connect,
+/// since adbd takes a moment to re-bind on the new port.
+pub async fn enable_tcpip_for_device(
+    adb_serial: &str,
+    port: u16,
+) -> Result<SocketAddr, TransportError> {
+    adb_helper::enable_tcpip(adb_serial.to_string(), port)
+        .await
+        .map_err(TransportError::AdbCommandFailed)?;
+
+    let ip_str = adb_helper::get_wlan_ipv4(adb_serial.to_string())
+        .await
+        .map_err(TransportError::AdbCommandFailed)?
+        .ok_or_else(|| {
+            TransportError::AdbCommandFailed(format!(
+                "device {adb_serial} has no IPv4 address on wlan0 (is Wi-Fi connected?)"
+            ))
+        })?;
+
+    let ip: IpAddr = ip_str
+        .parse()
+        .map_err(|e| TransportError::AdbCommandFailed(format!("invalid IPv4 {ip_str}: {e}")))?;
+
+    Ok(SocketAddr::new(ip, port))
 }
 
 /// Bidirectionally copy data between the incoming local connection and the

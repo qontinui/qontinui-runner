@@ -48,6 +48,10 @@ sentry = { version = "0.35", default-features = false, features = ["backtrace", 
 dirs = "6.0"
 keyring = "3.6"
 mdns-sd = "0.11"
+# Pure-Rust ADB client (Plan 1A) — replaces fragile subprocess adb.exe parsing.
+# Plan mention: cocool97/adb_client. Features: `usb` for direct USB device I/O,
+# `mdns` for adb mDNS services. The crate is sync; call via tokio::spawn_blocking.
+adb_client = { version = "3", features = ["usb", "mdns"] }
 reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form"] }
 open = "5"
 hostname = "0.4"
