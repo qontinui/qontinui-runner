@@ -84,6 +84,36 @@ class StepOutputHandlerRegistry {
   }
 
   /**
+   * Async variant of {@link summarizeForAI}. Prefers the handler's
+   * `summarizeForAIAsync` method when present (currently only
+   * `CommandHandler`); falls back to the sync path otherwise.
+   *
+   * When the caller has a real `task_run_id` (step executor, workflow
+   * engine), pass it as the second argument so the scripted-output
+   * emitter's per-run cost ceilings (20 calls / 10k input / 2k output
+   * tokens) enforce against the correct bucket. Callers without a
+   * task-run context can omit the argument — the emitter records events
+   * with a NULL FK in that case.
+   *
+   * This is the entry point for wiring scripted-output extraction into
+   * live pipelines. The existing sync call sites can keep calling
+   * {@link summarizeForAI} unchanged.
+   */
+  async summarizeForAIAsync(output: StepOutput, taskRunId?: string | null): Promise<string> {
+    const handler = this.get(output.step_type);
+    if (!handler) {
+      return this.genericSummary(output);
+    }
+    const asyncCapable = handler as StepOutputHandler & {
+      summarizeForAIAsync?: (o: StepOutput, taskRunId?: string | null) => Promise<string>;
+    };
+    if (typeof asyncCapable.summarizeForAIAsync === "function") {
+      return asyncCapable.summarizeForAIAsync(output, taskRunId);
+    }
+    return handler.summarizeForAI(output);
+  }
+
+  /**
    * Get assertable fields for a step output.
    * Returns empty array if no handler exists.
    */
@@ -191,6 +221,53 @@ export function summarizeOutputsForAI(outputs: StepOutput[]): string {
   // Detailed summaries
   for (const output of outputs) {
     lines.push(stepOutputRegistry.summarizeForAI(output));
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Async variant of {@link summarizeOutputsForAI}. Use this when the
+ * caller wants handler-provided async summarization (the only current
+ * consumer: `CommandHandler.summarizeForAIAsync` routing >8 KiB stdout
+ * through the scripted-output emitter).
+ *
+ * Pass `taskRunId` when the summary belongs to a specific task run —
+ * the scripted-output emitter's per-run cost ceilings will enforce
+ * against that bucket. Pre-existing sync callers can stay on
+ * {@link summarizeOutputsForAI}; their behavior is unchanged.
+ */
+export async function summarizeOutputsForAIAsync(
+  outputs: StepOutput[],
+  taskRunId?: string | null,
+): Promise<string> {
+  if (outputs.length === 0) return "";
+
+  const lines: string[] = [];
+  lines.push("## Step Outputs (Ground Truth)\n");
+  lines.push(`**${outputs.length} step outputs collected:**\n`);
+
+  const byType = new Map<StepOutputType, StepOutput[]>();
+  for (const output of outputs) {
+    const existing = byType.get(output.step_type) || [];
+    existing.push(output);
+    byType.set(output.step_type, existing);
+  }
+
+  for (const [type, typeOutputs] of byType) {
+    const handler = stepOutputRegistry.get(type);
+    const displayName = handler?.displayName || type;
+    lines.push(`- ${typeOutputs.length} ${displayName} outputs`);
+  }
+  lines.push("");
+
+  // Run handler summarization sequentially — the scripted-output emitter
+  // has per-task_run budgets that are cheaper to enforce against a
+  // serialized stream. Parallelism here would also race on the same
+  // Tier-1 LRU entries and burn the budget faster for no real gain.
+  for (const output of outputs) {
+    lines.push(await stepOutputRegistry.summarizeForAIAsync(output, taskRunId));
     lines.push("");
   }
 

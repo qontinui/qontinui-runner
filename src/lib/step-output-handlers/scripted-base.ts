@@ -108,10 +108,12 @@ export abstract class ScriptedOutputHandler<
    *                    (budgets simply aren't enforced for unassigned
    *                    calls).
    *
-   * TODO: concrete handlers (`CommandHandler.summarizeForAIAsync`, etc.)
-   * should plumb the real task_run_id from the step execution context
-   * through this parameter so the Rust budget actually kicks in.  For now
-   * the door is open but all callers pass `undefined`.
+   * Plumbing: `CommandHandler.summarizeForAIAsync(output, taskRunId?)`
+   * forwards this through, and `stepOutputRegistry.summarizeForAIAsync`
+   * / `summarizeOutputsForAIAsync(outputs, taskRunId?)` expose it to
+   * callers that have a task-run context. Call sites that don't yet
+   * know their `task_run_id` can omit the argument — the emitter
+   * records events with a NULL FK column in that case.
    */
   protected async summarizeViaScript(
     rawOutput: string,

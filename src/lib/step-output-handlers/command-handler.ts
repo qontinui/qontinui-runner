@@ -163,8 +163,15 @@ export class CommandHandler
    * Callers that don't need scripted output should keep using the sync
    * method — this sibling exists so the `summarizeForAI` surface on the
    * `StepOutputHandler` interface and the registry stays synchronous.
+   *
+   * @param taskRunId  When the caller has a real `task_run_id` (step
+   *                   executor, workflow engine), pass it so the Rust
+   *                   emitter can enforce its per-run cost ceilings
+   *                   (20 calls / 10k input / 2k output tokens per run)
+   *                   against the correct bucket instead of the
+   *                   unassigned one.
    */
-  async summarizeForAIAsync(output: CommandStepOutput): Promise<string> {
+  async summarizeForAIAsync(output: CommandStepOutput, taskRunId?: string | null): Promise<string> {
     const stdout = output.stdout ?? "";
     const shouldAttemptScripted = stdout.length > SCRIPTED_OUTPUT_THRESHOLD_BYTES;
 
@@ -187,10 +194,15 @@ export class CommandHandler
       "smallest JSON-serializable structure that captures: (a) exit signals, " +
       "(b) errors/warnings, (c) final result lines. Prefer arrays of short strings.";
 
-    const { extracted, bytesAvoided, fallback } = await this.summarizeViaScript(stdout, goal, {
-      command: output.command,
-      exit_code: output.exit_code,
-    });
+    const { extracted, bytesAvoided, fallback } = await this.summarizeViaScript(
+      stdout,
+      goal,
+      {
+        command: output.command,
+        exit_code: output.exit_code,
+      },
+      taskRunId,
+    );
 
     // Rebuild the summary using the extracted payload in place of stdout.
     const lines: string[] = [];
