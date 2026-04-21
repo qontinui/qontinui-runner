@@ -17,7 +17,7 @@
 
 import { useEffect, useCallback, useReducer, useState } from "react";
 import { ShieldCheck, FlaskConical, FileJson, X, CheckCircle2, AlertTriangle } from "lucide-react";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent } from "@qontinui/ui-bridge";
 import { useSpecsState } from "./useSpecsState";
 import { ConnectionBar } from "./ConnectionBar";
 import { SpecTree } from "./SpecTree";

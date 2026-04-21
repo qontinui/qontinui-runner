@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent } from "@qontinui/ui-bridge";
 import {
   Zap,
   Image,

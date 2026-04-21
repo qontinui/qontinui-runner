@@ -44,7 +44,7 @@ export type {
   ResponsiveBreakpoint,
   AccessibilityTarget,
   CapacityConstraint,
-} from "ui-bridge";
+} from "@qontinui/ui-bridge";
 
 // The kind of spec loaded
 export type SpecKind =
@@ -100,41 +100,41 @@ export type LoadedSpec =
       specId: string;
       appName: string;
       kind: "page-spec";
-      config: import("ui-bridge").SpecConfig;
+      config: import("@qontinui/ui-bridge").SpecConfig;
       source: "bundled" | "discovered" | "file";
     }
   | {
       specId: string;
       appName: string;
       kind: "architecture";
-      config: import("ui-bridge").ArchitectureConfig;
+      config: import("@qontinui/ui-bridge").ArchitectureConfig;
       source: "bundled" | "discovered" | "file";
     }
   | {
       specId: string;
       appName: string;
       kind: "api";
-      config: import("ui-bridge").ApiConfig;
+      config: import("@qontinui/ui-bridge").ApiConfig;
       source: "bundled" | "discovered" | "file";
     }
   | {
       specId: string;
       appName: string;
       kind: "data";
-      config: import("ui-bridge").DataConfig;
+      config: import("@qontinui/ui-bridge").DataConfig;
       source: "bundled" | "discovered" | "file";
     }
   | {
       specId: string;
       appName: string;
       kind: "dependency";
-      config: import("ui-bridge").DependencyConfig;
+      config: import("@qontinui/ui-bridge").DependencyConfig;
       source: "bundled" | "discovered" | "file";
     }
   | {
       specId: string;
       appName: string;
       kind: "constraint";
-      config: import("ui-bridge").ConstraintConfig;
+      config: import("@qontinui/ui-bridge").ConstraintConfig;
       source: "bundled" | "discovered" | "file";
     };

@@ -18,7 +18,7 @@ import {
   useUIStateGroup,
   useKeyboardShortcuts,
   type ShortcutDef,
-} from "ui-bridge";
+} from "@qontinui/ui-bridge";
 
 // ---------------------------------------------------------------------------
 // Props — the host component (AppContent) passes live state so hooks can

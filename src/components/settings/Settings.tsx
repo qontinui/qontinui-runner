@@ -6,7 +6,7 @@
  */
 
 import { useState, useEffect } from "react";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent } from "@qontinui/ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
 import { AuthConnectionSettings } from "./AuthConnectionSettings";
 import { GeneralSettings } from "./GeneralSettings";

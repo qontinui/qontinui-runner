@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Shield, AlertTriangle, Plus, Bug } from "lucide-react";
 import type { LoadedSpec } from "./types";
-import type { SpecGroup, SpecAssertion, SetupAction } from "ui-bridge";
+import type { SpecGroup, SpecAssertion, SetupAction } from "@qontinui/ui-bridge";
 import { SpecIssuesPanel } from "./SpecIssuesPanel";
 import { GlobalIssuesPanel } from "./GlobalIssuesPanel";
 import { SpecTriageView } from "@/components/specs/SpecTriageView";

@@ -7,7 +7,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { RenderLogStorage, RenderLogEntry, RenderLogEntryType } from "ui-bridge";
+import type { RenderLogStorage, RenderLogEntry, RenderLogEntryType } from "@qontinui/ui-bridge";
 
 /**
  * Convert ui-bridge entry to the format expected by the Rust backend

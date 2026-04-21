@@ -15,7 +15,7 @@ import { ContextualTutorial } from "./components/tutorial";
 import { DemoVisualOverlay } from "./components/demo-video/DemoVisualOverlay";
 import { getGraphQLClient } from "./lib/graphql-client";
 
-import { UIBridgeProvider, AutoRegisterProvider } from "ui-bridge";
+import { UIBridgeProvider, AutoRegisterProvider } from "@qontinui/ui-bridge";
 
 import { setupEventHandlers, eventRouter } from "./managers";
 import {
@@ -36,6 +36,7 @@ import {
   useBackgroundActivities,
   useCloudRelayAutoConnect,
   UIBridgeEventHandler,
+  UIBridgeInvokeHandler,
   SpecExecutionHandler,
 } from "./hooks";
 import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
@@ -68,7 +69,7 @@ import { useTaskRuns } from "./hooks/useAiData";
 import { getAllSpecs } from "./lib/spec-registry";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
 import { autoPopulateCtr, getGlobalCtr } from "@qontinui/ui-bridge/ctr";
-import { getGlobalRegistry } from "ui-bridge";
+import { getGlobalRegistry } from "@qontinui/ui-bridge";
 
 import { instanceStorage } from "@/lib/instance-storage";
 
@@ -724,6 +725,7 @@ export default function App() {
         browserCaptureConfig={{ console: true }}
       >
         <UIBridgeEventHandler />
+        <UIBridgeInvokeHandler />
         <SpecExecutionHandler />
         <BundledSpecsLoader />
         <CtrAutoPopulator />

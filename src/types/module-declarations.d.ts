@@ -201,7 +201,7 @@ declare module "@qontinui/ui-bridge/artifacts" {
 // =============================================================================
 
 declare module "@qontinui/ui-bridge/contracts" {
-  type SpecAssertion = import("ui-bridge").SpecAssertion;
+  type SpecAssertion = import("@qontinui/ui-bridge").SpecAssertion;
 
   export type ContractCheck =
     | {

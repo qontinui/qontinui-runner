@@ -16,7 +16,7 @@ import {
   CheckSquare,
   Square,
 } from "lucide-react";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent } from "@qontinui/ui-bridge";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import type { ProductTour, TourAudience, TourGenerationState } from "@/types/product-tour";
 import { INITIAL_GENERATION_STATE, PRODUCT_TOURS_STORAGE_KEY } from "@/types/product-tour";

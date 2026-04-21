@@ -30,7 +30,7 @@ import {
 // Import from main entry to share the same globalRegistry singleton as UIBridgeProvider.
 // Importing from "@qontinui/ui-bridge/core" resolves to a separate dist bundle with
 // its own isolated globalRegistry variable, causing elements to be invisible to the engine.
-import { getGlobalRegistry } from "ui-bridge";
+import { getGlobalRegistry } from "@qontinui/ui-bridge";
 import { getUIBridgeGlobal } from "./ui-bridge-events/utils";
 import { getAllSpecs } from "@/lib/spec-registry";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";

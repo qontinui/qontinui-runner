@@ -9,7 +9,7 @@
 
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useUIComponent, useUIElement } from "ui-bridge";
+import { useUIComponent, useUIElement } from "@qontinui/ui-bridge";
 import { Search, Clock, Filter, ExternalLink } from "lucide-react";
 
 interface TimelineSearchResult {

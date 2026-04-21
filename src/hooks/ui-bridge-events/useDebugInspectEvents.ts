@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { getGlobalSpecStore } from "ui-bridge";
+import { getGlobalSpecStore } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
 import { getAllSpecs } from "../../lib/spec-registry";
@@ -56,7 +56,7 @@ async function discoverBridgeForms(bridge: {
     getState: () => unknown;
   }>;
 }) {
-  const { discoverForms } = await import("ui-bridge/ai");
+  const { discoverForms } = await import("@qontinui/ui-bridge/ai");
   const formElements = bridge.elements
     .filter(
       (el) =>
@@ -68,7 +68,7 @@ async function discoverBridgeForms(bridge: {
       element: el.element as HTMLElement,
       type: el.type,
       label: el.label,
-      getState: () => el.getState() as import("ui-bridge").ElementState,
+      getState: () => el.getState() as import("@qontinui/ui-bridge").ElementState,
     }));
   return discoverForms(formElements);
 }
@@ -141,7 +141,7 @@ export function useDebugInspectEvents(
             : capture.getConsoleRecent(limit ?? 50);
 
           if (shouldGroup) {
-            const { computeFingerprint: fingerprint } = await import("ui-bridge/debug");
+            const { computeFingerprint: fingerprint } = await import("@qontinui/ui-bridge/debug");
             const groupMap = new Map<
               string,
               {
@@ -153,7 +153,7 @@ export function useDebugInspectEvents(
               }
             >();
             for (const err of errors) {
-              const fp = fingerprint(err as import("ui-bridge/debug").AnyCapturedEvent);
+              const fp = fingerprint(err as import("@qontinui/ui-bridge/debug").AnyCapturedEvent);
               const existing = groupMap.get(fp);
               if (existing) {
                 existing.count++;

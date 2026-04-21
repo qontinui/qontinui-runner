@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 
 import { FilePathLinkProvider } from "./FilePathLinkProvider";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useUIBridgeOptional } from "ui-bridge";
+import { useUIBridgeOptional } from "@qontinui/ui-bridge";
 import { createTerminalBackend } from "./backends";
 import type { BackendType, ITerminalBackend } from "./backends";
 import { instanceStorage } from "@/lib/instance-storage";

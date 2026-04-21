@@ -20,7 +20,7 @@ import {
   MapPin,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent } from "@qontinui/ui-bridge";
 import type { ProductTour } from "@/types/product-tour";
 import { PRODUCT_TOURS_STORAGE_KEY } from "@/types/product-tour";
 import { instanceStorage } from "@/lib/instance-storage";

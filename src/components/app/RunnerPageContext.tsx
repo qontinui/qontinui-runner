@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { usePageContext } from "ui-bridge";
+import { usePageContext } from "@qontinui/ui-bridge";
 import type { MainTabId } from "./tab-types";
 
 export function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {

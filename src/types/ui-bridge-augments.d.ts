@@ -19,7 +19,7 @@ declare module "@qontinui/ui-bridge/core" {
 // ui-bridge/ai — add parseNLAssertion and subscribeChanges on ChangeTrackerDeps
 // ---------------------------------------------------------------------------
 
-declare module "ui-bridge/ai" {
+declare module "@qontinui/ui-bridge/ai" {
   export interface NLAssertionInput {
     target?: unknown;
     type?: string;

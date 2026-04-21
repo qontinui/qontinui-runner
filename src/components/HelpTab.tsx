@@ -11,7 +11,7 @@
 
 import { useState, useEffect, type ComponentType } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { useUIElement, useUIComponent } from "ui-bridge";
+import { useUIElement, useUIComponent } from "@qontinui/ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
 import {
   Keyboard,

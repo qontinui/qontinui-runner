@@ -9,7 +9,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useUIComponent, useUIElement } from "ui-bridge";
+import { useUIComponent, useUIElement } from "@qontinui/ui-bridge";
 import { Eye, Plus, Trash2, ToggleLeft, ToggleRight, Clock, X } from "lucide-react";
 
 interface Watcher {

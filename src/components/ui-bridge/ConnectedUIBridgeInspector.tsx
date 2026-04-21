@@ -6,8 +6,8 @@
  */
 
 import { useState, useCallback, useEffect, useRef } from "react";
-import { useUIBridge } from "ui-bridge";
-import type { RegisteredElement } from "ui-bridge";
+import { useUIBridge } from "@qontinui/ui-bridge";
+import type { RegisteredElement } from "@qontinui/ui-bridge";
 import { UIBridgeInspectorPanel } from "./UIBridgeInspectorPanel";
 import type { UIBridgeElement, UIBridgeEvent, UIBridgeSnapshot } from "./inspector-types";
 import { ElementOverlay } from "./ElementOverlay";

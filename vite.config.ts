@@ -173,8 +173,11 @@ export default defineConfig({
       { find: /^@qontinui\/shared-types\/(.+)$/, replacement: path.resolve(__dirname, "../qontinui-schemas/ts/dist/$1.js") },
       { find: "@qontinui/shared-types", replacement: path.resolve(__dirname, "../qontinui-schemas/ts/dist/index.js") },
       { find: "@qontinui/workflow-utils", replacement: path.resolve(__dirname, "../qontinui-workflow-utils/dist/index.js") },
-      // @qontinui/ui-bridge subpath imports must resolve to dist/ to match how bare
-      // "ui-bridge" resolves, preventing duplicate module instances (singleton split).
+      // @qontinui/ui-bridge subpath imports must resolve to dist/ (not the SDK's
+      // source) so the runner and the SDK share a single module instance. Without
+      // this, import-map resolution can walk into the SDK's own src/ tree through
+      // its package.json `main`/`exports` entries, creating duplicate copies of
+      // singletons like the global registry and spec store.
       { find: /^@qontinui\/ui-bridge\/(.+)$/, replacement: path.resolve(__dirname, "../ui-bridge/packages/ui-bridge/dist/$1/index.mjs") },
       { find: "@qontinui/ui-bridge", replacement: path.resolve(__dirname, "../ui-bridge/packages/ui-bridge/dist/index.mjs") },
       // ui-bridge-auto resolves to source (Vite transpiles TS on the fly)

@@ -9,7 +9,7 @@
  *   usePageRegistration("settings", "Settings", "Application settings and configuration");
  */
 
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent } from "@qontinui/ui-bridge";
 
 interface PageAction {
   id: string;

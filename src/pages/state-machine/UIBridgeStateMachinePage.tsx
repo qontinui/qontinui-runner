@@ -9,7 +9,7 @@
 
 import { useState, useCallback, useEffect, useRef, type ComponentType } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useUIElement, useUIComponent } from "ui-bridge";
+import { useUIElement, useUIComponent } from "@qontinui/ui-bridge";
 import {
   Network,
   GitBranch,

@@ -4,13 +4,13 @@ import {
   captureResponsiveSnapshots,
   captureStateVariations,
   runStyleAudit,
-} from "ui-bridge";
+} from "@qontinui/ui-bridge";
 import type {
   ElementDesignData,
   DesignRegistryLike,
   InteractionStateName,
   StyleGuideConfig,
-} from "ui-bridge";
+} from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import type { RegisteredElement } from "./types";
 import { createLogger } from "@/lib/logger";

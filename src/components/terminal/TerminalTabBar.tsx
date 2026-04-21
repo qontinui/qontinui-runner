@@ -4,7 +4,7 @@ import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { AccountUsageInfo } from "./useSessionManager";
 import { LaunchMenu } from "./LaunchMenu";
-import { useUIComponent, UIBridgeComponentScope } from "ui-bridge";
+import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 
 interface TerminalTabBarProps {
   tabs: TerminalTab[];

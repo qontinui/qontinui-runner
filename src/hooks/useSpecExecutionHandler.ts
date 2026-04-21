@@ -22,7 +22,7 @@
 
 import { useEffect, useCallback, useRef } from "react";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
-import { useUIBridge } from "ui-bridge";
+import { useUIBridge } from "@qontinui/ui-bridge";
 import type { SpecGroup, SpecGroupResult, SpecExecutionOptions } from "@qontinui/ui-bridge/specs";
 import { executeSpecGroup, externalToDiscovered } from "../lib/spec-execution";
 import { IpcArtifactStore } from "@qontinui/ui-bridge/artifacts";

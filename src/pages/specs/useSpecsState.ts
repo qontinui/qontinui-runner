@@ -7,7 +7,7 @@ import { getAllSpecs } from "@/lib/spec-registry";
 import { getKnownPages, type KnownPage } from "@/lib/page-catalog";
 import { useSpecFileLoader } from "./useSpecFileLoader";
 import type { LoadedSpec, SpecSelection, SpecTreeNode, ConnectionState } from "./types";
-import type { SpecConfig, SpecGroup, SpecAssertion, SetupAction } from "ui-bridge";
+import type { SpecConfig, SpecGroup, SpecAssertion, SetupAction } from "@qontinui/ui-bridge";
 
 function buildNodeFromSpec(spec: LoadedSpec): SpecTreeNode {
   if (spec.kind === "page-spec") {

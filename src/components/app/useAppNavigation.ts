@@ -1,6 +1,6 @@
 import { useEffect, useCallback, useState, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { useUIBridge } from "ui-bridge";
+import { useUIBridge } from "@qontinui/ui-bridge";
 import { useApiReady, useRenderPerformance } from "@/hooks";
 import { getApiPort } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
@@ -160,6 +160,32 @@ export function useAppNavigation(): UseAppNavigationReturn {
     return () => {
       window.removeEventListener("ui-bridge-navigate", handler);
       window.removeEventListener("ui-bridge-set-tab", directHandler as EventListener);
+    };
+  }, []);
+
+  // Tauri-native listener for the `ui-bridge:activate-tab` event emitted by
+  // `POST /ui-bridge/control/activate-tab/{tab_id}`. This is intentionally
+  // separate from the `ui-bridge-set-tab` window event used by the legacy
+  // `/page/set-tab` endpoint, so the two paths remain independently
+  // debuggable. Sub-tab propagation for `settings-*` ids is handled
+  // automatically by TabContent → Settings via the `defaultTab` prop and
+  // Settings' `useEffect([defaultTab])`, so we only need to set the main
+  // activeTab here.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    const setup = async () => {
+      unlisten = await listen<{ tab_id: string }>("ui-bridge:activate-tab", (event) => {
+        const { tab_id } = event.payload ?? { tab_id: "" };
+        if (!tab_id) return;
+        setActiveTab(tab_id as MainTabId);
+      });
+    };
+
+    setup();
+
+    return () => {
+      if (unlisten) unlisten();
     };
   }, []);
 

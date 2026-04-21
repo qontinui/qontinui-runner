@@ -26,7 +26,7 @@ Register every significant interactive and data-display element with the UI Brid
 ## Output Format
 
 Generate a single TypeScript file that:
-1. Imports \`useUIComponent\` and \`useUIElement\` from "ui-bridge"
+1. Imports \`useUIComponent\` and \`useUIElement\` from "@qontinui/ui-bridge"
 2. Exports a custom hook \`use<PageName>Registrations()\` that:
    - Calls \`useUIComponent\` once for the page-level component with:
      - \`id\`: kebab-case page identifier (e.g., "dashboard-page")

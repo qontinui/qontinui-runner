@@ -3,7 +3,7 @@
  */
 
 import { useState } from "react";
-import { useUIElement } from "ui-bridge";
+import { useUIElement } from "@qontinui/ui-bridge";
 import {
   Loader2,
   BookOpen,

@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from "react";
-import { useUIBridge } from "ui-bridge";
+import { useUIBridge } from "@qontinui/ui-bridge";
 import { tracedFetch } from "@/lib/traced-fetch";
 import { getApiBase } from "@/lib/runner-api";
 
@@ -126,7 +126,7 @@ export function usePromptExecution(): UsePromptExecutionReturn {
             await new Promise((r) => setTimeout(r, 500));
           } else if (step.type === "action" && step.instruction) {
             // Use NLActionExecutor on current page DOM
-            const { NLActionExecutor } = await import("ui-bridge/ai");
+            const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
             const discovered = await bridge.discover({ includeHidden: false });
             const executor = new NLActionExecutor();
             executor.updateElements(discovered.elements);

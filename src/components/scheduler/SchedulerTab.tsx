@@ -10,7 +10,7 @@
 
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { useUIElement, useUIComponent } from "ui-bridge";
+import { useUIElement, useUIComponent } from "@qontinui/ui-bridge";
 import { Calendar, History, Settings, Plus, RefreshCw, Wrench, Sparkles } from "lucide-react";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { useScheduler } from "../../hooks/useScheduler";

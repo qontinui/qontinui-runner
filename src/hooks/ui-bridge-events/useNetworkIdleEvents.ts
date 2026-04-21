@@ -22,7 +22,7 @@ export function useNetworkIdleEvents(
       switch (type) {
         case "get_network_requests":
         case "get_network_requests_in_flight": {
-          const { NetworkRequestTracker } = await import("ui-bridge");
+          const { NetworkRequestTracker } = await import("@qontinui/ui-bridge");
 
           if (!networkTrackerRef.current) {
             networkTrackerRef.current = new NetworkRequestTracker();
@@ -56,7 +56,7 @@ export function useNetworkIdleEvents(
 
         case "get_idle_status":
         case "wait_for_idle": {
-          const { CompositeIdleDetector } = await import("ui-bridge");
+          const { CompositeIdleDetector } = await import("@qontinui/ui-bridge");
 
           if (!idleDetectorRef.current) {
             idleDetectorRef.current = CompositeIdleDetector.create();
@@ -89,7 +89,7 @@ export function useNetworkIdleEvents(
         }
 
         case "get_idle_signal": {
-          const { CompositeIdleDetector } = await import("ui-bridge");
+          const { CompositeIdleDetector } = await import("@qontinui/ui-bridge");
           if (!idleDetectorRef.current) {
             idleDetectorRef.current = CompositeIdleDetector.create();
           }
@@ -116,7 +116,7 @@ export function useNetworkIdleEvents(
         }
 
         case "wait_for_idle_signal": {
-          const { CompositeIdleDetector } = await import("ui-bridge");
+          const { CompositeIdleDetector } = await import("@qontinui/ui-bridge");
           if (!idleDetectorRef.current) {
             idleDetectorRef.current = CompositeIdleDetector.create();
           }
@@ -145,7 +145,7 @@ export function useNetworkIdleEvents(
         }
 
         case "wait_for_targets": {
-          const { CompositeIdleDetector } = await import("ui-bridge");
+          const { CompositeIdleDetector } = await import("@qontinui/ui-bridge");
           if (!idleDetectorRef.current) {
             idleDetectorRef.current = CompositeIdleDetector.create();
           }
@@ -238,7 +238,7 @@ export function useNetworkIdleEvents(
             const fallbackId = setTimeout(async () => {
               if (settled) return;
               try {
-                const { CompositeIdleDetector } = await import("ui-bridge");
+                const { CompositeIdleDetector } = await import("@qontinui/ui-bridge");
                 if (!idleDetectorRef.current) {
                   idleDetectorRef.current = CompositeIdleDetector.create();
                 }
@@ -404,7 +404,8 @@ export function useNetworkIdleEvents(
         }
 
         case "diagnose_stuck_screen": {
-          const { CompositeIdleDetector, StuckScreenDetector } = await import("ui-bridge");
+          const { CompositeIdleDetector, StuckScreenDetector } =
+            await import("@qontinui/ui-bridge");
 
           if (!idleDetectorRef.current) {
             idleDetectorRef.current = CompositeIdleDetector.create();

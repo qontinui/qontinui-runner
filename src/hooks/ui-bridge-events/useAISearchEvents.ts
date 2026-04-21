@@ -24,7 +24,7 @@ export function useAISearchEvents(
 
       switch (type) {
         case "ai_search": {
-          const { SearchEngine } = await import("ui-bridge/ai");
+          const { SearchEngine } = await import("@qontinui/ui-bridge/ai");
           // Use discover() for fresh elements with up-to-date visibility state
           // (currentBridge.elements is memoized and may have stale DOM refs)
           const discovered = await currentBridge.discover({ includeHidden: true });
@@ -43,7 +43,7 @@ export function useAISearchEvents(
         }
 
         case "ai_find": {
-          const { SearchEngine, find: aiFindFn } = await import("ui-bridge/ai");
+          const { SearchEngine, find: aiFindFn } = await import("@qontinui/ui-bridge/ai");
           const discovered = await currentBridge.discover({ includeHidden: true });
           const engine = new SearchEngine({ includeHidden: true });
           engine.updateElements(discovered.elements);
@@ -293,7 +293,7 @@ export function useAISearchEvents(
         }
 
         case "ai_execute": {
-          const { NLActionExecutor } = await import("ui-bridge/ai");
+          const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
           const discovered = await currentBridge.discover({ includeHidden: true });
           const executor = new NLActionExecutor();
           executor.updateElements(discovered.elements);
@@ -322,7 +322,7 @@ export function useAISearchEvents(
         }
 
         case "ai_assert": {
-          const { AssertionExecutor, parseNLAssertion } = await import("ui-bridge/ai");
+          const { AssertionExecutor, parseNLAssertion } = await import("@qontinui/ui-bridge/ai");
           const discovered = await currentBridge.discover({ includeHidden: true });
           const executor = new AssertionExecutor();
           executor.updateElements(discovered.elements);
@@ -344,7 +344,7 @@ export function useAISearchEvents(
         }
 
         case "ai_assert_batch": {
-          const { AssertionExecutor, parseNLAssertion } = await import("ui-bridge/ai");
+          const { AssertionExecutor, parseNLAssertion } = await import("@qontinui/ui-bridge/ai");
           const discovered = await currentBridge.discover({ includeHidden: true });
           const executor = new AssertionExecutor();
           executor.updateElements(discovered.elements);
@@ -371,7 +371,7 @@ export function useAISearchEvents(
         }
 
         case "ai_snapshot": {
-          const { SemanticSnapshotManager } = await import("ui-bridge/ai");
+          const { SemanticSnapshotManager } = await import("@qontinui/ui-bridge/ai");
           const controlSnapshot = await currentBridge.createSnapshotAsync();
           const maxTokens = typeof payload?.maxTokens === "number" ? payload.maxTokens : 0;
           const manager = new SemanticSnapshotManager({ maxTokens });
@@ -390,7 +390,8 @@ export function useAISearchEvents(
         }
 
         case "ai_summary": {
-          const { generatePageSummary, SemanticSnapshotManager } = await import("ui-bridge/ai");
+          const { generatePageSummary, SemanticSnapshotManager } =
+            await import("@qontinui/ui-bridge/ai");
           const controlSnapshot = await currentBridge.createSnapshotAsync();
           // Convert to AI elements via snapshot manager
           const manager = new SemanticSnapshotManager();
@@ -417,7 +418,7 @@ export function useAISearchEvents(
         // ==================================================================
 
         case "ai_semantic_search": {
-          const { SearchEngine } = await import("ui-bridge/ai");
+          const { SearchEngine } = await import("@qontinui/ui-bridge/ai");
           const discovered = await currentBridge.discover({ includeHidden: true });
           const engine = new SearchEngine({ includeHidden: true });
           engine.updateElements(discovered.elements);
@@ -439,7 +440,7 @@ export function useAISearchEvents(
         }
 
         case "ai_diff": {
-          const { SemanticSnapshotManager } = await import("ui-bridge/ai");
+          const { SemanticSnapshotManager } = await import("@qontinui/ui-bridge/ai");
           const diffSnapshot = await currentBridge.createSnapshotAsync();
           const diffManager = new SemanticSnapshotManager();
           const currentSemantic = diffManager.createSnapshot(diffSnapshot as never, {
@@ -597,7 +598,7 @@ export function useAISearchEvents(
           const recoveryParams = payload.params ?? payload.body ?? {};
           const instruction = (recoveryParams.instruction as string) ?? "";
           try {
-            const { NLActionExecutor } = await import("ui-bridge/ai");
+            const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
             const discovered = await currentBridge.discover({ includeHidden: true });
             const executor = new NLActionExecutor();
             executor.updateElements(discovered.elements);
@@ -744,7 +745,7 @@ export function useAISearchEvents(
               });
             } else {
               // Fall back to NL action executor
-              const { NLActionExecutor } = await import("ui-bridge/ai");
+              const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
               const discovered = await currentBridge.discover({ includeHidden: true });
               const executor = new NLActionExecutor();
               executor.updateElements(discovered.elements);

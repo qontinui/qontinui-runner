@@ -4,7 +4,7 @@ import type {
   ElementIdentifier,
   ElementState,
   StyleGuideConfig,
-} from "ui-bridge";
+} from "@qontinui/ui-bridge";
 
 /**
  * Request types that can come from the Rust backend
@@ -318,17 +318,17 @@ export interface SerializedComponent {
  * Each sub-hook destructures only the fields it needs.
  */
 export interface UIBridgeEventContext {
-  bridgeRef: React.MutableRefObject<ReturnType<typeof import("ui-bridge").useUIBridge>>;
+  bridgeRef: React.MutableRefObject<ReturnType<typeof import("@qontinui/ui-bridge").useUIBridge>>;
   sendResponse: (response: UIBridgeResponsePayload) => Promise<void>;
   loadedStyleGuideRef: React.MutableRefObject<StyleGuideConfig | null>;
   changeTrackerRef: React.MutableRefObject<InstanceType<
-    typeof import("ui-bridge/ai").ChangeTracker
+    typeof import("@qontinui/ui-bridge/ai").ChangeTracker
   > | null>;
   networkTrackerRef: React.MutableRefObject<InstanceType<
-    typeof import("ui-bridge").NetworkRequestTracker
+    typeof import("@qontinui/ui-bridge").NetworkRequestTracker
   > | null>;
   idleDetectorRef: React.MutableRefObject<InstanceType<
-    typeof import("ui-bridge").CompositeIdleDetector
+    typeof import("@qontinui/ui-bridge").CompositeIdleDetector
   > | null>;
 }
 

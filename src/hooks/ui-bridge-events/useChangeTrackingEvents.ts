@@ -82,7 +82,7 @@ export function useChangeTrackingEvents(
             ChangeTracker,
             createSnapshotManager,
             analyzeStructuredChanges: analyzeStructured,
-          } = await import("ui-bridge/ai");
+          } = await import("@qontinui/ui-bridge/ai");
 
           // Lazy-init ChangeTracker singleton
           if (!changeTrackerRef.current) {

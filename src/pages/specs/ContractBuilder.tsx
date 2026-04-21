@@ -33,7 +33,7 @@ import type {
   ContractVerification,
 } from "@qontinui/ui-bridge/contracts";
 import { CONTRACT_CONFIG_VERSION, validateContractConfig } from "@qontinui/ui-bridge/contracts";
-import type { SpecAssertion } from "ui-bridge";
+import type { SpecAssertion } from "@qontinui/ui-bridge";
 import { getAllSpecs } from "@/lib/spec-registry";
 
 // =============================================================================

@@ -3,7 +3,7 @@ import {
   type RegisteredElement,
   type RegisteredComponent,
   serializeRegisteredElement,
-} from "ui-bridge";
+} from "@qontinui/ui-bridge";
 import type { SerializedElement, SerializedComponent } from "./types";
 
 /**

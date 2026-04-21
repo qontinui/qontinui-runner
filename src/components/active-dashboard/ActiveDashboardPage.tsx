@@ -32,7 +32,7 @@
  */
 
 import { useCallback } from "react";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent } from "@qontinui/ui-bridge";
 import { invoke } from "@tauri-apps/api/core";
 import { ActiveRunsProvider, WorkflowExecutionProvider } from "../../contexts";
 import { DashboardPage, type DashboardPageProps } from "./DashboardPage";

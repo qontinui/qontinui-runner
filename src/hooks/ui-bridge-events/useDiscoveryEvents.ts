@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import type { BridgeSnapshot } from "ui-bridge";
+import type { BridgeSnapshot } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
 import { createLogger } from "@/lib/logger";
@@ -86,7 +86,7 @@ export function useDiscoveryEvents(
 
           // Enrich elements with stableRef if createStableRef is available
           try {
-            const { createStableRef } = await import("ui-bridge/core");
+            const { createStableRef } = await import("@qontinui/ui-bridge/core");
             const registry = (
               currentBridge as { registry?: { getElement?: (id: string) => unknown } }
             ).registry;

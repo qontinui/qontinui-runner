@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import { RenderLogManager, type RenderLogEntry } from "ui-bridge";
+import { RenderLogManager, type RenderLogEntry } from "@qontinui/ui-bridge";
 import { TauriRenderLogStorage } from "./TauriRenderLogStorage";
 
 export interface UseRenderLogManagerOptions {

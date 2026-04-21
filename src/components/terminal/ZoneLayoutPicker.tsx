@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { LayoutGrid } from "lucide-react";
 import { LAYOUT_PRESETS, type LayoutPreset } from "./useZoneLayout";
-import { useUIComponent, UIBridgeComponentScope } from "ui-bridge";
+import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 
 interface ZoneLayoutPickerProps {
   currentLayoutId: string;

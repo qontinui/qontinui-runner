@@ -6,7 +6,7 @@
  */
 
 import type { DiscoveredElement } from "@qontinui/ui-bridge/control";
-import type { RegisteredElement } from "ui-bridge";
+import type { RegisteredElement } from "@qontinui/ui-bridge";
 import type { ExternalElement } from "../../types/ui-bridge-types";
 
 /**

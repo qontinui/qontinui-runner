@@ -789,7 +789,7 @@ export function PageSpecOverview({
   onAddGroup,
   onRemoveGroup,
 }: {
-  config: import("ui-bridge").SpecConfig;
+  config: import("@qontinui/ui-bridge").SpecConfig;
   specId: string;
   source: string;
   appName?: string;

@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Save, FolderOpen, Trash2, ChevronDown } from "lucide-react";
-import { useUIComponent, UIBridgeComponentScope } from "ui-bridge";
+import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 
 export interface ZoneSessionInfo {
   zoneIndex: number;

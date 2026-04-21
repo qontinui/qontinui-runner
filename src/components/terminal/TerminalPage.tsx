@@ -1,5 +1,5 @@
 import { useEffect, useCallback } from "react";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent } from "@qontinui/ui-bridge";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
@@ -37,7 +37,7 @@ import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { useTerminalInitialization } from "./useTerminalInitialization";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
-import { UIBridgeComponentScope } from "ui-bridge";
+import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;

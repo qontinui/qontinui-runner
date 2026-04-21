@@ -11,7 +11,7 @@
  */
 
 import { useState } from "react";
-import { useUIElement, useUIComponent } from "ui-bridge";
+import { useUIElement, useUIComponent } from "@qontinui/ui-bridge";
 import {
   Activity,
   AlertCircle,

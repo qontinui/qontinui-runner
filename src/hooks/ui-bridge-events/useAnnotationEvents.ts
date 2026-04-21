@@ -13,7 +13,7 @@ export function useAnnotationEvents(
 
   // Lazy-init annotation store (persists across renders)
   const storeRef = useRef<InstanceType<
-    typeof import("ui-bridge/annotations").AnnotationStore
+    typeof import("@qontinui/ui-bridge/annotations").AnnotationStore
   > | null>(null);
 
   return useCallback(
@@ -22,7 +22,7 @@ export function useAnnotationEvents(
 
       // Lazy-init the annotation store on first use
       if (!storeRef.current) {
-        const { AnnotationStore } = await import("ui-bridge/annotations");
+        const { AnnotationStore } = await import("@qontinui/ui-bridge/annotations");
         storeRef.current = new AnnotationStore();
       }
       const store = storeRef.current;

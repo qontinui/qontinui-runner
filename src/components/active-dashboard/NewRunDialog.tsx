@@ -7,7 +7,7 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
-import { useUIComponent } from "ui-bridge";
+import { useUIComponent } from "@qontinui/ui-bridge";
 import { X, Monitor, Cloud, AlertTriangle, Loader2 } from "lucide-react";
 import { Button } from "../ui";
 import { getAccentColors } from "@/design-system";
