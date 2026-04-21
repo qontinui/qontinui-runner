@@ -181,6 +181,40 @@ impl StepHandler for ShellCommandHandler {
 
         let timeout_secs = step.timeout_seconds;
 
+        // Pre-flight: if the command targets /state-machine/navigate on localhost,
+        // verify the SM is loaded before running curl. Fail fast with a clear message
+        // rather than letting curl hit the endpoint and get back a generic 500.
+        if command.contains("/state-machine/navigate")
+            && (command.contains("localhost") || command.contains("127.0.0.1"))
+        {
+            if let Some(port) = Self::extract_state_machine_navigate_port(&command) {
+                match Self::check_state_machine_loaded(port).await {
+                    Ok(true) => { /* proceed */ }
+                    Ok(false) => {
+                        warn!(
+                            "Shell command '{}' pre-flight: state machine not loaded on port {}",
+                            step_name, port
+                        );
+                        return StepHandlerResult::failure(
+                            "state machine not loaded at runner startup — cannot execute \
+                             /state-machine/navigate. Either the auto-load failed (check \
+                             runner startup logs) or no state machine config exists yet \
+                             (run the Specs page 'Compile State Machine' action). \
+                             Fall back to click + wait_for_element if navigation is needed."
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        // Probe itself failed — log but proceed; curl will give its own error
+                        warn!(
+                            "state-machine status probe failed: {}; proceeding with curl",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         // Detect shell type: PowerShell > bash > cmd (on Windows)
         let is_powershell = Self::is_powershell_command(&command);
         let is_bash = !is_powershell && Self::is_bash_command(&command);
@@ -511,6 +545,71 @@ impl ShellCommandHandler {
         } else {
             "sh"
         }
+    }
+
+    /// Extract the port number from a `http://localhost:<port>/state-machine/navigate`
+    /// URL found inside the command string. Returns None if no matching URL is present.
+    ///
+    /// This is used by the pre-flight probe to determine which runner port to query
+    /// for `/state-machine/status` without having to thread the port through
+    /// HandlerContext.
+    pub(crate) fn extract_state_machine_navigate_port(command: &str) -> Option<u16> {
+        // Look for either `localhost:PORT/state-machine/navigate` or
+        // `127.0.0.1:PORT/state-machine/navigate`. We scan for the hosts and then
+        // parse digits up to the next `/`.
+        for host in ["localhost:", "127.0.0.1:"] {
+            let mut search_from = 0;
+            while let Some(rel_idx) = command[search_from..].find(host) {
+                let idx = search_from + rel_idx;
+                let after_host = &command[idx + host.len()..];
+                let digits_end = after_host
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(after_host.len());
+                if digits_end == 0 {
+                    search_from = idx + host.len();
+                    continue;
+                }
+                let port_str = &after_host[..digits_end];
+                let rest = &after_host[digits_end..];
+                if rest.starts_with("/state-machine/navigate") {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        return Some(port);
+                    }
+                }
+                search_from = idx + host.len();
+            }
+        }
+        None
+    }
+
+    /// Probe `GET http://localhost:<port>/state-machine/status` and return whether
+    /// a state machine is currently loaded in the Python bridge.
+    ///
+    /// Timeout is 3s so a hung or unreachable bridge doesn't block the step for
+    /// longer than curl itself would. On any transport/parse failure we return
+    /// Err so the caller can log and fall through to curl (which will produce
+    /// its own error).
+    async fn check_state_machine_loaded(port: u16) -> Result<bool, String> {
+        let url = format!("http://localhost:{}/state-machine/status", port);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .map_err(|e| format!("client build: {}", e))?;
+        let res = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("GET {}: {}", url, e))?;
+        if !res.status().is_success() {
+            return Err(format!("status {} from {}", res.status(), url));
+        }
+        let body: serde_json::Value = res.json().await.map_err(|e| format!("parse: {}", e))?;
+        // Response shape: {"success": true, "data": {"loaded": true|false}}
+        let loaded = body
+            .pointer("/data/loaded")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| "missing /data/loaded in response".to_string())?;
+        Ok(loaded)
     }
 
     /// Replace `jq` commands with Python equivalents at runtime.
@@ -954,5 +1053,43 @@ mod tests {
             2
         );
         assert_eq!(ShellCommandHandler::extract_threshold("length > 10"), 10);
+    }
+
+    #[test]
+    fn test_extract_state_machine_navigate_port_localhost() {
+        let cmd = r#"curl -sf -X POST http://localhost:9876/state-machine/navigate -H 'Content-Type: application/json' -d '{"target":"Foo"}'"#;
+        assert_eq!(
+            ShellCommandHandler::extract_state_machine_navigate_port(cmd),
+            Some(9876)
+        );
+    }
+
+    #[test]
+    fn test_extract_state_machine_navigate_port_ipv4() {
+        let cmd =
+            "curl -sf -X POST http://127.0.0.1:1234/state-machine/navigate -d '{}'";
+        assert_eq!(
+            ShellCommandHandler::extract_state_machine_navigate_port(cmd),
+            Some(1234)
+        );
+    }
+
+    #[test]
+    fn test_extract_state_machine_navigate_port_missing() {
+        // Has localhost but hits a different endpoint — should return None
+        let cmd = "curl -sf http://localhost:9876/state-machine/status";
+        assert_eq!(
+            ShellCommandHandler::extract_state_machine_navigate_port(cmd),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_state_machine_navigate_port_no_url() {
+        let cmd = "echo hello";
+        assert_eq!(
+            ShellCommandHandler::extract_state_machine_navigate_port(cmd),
+            None
+        );
     }
 }

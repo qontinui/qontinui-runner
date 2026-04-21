@@ -1638,6 +1638,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
+            // Auto-load the default state machine into the Python bridge so
+            // that `POST /state-machine/navigate` and other bridge-dispatched
+            // endpoints work immediately after startup without requiring a
+            // manual click on the State Machine page's "Load into Runtime"
+            // button. Best-effort — never blocks startup, never panics.
+            {
+                let sm_app_state: Arc<commands::AppState> =
+                    app.state::<Arc<commands::AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::mcp::state_machine::auto_load_default_state_machine(&sm_app_state).await;
+                });
+            }
+
             // Start error monitor service in background
             info!("Starting error monitor service");
             let error_monitor_config = ErrorMonitorConfig::default();

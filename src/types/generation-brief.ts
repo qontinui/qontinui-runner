@@ -22,6 +22,8 @@ export interface BriefGroup {
   deterministicAssertions: SpecAssertion[];
   /** Assertions that need AI reasoning (semantic, behavior, source_review, or deterministic types missing a target). */
   semanticAssertions: SpecAssertion[];
+  /** ID of a state in the spec stateMachine matching this group's preconditions, if any. Enables one-step state-machine navigation instead of click+wait pairs. */
+  targetStateId?: string;
 }
 
 export interface GenerationBrief {

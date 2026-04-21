@@ -12,6 +12,7 @@ import { useAiSession } from "./useAiSession";
 import { buildPageSpecPrompt } from "@/lib/page-analysis-prompt-builder";
 import { getApiBase } from "@/lib/runner-api";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
+import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
 import type { LoadedSpec } from "@/pages/specs/types";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 
@@ -366,6 +367,10 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
         const json = JSON.stringify(stateMachine);
         (bridge.loadStateMachine as (json: string) => unknown)(json);
       }
+
+      // Best-effort: also persist to the backend DB so the compiled machine is
+      // available via the HTTP API (and survives runner restarts).
+      void persistCompiledStateMachine(stateMachine);
 
       if (stats.warnings.length > 0) {
         warningsRef.current.push(...stats.warnings);

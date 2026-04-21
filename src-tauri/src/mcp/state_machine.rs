@@ -12,9 +12,9 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::executor::with_default_bridge;
+use crate::executor::{is_default_bridge_running, with_default_bridge};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::state_machine_configs::{
     CreateSmConfigRequest, CreateSmStateRequest, CreateSmTransitionRequest, SmConfig, SmConfigFull,
@@ -873,6 +873,17 @@ pub struct SaveCompiledRequest {
 ///
 /// The frontend calls this after `compileStateMachineFromSpecs` to push the
 /// compiled state machine into the backend DB so it is available via the HTTP API.
+///
+/// Input shape is the flat `PersistedStateMachine` produced by
+/// `@qontinui/ui-bridge-auto` — an object with `version`, `createdAt`,
+/// `updatedAt`, `states: StateDefinition[]`, and `transitions: TransitionDefinition[]`.
+/// This handler does the adaptation into the relational schema itself — it
+/// does NOT delegate to `import_sm_config`, which expects a different
+/// (import-JSON) shape with states/transitions keyed as objects.
+///
+/// Upsert semantics on `name`: if a config with the same `name` already
+/// exists, delete it first so "save-compiled" is idempotent from the
+/// frontend's perspective (repeated spec compiles replace the prior row).
 pub async fn save_compiled_state_machine(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<SaveCompiledRequest>,
@@ -885,23 +896,133 @@ pub async fn save_compiled_state_machine(
         name
     );
 
-    let import_req = SmImportRequest {
-        name: Some(name),
-        config: request.compiled,
-    };
+    let compiled = request.compiled;
 
-    let result = pg_db(&state)
-        .import_sm_config(&import_req)
+    // Upsert by name: drop any existing config with the same name so the
+    // frontend can call save-compiled repeatedly without piling up rows.
+    if let Ok(existing) = pg_db(&state).list_sm_configs().await {
+        for cfg in existing.iter().filter(|c| c.name == name) {
+            if let Err(e) = pg_db(&state).delete_sm_config(&cfg.id).await {
+                warn!(
+                    "save-compiled: failed to delete prior config '{}' ({}): {}",
+                    cfg.name, cfg.id, e
+                );
+            }
+        }
+    }
+
+    // Insert the parent config row.
+    let config = pg_db(&state)
+        .insert_sm_config(&CreateSmConfigRequest {
+            name: name.clone(),
+            description: Some("Spec-compiled state machine".to_string()),
+        })
         .await
         .map_err(pg_err)?;
 
+    // Insert states. The PersistedStateMachine state shape is
+    // `{id, name, requiredElements: ElementQuery[], pathCost}`. We stash
+    // the full requiredElements queries in extra_metadata so downstream
+    // readers can reconstruct them; `element_ids` stays empty because
+    // ElementQuery objects are not runtime element IDs.
+    let mut inserted_states = Vec::new();
+    if let Some(states_arr) = compiled.get("states").and_then(|v| v.as_array()) {
+        for s in states_arr {
+            let state_id = match s.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            let name = s
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&state_id)
+                .to_string();
+            let required_elements = s.get("requiredElements").cloned().unwrap_or(serde_json::json!([]));
+            let path_cost = s.get("pathCost").cloned().unwrap_or(serde_json::json!(1.0));
+            let extra = serde_json::json!({
+                "requiredElements": required_elements,
+                "pathCost": path_cost,
+            });
+            let req = CreateSmStateRequest {
+                state_id: Some(state_id),
+                name,
+                description: s.get("description").and_then(|v| v.as_str()).map(String::from),
+                element_ids: Some(Vec::new()),
+                render_ids: Some(Vec::new()),
+                confidence: None,
+                acceptance_criteria: Some(Vec::new()),
+                extra_metadata: Some(extra),
+                domain_knowledge: None,
+            };
+            match pg_db(&state).insert_sm_state(&config.id, &req).await {
+                Ok(st) => inserted_states.push(st),
+                Err(e) => warn!("save-compiled: failed to insert state: {}", e),
+            }
+        }
+    }
+
+    // Insert transitions. The PersistedStateMachine transition shape is
+    // `{id, name, fromStates, activateStates, exitStates, actions, pathCost}`.
+    let mut inserted_transitions = Vec::new();
+    if let Some(trans_arr) = compiled.get("transitions").and_then(|v| v.as_array()) {
+        for t in trans_arr {
+            let transition_id = match t.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            let tname = t
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&transition_id)
+                .to_string();
+            let from_states: Vec<String> = t
+                .get("fromStates")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let activate_states: Vec<String> = t
+                .get("activateStates")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let exit_states: Vec<String> = t
+                .get("exitStates")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let actions: Vec<serde_json::Value> = t
+                .get("actions")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let path_cost = t.get("pathCost").and_then(|v| v.as_f64());
+            let req = CreateSmTransitionRequest {
+                transition_id: Some(transition_id),
+                name: tname,
+                from_states,
+                activate_states,
+                exit_states,
+                actions,
+                path_cost,
+                stays_visible: None,
+                extra_metadata: None,
+            };
+            match pg_db(&state).insert_sm_transition(&config.id, &req).await {
+                Ok(tr) => inserted_transitions.push(tr),
+                Err(e) => warn!("save-compiled: failed to insert transition: {}", e),
+            }
+        }
+    }
+
     info!(
         "State Machine API: Saved compiled config '{}' ({} states, {} transitions)",
-        result.config.name,
-        result.states.len(),
-        result.transitions.len()
+        config.name,
+        inserted_states.len(),
+        inserted_transitions.len()
     );
-    Ok(Json(ApiResponse::success(result)))
+
+    Ok(Json(ApiResponse::success(SmConfigFull {
+        config,
+        states: inserted_states,
+        transitions: inserted_transitions,
+    })))
 }
 
 /// GET /state-machine/current — Return the most recently updated state machine config
@@ -986,4 +1107,158 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/state-machine/configs/{config_id}/transitions/{id}",
             delete(delete_transition),
         )
+}
+
+// ============================================================================
+// Startup auto-load
+// ============================================================================
+
+/// Auto-load the most recent non-empty state machine config on startup.
+///
+/// This is a best-effort routine that runs once during runner startup so that
+/// `POST /state-machine/navigate` and other bridge-dispatched endpoints work
+/// immediately, without requiring the user to click "Load into Runtime" on
+/// the State Machine page after every restart.
+///
+/// Selection logic mirrors `get_current_state_machine` — the most recently
+/// updated config (as returned by `list_sm_configs`) with non-empty states
+/// or transitions wins. The Python bridge readiness is polled with
+/// exponential backoff up to roughly 30s. On any failure the function logs
+/// a WARN and returns; it never panics and never blocks startup.
+pub async fn auto_load_default_state_machine(app_state: &Arc<crate::commands::AppState>) {
+    // 1. Select a config from PG.
+    let configs = match app_state.pg_db.list_sm_configs().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "Auto-load state machine: failed to list SM configs from PG: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    if configs.is_empty() {
+        info!("Auto-load state machine: no state machine configs to auto-load");
+        return;
+    }
+
+    let mut selected: Option<SmConfigFull> = None;
+    for config in configs.iter() {
+        match app_state.pg_db.get_sm_config_full(&config.id).await {
+            Ok(Some(full)) => {
+                if !full.states.is_empty() || !full.transitions.is_empty() {
+                    selected = Some(full);
+                    break;
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(
+                    "Auto-load state machine: failed to load full config {}: {}",
+                    config.id, e
+                );
+                continue;
+            }
+        }
+    }
+
+    let selected = match selected {
+        Some(s) => s,
+        None => {
+            info!("Auto-load state machine: no non-empty configs to auto-load");
+            return;
+        }
+    };
+
+    let config_name = selected.config.name.clone();
+    let config_id = selected.config.id.clone();
+    let states_count = selected.states.len();
+    let transitions_count = selected.transitions.len();
+
+    // 2. Wait briefly for the Python bridge to come up.
+    //    Exponential backoff: 1s, 2s, 4s, 8s, 15s — capped at ~30s total.
+    let delays = [1u64, 2, 4, 8, 15];
+    let mut ready = false;
+    for &secs in &delays {
+        if is_default_bridge_running(app_state) {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    }
+    // Final check after last sleep.
+    if !ready {
+        ready = is_default_bridge_running(app_state);
+    }
+    if !ready {
+        warn!(
+            "Auto-load state machine: Python bridge not ready after ~30s; skipping auto-load of '{}' ({})",
+            config_name, config_id
+        );
+        return;
+    }
+
+    // 3. Serialize the full config and dispatch via the bridge.
+    let config_json = match serde_json::to_value(&selected) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Auto-load state machine: failed to serialize SmConfigFull '{}' ({}): {}",
+                config_name, config_id, e
+            );
+            return;
+        }
+    };
+
+    let params = serde_json::json!({ "config": config_json });
+    let timeout = std::time::Duration::from_secs(30);
+    let app_state_for_bridge = app_state.clone();
+
+    let dispatch = tokio::task::spawn_blocking(move || {
+        with_default_bridge(&app_state_for_bridge, |bridge| {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("load_state_machine", Some(params), timeout)
+        })
+    })
+    .await;
+
+    match dispatch {
+        Ok(Ok(Ok(response))) => {
+            if response.success {
+                info!(
+                    "Auto-load state machine: loaded '{}' ({}) — {} states, {} transitions",
+                    config_name, config_id, states_count, transitions_count
+                );
+            } else {
+                let err_msg = response
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string());
+                warn!(
+                    "Auto-load state machine: bridge returned failure for '{}' ({}): {}",
+                    config_name, config_id, err_msg
+                );
+            }
+        }
+        Ok(Ok(Err(e))) => {
+            warn!(
+                "Auto-load state machine: bridge send_command_and_wait failed for '{}' ({}): {}",
+                config_name, config_id, e
+            );
+        }
+        Ok(Err(e)) => {
+            warn!(
+                "Auto-load state machine: with_default_bridge returned error for '{}' ({}): {}",
+                config_name, config_id, e
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Auto-load state machine: spawn_blocking join error for '{}' ({}): {}",
+                config_name, config_id, e
+            );
+        }
+    }
 }

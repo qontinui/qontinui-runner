@@ -569,6 +569,29 @@ If the Additional Context contains a block labeled "Spec Generation Brief (JSON)
 
 For `click`, `ui_bridge_target` is a JSON-stringified **criteria object** (NOT an assertion array). The handler resolves it against a fresh snapshot, takes the first match, and POSTs `/control/element/<id>/action` with `{{"action":"click"}}`. Use `accessibleName` to disambiguate when multiple elements share the same textContent.
 
+8. **Prefer state-machine navigation when `targetStateId` is present.** If a brief group has a `targetStateId` field (a state id from the spec's `stateMachine` section), emit ONE `command` setup step with `command_mode: "shell"` that POSTs `/state-machine/navigate` to reach that state. The loaded state machine's transition already encodes the click sequence and `waitAfter` timing, and the target state's required elements are re-verified during navigation — so you do NOT need a separate `wait_for_element` or `click` setup step for that precondition. Use:
+
+   `curl -sS -X POST http://localhost:{runner_api_port}/state-machine/navigate -H "Content-Type: application/json" -d '{{"targetStates":["<targetStateId>"]}}'`
+
+   Note the payload key is `targetStates` (camelCase, plural) — that's what the Rust handler's `NavigateRequest` deserializes from (`#[serde(rename_all = "camelCase")]`).
+
+   If the runner's state machine is not loaded at execution time, this step will fail fast with a structured error — that's the expected signal, and the workflow as a whole then falls back cleanly. When `targetStateId` is absent on a group, follow rules 3/6/7 (the legacy click + wait_for_element pair) as before.
+
+### Canonical state-machine/navigate Step Example
+
+```json
+{{
+  "id": "<uuid>",
+  "type": "command",
+  "phase": "setup",
+  "name": "navigate_to_findings_panel",
+  "mode": "shell",
+  "command": "curl -sS -X POST http://localhost:{runner_api_port}/state-machine/navigate -H \"Content-Type: application/json\" -d '{{\"targetStates\":[\"findings-panel\"]}}'"
+}}
+```
+
+Emit exactly ONE such step per group that has `targetStateId`; do NOT additionally emit `wait_for_element` or `click` setup steps for that group's preconditions.
+
 ### Canonical snapshot_assert Step Example
 
 ```json

@@ -37,6 +37,7 @@ import { SpecExperimentationDashboard } from "@/components/specs/SpecExperimenta
 import { ContractBuilder } from "./ContractBuilder";
 import type { LoadedSpec } from "./types";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
+import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import { useSpecSync } from "@/hooks/useSpecSync";
 
@@ -556,6 +557,10 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
         `[Specs] State machine compiled: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions (engine not available — loadStateMachine not found on bridge)`,
       );
     }
+
+    // Best-effort: also persist to the backend DB so the compiled machine is
+    // available via the HTTP API (and survives runner restarts).
+    void persistCompiledStateMachine(stateMachine);
 
     if (stats.warnings.length > 0) {
       console.warn("[Specs] Compilation warnings:", stats.warnings);

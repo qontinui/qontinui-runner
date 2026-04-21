@@ -64,4 +64,170 @@ describe("buildSpecBrief", () => {
     expect(brief.summary).toContain("1 groups");
     expect(brief.summary).toContain("2 assertions");
   });
+
+  describe("targetStateId resolution", () => {
+    it("maps precondition to a matching state by name", () => {
+      const specConfig: SpecConfig = {
+        version: "1",
+        description: "test spec",
+        groups: [
+          {
+            id: "g1",
+            name: "Findings panel contents",
+            description: "Panel checks",
+            category: "ui",
+            setupActions: [],
+            assertions: [
+              {
+                id: "a1",
+                description: "Findings panel shows entries",
+                enabled: true,
+                precondition: "Findings panel must be open",
+                severity: "critical",
+                assertionType: "exists",
+                target: { criteria: { role: "region" } },
+              },
+            ],
+          },
+        ],
+        stateMachine: {
+          states: [
+            {
+              id: "findings-panel",
+              name: "Findings Panel Open",
+              description: "",
+              elements: [],
+              isInitial: false,
+              transitions: [],
+            },
+            {
+              id: "active-terminals",
+              name: "Active Terminals",
+              description: "",
+              elements: [],
+              isInitial: true,
+              transitions: [],
+            },
+          ],
+        },
+      };
+
+      const brief = buildSpecBrief({ specConfig });
+      expect(brief.groups[0].targetStateId).toBe("findings-panel");
+    });
+
+    it("resolves via id-token fallback when name does not match", () => {
+      const specConfig: SpecConfig = {
+        version: "1",
+        description: "test spec",
+        groups: [
+          {
+            id: "g1",
+            name: "Some generic group",
+            description: "",
+            category: "ui",
+            setupActions: [],
+            assertions: [
+              {
+                id: "a1",
+                description: "Thing is there",
+                enabled: true,
+                precondition: "The findings panel must be visible",
+                severity: "critical",
+                assertionType: "exists",
+                target: { criteria: { role: "region" } },
+              },
+            ],
+          },
+        ],
+        stateMachine: {
+          states: [
+            {
+              id: "findings-panel",
+              name: "Totally Different Name",
+              description: "",
+              elements: [],
+              isInitial: false,
+              transitions: [],
+            },
+          ],
+        },
+      };
+
+      const brief = buildSpecBrief({ specConfig });
+      expect(brief.groups[0].targetStateId).toBe("findings-panel");
+    });
+
+    it("leaves targetStateId undefined when no state matches", () => {
+      const specConfig: SpecConfig = {
+        version: "1",
+        description: "test spec",
+        groups: [
+          {
+            id: "g1",
+            name: "Header banner",
+            description: "",
+            category: "ui",
+            setupActions: [],
+            assertions: [
+              {
+                id: "a1",
+                description: "Header exists",
+                enabled: true,
+                severity: "critical",
+                assertionType: "exists",
+                target: { criteria: { selector: "#header" } },
+              },
+            ],
+          },
+        ],
+        stateMachine: {
+          states: [
+            {
+              id: "settings-modal",
+              name: "Settings Modal Open",
+              description: "",
+              elements: [],
+              isInitial: false,
+              transitions: [],
+            },
+          ],
+        },
+      };
+
+      const brief = buildSpecBrief({ specConfig });
+      expect(brief.groups[0].targetStateId).toBeUndefined();
+    });
+
+    it("leaves targetStateId undefined when spec has no stateMachine", () => {
+      const specConfig: SpecConfig = {
+        version: "1",
+        description: "test spec",
+        groups: [
+          {
+            id: "g1",
+            name: "Findings panel contents",
+            description: "",
+            category: "ui",
+            setupActions: [],
+            assertions: [
+              {
+                id: "a1",
+                description: "Findings panel shows entries",
+                enabled: true,
+                precondition: "Findings panel must be open",
+                severity: "critical",
+                assertionType: "exists",
+                target: { criteria: { role: "region" } },
+              },
+            ],
+          },
+        ],
+        // stateMachine intentionally absent (older specs)
+      };
+
+      const brief = buildSpecBrief({ specConfig });
+      expect(brief.groups[0].targetStateId).toBeUndefined();
+    });
+  });
 });

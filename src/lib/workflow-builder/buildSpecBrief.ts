@@ -20,7 +20,7 @@
  */
 
 import type { GenerationBrief, BriefGroup } from "../../types/generation-brief";
-import type { SpecAssertion, SpecConfig, SetupAction } from "./buildSpecWorkflow";
+import type { SpecAssertion, SpecConfig, SetupAction, SpecStateShape } from "./buildSpecWorkflow";
 import { isDeterministic } from "./buildSpecWorkflow";
 
 export interface BuildSpecBriefInput {
@@ -99,7 +99,44 @@ function derivePreconditions(groupName: string, assertions: SpecAssertion[]): st
   return preconditions;
 }
 
-function buildBriefGroup(group: SpecConfig["groups"][number]): BriefGroup {
+/**
+ * Try to match any of the group's free-text preconditions to a state in the
+ * spec's stateMachine. Returns the matching state's `id`, or undefined if no
+ * state matches. Matching is intentionally simple (substring on lowercased
+ * name, then token-split on id) — the plan calls out "simple substring match
+ * is fine."
+ */
+function matchPreconditionsToState(
+  preconditions: string[],
+  states: SpecStateShape[],
+): string | undefined {
+  for (const p of preconditions) {
+    const lower = p.toLowerCase();
+
+    // Prefer a name-based match (two-way substring so "Findings Panel Open"
+    // matches "Findings panel must be open" in either direction).
+    const byName = states.find((s) => {
+      const name = s.name.toLowerCase();
+      return lower.includes(name) || name.includes(lower);
+    });
+    if (byName) return byName.id;
+
+    // Fallback: id-based match — every token of the hyphen/underscore-split
+    // id must appear in the precondition text.
+    const byId = states.find((s) => {
+      const idTokens = s.id.toLowerCase().split(/[-_]/).filter(Boolean);
+      if (idTokens.length === 0) return false;
+      return idTokens.every((t) => lower.includes(t));
+    });
+    if (byId) return byId.id;
+  }
+  return undefined;
+}
+
+function buildBriefGroup(
+  group: SpecConfig["groups"][number],
+  stateMachineStates?: SpecStateShape[],
+): BriefGroup {
   const enabled = group.assertions.filter((a) => a.enabled);
   const deterministic: SpecAssertion[] = [];
   const semantic: SpecAssertion[] = [];
@@ -111,6 +148,23 @@ function buildBriefGroup(group: SpecConfig["groups"][number]): BriefGroup {
   const setupHints: SetupAction[] = group.setupActions ? [...group.setupActions] : [];
   const preconditions = derivePreconditions(group.name, enabled);
 
+  const targetStateId =
+    stateMachineStates && stateMachineStates.length > 0
+      ? matchPreconditionsToState(preconditions, stateMachineStates)
+      : undefined;
+
+  // Defensive sanity check — Known Risks §4 of the state-machine-navigation
+  // plan calls out spec drift. `targetStateId` is derived from `states`, so
+  // this should be impossible, but fail loudly if it ever isn't.
+  if (
+    targetStateId !== undefined &&
+    !(stateMachineStates ?? []).some((s) => s.id === targetStateId)
+  ) {
+    throw new Error(
+      `[buildSpecBrief] targetStateId "${targetStateId}" for group "${group.id}" does not match any state in the spec stateMachine. This indicates spec drift.`,
+    );
+  }
+
   return {
     id: group.id,
     name: group.name,
@@ -119,6 +173,7 @@ function buildBriefGroup(group: SpecConfig["groups"][number]): BriefGroup {
     setupHints,
     deterministicAssertions: deterministic,
     semanticAssertions: semantic,
+    ...(targetStateId !== undefined ? { targetStateId } : {}),
   };
 }
 
@@ -135,7 +190,8 @@ export function buildSpecBrief(input: BuildSpecBriefInput): GenerationBrief {
     ? specConfig.groups.filter((g) => selectedGroupIds.has(g.id))
     : specConfig.groups;
 
-  const groups = selectedGroups.map(buildBriefGroup);
+  const stateMachineStates = specConfig.stateMachine?.states;
+  const groups = selectedGroups.map((g) => buildBriefGroup(g, stateMachineStates));
 
   const totalAssertions = groups.reduce(
     (sum, g) => sum + g.deterministicAssertions.length + g.semanticAssertions.length,

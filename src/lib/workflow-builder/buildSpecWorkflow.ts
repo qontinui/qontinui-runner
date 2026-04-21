@@ -85,12 +85,30 @@ export interface SpecGroup {
   [key: string]: unknown;
 }
 
+/** Minimal shape of a state in the spec stateMachine. Kept structurally compatible
+ *  with `SpecState` in `../spec-prompt-builder.ts` so callers can pass either. */
+export interface SpecStateShape {
+  id: string;
+  name: string;
+  description?: string;
+  elements?: Record<string, unknown>[];
+  isInitial?: boolean;
+  transitions?: unknown[];
+}
+
+export interface SpecStateMachineShape {
+  states: SpecStateShape[];
+}
+
 export interface SpecConfig {
   version: string;
   description?: string;
   groups: SpecGroup[];
   assertions?: unknown[];
   metadata?: Record<string, unknown>;
+  /** Optional state machine section — when present, buildSpecBrief will map
+   *  group preconditions to state IDs for one-step navigation. */
+  stateMachine?: SpecStateMachineShape;
 }
 
 export interface BuildSpecWorkflowInput {

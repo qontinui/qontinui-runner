@@ -34,6 +34,7 @@ import { getGlobalRegistry } from "@qontinui/ui-bridge";
 import { getUIBridgeGlobal } from "./ui-bridge-events/utils";
 import { getAllSpecs } from "@/lib/spec-registry";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
+import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 
 const SM_SELECTED_CONFIG_KEY = "qontinui-runner-sm-selected-config";
@@ -430,6 +431,9 @@ export function useStateMachineRegistration(): void {
           console.info(
             `[StateMachine] Auto-compiled from bundled specs: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions`,
           );
+          // Best-effort: also persist to the backend DB so the compiled machine
+          // is available via the HTTP API (and survives runner restarts).
+          void persistCompiledStateMachine(stateMachine);
         }
       } catch (e) {
         console.warn("[StateMachine] Auto-compile from specs failed:", e);
