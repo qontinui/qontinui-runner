@@ -5,6 +5,7 @@
 //! - LAN — Direct Wi-Fi connection via TCP proxy
 //! - Cloud — Relayed via qontinui.io backend WebSocket (fallback)
 
+pub mod ios; // Plan 2: iOS device transport (pymobiledevice3 sidecar)
 pub mod lan;
 pub mod pairing;
 pub mod usb;
@@ -98,6 +99,9 @@ pub enum TransportError {
 
     #[error("Pairing error: {0}")]
     PairingError(String),
+
+    #[error("iOS sidecar error: {0}")]
+    IosSidecar(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

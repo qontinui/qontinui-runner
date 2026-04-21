@@ -225,6 +225,8 @@ pub struct ApiState {
     pub pairing_manager: Arc<crate::mcp::transport::pairing::PairingManager>,
     /// Rathole tunnel client (Plan 1B). Singleton — only one tunnel active.
     pub tunnel_client: Arc<crate::tunnel::RatholeClient>,
+    /// iOS transport sidecar (Plan 2). Started lazily on first iOS request.
+    pub ios_transport: Arc<crate::mcp::transport::ios::IosTransport>,
 }
 
 /// Response for API endpoints

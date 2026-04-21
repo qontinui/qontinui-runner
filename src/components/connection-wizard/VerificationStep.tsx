@@ -45,9 +45,15 @@ interface HealthBody {
   };
 }
 
-// Shape returned by the UI Bridge /elements endpoint. Real payload is richer;
-// we only pluck label/type for the preview.
-interface ElementsBody {
+// Shape returned by /ui-bridge/control/snapshot. The snapshot is the canonical
+// element source across runner and mobile SDK (the flat /elements endpoint
+// isn't implemented by ui-bridge-native). Real payload is richer; we pluck
+// label/type/id for the wizard's preview.
+interface SnapshotBody {
+  success?: boolean;
+  data?: {
+    elements?: Array<{ id: string; label?: string; type?: string }>;
+  };
   elements?: Array<{ id: string; label?: string; type?: string }>;
 }
 
@@ -94,14 +100,22 @@ export function VerificationStep({
     let proxyUrl = api.state.proxyUrl;
     try {
       if (api.state.connectionType === "usb" && api.state.deviceId) {
-        const resp = await tracedFetch(`${getApiBase()}/ui-bridge/apps/forward-device`, {
+        // Android uses ADB forward; iOS uses the pymobiledevice3 sidecar.
+        const isIos = api.state.platform === "ios";
+        const endpoint = isIos
+          ? `${getApiBase()}/ui-bridge/ios/forward`
+          : `${getApiBase()}/ui-bridge/apps/forward-device`;
+        const payload = isIos
+          ? { udid: api.state.deviceId, devicePort: 9876 }
+          : { deviceId: api.state.deviceId };
+        const resp = await tracedFetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ deviceId: api.state.deviceId }),
+          body: JSON.stringify(payload),
         });
         const body: ApiResponse<ForwardDeviceResponse> = await resp.json();
         if (!body.success || !body.data) {
-          throw new Error(body.error ?? "ADB forward failed");
+          throw new Error(body.error ?? "USB forward failed");
         }
         proxyUrl = `http://127.0.0.1:${body.data.localPort}`;
       }
@@ -133,13 +147,15 @@ export function VerificationStep({
       return;
     }
 
-    // Stage 3: elements
+    // Stage 3: elements via /control/snapshot — canonical across runner + mobile.
     update("elements", { state: "running" });
     try {
-      const resp = await tracedFetch(`${proxyUrl}/ui-bridge/elements`);
+      const resp = await tracedFetch(
+        `${proxyUrl}/ui-bridge/control/snapshot?visibleOnly=true&maxElements=200`,
+      );
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const body: ElementsBody = await resp.json();
-      const elements = body.elements ?? [];
+      const body: SnapshotBody = await resp.json();
+      const elements = body.data?.elements ?? body.elements ?? [];
       if (elements.length === 0) {
         throw new Error("elements endpoint returned empty list");
       }

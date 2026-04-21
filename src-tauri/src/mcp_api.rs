@@ -362,6 +362,7 @@ pub fn create_router(
         ),
         pairing_manager: Arc::new(crate::mcp::transport::pairing::PairingManager::new()),
         tunnel_client: Arc::new(crate::tunnel::RatholeClient::new()),
+        ios_transport: Arc::new(crate::mcp::transport::ios::IosTransport::new()),
     });
 
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking

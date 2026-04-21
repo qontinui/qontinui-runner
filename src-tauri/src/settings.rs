@@ -802,10 +802,20 @@ pub struct WebIntegrationSettings {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Base URL of qontinui-web, e.g. "https://api.qontinui.io" or "http://127.0.0.1:8000".
+    /// API base — the FastAPI backend that serves `/api/v1/*`. In a unified
+    /// production deployment this is also the origin that serves the web SPA.
+    /// Example: `https://api.qontinui.io` or `http://127.0.0.1:8000`.
     /// No trailing slash required.
     #[serde(default)]
     pub backend_url: String,
+
+    /// Optional override for the Next.js web frontend origin — the host that
+    /// serves user-facing pages like `/connect-runner`. When unset, falls
+    /// back to `backend_url`. Only needed in split local-dev setups where
+    /// the API (8000) and SPA (3001) run on different ports.
+    /// No trailing slash required.
+    #[serde(default)]
+    pub web_base_url: Option<String>,
 
     /// Plain runner token (qontinui_runner_<64hex>) created via the web UI or API.
     /// Stored plaintext — acceptable since the settings file is user-local.

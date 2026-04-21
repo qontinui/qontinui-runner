@@ -1,0 +1,8 @@
+# Plan 2: iOS transport sidecar — pymobiledevice3 wrapper.
+#
+# pymobiledevice3 implements Apple's usbmux/Lockdown/RemoteXPC protocols in
+# pure Python (no Xcode / libimobiledevice dependency). It works on Windows,
+# macOS, and Linux via libusb.
+pymobiledevice3>=4.14.0
+fastapi>=0.115.0
+uvicorn>=0.32.0

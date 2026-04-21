@@ -83,6 +83,11 @@ fn normalize_for_compare(s: &WebIntegrationSettings) -> WebIntegrationSettings {
     WebIntegrationSettings {
         enabled: s.enabled,
         backend_url: trim_backend_url(&s.backend_url),
+        web_base_url: s
+            .web_base_url
+            .as_deref()
+            .map(trim_backend_url)
+            .filter(|s| !s.is_empty()),
         runner_token: s.runner_token.trim().to_string(),
     }
 }
@@ -98,6 +103,7 @@ fn normalize_for_compare(s: &WebIntegrationSettings) -> WebIntegrationSettings {
 /// from the background registration retry loop, or `None` if registration
 /// succeeded (or has not yet been attempted).
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetWebIntegrationStatusResponse {
     pub enabled: bool,
     pub backend_url: String,
@@ -184,7 +190,8 @@ pub async fn apply_web_integration_settings(
     // Spawn background tasks on the new state (if any).
     if let Some(new_state) = new_state_opt {
         let restate_enabled = settings::load_settings().restate.enabled;
-        crate::server_mode::spawn_background_tasks(new_state, restate_enabled);
+        let ui_error_state = app_state.ui_error.clone();
+        crate::server_mode::spawn_background_tasks(new_state, restate_enabled, ui_error_state);
         info!(
             "Web-integration hot-reload: background tasks spawned (backend={})",
             normalized.backend_url
@@ -244,10 +251,16 @@ pub async fn save_web_integration_settings(
     enabled: bool,
     backend_url: String,
     runner_token: String,
+    #[allow(non_snake_case)] web_base_url: Option<String>,
 ) -> Result<(), String> {
     let settings = WebIntegrationSettings {
         enabled,
         backend_url,
+        web_base_url: web_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         runner_token,
     };
     apply_web_integration_settings(app_state.inner().as_ref(), &app_handle, settings).await

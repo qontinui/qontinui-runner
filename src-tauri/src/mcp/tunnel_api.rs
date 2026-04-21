@@ -34,12 +34,21 @@ pub struct GenerateConfigRequest {
     #[serde(default)]
     pub default_token: Option<String>,
     pub services: Vec<TunnelService>,
+    /// Optional: bind host for the server TOML (default `0.0.0.0`).
+    #[serde(default)]
+    pub server_bind_host: Option<String>,
+    /// Optional: starting public port for server-side services
+    /// (default `5200`, incremented per service).
+    #[serde(default)]
+    pub public_bind_start: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateConfigResponse {
     pub client_toml: String,
+    /// Mirror server-side TOML for the user's rathole VPS (Plan 1B polish).
+    pub server_toml: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,13 +111,18 @@ async fn generate_config(
     State(_state): State<Arc<ApiState>>,
     Json(req): Json<GenerateConfigRequest>,
 ) -> Result<Json<ApiResponse<GenerateConfigResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let bind_host = req.server_bind_host.as_deref().unwrap_or("0.0.0.0");
+    let public_start = req.public_bind_start.unwrap_or(5200);
     let config = RatholeConfig {
         server_addr: req.server_addr,
         default_token: req.default_token,
         services: req.services,
     };
+    let client_toml = config.to_toml();
+    let server_toml = config.to_server_toml(bind_host, public_start);
     Ok(Json(ApiResponse::success(GenerateConfigResponse {
-        client_toml: config.to_toml(),
+        client_toml,
+        server_toml,
     })))
 }
 

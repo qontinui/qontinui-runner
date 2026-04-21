@@ -459,6 +459,37 @@ async fn scan_mobile(
     Ok(Json(ApiResponse::success(devices)))
 }
 
+/// Scan iOS devices only (Plan 2) — spawns ios_bridge sidecar on first call.
+async fn scan_ios(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<MobileDevice>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let ios_devices = match state.ios_transport.list_devices().await {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(Json(ApiResponse::error(format!(
+                "iOS scan failed: {e}"
+            ))));
+        }
+    };
+
+    let mobile: Vec<MobileDevice> = ios_devices
+        .into_iter()
+        .map(|d| MobileDevice {
+            device_id: d.udid,
+            device_type: format!("ios-{}", d.connection),
+            model: d
+                .name
+                .clone()
+                .or(d.product_type.clone())
+                .or_else(|| Some("iOS device".to_string())),
+            status: if d.paired { "online" } else { "unauthorized" }.to_string(),
+            ui_bridge: None,
+        })
+        .collect();
+
+    Ok(Json(ApiResponse::success(mobile)))
+}
+
 // ============================================================================
 // ADB Port Forwarding (persistent, for connecting to mobile devices)
 // ============================================================================
@@ -551,6 +582,33 @@ async fn forward_device(
     })))
 }
 
+/// iOS USB port forward (Plan 2) — routes through the pymobiledevice3 sidecar.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IosForwardRequest {
+    pub udid: String,
+    #[serde(default = "default_remote_port")]
+    pub device_port: u16,
+}
+
+async fn ios_forward(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<IosForwardRequest>,
+) -> Result<Json<ApiResponse<ForwardDeviceResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state
+        .ios_transport
+        .forward_port(&req.udid, req.device_port)
+        .await
+    {
+        Ok(local_port) => Ok(Json(ApiResponse::success(ForwardDeviceResponse {
+            local_port,
+            device_id: req.udid,
+            remote_port: req.device_port,
+        }))),
+        Err(e) => Ok(Json(ApiResponse::error(format!("iOS forward: {e}")))),
+    }
+}
+
 /// Manual app registration
 async fn register_app(
     State(_state): State<Arc<ApiState>>,
@@ -583,6 +641,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/apps/scan/web", get(scan_web))
         .route("/ui-bridge/apps/scan/desktop", get(scan_desktop))
         .route("/ui-bridge/apps/scan/mobile", get(scan_mobile))
+        .route("/ui-bridge/apps/scan/ios", get(scan_ios))
         .route("/ui-bridge/apps/register", post(register_app))
         .route("/ui-bridge/apps/forward-device", post(forward_device))
+        .route("/ui-bridge/ios/forward", post(ios_forward))
 }

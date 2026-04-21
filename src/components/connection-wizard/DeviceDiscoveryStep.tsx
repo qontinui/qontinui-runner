@@ -55,20 +55,51 @@ export function DeviceDiscoveryStep({ api }: { api: WizardApi }) {
 // USB branch
 // ---------------------------------------------------------------------------
 
+interface UsbDevice extends MobileDeviceApi {
+  platform: Platform;
+}
+
 function UsbBranch({ api }: { api: WizardApi }) {
-  const [devices, setDevices] = useState<MobileDeviceApi[]>([]);
+  const [devices, setDevices] = useState<UsbDevice[]>([]);
   const [loading, setLoading] = useState(false);
+  const [iosError, setIosError] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);
     api.setError(null);
+    setIosError(null);
     try {
-      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/apps/scan/mobile`);
-      const body: ApiResponse<MobileDeviceApi[]> = await resp.json();
-      if (!body.success || !body.data) {
-        throw new Error(body.error ?? "Scan failed");
+      // Android via adb_client (Plan 1A) and iOS via ios_bridge (Plan 2) —
+      // fetched in parallel. iOS failure is non-fatal (user may not have
+      // pymobiledevice3 installed); Android failure is.
+      const [androidResp, iosResp] = await Promise.all([
+        tracedFetch(`${getApiBase()}/ui-bridge/apps/scan/mobile`),
+        tracedFetch(`${getApiBase()}/ui-bridge/apps/scan/ios`).catch(() => null),
+      ]);
+
+      const androidBody: ApiResponse<MobileDeviceApi[]> = await androidResp.json();
+      if (!androidBody.success || !androidBody.data) {
+        throw new Error(androidBody.error ?? "Android scan failed");
       }
-      setDevices(body.data.filter((d) => d.status === "online"));
+      const androidDevices: UsbDevice[] = androidBody.data
+        .filter((d) => d.status === "online")
+        .map((d) => ({ ...d, platform: "android" as const }));
+
+      let iosDevices: UsbDevice[] = [];
+      if (iosResp) {
+        const iosBody: ApiResponse<MobileDeviceApi[]> = await iosResp.json();
+        if (iosBody.success && iosBody.data) {
+          // iOS USB shows as connection=usb in our mapping; skip network
+          // entries from Bonjour (those belong in the LAN branch).
+          iosDevices = iosBody.data
+            .filter((d) => d.deviceType === "ios-usb" && d.status === "online")
+            .map((d) => ({ ...d, platform: "ios" as const }));
+        } else if (iosBody.error) {
+          setIosError(iosBody.error);
+        }
+      }
+
+      setDevices([...androidDevices, ...iosDevices]);
     } catch (e) {
       api.setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -82,17 +113,13 @@ function UsbBranch({ api }: { api: WizardApi }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const pick = (d: MobileDeviceApi) => {
-    const platform: Platform =
-      d.deviceId.startsWith("emulator-") || d.deviceType === "emulator" ? "android" : "android"; // USB iOS is Plan 2; Plan 3 treats USB as Android for now.
+  const pick = (d: UsbDevice) => {
     const discovered: DiscoveredDevice = {
       deviceId: d.deviceId,
-      platform,
+      platform: d.platform,
       model: d.model,
-      adbSerial: d.deviceId,
+      adbSerial: d.platform === "android" ? d.deviceId : undefined,
     };
-    // USB transport establishment happens via /ui-bridge/apps/forward-device
-    // during the Verification step; we don't have a proxyUrl yet.
     api.setDevice(discovered, null);
     api.next();
   };
@@ -100,7 +127,9 @@ function UsbBranch({ api }: { api: WizardApi }) {
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <p className="text-sm text-muted-foreground">Connected devices reported by ADB.</p>
+        <p className="text-sm text-muted-foreground">
+          Connected Android (ADB) + iOS (pymobiledevice3) devices.
+        </p>
         <Button variant="ghost" size="sm" onClick={load} disabled={loading}>
           {loading ? (
             <Loader2 className="w-4 h-4 animate-spin" />
@@ -115,9 +144,9 @@ function UsbBranch({ api }: { api: WizardApi }) {
         <EmptyDeviceHint
           title="No devices found"
           hints={[
-            "Plug the phone into this computer with a USB cable",
-            "Enable Developer Options → USB debugging on the phone",
-            "Accept the 'Trust this computer' dialog on the phone",
+            "Android: enable Developer Options → USB debugging and accept the RSA prompt",
+            "iOS: accept 'Trust this computer' on the iPhone",
+            "pymobiledevice3 must be installed for iOS detection (pip install pymobiledevice3)",
           ]}
         />
       ) : (
@@ -127,11 +156,15 @@ function UsbBranch({ api }: { api: WizardApi }) {
               key={d.deviceId}
               id={d.deviceId}
               model={d.model}
-              sub={d.deviceType}
+              sub={`${d.platform} · ${d.deviceType}`}
               onPick={() => pick(d)}
             />
           ))}
         </ul>
+      )}
+
+      {iosError && (
+        <p className="text-xs text-muted-foreground">iOS scan unavailable: {iosError}</p>
       )}
     </div>
   );
@@ -260,7 +293,9 @@ function LanBranch({ api }: { api: WizardApi }) {
 function RemoteBranch({ api }: { api: WizardApi }) {
   const [serverAddr, setServerAddr] = useState("");
   const [token, setToken] = useState("");
-  const [toml, setToml] = useState<string | null>(null);
+  const [clientToml, setClientToml] = useState<string | null>(null);
+  const [serverToml, setServerToml] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"client" | "server">("client");
 
   const generate = async () => {
     api.setError(null);
@@ -280,12 +315,13 @@ function RemoteBranch({ api }: { api: WizardApi }) {
         ],
       }),
     });
-    const body: ApiResponse<{ clientToml: string }> = await resp.json();
+    const body: ApiResponse<{ clientToml: string; serverToml: string }> = await resp.json();
     if (!body.success || !body.data) {
       api.setError(body.error ?? "Config generation failed");
       return;
     }
-    setToml(body.data.clientToml);
+    setClientToml(body.data.clientToml);
+    setServerToml(body.data.serverToml);
     api.setTunnelConfig({ serverAddr, token });
   };
 
@@ -323,7 +359,7 @@ function RemoteBranch({ api }: { api: WizardApi }) {
         <Button variant="primary" onClick={generate} disabled={!serverAddr || !token}>
           Generate config
         </Button>
-        {toml && (
+        {clientToml && (
           <Button
             variant="secondary"
             onClick={() => {
@@ -335,10 +371,45 @@ function RemoteBranch({ api }: { api: WizardApi }) {
         )}
       </div>
 
-      {toml && (
-        <pre className="mt-2 p-3 rounded-md bg-zinc-900 border border-zinc-700 text-xs text-zinc-300 whitespace-pre-wrap max-h-48 overflow-auto">
-          {toml}
-        </pre>
+      {clientToml && serverToml && (
+        <div className="space-y-2 mt-2">
+          <div className="flex gap-2 text-xs">
+            <button
+              onClick={() => setActiveTab("client")}
+              className={
+                "px-2 py-1 rounded " +
+                (activeTab === "client"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-zinc-800 text-muted-foreground hover:text-foreground")
+              }
+            >
+              client.toml (runner)
+            </button>
+            <button
+              onClick={() => setActiveTab("server")}
+              className={
+                "px-2 py-1 rounded " +
+                (activeTab === "server"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-zinc-800 text-muted-foreground hover:text-foreground")
+              }
+            >
+              server.toml (VPS)
+            </button>
+          </div>
+
+          <pre className="p-3 rounded-md bg-zinc-900 border border-zinc-700 text-xs text-zinc-300 whitespace-pre-wrap max-h-56 overflow-auto">
+            {activeTab === "client" ? clientToml : serverToml}
+          </pre>
+
+          {activeTab === "server" && (
+            <p className="text-[11px] text-muted-foreground">
+              Copy this to your rathole server (Oracle Cloud Free Tier is a good free option) as{" "}
+              <code>server.toml</code>. The bundled deploy script at{" "}
+              <code>scripts/rathole-oracle-deploy.sh</code> automates the setup.
+            </p>
+          )}
+        </div>
       )}
     </div>
   );

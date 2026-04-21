@@ -38,9 +38,8 @@ pub struct RatholeConfig {
 }
 
 impl RatholeConfig {
-    /// Render this config as rathole-compatible TOML.
-    ///
-    /// Rathole's client-side config shape (from their docs):
+    /// Render the **client-side** TOML that the runner hands to its embedded
+    /// rathole client.
     ///
     /// ```toml
     /// [client]
@@ -71,6 +70,59 @@ impl RatholeConfig {
 
         out
     }
+
+    /// Render the mirror **server-side** TOML for the user's rathole VPS.
+    ///
+    /// Key differences from the client TOML:
+    /// - `[server]` with `bind_addr` (the port the client connects to)
+    /// - Each service's `bind_addr` is the public port the phone / device
+    ///   reaches out to. We pick a deterministic offset from the server's
+    ///   bind port if the caller doesn't override `public_bind_start`.
+    ///
+    /// ```toml
+    /// [server]
+    /// bind_addr = "0.0.0.0:2333"
+    /// default_token = "..."
+    ///
+    /// [server.services.ui-bridge]
+    /// token = "..."
+    /// bind_addr = "0.0.0.0:5202"
+    /// ```
+    ///
+    /// The `server_bind_host` argument lets the caller choose `0.0.0.0`
+    /// (everything), `[::]:` (dual-stack), or a specific interface.
+    pub fn to_server_toml(&self, server_bind_host: &str, public_bind_start: u16) -> String {
+        // `server_addr` in this struct is "host:port" — the server listens on
+        // that port. The public per-service ports start at `public_bind_start`
+        // and increment by one per service (stable order).
+        let control_port = self
+            .server_addr
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .unwrap_or(2333);
+
+        let mut out = String::new();
+        out.push_str("[server]\n");
+        out.push_str(&format!(
+            "bind_addr = \"{server_bind_host}:{control_port}\"\n"
+        ));
+        if let Some(token) = &self.default_token {
+            out.push_str(&format!("default_token = \"{}\"\n", token));
+        }
+        out.push('\n');
+
+        for (i, svc) in self.services.iter().enumerate() {
+            let public_port = public_bind_start.saturating_add(i as u16);
+            out.push_str(&format!("[server.services.{}]\n", svc.name));
+            out.push_str(&format!("token = \"{}\"\n", svc.token));
+            out.push_str(&format!(
+                "bind_addr = \"{server_bind_host}:{public_port}\"\n"
+            ));
+            out.push('\n');
+        }
+
+        out
+    }
 }
 
 #[cfg(test)]
@@ -93,5 +145,35 @@ mod tests {
         assert!(toml.contains("remote_addr = \"relay.qontinui.io:2333\""));
         assert!(toml.contains("[client.services.ui-bridge]"));
         assert!(toml.contains("local_addr = \"127.0.0.1:9876\""));
+    }
+
+    #[test]
+    fn renders_server_toml_mirror() {
+        let cfg = RatholeConfig {
+            server_addr: "relay.qontinui.io:2333".to_string(),
+            default_token: Some("shared-secret".to_string()),
+            services: vec![
+                TunnelService {
+                    name: "ui-bridge".to_string(),
+                    local_addr: "127.0.0.1:9876".to_string(),
+                    service_type: "tcp".to_string(),
+                    token: "svc-a".to_string(),
+                },
+                TunnelService {
+                    name: "api".to_string(),
+                    local_addr: "127.0.0.1:8000".to_string(),
+                    service_type: "tcp".to_string(),
+                    token: "svc-b".to_string(),
+                },
+            ],
+        };
+        let server = cfg.to_server_toml("0.0.0.0", 5200);
+        assert!(server.contains("bind_addr = \"0.0.0.0:2333\""));
+        assert!(server.contains("[server.services.ui-bridge]"));
+        assert!(server.contains("bind_addr = \"0.0.0.0:5200\""));
+        assert!(server.contains("[server.services.api]"));
+        assert!(server.contains("bind_addr = \"0.0.0.0:5201\""));
+        // Server TOML must not leak the client's local_addr
+        assert!(!server.contains("127.0.0.1:9876"));
     }
 }
