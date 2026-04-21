@@ -123,7 +123,7 @@ pub struct CacheAwareRequestBuilder {
 
 /// Minimum character length for a block to be worth caching.
 /// Roughly maps to ~256 tokens. Blocks smaller than this are merged or left uncached.
-const MIN_CACHEABLE_CHARS: usize = 1024;
+pub(super) const MIN_CACHEABLE_CHARS: usize = 1024;
 
 impl CacheAwareRequestBuilder {
     /// Create a new builder for the given model.

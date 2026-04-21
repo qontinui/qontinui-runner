@@ -187,6 +187,10 @@ pub struct ScriptedOutputStats {
     pub total_tokens_in: u64,
     /// Total output tokens summed across `scripted_output.llm_ok` events.
     pub total_tokens_out: u64,
+    /// Sum of `cache_creation_tokens` across all `scripted_output.llm_ok` events.
+    pub cache_creation_tokens: u64,
+    /// Sum of `cache_read_tokens` across all `scripted_output.llm_ok` events.
+    pub cache_read_tokens: u64,
 }
 
 /// Aggregate scripted-output activity-timeline events into a single
@@ -214,6 +218,8 @@ pub async fn get_scripted_output_stats(
         fallbacks: std::collections::HashMap::new(),
         total_tokens_in: 0,
         total_tokens_out: 0,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
     };
 
     for (text_content, metadata_json) in rows {
@@ -245,6 +251,13 @@ pub async fn get_scripted_output_stats(
                         .and_then(|v| v.as_u64())
                     {
                         stats.total_tokens_out = stats.total_tokens_out.saturating_add(n);
+                    }
+                    if let Some(n) = m.get("cache_creation_tokens").and_then(|v| v.as_u64()) {
+                        stats.cache_creation_tokens =
+                            stats.cache_creation_tokens.saturating_add(n);
+                    }
+                    if let Some(n) = m.get("cache_read_tokens").and_then(|v| v.as_u64()) {
+                        stats.cache_read_tokens = stats.cache_read_tokens.saturating_add(n);
                     }
                     // Some Phase-B builds may roll `bytes_avoided` into the
                     // llm_ok event. Include it here defensively.

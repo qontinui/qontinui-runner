@@ -38,6 +38,18 @@ export interface ScriptedOutputStats {
   fallbacks: Record<string, number>;
   totalTokensIn: number;
   totalTokensOut: number;
+  /**
+   * Sum of `cache_creation_tokens` across all `scripted_output.llm_ok`
+   * events. Non-zero only when the warm provider's system prefix crossed
+   * the minimum cacheable size and the cache was freshly populated.
+   */
+  cacheCreationTokens: number;
+  /**
+   * Sum of `cache_read_tokens` across all `scripted_output.llm_ok` events.
+   * Non-zero only after the cache is populated and the ≥2s propagation
+   * window has elapsed.
+   */
+  cacheReadTokens: number;
 }
 
 export const scriptedOutputKeys = {

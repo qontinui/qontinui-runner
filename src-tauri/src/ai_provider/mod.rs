@@ -12,6 +12,7 @@
 pub mod cache_aware_builder;
 pub mod circuit_breaker;
 mod claude_api;
+pub(crate) mod claude_api_warm;
 mod claude_cli;
 pub mod compaction_middleware;
 mod config;

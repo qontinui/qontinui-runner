@@ -823,7 +823,7 @@ fn compute_expected_usage(
 }
 
 /// Read the OAuth access token from a Claude config directory's credentials file.
-fn read_oauth_token(config_dir: &str) -> Result<String, String> {
+pub(crate) fn read_oauth_token(config_dir: &str) -> Result<String, String> {
     let creds_path = std::path::PathBuf::from(config_dir).join(".credentials.json");
     let content = std::fs::read_to_string(&creds_path)
         .map_err(|e| format!("Cannot read {}: {}", creds_path.display(), e))?;
@@ -1122,7 +1122,7 @@ pub struct CliAuthStatus {
 }
 
 /// Find the Claude CLI credentials file, respecting config_dir settings.
-fn find_claude_credentials_path() -> Option<std::path::PathBuf> {
+pub(crate) fn find_claude_credentials_path() -> Option<std::path::PathBuf> {
     // 1. Check effective config_dir from runner AI settings (respects least-usage mode)
     let ai_settings = settings::get_ai_settings();
     let effective_dir = crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);

@@ -205,6 +205,25 @@ export function ScriptedOutputPanel({ taskRunId }: ScriptedOutputPanelProps) {
               value={humanizeTokens(stats.totalTokensOut)}
               subtitle="across llm_ok"
             />
+            <MetricCard
+              title="Prompt cache hit"
+              value={formatRate(
+                stats.cacheReadTokens,
+                stats.cacheReadTokens + stats.cacheCreationTokens,
+              )}
+              subtitle="read / (read + create)"
+              variant={
+                stats.cacheReadTokens + stats.cacheCreationTokens > 0 &&
+                stats.cacheReadTokens / (stats.cacheReadTokens + stats.cacheCreationTokens) >= 0.7
+                  ? "success"
+                  : "default"
+              }
+            />
+            <MetricCard
+              title="Cache-tokens saved"
+              value={humanizeTokens(stats.cacheReadTokens)}
+              subtitle="billed at ~10% rate"
+            />
           </div>
 
           {fallbackRows.length > 0 && (

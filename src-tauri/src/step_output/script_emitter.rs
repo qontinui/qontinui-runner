@@ -103,6 +103,17 @@ pub struct EmitResult {
     /// Which cache tier served this (only Tier 1 exists today). `None` for
     /// LLM responses.
     pub cache_tier: Option<u8>,
+    /// Which provider served this call: `"claude_api"`, `"claude_api_warm"`,
+    /// or `"cache"`. Lets the TS panel format `model@provider`.
+    pub provider: String,
+    /// Tokens written to Anthropic prompt cache (1.25× base input price). Only
+    /// non-zero when the warm provider's system prefix crossed the minimum
+    /// cacheable size on this call.
+    pub cache_creation_tokens: u32,
+    /// Tokens read from Anthropic prompt cache (0.1× base input price).
+    /// Only non-zero after the cache is populated and the ≥2s propagation
+    /// window has elapsed.
+    pub cache_read_tokens: u32,
 }
 
 /// Per-task_run running counters exposed via [`get_task_run_stats`] for
@@ -221,6 +232,9 @@ pub async fn emit_extraction_script(
             tokens_out: 0,
             source: "cache".to_string(),
             cache_tier: Some(1),
+            provider: "cache".to_string(),
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
     }
 
@@ -262,25 +276,59 @@ pub async fn emit_extraction_script(
     // ------------------------------------------------------- 5. Model + prompt
     let model = resolve_model();
     let schema = response_schema();
-    let system_and_user = build_prompt(&goal, &schema_hint, &output_preview);
+    let provider_mode = resolve_provider_mode();
+    // Split the prompt so the stable `system_prefix` (preamble + worked
+    // examples + version suffix) can be marked for caching, while the
+    // per-call `{goal, schemaHint, outputPreview}` rides in the user message
+    // without polluting the cache key.
+    let (system_prefix, user_message) = build_prompt_split(&goal, &schema_hint, &output_preview);
 
     // ---------------------------------------------- 6. Issue LLM call w/ timeout
-    // `run_prompt_with_structured_output` is blocking; wrap in spawn_blocking
-    // as the rest of the codebase does.
+    // All provider paths are blocking; wrap in spawn_blocking as the rest of
+    // the codebase does. We dispatch on `provider_mode` inside the closure so
+    // the hot-path is symmetric across modes.
     let model_owned = model.clone();
+    let ai_settings_snapshot = crate::settings::get_ai_settings();
+    let schema_for_call = schema.clone();
+    let system_prefix_for_call = system_prefix.clone();
+    let user_message_for_call = user_message.clone();
+
     let llm_call = async move {
-        let model_for_task = model_owned.clone();
         tokio::task::spawn_blocking(move || {
-            run_prompt_with_structured_output(
-                &system_and_user,
-                &schema,
-                "scripted_output_extraction",
-                None, // no Doctor handle — this is a short synthetic call
-                Some(&model_for_task),
-                None, // let the runner's configured AI provider decide (claude_cli, claude_api, …)
-                Some(0.0),      // deterministic
-                Some(512),      // cap: expression is < 512 tokens always
-            )
+            match provider_mode {
+                ScriptedOutputProviderMode::Auto | ScriptedOutputProviderMode::ClaudeApiWarm => {
+                    crate::ai_provider::claude_api_warm::run_claude_api_warm_with_structured_output(
+                        &system_prefix_for_call,
+                        &user_message_for_call,
+                        &ai_settings_snapshot.claude_api,
+                        Some(&model_owned),
+                        None,            // no Doctor handle — short synthetic call
+                        Some(0.0),       // deterministic
+                        Some(512),       // cap: expression is < 512 tokens always
+                        &schema_for_call,
+                        "scripted_output_extraction",
+                    )
+                }
+                ScriptedOutputProviderMode::ClaudeApi => {
+                    // Legacy keychain-API-key path. This path can't take a
+                    // split prompt, so concatenate the two halves. No
+                    // caching on this path — that's the point of the mode.
+                    let concatenated = format!(
+                        "{}\n\n---\n\n{}",
+                        system_prefix_for_call, user_message_for_call
+                    );
+                    run_prompt_with_structured_output(
+                        &concatenated,
+                        &schema_for_call,
+                        "scripted_output_extraction",
+                        None,
+                        Some(&model_owned),
+                        Some("claude_api"),
+                        Some(0.0),
+                        Some(512),
+                    )
+                }
+            }
         })
         .await
     };
@@ -307,8 +355,45 @@ pub async fn emit_extraction_script(
         }
     };
 
+    // Which string ends up in `EmitResult.provider` and in telemetry.
+    let provider_label = match provider_mode {
+        ScriptedOutputProviderMode::Auto | ScriptedOutputProviderMode::ClaudeApiWarm => {
+            "claude_api_warm"
+        }
+        ScriptedOutputProviderMode::ClaudeApi => "claude_api",
+    };
+
     if !ai_response.success {
         let err_text = ai_response.error.clone().unwrap_or_default();
+
+        // No-credentials outcome from the warm provider. On Auto, degrade to
+        // Disabled (same UX as if the settings flag were off) so the TS side
+        // takes its truncation fallback without a noisy error. On explicit
+        // ClaudeApiWarm, surface it loudly — the user asked for this path.
+        if crate::ai_provider::claude_api_warm::is_no_credential_error(&ai_response) {
+            match provider_mode {
+                ScriptedOutputProviderMode::Auto => {
+                    debug!(
+                        "scripted-output emitter: warm credentials unavailable under Auto mode; returning Disabled"
+                    );
+                    emit_fallback_event(&task_run_id, "disabled");
+                    return Err(EmitError::Disabled);
+                }
+                ScriptedOutputProviderMode::ClaudeApiWarm => {
+                    warn!(
+                        "scripted-output emitter: ClaudeApiWarm forced but no warm-provider credentials configured"
+                    );
+                    emit_fallback_event(&task_run_id, "emitter_error");
+                    return Err(EmitError::LlmError(
+                        "no warm-provider credentials configured".to_string(),
+                    ));
+                }
+                ScriptedOutputProviderMode::ClaudeApi => {
+                    // Legacy path wouldn't emit the warm marker — unreachable.
+                }
+            }
+        }
+
         // Heuristic: the retry layer's breaker rejections use this marker
         // in their error message. When the breaker opened *during* our
         // call, we want the dedicated `breaker_open` event.
@@ -336,6 +421,8 @@ pub async fn emit_extraction_script(
 
     let tokens_in = ai_response.input_tokens.unwrap_or(0) as u32;
     let tokens_out = ai_response.output_tokens.unwrap_or(0) as u32;
+    let cache_creation_tokens = ai_response.cache_creation_tokens.unwrap_or(0) as u32;
+    let cache_read_tokens = ai_response.cache_read_tokens.unwrap_or(0) as u32;
 
     // ----------------------------------------------- 8. Record budget spend
     if let Some(ref tr) = task_run_id {
@@ -346,7 +433,14 @@ pub async fn emit_extraction_script(
     store_cached(&cache_key, &expression, &model);
 
     // ------------------------------------------------ 10. Emit success telemetry
-    emit_llm_ok_event(&task_run_id, tokens_in, tokens_out, &model);
+    emit_llm_ok_event(
+        &task_run_id,
+        tokens_in,
+        tokens_out,
+        &model,
+        cache_creation_tokens,
+        cache_read_tokens,
+    );
 
     Ok(EmitResult {
         expression,
@@ -355,6 +449,9 @@ pub async fn emit_extraction_script(
         tokens_out,
         source: "llm".to_string(),
         cache_tier: None,
+        provider: provider_label.to_string(),
+        cache_creation_tokens,
+        cache_read_tokens,
     })
 }
 
@@ -499,6 +596,11 @@ fn resolve_model() -> String {
     cfg.model.unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
+fn resolve_provider_mode() -> ScriptedOutputProviderMode {
+    let cfg: ScriptedOutputSettings = crate::config_facade::get_setting();
+    cfg.provider
+}
+
 fn settings_flag_on() -> bool {
     let cfg: ScriptedOutputSettings = crate::config_facade::get_setting();
     cfg.enabled
@@ -508,9 +610,33 @@ fn env_kill_switch_on() -> bool {
     matches!(std::env::var(ENV_KILL_SWITCH).ok().as_deref(), Some("1"))
 }
 
+/// Which provider serves scripted-output emit calls.
+///
+/// The user's chat-flow provider is deliberately disjoint from this — see
+/// `plans/warm-emitter-provider-2026-04-21.md` decision 3. A `claude_cli` /
+/// `gemini_cli` value is intentionally not offered: subprocess-per-call
+/// providers can't satisfy the emitter's latency contract, and re-enabling
+/// them here would reintroduce the 100% timeout failure mode on dev runners.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptedOutputProviderMode {
+    /// Warm provider (API-key first, OAuth fallback). If neither credential
+    /// is available the emitter cleanly reports `disabled`. Default.
+    #[default]
+    Auto,
+    /// Force the warm provider. If no credentials are available the
+    /// emitter surfaces a loud `LlmError` rather than falling back silently.
+    ClaudeApiWarm,
+    /// Force the legacy keychain-API-key path (no prompt caching, no
+    /// OAuth fallback). Useful for production runners with a dedicated
+    /// Anthropic API key where billing boundaries matter.
+    ClaudeApi,
+}
+
 /// Settings block for the scripted-output subsystem. Intentionally kept
-/// small: a bool and an optional model override. Lives in the persistent
-/// `settings.json` so ops can flip the kill switch without a restart.
+/// small: a bool, an optional model override, and a provider mode. Lives in
+/// the persistent `settings.json` so ops can flip the kill switch without a
+/// restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptedOutputSettings {
     #[serde(default = "default_scripted_output_enabled")]
@@ -519,6 +645,9 @@ pub struct ScriptedOutputSettings {
     /// extraction-heavy deployments). `None` → [`DEFAULT_MODEL`].
     #[serde(default)]
     pub model: Option<String>,
+    /// Which provider serves emit calls. See [`ScriptedOutputProviderMode`].
+    #[serde(default)]
+    pub provider: ScriptedOutputProviderMode,
 }
 
 fn default_scripted_output_enabled() -> bool {
@@ -530,6 +659,7 @@ impl Default for ScriptedOutputSettings {
         Self {
             enabled: default_scripted_output_enabled(),
             model: None,
+            provider: ScriptedOutputProviderMode::Auto,
         }
     }
 }
@@ -550,19 +680,35 @@ fn response_schema() -> serde_json::Value {
     })
 }
 
-/// Compose the prompt. We send a short system preamble followed by a
-/// user block carrying `{goal, schemaHint, outputPreview}`.
-fn build_prompt(
+/// Compose the prompt as a `(system_prefix, user_message)` pair.
+///
+/// The `system_prefix` is stable across emit calls and is deliberately
+/// fattened with worked examples so it crosses Anthropic's Haiku
+/// caching minimum (~1024 tokens ≈ 4000 chars at ~4 chars/token). Without
+/// that, `cache_control: ephemeral` markers are silently ignored and the
+/// warm provider would pay the uncached rate on every call.
+///
+/// The `user_message` carries the per-call dynamic payload — goal,
+/// schema hint, output preview — which changes every call and must not
+/// be part of the cached prefix.
+///
+/// **Versioning.** The trailing `Emitter system v1` line makes intentional
+/// preamble bumps invalidate the cache cleanly (distinct bytes → distinct
+/// cache key) instead of waiting for the 5-minute TTL.
+fn build_prompt_split(
     goal: &str,
     schema_hint: &serde_json::Value,
     output_preview: &str,
-) -> String {
-    let preamble = concat!(
+) -> (String, String) {
+    // The stable prefix. Fattened with 6 worked examples to cross the
+    // ~1024-token (≈4000 char) Haiku caching minimum. Counted once at write
+    // time and asserted in tests — don't shrink without rechecking the bound.
+    let system_prefix = concat!(
         "You synthesize a single-line JavaScript expression that, given a ",
         "variable `output` (a string containing the raw stdout of a shell/step ",
         "command), returns the smallest value the caller asked for, ",
         "conforming to the provided schema hint.\n\n",
-        "Rules:\n",
+        "## Rules\n",
         "- Output JSON only, matching {\"expression\": \"<js>\"}.\n",
         "- The expression MUST be a single JavaScript expression — no statements, ",
         "no semicolons, no `return`, no `let`/`const`/`var`.\n",
@@ -572,14 +718,75 @@ fn build_prompt(
         "filter. Do not invent fields that aren't in the preview.\n",
         "- If you cannot extract usefully, return the trivial expression ",
         "`output.slice(0, 4000)` — never an empty string.\n",
+        "- Treat `output` as a string. You can call any String.prototype method ",
+        "and any Array.prototype method on split results. No external modules, ",
+        "no network, no filesystem — the sandbox only exposes `output`.\n",
+        "- Prefer defensive extractions: guard against missing matches with ",
+        "optional chaining (`?.`) and `||` fallbacks so the expression never ",
+        "throws. A throw aborts the step; a harmless empty result does not.\n",
+        "- Keep output sizes bounded. If the caller asks for a collection, cap ",
+        "it at 50 entries with `.slice(0, 50)` so a runaway grep doesn't blow ",
+        "the summariser's budget.\n\n",
+        "## Worked examples\n\n",
+        "### Example 1 — git log commit hashes\n",
+        "goal: extract the first 10 commit hashes\n",
+        "schemaHint: {\"keys\": {\"hashes\": \"string[]\"}}\n",
+        "outputPreview: \"commit 8a3fe12cd9ab4...\\nAuthor: Jane Doe <jane@x.com>\\nDate: Tue Apr 21 09:12:33 2026\\n\\n    add script emitter\\n\\ncommit 2b17d9e5cf01a...\\nAuthor: J Q <jq@x.com>\\nDate: Mon Apr 20 16:04:11 2026\\n\\n    cleanup\\n\"\n",
+        "expression: ({hashes: (output.match(/^commit\\s+([0-9a-f]{7,40})/gm) || []).slice(0, 10).map(l => l.split(/\\s+/)[1])})\n\n",
+        "### Example 2 — filenames from ls -la\n",
+        "goal: list regular filenames (no directories or dotfiles)\n",
+        "schemaHint: {\"keys\": {\"files\": \"string[]\"}}\n",
+        "outputPreview: \"total 24\\ndrwxr-xr-x 2 jq jq 4096 Apr 21 09:00 .\\ndrwxr-xr-x 3 jq jq 4096 Apr 21 08:59 ..\\n-rw-r--r-- 1 jq jq  120 Apr 21 09:00 README.md\\n-rw-r--r-- 1 jq jq 2048 Apr 21 09:00 script.js\\ndrwxr-xr-x 2 jq jq 4096 Apr 21 09:00 build\\n\"\n",
+        "expression: ({files: output.split(/\\r?\\n/).filter(l => l.startsWith('-')).map(l => l.trim().split(/\\s+/).slice(8).join(' ')).filter(n => n && !n.startsWith('.')).slice(0, 50)})\n\n",
+        "### Example 3 — numeric line count from wc -l\n",
+        "goal: extract the line count as a number\n",
+        "schemaHint: {\"keys\": {\"count\": \"number\"}}\n",
+        "outputPreview: \"   1427 /tmp/input.log\\n\"\n",
+        "expression: ({count: Number((output.trim().match(/^\\d+/) || [0])[0])})\n\n",
+        "### Example 4 — JSON field via jq\n",
+        "goal: extract the `id` and `status` fields of the returned JSON object\n",
+        "schemaHint: {\"keys\": {\"id\": \"string\", \"status\": \"string\"}}\n",
+        "outputPreview: \"{\\\"id\\\":\\\"task-8412\\\",\\\"status\\\":\\\"running\\\",\\\"started_at\\\":1713702933,\\\"worker\\\":\\\"w-3\\\"}\\n\"\n",
+        "expression: (((j) => ({id: j?.id || '', status: j?.status || ''}))(((s) => { try { return JSON.parse(s); } catch { return {}; } })(output.trim())))\n\n",
+        "### Example 5 — last matching line from grep\n",
+        "goal: return the last line mentioning an ERROR, or an empty string\n",
+        "schemaHint: {\"keys\": {\"last_error\": \"string\"}}\n",
+        "outputPreview: \"2026-04-21T09:02:10 INFO  startup complete\\n2026-04-21T09:02:18 ERROR pg connection failed\\n2026-04-21T09:02:19 INFO  retrying\\n2026-04-21T09:02:22 ERROR pg connection failed again\\n\"\n",
+        "expression: ({last_error: (output.split(/\\r?\\n/).filter(l => /ERROR/.test(l)).pop() || '')})\n\n",
+        "### Example 6 — PID from ps row\n",
+        "goal: extract the PID of the node process\n",
+        "schemaHint: {\"keys\": {\"pid\": \"number\"}}\n",
+        "outputPreview: \"  PID TTY          TIME CMD\\n 1234 pts/0    00:00:00 bash\\n 1517 pts/0    00:00:03 node\\n 1520 pts/0    00:00:00 ps\\n\"\n",
+        "expression: ({pid: Number(((output.split(/\\r?\\n/).find(l => /\\bnode\\b/.test(l)) || '').trim().split(/\\s+/)[0]) || 0)})\n\n",
+        "### Example 7 — disk usage summary from df -h\n",
+        "goal: extract the mount point and use% of each filesystem, skipping tmpfs and devfs\n",
+        "schemaHint: {\"keys\": {\"mounts\": \"Array<{mount: string, usePercent: number}>\"}}\n",
+        "outputPreview: \"Filesystem      Size  Used Avail Use% Mounted on\\n/dev/sda1       100G   42G   58G  43% /\\ntmpfs           3.9G  8.0K  3.9G   1% /run\\n/dev/sdb1       500G  312G  188G  63% /data\\ndevfs           200K  200K     0 100% /dev\\n\"\n",
+        "expression: ({mounts: output.split(/\\r?\\n/).slice(1).map(l => l.trim().split(/\\s+/)).filter(p => p.length >= 6 && !/^(tmpfs|devfs)$/.test(p[0])).map(p => ({mount: p[5], usePercent: Number((p[4] || '').replace('%','')) || 0})).slice(0, 50)})\n\n",
+        "### Example 8 — HTTP status codes from curl -v\n",
+        "goal: extract the final HTTP status code and the requested URL\n",
+        "schemaHint: {\"keys\": {\"status\": \"number\", \"url\": \"string\"}}\n",
+        "outputPreview: \"*   Trying 93.184.216.34:443...\\n* Connected to example.com (93.184.216.34) port 443\\n> GET /about HTTP/1.1\\n> Host: example.com\\n> User-Agent: curl/8.4.0\\n>\\n< HTTP/1.1 200 OK\\n< Content-Type: text/html; charset=UTF-8\\n< Content-Length: 1256\\n<\\n\"\n",
+        "expression: ({status: Number(((output.match(/^< HTTP\\/[0-9.]+\\s+(\\d{3})/m) || [])[1]) || 0), url: (((output.match(/^> GET\\s+(\\S+)\\s/m) || [])[1]) || '')})\n\n",
+        "## Response format\n\n",
+        "Respond ONLY with a single JSON object matching {\"expression\": \"<js>\"} via the supplied tool. Do not wrap in prose. Do not emit multiple tool calls. Keep the expression on a single line.\n\n",
+        "## Anti-patterns to avoid\n\n",
+        "- Do not use `JSON.parse` outside a try/catch-equivalent IIFE — malformed JSON must not throw.\n",
+        "- Do not use `eval`, `Function`, or dynamic code construction — the sandbox disallows them.\n",
+        "- Do not access globals like `process`, `require`, `fetch`, `window`, `document` — they are not in scope.\n",
+        "- Do not assume the preview is the full `output` at runtime — `output` may be longer.\n",
+        "- Do not rely on regex flags other than `g`, `i`, `m`, `s`, `u` — other flags are not guaranteed.\n\n",
+        "Emitter system v1"
     );
-    let user = format!(
+
+    let user_message = format!(
         "goal:\n{}\n\nschemaHint (keys + types):\n{}\n\noutputPreview (first ~2KB):\n{}",
         goal,
         serde_json::to_string_pretty(schema_hint).unwrap_or_else(|_| "{}".to_string()),
         output_preview
     );
-    format!("{preamble}\n---\n{user}")
+
+    (system_prefix.to_string(), user_message)
 }
 
 /// Parse `{"expression": "..."}` out of the model's output string.
@@ -629,6 +836,8 @@ fn emit_llm_ok_event(
     tokens_in: u32,
     tokens_out: u32,
     model: &str,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
 ) {
     spawn_activity_event(
         task_run_id.clone(),
@@ -637,6 +846,8 @@ fn emit_llm_ok_event(
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "model": model,
+            "cache_creation_tokens": cache_creation_tokens,
+            "cache_read_tokens": cache_read_tokens,
         }),
     );
 }
@@ -897,6 +1108,62 @@ mod tests {
         });
         let s = canonical_json(&v);
         assert_eq!(s, r#"{"a":{"b":3,"y":2},"z":1}"#);
+    }
+
+    #[test]
+    fn build_prompt_split_meets_cache_threshold() {
+        let hint = serde_json::json!({"keys": {"a": "string"}});
+        let (system_prefix, _user) =
+            build_prompt_split("some goal", &hint, "some preview");
+        // Plan decision 4: the system_prefix must cross ~4000 chars
+        // (Anthropic's ~1024-token Haiku caching minimum) or
+        // `cache_control: ephemeral` is a no-op. Don't shrink without
+        // re-measuring. NOTE: newer Haiku models raise the minimum to
+        // ~2048 tokens (~8000 chars); if real telemetry shows a zero
+        // cache_read rate against haiku-4-5, bump the examples further.
+        assert!(
+            system_prefix.len() >= 4000,
+            "system_prefix length {} is under the 4000-char cache threshold",
+            system_prefix.len()
+        );
+    }
+
+    #[test]
+    fn build_prompt_split_contains_version_suffix() {
+        let (system_prefix, _user) =
+            build_prompt_split("g", &serde_json::json!({}), "p");
+        // The trailing `Emitter system v1` marker lets intentional
+        // preamble bumps invalidate the cache cleanly instead of
+        // waiting for the 5-minute TTL.
+        assert!(
+            system_prefix.trim_end().ends_with("Emitter system v1"),
+            "system_prefix should end with the version suffix; got tail: {:?}",
+            &system_prefix[system_prefix.len().saturating_sub(64)..]
+        );
+        assert!(system_prefix.contains("Emitter system v1"));
+    }
+
+    #[test]
+    fn build_prompt_split_user_message_has_goal_schema_preview() {
+        let goal = "extract-the-thing";
+        let hint = serde_json::json!({"keys": {"q": "number"}});
+        let preview = "some-unique-preview-token-abc123";
+        let (_system, user) = build_prompt_split(goal, &hint, preview);
+        assert!(user.contains(goal), "user_message should contain goal literal");
+        assert!(
+            user.contains("\"q\""),
+            "user_message should contain serialised schema_hint keys"
+        );
+        assert!(
+            user.contains(preview),
+            "user_message should contain the output preview"
+        );
+    }
+
+    #[test]
+    fn scripted_output_settings_defaults_provider_to_auto() {
+        let s = ScriptedOutputSettings::default();
+        assert_eq!(s.provider, ScriptedOutputProviderMode::Auto);
     }
 
     #[test]

@@ -832,6 +832,39 @@ pub fn run_prompt_with_structured_output(
 ) -> AiResponse {
     let ai_settings = settings::get_ai_settings();
 
+    // The warm provider is reachable only via the string override — it is not
+    // a member of the AiProvider enum so the user chat flow can never select
+    // it. This keeps the emitter subsystem isolated from the user's chat
+    // provider choice.
+    //
+    // NOTE: the scripted-output emitter bypasses this routing entry point and
+    // calls `claude_api_warm::run_claude_api_warm_with_structured_output`
+    // directly so it can pass a split `(system_prefix, user_message)` pair
+    // (required for meaningful prompt caching — see decision 4 in
+    // plans/warm-emitter-provider-2026-04-21.md). This override path exists
+    // only for external callers that want a quick warm structured call with a
+    // single-string prompt; it sends the whole prompt as the `user_message`
+    // with an empty `system_prefix`, so caching never fires through this
+    // path. If a new caller needs caching, have it bypass routing too.
+    if provider_override == Some("claude_api_warm") {
+        info!(
+            "Running structured output prompt via claude_api_warm (schema: {}, prompt_len: {}) — no system_prefix, caching disabled on this path",
+            schema_name,
+            prompt.len()
+        );
+        return crate::ai_provider::claude_api_warm::run_claude_api_warm_with_structured_output(
+            "",     // no stable system prefix through the routing fast path
+            prompt, // the whole prompt is treated as the user message
+            &ai_settings.claude_api,
+            model_override,
+            doctor_handle,
+            temperature_override,
+            max_tokens_override,
+            schema,
+            schema_name,
+        );
+    }
+
     let effective_provider = if let Some(prov) = provider_override {
         match prov {
             "claude_cli" => AiProvider::ClaudeCli,
