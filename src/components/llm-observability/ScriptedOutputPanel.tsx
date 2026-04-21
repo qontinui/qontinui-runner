@@ -76,15 +76,36 @@ export function ScriptedOutputPanel({ taskRunId }: ScriptedOutputPanelProps) {
       stats.workerOk === 0 &&
       Object.keys(stats.fallbacks).length === 0);
 
-  // Denominator for rates: prefer the Phase-B `attempted` counter when it's
-  // being emitted, fall back to the sum of terminal Phase-A counters so the
-  // rates still mean something even without Phase B.
+  // Partition fallbacks into emitter-path vs worker-path so the tiles can
+  // use the right denominator for each metric. The split is by reason:
+  // - Worker-path fallbacks ("bad_expression") fire after the emitter
+  //   produced a script that then threw inside the node:vm sandbox. They
+  //   count against `cacheHit + llmOk`, not against total emitter calls.
+  // - Everything else (timeout, breaker_open, cost_cap, token_budget,
+  //   disabled, emitter_error) is an emitter-path terminal state: the LLM
+  //   path never produced a usable script.
+  const WORKER_FALLBACK_REASONS = new Set(["bad_expression"]);
   const totalFallbacks = stats ? Object.values(stats.fallbacks).reduce((a, b) => a + b, 0) : 0;
-  const effectiveAttempts = stats
-    ? stats.attempted > 0
-      ? stats.attempted
-      : stats.cacheHit + stats.llmOk + totalFallbacks
+  const workerFallbacks = stats
+    ? Object.entries(stats.fallbacks)
+        .filter(([reason]) => WORKER_FALLBACK_REASONS.has(reason))
+        .reduce((a, [, c]) => a + c, 0)
     : 0;
+  const emitterFallbacks = totalFallbacks - workerFallbacks;
+
+  // Denominator for emitter-level metrics. `attempted` (from
+  // `summarizeViaScript`) is authoritative when emitted, but we fall back
+  // to the sum of terminal Phase-A counters and take the max so the
+  // denominator is always ≥ the observed terminal events — otherwise
+  // rates could exceed 100% when `attempted` is under-emitted (e.g.
+  // direct `invoke()` calls in tests bypass the base handler).
+  const emitterCalls = stats
+    ? Math.max(stats.attempted, stats.cacheHit + stats.llmOk + emitterFallbacks)
+    : 0;
+
+  // Number of scripts actually sent to the worker (produced by cache or
+  // LLM). Used as the denominator for Worker-OK and worker-fallback rates.
+  const workerCalls = stats ? stats.cacheHit + stats.llmOk : 0;
 
   const fallbackRows = stats ? Object.entries(stats.fallbacks).sort((a, b) => b[1] - a[1]) : [];
 
@@ -132,45 +153,45 @@ export function ScriptedOutputPanel({ taskRunId }: ScriptedOutputPanelProps) {
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <MetricCard
               title="Attempts"
-              value={effectiveAttempts.toLocaleString()}
+              value={emitterCalls.toLocaleString()}
               subtitle={
-                stats.attempted === 0 && effectiveAttempts > 0
+                stats.attempted === 0 && emitterCalls > 0
                   ? "derived (Phase B pending)"
-                  : undefined
+                  : "emitter calls"
               }
             />
             <MetricCard
               title="Cache hit rate"
-              value={formatRate(stats.cacheHit, effectiveAttempts)}
+              value={formatRate(stats.cacheHit, emitterCalls)}
               subtitle={`${stats.cacheHit.toLocaleString()} hits`}
               variant={
-                effectiveAttempts > 0 && stats.cacheHit / effectiveAttempts >= 0.4
-                  ? "success"
-                  : "default"
+                emitterCalls > 0 && stats.cacheHit / emitterCalls >= 0.4 ? "success" : "default"
               }
             />
             <MetricCard
               title="LLM-OK rate"
-              value={formatRate(stats.llmOk, effectiveAttempts)}
+              value={formatRate(stats.llmOk, emitterCalls)}
               subtitle={`${stats.llmOk.toLocaleString()} calls`}
             />
             <MetricCard
               title="Worker-OK rate"
-              value={stats.workerOk > 0 ? formatRate(stats.workerOk, effectiveAttempts) : "—"}
+              value={workerCalls > 0 ? formatRate(stats.workerOk, workerCalls) : "—"}
               subtitle={
-                stats.workerOk === 0
-                  ? "Phase B not emitting"
-                  : `${stats.workerOk.toLocaleString()} succeeded`
+                workerCalls === 0
+                  ? "no scripts run yet"
+                  : `${stats.workerOk.toLocaleString()} of ${workerCalls.toLocaleString()} scripts`
               }
             />
             <MetricCard
-              title="Fallback rate"
-              value={formatRate(totalFallbacks, effectiveAttempts)}
-              subtitle={`${totalFallbacks.toLocaleString()} fallbacks`}
+              title="Emitter fallback rate"
+              value={formatRate(emitterFallbacks, emitterCalls)}
+              subtitle={
+                workerFallbacks > 0
+                  ? `${emitterFallbacks.toLocaleString()} emitter + ${workerFallbacks.toLocaleString()} worker`
+                  : `${emitterFallbacks.toLocaleString()} fallbacks`
+              }
               variant={
-                effectiveAttempts > 0 && totalFallbacks / effectiveAttempts >= 0.15
-                  ? "warning"
-                  : "default"
+                emitterCalls > 0 && emitterFallbacks / emitterCalls >= 0.15 ? "warning" : "default"
               }
             />
             <MetricCard title="Bytes avoided" value={humanizeBytes(stats.bytesAvoided)} />
