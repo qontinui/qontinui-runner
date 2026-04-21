@@ -583,6 +583,7 @@ pub fn generate_workflow(
     doctor_handle: Option<&DoctorHandle>,
     pg_db: Option<&Arc<PgDb>>,
     query_embedding: Option<&[f32]>,
+    app_state: Option<&crate::commands::AppState>,
 ) -> (GenerateWorkflowResponse, PipelineArtifact) {
     info!(
         "Generating workflow from description: {}",
@@ -1447,6 +1448,7 @@ pub fn generate_workflow(
                         generation_provider,
                         builder_insights_section.as_deref(),
                         constitution.as_deref(),
+                        app_state,
                     ) {
                         Ok((w, prompt)) => {
                             artifact_builder.builder_duration_ms =
@@ -1480,6 +1482,7 @@ pub fn generate_workflow(
                 generation_provider,
                 builder_insights_section.as_deref(),
                 constitution.as_deref(),
+                app_state,
             ) {
                 Ok((w, prompt)) => {
                     artifact_builder.builder_duration_ms =
@@ -1512,6 +1515,7 @@ pub fn generate_workflow(
             generation_provider,
             builder_insights_section.as_deref(),
             constitution.as_deref(),
+            app_state,
         ) {
             Ok((w, prompt)) => {
                 artifact_builder.builder_duration_ms =
@@ -2366,6 +2370,7 @@ fn run_builder_agent(
     provider_override: Option<&str>,
     builder_insights: Option<&str>,
     constitution: Option<&str>,
+    app_state: Option<&crate::commands::AppState>,
 ) -> Result<(UnifiedWorkflow, String), Box<GenerateWorkflowResponse>> {
     let schema_context = if pg_db.is_some() || query_embedding.is_some() {
         build_schema_context_full(&request.description, pg_db, query_embedding)
@@ -2412,12 +2417,17 @@ fn run_builder_agent(
         .map(|c| c.contains("Spec Generation Brief"))
         .unwrap_or(false)
     {
-        // This synchronous path has no AppState — fall back to the env /
-        // default port lookup used elsewhere in generator.rs. Temp runners
-        // spawned via the supervisor may advertise 9876 here instead of
-        // their real bound port; the hardener's URL normalizer will migrate
-        // them to the actual runner port when it runs.
-        let runner_port = crate::mcp::types::get_mcp_api_port();
+        // Prefer the runner's actually-bound port (via AppState) so that
+        // temp runners on 9877+ advertise the correct URL in the Builder
+        // prompt right away, instead of relying on the hardener's post-hoc
+        // URL normalizer to migrate `localhost:9876` → the real port. When
+        // AppState isn't threaded through (legacy callers, tests, bootstrap
+        // paths), fall back to the env-var lookup; the normalizer still
+        // catches any miss on its second pass.
+        let runner_port = match app_state {
+            Some(s) => crate::mcp::types::runner_api_port(s),
+            None => crate::mcp::types::get_mcp_api_port(),
+        };
         context_section.push_str(&super::meta_workflow::build_spec_brief_recognition_prompt(
             runner_port,
         ));

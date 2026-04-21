@@ -828,6 +828,8 @@ pub async fn generate_unified_workflow_handler(
     let doctor_handle = state.doctor_handle.clone();
     let pg_db = state.app_state.pg_db.clone();
     let pg_clone = pg_db.clone();
+    // See transcript.rs rationale — thread AppState for brief-mode port.
+    let app_state_for_gen = state.app_state.clone();
 
     let (result, artifact) = tokio::task::spawn_blocking(move || {
         let (response, artifact) = workflow_generation::generate_workflow(
@@ -835,6 +837,7 @@ pub async fn generate_unified_workflow_handler(
             doctor_handle.as_ref(),
             Some(&pg_clone),
             None,
+            Some(&*app_state_for_gen),
         );
         (response, artifact)
     })

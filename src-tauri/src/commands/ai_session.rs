@@ -667,6 +667,9 @@ pub async fn generate_workflow_from_session(
     let pg_db = app_state.pg_db.clone();
     let pg_clone = pg_db.clone();
     let artifact_task_run_id = task_run_id.clone();
+    // See transcript.rs rationale — threading AppState here lets brief-mode
+    // runs advertise the correct runner port in the Builder prompt.
+    let app_state_for_gen = app_state.inner().clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
         let (response, mut artifact) = crate::workflow_generation::generate_workflow(
@@ -674,6 +677,7 @@ pub async fn generate_workflow_from_session(
             doctor_handle.as_ref(),
             Some(&pg_clone),
             None,
+            Some(&*app_state_for_gen),
         );
         artifact.task_run_id = Some(artifact_task_run_id.clone());
         (response, artifact)

@@ -357,6 +357,11 @@ pub async fn generate_workflow_standalone(
     let doctor_handle = app_state.doctor_handle.lock().await.clone();
     let pg_db = app_state.pg_db.clone();
     let pg_clone = pg_db.clone();
+    // Clone the AppState Arc so the builder's brief-mode port resolution
+    // can use the actually-bound runner port (matters for temp runners on
+    // 9877+). Without this the synchronous path falls back to
+    // get_mcp_api_port() which reads $QONTINUI_PORT / defaults to 9876.
+    let app_state_for_gen = app_state.inner().clone();
 
     // catch_unwind safety net: converts any latent panic inside the generation
     // pipeline (e.g. a future PG deserialization drift) into a clean structured
@@ -369,6 +374,7 @@ pub async fn generate_workflow_standalone(
                 doctor_handle.as_ref(),
                 Some(&pg_clone),
                 None,
+                Some(&*app_state_for_gen),
             )
         }));
         match panic_result {

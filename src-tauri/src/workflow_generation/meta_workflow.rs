@@ -538,6 +538,37 @@ If the Additional Context contains a block labeled "Spec Generation Brief (JSON)
 5. **Semantic assertions become prompt or agentic steps.** Each group's `semanticAssertions[]` should become one or more `prompt` steps with a `content` field that includes the assertion descriptions. These may navigate and inspect the UI via the UI Bridge tools.
 6. **Always bias toward determinism.** When an assertion could be either deterministic or semantic, prefer the deterministic form (snapshot_assert).
 
+7. **Wait for elements before asserting on a freshly-loaded page.** Navigation + auto-auth can leave the DOM mid-render when the verification steps start polling. For any group that depends on the page being interactive (e.g. action-bar buttons, tab bars, panels), emit a `ui_bridge` step with `ui_bridge_action: "wait_for_element"` BEFORE the group's `snapshot_assert`. The step's `ui_bridge_target` is a JSON string of the form `{{"criteria":{{"role":"tablist"}},"timeout":10000}}` — pick a criteria that is distinctive of the ready state (tablist for terminals, role=main for pages, a known header textContent for panels). `timeout` is milliseconds; the handler polls `/control/snapshot` every 500ms and succeeds as soon as at least one element matches. Without this gate, the first `snapshot_assert` often captures an empty/stale snapshot and reports the asserted elements as missing.
+
+### Canonical wait_for_element Step Example
+
+```json
+{{
+  "id": "<uuid>",
+  "type": "ui_bridge",
+  "phase": "setup",
+  "name": "wait_for_terminal_ready",
+  "ui_bridge_action": "wait_for_element",
+  "ui_bridge_target": "{{\"criteria\":{{\"role\":\"tablist\"}},\"timeout\":10000}}",
+  "ui_bridge_snapshot_target": "control"
+}}
+```
+
+### Canonical click Step Example (for preconditions from spec `setupActions: [{{type: "click"}}]`)
+
+```json
+{{
+  "id": "<uuid>",
+  "type": "ui_bridge",
+  "phase": "setup",
+  "name": "open_findings_panel",
+  "ui_bridge_action": "click",
+  "ui_bridge_target": "{{\"role\":\"button\",\"accessibleName\":\"Toggle findings decisions panel\"}}"
+}}
+```
+
+For `click`, `ui_bridge_target` is a JSON-stringified **criteria object** (NOT an assertion array). The handler resolves it against a fresh snapshot, takes the first match, and POSTs `/control/element/<id>/action` with `{{"action":"click"}}`. Use `accessibleName` to disambiguate when multiple elements share the same textContent.
+
 ### Canonical snapshot_assert Step Example
 
 ```json
