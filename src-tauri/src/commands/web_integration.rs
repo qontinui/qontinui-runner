@@ -212,7 +212,19 @@ pub async fn apply_web_integration_settings(
 
 /// Persist new web-integration settings and hot-reload the background tasks.
 ///
-/// Idempotency: if the incoming settings match the currently-persisted
+/// **Wire contract (IMPORTANT):** JS callers pass three flat top-level
+/// arguments — `enabled`, `backendUrl`, `runnerToken` — NOT a wrapped
+/// `settings` object. Tauri's IPC converts top-level arg names camelCase →
+/// snake_case, so the JS shape `{ enabled, backendUrl, runnerToken }` maps
+/// naturally to this signature's `enabled, backend_url, runner_token`
+/// parameters. A `settings: WebIntegrationSettings` struct-arg would have
+/// forced JS callers to pass `{ settings: { enabled, backend_url, ... } }`
+/// with snake-case keys (Tauri does NOT recurse rename_all into struct
+/// fields) — that mismatch shipped broken in Phase 3G. When adding a new
+/// field here, update THREE sites: the command signature, the JS caller
+/// in `WebIntegrationSettings.tsx`, and the `WebIntegrationSettings` struct.
+///
+/// Idempotency: if the incoming values match the currently-persisted
 /// settings (after trimming), the function returns early without touching
 /// disk, the running `ServerModeState`, or emitting an event. This keeps
 /// the Settings UI safe to call on every field change without tearing down
@@ -229,8 +241,15 @@ pub async fn apply_web_integration_settings(
 pub async fn save_web_integration_settings(
     app_state: State<'_, Arc<AppState>>,
     app_handle: AppHandle,
-    settings: WebIntegrationSettings,
+    enabled: bool,
+    backend_url: String,
+    runner_token: String,
 ) -> Result<(), String> {
+    let settings = WebIntegrationSettings {
+        enabled,
+        backend_url,
+        runner_token,
+    };
     apply_web_integration_settings(app_state.inner().as_ref(), &app_handle, settings).await
 }
 
@@ -519,20 +538,155 @@ pub async fn start_web_token_flow(
     );
 
     let runner_name = get_hostname_for_browser();
+
+    // `/connect-runner` is a Next.js page, not an API endpoint. In unified
+    // production deployments `backend_url` serves both, but in split local
+    // dev (FastAPI on :8000, Next.js on :3001) they're different hosts.
+    // Honor an explicit `web_base_url` override when set, else fall back
+    // to `backend_url` — preserving the old behavior for production.
+    let web_origin = settings::load_settings()
+        .web_integration
+        .web_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(trim_backend_url)
+        .unwrap_or_else(|| effective_backend.clone());
+
     let web_url = format!(
         "{}/connect-runner?state={}&callback={}&runner_name={}",
-        effective_backend,
+        web_origin,
         url_encode(&state),
         url_encode(&callback_url),
         url_encode(&runner_name),
     );
 
     info!(
-        "start_web_token_flow: opening browser to {}/connect-runner (callback_port={})",
-        effective_backend, runner_port
+        "start_web_token_flow: opening browser to {}/connect-runner (callback_port={}, api_backend={})",
+        web_origin, runner_port, effective_backend
     );
 
     open::that(&web_url).map_err(|e| format!("failed to open browser: {}", e))?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests — IPC wire contract (Phase 3H)
+// ---------------------------------------------------------------------------
+//
+// The Phase 3G frontend shipped broken: it invoked
+// `save_web_integration_settings` with flat camelCase args while the Rust
+// signature took a single `settings: WebIntegrationSettings` struct arg.
+// Tauri's IPC accepts top-level args by name and converts camelCase →
+// snake_case, but it does NOT recurse that rename into struct fields. The
+// mismatch silently failed (Tauri returned "missing required key settings",
+// which the frontend logged as a generic error). No build step caught it.
+//
+// These tests mirror what Tauri's `#[tauri::command]` macro generates for
+// argument extraction so a shape-drift regression fails in CI. They're
+// decoupled from Tauri itself so they stay fast and don't require a mock
+// app. If Tauri changes its internal extractor, these tests become a
+// false-confidence measure — re-verify with a real end-to-end invoke via
+// the UI Bridge when touching the macro or upgrading Tauri.
+
+#[cfg(test)]
+mod ipc_wire_contract_tests {
+    use serde::Deserialize;
+
+    /// Mirror of what Tauri generates for `save_web_integration_settings`
+    /// argument extraction. Top-level args are renamed camelCase → snake_case.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SaveArgs {
+        enabled: bool,
+        backend_url: String,
+        runner_token: String,
+    }
+
+    #[test]
+    fn save_accepts_frontends_natural_shape() {
+        // This is the exact shape WebIntegrationSettings.tsx sends.
+        let payload = r#"{
+            "enabled": true,
+            "backendUrl": "http://localhost:8000",
+            "runnerToken": "qontinui_runner_0000000000000000000000000000000000000000000000000000000000000000"
+        }"#;
+        let args: SaveArgs = serde_json::from_str(payload).expect("must deserialize");
+        assert!(args.enabled);
+        assert_eq!(args.backend_url, "http://localhost:8000");
+        assert!(args.runner_token.starts_with("qontinui_runner_"));
+    }
+
+    #[test]
+    fn save_rejects_phase3g_broken_wrapped_shape() {
+        // The shape that shipped broken in Phase 3G — `settings` wrapper
+        // around the inner fields. Must fail so a future accidental revert
+        // is caught in CI.
+        let payload = r#"{
+            "settings": {
+                "enabled": true,
+                "backendUrl": "http://localhost:8000",
+                "runnerToken": "qontinui_runner_x"
+            }
+        }"#;
+        let result = serde_json::from_str::<SaveArgs>(payload);
+        assert!(
+            result.is_err(),
+            "settings-wrapped payload must not deserialize — that was the 3G bug"
+        );
+    }
+
+    #[test]
+    fn save_rejects_snake_case_keys() {
+        // Tauri top-level arg convention is camelCase in; snake_case keys
+        // from JS would indicate the frontend is speaking the wrong dialect.
+        let payload = r#"{
+            "enabled": true,
+            "backend_url": "http://localhost:8000",
+            "runner_token": "qontinui_runner_x"
+        }"#;
+        let result = serde_json::from_str::<SaveArgs>(payload);
+        assert!(
+            result.is_err(),
+            "snake_case top-level keys must not deserialize — JS callers must use camelCase"
+        );
+    }
+
+    /// Mirror for `test_web_integration_connection` (already flat from 3G).
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TestConnectionArgs {
+        backend_url: String,
+        runner_token: String,
+    }
+
+    #[test]
+    fn test_connection_accepts_frontends_natural_shape() {
+        let payload = r#"{"backendUrl": "http://x", "runnerToken": "tok"}"#;
+        let args: TestConnectionArgs = serde_json::from_str(payload).expect("must deserialize");
+        assert_eq!(args.backend_url, "http://x");
+        assert_eq!(args.runner_token, "tok");
+    }
+
+    /// Mirror for `start_web_token_flow` — `backendUrl` is optional.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StartFlowArgs {
+        backend_url: Option<String>,
+    }
+
+    #[test]
+    fn start_flow_accepts_missing_backend_url() {
+        let payload = r#"{}"#;
+        let args: StartFlowArgs = serde_json::from_str(payload).expect("empty must deserialize");
+        assert_eq!(args.backend_url, None);
+    }
+
+    #[test]
+    fn start_flow_accepts_camelcase_backend_url() {
+        let payload = r#"{"backendUrl": "http://x"}"#;
+        let args: StartFlowArgs = serde_json::from_str(payload).expect("must deserialize");
+        assert_eq!(args.backend_url.as_deref(), Some("http://x"));
+    }
 }
