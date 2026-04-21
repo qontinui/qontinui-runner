@@ -77,3 +77,38 @@ pub async fn emit_extraction_script(
     .await
     .map_err(Into::into)
 }
+
+/// Request payload for `emit_scripted_output_event`.
+///
+/// Called by the TS `ScriptedOutputHandler` base class (via the helper in
+/// `src/lib/step-output-handlers/scripted-output-telemetry.ts`) to record
+/// the three TS-originated events (`attempted`, `worker_ok`,
+/// `bytes_avoided`) and the `bad_expression` flavour of `fallback`.
+///
+/// Goes through the Rust emitter's FK-aware insert path, so an
+/// unassigned/unknown task_run_id is handled by recording the event with a
+/// NULL FK column instead of being dropped.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmitScriptedOutputEventArgs {
+    /// Event name. Must be one of `scripted_output.attempted`,
+    /// `scripted_output.worker_ok`, `scripted_output.bytes_avoided`, or
+    /// `scripted_output.fallback`.
+    pub name: String,
+    /// Arbitrary JSON metadata. Stored as-is in
+    /// `activity_timeline.metadata_json`.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    /// Optional task run id. If set, the emitter pre-checks its existence
+    /// in `task_runs` and falls back to NULL on miss (the raw value is
+    /// preserved in `metadata.task_run_id_raw`).
+    pub task_run_id: Option<String>,
+}
+
+/// `invoke("emit_scripted_output_event", {...})` handler.
+#[tauri::command]
+pub async fn emit_scripted_output_event(
+    args: EmitScriptedOutputEventArgs,
+) -> Result<(), String> {
+    script_emitter::emit_ts_originated_event(&args.name, args.metadata, args.task_run_id)
+}

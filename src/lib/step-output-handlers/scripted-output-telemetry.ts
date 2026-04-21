@@ -2,16 +2,24 @@
  * Scripted-output telemetry (TS side).
  *
  * Writes the three TS-originating events from
- * {@link ScriptedOutputHandler.summarizeViaScript} into the shared
- * `activity_timeline` table via the `insert_activity_entry` Tauri command.
- * The Rust emitter (`src-tauri/src/step_output/script_emitter.rs`) writes
- * the other three (`cache_hit`, `llm_ok`, `fallback`) directly.
+ * {@link ScriptedOutputHandler.summarizeViaScript} via the
+ * `emit_scripted_output_event` Tauri command.  The Rust emitter
+ * (`src-tauri/src/step_output/script_emitter.rs`) writes the other three
+ * (`cache_hit`, `llm_ok`, `fallback`) directly through the same FK-aware
+ * insert path.
  *
  * All six events are aggregated by the LLM Analytics widget via
- * `get_scripted_output_stats` (Phase C).
+ * `get_scripted_output_stats`.
+ *
+ * We deliberately DO NOT use the generic `insert_activity_entry` command:
+ * that path runs PII scrubbing and has no FK pre-check, so an ad-hoc
+ * `task_run_id` (e.g. during tests or early in a step handler) would be
+ * dropped by the `activity_timeline.task_run_id → task_runs(id)`
+ * constraint. The dedicated command reuses the Rust emitter's FK-aware
+ * fallback (null out the column, preserve the raw id in metadata).
  *
  * Telemetry is fire-and-forget: a failed write must never disrupt the
- * emitter path.  Outside a Tauri context (unit tests, web build) the
+ * emitter path. Outside a Tauri context (unit tests, web build) the
  * helper is a no-op.
  */
 
@@ -32,8 +40,9 @@ export type ScriptedOutputEventName =
 
 /**
  * Fire-and-forget activity_timeline write.  Safe to call with an
- * undefined `taskRunId` — the Rust side tolerates that via the literal
- * "unassigned" sentinel.
+ * undefined `taskRunId` — the Rust command records the event with a
+ * NULL FK column in that case (and preserves the raw value in
+ * `metadata.task_run_id_raw` when one was supplied but didn't resolve).
  */
 export function emitScriptedOutputEvent(
   name: ScriptedOutputEventName,
@@ -42,30 +51,15 @@ export function emitScriptedOutputEvent(
 ): void {
   if (!isTauri()) return;
 
-  // Field names are camelCase because `ActivityTimelineInput` carries
-  // `#[serde(rename_all = "camelCase")]`.  Optional fields with `None` on
-  // the Rust side must be omitted (serde `skip_serializing_if` is
-  // deserialize-asymmetric).
-  const input: Record<string, unknown> = {
-    textContent: name,
-    sourceType: "scripted_output",
-    captureMode: "runner",
-    appName: "runner",
-    taskRunId: taskRunId ?? "unassigned",
-    metadataJson: safeStringify(metadata),
-  };
-
-  void invoke("insert_activity_entry", { input }).catch((err) => {
+  void invoke("emit_scripted_output_event", {
+    args: {
+      name,
+      metadata,
+      taskRunId: taskRunId ?? null,
+    },
+  }).catch((err) => {
     log.debug("scripted-output telemetry write failed for %s: %s", name, describeError(err));
   });
-}
-
-function safeStringify(value: unknown): string {
-  try {
-    return JSON.stringify(value) ?? "{}";
-  } catch {
-    return "{}";
-  }
 }
 
 function describeError(err: unknown): string {

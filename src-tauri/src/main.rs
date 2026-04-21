@@ -600,6 +600,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::screenshot::capture_screenshot_via_python,
             // Scripted-output emitter (think-in-code extraction script)
             commands::script_emitter::emit_extraction_script,
+            commands::script_emitter::emit_scripted_output_event,
             // Logging commands
             commands::logging::append_ai_output_log,
             commands::logging::clear_ai_output_log,

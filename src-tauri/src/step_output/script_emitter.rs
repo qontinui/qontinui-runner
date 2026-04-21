@@ -21,11 +21,11 @@
 //!   *before* the LLM call and only consumed on success — a rejected call
 //!   never spends budget.
 //! - **3-second LLM timeout** via `tokio::time::timeout`.
-//! - **Circuit breaker reuse.** We check the Claude API breaker
-//!   (`ai_provider::circuit_breaker`) before the call; when open we return
-//!   [`EmitError::BreakerOpen`] without consuming budget. The underlying
-//!   provider still records failures into the same registry so the two
-//!   views stay consistent.
+//! - **Circuit breaker reuse.** The inner `run_prompt_*` path consults the
+//!   breaker against whichever provider the runner is configured to use
+//!   (claude_cli, claude_api, …); we classify a breaker-open response by
+//!   error-text match and return [`EmitError::BreakerOpen`]. We don't know
+//!   the provider at call-site so we can't pre-check against the right one.
 //! - **Telemetry.** Emits three activity-timeline events into `runner`
 //!   scope: `scripted_output.cache_hit`, `scripted_output.llm_ok`,
 //!   `scripted_output.fallback{reason}`. The TS side emits the other three
@@ -42,7 +42,6 @@ use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::ai_provider::circuit_breaker;
 use crate::ai_provider::routing::run_prompt_with_structured_output;
 use crate::database::pg::PgDb;
 use crate::database::types::ActivityTimelineInput;
@@ -253,15 +252,12 @@ pub async fn emit_extraction_script(
     }
 
     // -------------------------------------------------------- 4. Breaker peek
-    // If the Claude API breaker is open right now, short-circuit with an
-    // unambiguous reason. (The inner `run_prompt_*` path *also* checks the
-    // breaker; this pre-check is so we can distinguish `BreakerOpen` from a
-    // generic `LlmError` upstream.)
-    if !circuit_breaker::is_provider_available("claude_api") {
-        warn!("scripted-output emitter: claude_api breaker is open; skipping LLM call");
-        emit_fallback_event(&task_run_id, "breaker_open");
-        return Err(EmitError::BreakerOpen);
-    }
+    // We don't know which provider the runner is configured to use
+    // (claude_cli, claude_api, …) until `run_prompt_with_structured_output`
+    // resolves it from settings. The inner path does its own breaker check
+    // against the right provider — we classify a `BreakerOpen` result by
+    // error-text match below rather than pre-checking the wrong provider
+    // and masking the real state.
 
     // ------------------------------------------------------- 5. Model + prompt
     let model = resolve_model();
@@ -281,7 +277,7 @@ pub async fn emit_extraction_script(
                 "scripted_output_extraction",
                 None, // no Doctor handle — this is a short synthetic call
                 Some(&model_for_task),
-                Some("claude_api"),
+                None, // let the runner's configured AI provider decide (claude_cli, claude_api, …)
                 Some(0.0),      // deterministic
                 Some(512),      // cap: expression is < 512 tokens always
             )
@@ -653,6 +649,37 @@ fn emit_fallback_event(task_run_id: &Option<String>, reason: &str) {
     );
 }
 
+/// Emit a scripted-output telemetry event that originates from the TS base
+/// handler (`ScriptedOutputHandler.summarizeViaScript`). Exposed as the
+/// `emit_scripted_output_event` Tauri command so the TS side can reuse the
+/// FK-aware insert path rather than going through `insert_activity_entry`
+/// (which runs PII scrubbing and has no FK pre-check).
+///
+/// Only the three TS-originated event names are accepted, plus the
+/// `bad_expression` flavour of `fallback`; anything else is rejected so a
+/// compromised/misbehaving caller can't spam arbitrary `scripted_output.*`
+/// rows.
+pub fn emit_ts_originated_event(
+    name: &str,
+    metadata: serde_json::Value,
+    task_run_id: Option<String>,
+) -> Result<(), String> {
+    const ALLOWED: &[&str] = &[
+        "scripted_output.attempted",
+        "scripted_output.worker_ok",
+        "scripted_output.bytes_avoided",
+        "scripted_output.fallback",
+    ];
+    if !ALLOWED.contains(&name) {
+        return Err(format!(
+            "emit_ts_originated_event: event name '{}' is not one of {:?}",
+            name, ALLOWED
+        ));
+    }
+    spawn_activity_event(task_run_id, name.to_string(), metadata);
+    Ok(())
+}
+
 /// Fire-and-forget telemetry write. Errors are logged at `debug` — a
 /// telemetry failure must never disrupt the emitter path.
 fn spawn_activity_event(
@@ -664,24 +691,54 @@ fn spawn_activity_event(
         debug!("scripted-output telemetry: PgDb not initialised yet; skipping '{}'", event_name);
         return;
     };
-    let tr = task_run_id.unwrap_or_else(|| "unassigned".to_string());
-    let meta_str = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
-    let input = ActivityTimelineInput {
-        // text_content doubles as the event name so existing FTS queries
-        // can find it ("scripted_output.llm_ok", etc.).
-        text_content: event_name.clone(),
-        source_type: "scripted_output".to_string(),
-        capture_mode: "runner".to_string(),
-        app_name: Some("runner".to_string()),
-        window_title: None,
-        url: None,
-        task_run_id: Some(tr),
-        screenshot_path: None,
-        element_count: None,
-        confidence: None,
-        metadata_json: Some(meta_str),
-    };
+    // activity_timeline.task_run_id has a FK to task_runs(id). An "unassigned"
+    // sentinel or a pre-task-run ad-hoc id would fail the FK check and the
+    // insert would be silently dropped. Fold the original value into
+    // metadata_json for debuggability; spawn a task that validates the FK by
+    // pre-check, and falls back to NULL on miss.
+    let mut metadata_with_tr = metadata;
+    if let (serde_json::Value::Object(map), Some(s)) =
+        (&mut metadata_with_tr, task_run_id.as_ref())
+    {
+        map.insert(
+            "task_run_id_raw".to_string(),
+            serde_json::Value::String(s.clone()),
+        );
+    }
+    let meta_str = serde_json::to_string(&metadata_with_tr).unwrap_or_else(|_| "{}".to_string());
+
     tokio::spawn(async move {
+        // If a task_run_id was passed, verify it exists before using it —
+        // otherwise let the FK column be NULL so the event is still recorded.
+        let resolved_tr = match task_run_id.as_deref() {
+            None => None,
+            Some(tr) => match pg.task_run_exists(tr).await {
+                Ok(true) => Some(tr.to_string()),
+                Ok(false) => None,
+                Err(e) => {
+                    debug!(
+                        "scripted-output telemetry: task_run lookup failed for '{}': {}; recording with NULL task_run_id",
+                        tr, e
+                    );
+                    None
+                }
+            },
+        };
+        let input = ActivityTimelineInput {
+            // text_content doubles as the event name so existing FTS queries
+            // can find it ("scripted_output.llm_ok", etc.).
+            text_content: event_name.clone(),
+            source_type: "scripted_output".to_string(),
+            capture_mode: "runner".to_string(),
+            app_name: Some("runner".to_string()),
+            window_title: None,
+            url: None,
+            task_run_id: resolved_tr,
+            screenshot_path: None,
+            element_count: None,
+            confidence: None,
+            metadata_json: Some(meta_str),
+        };
         if let Err(e) = pg.insert_activity_entry(&input).await {
             debug!(
                 "scripted-output telemetry insert failed for '{}': {}",

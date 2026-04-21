@@ -278,6 +278,30 @@ impl PgDb {
             .collect())
     }
 
+    /// Lightweight FK pre-check used by the scripted-output telemetry path.
+    ///
+    /// `activity_timeline.task_run_id` has an FK constraint to `task_runs(id)`,
+    /// so an insert that names a non-existent task_run is rejected outright
+    /// and the event is lost. The emitter calls this before inserting to
+    /// null out the FK column rather than drop the event when the caller's
+    /// id doesn't resolve (e.g. ad-hoc direct invocations of
+    /// `emit_extraction_script` outside a real workflow run).
+    pub async fn task_run_exists(&self, task_run_id: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT 1 FROM task_runs WHERE id = $1 LIMIT 1",
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG task_run_exists: {}", e))?;
+        Ok(row.is_some())
+    }
+
     /// Return every `scripted_output` activity-timeline row's event name
     /// (`text_content`) and `metadata_json`, optionally scoped to a single
     /// `task_run_id`. Returns tuples `(text_content, metadata_json)` with
