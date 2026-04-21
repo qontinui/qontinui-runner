@@ -164,6 +164,24 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{ \"backendUrl\"?: string | null }",
         response_schema: "null",
     },
+    ProxyableCommand {
+        name: "emit_extraction_script",
+        description: "Synthesise a one-line JS extraction expression for the scripted-output indirection (already registered in Tauri — this entry only allowlists it over HTTP). Maps to a 500 with `{ kind, message }` error body on failure; `kind` is one of `cost_cap` (per-task_run call cap exceeded), `token_budget` (input/output token budget exhausted), `timeout` (LLM exceeded 3s), `breaker_open` (shared Claude circuit breaker is Open), `disabled` (global kill switch off), `llm_error`, or `invalid_response`.",
+        args_schema: "{ \"goal\": string, \"schemaHint\": object, \"outputPreview\": string, \"taskRunId\"?: string | null }",
+        response_schema: "{ \"expression\": string, \"modelId\": string, \"tokensIn\": number, \"tokensOut\": number, \"source\": \"cache\" | \"llm\", \"cacheTier\": number | null, \"provider\": string, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
+    },
+    ProxyableCommand {
+        name: "emit_scripted_output_event",
+        description: "Record a TS-originated scripted-output activity-timeline event through the Rust emitter's FK-aware insert path (already registered in Tauri — this entry only allowlists it over HTTP). `name` must be one of `scripted_output.attempted`, `scripted_output.worker_ok`, `scripted_output.bytes_avoided`, or `scripted_output.fallback`; any other value is rejected. `metadata` defaults to `{}` if omitted; `taskRunId` is optional and falls back to NULL on a miss in `task_runs` (raw value preserved in `metadata.task_run_id_raw`).",
+        args_schema: "{ \"name\": string, \"metadata\"?: object, \"taskRunId\"?: string | null }",
+        response_schema: "null",
+    },
+    ProxyableCommand {
+        name: "get_scripted_output_stats",
+        description: "Aggregate `source_type = 'scripted_output'` activity-timeline events into a single stat block (already registered in Tauri — this entry only allowlists it over HTTP). `taskRunId` is optional: when omitted or `null`, returns global stats across all runs (including the unassigned bucket); otherwise scopes to that run.",
+        args_schema: "{ \"taskRunId\"?: string | null }",
+        response_schema: "{ \"attempted\": number, \"cacheHit\": number, \"llmOk\": number, \"workerOk\": number, \"bytesAvoided\": number, \"fallbacks\": { [reason: string]: number }, \"totalTokensIn\": number, \"totalTokensOut\": number, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.
@@ -257,6 +275,13 @@ mod tests {
         assert!(is_allowlisted("save_web_integration_settings"));
         assert!(is_allowlisted("test_web_integration_connection"));
         assert!(is_allowlisted("start_web_token_flow"));
+    }
+
+    #[test]
+    fn is_allowlisted_recognizes_scripted_output_commands() {
+        assert!(is_allowlisted("emit_extraction_script"));
+        assert!(is_allowlisted("emit_scripted_output_event"));
+        assert!(is_allowlisted("get_scripted_output_stats"));
     }
 
     #[test]

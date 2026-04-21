@@ -170,6 +170,41 @@ If not using the Python client:
 | GET    | `/ui-bridge/control/snapshot`                       | Get UI snapshot          |
 | GET    | `/health`                                           | Health check             |
 
+### Choosing a wait / nav / batch primitive
+
+Prefer these primitives over `sleep N && re-discover`; they all already exist. Each pairs a bounded wait or a single round-trip with a verification signal, which is usually what the naive sleep is trying to approximate.
+
+**Waits** — use instead of fixed sleeps:
+
+- `POST /ui-bridge/control/wait-for-element-state` — wait until a known element id becomes `visible` / `enabled` / `focused`. 100 ms polling. Body: `{ id, state, timeout_ms }`. Use when you already have a registered element id.
+- `POST /ui-bridge/control/wait-for-route` — wait until the current route matches a glob (`**` supported). Body: `{ pattern, timeout_ms }`. Use after a navigation trigger when the route is the observable signal.
+- `POST /ui-bridge/ai/wait-for-element-condition` — structured-selector wait: `{ condition: 'present'|'visible'|'clickable'|'text-matches', target: { id|title|aria_label|text|type }, timeout_ms }`. Use when you don't have a registered id yet. Returns 408 on timeout.
+
+**Tab navigation** — pick the simplest that works:
+
+- `POST /ui-bridge/control/activate-tab/{tab_id}` — fire-and-forget Tauri event; fastest path when you just need the tab switched and don't need a signal back.
+- `POST /ui-bridge/control/page/set-tab` — body `{ tab }`. Dispatches a `CustomEvent("ui-bridge-set-tab", …)` and reads back `[data-page-id]` so you get a verification signal in the response. Works even when the SDK is unresponsive.
+- `window.__UI_BRIDGE__.stateMachine.navigateTo("page-<slug>")` via `POST /ui-bridge/control/page/evaluate` — runs the compiled sidebar transition. Use when you need the state-machine side effects (active-state updates, etc.).
+- Avoid clicking sidebar buttons via `POST /ui-bridge/control/element/<id>/action` for navigation — the click handler fires but may not route through the state-machine transition. Use one of the three above instead.
+
+**Batch** — use when a manual-test sequence would otherwise need 3+ round-trips:
+
+- `POST /ui-bridge/control/batch-execute` — mixed `action` / `wait` / `snapshot` steps, serial, with `stop_on_error` default `true`.
+- `POST /ui-bridge/control/batch` and `POST /ui-bridge/control/batch-actions` — pure action batches with timing and pre/post snapshot diff.
+
+**Tauri invoke proxy** — drop the `page/evaluate + window.__TAURI_INTERNALS__.invoke(...)` boilerplate:
+
+- `GET /ui-bridge/commands` — lists every command the runner will proxy, with `args_schema` / `response_schema`.
+- `POST /ui-bridge/invoke/{command_name}` — body `{ args }`. Calls an allowlisted Tauri command directly. If the command you need isn't allowlisted, add it to `UI_BRIDGE_COMMANDS` in `src-tauri/src/ui_bridge_invoke.rs` (threat-review gate: no filesystem paths, credentials, or PTY handles).
+
+**Console errors** — targeted retrieval, not "dump everything":
+
+- `GET /ui-bridge/control/console-errors?since=<epoch-ms-or-ISO>&limit=&group=true&groupBy=` — `since` accepts both epoch-ms numeric and ISO-8601 strings. Use `group=true` for fingerprint-rolled buckets on long runs.
+
+**Side-effect detection on clicks** — read before re-discovering:
+
+- `click` / `doubleClick` actions on non-input elements automatically run an `expectChange` DOM-diff detector. The action response includes `expectChange: { changed: boolean, added, removed, … }`. Read that instead of immediately calling `/control/snapshot` again; it'll usually tell you whether the click produced the side effect you expected.
+
 ### Common Patterns
 
 **Wait for element to appear:**

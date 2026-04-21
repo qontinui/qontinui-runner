@@ -7,6 +7,7 @@
  */
 
 import { useState } from "react";
+import { useUIComponent, useUIElement } from "@qontinui/ui-bridge";
 import { CreditCard, RefreshCw, AlertTriangle, Clock } from "lucide-react";
 import { useLlmAnalytics } from "../../hooks/useLlmAnalytics";
 import type { LlmTimeRange } from "./types";
@@ -39,9 +40,75 @@ export default function LlmObservabilityDashboard() {
     refresh,
   } = useLlmAnalytics(timeRange);
 
+  // --- UI Bridge registrations ---
+  // Page marker — surfaces in currentRouteOnly snapshots when the
+  // LLM Analytics tab is active so callers can see this page exists
+  // beyond the sidebar buttons.
+  useUIComponent({
+    id: "page:llm-analytics",
+    name: "LLM Analytics page",
+    description:
+      "LLM token usage, cost analytics, and provider latency dashboard for the active task runs",
+  });
+  const { ref: pageRootRef } = useUIElement({
+    id: "llm-analytics-root",
+    type: "generic",
+    label: "LLM Analytics page root",
+  });
+  const { ref: refreshButtonRef } = useUIElement({
+    id: "llm-analytics-refresh",
+    type: "button",
+    label: "Refresh LLM analytics",
+    actions: ["click"],
+  });
+  const { ref: timeRangeSelectRef } = useUIElement({
+    id: "llm-analytics-time-range",
+    type: "select",
+    label: "Time range selector",
+  });
+  const { ref: costOverTimeRef } = useUIElement({
+    id: "llm-analytics-chart-cost-over-time",
+    type: "generic",
+    label: "Cost over time chart",
+  });
+  const { ref: costByModelRef } = useUIElement({
+    id: "llm-analytics-chart-cost-by-model",
+    type: "generic",
+    label: "Cost by model chart",
+  });
+  const { ref: costByPhaseRef } = useUIElement({
+    id: "llm-analytics-chart-cost-by-phase",
+    type: "generic",
+    label: "Cost by phase chart",
+  });
+  const { ref: providerLatencyRef } = useUIElement({
+    id: "llm-analytics-chart-provider-latency",
+    type: "generic",
+    label: "Provider latency chart",
+  });
+  const { ref: costTrendRef } = useUIElement({
+    id: "llm-analytics-chart-cost-trend",
+    type: "generic",
+    label: "Cost trend chart",
+  });
+  const { ref: costByTargetAppRef } = useUIElement({
+    id: "llm-analytics-chart-cost-by-target-app",
+    type: "generic",
+    label: "Cost by target app chart",
+  });
+  const { ref: taskRunCostTableRef } = useUIElement({
+    id: "llm-analytics-task-run-cost-table",
+    type: "generic",
+    label: "Task run cost table",
+  });
+
   if (loading) {
     return (
-      <div className="h-full flex items-center justify-center">
+      <div
+        ref={pageRootRef}
+        data-nav-item="page:llm-analytics"
+        className="h-full flex items-center justify-center"
+      >
         <RefreshCw className="w-6 h-6 animate-spin text-muted-foreground" />
       </div>
     );
@@ -49,12 +116,17 @@ export default function LlmObservabilityDashboard() {
 
   if (error) {
     return (
-      <div className="h-full flex items-center justify-center text-muted-foreground">
+      <div
+        ref={pageRootRef}
+        data-nav-item="page:llm-analytics"
+        className="h-full flex items-center justify-center text-muted-foreground"
+      >
         <div className="text-center">
           <AlertTriangle className="w-12 h-12 mx-auto mb-4 opacity-50" />
           <p>Failed to load LLM analytics</p>
           <p className="text-sm mt-2">{error}</p>
           <button
+            ref={refreshButtonRef}
             onClick={refresh}
             className="mt-4 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm hover:bg-primary/90 transition-colors"
           >
@@ -67,7 +139,11 @@ export default function LlmObservabilityDashboard() {
 
   if (!summary || summary.total_calls === 0) {
     return (
-      <div className="h-full overflow-auto p-4 space-y-6">
+      <div
+        ref={pageRootRef}
+        data-nav-item="page:llm-analytics"
+        className="h-full overflow-auto p-4 space-y-6"
+      >
         <AccountUsageCard />
         <div className="flex items-center justify-center text-muted-foreground pt-4">
           <div className="text-center">
@@ -86,6 +162,8 @@ export default function LlmObservabilityDashboard() {
 
   return (
     <div
+      ref={pageRootRef}
+      data-nav-item="page:llm-analytics"
       className="h-full overflow-auto p-4 space-y-4"
       data-tutorial-id="llm-observability-dashboard"
     >
@@ -105,6 +183,7 @@ export default function LlmObservabilityDashboard() {
           <div className="flex items-center gap-2" data-tutorial-id="llm-time-range">
             <Clock className="w-4 h-4 text-muted-foreground" />
             <select
+              ref={timeRangeSelectRef}
               value={timeRange}
               onChange={(e) => setTimeRange(e.target.value as LlmTimeRange)}
               aria-label="Select time range"
@@ -118,6 +197,7 @@ export default function LlmObservabilityDashboard() {
             </select>
           </div>
           <button
+            ref={refreshButtonRef}
             onClick={refresh}
             className="p-2 rounded-md hover:bg-muted transition-colors"
             title="Refresh analytics"
@@ -138,27 +218,43 @@ export default function LlmObservabilityDashboard() {
 
       {/* Charts Row 1 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <CostOverTimeChart data={dailyCost} />
-        <CostByModelChart data={costByModel} />
+        <div ref={costOverTimeRef}>
+          <CostOverTimeChart data={dailyCost} />
+        </div>
+        <div ref={costByModelRef}>
+          <CostByModelChart data={costByModel} />
+        </div>
       </div>
 
       {/* Cost Trend (fetches its own data from the web backend) */}
-      <CostTrendChart />
+      <div ref={costTrendRef}>
+        <CostTrendChart />
+      </div>
 
       {/* Scripted-output (think-in-code) aggregates — Phase C of script-emitter-wiring */}
       <ScriptedOutputPanel />
 
       {/* Charts Row 2 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <CostByPhaseChart data={costByPhase} />
-        <ProviderLatencyChart data={providerLatency} />
+        <div ref={costByPhaseRef}>
+          <CostByPhaseChart data={costByPhase} />
+        </div>
+        <div ref={providerLatencyRef}>
+          <ProviderLatencyChart data={providerLatency} />
+        </div>
       </div>
 
       {/* UI Bridge Cost Attribution */}
-      {costByTargetApp.length > 0 && <CostByTargetAppChart data={costByTargetApp} />}
+      {costByTargetApp.length > 0 && (
+        <div ref={costByTargetAppRef}>
+          <CostByTargetAppChart data={costByTargetApp} />
+        </div>
+      )}
 
       {/* Task Run Cost Table */}
-      <TaskRunCostTable data={taskRunCosts} />
+      <div ref={taskRunCostTableRef}>
+        <TaskRunCostTable data={taskRunCosts} />
+      </div>
     </div>
   );
 }
