@@ -1,4 +1,5 @@
 import { Component, ErrorInfo, ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 interface Props {
   children: ReactNode;
@@ -33,6 +34,44 @@ class ErrorBoundary extends Component<Props, State> {
       error,
       errorInfo,
     });
+
+    // Phase 3J.1 — notify the Rust backend so /health, heartbeats, and
+    // supervisor fleet views can flag this runner as errored. Best-effort
+    // only: if the IPC fails (non-Tauri context, runtime not ready, etc.)
+    // we swallow the error so we never mask the original render failure.
+    // React 18+ production builds attach `error.digest` for minified
+    // errors — capture it when present for cross-runner aggregation.
+    try {
+      const digest =
+        typeof (error as Error & { digest?: unknown }).digest === "string"
+          ? (error as Error & { digest?: string }).digest
+          : null;
+      invoke("report_ui_error", {
+        message: error.message,
+        stack: error.stack ?? null,
+        componentStack: errorInfo.componentStack ?? null,
+        digest: digest ?? null,
+      }).catch(() => {
+        /* best-effort: swallow IPC failures */
+      });
+    } catch {
+      /* best-effort: non-Tauri context, etc. */
+    }
+  }
+
+  public componentDidUpdate(_prevProps: Props, prevState: State) {
+    // Phase 3J.1 — when the boundary recovers (previously errored, now
+    // rendering cleanly), clear the Rust-side UI-error state so health
+    // flips back to "healthy". Best-effort only.
+    if (prevState.hasError && !this.state.hasError) {
+      try {
+        invoke("clear_ui_error").catch(() => {
+          /* best-effort: swallow IPC failures */
+        });
+      } catch {
+        /* best-effort: non-Tauri context, etc. */
+      }
+    }
   }
 
   public render() {

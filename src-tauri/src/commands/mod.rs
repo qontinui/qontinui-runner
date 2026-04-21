@@ -129,6 +129,7 @@ pub mod ui_bridge_baselines; // UI Bridge visual regression baseline CRUD
 pub mod verification;
 pub mod video;
 pub mod watchers; // Screenpipe-inspired scheduled reactive AI agents
+pub mod web_integration; // Phase 3G: runner↔web backend integration toggle
 pub mod websocket;
 pub mod window_manager; // OS-level window enumeration and activation
 pub mod workflow_events; // Workflow event emission to backend for mobile push notifications
@@ -233,12 +234,36 @@ pub struct AppState {
     /// Avoids rebuilding expensive parallel PG queries on every prompt construction.
     pub working_representation_cache:
         Arc<crate::memory::working_representation::WorkingRepresentationCache>,
-    /// Server-mode web-backend integration state.
-    /// `Some` only when `QONTINUI_SERVER_MODE=1` and both
-    /// `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN` are set. Holds the
+    /// Web-backend integration state (Phase 3G: settings-driven).
+    ///
+    /// `Some` when [`crate::settings::WebIntegrationSettings::enabled`] is
+    /// true and both `backend_url` and `runner_token` are set. Holds the
     /// runner_id assigned by `/api/v1/runners/register` and the token needed
-    /// for authenticated POSTs to the web backend. Cheap to clone.
-    pub server_mode: Option<crate::server_mode::ServerModeState>,
+    /// for authenticated POSTs to the web backend.
+    ///
+    /// Wrapped in `Arc<RwLock<...>>` so the settings-save command can
+    /// hot-reload the integration without restarting the runner: the command
+    /// signals shutdown on the old state, builds a new one, and swaps it in.
+    /// Consumers should use [`AppState::current_server_mode`] which clones
+    /// the inner `Option<ServerModeState>` under a read lock.
+    pub server_mode: Arc<tokio::sync::RwLock<Option<crate::server_mode::ServerModeState>>>,
+    /// Pending browser-login token flow store (Phase 3G-web-polish).
+    ///
+    /// Single-slot: starting a new flow cancels any in-progress flow.
+    /// Populated by `commands::web_integration::start_web_token_flow` when
+    /// the user clicks "Connect with web login" in Settings; consumed by
+    /// `mcp::auth_callback::runner_token_callback_handler` when the user's
+    /// browser redirects back with `?state=...&token=...`.
+    pub token_flow: Arc<crate::server_mode::TokenFlowStore>,
+    /// Nuanced runner-health: latest UI error reported by the React
+    /// `ErrorBoundary` (Phase 3J.1/3J.2).
+    ///
+    /// Populated via the `report_ui_error` Tauri command, cleared via
+    /// `clear_ui_error`. Surfaced on the `/health` endpoint
+    /// (`derived_status` + `ui_error` fields) and on outgoing heartbeats
+    /// so supervisors and the qontinui-web fleet view can flag runners
+    /// whose backend is up but whose UI is broken.
+    pub ui_error: Arc<crate::ui_error::UiErrorState>,
 }
 
 impl AppState {
@@ -270,6 +295,18 @@ impl AppState {
     /// Remove cost trackers after run completion.
     pub async fn remove_cost_trackers(&self, execution_id: &str) {
         self.run_cost_trackers.lock().await.remove(execution_id);
+    }
+
+    /// Snapshot the current web-integration state.
+    ///
+    /// Returns a cloned `Option<ServerModeState>` under a read lock, so the
+    /// caller does not hold the lock while awaiting downstream HTTP work.
+    /// Callers that need to inspect state fields (runner_id, dispatch_secret)
+    /// should use this helper rather than locking directly — the inner
+    /// `ServerModeState` already shares its data via `Arc<RwLock<...>>`, so
+    /// the clone is cheap.
+    pub async fn current_server_mode(&self) -> Option<crate::server_mode::ServerModeState> {
+        self.server_mode.read().await.clone()
     }
 }
 

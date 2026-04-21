@@ -222,6 +222,15 @@ struct RegistrationResponse {
 struct HeartbeatRequest {
     restate_healthy: bool,
     status: String,
+    /// Phase 3J.2 — `"healthy"` if no UI error is tracked, `"errored"`
+    /// when the React error boundary has reported an unhandled error.
+    /// Distinct from `status` (which tracks Restate health) so the
+    /// qontinui-web fleet page can surface both independently.
+    derived_status: String,
+    /// Phase 3J.2 — latest UI error snapshot from the runner's React error
+    /// boundary. Serialized as `null` when healthy (the key is always
+    /// present so consumers can assume the shape).
+    ui_error: Option<crate::ui_error::UiError>,
 }
 
 fn build_http_client() -> reqwest::Client {
@@ -263,7 +272,11 @@ fn get_runner_port() -> u16 {
 /// `restate_enabled` is captured up front from the live `RestateSettings`;
 /// registration reports the static value (the dynamic health is reported on
 /// each heartbeat instead).
-pub fn spawn_background_tasks(state: ServerModeState, restate_enabled: bool) {
+pub fn spawn_background_tasks(
+    state: ServerModeState,
+    restate_enabled: bool,
+    ui_error_state: Arc<crate::ui_error::UiErrorState>,
+) {
     let state_for_register = state.clone();
     tauri::async_runtime::spawn(async move {
         register_with_retry(&state_for_register, restate_enabled).await;
@@ -273,7 +286,7 @@ pub fn spawn_background_tasks(state: ServerModeState, restate_enabled: bool) {
         }
         // Once registered, start heartbeats. We chain them so the heartbeat
         // loop never runs without a runner_id (which would 404 every tick).
-        run_heartbeat_loop(state_for_register, restate_enabled).await;
+        run_heartbeat_loop(state_for_register, restate_enabled, ui_error_state).await;
     });
 }
 
@@ -377,7 +390,11 @@ async fn register_with_retry(state: &ServerModeState, restate_enabled: bool) {
 /// Heartbeat loop: every 30s while `runner_id` is set. Network errors warn
 /// but never back off — a missed heartbeat is fine. Exits when
 /// [`ServerModeState::shutdown`] has been called.
-async fn run_heartbeat_loop(state: ServerModeState, restate_enabled: bool) {
+async fn run_heartbeat_loop(
+    state: ServerModeState,
+    restate_enabled: bool,
+    ui_error_state: Arc<crate::ui_error::UiErrorState>,
+) {
     let client = build_http_client();
     let mut ticker = tokio::time::interval(Duration::from_secs(30));
     // Skip the immediate tick — we just registered.
@@ -414,6 +431,16 @@ async fn run_heartbeat_loop(state: ServerModeState, restate_enabled: bool) {
             "healthy"
         };
 
+        // Phase 3J.2 — snapshot the UI error state for this tick. The
+        // `derived_status` reported here is specifically about UI health,
+        // independent of Restate's `status` field above.
+        let ui_error_snapshot = ui_error_state.get().await;
+        let derived_status = if ui_error_snapshot.is_some() {
+            "errored".to_string()
+        } else {
+            "healthy".to_string()
+        };
+
         let url = format!(
             "{}/api/v1/runners/{}/heartbeat",
             state.config.web_backend_url, runner_id
@@ -421,6 +448,8 @@ async fn run_heartbeat_loop(state: ServerModeState, restate_enabled: bool) {
         let body = HeartbeatRequest {
             restate_healthy,
             status: status.to_string(),
+            derived_status,
+            ui_error: ui_error_snapshot,
         };
 
         match client

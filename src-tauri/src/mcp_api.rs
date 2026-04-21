@@ -236,6 +236,23 @@ async fn health(
         crate::settings::AiProvider::GeminiApi => Some(ai_settings.gemini_api.model.clone()),
     };
 
+    // Phase 3J.2 — surface the in-memory UI error state captured by the React
+    // ErrorBoundary. `derived_status` is an additive field; the existing
+    // `status` ("ok" / "starting") literal is preserved so older consumers
+    // keep working.
+    //
+    // The `ui_error` object is null when no error is tracked.
+    let ui_error_snapshot = state.app_state.ui_error.get().await;
+    let derived_status = if ui_error_snapshot.is_some() {
+        "errored"
+    } else {
+        "healthy"
+    };
+    let ui_error_json = match &ui_error_snapshot {
+        Some(err) => serde_json::to_value(err).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    };
+
     let mut data = serde_json::json!({
         "status": status,
         "ready": last_pong > 0,
@@ -262,6 +279,8 @@ async fn health(
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
         },
+        "derived_status": derived_status,
+        "ui_error": ui_error_json.clone(),
     });
 
     if let Some((screenshot, width, height)) = diagnostic_screenshot {
@@ -286,6 +305,12 @@ async fn health(
             "framework": "tauri",
             "capabilities": ["control", "renderLog", "debug"],
         },
+        // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
+        // so supervisor/fleet consumers can read them without descending into
+        // the inner `data` block. The inner `data.status` / `data.derived_status`
+        // / `data.ui_error` fields remain authoritative for existing callers.
+        "derived_status": derived_status,
+        "ui_error": ui_error_json,
         "timestamp": now_ms,
     }))
 }

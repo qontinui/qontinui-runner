@@ -11,6 +11,7 @@ use tracing::{debug, info};
 use serde::Serialize;
 
 use crate::commands::AppState;
+use crate::ui_error::UiError;
 
 #[derive(Debug, Serialize)]
 struct HeartbeatPayload {
@@ -22,6 +23,14 @@ struct HeartbeatPayload {
     os_version: Option<String>,
     running_task_count: u32,
     running_task_ids: Vec<String>,
+    /// Phase 3J.2 — `"healthy"` if no UI error is tracked, `"errored"`
+    /// when the React error boundary has reported an unhandled error that
+    /// has not yet been cleared.
+    derived_status: String,
+    /// Phase 3J.2 — latest UI error snapshot. Serialized as `null` when no
+    /// error is tracked (always present as a key so consumers can assume
+    /// the shape).
+    ui_error: Option<UiError>,
 }
 
 /// Start the heartbeat background task.
@@ -104,6 +113,15 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 Err(_) => get_running_tasks_fallback(),
             };
 
+            // Phase 3J.2 — snapshot the latest UI error (if any) once per
+            // tick; used by both the backend and primary-runner heartbeats.
+            let ui_error_snapshot = app_state.ui_error.get().await;
+            let derived_status = if ui_error_snapshot.is_some() {
+                "errored".to_string()
+            } else {
+                "healthy".to_string()
+            };
+
             // Send to web backend every 30s (every other tick)
             if tick_count.is_multiple_of(2) {
                 let ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
@@ -116,6 +134,8 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     os_version: None,
                     running_task_count: task_count,
                     running_task_ids: task_ids.clone(),
+                    derived_status: derived_status.clone(),
+                    ui_error: ui_error_snapshot.clone(),
                 };
 
                 match client.post(&heartbeat_url).json(&payload).send().await {
@@ -157,6 +177,10 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 let body = serde_json::json!({
                     "running_task_count": task_count,
                     "running_task_ids": task_ids,
+                    // Phase 3J.2 — include UI error status for supervisor
+                    // aggregation. `ui_error` is null when healthy.
+                    "derived_status": derived_status,
+                    "ui_error": ui_error_snapshot,
                 });
 
                 match client.post(&url).json(&body).send().await {

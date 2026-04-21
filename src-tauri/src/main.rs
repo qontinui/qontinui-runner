@@ -131,6 +131,7 @@ mod tracing_layers;
 mod trigger_system;
 mod tunnel;
 mod ui_bridge_plugin;
+mod ui_error;
 mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
@@ -413,6 +414,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         },
         server_mode: server_mode_state.clone(),
         token_flow: Arc::new(crate::server_mode::TokenFlowStore::new()),
+        ui_error: Arc::new(ui_error::UiErrorState::new()),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -1375,6 +1377,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::web_integration::test_web_integration_connection,
             // Browser-login one-click token flow (Phase 3G-web-polish)
             commands::web_integration::start_web_token_flow,
+            // Runner UI error reporting (Phase 3J.1/3J.2)
+            ui_error::report_ui_error,
+            ui_error::clear_ui_error,
+            ui_error::get_ui_error,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -1586,7 +1592,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     let sm_state_opt = startup_app_state.current_server_mode().await;
                     if let Some(sm_state) = sm_state_opt {
                         let restate_enabled = crate::settings::load_settings().restate.enabled;
-                        crate::server_mode::spawn_background_tasks(sm_state, restate_enabled);
+                        let ui_error_state = startup_app_state.ui_error.clone();
+                        crate::server_mode::spawn_background_tasks(
+                            sm_state,
+                            restate_enabled,
+                            ui_error_state,
+                        );
                     }
                 });
             }
