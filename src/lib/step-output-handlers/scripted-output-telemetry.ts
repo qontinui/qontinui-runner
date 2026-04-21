@@ -52,11 +52,9 @@ export function emitScriptedOutputEvent(
   if (!isTauri()) return;
 
   void invoke("emit_scripted_output_event", {
-    args: {
-      name,
-      metadata,
-      taskRunId: taskRunId ?? null,
-    },
+    name,
+    metadata,
+    taskRunId: taskRunId ?? null,
   }).catch((err) => {
     log.debug("scripted-output telemetry write failed for %s: %s", name, describeError(err));
   });

@@ -6,30 +6,9 @@
 //! `invoke("emit_extraction_script", {...})` when a handler's stdout
 //! exceeds the 8 KB scripted-output threshold.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::step_output::script_emitter::{self, EmitError, EmitResult};
-
-/// Request payload for `emit_extraction_script`.
-///
-/// Camel-cased because the TS caller sends camelCase. The frontend
-/// invoker follows Tauri's default convention.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EmitExtractionScriptArgs {
-    /// Human-readable description of what the summariser wants (e.g.
-    /// "find the last 10 ERROR lines").
-    pub goal: String,
-    /// Top-level key+type summary of the expected extracted shape. Used
-    /// for cache-key stability and as an LLM hint.
-    pub schema_hint: serde_json::Value,
-    /// First ~2 KB of the raw stdout. Full stdout is deliberately NOT
-    /// passed — the whole point of the indirection is to avoid that cost.
-    pub output_preview: String,
-    /// Optional task-run identifier. Drives per-run cost ceilings and
-    /// telemetry correlation; may be `None` for ad-hoc / test calls.
-    pub task_run_id: Option<String>,
-}
 
 /// Structured error shape returned to the TS shim on rejection. The shim
 /// maps any failure onto the truncation fallback; differentiating the
@@ -64,51 +43,44 @@ impl From<EmitError> for EmitExtractionScriptError {
 }
 
 /// `invoke("emit_extraction_script", {...})` handler.
+///
+/// Parameters are unpacked into named fields so the invoke payload is flat
+/// (`{ goal, schemaHint, outputPreview, taskRunId }`) — matching the
+/// convention used by every other command in the UI Bridge invoke allowlist
+/// and avoiding the `{args: {args: {...}}}` double-wrap gotcha that a single
+/// struct parameter would introduce.
 #[tauri::command]
 pub async fn emit_extraction_script(
-    args: EmitExtractionScriptArgs,
+    goal: String,
+    schema_hint: serde_json::Value,
+    output_preview: String,
+    task_run_id: Option<String>,
 ) -> Result<EmitResult, EmitExtractionScriptError> {
-    script_emitter::emit_extraction_script(
-        args.goal,
-        args.schema_hint,
-        args.output_preview,
-        args.task_run_id,
-    )
-    .await
-    .map_err(Into::into)
-}
-
-/// Request payload for `emit_scripted_output_event`.
-///
-/// Called by the TS `ScriptedOutputHandler` base class (via the helper in
-/// `src/lib/step-output-handlers/scripted-output-telemetry.ts`) to record
-/// the three TS-originated events (`attempted`, `worker_ok`,
-/// `bytes_avoided`) and the `bad_expression` flavour of `fallback`.
-///
-/// Goes through the Rust emitter's FK-aware insert path, so an
-/// unassigned/unknown task_run_id is handled by recording the event with a
-/// NULL FK column instead of being dropped.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EmitScriptedOutputEventArgs {
-    /// Event name. Must be one of `scripted_output.attempted`,
-    /// `scripted_output.worker_ok`, `scripted_output.bytes_avoided`, or
-    /// `scripted_output.fallback`.
-    pub name: String,
-    /// Arbitrary JSON metadata. Stored as-is in
-    /// `activity_timeline.metadata_json`.
-    #[serde(default)]
-    pub metadata: serde_json::Value,
-    /// Optional task run id. If set, the emitter pre-checks its existence
-    /// in `task_runs` and falls back to NULL on miss (the raw value is
-    /// preserved in `metadata.task_run_id_raw`).
-    pub task_run_id: Option<String>,
+    script_emitter::emit_extraction_script(goal, schema_hint, output_preview, task_run_id)
+        .await
+        .map_err(Into::into)
 }
 
 /// `invoke("emit_scripted_output_event", {...})` handler.
+///
+/// Called by the TS `ScriptedOutputHandler` base class (via the helper in
+/// `src/lib/step-output-handlers/scripted-output-telemetry.ts`) to record
+/// the three TS-originated events (`scripted_output.attempted`,
+/// `scripted_output.worker_ok`, `scripted_output.bytes_avoided`) and the
+/// `bad_expression` flavour of `scripted_output.fallback`. Goes through the
+/// Rust emitter's FK-aware insert path — an unassigned/unknown task_run_id
+/// is recorded with a NULL FK column (the raw value is preserved in
+/// `metadata.task_run_id_raw`) instead of being dropped.
+///
+/// Parameters are unpacked into named fields so the invoke payload is flat
+/// (`{ name, metadata?, taskRunId? }`) — see `emit_extraction_script` for
+/// the same rationale.
 #[tauri::command]
 pub async fn emit_scripted_output_event(
-    args: EmitScriptedOutputEventArgs,
+    name: String,
+    metadata: Option<serde_json::Value>,
+    task_run_id: Option<String>,
 ) -> Result<(), String> {
-    script_emitter::emit_ts_originated_event(&args.name, args.metadata, args.task_run_id)
+    let metadata = metadata.unwrap_or_else(|| serde_json::json!({}));
+    script_emitter::emit_ts_originated_event(&name, metadata, task_run_id)
 }
