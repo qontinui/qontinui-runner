@@ -219,17 +219,20 @@ pub async fn apply_web_integration_settings(
 
 /// Persist new web-integration settings and hot-reload the background tasks.
 ///
-/// **Wire contract (IMPORTANT):** JS callers pass three flat top-level
-/// arguments — `enabled`, `backendUrl`, `runnerToken` — NOT a wrapped
-/// `settings` object. Tauri's IPC converts top-level arg names camelCase →
-/// snake_case, so the JS shape `{ enabled, backendUrl, runnerToken }` maps
-/// naturally to this signature's `enabled, backend_url, runner_token`
-/// parameters. A `settings: WebIntegrationSettings` struct-arg would have
-/// forced JS callers to pass `{ settings: { enabled, backend_url, ... } }`
-/// with snake-case keys (Tauri does NOT recurse rename_all into struct
-/// fields) — that mismatch shipped broken in Phase 3G. When adding a new
-/// field here, update THREE sites: the command signature, the JS caller
-/// in `WebIntegrationSettings.tsx`, and the `WebIntegrationSettings` struct.
+/// **Wire contract (IMPORTANT):** JS callers pass flat top-level arguments —
+/// `enabled`, `backendUrl`, `runnerToken`, optional `webBaseUrl` — NOT a
+/// wrapped `settings` object. Tauri's IPC converts top-level arg names
+/// camelCase → snake_case, so the JS shape maps naturally to this signature's
+/// `enabled, backend_url, runner_token, web_base_url` parameters. A
+/// `settings: WebIntegrationSettings` struct-arg would have forced JS callers
+/// to pass `{ settings: { ... } }` with snake-case inner keys (Tauri does NOT
+/// recurse rename_all into struct fields) — that mismatch shipped broken in
+/// Phase 3G. When adding a new top-level arg, update FOUR sites:
+///   1. this command's signature
+///   2. the JS caller in `WebIntegrationSettings.tsx`
+///   3. the `WebIntegrationSettings` struct in `settings.rs`
+///   4. the `SaveArgs` mirror in `ipc_wire_contract_tests` at the bottom of
+///      this file (add a test that locks in the new field's wire shape)
 ///
 /// Idempotency: if the incoming values match the currently-persisted
 /// settings (after trimming), the function returns early without touching
@@ -251,7 +254,7 @@ pub async fn save_web_integration_settings(
     enabled: bool,
     backend_url: String,
     runner_token: String,
-    #[allow(non_snake_case)] web_base_url: Option<String>,
+    web_base_url: Option<String>,
 ) -> Result<(), String> {
     let settings = WebIntegrationSettings {
         enabled,
@@ -609,17 +612,23 @@ mod ipc_wire_contract_tests {
 
     /// Mirror of what Tauri generates for `save_web_integration_settings`
     /// argument extraction. Top-level args are renamed camelCase → snake_case.
+    /// Kept in sync with the live command signature — update this struct AND
+    /// the command's doc block when adding a new top-level arg.
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct SaveArgs {
         enabled: bool,
         backend_url: String,
         runner_token: String,
+        #[serde(default)]
+        web_base_url: Option<String>,
     }
 
     #[test]
     fn save_accepts_frontends_natural_shape() {
-        // This is the exact shape WebIntegrationSettings.tsx sends.
+        // Three-field shape from WebIntegrationSettings.tsx — no webBaseUrl.
+        // Must keep working so desktop users who don't set the SPA override
+        // continue to save cleanly (webBaseUrl falls back to backend_url).
         let payload = r#"{
             "enabled": true,
             "backendUrl": "http://localhost:8000",
@@ -629,6 +638,21 @@ mod ipc_wire_contract_tests {
         assert!(args.enabled);
         assert_eq!(args.backend_url, "http://localhost:8000");
         assert!(args.runner_token.starts_with("qontinui_runner_"));
+        assert_eq!(args.web_base_url, None);
+    }
+
+    #[test]
+    fn save_accepts_web_base_url_override() {
+        // Split local dev: FastAPI on :8000, Next.js SPA on :3001. When the
+        // frontend exposes webBaseUrl, the four-field payload must deserialize.
+        let payload = r#"{
+            "enabled": true,
+            "backendUrl": "http://localhost:8000",
+            "runnerToken": "qontinui_runner_0000000000000000000000000000000000000000000000000000000000000000",
+            "webBaseUrl": "http://localhost:3001"
+        }"#;
+        let args: SaveArgs = serde_json::from_str(payload).expect("must deserialize");
+        assert_eq!(args.web_base_url.as_deref(), Some("http://localhost:3001"));
     }
 
     #[test]
