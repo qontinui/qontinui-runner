@@ -120,6 +120,11 @@ pub fn awas_action_to_ui_bridge_element(
         },
         registered_at: chrono::Utc::now().timestamp_millis(),
         mounted: true, // Manifest-declared elements are always "mounted"
+        // AWAS actions are manifest-declared, not live DOM refs — no bbox
+        // is available. The bbox-first click provider will fall through to
+        // the VLM path for these.
+        bbox: None,
+        visible: None,
     }
 }
 

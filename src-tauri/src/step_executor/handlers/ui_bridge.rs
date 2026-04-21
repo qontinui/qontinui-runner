@@ -484,6 +484,28 @@ fn element_matches_criteria(
     true
 }
 
+/// Inspect a criteria map and, when it amounts to a single id- or
+/// label-based lookup, return the corresponding
+/// [`click_providers::ElementIdentifier`] borrowing from the map.
+///
+/// Returns `None` when the caller mixed in richer criteria (testId,
+/// role, textContent, etc.) — those cases fall through to the generic
+/// matcher, since the bbox provider intentionally does not fuzzy-match.
+fn extract_bbox_identifier(
+    criteria: &serde_json::Map<String, serde_json::Value>,
+) -> Option<super::click_providers::ElementIdentifier<'_>> {
+    if criteria.len() != 1 {
+        return None;
+    }
+    let (key, value) = criteria.iter().next()?;
+    let v = value.as_str()?;
+    match key.as_str() {
+        "id" | "elementId" => Some(super::click_providers::ElementIdentifier::Id(v)),
+        "label" => Some(super::click_providers::ElementIdentifier::Label(v)),
+        _ => None,
+    }
+}
+
 /// Create a human-readable summary of search criteria for error messages.
 fn criteria_summary(criteria: &serde_json::Map<String, serde_json::Value>) -> String {
     criteria
@@ -1365,30 +1387,56 @@ impl UiBridgeHandler {
             }
         };
 
-        let matching: Vec<&serde_json::Value> = elements
-            .iter()
-            .filter(|el| element_matches_criteria(el, &criteria))
-            .collect();
+        // ── Provider chain: bbox-first resolver ──
+        //
+        // When the caller asks by id or label, consult the bbox click
+        // provider before the generic criteria matcher. On a hit we
+        // log the resolved coords so downstream analysis can verify
+        // the fast path bypassed VLM targeting; on miss we fall
+        // through to the existing criteria-based lookup (which is
+        // also what a future Rust-side VLM provider would front).
+        let bbox_identifier = extract_bbox_identifier(&criteria);
+        let bbox_target = bbox_identifier
+            .as_ref()
+            .and_then(|ident| {
+                super::click_providers::resolve_click_target(ident, &snapshot)
+            });
 
-        if matching.is_empty() {
-            return StepHandlerResult::failure(format!(
-                "No element found matching criteria {:?} for {} action",
-                criteria_summary(&criteria),
-                action_name
-            ));
-        }
+        let element_id: String = if let Some(ref target) = bbox_target {
+            info!(
+                "element_action: {} on element '{}' via {} provider at ({:.1}, {:.1})",
+                action_name, target.element_id, target.provider, target.x, target.y
+            );
+            target.element_id.clone()
+        } else {
+            let matching: Vec<&serde_json::Value> = elements
+                .iter()
+                .filter(|el| element_matches_criteria(el, &criteria))
+                .collect();
 
-        let element_id = matching[0]
-            .get("id")
-            .and_then(|id| id.as_str())
-            .unwrap_or("");
+            if matching.is_empty() {
+                return StepHandlerResult::failure(format!(
+                    "No element found matching criteria {:?} for {} action",
+                    criteria_summary(&criteria),
+                    action_name
+                ));
+            }
 
-        info!(
-            "element_action: {} on element '{}' (criteria: {:?})",
-            action_name,
-            element_id,
-            criteria_summary(&criteria)
-        );
+            let id = matching[0]
+                .get("id")
+                .and_then(|id| id.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            info!(
+                "element_action: {} on element '{}' (criteria: {:?})",
+                action_name,
+                id,
+                criteria_summary(&criteria)
+            );
+            id
+        };
+        let element_id = element_id.as_str();
 
         // Execute action via the SDK's action endpoint
         let action_endpoint = format!(

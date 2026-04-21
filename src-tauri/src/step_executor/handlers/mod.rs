@@ -80,6 +80,7 @@ pub(super) mod check_group;
 pub(crate) mod shell_command;
 pub(super) mod test;
 // Active handlers
+pub(super) mod click_providers;
 mod code_execution;
 mod command;
 pub mod dag_nodes;

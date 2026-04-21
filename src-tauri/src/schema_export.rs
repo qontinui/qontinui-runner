@@ -560,6 +560,7 @@ pub fn export_all_schemas() -> Value {
     add!("StageTransition", qv::StageTransition);
 
     // ── qontinui-types: ui_bridge ──
+    add!("ElementBbox", qub::ElementBbox);
     add!("ElementRect", qub::ElementRect);
     add!("ElementState", qub::ElementState);
     add!("ElementIdentifier", qub::ElementIdentifier);
