@@ -138,6 +138,7 @@ mod unified_workflow_executor;
 mod unified_workflows;
 mod validation;
 mod verification;
+mod vga;
 mod video_recorder;
 mod vision;
 mod window_manager;

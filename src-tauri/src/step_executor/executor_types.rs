@@ -545,6 +545,39 @@ pub struct ExecutionStepConfig {
     pub visual_assertion_options: Option<serde_json::Value>,
 
     // ========================================================================
+    // VGA (Visual GUI Automation) Step Fields
+    // ========================================================================
+    /// VGA: UUID referencing `runner.vga_state_machines.id` — the persisted
+    /// state machine defining the elements the step may click/type/wait for.
+    #[serde(alias = "stateMachineId", alias = "state_machine_id", default)]
+    pub vga_state_machine_id: Option<String>,
+
+    /// VGA: Target process / window name (e.g. "notepad++.exe") — used by the
+    /// HAL to focus the correct top-level window before each action.
+    #[serde(alias = "targetProcess", alias = "target_process", default)]
+    pub vga_target_process: Option<String>,
+
+    /// VGA: Ordered sequence of VGA actions (internally-tagged by "kind").
+    /// Passed through verbatim to the Python worker.
+    #[serde(alias = "actionSequence", alias = "action_sequence", default)]
+    pub vga_action_sequence: Option<serde_json::Value>,
+
+    /// VGA: Overall step timeout in milliseconds. Defaults to 300000 (5 min).
+    #[serde(
+        alias = "vgaTimeoutMs",
+        alias = "vga_timeout_ms",
+        alias = "timeoutMs",
+        alias = "timeout_ms",
+        default
+    )]
+    pub vga_timeout_ms: Option<u64>,
+
+    /// VGA: Reserved for future async mode. Currently the handler rejects
+    /// `true` until async mode is implemented.
+    #[serde(alias = "vgaAsync", alias = "vga_async", alias = "async", default)]
+    pub vga_async: Option<bool>,
+
+    // ========================================================================
     // Console Error Handling
     // ========================================================================
     /// If true, step fails when console errors are captured during execution

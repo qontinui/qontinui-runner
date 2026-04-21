@@ -3774,3 +3774,68 @@ CREATE TABLE IF NOT EXISTS phase_results (
 );
 CREATE INDEX IF NOT EXISTS idx_pr_execution ON phase_results(execution_id);
 CREATE INDEX IF NOT EXISTS idx_pr_execution_phase ON phase_results(execution_id, phase, iteration);
+
+-- ---------------------------------------------------------------------------
+-- Visual GUI Automation (VGA) — state machines for non-instrumentable apps.
+-- Owned by the VGA product surface (see plan: vga-product-surface-2026-04-21.md).
+-- Lands in the `runner` schema (default) via search_path = runner, public.
+--
+-- grounding_model pins each state machine to a specific grounding VLM so that
+-- rolling out v6 is an explicit migration per SM, not a side effect of a
+-- llama-swap config swap.
+-- private=TRUE (the default) blocks correction entries from being shared
+-- off-machine; flip only for state machines whose screenshots are already
+-- sanitized or public.
+CREATE TABLE IF NOT EXISTS vga_state_machines (
+    id              UUID PRIMARY KEY,
+    name            TEXT NOT NULL,
+    target_process  TEXT NOT NULL,
+    target_os       TEXT NOT NULL,
+    grounding_model TEXT NOT NULL DEFAULT 'qontinui-grounding-v5',
+    private         BOOLEAN NOT NULL DEFAULT TRUE,
+    state_graph     JSONB NOT NULL,
+    v5_proposed     INTEGER NOT NULL DEFAULT 0,
+    v5_confirmed    INTEGER NOT NULL DEFAULT 0,
+    v5_corrected    INTEGER NOT NULL DEFAULT 0,
+    content_hash    TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_vga_sm_target_process ON vga_state_machines(target_process);
+CREATE INDEX IF NOT EXISTS idx_vga_sm_grounding_model ON vga_state_machines(grounding_model);
+
+-- VGA runtime executions — one row per VgaRuntime.execute() call.
+-- step_log is JSONB array of {action, prompt, bbox_pred, bbox_last, iou,
+-- template_similarity, status, timestamp}.
+CREATE TABLE IF NOT EXISTS vga_runs (
+    id                UUID PRIMARY KEY,
+    state_machine_id  UUID NOT NULL REFERENCES vga_state_machines(id) ON DELETE CASCADE,
+    task_run_id       TEXT,
+    grounding_model   TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    step_log          JSONB NOT NULL DEFAULT '[]'::jsonb,
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at          TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_vga_runs_sm ON vga_runs(state_machine_id);
+CREATE INDEX IF NOT EXISTS idx_vga_runs_task ON vga_runs(task_run_id) WHERE task_run_id IS NOT NULL;
+
+-- Shadow-eval log — every production grounding call logs
+-- (image_sha, prompt, predicted_bbox, model_used) for offline re-prediction
+-- by v6 before it ships. Used to detect production-distribution regressions
+-- the synthetic eval misses (mirrors proj_world_state_verifier.md pattern).
+CREATE TABLE IF NOT EXISTS vga_shadow_samples (
+    id                BIGSERIAL PRIMARY KEY,
+    state_machine_id  UUID NOT NULL REFERENCES vga_state_machines(id) ON DELETE CASCADE,
+    image_sha         TEXT NOT NULL,
+    image_path        TEXT NOT NULL,
+    prompt            TEXT NOT NULL,
+    target_process    TEXT NOT NULL,
+    predicted_bbox    JSONB NOT NULL,
+    model_used        TEXT NOT NULL,
+    confidence        REAL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_vga_shadow_sm ON vga_shadow_samples(state_machine_id);
+CREATE INDEX IF NOT EXISTS idx_vga_shadow_target ON vga_shadow_samples(target_process);
+CREATE INDEX IF NOT EXISTS idx_vga_shadow_model ON vga_shadow_samples(model_used);

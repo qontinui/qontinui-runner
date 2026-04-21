@@ -1264,6 +1264,7 @@ pub fn create_router(
         .merge(crate::mcp::restate_api::routes())
         .merge(crate::mcp::hitl::routes())
         .merge(crate::mcp::streaming::routes())
+        .merge(crate::vga::routes())
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
         .route("/cloud-relay/login", post(cloud_relay_login))

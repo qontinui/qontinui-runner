@@ -163,6 +163,9 @@ pub fn export_all_schemas() -> Value {
         "UiBridgeVisualAssertionStep",
         qws::UiBridgeVisualAssertionStep
     );
+    add!("VgaActionKind", qws::VgaActionKind);
+    add!("VgaAction", qws::VgaAction);
+    add!("VgaAutomateStep", qws::VgaAutomateStep);
     add!("WorkflowRefStep", qws::WorkflowRefStep);
     add!("DagCancelStep", qws::DagCancelStep);
     add!("DagApprovalStep", qws::DagApprovalStep);
