@@ -14,7 +14,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::executor::{is_default_bridge_running, with_default_bridge};
+use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::state_machine_configs::{
     CreateSmConfigRequest, CreateSmStateRequest, CreateSmTransitionRequest, SmConfig, SmConfigFull,
@@ -1178,10 +1178,22 @@ pub async fn auto_load_default_state_machine(app_state: &Arc<crate::commands::Ap
 
     // 2. Wait briefly for the Python bridge to come up.
     //    Exponential backoff: 1s, 2s, 4s, 8s, 15s — capped at ~30s total.
+    //    CRITICAL: use the async variant of the bridge-running check. The
+    //    synchronous `is_default_bridge_running` uses `block_on` internally
+    //    and panics with "Cannot start a runtime from within a runtime" when
+    //    called from this tokio async context (the function runs inside a
+    //    `tauri::async_runtime::spawn`). See `bridge_manager.rs:668` warning.
+    let bridge_running = || async {
+        let guard = app_state.bridge_manager.lock().await;
+        match &*guard {
+            Some(manager) => manager.is_default_bridge_running_async().await,
+            None => false,
+        }
+    };
     let delays = [1u64, 2, 4, 8, 15];
     let mut ready = false;
     for &secs in &delays {
-        if is_default_bridge_running(app_state) {
+        if bridge_running().await {
             ready = true;
             break;
         }
@@ -1189,7 +1201,7 @@ pub async fn auto_load_default_state_machine(app_state: &Arc<crate::commands::Ap
     }
     // Final check after last sleep.
     if !ready {
-        ready = is_default_bridge_running(app_state);
+        ready = bridge_running().await;
     }
     if !ready {
         warn!(
@@ -1212,7 +1224,11 @@ pub async fn auto_load_default_state_machine(app_state: &Arc<crate::commands::Ap
     };
 
     let params = serde_json::json!({ "config": config_json });
-    let timeout = std::time::Duration::from_secs(30);
+    // 120s: a full spec-compiled SM at current scale is ~400 states × ~900
+    // transitions; the Python runtime takes >30s to index that. Keep generous
+    // headroom so a fresh runner reliably auto-loads on first boot. Tighten
+    // later if the compiled SM shrinks (e.g. per-spec partitioning).
+    let timeout = std::time::Duration::from_secs(120);
     let app_state_for_bridge = app_state.clone();
 
     let dispatch = tokio::task::spawn_blocking(move || {
