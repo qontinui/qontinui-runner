@@ -73,6 +73,18 @@ pub async fn probe_allowlist_wire_contracts(
     let mut results = Vec::with_capacity(UI_BRIDGE_COMMANDS.len());
 
     for cmd in UI_BRIDGE_COMMANDS {
+        // Destructive commands opt out — see `ProxyableCommand::probe_with_empty_args`.
+        // Skipping these sacrifices schema-drift detection for this specific
+        // command (there's nothing to detect anyway — no required keys), but
+        // avoids side-effects on startup.
+        if !cmd.probe_with_empty_args {
+            debug!(
+                command = cmd.name,
+                "probe skipped — command opted out via probe_with_empty_args=false"
+            );
+            continue;
+        }
+
         let request_id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel::<InvokeResponse>();
         store.register(request_id.clone(), sender).await;
@@ -329,9 +341,7 @@ pub fn log_probe_results(results: &[ProbeResult]) {
     } else {
         debug!(
             total = results.len(),
-            ok,
-            skipped,
-            "ui_bridge_invoke_probe: finished with no schema drift"
+            ok, skipped, "ui_bridge_invoke_probe: finished with no schema drift"
         );
     }
 }

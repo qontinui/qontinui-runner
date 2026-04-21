@@ -127,6 +127,31 @@ pub struct ProxyableCommand {
     pub description: &'static str,
     pub args_schema: &'static str,
     pub response_schema: &'static str,
+    /// Whether the startup invoke-proxy probe may call this command with
+    /// empty args. Defaults to `true` via [`ProxyableCommand::default_probe`].
+    ///
+    /// Set to `false` for commands that
+    /// 1. accept empty args (no required keys in their schema), AND
+    /// 2. have observable side effects when invoked with empty args.
+    ///
+    /// Example: [`dismiss_recent_crash`] clears `/health.recent_crash`. The
+    /// probe is otherwise unable to distinguish "empty args accepted"
+    /// (healthy) from "command ran for real and did something" — and for
+    /// destructive side effects the "for real" branch is unacceptable. The
+    /// probe covers missing-required-key detection for commands with
+    /// required args; skipping it for no-arg commands gives up schema-drift
+    /// coverage we wouldn't have anyway (there's no required key to be
+    /// missing).
+    ///
+    /// [`dismiss_recent_crash`]: crate::crash_dumps::dismiss_recent_crash
+    #[serde(default = "default_probe_safe")]
+    pub probe_with_empty_args: bool,
+}
+
+/// Default for [`ProxyableCommand::probe_with_empty_args`] — commands
+/// opt in to probing by default.
+const fn default_probe_safe() -> bool {
+    true
 }
 
 /// The static allowlist of Tauri commands reachable via
@@ -145,60 +170,83 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         description: "Return the persisted web-integration settings plus live registration state (runner id, last heartbeat, last registration error).",
         args_schema: "{}",
         response_schema: "{ \"enabled\": boolean, \"backendUrl\": string, \"runnerTokenMasked\": string, \"runnerId\": string | null, \"lastHeartbeatAt\": string | null, \"registrationError\": string | null }",
+        probe_with_empty_args: true,
     },
     ProxyableCommand {
         name: "save_web_integration_settings",
         description: "Persist web-integration settings (enable flag, backend URL, runner token, optional web base URL) and trigger re-registration with the configured backend. `webBaseUrl` is optional and only needed when the Next.js web UI runs on a different host than the API backend.",
         args_schema: "{ \"enabled\": boolean, \"backendUrl\": string, \"runnerToken\": string, \"webBaseUrl\"?: string | null }",
         response_schema: "null",
+        probe_with_empty_args: true,
     },
     ProxyableCommand {
         name: "test_web_integration_connection",
         description: "Probe the given backend URL + runner token by making a throwaway runner-registration call and immediately deleting the created entry. Returns the transient runner id (for debugging only; do not reuse it).",
         args_schema: "{ \"backendUrl\": string, \"runnerToken\": string }",
         response_schema: "{ \"runner_id\": string }",
+        probe_with_empty_args: true,
     },
     ProxyableCommand {
         name: "start_web_token_flow",
         description: "Open the user's browser at `{backend_url}/connect-runner?state=...&callback=...&runner_name=...`, stashing state for the eventual callback that applies the issued runner token. `backendUrl` is optional — when omitted, uses the persisted backend URL.",
         args_schema: "{ \"backendUrl\"?: string | null }",
         response_schema: "null",
+        // `backendUrl` is optional, so an empty-args probe would actually
+        // open the user's browser. Skip.
+        probe_with_empty_args: false,
     },
     ProxyableCommand {
         name: "emit_extraction_script",
         description: "Synthesise a one-line JS extraction expression for the scripted-output indirection (already registered in Tauri — this entry only allowlists it over HTTP). Maps to a 500 with `{ kind, message }` error body on failure; `kind` is one of `cost_cap` (per-task_run call cap exceeded), `token_budget` (input/output token budget exhausted), `timeout` (LLM exceeded 3s), `breaker_open` (shared Claude circuit breaker is Open), `disabled` (global kill switch off), `llm_error`, or `invalid_response`.",
         args_schema: "{ \"goal\": string, \"schemaHint\": object, \"outputPreview\": string, \"taskRunId\"?: string | null }",
         response_schema: "{ \"expression\": string, \"modelId\": string, \"tokensIn\": number, \"tokensOut\": number, \"source\": \"cache\" | \"llm\", \"cacheTier\": number | null, \"provider\": string, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
+        probe_with_empty_args: true,
     },
     ProxyableCommand {
         name: "emit_scripted_output_event",
         description: "Record a TS-originated scripted-output activity-timeline event through the Rust emitter's FK-aware insert path (already registered in Tauri — this entry only allowlists it over HTTP). `name` must be one of `scripted_output.attempted`, `scripted_output.worker_ok`, `scripted_output.bytes_avoided`, or `scripted_output.fallback`; any other value is rejected. `metadata` defaults to `{}` if omitted; `taskRunId` is optional and falls back to NULL on a miss in `task_runs` (raw value preserved in `metadata.task_run_id_raw`).",
         args_schema: "{ \"name\": string, \"metadata\"?: object, \"taskRunId\"?: string | null }",
         response_schema: "null",
+        probe_with_empty_args: true,
     },
     ProxyableCommand {
         name: "get_scripted_output_stats",
         description: "Aggregate `source_type = 'scripted_output'` activity-timeline events into a single stat block (already registered in Tauri — this entry only allowlists it over HTTP). `taskRunId` is optional: when omitted or `null`, returns global stats across all runs (including the unassigned bucket); otherwise scopes to that run.",
         args_schema: "{ \"taskRunId\"?: string | null }",
         response_schema: "{ \"attempted\": number, \"cacheHit\": number, \"llmOk\": number, \"workerOk\": number, \"bytesAvoided\": number, \"fallbacks\": { [reason: string]: number }, \"totalTokensIn\": number, \"totalTokensOut\": number, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
+        probe_with_empty_args: true,
     },
     ProxyableCommand {
         name: "report_ui_error",
         description: "Record a UI error observed by the React error boundary. Coalesces repeat reports with the same message/digest into a single record (incrementing `count`, refreshing `reported_at`, pinning `first_seen`).",
         args_schema: r#"{"type":"object","properties":{"message":{"type":"string"},"stack":{"type":["string","null"]},"componentStack":{"type":["string","null"]},"digest":{"type":["string","null"]}},"required":["message"]}"#,
         response_schema: r#"{"type":"null"}"#,
+        probe_with_empty_args: true,
     },
     ProxyableCommand {
         name: "clear_ui_error",
         description: "Clear the current UI error state (called on error boundary recovery).",
         args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         response_schema: r#"{"type":"null"}"#,
+        // Destructive + takes empty args → probing it on startup would
+        // race the React ErrorBoundary's own first report.
+        probe_with_empty_args: false,
     },
     ProxyableCommand {
         name: "get_ui_error",
         description: "Read the current UI error state, or null if none.",
         args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         response_schema: r#"{"type":["object","null"],"properties":{"message":{"type":"string"},"stack":{"type":["string","null"]},"component_stack":{"type":["string","null"]},"digest":{"type":["string","null"]},"first_seen":{"type":"string"},"reported_at":{"type":"string"},"count":{"type":"integer"}}}"#,
+        probe_with_empty_args: true,
+    },
+    ProxyableCommand {
+        name: "dismiss_recent_crash",
+        description: "Acknowledge the startup crash-dump banner, clearing /health.recent_crash and flipping derived_status back to healthy. The on-disk crash_*.txt file is left intact for forensics.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"null"}"#,
+        // Destructive + takes empty args → probing it on startup would
+        // clear the very crash dump we just surfaced to the user.
+        probe_with_empty_args: false,
     },
 ];
 
