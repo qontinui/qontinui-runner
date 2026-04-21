@@ -518,9 +518,44 @@ fn criteria_summary(criteria: &serde_json::Map<String, serde_json::Value>) -> St
         .join(", ")
 }
 
-/// Extract bounding rect from an element's `state.rect` object.
-/// Returns (x, y, width, height, top, right, bottom, left) or None if missing.
+/// Extract bounding rect from a snapshot element.
+///
+/// Returns `(x, y, width, height, top, right, bottom, left)` or `None` if
+/// neither source is available.
+///
+/// ## Precedence
+///
+/// 1. **Top-level `bbox`** (preferred, Phase-A and later): `{ x, y, width,
+///    height }` — this is the bbox-first field produced by the UI Bridge
+///    SDK. `top/right/bottom/left` are derived arithmetically
+///    (`top = y`, `left = x`, `right = x + width`, `bottom = y + height`).
+/// 2. **Legacy `state.rect`** (fallback): the older nested DOMRect-shaped
+///    object. Used for pre-Phase-A snapshots and elements that don't
+///    expose a live-tracked bbox. Richer fields (`top/right/bottom/left`)
+///    are read through when present; otherwise they are derived from
+///    `x/y/width/height` the same way as the bbox path.
+///
+/// Note: `state.rect` remains part of the snapshot payload as a
+/// debug-oriented field. Only the runtime hot path (layout assertions,
+/// click targeting) prefers the top-level `bbox`.
 fn extract_rect(element: &serde_json::Value) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
+    // Preferred path: top-level `bbox` (Phase-A and later).
+    if let Some(bbox) = element.get("bbox") {
+        if let (Some(x), Some(y), Some(width), Some(height)) = (
+            bbox.get("x").and_then(|v| v.as_f64()),
+            bbox.get("y").and_then(|v| v.as_f64()),
+            bbox.get("width").and_then(|v| v.as_f64()),
+            bbox.get("height").and_then(|v| v.as_f64()),
+        ) {
+            let top = y;
+            let left = x;
+            let right = x + width;
+            let bottom = y + height;
+            return Some((x, y, width, height, top, right, bottom, left));
+        }
+    }
+
+    // Legacy fallback: nested `state.rect` (pre-Phase-A snapshots).
     let rect = element.get("state")?.get("rect")?;
     let x = rect.get("x")?.as_f64()?;
     let y = rect.get("y")?.as_f64()?;
@@ -1392,9 +1427,12 @@ impl UiBridgeHandler {
         // When the caller asks by id or label, consult the bbox click
         // provider before the generic criteria matcher. On a hit we
         // log the resolved coords so downstream analysis can verify
-        // the fast path bypassed VLM targeting; on miss we fall
-        // through to the existing criteria-based lookup (which is
-        // also what a future Rust-side VLM provider would front).
+        // the SDK-scope fast path took the element's live DOM
+        // `getBoundingClientRect()`; on miss we fall through to the
+        // existing structured criteria-based lookup (testId, role,
+        // textContent, etc.). No VLM / visual-grounding provider is
+        // invoked from this path — that surface is Visual GUI
+        // Automation, handled outside the runner.
         let bbox_identifier = extract_bbox_identifier(&criteria);
         let bbox_target = bbox_identifier
             .as_ref()
@@ -2235,6 +2273,119 @@ mod tests {
         tracker.reset("http://localhost:9876").await;
         let recent = tracker.get_recent_errors("http://localhost:9876", 10).await;
         assert!(recent.is_empty());
+    }
+
+    // --- extract_rect tests ---
+
+    #[test]
+    fn test_extract_rect_prefers_top_level_bbox() {
+        // Element exposes only the new top-level `bbox` — no legacy
+        // `state.rect`. The helper must pick bbox and derive
+        // top/right/bottom/left arithmetically.
+        let element = serde_json::json!({
+            "id": "primary",
+            "bbox": { "x": 10.0, "y": 20.0, "width": 40.0, "height": 15.0 },
+            "state": { "visible": true, "enabled": true },
+        });
+
+        let (x, y, w, h, top, right, bottom, left) =
+            extract_rect(&element).expect("top-level bbox must resolve");
+
+        assert_eq!(x, 10.0);
+        assert_eq!(y, 20.0);
+        assert_eq!(w, 40.0);
+        assert_eq!(h, 15.0);
+        assert_eq!(top, 20.0);
+        assert_eq!(left, 10.0);
+        assert_eq!(right, 50.0);
+        assert_eq!(bottom, 35.0);
+    }
+
+    #[test]
+    fn test_extract_rect_falls_back_to_state_rect_for_legacy_snapshot() {
+        // Pre-Phase-A snapshot: no top-level `bbox`, only nested
+        // `state.rect`. Helper must read through and honor the rich
+        // top/right/bottom/left fields when present.
+        let element = serde_json::json!({
+            "id": "legacy",
+            "state": {
+                "visible": true,
+                "rect": {
+                    "x": 5.0,
+                    "y": 6.0,
+                    "width": 20.0,
+                    "height": 10.0,
+                    "top": 6.0,
+                    "right": 25.0,
+                    "bottom": 16.0,
+                    "left": 5.0,
+                }
+            }
+        });
+
+        let (x, y, w, h, top, right, bottom, left) =
+            extract_rect(&element).expect("legacy state.rect must resolve");
+
+        assert_eq!(x, 5.0);
+        assert_eq!(y, 6.0);
+        assert_eq!(w, 20.0);
+        assert_eq!(h, 10.0);
+        assert_eq!(top, 6.0);
+        assert_eq!(right, 25.0);
+        assert_eq!(bottom, 16.0);
+        assert_eq!(left, 5.0);
+    }
+
+    #[test]
+    fn test_extract_rect_prefers_bbox_when_both_present() {
+        // If both `bbox` and `state.rect` exist, `bbox` wins — we don't
+        // want a stale `state.rect` to override a fresh live-tracked
+        // bbox. Use differing values to prove which source was read.
+        let element = serde_json::json!({
+            "id": "both",
+            "bbox": { "x": 100.0, "y": 200.0, "width": 30.0, "height": 40.0 },
+            "state": {
+                "visible": true,
+                "rect": { "x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0 }
+            }
+        });
+
+        let (x, y, w, h, _, _, _, _) =
+            extract_rect(&element).expect("must resolve when both present");
+
+        assert_eq!(x, 100.0, "bbox should take precedence over state.rect");
+        assert_eq!(y, 200.0);
+        assert_eq!(w, 30.0);
+        assert_eq!(h, 40.0);
+    }
+
+    #[test]
+    fn test_extract_rect_returns_none_when_neither_source_present() {
+        let element = serde_json::json!({
+            "id": "empty",
+            "state": { "visible": true }
+        });
+        assert!(extract_rect(&element).is_none());
+    }
+
+    #[test]
+    fn test_extract_rect_falls_back_when_bbox_is_malformed() {
+        // A bbox object missing one of the required numeric fields
+        // should trigger the legacy fallback rather than returning None.
+        let element = serde_json::json!({
+            "id": "partial-bbox",
+            "bbox": { "x": 1.0, "y": 2.0, "width": 3.0 }, // missing height
+            "state": {
+                "rect": { "x": 9.0, "y": 9.0, "width": 9.0, "height": 9.0 }
+            }
+        });
+
+        let (x, y, w, h, _, _, _, _) =
+            extract_rect(&element).expect("should fall back to state.rect");
+        assert_eq!(x, 9.0);
+        assert_eq!(y, 9.0);
+        assert_eq!(w, 9.0);
+        assert_eq!(h, 9.0);
     }
 }
 

@@ -8,9 +8,22 @@
 //! ## Chain order
 //!
 //! 1. [`BboxProvider`] — reads `bbox` + `visible` directly from snapshot
-//!    elements. Cheap, deterministic, requires no model inference.
-//! 2. VLM provider (e.g. `uitars`) — screenshot → model → `<point>x y</point>`.
-//!    Registered externally; this module only defines the fast path.
+//!    elements. This is the primary and intended path for SDK-instrumented
+//!    applications, which advertise a live DOM `getBoundingClientRect()`
+//!    per registered element.
+//! 2. On miss, the caller falls through to the existing structured
+//!    `element_matches_criteria` matcher (testId, role, textContent,
+//!    htmlId, etc.), which operates on the same snapshot without any
+//!    model inference.
+//!
+//! The [`ClickProvider`] trait is deliberately open so additional
+//! structured providers can slot in later (e.g. a platform-specific
+//! accessibility-tree provider). There is **no** VLM provider in this
+//! chain. Visual grounding (screenshot → model → point) belongs to the
+//! separate Visual GUI Automation surface, which targets external
+//! non-instrumentable applications and is dispatched by the Python
+//! `qontinui` library through distinct step types — not through the
+//! runner's SDK-scope click path.
 //!
 //! The chain dispatches through [`resolve_click_target`], which runs
 //! [`BboxProvider`] first and leaves the fall-through to the caller
@@ -99,11 +112,11 @@ pub trait ClickProvider: Send + Sync {
 
 /// Narrow identifier used to match an element in a snapshot.
 ///
-/// At this phase the chain only supports `id` and `label` lookups — the
-/// two keys that [`useUIElement`] call sites actually pass. Richer
-/// criteria (testId, htmlId, role) live in the existing
-/// `element_matches_criteria` helper and are routed through the VLM
-/// fallback path when the bbox provider misses.
+/// The bbox provider only supports `id` and `label` lookups — the two
+/// keys that [`useUIElement`] call sites actually pass. Richer criteria
+/// (testId, htmlId, role, textContent) live in the existing
+/// `element_matches_criteria` helper, which the caller consults when
+/// the bbox provider returns a miss.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ElementIdentifier<'a> {
     /// Exact match against the element's `id` field.
@@ -188,9 +201,11 @@ impl ClickProvider for BboxProvider {
 /// first hit. Logs each miss at `debug` level so callers can verify
 /// the fast path is actually taken once deployed.
 ///
-/// At this phase the chain is `[BboxProvider]`. The VLM/uitars provider
-/// lives outside the Rust runner (Python/SDK dispatch) and is invoked
-/// by the caller when this function returns `None`.
+/// At this phase the chain is `[BboxProvider]`. On `None`, the caller
+/// falls through to the structured `element_matches_criteria` matcher
+/// in `ui_bridge.rs`. There is no VLM provider in this chain; visual
+/// grounding is handled by the separate Visual GUI Automation surface
+/// and is not invoked from the SDK-scope click path.
 pub fn resolve_click_target(
     identifier: &ElementIdentifier,
     snapshot: &serde_json::Value,
@@ -221,7 +236,10 @@ pub fn resolve_click_target(
         }
     }
 
-    debug!(?identifier, "all in-process click providers missed; caller should fall through to VLM");
+    debug!(
+        ?identifier,
+        "all in-process click providers missed; caller falls through to structured criteria matcher"
+    );
     None
 }
 
