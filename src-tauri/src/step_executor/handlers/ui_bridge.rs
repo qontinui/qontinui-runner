@@ -506,6 +506,26 @@ fn extract_bbox_identifier(
     }
 }
 
+/// Parse a `ui_bridge_target` string as a JSON criteria object.
+///
+/// The field is stored as `Option<String>` so authors can hand the backend
+/// either a bare criteria object (`{"role":"button","textContent":"Save"}`)
+/// or — for `snapshot_assert` — a stringified array of assertions. The
+/// `click` action only accepts the object form; this helper surfaces a
+/// clear error otherwise.
+fn parse_ui_bridge_target_as_criteria(raw: Option<&str>) -> Result<serde_json::Value, String> {
+    let s = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "UI Bridge click requires 'ui_bridge_target' (JSON criteria object, e.g. \
+             {\"role\":\"button\",\"textContent\":\"Save\"})"
+                .to_string()
+        })?;
+    serde_json::from_str::<serde_json::Value>(s)
+        .map_err(|e| format!("ui_bridge_target is not valid JSON: {} (raw: {:?})", e, s))
+}
+
 /// Create a human-readable summary of search criteria for error messages.
 fn criteria_summary(criteria: &serde_json::Map<String, serde_json::Value>) -> String {
     criteria
@@ -1102,6 +1122,80 @@ impl StepHandler for UiBridgeHandler {
                     let endpoint =
                         format!("{}/control/action-plan", base_url.trim_end_matches('/'));
                     client.post(&endpoint).json(&plan_json).send().await
+                }
+                "click" => {
+                    // Find-and-click against runner-self control. The Builder
+                    // emits this for spec setupActions of `type: "click"` where
+                    // `target` carries a criteria object ({role, textContent,
+                    // accessibleName, ...}). Resolve the criteria against a
+                    // fresh snapshot, take the first match's id, then POST to
+                    // /control/element/<id>/action. Fails cleanly with a
+                    // criteria summary when no match is found.
+                    let criteria_value = match parse_ui_bridge_target_as_criteria(
+                        step.ui_bridge_target.as_deref(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => return StepHandlerResult::failure(e),
+                    };
+                    let criteria_map = match criteria_value.as_object() {
+                        Some(m) => m.clone(),
+                        None => {
+                            return StepHandlerResult::failure(
+                                "UI Bridge click: 'ui_bridge_target' must decode to a criteria object (e.g. {\"role\":\"button\",\"textContent\":\"Save\"})"
+                            );
+                        }
+                    };
+                    let snapshot_endpoint =
+                        format!("{}/control/snapshot", base_url.trim_end_matches('/'));
+                    let snap_resp = match client.get(&snapshot_endpoint).send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_error = Some(format!("snapshot fetch failed: {}", e));
+                            if attempt < max_attempts {
+                                let backoff =
+                                    std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                                tokio::time::sleep(backoff).await;
+                                continue;
+                            }
+                            return StepHandlerResult::failure(
+                                last_error.unwrap_or_else(|| "snapshot fetch failed".into()),
+                            );
+                        }
+                    };
+                    let snap_json = match snap_resp.json::<serde_json::Value>().await {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return StepHandlerResult::failure(format!(
+                                "snapshot JSON parse failed: {}",
+                                e
+                            ));
+                        }
+                    };
+                    let empty_vec: Vec<serde_json::Value> = Vec::new();
+                    let elements = snap_json
+                        .get("data")
+                        .and_then(|d| d.get("elements"))
+                        .and_then(|e| e.as_array())
+                        .unwrap_or(&empty_vec);
+                    let matched = elements
+                        .iter()
+                        .find(|el| element_matches_criteria(el, &criteria_map));
+                    let target_id = match matched.and_then(|e| e.get("id")).and_then(|i| i.as_str()) {
+                        Some(id) => id.to_string(),
+                        None => {
+                            return StepHandlerResult::failure(format!(
+                                "UI Bridge click: no element matched criteria {}",
+                                criteria_summary(&criteria_map)
+                            ));
+                        }
+                    };
+                    let action_endpoint = format!(
+                        "{}/control/element/{}/action",
+                        base_url.trim_end_matches('/'),
+                        urlencoding::encode(&target_id)
+                    );
+                    let body = serde_json::json!({"action": "click"});
+                    client.post(&action_endpoint).json(&body).send().await
                 }
                 other => {
                     return StepHandlerResult::failure(format!(
