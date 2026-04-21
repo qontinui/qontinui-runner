@@ -227,6 +227,10 @@ pub struct ApiState {
     pub tunnel_client: Arc<crate::tunnel::RatholeClient>,
     /// iOS transport sidecar (Plan 2). Started lazily on first iOS request.
     pub ios_transport: Arc<crate::mcp::transport::ios::IosTransport>,
+    /// Pending UI Bridge invoke-proxy requests (Phase 3I.1).
+    /// Keyed by request_id; HTTP handler awaits the oneshot receiver, the
+    /// `ui-bridge:invoke-response` Tauri listener in `mcp_api.rs` fires the sender.
+    pub ui_bridge_invoke_store: Arc<crate::ui_bridge_invoke::InvokeRequestStore>,
 }
 
 /// Response for API endpoints

@@ -388,6 +388,7 @@ pub fn create_router(
         pairing_manager: Arc::new(crate::mcp::transport::pairing::PairingManager::new()),
         tunnel_client: Arc::new(crate::tunnel::RatholeClient::new()),
         ios_transport: Arc::new(crate::mcp::transport::ios::IosTransport::new()),
+        ui_bridge_invoke_store: Arc::new(crate::ui_bridge_invoke::InvokeRequestStore::new()),
     });
 
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
@@ -457,6 +458,90 @@ pub fn create_router(
             }
         });
         info!("UI Bridge: Response listener set up");
+    }
+
+    // Set up UI Bridge invoke-proxy response listener (Phase 3I.1).
+    //
+    // Mirrors the `ui-bridge-response` listener above, but for the typed
+    // invoke-proxy flow. The React hook (useUIBridgeInvokeHandler) emits
+    // `{ request_id, ok, result?, error? }` after calling `invoke(command, args)`;
+    // we forward it to the matching pending oneshot by id.
+    //
+    // Payload tolerance: Tauri 2.x emit+listen may double-stringify JSON
+    // payloads — try a direct object parse first, fall back to unwrapping
+    // one level of string quoting if the outer payload is a JSON string.
+    {
+        let invoke_store = api_state.ui_bridge_invoke_store.clone();
+        let handle = app_handle.clone();
+
+        use tauri::Listener;
+
+        let _listener_id = handle.listen("ui-bridge:invoke-response", move |event| {
+            let payload_str = event.payload();
+            let parsed: Option<serde_json::Value> =
+                serde_json::from_str::<serde_json::Value>(payload_str)
+                    .ok()
+                    .and_then(|v| {
+                        if v.is_object() {
+                            Some(v)
+                        } else if let Some(s) = v.as_str() {
+                            serde_json::from_str::<serde_json::Value>(s).ok()
+                        } else {
+                            Some(v)
+                        }
+                    });
+
+            let Some(parsed) = parsed else {
+                warn!(
+                    "UI Bridge invoke: failed to parse invoke-response payload: {}",
+                    &payload_str[..payload_str.len().min(200)]
+                );
+                return;
+            };
+
+            let request_id = parsed
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let Some(request_id) = request_id else {
+                warn!(
+                    "UI Bridge invoke: invoke-response missing request_id: {}",
+                    &payload_str[..payload_str.len().min(200)]
+                );
+                return;
+            };
+
+            let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let result = parsed.get("result").cloned();
+            let error = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let response = crate::ui_bridge_invoke::InvokeResponse { ok, result, error };
+
+            // Deliver on a tokio task — the listener callback runs on the
+            // main thread and deliver() needs a tokio context to await the
+            // async mutex.
+            let store = invoke_store.clone();
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let delivered = store.deliver(&request_id, response).await;
+                    if !delivered {
+                        tracing::debug!(
+                            "UI Bridge invoke: response for unknown request_id {} (likely timed out)",
+                            request_id
+                        );
+                    }
+                });
+            } else {
+                warn!(
+                    "UI Bridge invoke: no tokio runtime available — dropping response for {}",
+                    request_id
+                );
+            }
+        });
+        info!("UI Bridge: invoke-proxy response listener set up");
     }
 
     // Set up UI Bridge pong listener for frontend liveness tracking

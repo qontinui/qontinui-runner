@@ -773,7 +773,7 @@ pub async fn ui_bridge_request_sync(
         Err(_) => {
             return Err(
                 "UI Bridge concurrency limit reached (timeout acquiring permit)".to_string(),
-            )
+            );
         }
     };
 
@@ -3964,6 +3964,7 @@ const VALID_TAB_IDS: &[&str] = &[
     "settings-playwright",
     "settings-mobile",
     "settings-cloud-relay",
+    "settings-web-integration",
     "settings-mcp",
     "settings-log-sources",
     "settings-execution-variables",
@@ -4107,6 +4108,86 @@ pub async fn ui_bridge_page_set_tab_handler(
             ))
         }
     }
+}
+
+/// POST /ui-bridge/control/activate-tab/{tab_id}
+///
+/// Switch the runner's main tab via a native Tauri event. Validates
+/// `tab_id` against the known `MainTabId` list, emits
+/// `ui-bridge:activate-tab` with `{ tab_id }`, returns 200 immediately
+/// (fire-and-forget). The frontend's `useAppNavigation` hook subscribes
+/// to this event and calls `setActiveTab(tab_id)`.
+///
+/// Unlike `POST /ui-bridge/control/page/set-tab`, this endpoint:
+/// - uses a URL-path parameter for the tab id (more RESTful),
+/// - emits a Tauri-native event instead of a JS CustomEvent via
+///   `page/evaluate` (survives webview slowness), and
+/// - returns immediately without waiting for a page-id readback.
+///
+/// For `settings-*` tab ids, the sub-tab propagation is handled entirely
+/// by the existing `TabContent` routing: setting `activeTab` to e.g.
+/// `settings-web-integration` causes `TabContent` to render `<Settings
+/// defaultTab="web-integration" />`, and `Settings`'s existing
+/// `useEffect([defaultTab])` re-seeds its internal sub-tab state. No
+/// extra localStorage write or custom event is required — activating
+/// `settings-web-integration` lands on the Web Integration sub-tab on
+/// the next render.
+///
+/// Request: path parameter `tab_id` (e.g. `settings-web-integration`).
+/// Response: `{ "success": true, "tab_id": "<resolved>" }`
+/// Errors: 400 if `tab_id` is empty or not a known `MainTabId`;
+/// 500 if emitting the Tauri event fails.
+pub async fn ui_bridge_activate_tab_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(tab_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let trimmed = tab_id.trim().to_string();
+    if trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "activate-tab: `tab_id` path parameter is required (non-empty string)".to_string(),
+            )),
+        ));
+    }
+
+    if !VALID_TAB_IDS.contains(&trimmed.as_str()) {
+        let preview: Vec<&str> = VALID_TAB_IDS.iter().take(12).copied().collect();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "activate-tab: unknown tab_id `{}`. Valid tab_ids include: {} (and {} more — \
+                 see src/components/app/tab-types.ts for the full list).",
+                trimmed,
+                preview.join(", "),
+                VALID_TAB_IDS.len() - preview.len()
+            ))),
+        ));
+    }
+
+    info!("UI Bridge API: activate-tab -> {}", trimmed);
+
+    state
+        .app_handle
+        .emit(
+            "ui-bridge:activate-tab",
+            serde_json::json!({ "tab_id": trimmed }),
+        )
+        .map_err(|e| {
+            error!("UI Bridge API: activate-tab emit failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "activate-tab: failed to emit ui-bridge:activate-tab: {}",
+                    e
+                ))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "success": true,
+        "tab_id": trimmed,
+    }))))
 }
 
 // ============================================================================
@@ -4961,7 +5042,13 @@ fn capture_runner_window(
     if crop_w == 0 || crop_h == 0 {
         return Err(format!(
             "Runner window has zero visible area (crop: {}x{} at ({}, {}), image: {}x{}, scale: {})",
-            crop_w, crop_h, crop_x, crop_y, captured.physical_width, captured.physical_height, monitor.scale_factor
+            crop_w,
+            crop_h,
+            crop_x,
+            crop_y,
+            captured.physical_width,
+            captured.physical_height,
+            monitor.scale_factor
         ));
     }
 
@@ -8359,7 +8446,7 @@ pub async fn ui_bridge_element_screenshot_handler(
                 Json(api_error(
                     "element-screenshot requires `id` query param".to_string(),
                 )),
-            ))
+            ));
         }
     };
 
@@ -10941,6 +11028,7 @@ pub async fn ui_bridge_routes_manifest_handler(
 /// list each method as a separate tuple.
 fn route_manifest() -> &'static [(&'static str, &'static str)] {
     &[
+        ("GET", "/ui-bridge/_help"),
         ("GET", "/ui-bridge/_routes"),
         ("GET", "/ui-bridge/control/elements"),
         ("GET", "/ui-bridge/control/elements/last-discovered"),
@@ -10997,6 +11085,7 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/page/evaluate-safe"),
         ("POST", "/ui-bridge/control/page/evaluate-batch"),
         ("POST", "/ui-bridge/control/page/set-tab"),
+        ("POST", "/ui-bridge/control/activate-tab/{tab_id}"),
         ("POST", "/ui-bridge/control/page/find-by-text"),
         ("POST", "/ui-bridge/control/page/click-by-text"),
         ("POST", "/ui-bridge/control/page/click-by-selector"),
@@ -11185,14 +11274,20 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/undo-state"),
         ("POST", "/ui-bridge/control/error-baselines/capture"),
         ("POST", "/ui-bridge/control/error-baselines/compare"),
+        // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy
+        ("GET", "/ui-bridge/commands"),
+        ("POST", "/ui-bridge/invoke/{command_name}"),
     ]
 }
 
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
-        // P2.2 — Endpoint discovery
+        // P2.2 — Endpoint discovery. `_help` is a cross-platform alias that
+        // works on both runner and mobile UI Bridge; returns the same payload
+        // here so one URL covers both surfaces.
         .route("/ui-bridge/_routes", get(ui_bridge_routes_manifest_handler))
+        .route("/ui-bridge/_help", get(ui_bridge_routes_manifest_handler))
         .route(
             "/ui-bridge/control/elements",
             get(ui_bridge_get_elements_handler),
@@ -11417,6 +11512,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/page/set-tab",
             post(ui_bridge_page_set_tab_handler),
+        )
+        .route(
+            "/ui-bridge/control/activate-tab/{tab_id}",
+            post(ui_bridge_activate_tab_handler),
         )
         // Convenience DOM interaction endpoints
         .route(
@@ -12104,6 +12203,15 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         // Tier 2.1 — safelisted Tauri command proxy
         .merge(crate::mcp::tauri_proxy::routes())
+        // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy (HTTP → Tauri invoke round-trip)
+        .route(
+            "/ui-bridge/commands",
+            get(crate::mcp::ui_bridge_invoke_handlers::ui_bridge_commands_handler),
+        )
+        .route(
+            "/ui-bridge/invoke/{command_name}",
+            post(crate::mcp::ui_bridge_invoke_handlers::ui_bridge_invoke_handler),
+        )
 }
 
 #[cfg(test)]
