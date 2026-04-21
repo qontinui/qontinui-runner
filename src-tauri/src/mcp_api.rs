@@ -243,14 +243,32 @@ async fn health(
     //
     // The `ui_error` object is null when no error is tracked.
     let ui_error_snapshot = state.app_state.ui_error.get().await;
-    let derived_status = if ui_error_snapshot.is_some() {
-        "errored"
-    } else {
-        "healthy"
-    };
     let ui_error_json = match &ui_error_snapshot {
         Some(err) => serde_json::to_value(err).unwrap_or(serde_json::Value::Null),
         None => serde_json::Value::Null,
+    };
+
+    // Post-3J follow-up — surface the most recent Rust crash dump picked up
+    // at startup. React's ErrorBoundary can't report non-unwinding panics
+    // (the process aborts across the WebView2 FFI boundary before the
+    // boundary catches anything), so a runner that's been force-restarted
+    // after a Rust panic looks healthy to fleet consumers unless we surface
+    // the disk artifact here.
+    let recent_crash_snapshot = state.app_state.crash_dumps.get().await;
+    let recent_crash_json = match &recent_crash_snapshot {
+        Some(c) => serde_json::to_value(c).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    };
+
+    // Derived status: either a live UI error OR a fresh crash dump tips the
+    // runner to `errored`. Both paths flag the same "something is wrong"
+    // bucket for supervisors/fleet consumers; callers who care about the
+    // distinction should branch on `ui_error` vs `recent_crash` presence
+    // instead of re-parsing a compound status string.
+    let derived_status = if ui_error_snapshot.is_some() || recent_crash_snapshot.is_some() {
+        "errored"
+    } else {
+        "healthy"
     };
 
     let mut data = serde_json::json!({
@@ -281,6 +299,7 @@ async fn health(
         },
         "derived_status": derived_status,
         "ui_error": ui_error_json.clone(),
+        "recent_crash": recent_crash_json.clone(),
     });
 
     if let Some((screenshot, width, height)) = diagnostic_screenshot {
@@ -309,8 +328,10 @@ async fn health(
         // so supervisor/fleet consumers can read them without descending into
         // the inner `data` block. The inner `data.status` / `data.derived_status`
         // / `data.ui_error` fields remain authoritative for existing callers.
+        // `recent_crash` mirrors for the same reason.
         "derived_status": derived_status,
         "ui_error": ui_error_json,
+        "recent_crash": recent_crash_json,
         "timestamp": now_ms,
     }))
 }

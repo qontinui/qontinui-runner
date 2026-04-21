@@ -33,6 +33,7 @@ mod constraint_engine;
 mod container;
 mod context;
 mod cost_management;
+mod crash_dumps;
 mod database;
 mod debug_lifecycle;
 mod demo_workflows;
@@ -418,10 +419,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         server_mode: server_mode_state.clone(),
         token_flow: Arc::new(crate::server_mode::TokenFlowStore::new()),
         ui_error: Arc::new(ui_error::UiErrorState::new()),
+        crash_dumps: Arc::new(crash_dumps::CrashDumpState::new()),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
     let heartbeat_app_state = shared_app_state.clone();
+    let crash_dump_app_state = shared_app_state.clone();
 
     // Create error monitor config for later initialization
     let error_monitor_pg = shared_app_state.pg_db.clone();
@@ -1384,6 +1387,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             ui_error::report_ui_error,
             ui_error::clear_ui_error,
             ui_error::get_ui_error,
+            // Startup crash-dump surface (post-3J follow-up): ack a panic
+            // the previous process aborted on, clearing /health.derived_status.
+            crash_dumps::dismiss_recent_crash,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -1487,6 +1493,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(_) => info!("MCP API server stopped normally"),
                     Err(e) => error!("MCP API server error: {}", e),
                 }
+            });
+
+            // Scan for crash dumps written by the previous process. Run in
+            // parallel with the MCP server spawn above — the scan is a
+            // read-only disk walk + ~1 file parse and completes in ms, so we
+            // don't bother awaiting it before accepting /health requests.
+            // Worst case: a request that lands in the first few ms after
+            // startup sees `recent_crash: null` and then the next one flips
+            // to the populated value.
+            tauri::async_runtime::spawn(async move {
+                let dir = crate::logging::get_crash_dump_dir();
+                crash_dump_app_state.crash_dumps.scan_on_startup(&dir).await;
             });
 
             // Clear runner log files from previous session

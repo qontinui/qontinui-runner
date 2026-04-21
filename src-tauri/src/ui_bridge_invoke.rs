@@ -182,6 +182,24 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{ \"taskRunId\"?: string | null }",
         response_schema: "{ \"attempted\": number, \"cacheHit\": number, \"llmOk\": number, \"workerOk\": number, \"bytesAvoided\": number, \"fallbacks\": { [reason: string]: number }, \"totalTokensIn\": number, \"totalTokensOut\": number, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
     },
+    ProxyableCommand {
+        name: "report_ui_error",
+        description: "Record a UI error observed by the React error boundary. Coalesces repeat reports with the same message/digest into a single record (incrementing `count`, refreshing `reported_at`, pinning `first_seen`).",
+        args_schema: r#"{"type":"object","properties":{"message":{"type":"string"},"stack":{"type":["string","null"]},"componentStack":{"type":["string","null"]},"digest":{"type":["string","null"]}},"required":["message"]}"#,
+        response_schema: r#"{"type":"null"}"#,
+    },
+    ProxyableCommand {
+        name: "clear_ui_error",
+        description: "Clear the current UI error state (called on error boundary recovery).",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"null"}"#,
+    },
+    ProxyableCommand {
+        name: "get_ui_error",
+        description: "Read the current UI error state, or null if none.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":["object","null"],"properties":{"message":{"type":"string"},"stack":{"type":["string","null"]},"component_stack":{"type":["string","null"]},"digest":{"type":["string","null"]},"first_seen":{"type":"string"},"reported_at":{"type":"string"},"count":{"type":"integer"}}}"#,
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.
@@ -285,9 +303,16 @@ mod tests {
     }
 
     #[test]
+    fn is_allowlisted_recognizes_ui_error_commands() {
+        assert!(is_allowlisted("report_ui_error"));
+        assert!(is_allowlisted("clear_ui_error"));
+        assert!(is_allowlisted("get_ui_error"));
+    }
+
+    #[test]
     fn is_allowlisted_rejects_unknown_commands() {
-        assert!(!is_allowlisted("get_ui_error"));
         assert!(!is_allowlisted("rm_rf_my_disk"));
+        assert!(!is_allowlisted("execute_sql"));
         assert!(!is_allowlisted(""));
     }
 

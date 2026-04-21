@@ -95,6 +95,7 @@ import {
   Network,
   Repeat,
   Video,
+  Target,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -186,6 +187,7 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   Network,
   Repeat,
   Video,
+  Target,
 };
 
 function getIconComponent(iconName: IconName): LucideIcon {

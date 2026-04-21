@@ -264,6 +264,12 @@ pub struct AppState {
     /// so supervisors and the qontinui-web fleet view can flag runners
     /// whose backend is up but whose UI is broken.
     pub ui_error: Arc<crate::ui_error::UiErrorState>,
+    /// Recent (within the freshness window) Rust crash dump discovered at
+    /// startup. Closes the 3J gap for non-unwinding panics that abort the
+    /// process before the React ErrorBoundary can report them — the
+    /// restarted runner marks itself `errored` via `/health.derived_status`
+    /// until the user dismisses the record via `dismiss_recent_crash`.
+    pub crash_dumps: Arc<crate::crash_dumps::CrashDumpState>,
 }
 
 impl AppState {

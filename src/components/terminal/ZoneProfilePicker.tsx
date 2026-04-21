@@ -376,6 +376,9 @@ export function ZoneProfilePicker({
       <div className="relative shrink-0" ref={ref}>
         <button
           onClick={() => setOpen(!open)}
+          aria-label="Zone profiles"
+          aria-haspopup="menu"
+          aria-expanded={open}
           className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
             open
               ? "text-[#7aa2f7] bg-[#7aa2f7]/10"

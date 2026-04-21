@@ -549,6 +549,10 @@ pub struct ExecutionStepConfig {
     // ========================================================================
     /// VGA: UUID referencing `runner.vga_state_machines.id` — the persisted
     /// state machine defining the elements the step may click/type/wait for.
+    ///
+    /// VGA state machine id. See `qontinui-schemas::workflow_step`
+    /// for the canonical spelling (`vgaStateMachineId`) — the aliases
+    /// here exist only for historical JSON compatibility.
     #[serde(alias = "stateMachineId", alias = "state_machine_id", default)]
     pub vga_state_machine_id: Option<String>,
 

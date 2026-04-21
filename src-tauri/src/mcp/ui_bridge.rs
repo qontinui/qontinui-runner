@@ -2016,6 +2016,7 @@ pub async fn ui_bridge_discover_handler(
                             &state,
                             "document.body && document.body.innerText.length > 100",
                             None,
+                            false,
                         ),
                     )
                     .await
@@ -2025,7 +2026,12 @@ pub async fn ui_bridge_discover_handler(
 
                     let title = tokio::time::timeout(
                         diag_timeout,
-                        direct_webview_evaluate_with_result(&state, "document.title", None),
+                        direct_webview_evaluate_with_result(
+                            &state,
+                            "document.title",
+                            None,
+                            false,
+                        ),
                     )
                     .await
                     .ok()
@@ -3197,6 +3203,13 @@ pub struct PageEvaluateRequest {
     /// `invoke("generate_workflow_standalone", ...)` that can take minutes.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// When true, if the expression returns a Promise the runner awaits it
+    /// before sending the response. Mirrors Chrome DevTools'
+    /// `Runtime.evaluate.awaitPromise` contract. Default: false (keeps
+    /// existing behavior for non-async expressions). The IPC path already
+    /// awaits unconditionally; this flag governs the direct WebView fallback.
+    #[serde(default)]
+    pub await_promise: bool,
 }
 
 /// Request to evaluate multiple JS expressions in one round-trip.
@@ -3478,7 +3491,7 @@ pub async fn ui_bridge_page_evaluate_handler(
     Json(request): Json<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let timeout = request.timeout_ms.map(|ms| ms.clamp(1000, 600_000));
-    page_evaluate_inner(state, request.expression, timeout).await
+    page_evaluate_inner(state, request.expression, timeout, request.await_promise).await
 }
 
 /// `POST /ui-bridge/control/page/evaluate-raw`
@@ -3489,6 +3502,13 @@ pub async fn ui_bridge_page_evaluate_handler(
 /// regex / backslashes — the test report flagged this as a real
 /// ergonomics problem (`Failed to parse the request body as JSON:
 /// invalid escape`).
+///
+/// This is an undocumented escape hatch; for normal use prefer
+/// `/page/evaluate`. Use the raw endpoint only when you want to bypass
+/// JSON decoding and send arbitrary JS source as the raw request body.
+/// The raw body is taken verbatim — the caller is responsible for any
+/// pre-escaping — so the JS-string-literal newline issue that affects
+/// `/page/evaluate` does not apply here.
 ///
 /// Body: a JavaScript expression, e.g.
 /// ```text
@@ -3504,18 +3524,27 @@ pub async fn ui_bridge_page_evaluate_raw_handler(
             Json(api_error("page/evaluate-raw: body is empty".to_string())),
         ));
     }
-    page_evaluate_inner(state, body, None).await
+    page_evaluate_inner(state, body, None, false).await
 }
 
 async fn page_evaluate_inner(
     state: Arc<ApiState>,
     expression: String,
     timeout_ms: Option<u64>,
+    await_promise: bool,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let preview: String = expression.chars().take(80).collect();
     info!("UI Bridge API: Page evaluate ({}...)", preview);
 
-    let payload = serde_json::json!({ "expression": expression });
+    // IPC path: the frontend handler already awaits any returned Promise
+    // unconditionally (see usePageEvents.ts → `await Promise.resolve(result)`),
+    // so `awaitPromise=true` is a no-op there. We still forward the flag for
+    // observability and future-proofing in case the frontend gains a
+    // non-awaiting mode.
+    let payload = serde_json::json!({
+        "expression": expression,
+        "awaitPromise": await_promise,
+    });
 
     // Try IPC path first (fastest, uses SDK event handlers).
     // Wrap with caller's timeout_ms when provided (e.g. for 3+ min pipelines).
@@ -3555,7 +3584,14 @@ async fn page_evaluate_inner(
                 ipc_err
             );
 
-            match direct_webview_evaluate_with_result(&state, &expression, timeout_ms).await {
+            match direct_webview_evaluate_with_result(
+                &state,
+                &expression,
+                timeout_ms,
+                await_promise,
+            )
+            .await
+            {
                 Ok(result) => Ok(Json(ApiResponse::success(serde_json::json!({
                     "result": { "value": result },
                     "source": "direct_eval"
@@ -3587,6 +3623,7 @@ async fn direct_webview_evaluate_with_result(
     state: &Arc<ApiState>,
     expression: &str,
     timeout_override_ms: Option<u64>,
+    await_promise: bool,
 ) -> Result<String, String> {
     use tauri::Manager;
 
@@ -3622,13 +3659,38 @@ async fn direct_webview_evaluate_with_result(
         return Err("API port not yet bound — direct eval unavailable".to_string());
     }
 
+    // Encode the user's expression as a JS *string literal* so that any
+    // characters that would break a raw splice (newlines inside a string
+    // literal, `*/`, unpaired quotes, etc.) survive intact. JSON strings are
+    // a strict subset of JS strings, so serde_json output is a valid JS
+    // literal. We then `eval()` that literal inside the webview — this
+    // matches Chrome DevTools' `Runtime.evaluate` contract. (Previously the
+    // expression was spliced into the JS template directly, which corrupted
+    // any body containing a literal newline inside a string literal, e.g.
+    // `invoke("report_ui_error", {stack: "at A\n  at B"})`.)
+    let expr_literal = serde_json::to_string(expression)
+        .map_err(|e| format!("Failed to encode expression as JS literal: {}", e))?;
+
+    // When `awaitPromise` is true, mirror DevTools behavior: if the
+    // expression evaluates to a Promise (e.g. an async `invoke(...)` or
+    // an IIFE returning a Promise), resolve it before reporting the value.
+    // When false, keep the pre-existing direct-path semantics: send the
+    // raw return value straight through (non-resolved Promises become
+    // `"[object Promise]"` after JSON.stringify), so existing callers see
+    // no behavior change beyond the newline/escape bugfix.
+    let eval_inner = if await_promise {
+        format!("await Promise.resolve(eval({}))", expr_literal)
+    } else {
+        format!("eval({})", expr_literal)
+    };
+
     // Build JS that evaluates the expression and POSTs the result back
     // via the IPC response HTTP endpoint
     let callback_js = format!(
         r#"(async function() {{
             var reqId = "{}";
             try {{
-                var result = (function() {{ return {}; }})();
+                var result = {};
                 var value = (result === undefined) ? null : result;
                 await fetch("http://127.0.0.1:{}/ui-bridge/ipc-response", {{
                     method: "POST",
@@ -3653,7 +3715,7 @@ async fn direct_webview_evaluate_with_result(
                 }}).catch(function() {{}});
             }}
         }})()"#,
-        request_id, expression, api_port, api_port
+        request_id, eval_inner, api_port, api_port
     );
 
     window
@@ -4080,7 +4142,7 @@ pub async fn ui_bridge_page_set_tab_handler(
         escaped_tab
     );
 
-    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000)).await {
+    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), false).await {
         Ok(result_str) => {
             // direct_webview_evaluate_with_result returns the JS-side
             // JSON.stringify output. Parse it back out to get pageId.
@@ -10156,7 +10218,7 @@ async fn evaluate_js_expression(state: &Arc<ApiState>, expression: &str) -> Resu
                 || data.get("error").is_some()
             {
                 // IPC returned an error — fall back to direct eval
-                return direct_webview_evaluate_with_result(state, expression, None).await;
+                return direct_webview_evaluate_with_result(state, expression, None, false).await;
             }
             // Extract the result value from the IPC response
             if let Some(result) = data.get("result").and_then(|r| r.get("value")) {
@@ -10170,7 +10232,7 @@ async fn evaluate_js_expression(state: &Arc<ApiState>, expression: &str) -> Resu
         }
         Err(_ipc_err) => {
             // Fallback to direct WebView evaluation
-            direct_webview_evaluate_with_result(state, expression, None).await
+            direct_webview_evaluate_with_result(state, expression, None, false).await
         }
     }
 }
