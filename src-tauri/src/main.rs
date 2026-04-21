@@ -131,6 +131,7 @@ mod tracing_layers;
 mod trigger_system;
 mod tunnel;
 mod ui_bridge_invoke;
+mod ui_bridge_invoke_probe;
 mod ui_bridge_plugin;
 mod ui_error;
 mod unified_ai_session;

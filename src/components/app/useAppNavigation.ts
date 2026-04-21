@@ -1,6 +1,6 @@
 import { useEffect, useCallback, useState, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { useUIBridge } from "@qontinui/ui-bridge";
+import { useRouteAwareness } from "@qontinui/ui-bridge";
 import { useApiReady, useRenderPerformance } from "@/hooks";
 import { getApiPort } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
@@ -110,6 +110,18 @@ export function useAppNavigation(): UseAppNavigationReturn {
     const stored = instanceStorage.getItem("qontinui-main-active-tab");
     return migrateTabId(stored);
   });
+
+  // Feed the active tab into the UI Bridge navigation tracker as the canonical
+  // route signal. The runner doesn't use react-router or history.pushState, so
+  // `page.pathname` is frozen at whatever the webview loaded with; consumers
+  // should read `page.route.pattern` / `page.route.id` instead. See
+  // `ui_bridge_core.md` (Choosing a wait/nav/batch primitive) for the rationale.
+  // `id` is not in the `RouteInfo` TS interface but the tracker stores the
+  // object verbatim and emits it in `page.route`, so the extra field round-trips
+  // to consumers reading `page.route.id`.
+  useRouteAwareness({ pattern: activeTab, id: activeTab } as Parameters<
+    typeof useRouteAwareness
+  >[0]);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     return instanceStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
@@ -318,36 +330,6 @@ export function useAppNavigation(): UseAppNavigationReturn {
       }
     };
   }, [setActiveTab]);
-
-  // Bridge the runner's tab-based "navigation" into the UI Bridge registry as
-  // navigation:change events. The runner doesn't use react-router or
-  // history.pushState, so the SDK's NavigationTracker has nothing to observe;
-  // instead we synthesize PageInfo objects from activeTab + document.title and
-  // dispatch directly. This lets /ai/change-buffer/drain pick up route entries
-  // and lets `/control/wait-for-route` work against runner pages.
-  const bridge = useUIBridge();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry shape varies across builds
-  const registry = (bridge as any)?.registry ?? null;
-  const prevTabRef = useRef<MainTabId | null>(null);
-  useEffect(() => {
-    if (!registry?.dispatchEvent) return;
-    const prev = prevTabRef.current;
-    if (prev === activeTab) return;
-
-    const buildPageInfo = (tab: MainTabId | null) => {
-      const path = tab ? `/${tab}` : "/";
-      const title = typeof document !== "undefined" ? document.title : "";
-      const url = typeof window !== "undefined" ? `${window.location.origin}${path}` : path;
-      return { url, pathname: path, search: "", hash: "", title };
-    };
-
-    registry.dispatchEvent("navigation:change", {
-      from: buildPageInfo(prev),
-      to: buildPageInfo(activeTab),
-      trigger: prev === null ? "initial" : "push",
-    });
-    prevTabRef.current = activeTab;
-  }, [activeTab, registry]);
 
   return {
     activeTab,

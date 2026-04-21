@@ -544,6 +544,34 @@ pub fn create_router(
         info!("UI Bridge: invoke-proxy response listener set up");
     }
 
+    // UI Bridge invoke-proxy wire-contract probe (Phase 1 of
+    // optimized-toasting-badger). Dry-runs every allowlisted command with
+    // `{}` args on startup and cross-checks Tauri's "missing required key"
+    // reply against the declared args_schema. Catches schema drift between
+    // the hand-written schema string and the actual Rust command signature
+    // (the exact bug fixed in commit 01ba1085b). Purely diagnostic —
+    // logs-only, never fails boot.
+    {
+        let probe_handle = app_handle.clone();
+        let probe_store = api_state.ui_bridge_invoke_store.clone();
+        tokio::spawn(async move {
+            // Give the React side a moment to mount the invoke-response
+            // listener before we start firing probes at it.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let results =
+                crate::ui_bridge_invoke_probe::probe_allowlist_wire_contracts(
+                    &probe_handle,
+                    probe_store,
+                )
+                .await;
+            crate::ui_bridge_invoke_probe::log_probe_results(&results);
+            tracing::debug!(
+                probe_count = results.len(),
+                "ui_bridge_invoke_probe: startup probe completed"
+            );
+        });
+    }
+
     // Set up UI Bridge pong listener for frontend liveness tracking
     {
         let last_pong = api_state.ui_bridge_last_pong.clone();

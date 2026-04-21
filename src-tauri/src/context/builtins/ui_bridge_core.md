@@ -187,6 +187,8 @@ Prefer these primitives over `sleep N && re-discover`; they all already exist. E
 - `window.__UI_BRIDGE__.stateMachine.navigateTo("page-<slug>")` via `POST /ui-bridge/control/page/evaluate` — runs the compiled sidebar transition. Use when you need the state-machine side effects (active-state updates, etc.).
 - Avoid clicking sidebar buttons via `POST /ui-bridge/control/element/<id>/action` for navigation — the click handler fires but may not route through the state-machine transition. Use one of the three above instead.
 
+**`page.pathname` vs `page.route.pattern`:** on the runner, `page.pathname` reflects the webview's HTML-history path and stays at the initial value across tab switches — tab navigation is React-state-only, not `history.pushState`. Prefer `page.route.pattern` and `page.route.id` for "what tab is active?" checks; both are wired to the active `MainTabId` via `useRouteAwareness`.
+
 **Batch** — use when a manual-test sequence would otherwise need 3+ round-trips:
 
 - `POST /ui-bridge/control/batch-execute` — mixed `action` / `wait` / `snapshot` steps, serial, with `stop_on_error` default `true`.

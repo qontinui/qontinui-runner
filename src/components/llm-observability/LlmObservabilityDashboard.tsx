@@ -6,7 +6,7 @@
  * charts, and a task run cost table.
  */
 
-import { useState } from "react";
+import { useState, type ReactElement } from "react";
 import { useUIComponent, useUIElement } from "@qontinui/ui-bridge";
 import { CreditCard, RefreshCw, AlertTriangle, Clock } from "lucide-react";
 import { useLlmAnalytics } from "../../hooks/useLlmAnalytics";
@@ -102,31 +102,69 @@ export default function LlmObservabilityDashboard() {
     label: "Task run cost table",
   });
 
+  // Always-on header: refresh button + time-range selector register and
+  // render regardless of branch, so UI Bridge snapshots can verify both
+  // registrations even when there is no data yet.
+  const header = (
+    <div className="flex items-center justify-between">
+      <div>
+        <h2 className="text-lg font-semibold flex items-center gap-2">
+          <CreditCard className="w-5 h-5" />
+          LLM Analytics
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          Token usage, costs, and provider performance
+        </p>
+      </div>
+      <div className="flex items-center gap-3">
+        {/* Time Range Selector */}
+        <div
+          ref={timeRangeSelectRef}
+          className="flex items-center gap-2"
+          data-tutorial-id="llm-time-range"
+        >
+          <Clock className="w-4 h-4 text-muted-foreground" />
+          <select
+            value={timeRange}
+            onChange={(e) => setTimeRange(e.target.value as LlmTimeRange)}
+            aria-label="Select time range"
+            className="bg-muted border border-border rounded-md px-3 py-1.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
+          >
+            {TIME_RANGE_OPTIONS.map((option) => (
+              <option key={option} value={option}>
+                {LLM_TIME_RANGE_LABELS[option]}
+              </option>
+            ))}
+          </select>
+        </div>
+        <button
+          ref={refreshButtonRef}
+          onClick={refresh}
+          className="p-2 rounded-md hover:bg-muted transition-colors"
+          title="Refresh analytics"
+          aria-label="Refresh analytics"
+        >
+          <RefreshCw className="w-4 h-4" />
+        </button>
+      </div>
+    </div>
+  );
+
+  let main: ReactElement;
   if (loading) {
-    return (
-      <div
-        ref={pageRootRef}
-        data-nav-item="page:llm-analytics"
-        className="h-full flex items-center justify-center"
-      >
+    main = (
+      <div className="flex items-center justify-center py-12">
         <RefreshCw className="w-6 h-6 animate-spin text-muted-foreground" />
       </div>
     );
-  }
-
-  if (error) {
-    return (
-      <div
-        ref={pageRootRef}
-        data-nav-item="page:llm-analytics"
-        className="h-full flex items-center justify-center text-muted-foreground"
-      >
+  } else if (error) {
+    main = (
+      <div className="flex items-center justify-center text-muted-foreground py-12">
         <div className="text-center">
           <AlertTriangle className="w-12 h-12 mx-auto mb-4 opacity-50" />
           <p>Failed to load LLM analytics</p>
           <p className="text-sm mt-2">{error}</p>
           <button
-            ref={refreshButtonRef}
             onClick={refresh}
             className="mt-4 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm hover:bg-primary/90 transition-colors"
           >
@@ -135,15 +173,9 @@ export default function LlmObservabilityDashboard() {
         </div>
       </div>
     );
-  }
-
-  if (!summary || summary.total_calls === 0) {
-    return (
-      <div
-        ref={pageRootRef}
-        data-nav-item="page:llm-analytics"
-        className="h-full overflow-auto p-4 space-y-6"
-      >
+  } else if (!summary || summary.total_calls === 0) {
+    main = (
+      <div className="space-y-6">
         <AccountUsageCard />
         <div className="flex items-center justify-center text-muted-foreground pt-4">
           <div className="text-center">
@@ -158,6 +190,58 @@ export default function LlmObservabilityDashboard() {
         <ScriptedOutputPanel />
       </div>
     );
+  } else {
+    main = (
+      <div className="space-y-4" data-tutorial-id="llm-observability-dashboard">
+        {/* Summary Cards */}
+        <div data-tutorial-id="llm-summary-cards">
+          <SummaryCards summary={summary} />
+        </div>
+
+        {/* Account Usage vs Expected */}
+        <AccountUsageCard />
+
+        {/* Charts Row 1 */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div ref={costOverTimeRef}>
+            <CostOverTimeChart data={dailyCost} />
+          </div>
+          <div ref={costByModelRef}>
+            <CostByModelChart data={costByModel} />
+          </div>
+        </div>
+
+        {/* Cost Trend (fetches its own data from the web backend) */}
+        <div ref={costTrendRef}>
+          <CostTrendChart />
+        </div>
+
+        {/* Scripted-output (think-in-code) aggregates — Phase C of script-emitter-wiring */}
+        <ScriptedOutputPanel />
+
+        {/* Charts Row 2 */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div ref={costByPhaseRef}>
+            <CostByPhaseChart data={costByPhase} />
+          </div>
+          <div ref={providerLatencyRef}>
+            <ProviderLatencyChart data={providerLatency} />
+          </div>
+        </div>
+
+        {/* UI Bridge Cost Attribution */}
+        {costByTargetApp.length > 0 && (
+          <div ref={costByTargetAppRef}>
+            <CostByTargetAppChart data={costByTargetApp} />
+          </div>
+        )}
+
+        {/* Task Run Cost Table */}
+        <div ref={taskRunCostTableRef}>
+          <TaskRunCostTable data={taskRunCosts} />
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -165,96 +249,9 @@ export default function LlmObservabilityDashboard() {
       ref={pageRootRef}
       data-nav-item="page:llm-analytics"
       className="h-full overflow-auto p-4 space-y-4"
-      data-tutorial-id="llm-observability-dashboard"
     >
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-semibold flex items-center gap-2">
-            <CreditCard className="w-5 h-5" />
-            LLM Analytics
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Token usage, costs, and provider performance
-          </p>
-        </div>
-        <div className="flex items-center gap-3">
-          {/* Time Range Selector */}
-          <div className="flex items-center gap-2" data-tutorial-id="llm-time-range">
-            <Clock className="w-4 h-4 text-muted-foreground" />
-            <select
-              ref={timeRangeSelectRef}
-              value={timeRange}
-              onChange={(e) => setTimeRange(e.target.value as LlmTimeRange)}
-              aria-label="Select time range"
-              className="bg-muted border border-border rounded-md px-3 py-1.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
-            >
-              {TIME_RANGE_OPTIONS.map((option) => (
-                <option key={option} value={option}>
-                  {LLM_TIME_RANGE_LABELS[option]}
-                </option>
-              ))}
-            </select>
-          </div>
-          <button
-            ref={refreshButtonRef}
-            onClick={refresh}
-            className="p-2 rounded-md hover:bg-muted transition-colors"
-            title="Refresh analytics"
-            aria-label="Refresh analytics"
-          >
-            <RefreshCw className="w-4 h-4" />
-          </button>
-        </div>
-      </div>
-
-      {/* Summary Cards */}
-      <div data-tutorial-id="llm-summary-cards">
-        <SummaryCards summary={summary} />
-      </div>
-
-      {/* Account Usage vs Expected */}
-      <AccountUsageCard />
-
-      {/* Charts Row 1 */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div ref={costOverTimeRef}>
-          <CostOverTimeChart data={dailyCost} />
-        </div>
-        <div ref={costByModelRef}>
-          <CostByModelChart data={costByModel} />
-        </div>
-      </div>
-
-      {/* Cost Trend (fetches its own data from the web backend) */}
-      <div ref={costTrendRef}>
-        <CostTrendChart />
-      </div>
-
-      {/* Scripted-output (think-in-code) aggregates — Phase C of script-emitter-wiring */}
-      <ScriptedOutputPanel />
-
-      {/* Charts Row 2 */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div ref={costByPhaseRef}>
-          <CostByPhaseChart data={costByPhase} />
-        </div>
-        <div ref={providerLatencyRef}>
-          <ProviderLatencyChart data={providerLatency} />
-        </div>
-      </div>
-
-      {/* UI Bridge Cost Attribution */}
-      {costByTargetApp.length > 0 && (
-        <div ref={costByTargetAppRef}>
-          <CostByTargetAppChart data={costByTargetApp} />
-        </div>
-      )}
-
-      {/* Task Run Cost Table */}
-      <div ref={taskRunCostTableRef}>
-        <TaskRunCostTable data={taskRunCosts} />
-      </div>
+      <header>{header}</header>
+      <main>{main}</main>
     </div>
   );
 }

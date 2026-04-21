@@ -1179,7 +1179,7 @@
             "label": "LLM Analytics refresh button"
           },
           "assertionType": "exists",
-          "precondition": "Dashboard is in the normal (non-loading) render branch",
+          "precondition": "LLM Analytics tab is currently active",
           "source": "ai-generated",
           "reviewed": false,
           "enabled": true
@@ -1195,7 +1195,7 @@
             "label": "LLM Analytics time-range selector"
           },
           "assertionType": "exists",
-          "precondition": "Dashboard is in the normal render branch",
+          "precondition": "LLM Analytics tab is currently active",
           "source": "ai-generated",
           "reviewed": false,
           "enabled": true
