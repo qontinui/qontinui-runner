@@ -3824,9 +3824,16 @@ CREATE INDEX IF NOT EXISTS idx_vga_runs_task ON vga_runs(task_run_id) WHERE task
 -- (image_sha, prompt, predicted_bbox, model_used) for offline re-prediction
 -- by v6 before it ships. Used to detect production-distribution regressions
 -- the synthetic eval misses (mirrors proj_world_state_verifier.md pattern).
+--
+-- state_machine_id is nullable on purpose: the VGA product surface logs
+-- shadow samples from three paths — (1) the runtime executing a persisted
+-- SM (FK present), (2) the builder UI calling /api/vga/ground or /propose
+-- while authoring a new SM that hasn't been saved yet (no FK), (3) one-off
+-- probes from callers that don't own an SM at all. In cases (2) and (3)
+-- the per-domain bucket is keyed off ``target_process`` instead.
 CREATE TABLE IF NOT EXISTS vga_shadow_samples (
     id                BIGSERIAL PRIMARY KEY,
-    state_machine_id  UUID NOT NULL REFERENCES vga_state_machines(id) ON DELETE CASCADE,
+    state_machine_id  UUID REFERENCES vga_state_machines(id) ON DELETE CASCADE,
     image_sha         TEXT NOT NULL,
     image_path        TEXT NOT NULL,
     prompt            TEXT NOT NULL,
