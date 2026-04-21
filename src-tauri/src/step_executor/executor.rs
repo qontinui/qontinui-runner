@@ -234,6 +234,7 @@ fn handler_lookup_key(step: &qontinui_types::workflow_step::FullRunnerStep) -> &
         FullRunnerStep::DagCancel(_) => "dag_cancel",
         FullRunnerStep::DagApproval(_) => "dag_approval",
         FullRunnerStep::DagLoop(_) => "dag_loop",
+        FullRunnerStep::VgaAutomate(_) => "vga_automate",
     }
 }
 
