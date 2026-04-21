@@ -88,35 +88,47 @@ pub fn get_meta_optimizer_runs(
 
 // ── Progress Tracking ─────────────────────────────────────────────────
 
+// These commands are `async` on purpose: their sync predecessors invoked
+// `snapshots::{get_progress_summary, capture_baseline, list_snapshots}`,
+// each of which bottoms out in `Handle::current().block_on(...)`. Sync
+// Tauri commands run on worker threads with no ambient tokio runtime, so
+// `Handle::current()` panics with "there is no reactor running" — a
+// non-unwinding panic that aborts the whole process when it unwinds
+// across the WebView2 FFI boundary. Making the command async puts it on
+// Tauri's tokio runtime, and the `_async` helpers below `.await` the PG
+// calls directly instead of cross-runtime blocking.
 #[tauri::command]
-pub fn get_meta_optimizer_progress(
+pub async fn get_meta_optimizer_progress(
     app_state: State<'_, Arc<AppState>>,
     category: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
-    let summary = crate::meta_optimizer::snapshots::get_progress_summary(&app_state.pg_db, cat)?;
+    let summary =
+        crate::meta_optimizer::snapshots::get_progress_summary_async(&app_state.pg_db, cat).await?;
     serde_json::to_value(summary).map_err(|e| format!("Serialization error: {}", e))
 }
 
 #[tauri::command]
-pub fn capture_meta_optimizer_baseline(
+pub async fn capture_meta_optimizer_baseline(
     app_state: State<'_, Arc<AppState>>,
     category: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
-    let snapshot = crate::meta_optimizer::snapshots::capture_baseline(&app_state.pg_db, cat)?;
+    let snapshot =
+        crate::meta_optimizer::snapshots::capture_baseline_async(&app_state.pg_db, cat).await?;
     serde_json::to_value(snapshot).map_err(|e| format!("Serialization error: {}", e))
 }
 
 #[tauri::command]
-pub fn get_meta_optimizer_snapshots(
+pub async fn get_meta_optimizer_snapshots(
     app_state: State<'_, Arc<AppState>>,
     snapshot_type: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let snapshots = crate::meta_optimizer::snapshots::list_snapshots(
+    let snapshots = crate::meta_optimizer::snapshots::list_snapshots_async(
         &app_state.pg_db,
         snapshot_type.as_deref(),
-    )?;
+    )
+    .await?;
     serde_json::to_value(snapshots).map_err(|e| format!("Serialization error: {}", e))
 }
 

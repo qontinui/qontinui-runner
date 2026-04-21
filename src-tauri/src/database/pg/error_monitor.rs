@@ -130,12 +130,15 @@ impl PgDb {
             .map_err(|e| format!("PG get_error_summary: {}", e))?
         };
 
-        let total: i64 = counts_row.get(0);
-        let new_count: i64 = counts_row.get(1);
-        let unresolved_count: i64 = counts_row.get(2);
-        let critical_count: i64 = counts_row.get(3);
-        let error_count: i64 = counts_row.get(4);
-        let warning_count: i64 = counts_row.get(5);
+        // SQL casts every count to ::INTEGER (pg i32), so decode as i32 —
+        // reading them as i64 panics with "error deserializing column 0" at
+        // runtime. Widen to i64 in Rust for the downstream JSON payload.
+        let total: i64 = counts_row.get::<_, i32>(0) as i64;
+        let new_count: i64 = counts_row.get::<_, i32>(1) as i64;
+        let unresolved_count: i64 = counts_row.get::<_, i32>(2) as i64;
+        let critical_count: i64 = counts_row.get::<_, i32>(3) as i64;
+        let error_count: i64 = counts_row.get::<_, i32>(4) as i64;
+        let warning_count: i64 = counts_row.get::<_, i32>(5) as i64;
 
         // Breakdown by source
         let by_source = self

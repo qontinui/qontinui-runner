@@ -366,6 +366,34 @@ pub fn capture_snapshot(
     })
 }
 
+/// Async-native variant of [`capture_snapshot`].
+pub async fn capture_snapshot_async(
+    pg_db: &Arc<PgDb>,
+    snapshot_type: &str,
+    recommendation_id: Option<&str>,
+    lookback_days: i64,
+    category: WorkflowCategory,
+) -> Result<MetaOptimizerSnapshot, String> {
+    let category_filter = category.sql_filter("tr");
+    pg_db
+        .pg_capture_snapshot(
+            snapshot_type,
+            recommendation_id,
+            lookback_days,
+            &category_filter,
+        )
+        .await
+}
+
+/// Async-native variant of [`capture_baseline`].
+pub async fn capture_baseline_async(
+    pg_db: &Arc<PgDb>,
+    category: WorkflowCategory,
+) -> Result<MetaOptimizerSnapshot, String> {
+    let snapshot_type = format!("baseline{}", category.snapshot_suffix());
+    capture_snapshot_async(pg_db, &snapshot_type, None, 30, category).await
+}
+
 /// Capture a snapshot (same as capture_snapshot now, kept for backward compat).
 #[allow(dead_code)]
 pub fn capture_snapshot_with_pg(
@@ -429,6 +457,21 @@ pub fn get_latest_baseline(
     })
 }
 
+/// Async-native variant of [`get_latest_baseline`].
+///
+/// Call this from async Tauri commands or other async contexts. The sync
+/// [`get_latest_baseline`] relies on `tokio::runtime::Handle::current()`
+/// and aborts the process with a non-unwinding panic when invoked on a
+/// sync Tauri command thread that has no ambient runtime — which happens
+/// any time a `#[tauri::command] pub fn ...` reaches this helper.
+pub async fn get_latest_baseline_async(
+    pg_db: &Arc<PgDb>,
+    category: WorkflowCategory,
+) -> Result<Option<MetaOptimizerSnapshot>, String> {
+    let snap_type = format!("baseline{}", category.snapshot_suffix());
+    pg_db.get_latest_baseline_snapshot(&snap_type).await
+}
+
 /// List snapshots with optional type filter.
 pub fn list_snapshots(
     pg_db: &Arc<PgDb>,
@@ -438,6 +481,16 @@ pub fn list_snapshots(
         tokio::runtime::Handle::current()
             .block_on(async { pg_db.list_snapshots(snapshot_type).await })
     })
+}
+
+/// Async-native variant of [`list_snapshots`]. See
+/// [`get_latest_baseline_async`] for why the sync version cannot be called
+/// from sync Tauri command threads.
+pub async fn list_snapshots_async(
+    pg_db: &Arc<PgDb>,
+    snapshot_type: Option<&str>,
+) -> Result<Vec<MetaOptimizerSnapshot>, String> {
+    pg_db.list_snapshots(snapshot_type).await
 }
 
 /// Get a full progress summary: baseline vs current, deltas, and all snapshots.
@@ -478,6 +531,51 @@ pub fn get_progress_summary(
         tokio::runtime::Handle::current()
             .block_on(async { pg_db.count_applied_recommendations().await })
     })?;
+
+    Ok(ProgressSummary {
+        baseline: baseline_metrics,
+        current: current_metrics,
+        delta,
+        snapshots,
+        applied_recommendations_count,
+    })
+}
+
+/// Async-native variant of [`get_progress_summary`]. Safe to call from
+/// sync Tauri commands (after making the command itself `async`). The
+/// sync `get_progress_summary` chain ultimately hits
+/// `Handle::current().block_on(...)` at multiple points — each one will
+/// abort the process if no tokio runtime is attached to the calling
+/// thread.
+pub async fn get_progress_summary_async(
+    pg_db: &Arc<PgDb>,
+    category: WorkflowCategory,
+) -> Result<ProgressSummary, String> {
+    let baseline_snap = get_latest_baseline_async(pg_db, category).await?;
+
+    let periodic_type = format!("periodic{}", category.snapshot_suffix());
+    let current_snap = pg_db.get_latest_baseline_snapshot(&periodic_type).await?;
+
+    let baseline_metrics = baseline_snap
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<SnapshotMetrics>(&s.metrics_json).ok());
+
+    let current_metrics = current_snap
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<SnapshotMetrics>(&s.metrics_json).ok());
+
+    let delta = match (&baseline_metrics, &current_metrics) {
+        (Some(b), Some(c)) => Some(MetricsDelta {
+            success_rate_delta: c.success_rate - b.success_rate,
+            duration_delta: c.avg_duration_secs - b.avg_duration_secs,
+            iterations_delta: c.avg_iterations - b.avg_iterations,
+            cost_delta: c.avg_cost_cents - b.avg_cost_cents,
+        }),
+        _ => None,
+    };
+
+    let snapshots = list_snapshots_async(pg_db, None).await?;
+    let applied_recommendations_count = pg_db.count_applied_recommendations().await?;
 
     Ok(ProgressSummary {
         baseline: baseline_metrics,
