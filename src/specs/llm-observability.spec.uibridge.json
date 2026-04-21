@@ -1146,6 +1146,128 @@
           "enabled": true
         }
       ]
+    },
+    {
+      "id": "llm-ui-bridge-registrations",
+      "name": "UI Bridge Element Registrations",
+      "description": "The dashboard and its summary-cards subcomponent register elements with the UI Bridge SDK so that currentRouteOnly=true snapshots return the page's interactive content (refresh button, time-range selector, metric cards, charts, task-run table), not just sidebar chrome. Exposes stable element ids that automation workflows can target without depending on rendered text. A `page:llm-analytics` component and a `llm-analytics-root` element are always present; the metric-card and chart registrations require the corresponding data branch to have rendered.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "llm-ui-bridge-page-root",
+          "description": "An element registered with id 'llm-analytics-root' exists on the LLM Analytics dashboard. This is the page-marker registration and is present in every render branch (loading, error, zero-usage, normal).",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "id": "llm-analytics-root" },
+            "label": "LLM Analytics page root"
+          },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "llm-ui-bridge-refresh-button",
+          "description": "The refresh button is registered with id 'llm-analytics-refresh' so workflows can trigger a data reload without depending on the rendered aria-label.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "id": "llm-analytics-refresh" },
+            "label": "LLM Analytics refresh button"
+          },
+          "assertionType": "exists",
+          "precondition": "Dashboard is in the normal (non-loading) render branch",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "llm-ui-bridge-time-range",
+          "description": "The time-range selector is registered with id 'llm-analytics-time-range'. Workflows can drive it via set-value actions targeting this id.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "id": "llm-analytics-time-range" },
+            "label": "LLM Analytics time-range selector"
+          },
+          "assertionType": "exists",
+          "precondition": "Dashboard is in the normal render branch",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "llm-ui-bridge-metric-cards",
+          "description": "The four summary metric cards are registered with ids 'llm-analytics-metric-total-cost', 'llm-analytics-metric-total-tokens', 'llm-analytics-metric-total-calls', and 'llm-analytics-metric-avg-cost-per-call'. All four must exist whenever the summary card grid has rendered (i.e., analytics returned at least one call).",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "idPattern": "^llm-analytics-metric-" },
+            "label": "LLM Analytics metric cards"
+          },
+          "assertionType": "count",
+          "expected": 4,
+          "precondition": "summary.total_calls > 0 — SummaryCards branch has rendered",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "llm-ui-bridge-chart-registrations",
+          "description": "The cost/latency charts are registered with the following ids: 'llm-analytics-chart-cost-over-time', 'llm-analytics-chart-cost-by-model', 'llm-analytics-chart-cost-by-phase', 'llm-analytics-chart-provider-latency', 'llm-analytics-chart-cost-trend'. An optional sixth chart id 'llm-analytics-chart-cost-by-target-app' appears only when costByTargetApp has at least one entry. At least five chart registrations must be present whenever the dashboard is in the normal (data-loaded) branch.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "idPattern": "^llm-analytics-chart-" },
+            "label": "LLM Analytics chart containers"
+          },
+          "assertionType": "semantic",
+          "expected": "at least 5 chart registrations visible; exactly 6 when target-app cost data exists",
+          "precondition": "Analytics data has loaded — not in loading/error/zero-usage state",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "llm-ui-bridge-task-run-table",
+          "description": "The task-run cost table is registered with id 'llm-analytics-task-run-cost-table' so workflows can scope pointer/scroll actions to its container without relying on the heading text.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "id": "llm-analytics-task-run-cost-table" },
+            "label": "LLM Analytics task-run cost table"
+          },
+          "assertionType": "exists",
+          "precondition": "Analytics data has loaded and task-run cost data is non-empty",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "llm-ui-bridge-current-route-only",
+          "description": "A GET /ui-bridge/control/snapshot?currentRouteOnly=true request while the LLM Analytics tab is active must return more than just sidebar elements — specifically, the 'llm-analytics-root' element (and when data is loaded, the metric cards and chart containers) must be included. This was the core regression that motivated adding these registrations in the first place: previously, currentRouteOnly=true returned only the 26 sidebar nav buttons because the page had no registrations.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "id": "llm-analytics-root" },
+            "label": "Snapshot coverage of LLM Analytics content"
+          },
+          "assertionType": "semantic",
+          "precondition": "LLM Analytics tab is currently active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "stateMachine": {
