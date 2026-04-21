@@ -27,8 +27,8 @@
 
 import { useEffect, useLayoutEffect, useCallback, useRef } from "react";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
-import { useUIBridge } from "ui-bridge";
-import type { StyleGuideConfig } from "ui-bridge";
+import { useUIBridge } from "@qontinui/ui-bridge";
+import type { StyleGuideConfig } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
 
@@ -61,14 +61,14 @@ export function useUIBridgeEventHandler(): void {
   const bridge = useUIBridge();
   const bridgeRef = useRef(bridge);
   const loadedStyleGuideRef = useRef<StyleGuideConfig | null>(null);
-  const changeTrackerRef = useRef<InstanceType<typeof import("ui-bridge/ai").ChangeTracker> | null>(
-    null,
-  );
+  const changeTrackerRef = useRef<InstanceType<
+    typeof import("@qontinui/ui-bridge/ai").ChangeTracker
+  > | null>(null);
   const networkTrackerRef = useRef<InstanceType<
-    typeof import("ui-bridge").NetworkRequestTracker
+    typeof import("@qontinui/ui-bridge").NetworkRequestTracker
   > | null>(null);
   const idleDetectorRef = useRef<InstanceType<
-    typeof import("ui-bridge").CompositeIdleDetector
+    typeof import("@qontinui/ui-bridge").CompositeIdleDetector
   > | null>(null);
 
   // Keep bridge ref updated via useLayoutEffect to minimize the gap between
