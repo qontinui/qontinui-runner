@@ -4,9 +4,12 @@
 //! library. Every operation runs on `tokio::task::spawn_blocking` because the
 //! underlying `adb_client` API is synchronous.
 //!
-//! Port forwarding (`adb forward`) is NOT exposed by `adb_client` 3.x, so callers
-//! that need it still shell out via `crate::process_helpers::tokio_no_window`.
-//! Everything else (listing, shell, pull, screenshot, tcpip) routes through here.
+//! Port forwarding: `establish_forward` now uses `adb_client`'s `forward()` API
+//! (sends `host:forward:<local>;<remote>`). Because the library's `forward()`
+//! discards the response body, callers must pre-allocate the local port via
+//! `pick_free_local_port` rather than passing `tcp:0`. Per-forward removal
+//! (`host:killforward:tcp:<port>`) is not exposed, so teardown callers still
+//! shell out; only `forward_remove_all` (kills every forward) is available here.
 
 use std::io::Cursor;
 use std::net::SocketAddrV4;
@@ -179,6 +182,70 @@ pub async fn server_reachable() -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// Establish an `adb forward tcp:<local> tcp:<remote>` on the given device.
+///
+/// Caller must pre-allocate `local_port` via `pick_free_local_port`, because
+/// `adb_client`'s `forward()` drops the response body and cannot return the
+/// port the server picks when you pass `tcp:0`.
+///
+/// Note on argument order: `adb_client::ADBServerDevice::forward` takes
+/// `(remote, local)` (the ADB wire format is `host:forward:<local>;<remote>`
+/// but the `Forward(remote, local)` enum variant reorders them for the caller).
+pub async fn forward_tcp(
+    serial: String,
+    local_port: u16,
+    remote_port: u16,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
+        device
+            .forward(format!("tcp:{remote_port}"), format!("tcp:{local_port}"))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task join failed: {e}"))?
+}
+
+/// Pick a free loopback TCP port by briefly binding to `127.0.0.1:0`.
+///
+/// The OS returns a port that's free at the moment of binding; there is a
+/// small TOCTOU window between the drop and the subsequent `adb forward`
+/// call, but in practice this is how every tool in the ecosystem does it.
+pub async fn pick_free_local_port() -> Result<u16, String> {
+    tokio::task::spawn_blocking(|| -> Result<u16, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| format!("bind 127.0.0.1:0: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("local_addr: {e}"))?
+            .port();
+        // listener is dropped here, releasing the port for adb to claim.
+        Ok(port)
+    })
+    .await
+    .map_err(|e| format!("task join failed: {e}"))?
+}
+
+/// Remove **all** adb forwards (`host:killforward-all`).
+///
+/// Currently unused by callers but exposed for future teardown paths. Because
+/// there is no per-forward `killforward` API in `adb_client` 3.x, this is the
+/// only library-level removal available; individual forward cleanup still
+/// shells out to `adb forward --remove tcp:<port>`.
+#[allow(dead_code)]
+pub async fn forward_remove_all() -> Result<(), String> {
+    tokio::task::spawn_blocking(|| -> Result<(), String> {
+        // `forward_remove_all` is defined on ADBServerDevice, but the wire
+        // command it sends (`host:killforward-all`) targets the server, not a
+        // specific device. Using an empty serial is fine because the server
+        // ignores the device selector for this command.
+        let mut device = ADBServerDevice::new(String::new(), Some(default_server_addr()));
+        device.forward_remove_all().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task join failed: {e}"))?
 }
 
 // Keep an unused import suppressed explicitly; Cursor is used by downstream

@@ -1,8 +1,10 @@
 //! USB/ADB transport for physical Android device connections.
 //!
-//! Plan 1A refactor: device listing and shell commands use the pure-Rust
-//! `adb_client` crate via `mcp::adb_helper`. Port forwarding still shells out
-//! because `adb_client` 3.x does not expose the `host:forward` service.
+//! Plan 1A refactor: device listing, shell commands, and `establish_forward`
+//! now use the pure-Rust `adb_client` crate via `mcp::adb_helper`. The one
+//! remaining subprocess call is `release_forward`, which still shells out to
+//! `adb forward --remove tcp:<port>` because `adb_client` 3.x exposes only
+//! `forward_remove_all` (nuclear) and not per-forward `killforward`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,11 +21,13 @@ use crate::mcp::adb_helper;
 
 /// Manages ADB port forwards for connected Android devices.
 ///
-/// `adb_path` is still used by `establish_forward` / `release_forward` because
-/// the `adb_client` crate has no wrapper for `adb forward`. Everything else
-/// (device listing, shell, screenshot, logcat) goes through `adb_helper`.
+/// `adb_path` is still used by `release_forward` because `adb_client` 3.x has
+/// no per-forward `killforward` API (only `forward_remove_all`, which would
+/// stomp every forward on the machine). Everything else (device listing,
+/// shell, screenshot, logcat, `establish_forward`) goes through `adb_helper`.
 pub struct UsbTransport {
-    /// Path to the `adb` (or `adb.exe`) binary.
+    /// Path to the `adb` (or `adb.exe`) binary. Still needed for
+    /// `release_forward` — see struct-level doc above.
     pub adb_path: PathBuf,
     /// Maps ADB serial number → locally forwarded TCP port.
     pub active_forwards: Arc<Mutex<HashMap<String, u16>>>,
@@ -37,38 +41,28 @@ impl UsbTransport {
         }
     }
 
-    /// Run `adb -s {serial} forward tcp:0 tcp:{remote_port}` and return the
-    /// allocated local port.  Stores the mapping for later teardown.
+    /// Establish an `adb forward tcp:<local> tcp:<remote>` using `adb_client`'s
+    /// library-level `host:forward` call. Pre-allocates the local port on the
+    /// loopback interface because the library discards the response body and
+    /// cannot return an adb-chosen port. Stores the mapping for later teardown.
     pub async fn establish_forward(
         &self,
         adb_serial: &str,
         remote_port: u16,
     ) -> Result<u16, TransportError> {
-        let output = crate::process_helpers::tokio_no_window(&self.adb_path)
-            .args([
-                "-s",
-                adb_serial,
-                "forward",
-                "tcp:0",
-                &format!("tcp:{}", remote_port),
-            ])
-            .output()
+        let local_port = adb_helper::pick_free_local_port()
             .await
-            .map_err(|e| TransportError::AdbCommandFailed(e.to_string()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(TransportError::ForwardFailed {
+            .map_err(|e| TransportError::ForwardFailed {
                 device_id: adb_serial.to_string(),
-                reason: stderr,
-            });
-        }
+                reason: format!("pick local port: {e}"),
+            })?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let local_port: u16 = stdout.parse().map_err(|_| TransportError::ForwardFailed {
-            device_id: adb_serial.to_string(),
-            reason: format!("could not parse local port from adb output: {:?}", stdout),
-        })?;
+        adb_helper::forward_tcp(adb_serial.to_string(), local_port, remote_port)
+            .await
+            .map_err(|e| TransportError::ForwardFailed {
+                device_id: adb_serial.to_string(),
+                reason: e,
+            })?;
 
         info!(
             serial = %adb_serial,
@@ -77,8 +71,10 @@ impl UsbTransport {
             "ADB forward established"
         );
 
-        let mut forwards = self.active_forwards.lock().await;
-        forwards.insert(adb_serial.to_string(), local_port);
+        self.active_forwards
+            .lock()
+            .await
+            .insert(adb_serial.to_string(), local_port);
 
         Ok(local_port)
     }
