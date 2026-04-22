@@ -5,7 +5,15 @@
  * Enables multi-run dashboard view with run selection and GUI lock awareness.
  */
 
-import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type ReactNode,
+} from "react";
 import type { TaskActivityInfo } from "../types/dashboard/widget-registry";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
@@ -183,8 +191,20 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
   });
   const [isLoading, setIsLoading] = useState(true);
 
-  // Track previously seen run IDs to detect new runs
-  const [previousRunIds, setPreviousRunIds] = useState<Set<string>>(new Set());
+  // Track previously seen run IDs to detect new runs. Held in a ref so
+  // `refresh` can read the latest value without taking it as a dep. Rendering
+  // never reads it directly, so we don't need a state copy.
+  const previousRunIdsRef = useRef<Set<string>>(new Set());
+
+  // Mirror `selectedRunId` state into a ref so `refresh` can read the latest
+  // value without depending on it. Without this, `refresh` would recreate on
+  // every selection change, the polling useEffect would tear down and rebuild
+  // the interval, and the cascading setState inside `refresh` could trigger
+  // React error #185 ("Maximum update depth exceeded").
+  const selectedRunIdRef = useRef<string | null>(selectedRunId);
+  useEffect(() => {
+    selectedRunIdRef.current = selectedRunId;
+  }, [selectedRunId]);
 
   /**
    * Fetch active runs and GUI lock info.
@@ -267,22 +287,24 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
 
       // Detect new runs that weren't in the previous set
       const currentRunIds = new Set(runs.map((r) => r.runId));
-      const newRuns = runs.filter((r) => !previousRunIds.has(r.runId));
+      const prevRunIds = previousRunIdsRef.current;
+      const newRuns = runs.filter((r) => !prevRunIds.has(r.runId));
 
       setActiveRuns(runs);
-      setPreviousRunIds(currentRunIds);
+      previousRunIdsRef.current = currentRunIds;
 
       // Auto-select logic:
       // 1. If no run is selected, select the newest running task
       // 2. If a new run appears, optionally auto-select it (if current selection is completed)
       // 3. If selected run is no longer in the list, select the first available
 
-      if (!selectedRunId && runs.length > 0) {
+      const currentSelectedId = selectedRunIdRef.current;
+      if (!currentSelectedId && runs.length > 0) {
         // Prefer running tasks over completed ones
         const runningTask = runs.find((r) => r.status === "running");
         setSelectedRunId(runningTask?.runId ?? runs[0].runId);
-      } else if (selectedRunId) {
-        const currentSelection = runs.find((r) => r.runId === selectedRunId);
+      } else if (currentSelectedId) {
+        const currentSelection = runs.find((r) => r.runId === currentSelectedId);
 
         if (!currentSelection) {
           // Selected run is no longer in the list
@@ -305,9 +327,10 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
     } finally {
       setIsLoading(false);
     }
-  }, [selectedRunId, previousRunIds]);
+  }, []);
 
-  // Initial fetch and polling
+  // Initial fetch and polling. `refresh` has stable identity (empty deps), so
+  // this effect runs exactly once and the interval survives re-renders.
   useEffect(() => {
     refresh();
     const interval = setInterval(refresh, POLL_INTERVAL_MS);
