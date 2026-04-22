@@ -609,9 +609,12 @@ function AppWithTutorials() {
 
   return (
     <TutorialProvider onNavigate={navigate}>
-      <AppContent />
-      <ContextualTutorial />
-      <DemoVisualOverlay />
+      <PromptExecutionProvider>
+        <AppContent />
+        <ContextualTutorial />
+        <DemoVisualOverlay />
+        <PromptAutomationOverlay />
+      </PromptExecutionProvider>
     </TutorialProvider>
   );
 }
@@ -763,10 +766,7 @@ export default function App() {
                   }}
                 >
                   <AutoContinueProvider>
-                    <PromptExecutionProvider>
-                      <AppWithTutorials />
-                      <PromptAutomationOverlay />
-                    </PromptExecutionProvider>
+                    <AppWithTutorials />
                   </AutoContinueProvider>
                 </ExecutionProvider>
               </EventManagerProvider>

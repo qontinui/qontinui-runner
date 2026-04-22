@@ -29,9 +29,13 @@ interface SpecAssertion {
 
 function getSpecStore(): SpecStore | null {
   const bridge = (window as unknown as Record<string, unknown>).__UI_BRIDGE__ as
-    | { specs?: SpecStore }
+    | { specs?: unknown }
     | undefined;
-  return bridge?.specs ?? null;
+  const specs = bridge?.specs as Partial<SpecStore> | undefined;
+  if (!specs || typeof specs.get !== "function" || typeof specs.getAll !== "function") {
+    return null;
+  }
+  return specs as SpecStore;
 }
 
 /**
