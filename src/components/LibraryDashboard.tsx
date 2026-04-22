@@ -371,7 +371,6 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
   }, [onLog]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchAllItems();
   }, [fetchAllItems]);
 

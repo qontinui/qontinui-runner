@@ -86,7 +86,6 @@ export function DecisionTrailPage() {
   }, [searchQuery]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchDecisions();
     fetchConcepts();
   }, [fetchDecisions, fetchConcepts]);

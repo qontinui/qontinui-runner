@@ -62,7 +62,7 @@ export function ConnectedUIBridgeInspector() {
         states: [], // UI Bridge doesn't have explicit states yet
         transitions: [], // UI Bridge doesn't have transitions yet
         activeStates: [],
-        // eslint-disable-next-line react-hooks/purity
+
         timestamp: Date.now(),
       }
     : null;

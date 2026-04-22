@@ -208,7 +208,7 @@ export function AddStateStepsModal({
   useEffect(() => {
     if (isOpen) {
       refreshStates();
-      // eslint-disable-next-line react-hooks/set-state-in-effect
+
       setSelectedStateId(null);
       setExpandedStateId(null);
     }
@@ -217,7 +217,6 @@ export function AddStateStepsModal({
   // Update defaults when config type is detected
   useEffect(() => {
     if (states.length > 0 && configTypeInfo.type !== "unknown") {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIncludeVisionTest(configTypeInfo.recommendedVision);
       setIncludePlaywrightTest(configTypeInfo.recommendedPlaywright);
     }

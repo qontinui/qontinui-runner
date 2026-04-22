@@ -131,7 +131,7 @@ export function ExecutionReport({
     });
 
     // Initialize with current findings
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+
     setLiveFindings(findingsTracker.getAllFindings());
 
     return unsubscribe;

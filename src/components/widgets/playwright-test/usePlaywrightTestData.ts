@@ -94,7 +94,6 @@ export function usePlaywrightTestData(): PlaywrightTestData {
 
   // Initial fetch and polling
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchScripts();
     const interval = setInterval(fetchScripts, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
@@ -103,7 +102,6 @@ export function usePlaywrightTestData(): PlaywrightTestData {
   // Update elapsed time
   useEffect(() => {
     if (!startTime) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setElapsedTime(0);
       return;
     }

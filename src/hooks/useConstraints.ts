@@ -118,7 +118,6 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
   );
 
   const isDirty = useMemo(
-    // eslint-disable-next-line react-hooks/refs
     () => serializeState(constraints, resourceLimits) !== savedStateRef.current,
     [constraints, resourceLimits, serializeState],
   );
@@ -168,7 +167,6 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
   // Load on mount
   useEffect(() => {
     if (loadOnMount) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       reload();
     }
   }, [loadOnMount, reload]);

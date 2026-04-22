@@ -171,7 +171,6 @@ export function useDashboardState(): DashboardState {
   // Polling as fallback — relaxed from 2s to 5s (running) / 15s (idle)
   const hasRunningTasks = runningTasks.length > 0;
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
     const intervalMs = hasRunningTasks ? 5000 : 15000;
     const interval = setInterval(refresh, intervalMs);
@@ -181,7 +180,6 @@ export function useDashboardState(): DashboardState {
   // Update elapsed time
   useEffect(() => {
     if (!startTime) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setElapsedTime(0);
       return;
     }

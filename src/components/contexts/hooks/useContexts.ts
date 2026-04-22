@@ -452,7 +452,6 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
 
   // Initial load
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
   }, [refresh]);
 

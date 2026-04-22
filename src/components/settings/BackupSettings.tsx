@@ -195,7 +195,6 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
 
   // Load export summary on mount
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability
     loadExportSummary();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

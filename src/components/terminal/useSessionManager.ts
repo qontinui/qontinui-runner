@@ -427,7 +427,6 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchFileLocks();
     const interval = setInterval(fetchFileLocks, 10_000);
     return () => clearInterval(interval);
@@ -448,7 +447,6 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchExternalProcesses();
     const interval = setInterval(fetchExternalProcesses, 30 * 1000);
     return () => clearInterval(interval);
@@ -498,7 +496,6 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           // it's likely active externally rather than frozen
           if (externalProcessCount > 0) {
             try {
-              // eslint-disable-next-line react-hooks/purity
               const age = Date.now() - new Date(s.last_modified).getTime();
               if (age < 10 * 60 * 1000) {
                 // Modified within last 10 minutes — likely active externally
@@ -515,7 +512,6 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         } else if (externalProcessCount > 0 && !tab) {
           // Check if this non-frozen session might be running externally
           try {
-            // eslint-disable-next-line react-hooks/purity
             const age = Date.now() - new Date(s.last_modified).getTime();
             if (age < 2 * 60 * 1000) {
               // Very recently modified (within 2 min) and not in a zone — likely external

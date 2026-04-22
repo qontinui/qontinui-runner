@@ -62,7 +62,7 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
   // Load data on mount
   useEffect(() => {
     const allSpecs = getAllSpecs();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+
     setSpecs(allSpecs);
 
     invoke<RunnerInstance[]>("get_runner_instances")

@@ -108,7 +108,6 @@ function createInitialGridState(layout: LayoutPreset): GridState {
   };
 }
 
-/* eslint-disable react-hooks/refs -- terminalRefsRef holds a stable Map of individual terminal refs; reading .current during render is intentional */
 export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone }: ZoneGridProps) {
   // Read all data from contexts
   const {

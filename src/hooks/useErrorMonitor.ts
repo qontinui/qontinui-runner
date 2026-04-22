@@ -64,7 +64,7 @@ export function useErrorEvents(options: UseErrorEventsOptions = {}): UseErrorEve
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const optionsRef = useRef(options);
-  // eslint-disable-next-line react-hooks/refs
+
   optionsRef.current = options;
 
   const fetchErrors = useCallback(async () => {
@@ -96,7 +96,6 @@ export function useErrorEvents(options: UseErrorEventsOptions = {}): UseErrorEve
 
   // Initial fetch
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchErrors();
   }, [fetchErrors]);
 
@@ -175,7 +174,7 @@ export function useErrorSummary(options: UseErrorSummaryOptions = {}): UseErrorS
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const optionsRef = useRef(options);
-  // eslint-disable-next-line react-hooks/refs
+
   optionsRef.current = options;
 
   const fetchSummary = useCallback(async () => {
@@ -199,7 +198,6 @@ export function useErrorSummary(options: UseErrorSummaryOptions = {}): UseErrorS
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchSummary();
   }, [fetchSummary]);
 
@@ -255,7 +253,7 @@ export function useDebugContext(options: UseDebugContextOptions = {}): UseDebugC
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const optionsRef = useRef(options);
-  // eslint-disable-next-line react-hooks/refs
+
   optionsRef.current = options;
 
   const fetchContext = useCallback(async () => {
@@ -282,7 +280,6 @@ export function useDebugContext(options: UseDebugContextOptions = {}): UseDebugC
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchContext();
   }, [fetchContext]);
 

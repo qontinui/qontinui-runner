@@ -63,7 +63,7 @@ export function PromptLibraryPicker({
     };
 
     fetchPrompts();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+
     setSearchQuery("");
     setSelectedId(null);
     setCategoryFilter("");

@@ -204,7 +204,6 @@ export function MultiLoopPanel() {
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchMultiStatus();
     loadRunnerInstances();
     loadWorkflows();

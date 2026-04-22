@@ -240,7 +240,7 @@ function UnifiedDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
               `... ${lines.length - 6} unchanged lines ...`,
               ...lines.slice(-3),
             ];
-            // eslint-disable-next-line react-hooks/immutability
+
             lineNumber += lines.length;
             return (
               <div key={partIndex} className="text-muted-foreground">

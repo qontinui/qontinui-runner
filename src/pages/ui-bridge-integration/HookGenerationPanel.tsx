@@ -876,7 +876,6 @@ export function HookGenerationPanel({
   // When entering preview, ensure all files are expanded
   useEffect(() => {
     if (phase === "preview") {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setExpandedFiles(new Set(generatedFiles.map((f) => f.filePath)));
     }
   }, [phase, generatedFiles]);
@@ -1224,7 +1223,7 @@ export function HookGenerationPanel({
     phase === "generating-page-tutorial";
   const isGenerating =
     phase === "generating-hooks" || phase === "generating-spec" || isPerPagePhase;
-  // eslint-disable-next-line react-hooks/refs
+
   const currentPageName = currentPageRef.current?.page.route || "";
 
   // Group generated files by page for preview
@@ -1335,14 +1334,14 @@ export function HookGenerationPanel({
       {/* Progress steps — shown during generation */}
       {isGenerating && stepStatuses.length > 0 && (
         <div className="mb-2">
-          {/* eslint-disable react-hooks/refs */}
+          {}
           {isPerPagePhase && currentPageName && (
             <div className="flex items-center gap-1.5 text-xs text-cyan-400 font-medium mb-2">
               <FolderOpen className="w-3.5 h-3.5" />
               Processing: {currentPageName}
             </div>
           )}
-          {/* eslint-enable react-hooks/refs */}
+          {}
           <StepIndicator steps={stepStatuses} />
         </div>
       )}

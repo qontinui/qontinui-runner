@@ -168,7 +168,6 @@ export function useRenderPerformance(
     return performance.now() - dataChangeTimeRef.current;
   }, []);
 
-  /* eslint-disable react-hooks/refs */
   return {
     ProfilerWrapper,
     metrics,
@@ -179,7 +178,6 @@ export function useRenderPerformance(
     markDataChange,
     getTimeSinceDataChange,
   };
-  /* eslint-enable react-hooks/refs */
 }
 
 // ============================================================================

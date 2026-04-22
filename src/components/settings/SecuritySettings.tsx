@@ -459,9 +459,8 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
   const [auditFilter, setAuditFilter] = useState<string>("all");
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
-    // eslint-disable-next-line react-hooks/immutability
+
     loadProfiles();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -522,7 +521,6 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
   // Auto-load audit data when enabled and filter changes
   useEffect(() => {
     if (config.audit_enabled) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       loadAuditData();
     }
   }, [config.audit_enabled, loadAuditData]);

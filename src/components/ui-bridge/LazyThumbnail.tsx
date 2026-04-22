@@ -83,11 +83,11 @@ export function LazyThumbnail({
   // Keep a ref to the cache so the IntersectionObserver callback always
   // reads/writes the latest Map reference, avoiding stale closures.
   const cacheRef = useRef(thumbnailCache);
-  // eslint-disable-next-line react-hooks/refs
+
   cacheRef.current = thumbnailCache;
 
   const onLoadRef = useRef(onLoad);
-  // eslint-disable-next-line react-hooks/refs
+
   onLoadRef.current = onLoad;
 
   // Crop the thumbnail

@@ -127,7 +127,6 @@ export function useStepProgressMarkers(
   // Initial fetch
   useEffect(() => {
     if (taskRunId && checkpointId) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsLoading(true);
       fetchProgress();
     }

@@ -74,13 +74,11 @@ export function useWorkflowLibrary(
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchWorkflows();
   }, [fetchWorkflows]);
 
   useEffect(() => {
     if (!isSaving && currentWorkflowId) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       fetchWorkflows();
     }
   }, [isSaving, currentWorkflowId, fetchWorkflows]);

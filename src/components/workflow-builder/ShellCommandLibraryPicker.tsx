@@ -57,7 +57,7 @@ export function ShellCommandLibraryPicker({
     };
 
     fetchCommands();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+
     setSearchQuery("");
     setSelectedId(null);
     setCategoryFilter("");

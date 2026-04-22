@@ -61,7 +61,6 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
   // Reset state when dialog opens
   useEffect(() => {
     if (open) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedMode("headless");
       setForceGuiLock(false);
       setError(null);

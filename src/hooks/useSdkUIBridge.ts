@@ -73,7 +73,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
   );
 
   // Wire up the stable ref now that elementsHook exists
-  // eslint-disable-next-line react-hooks/refs, react-hooks/immutability
+
   fetchElementsRef.current = elementsHook.fetchElements;
 
   // --- Connection ---
@@ -88,7 +88,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
   const connectionHook = useConnection(elementsHook.fetchElements, clearElementState);
 
   // Keep connectedAppRef in sync with connection state
-  // eslint-disable-next-line react-hooks/refs
+
   connectedAppRef.current = connectionHook.connectedApp;
 
   // --- Commands ---

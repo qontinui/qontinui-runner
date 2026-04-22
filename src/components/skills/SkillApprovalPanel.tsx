@@ -79,7 +79,6 @@ export function SkillApprovalPanel() {
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchSkills();
   }, [fetchSkills]);
 

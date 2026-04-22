@@ -98,7 +98,6 @@ export function AiOutputTab({
       const latestLoop = loops[loops.length - 1];
       // Only auto-select if we don't have a selection or the selected loop no longer exists
       if (!selectedLoopId || !loops.find((l) => l.id === selectedLoopId)) {
-        // eslint-disable-next-line react-hooks/set-state-in-effect
         setSelectedLoopId(latestLoop.id);
       }
     }
@@ -318,7 +317,6 @@ export function AiOutputTab({
   // Poll executor status when we have lines
   useEffect(() => {
     if (lines.length === 0) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsAiWorking(false);
       return;
     }

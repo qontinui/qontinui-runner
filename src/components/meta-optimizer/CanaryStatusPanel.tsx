@@ -65,7 +65,6 @@ export function CanaryStatusPanel() {
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
     intervalRef.current = setInterval(load, 30000);
     return () => {

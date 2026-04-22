@@ -91,9 +91,8 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
   const [routingExpanded, setRoutingExpanded] = useState(true);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
-    // eslint-disable-next-line react-hooks/immutability
+
     loadReflectionSettings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

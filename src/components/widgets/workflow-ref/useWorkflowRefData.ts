@@ -104,7 +104,6 @@ export function useWorkflowRefData(): WorkflowRefData {
 
   // Initial fetch and polling
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchWorkflows();
     const interval = setInterval(fetchWorkflows, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
@@ -113,7 +112,6 @@ export function useWorkflowRefData(): WorkflowRefData {
   // Update elapsed time
   useEffect(() => {
     if (!startTime) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setElapsedTime(0);
       return;
     }

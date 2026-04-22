@@ -111,7 +111,7 @@ export function TestResultsTab() {
   const [expandedResults, setExpandedResults] = useState<Set<string>>(new Set());
 
   // Fetch test results for the selected run
-  // eslint-disable-next-line react-hooks/preserve-manual-memoization
+
   const fetchResults = useCallback(async () => {
     if (!selectedRun?.id) {
       setResults([]);
@@ -162,7 +162,6 @@ export function TestResultsTab() {
 
   // Fetch results when selected run changes
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchResults();
   }, [fetchResults]);
 

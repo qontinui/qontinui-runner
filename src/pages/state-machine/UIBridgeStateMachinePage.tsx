@@ -144,7 +144,6 @@ export function UIBridgeStateMachinePage() {
   const activeConfigId = sm.activeConfig?.id;
   useEffect(() => {
     if (!activeConfigId) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching reset
       setElementThumbnails(undefined);
       return;
     }
@@ -178,7 +177,6 @@ export function UIBridgeStateMachinePage() {
   const screenshotImageCache = useRef<Map<string, string>>(new Map());
   useEffect(() => {
     if (!activeConfigId) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching reset
       setCaptureScreenshots(undefined);
       screenshotImageCache.current.clear();
       return;
@@ -212,7 +210,6 @@ export function UIBridgeStateMachinePage() {
   const coocThumbs = discovery.cooccurrenceData?.elementThumbnails;
   useEffect(() => {
     if (coocThumbs && Object.keys(coocThumbs).length > 0) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing from external discovery data
       setElementThumbnails(coocThumbs);
     }
   }, [coocThumbs]);
@@ -283,7 +280,7 @@ export function UIBridgeStateMachinePage() {
     if (activeTab !== "diagram" || !hasConfig) return;
     if (!dataAdapter.getMermaidDiagram) return;
     let cancelled = false;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch lifecycle
+
     setDiagramLoading(true);
     (async () => {
       try {

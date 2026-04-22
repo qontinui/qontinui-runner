@@ -237,7 +237,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
   // Initial fetch and polling - skip when using unified context
   useEffect(() => {
     if (useUnifiedContext) return; // Don't poll when unified context is available
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+
     fetchSteps();
     const interval = setInterval(fetchSteps, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
@@ -247,7 +247,6 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
   useEffect(() => {
     if (useUnifiedContext) return;
     if (!startTime) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setElapsedTime(0);
       return;
     }
@@ -296,7 +295,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
         phase: currentStage,
         stageIndex: lastCompleted?.stageIndex ?? 0,
         stepIndex: -1,
-        // eslint-disable-next-line react-hooks/purity
+
         startTime: lastCompleted?.endTime ?? Date.now(),
       };
     }

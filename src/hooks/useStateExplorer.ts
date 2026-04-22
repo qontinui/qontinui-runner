@@ -129,7 +129,6 @@ export function useStateExplorer(): UseStateExplorerReturn {
 
   // Load history on mount
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     refreshHistory();
   }, [refreshHistory]);
 

@@ -154,7 +154,6 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
   }, [onLog]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchWorkflows();
   }, [fetchWorkflows]);
 

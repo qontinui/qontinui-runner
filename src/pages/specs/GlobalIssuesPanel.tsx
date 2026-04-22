@@ -458,7 +458,6 @@ export function GlobalIssuesPanel() {
   }, [statusFilter, categoryFilter, severityFilter]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadIssues();
   }, [loadIssues]);
 

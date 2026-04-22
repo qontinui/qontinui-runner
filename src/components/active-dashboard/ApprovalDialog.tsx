@@ -213,7 +213,6 @@ export function ApprovalDialog({ taskRunId, onResolved }: ApprovalDialogProps) {
   // Fetch history when toggled on
   useEffect(() => {
     if (showHistory) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       fetchHistory();
     }
   }, [showHistory, fetchHistory]);

@@ -147,7 +147,6 @@ export function useActionLogView(options: UseActionLogViewOptions = {}): UseActi
   // Fetch data on mount if enabled
   useEffect(() => {
     if (fetchOnMount) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       fetchData();
     }
   }, [fetchOnMount, fetchData]);

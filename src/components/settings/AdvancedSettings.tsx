@@ -53,9 +53,8 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
-    // eslint-disable-next-line react-hooks/immutability
+
     loadDeviceInfo();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

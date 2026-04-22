@@ -38,7 +38,7 @@ export function useProviderCircuitBreakers(): UseProviderCircuitBreakersResult {
 
   useEffect(() => {
     // Initial fetch for current snapshot
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+
     refresh();
 
     // Subscribe to real-time circuit breaker state-change events

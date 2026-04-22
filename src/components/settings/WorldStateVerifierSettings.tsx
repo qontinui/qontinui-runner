@@ -68,7 +68,6 @@ export function WorldStateVerifierSettings({ onLog }: WorldStateVerifierSettings
   const [testState, setTestState] = useState<TestState>({ kind: "idle" });
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability
     loadSettings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

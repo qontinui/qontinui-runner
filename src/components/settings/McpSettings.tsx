@@ -84,7 +84,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
   const [deleteConfirm, setDeleteConfirm] = useState<McpServerConfig | null>(null);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability
     loadServers();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

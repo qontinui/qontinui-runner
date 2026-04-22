@@ -44,7 +44,6 @@ export function useCanvasData(): CanvasData {
 
   // Initial fetch and polling
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchPanels();
     const interval = setInterval(fetchPanels, POLL_INTERVAL_MS);
     return () => clearInterval(interval);

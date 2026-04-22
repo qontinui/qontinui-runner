@@ -487,7 +487,7 @@ export function ExecutionSummaryTab() {
           const completedAt = selectedRun.completed_at
             ? new Date(selectedRun.completed_at).getTime()
             : null;
-          // eslint-disable-next-line react-hooks/purity
+
           const now = Date.now();
           const isRecentlyCompleted = completedAt && now - completedAt < 2 * 60 * 1000;
 

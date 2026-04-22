@@ -63,7 +63,6 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
 
   // Periodic status polling while the settings page is mounted
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability
     const interval = setInterval(loadStatus, 5000);
     return () => clearInterval(interval);
   }, []);

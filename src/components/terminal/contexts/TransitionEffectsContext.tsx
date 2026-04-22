@@ -64,7 +64,7 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
       createTerminal,
     ],
   );
-  // eslint-disable-next-line react-hooks/refs
+
   handleRestartInZoneRef.current = handleRestartInZone;
 
   const transitionEffects = useStateTransitionEffects({

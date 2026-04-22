@@ -63,7 +63,7 @@ export function useBrowserErrors(options: UseBrowserErrorsOptions = {}): UseBrow
   const [noConnection, setNoConnection] = useState(false);
 
   const enabledRef = useRef(enabled);
-  // eslint-disable-next-line react-hooks/refs
+
   enabledRef.current = enabled;
 
   const fetchReport = useCallback(async () => {
@@ -137,7 +137,6 @@ export function useBrowserErrors(options: UseBrowserErrorsOptions = {}): UseBrow
   // Initial fetch
   useEffect(() => {
     if (enabled) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       fetchReport();
     }
   }, [enabled, fetchReport]);
@@ -161,7 +160,6 @@ export function useBrowserErrors(options: UseBrowserErrorsOptions = {}): UseBrow
   // Update deduplicated errors when report changes
   useEffect(() => {
     if (!report) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setDeduplicatedErrors([]);
       return;
     }

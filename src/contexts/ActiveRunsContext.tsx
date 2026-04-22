@@ -309,7 +309,6 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
 
   // Initial fetch and polling
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
     const interval = setInterval(refresh, POLL_INTERVAL_MS);
     return () => clearInterval(interval);

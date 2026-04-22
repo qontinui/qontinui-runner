@@ -336,7 +336,6 @@ export function OrchestrationLoopPanel() {
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchStatus();
     loadSavedConfigs();
     loadRunnerInstances();

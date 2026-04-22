@@ -228,7 +228,6 @@ function AppContent() {
 
   useEffect(() => {
     if (activeTab !== "unified-workflow-builder") {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setEditWorkflowId(null);
     }
   }, [activeTab]);

@@ -16,7 +16,6 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
   const [lastChecked, setLastChecked] = useState<Date | null>(null);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability
     checkForUpdates();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

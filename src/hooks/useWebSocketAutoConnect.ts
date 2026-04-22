@@ -80,10 +80,8 @@ export function useWebSocketAutoConnect({
   // Load connection info when authenticated
   useEffect(() => {
     if (isAuthenticated) {
-      // eslint-disable-next-line react-hooks/immutability
       loadConnectionInfo();
     } else {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setConnectionInfo(null);
     }
   }, [isAuthenticated]);

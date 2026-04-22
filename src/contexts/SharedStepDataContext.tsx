@@ -104,7 +104,7 @@ export function SharedStepDataProvider({ children }: SharedStepDataProviderProps
   // Initial fetch + fallback polling
   useEffect(() => {
     mountedRef.current = true;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+
     fetchSteps();
     const interval = setInterval(fetchSteps, POLL_INTERVAL_MS);
     return () => {

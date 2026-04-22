@@ -47,7 +47,6 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
   const [storageLoading, setStorageLoading] = useState(false);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability
     loadStorageInfo();
   }, []);
 

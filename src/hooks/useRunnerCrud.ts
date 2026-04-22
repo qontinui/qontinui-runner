@@ -156,7 +156,6 @@ export function useRunnerCrud<T extends { id: string }>(
 
   useEffect(() => {
     if (autoLoad) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       refresh();
     }
   }, [autoLoad, refresh]);

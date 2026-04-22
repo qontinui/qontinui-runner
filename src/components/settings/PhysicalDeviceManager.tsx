@@ -181,7 +181,6 @@ export function PhysicalDeviceManager() {
   }, [loading]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchDevices();
     const interval = setInterval(fetchDevices, 10000);
     return () => clearInterval(interval);
