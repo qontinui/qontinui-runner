@@ -25,12 +25,47 @@ struct HeartbeatPayload {
     running_task_ids: Vec<String>,
     /// Phase 3J.2 — `"healthy"` if no UI error is tracked, `"errored"`
     /// when the React error boundary has reported an unhandled error that
-    /// has not yet been cleared.
+    /// has not yet been cleared OR a fresh Rust crash dump is present
+    /// (post-3J follow-up).
     derived_status: String,
     /// Phase 3J.2 — latest UI error snapshot. Serialized as `null` when no
     /// error is tracked (always present as a key so consumers can assume
     /// the shape).
     ui_error: Option<UiError>,
+    /// Post-3J follow-up — most recent Rust crash dump surfaced by the
+    /// startup scanner. `null` when no fresh dump is present. Independent
+    /// of `ui_error`: non-unwinding panics abort the process before the
+    /// React boundary can report them.
+    recent_crash: Option<HeartbeatRecentCrash>,
+}
+
+/// Snake-case projection of [`crate::crash_dumps::RecentCrash`] for the
+/// heartbeat wire format. The `/health` endpoint emits the source struct as
+/// camelCase to stay in sync with that endpoint's casing; qontinui-web's
+/// heartbeat schema uses snake_case (matching `UiErrorPayload`) so we emit
+/// a dedicated shape here.
+#[derive(Debug, Clone, Serialize)]
+struct HeartbeatRecentCrash {
+    file_path: String,
+    reported_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    panic_location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    panic_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread: Option<String>,
+}
+
+impl From<crate::crash_dumps::RecentCrash> for HeartbeatRecentCrash {
+    fn from(c: crate::crash_dumps::RecentCrash) -> Self {
+        Self {
+            file_path: c.file_path,
+            reported_at: c.reported_at,
+            panic_location: c.panic_location,
+            panic_message: c.panic_message,
+            thread: c.thread,
+        }
+    }
 }
 
 /// Start the heartbeat background task.
@@ -115,8 +150,16 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
 
             // Phase 3J.2 — snapshot the latest UI error (if any) once per
             // tick; used by both the backend and primary-runner heartbeats.
+            // Post-3J follow-up also surfaces the most recent Rust crash
+            // dump so a runner that just restarted after a non-unwinding
+            // panic still reports errored until the dump is dismissed.
             let ui_error_snapshot = app_state.ui_error.get().await;
-            let derived_status = if ui_error_snapshot.is_some() {
+            let recent_crash_snapshot = app_state
+                .crash_dumps
+                .get()
+                .await
+                .map(HeartbeatRecentCrash::from);
+            let derived_status = if ui_error_snapshot.is_some() || recent_crash_snapshot.is_some() {
                 "errored".to_string()
             } else {
                 "healthy".to_string()
@@ -136,6 +179,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     running_task_ids: task_ids.clone(),
                     derived_status: derived_status.clone(),
                     ui_error: ui_error_snapshot.clone(),
+                    recent_crash: recent_crash_snapshot.clone(),
                 };
 
                 match client.post(&heartbeat_url).json(&payload).send().await {
@@ -179,8 +223,12 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     "running_task_ids": task_ids,
                     // Phase 3J.2 — include UI error status for supervisor
                     // aggregation. `ui_error` is null when healthy.
+                    // Post-3J follow-up also includes `recent_crash` so a
+                    // runner restarted after a Rust panic is visible to the
+                    // primary's aggregation view.
                     "derived_status": derived_status,
                     "ui_error": ui_error_snapshot,
+                    "recent_crash": recent_crash_snapshot,
                 });
 
                 match client.post(&url).json(&body).send().await {

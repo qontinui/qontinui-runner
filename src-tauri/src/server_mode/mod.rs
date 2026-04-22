@@ -223,14 +223,51 @@ struct HeartbeatRequest {
     restate_healthy: bool,
     status: String,
     /// Phase 3J.2 — `"healthy"` if no UI error is tracked, `"errored"`
-    /// when the React error boundary has reported an unhandled error.
-    /// Distinct from `status` (which tracks Restate health) so the
-    /// qontinui-web fleet page can surface both independently.
+    /// when the React error boundary has reported an unhandled error OR a
+    /// fresh Rust crash dump is present (post-3J follow-up). Distinct from
+    /// `status` (which tracks Restate health) so the qontinui-web fleet
+    /// page can surface both independently.
     derived_status: String,
     /// Phase 3J.2 — latest UI error snapshot from the runner's React error
     /// boundary. Serialized as `null` when healthy (the key is always
     /// present so consumers can assume the shape).
     ui_error: Option<crate::ui_error::UiError>,
+    /// Post-3J follow-up — most recent Rust crash dump surfaced by the
+    /// startup scanner. Null when no fresh dump is present. Independent of
+    /// `ui_error`: non-unwinding panics abort the process before the React
+    /// boundary can report them, so the two signals cannot always be in
+    /// sync.
+    recent_crash: Option<HeartbeatRecentCrash>,
+}
+
+/// Snake-case projection of [`crate::crash_dumps::RecentCrash`] for the
+/// heartbeat wire format. The `/health` endpoint serializes the underlying
+/// struct as camelCase to stay in sync with the rest of that endpoint's
+/// casing; the qontinui-web heartbeat schema uses snake_case (matching
+/// `UiErrorPayload`), so we emit a dedicated shape here rather than
+/// renaming the source struct.
+#[derive(Debug, Serialize)]
+struct HeartbeatRecentCrash {
+    file_path: String,
+    reported_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    panic_location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    panic_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread: Option<String>,
+}
+
+impl From<crate::crash_dumps::RecentCrash> for HeartbeatRecentCrash {
+    fn from(c: crate::crash_dumps::RecentCrash) -> Self {
+        Self {
+            file_path: c.file_path,
+            reported_at: c.reported_at,
+            panic_location: c.panic_location,
+            panic_message: c.panic_message,
+            thread: c.thread,
+        }
+    }
 }
 
 fn build_http_client() -> reqwest::Client {
@@ -276,6 +313,7 @@ pub fn spawn_background_tasks(
     state: ServerModeState,
     restate_enabled: bool,
     ui_error_state: Arc<crate::ui_error::UiErrorState>,
+    crash_dump_state: Arc<crate::crash_dumps::CrashDumpState>,
 ) {
     let state_for_register = state.clone();
     tauri::async_runtime::spawn(async move {
@@ -286,7 +324,13 @@ pub fn spawn_background_tasks(
         }
         // Once registered, start heartbeats. We chain them so the heartbeat
         // loop never runs without a runner_id (which would 404 every tick).
-        run_heartbeat_loop(state_for_register, restate_enabled, ui_error_state).await;
+        run_heartbeat_loop(
+            state_for_register,
+            restate_enabled,
+            ui_error_state,
+            crash_dump_state,
+        )
+        .await;
     });
 }
 
@@ -394,6 +438,7 @@ async fn run_heartbeat_loop(
     state: ServerModeState,
     restate_enabled: bool,
     ui_error_state: Arc<crate::ui_error::UiErrorState>,
+    crash_dump_state: Arc<crate::crash_dumps::CrashDumpState>,
 ) {
     let client = build_http_client();
     let mut ticker = tokio::time::interval(Duration::from_secs(30));
@@ -433,9 +478,13 @@ async fn run_heartbeat_loop(
 
         // Phase 3J.2 — snapshot the UI error state for this tick. The
         // `derived_status` reported here is specifically about UI health,
-        // independent of Restate's `status` field above.
+        // independent of Restate's `status` field above. Post-3J follow-up
+        // also factors in `recent_crash`: a non-unwinding Rust panic aborts
+        // the process before the React boundary can fire, so without this
+        // the runner would report `healthy` immediately after restart.
         let ui_error_snapshot = ui_error_state.get().await;
-        let derived_status = if ui_error_snapshot.is_some() {
+        let recent_crash_snapshot = crash_dump_state.get().await;
+        let derived_status = if ui_error_snapshot.is_some() || recent_crash_snapshot.is_some() {
             "errored".to_string()
         } else {
             "healthy".to_string()
@@ -450,6 +499,7 @@ async fn run_heartbeat_loop(
             status: status.to_string(),
             derived_status,
             ui_error: ui_error_snapshot,
+            recent_crash: recent_crash_snapshot.map(HeartbeatRecentCrash::from),
         };
 
         match client

@@ -190,7 +190,13 @@ pub async fn apply_web_integration_settings(
     if let Some(new_state) = new_state_opt {
         let restate_enabled = settings::load_settings().restate.enabled;
         let ui_error_state = app_state.ui_error.clone();
-        crate::server_mode::spawn_background_tasks(new_state, restate_enabled, ui_error_state);
+        let crash_dump_state = app_state.crash_dumps.clone();
+        crate::server_mode::spawn_background_tasks(
+            new_state,
+            restate_enabled,
+            ui_error_state,
+            crash_dump_state,
+        );
         info!(
             "Web-integration hot-reload: background tasks spawned (backend={})",
             normalized.backend_url
