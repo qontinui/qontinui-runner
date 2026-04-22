@@ -159,11 +159,15 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 .get()
                 .await
                 .map(HeartbeatRecentCrash::from);
-            let derived_status = if ui_error_snapshot.is_some() || recent_crash_snapshot.is_some() {
-                "errored".to_string()
-            } else {
-                "healthy".to_string()
-            };
+            // Read the /health-driven embedding probe cache. `None` (probe
+            // hasn't run yet) collapses to "healthy" so a pre-probe heartbeat
+            // doesn't flap to "degraded" on boot.
+            let derived_status = crate::ui_error::compute_derived_status(
+                ui_error_snapshot.is_some(),
+                recent_crash_snapshot.is_some(),
+                crate::mcp_api::embedding_reachable_cached(),
+            )
+            .to_string();
 
             // Send to web backend every 30s (every other tick)
             if tick_count.is_multiple_of(2) {

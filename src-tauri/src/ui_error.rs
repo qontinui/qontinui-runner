@@ -5,9 +5,11 @@
 //! state is exposed to ops via two sinks:
 //!
 //! 1. The existing [`/health`](crate::mcp_api) endpoint, which now carries
-//!    a `derived_status: "healthy" | "errored"` field alongside a nullable
-//!    `ui_error` object. Supervisors and the qontinui-web fleet view poll
-//!    this to flag runners whose Rust backend is up but whose UI is broken.
+//!    a `derived_status: "healthy" | "degraded" | "errored"` field alongside
+//!    a nullable `ui_error` object. Supervisors and the qontinui-web fleet
+//!    view poll this to flag runners whose Rust backend is up but whose UI
+//!    is broken (errored) or whose embedding subsystem is unreachable
+//!    (degraded).
 //! 2. The runner's heartbeats (both the dev-dashboard heartbeat in
 //!    [`crate::heartbeat`] and the runner-fleet heartbeat in
 //!    [`crate::server_mode`]). Each heartbeat payload includes the
@@ -150,6 +152,39 @@ fn matches_existing(existing: &UiError, message: &str, digest: Option<&str>) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Derived-status helper
+// ---------------------------------------------------------------------------
+
+/// Compute the runner's overall `derived_status` from its sub-signals.
+///
+/// Priority (highest wins): any `errored` signal → "errored"; otherwise any
+/// `degraded` signal → "degraded"; otherwise "healthy".
+///
+/// Inputs:
+/// * `has_ui_error` — true when a React `ErrorBoundary` report is outstanding.
+/// * `has_recent_crash` — true when a fresh Rust crash dump was surfaced at
+///   startup (non-unwinding panics abort before React sees them).
+/// * `embedding_reachable` — `None` until the first probe has run (treated as
+///   unknown, not degraded — avoids false positives during boot). `Some(true)`
+///   = healthy. `Some(false)` = degraded.
+///
+/// All three heartbeat sinks (`/health`, dev-dashboard heartbeat, web-backend
+/// heartbeat) call this so their `derived_status` stays in lockstep.
+pub fn compute_derived_status(
+    has_ui_error: bool,
+    has_recent_crash: bool,
+    embedding_reachable: Option<bool>,
+) -> &'static str {
+    if has_ui_error || has_recent_crash {
+        "errored"
+    } else if matches!(embedding_reachable, Some(false)) {
+        "degraded"
+    } else {
+        "healthy"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
 
@@ -269,5 +304,74 @@ mod tests {
         state.report("boom".to_string(), None, None, None).await;
         state.clear().await;
         assert!(state.get().await.is_none());
+    }
+
+    #[test]
+    fn derived_status_errored_wins_over_everything() {
+        assert_eq!(compute_derived_status(true, false, Some(true)), "errored");
+        assert_eq!(compute_derived_status(true, true, Some(false)), "errored");
+        assert_eq!(compute_derived_status(false, true, Some(true)), "errored");
+    }
+
+    #[test]
+    fn derived_status_degraded_when_embedding_unreachable() {
+        assert_eq!(
+            compute_derived_status(false, false, Some(false)),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn derived_status_healthy_when_embedding_reachable() {
+        assert_eq!(compute_derived_status(false, false, Some(true)), "healthy");
+    }
+
+    #[test]
+    fn derived_status_unknown_embedding_is_healthy_not_degraded() {
+        // Boot-time: probe hasn't run yet. Avoid false-positive degraded.
+        assert_eq!(compute_derived_status(false, false, None), "healthy");
+    }
+
+    /// Wire-contract snapshot: serialized `UiError` must carry the exact
+    /// snake_case field names the supervisor (`qontinui-supervisor::health_cache::UiErrorSummary`)
+    /// and the web backend (`app/schemas/runner_fleet.py::UiErrorPayload`)
+    /// deserialize. Drift here silently breaks fleet-level aggregation.
+    #[test]
+    fn ui_error_json_shape_matches_consumer_contract() {
+        let now = Utc::now();
+        let err = UiError {
+            message: "boom".to_string(),
+            stack: Some("stack-trace".to_string()),
+            component_stack: Some("component-stack".to_string()),
+            digest: Some("185".to_string()),
+            first_seen: now,
+            reported_at: now,
+            count: 3,
+        };
+        let v = serde_json::to_value(&err).expect("serialize UiError");
+        let obj = v.as_object().expect("UiError serializes to a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "message",
+            "stack",
+            "component_stack",
+            "digest",
+            "first_seen",
+            "reported_at",
+            "count",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            keys, expected,
+            "UiError wire keys drifted; consumers will silently fail to parse"
+        );
+        // Sanity-check types the supervisor's serde structs rely on.
+        assert!(obj["message"].is_string());
+        assert!(obj["count"].is_u64());
+        assert!(
+            obj["first_seen"].is_string(),
+            "DateTime serializes as ISO8601 string"
+        );
     }
 }

@@ -477,18 +477,22 @@ async fn run_heartbeat_loop(
         };
 
         // Phase 3J.2 — snapshot the UI error state for this tick. The
-        // `derived_status` reported here is specifically about UI health,
-        // independent of Restate's `status` field above. Post-3J follow-up
-        // also factors in `recent_crash`: a non-unwinding Rust panic aborts
-        // the process before the React boundary can fire, so without this
-        // the runner would report `healthy` immediately after restart.
+        // `derived_status` reported here is specifically about UI/runtime
+        // health, independent of Restate's `status` field above. Factors in:
+        //   - `ui_error` (React boundary report outstanding) → errored
+        //   - `recent_crash` (Rust panic dump surfaced at startup) → errored
+        //   - embedding service unreachable → degraded (functional but
+        //     semantic-search unavailable)
+        // `None` from the embedding probe (hasn't run yet on boot) collapses
+        // to healthy so a fresh runner doesn't flap to degraded pre-probe.
         let ui_error_snapshot = ui_error_state.get().await;
         let recent_crash_snapshot = crash_dump_state.get().await;
-        let derived_status = if ui_error_snapshot.is_some() || recent_crash_snapshot.is_some() {
-            "errored".to_string()
-        } else {
-            "healthy".to_string()
-        };
+        let derived_status = crate::ui_error::compute_derived_status(
+            ui_error_snapshot.is_some(),
+            recent_crash_snapshot.is_some(),
+            crate::mcp_api::embedding_reachable_cached(),
+        )
+        .to_string();
 
         let url = format!(
             "{}/api/v1/runners/{}/heartbeat",

@@ -79,17 +79,34 @@ use crate::mcp::awas::{
 use crate::mcp::shared::get_workspace_paths_internal;
 use crate::mcp::types::ApiState;
 
+// Cached embedding-service probe state. Module-scope so heartbeats can read
+// the reachability bit without running the full async probe path — the
+// /health handler is the sole writer (compare_exchange-gated on 30s stale).
+static EMBEDDING_LAST_CHECK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EMBEDDING_LAST_REACHABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static EMBEDDING_LAST_CHECKED_AT_LEAST_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static EMBEDDING_LAST_ERROR: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+/// Read the most recent cached reachability of the embedding service.
+///
+/// Returns `None` until the first probe completes (/health path runs the
+/// probe; heartbeats read this value). Callers treat `None` as "unknown —
+/// don't flag as degraded yet" to avoid false positives during boot.
+pub fn embedding_reachable_cached() -> Option<bool> {
+    if EMBEDDING_LAST_CHECKED_AT_LEAST_ONCE.load(Ordering::Acquire) {
+        Some(EMBEDDING_LAST_REACHABLE.load(Ordering::Acquire))
+    } else {
+        None
+    }
+}
+
 /// Cached embedding-service health probe.  Calls GET /api/embeddings/status
 /// at most once every 30 seconds.  Returns a JSON value suitable for inlining
 /// into the `/health` response.
 async fn embedding_service_health() -> serde_json::Value {
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-
-    static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
-    static LAST_REACHABLE: AtomicBool = AtomicBool::new(false);
-    static LAST_ERROR: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
-        std::sync::OnceLock::new();
-
     let url = crate::database::embedding_client::EmbeddingClient::default_url();
 
     let now_ms = std::time::SystemTime::now()
@@ -97,11 +114,11 @@ async fn embedding_service_health() -> serde_json::Value {
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let prev = LAST_CHECK_MS.load(Ordering::Relaxed);
+    let prev = EMBEDDING_LAST_CHECK_MS.load(Ordering::Relaxed);
     let stale = now_ms.saturating_sub(prev) > 30_000;
 
     if stale
-        && LAST_CHECK_MS
+        && EMBEDDING_LAST_CHECK_MS
             .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
     {
@@ -114,7 +131,7 @@ async fn embedding_service_health() -> serde_json::Value {
             Ok(c) => match c.get(&status_url).send().await {
                 Ok(r) => r.status().is_success(),
                 Err(e) => {
-                    let err_mtx = LAST_ERROR.get_or_init(|| std::sync::Mutex::new(None));
+                    let err_mtx = EMBEDDING_LAST_ERROR.get_or_init(|| std::sync::Mutex::new(None));
                     if let Ok(mut g) = err_mtx.lock() {
                         *g = Some(e.to_string());
                     }
@@ -122,24 +139,25 @@ async fn embedding_service_health() -> serde_json::Value {
                 }
             },
             Err(e) => {
-                let err_mtx = LAST_ERROR.get_or_init(|| std::sync::Mutex::new(None));
+                let err_mtx = EMBEDDING_LAST_ERROR.get_or_init(|| std::sync::Mutex::new(None));
                 if let Ok(mut g) = err_mtx.lock() {
                     *g = Some(format!("Failed to build HTTP client: {e}"));
                 }
                 false
             }
         };
-        LAST_REACHABLE.store(ok, Ordering::Release);
+        EMBEDDING_LAST_REACHABLE.store(ok, Ordering::Release);
+        EMBEDDING_LAST_CHECKED_AT_LEAST_ONCE.store(true, Ordering::Release);
         if ok {
-            let err_mtx = LAST_ERROR.get_or_init(|| std::sync::Mutex::new(None));
+            let err_mtx = EMBEDDING_LAST_ERROR.get_or_init(|| std::sync::Mutex::new(None));
             if let Ok(mut g) = err_mtx.lock() {
                 *g = None;
             }
         }
     }
 
-    let reachable = LAST_REACHABLE.load(Ordering::Acquire);
-    let err_msg = LAST_ERROR
+    let reachable = EMBEDDING_LAST_REACHABLE.load(Ordering::Acquire);
+    let err_msg = EMBEDDING_LAST_ERROR
         .get()
         .and_then(|m| m.lock().ok())
         .and_then(|g| g.clone());
@@ -147,7 +165,7 @@ async fn embedding_service_health() -> serde_json::Value {
     serde_json::json!({
         "reachable": reachable,
         "url": url,
-        "lastCheckMs": LAST_CHECK_MS.load(Ordering::Relaxed),
+        "lastCheckMs": EMBEDDING_LAST_CHECK_MS.load(Ordering::Relaxed),
         "lastErrorMessage": err_msg,
     })
 }
@@ -261,15 +279,16 @@ async fn health(
     };
 
     // Derived status: either a live UI error OR a fresh crash dump tips the
-    // runner to `errored`. Both paths flag the same "something is wrong"
-    // bucket for supervisors/fleet consumers; callers who care about the
-    // distinction should branch on `ui_error` vs `recent_crash` presence
-    // instead of re-parsing a compound status string.
-    let derived_status = if ui_error_snapshot.is_some() || recent_crash_snapshot.is_some() {
-        "errored"
-    } else {
-        "healthy"
-    };
+    // runner to `errored`. An embedding-service outage downgrades to
+    // `degraded` (functional, but semantic-search is unavailable). Callers
+    // who care about the distinction should branch on `ui_error` /
+    // `recent_crash` / `embeddingService.reachable` presence instead of
+    // re-parsing the compound status string.
+    let derived_status = crate::ui_error::compute_derived_status(
+        ui_error_snapshot.is_some(),
+        recent_crash_snapshot.is_some(),
+        embedding_reachable_cached(),
+    );
 
     let mut data = serde_json::json!({
         "status": status,
