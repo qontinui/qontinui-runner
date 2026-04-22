@@ -1016,7 +1016,7 @@ pub async fn ui_bridge_get_elements_handler(
         if let Err(e) = ui_bridge_request_sync(
             &state,
             "discover",
-            serde_json::json!({ "params": { "interactive_only": false } }),
+            serde_json::json!({ "options": { "interactiveOnly": false } }),
         )
         .await
         {
@@ -1507,7 +1507,7 @@ pub async fn ui_bridge_execute_action_handler(
         match ui_bridge_request_sync(
             &state,
             "discover",
-            serde_json::json!({ "params": { "interactive_only": false } }),
+            serde_json::json!({ "options": { "interactiveOnly": false } }),
         )
         .await
         {
@@ -1648,7 +1648,7 @@ pub async fn ui_bridge_execute_action_handler(
             let _ = ui_bridge_request_sync(
                 &state,
                 "discover",
-                serde_json::json!({ "params": { "interactive_only": false } }),
+                serde_json::json!({ "options": { "interactiveOnly": false } }),
             )
             .await;
 
@@ -1785,7 +1785,7 @@ pub async fn ui_bridge_execute_action_handler(
         let post_sig = match ui_bridge_request_sync(
             &state,
             "discover",
-            serde_json::json!({ "params": { "interactive_only": false } }),
+            serde_json::json!({ "options": { "interactiveOnly": false } }),
         )
         .await
         {
@@ -4173,6 +4173,7 @@ const VALID_TAB_IDS: &[&str] = &[
     "memory-search",
     "online-learning",
     "dag-workflow-editor",
+    "project-explainer",
 ];
 
 #[derive(Debug, Deserialize)]
