@@ -1088,8 +1088,8 @@ impl FlowExecutor {
         // The runner's MCP API endpoint for tool execution
         // NOTE: no AppState in scope here — FlowExecutor is a standalone
         // orchestrator used by multiple entrypoints (incl. tests) and doesn't
-        // plumb AppState. Kept on the deprecated env-var lookup.
-        #[allow(deprecated)]
+        // plumb AppState. Uses the env-var lookup as the intentional
+        // AppState-less fallback.
         let base_url = crate::mcp::types::get_self_base_url_from_env();
         let url = format!("{}/api/mcp/tools/{}/execute", base_url, tool_id);
 

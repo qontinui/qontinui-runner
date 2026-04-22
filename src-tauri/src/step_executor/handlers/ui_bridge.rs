@@ -644,11 +644,8 @@ fn extract_origin(url: &str) -> String {
         return format!("http://{}", url.split('/').next().unwrap_or(url));
     }
     // Fallback — NOTE: no AppState in scope here (pure URL parsing helper);
-    // kept on deprecated env-var lookup.
-    #[allow(deprecated)]
-    {
-        crate::mcp::types::get_self_base_url_from_env()
-    }
+    // uses the env-var lookup as the intentional AppState-less fallback.
+    crate::mcp::types::get_self_base_url_from_env()
 }
 
 // ---------------------------------------------------------------------------

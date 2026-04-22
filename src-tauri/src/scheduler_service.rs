@@ -63,11 +63,7 @@ impl SchedulerService {
     fn self_base_url(&self) -> String {
         match &self.app_state {
             Some(state) => crate::mcp::types::get_self_base_url(state),
-            None =>
-            {
-                #[allow(deprecated)]
-                crate::mcp::types::get_self_base_url_from_env()
-            }
+            None => crate::mcp::types::get_self_base_url_from_env(),
         }
     }
 

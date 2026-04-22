@@ -756,9 +756,8 @@ async fn execute_mcp_call(step_id: &str, inputs: &HashMap<String, Value>) -> Ste
 
     // Call the runner's MCP tool execution endpoint
     // NOTE: no AppState in scope here — execute_mcp_call is a free fn invoked
-    // from execute_unified_tool, which lacks AppState plumbing. Kept on the
-    // deprecated env-var lookup.
-    #[allow(deprecated)]
+    // from execute_unified_tool, which lacks AppState plumbing. Uses the
+    // env-var lookup as the intentional AppState-less fallback.
     let base_url = crate::mcp::types::get_self_base_url_from_env();
     let url = format!(
         "{}/api/mcp/servers/{}/tools/{}/execute",

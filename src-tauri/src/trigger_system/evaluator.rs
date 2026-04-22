@@ -243,11 +243,7 @@ impl TriggerEvaluator {
         let client = reqwest::Client::new();
         let base = match &self.app_state {
             Some(state) => crate::mcp::types::get_self_base_url(state),
-            None =>
-            {
-                #[allow(deprecated)]
-                crate::mcp::types::get_self_base_url_from_env()
-            }
+            None => crate::mcp::types::get_self_base_url_from_env(),
         };
         let status_url = format!("{}/status", base);
         match client
