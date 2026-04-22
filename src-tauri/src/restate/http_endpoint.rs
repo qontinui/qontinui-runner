@@ -58,10 +58,24 @@ pub async fn start_restate_endpoint(
         .parse()
         .map_err(|e| format!("Invalid address: {}", e))?;
 
-    // `HttpServer::listen_and_serve` returns `()` — it runs until the server
-    // shuts down or the future is dropped. Any transport error is logged
-    // internally by the SDK. Our caller only observes task exit.
-    HttpServer::new(endpoint).listen_and_serve(addr).await;
+    // Bind the TCP listener ourselves. `HttpServer::listen_and_serve` does
+    // `TcpListener::bind(addr).expect("listener can bind")` internally — so
+    // any bind failure (port already in use, permission denied) panics the
+    // tokio worker. On Windows a port collision produces os error 10048
+    // (AddrInUse) and crashes the whole runner instance. Bind here, convert
+    // the io::Error to a String, and hand the listener to `serve()` instead.
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        error!(
+            port = port,
+            error = %e,
+            "Restate HTTP endpoint failed to bind",
+        );
+        format!("Restate endpoint bind failed on 127.0.0.1:{}: {}", port, e)
+    })?;
+
+    // `HttpServer::serve` returns `()` — it runs until ctrl_c or future drop.
+    // Any transport error after bind is logged internally by the SDK.
+    HttpServer::new(endpoint).serve(listener).await;
 
     info!(port = port, "Restate HTTP endpoint exited");
     Ok(())
