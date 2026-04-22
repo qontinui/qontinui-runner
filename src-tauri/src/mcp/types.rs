@@ -221,6 +221,8 @@ pub struct ApiState {
         Arc<tokio::sync::Mutex<qontinui_runner_lib::accessibility::AccessibilityManager>>,
     /// Registry of physical mobile devices across all transports
     pub physical_device_registry: Arc<crate::mcp::physical_device::PhysicalDeviceRegistry>,
+    /// Phone-home registry for apps that have registered via POST /ui-bridge/apps/register.
+    pub app_registry: Arc<crate::mcp::app_registry::AppRegistry>,
     /// Pairing manager for LAN and Cloud device authentication
     pub pairing_manager: Arc<crate::mcp::transport::pairing::PairingManager>,
     /// Rathole tunnel client (Plan 1B). Singleton — only one tunnel active.

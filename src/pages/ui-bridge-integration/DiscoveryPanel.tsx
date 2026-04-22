@@ -10,12 +10,26 @@ import {
   Wrench,
   ChevronDown,
   ChevronRight,
+  Plus,
+  Radio,
+  Trash2,
 } from "lucide-react";
-import { useState, useCallback, useEffect } from "react";
+import {
+  useState,
+  useCallback,
+  useEffect,
+  useMemo,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import type { DiscoveredApp, MobileDevice, DiscoveryResult, ApiResponse } from "./types";
 import { getApiBase } from "@/lib/runner-api";
+import {
+  useAppDiscovery,
+  type DiscoveredApp as RegisteredDiscoveredApp,
+  type RegisterAppPayload,
+} from "@/hooks/useAppDiscovery";
 
 // =============================================================================
 // ProcessConfig type (from process manager)
@@ -48,6 +62,20 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
   // Port → project path map built from process configs
   const [portToPath, setPortToPath] = useState<Map<number, string>>(new Map());
   const [projectsExpanded, setProjectsExpanded] = useState(true);
+
+  // Registered-apps state comes from the phone-home registry.
+  // The hook polls /ui-bridge/apps/registered every 5s and exposes register /
+  // deregister helpers. Registered entries use camelCase field names (appId,
+  // appName, basePath, ...) from the Rust `DiscoveredApp` struct, which is a
+  // separate shape from the snake_case `DiscoveredApp` used by the scan path
+  // in `./types` — the two coexist until scan is migrated.
+  const {
+    registeredApps,
+    registerApp,
+    deregisterApp,
+    refreshRegistered,
+    error: registeredError,
+  } = useAppDiscovery();
 
   // Collapse "Your Projects" when a project is selected
   useEffect(() => {
@@ -119,10 +147,40 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
     [portToPath],
   );
 
+  // Dedupe: drop scan-result entries whose appId already appears in the
+  // registered list. Registered (phone-home) entries are authoritative — they
+  // confirm the SDK is live in the running page, whereas scan entries only
+  // prove a health endpoint responds.
+  const registeredIds = useMemo(
+    () => new Set(registeredApps.map((a) => a.appId)),
+    [registeredApps],
+  );
+  const filteredResult: DiscoveryResult | null = useMemo(() => {
+    if (!result) return null;
+    // Scan payload uses snake_case (`app_id`) per ./types, while registered
+    // uses camelCase (`appId`). Match both to be safe across the mismatch.
+    const isRegistered = (app: DiscoveredApp): boolean => {
+      const id = (app as DiscoveredApp & { appId?: string }).appId ?? app.app_id;
+      return id ? registeredIds.has(id) : false;
+    };
+    return {
+      ...result,
+      web: result.web.filter((a) => !isRegistered(a)),
+      desktop: result.desktop.filter((a) => !isRegistered(a)),
+      // Mobile entries don't dedupe cleanly — leave them alone for now.
+      mobile: result.mobile,
+    };
+  }, [result, registeredIds]);
+
   const hasResults =
-    result && (result.web.length > 0 || result.desktop.length > 0 || result.mobile.length > 0);
-  const totalApps = result
-    ? result.web.length + result.desktop.length + result.mobile.filter((d) => d.ui_bridge).length
+    filteredResult &&
+    (filteredResult.web.length > 0 ||
+      filteredResult.desktop.length > 0 ||
+      filteredResult.mobile.length > 0);
+  const totalApps = filteredResult
+    ? filteredResult.web.length +
+      filteredResult.desktop.length +
+      filteredResult.mobile.filter((d) => d.ui_bridge).length
     : 0;
 
   // Deduplicate: exclude process configs whose port already appears in scan results
@@ -230,27 +288,27 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
       )}
 
       {/* Scan results */}
-      {hasResults && (
+      {hasResults && filteredResult && (
         <div className="flex flex-col gap-4">
-          {result.web.length > 0 && (
+          {filteredResult.web.length > 0 && (
             <AppSection
               icon={Globe}
               label="Web"
-              apps={result.web}
+              apps={filteredResult.web}
               resolveProjectPath={resolveProjectPath}
               onSelectApp={onSelectApp}
             />
           )}
-          {result.desktop.length > 0 && (
+          {filteredResult.desktop.length > 0 && (
             <AppSection
               icon={Monitor}
               label="Desktop"
-              apps={result.desktop}
+              apps={filteredResult.desktop}
               resolveProjectPath={resolveProjectPath}
               onSelectApp={onSelectApp}
             />
           )}
-          {result.mobile.length > 0 && <MobileSection devices={result.mobile} />}
+          {filteredResult.mobile.length > 0 && <MobileSection devices={filteredResult.mobile} />}
         </div>
       )}
 
@@ -265,6 +323,18 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
           )}
         </p>
       )}
+
+      {/* Registered applications — populated by SDK phone-home. */}
+      <RegisteredAppsSection
+        apps={registeredApps}
+        onSelectApp={onSelectApp}
+        onRefresh={refreshRegistered}
+        onDeregister={deregisterApp}
+        error={registeredError}
+      />
+
+      {/* Add application — manual entry, for apps we can't auto-discover. */}
+      <AddApplicationForm onRegister={registerApp} />
     </div>
   );
 }
@@ -502,6 +572,468 @@ function MobileDeviceCard({ device }: { device: MobileDevice }) {
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// RegisteredAppsSection — apps that phoned home via the SDK
+// =============================================================================
+
+function RegisteredAppsSection({
+  apps,
+  onSelectApp,
+  onRefresh,
+  onDeregister,
+  error,
+}: {
+  apps: RegisteredDiscoveredApp[];
+  onSelectApp?: (projectPath: string) => void;
+  onRefresh: () => Promise<void>;
+  onDeregister: (appId: string) => Promise<boolean>;
+  error: string | null;
+}) {
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [onRefresh]);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <div>
+          <h3 className="text-sm font-medium">Registered Applications</h3>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Apps that phoned home via the UI Bridge SDK (polled every 5s)
+          </p>
+        </div>
+        <button
+          onClick={handleRefresh}
+          disabled={refreshing}
+          className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded
+                     bg-white/5 text-muted-foreground border border-border
+                     hover:bg-white/10 hover:text-foreground disabled:opacity-50 transition-colors"
+          title="Refresh registered apps"
+        >
+          <RefreshCw className={`w-3 h-3 ${refreshing ? "animate-spin" : ""}`} aria-hidden="true" />
+          Refresh
+        </button>
+      </div>
+
+      {error && (
+        <div className="mb-2 text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded px-2 py-1">
+          {error}
+        </div>
+      )}
+
+      {apps.length === 0 ? (
+        <div className="text-[11px] text-muted-foreground/70 italic py-2">
+          No registered applications. Open an app that imports{" "}
+          <code className="text-[10px] bg-white/5 px-1 py-0.5 rounded">@qontinui/ui-bridge</code>{" "}
+          and it will appear here automatically.
+        </div>
+      ) : (
+        <div className="grid gap-2">
+          {apps.map((app) => (
+            <RegisteredAppCard
+              key={app.appId}
+              app={app}
+              onSelect={onSelectApp}
+              onDeregister={onDeregister}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RegisteredAppCard({
+  app,
+  onSelect,
+  onDeregister,
+}: {
+  app: RegisteredDiscoveredApp;
+  onSelect?: (projectPath: string) => void;
+  onDeregister: (appId: string) => Promise<boolean>;
+}) {
+  const [removing, setRemoving] = useState(false);
+  // Click-through uses the base URL as the "project path" proxy — matches the
+  // scan cards' behavior (they pass project path into onSelectApp).
+  const selectTarget = app.url;
+  const clickable = !!onSelect && !!selectTarget;
+
+  const handleDeregister = useCallback(
+    async (e: ReactMouseEvent) => {
+      e.stopPropagation();
+      if (removing) return;
+      setRemoving(true);
+      try {
+        await onDeregister(app.appId);
+      } finally {
+        setRemoving(false);
+      }
+    },
+    [onDeregister, app.appId, removing],
+  );
+
+  return (
+    <div
+      onClick={clickable ? () => onSelect(selectTarget) : undefined}
+      onKeyDown={
+        clickable
+          ? (e) => (e.key === "Enter" || e.key === " ") && onSelect(selectTarget)
+          : undefined
+      }
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      className={`flex items-center gap-3 p-3 rounded-lg border border-border bg-card/50${
+        clickable
+          ? " cursor-pointer hover:border-cyan-500/40 hover:bg-cyan-500/5 transition-colors"
+          : ""
+      }`}
+    >
+      <Radio className="w-4 h-4 text-green-400 shrink-0" aria-hidden="true" />
+
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-sm font-medium truncate">{app.appName}</span>
+          {app.framework && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-400 font-medium">
+              {app.framework}
+            </span>
+          )}
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground">
+            {app.appType}
+          </span>
+          <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-500/10 text-green-400 font-medium">
+            registered
+          </span>
+        </div>
+        <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
+          <span className="truncate">{app.url}</span>
+          {app.version && <span>v{app.version}</span>}
+        </div>
+        <div className="mt-0.5 text-[10px] text-muted-foreground/60 truncate">
+          <code>{app.appId}</code>
+        </div>
+      </div>
+
+      <button
+        onClick={handleDeregister}
+        disabled={removing}
+        className="shrink-0 p-1.5 rounded text-muted-foreground/60 hover:text-red-400 hover:bg-red-500/10
+                   disabled:opacity-50 transition-colors"
+        title="Deregister this app"
+        aria-label={`Deregister ${app.appName}`}
+      >
+        <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
+
+// =============================================================================
+// AddApplicationForm — manual entry for apps we can't auto-discover
+// =============================================================================
+
+/**
+ * Extract a reasonable `appId` default from a URL ("manual-hostname-port").
+ * Falls back to "manual-app" if the URL can't be parsed.
+ */
+function defaultAppIdFromUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname || "app";
+    const port =
+      parsed.port ||
+      (parsed.protocol === "https:" ? "443" : parsed.protocol === "http:" ? "80" : "");
+    return port ? `manual-${host}-${port}` : `manual-${host}`;
+  } catch {
+    return "manual-app";
+  }
+}
+
+/**
+ * Build a human name for an app from its URL ("hostname:port").
+ */
+function defaultAppNameFromUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname || "app";
+    return parsed.port ? `${host}:${parsed.port}` : host;
+  } catch {
+    return url;
+  }
+}
+
+function AddApplicationForm({
+  onRegister,
+}: {
+  onRegister: (payload: RegisterAppPayload) => Promise<RegisteredDiscoveredApp | null>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [url, setUrl] = useState("");
+  const [appId, setAppId] = useState("");
+  const [basePath, setBasePath] = useState("/ui-bridge");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<{ kind: "success" | "error"; message: string } | null>(null);
+
+  const buildBaseUrl = useCallback((rawUrl: string, rawBasePath: string): string => {
+    const trimmedBase = rawBasePath.trim().replace(/\/+$/, "");
+    const trimmedUrl = rawUrl.trim().replace(/\/+$/, "");
+    if (!trimmedBase) return trimmedUrl;
+    return trimmedBase.startsWith("/")
+      ? `${trimmedUrl}${trimmedBase}`
+      : `${trimmedUrl}/${trimmedBase}`;
+  }, []);
+
+  const handleProbeAndAdd = useCallback(async () => {
+    setStatus(null);
+    if (!url.trim()) {
+      setStatus({ kind: "error", message: "URL is required" });
+      return;
+    }
+    setBusy(true);
+    try {
+      const baseUrl = buildBaseUrl(url, basePath);
+      const healthUrl = `${baseUrl.replace(/\/+$/, "")}/health`;
+      // Same-origin fetch from the runner frontend — will likely hit CORS for
+      // cross-origin dev servers. If the app exposes CORS or runs on the same
+      // origin (e.g. another Tauri webview on tauri://localhost), this works.
+      // Otherwise: fall back to "Add without probing".
+      let probed: {
+        appId?: string;
+        appName?: string;
+        appType?: string;
+        framework?: string;
+        capabilities?: string[];
+        version?: string;
+      } = {};
+      try {
+        const response = await fetch(healthUrl, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        const body = await response.json();
+        // UI Bridge metadata block. The SDK emits it under `uiBridge`; some
+        // older servers emit it at the top level — accept either.
+        const meta = (body && (body.uiBridge ?? body)) as Partial<typeof probed>;
+        probed = {
+          appId: meta.appId,
+          appName: meta.appName,
+          appType: meta.appType,
+          framework: meta.framework,
+          capabilities: meta.capabilities,
+          version: meta.version,
+        };
+      } catch (err) {
+        setStatus({
+          kind: "error",
+          message: `Probe failed (${(err as Error).message}). Try "Add without probing".`,
+        });
+        return;
+      }
+
+      if (!probed.appId || !probed.appName || !probed.appType) {
+        setStatus({
+          kind: "error",
+          message: "Probe succeeded but response is missing uiBridge metadata",
+        });
+        return;
+      }
+
+      const payload: RegisterAppPayload = {
+        appId: appId.trim() || probed.appId,
+        appName: probed.appName,
+        appType: probed.appType,
+        framework: probed.framework,
+        baseUrl,
+        capabilities: probed.capabilities ?? [],
+        version: probed.version,
+      };
+      const registered = await onRegister(payload);
+      if (registered) {
+        setStatus({ kind: "success", message: `Registered "${registered.appName}"` });
+        setUrl("");
+        setAppId("");
+      } else {
+        setStatus({ kind: "error", message: "Registration failed — see console for details" });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }, [url, appId, basePath, buildBaseUrl, onRegister]);
+
+  const handleAddWithoutProbing = useCallback(async () => {
+    setStatus(null);
+    if (!url.trim()) {
+      setStatus({ kind: "error", message: "URL is required" });
+      return;
+    }
+    setBusy(true);
+    try {
+      const baseUrl = buildBaseUrl(url, basePath);
+      const derivedId = appId.trim() || defaultAppIdFromUrl(url);
+      const payload: RegisterAppPayload = {
+        appId: derivedId,
+        appName: defaultAppNameFromUrl(url),
+        appType: "other",
+        baseUrl,
+        capabilities: [],
+      };
+      // Reconciliation note: the runner-side registry is keyed by `appId`.
+      // When the SDK later phones home with the same `appId`, that POST will
+      // upsert and overwrite this placeholder with the real metadata — no
+      // extra reconciliation code is needed on either side.
+      const registered = await onRegister(payload);
+      if (registered) {
+        setStatus({
+          kind: "success",
+          message:
+            "Added as a placeholder. If the SDK is installed in this app, it should update this entry shortly by phoning home.",
+        });
+        setUrl("");
+        setAppId("");
+      } else {
+        setStatus({ kind: "error", message: "Registration failed — see console for details" });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }, [url, appId, basePath, buildBaseUrl, onRegister]);
+
+  return (
+    <div className="rounded-lg border border-border bg-card/30">
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="flex items-center gap-1.5 w-full text-left px-3 py-2 group"
+      >
+        {expanded ? (
+          <ChevronDown className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+        ) : (
+          <ChevronRight className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+        )}
+        <Plus className="w-3.5 h-3.5 text-cyan-400 shrink-0" aria-hidden="true" />
+        <span className="text-sm font-medium group-hover:text-foreground transition-colors">
+          Add Application
+        </span>
+        {!expanded && (
+          <span className="ml-auto text-[10px] text-muted-foreground/60">
+            Manual registration for apps not auto-discovered
+          </span>
+        )}
+      </button>
+
+      {expanded && (
+        <div className="px-3 pb-3 pt-1 flex flex-col gap-2">
+          <div className="flex flex-col gap-1">
+            <label className="text-[11px] text-muted-foreground" htmlFor="add-app-url">
+              URL <span className="text-red-400">*</span>
+            </label>
+            <input
+              id="add-app-url"
+              type="url"
+              placeholder="http://localhost:7000"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              disabled={busy}
+              className="w-full px-2 py-1.5 text-xs rounded border border-border bg-background/60
+                         focus:outline-none focus:border-cyan-500/50"
+            />
+          </div>
+
+          <div className="flex gap-2">
+            <div className="flex-1 flex flex-col gap-1">
+              <label className="text-[11px] text-muted-foreground" htmlFor="add-app-id">
+                App ID <span className="text-muted-foreground/60">(optional)</span>
+              </label>
+              <input
+                id="add-app-id"
+                type="text"
+                placeholder={url ? defaultAppIdFromUrl(url) : "auto-derived from URL"}
+                value={appId}
+                onChange={(e) => setAppId(e.target.value)}
+                disabled={busy}
+                className="w-full px-2 py-1.5 text-xs rounded border border-border bg-background/60
+                           focus:outline-none focus:border-cyan-500/50"
+              />
+            </div>
+            <div className="flex-1 flex flex-col gap-1">
+              <label className="text-[11px] text-muted-foreground" htmlFor="add-app-basepath">
+                Base path
+              </label>
+              <input
+                id="add-app-basepath"
+                type="text"
+                placeholder="/ui-bridge"
+                value={basePath}
+                onChange={(e) => setBasePath(e.target.value)}
+                disabled={busy}
+                className="w-full px-2 py-1.5 text-xs rounded border border-border bg-background/60
+                           focus:outline-none focus:border-cyan-500/50"
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 mt-1">
+            <button
+              onClick={handleProbeAndAdd}
+              disabled={busy || !url.trim()}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded
+                         bg-cyan-500/10 text-cyan-400 border border-cyan-500/20
+                         hover:bg-cyan-500/20 disabled:opacity-50 transition-colors"
+            >
+              {busy ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Search className="w-3.5 h-3.5" />
+              )}
+              Probe and add
+            </button>
+            <button
+              onClick={handleAddWithoutProbing}
+              disabled={busy || !url.trim()}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded
+                         bg-white/5 text-muted-foreground border border-border
+                         hover:bg-white/10 hover:text-foreground disabled:opacity-50 transition-colors"
+            >
+              Add without probing
+            </button>
+          </div>
+
+          {status && (
+            <div
+              className={`text-[11px] rounded px-2 py-1 border ${
+                status.kind === "success"
+                  ? "bg-green-500/10 text-green-400 border-green-500/20"
+                  : "bg-red-500/10 text-red-400 border-red-500/20"
+              }`}
+            >
+              {status.message}
+            </div>
+          )}
+
+          <p className="text-[10px] text-muted-foreground/60 mt-0.5">
+            "Probe and add" fetches{" "}
+            <code className="text-[10px] bg-white/5 px-1 rounded">
+              &lt;url&gt;&lt;basePath&gt;/health
+            </code>{" "}
+            and expects a <code className="text-[10px] bg-white/5 px-1 rounded">uiBridge</code>{" "}
+            metadata block. Cross-origin probes may fail due to CORS — use "Add without probing" in
+            that case.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

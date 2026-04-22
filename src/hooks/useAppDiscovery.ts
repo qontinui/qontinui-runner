@@ -3,9 +3,13 @@
  *
  * Discovers UI Bridge-enabled applications across web, desktop, and mobile
  * by calling the runner's /ui-bridge/apps/scan endpoints.
+ *
+ * Also polls /ui-bridge/apps/registered every 5s to surface apps that phoned
+ * home via the SDK's `CommandRelayListener`. Phase 4 of the discovery
+ * redesign — see C:/tmp/prompt-discovery-redesign.md.
  */
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // ============================================================================
@@ -15,10 +19,12 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
 export interface DiscoveredApp {
   appId: string;
   appName: string;
-  appType: "web" | "desktop" | "mobile" | "other";
+  appType: "web" | "desktop" | "mobile" | "other" | string;
   framework?: string;
   url: string;
   port: number;
+  /** Path under the origin where UI Bridge routes are mounted (e.g. "/ui-bridge"). */
+  basePath: string;
   version?: string;
   capabilities: string[];
   elementCount?: number;
@@ -48,10 +54,34 @@ export interface ForwardDeviceResult {
   remotePort: number;
 }
 
+/**
+ * Payload accepted by the runner's POST /ui-bridge/apps/register endpoint.
+ * Mirrors `RegisterAppRequest` in `mcp/app_discovery.rs`. Either `baseUrl` or
+ * (`url` + `port`) is required; the runner derives the canonical origin from
+ * whichever is supplied.
+ */
+export interface RegisterAppPayload {
+  appId: string;
+  appName: string;
+  appType: string;
+  framework?: string;
+  transport?: string;
+  /** Absolute URL to the app's UI Bridge base, e.g. "http://127.0.0.1:9875/supervisor-bridge". */
+  baseUrl?: string;
+  /** Legacy — falls back to this when `baseUrl` is absent. */
+  url?: string;
+  port?: number;
+  basePath?: string;
+  capabilities?: string[];
+  version?: string;
+  origin?: string;
+}
+
 export interface UseAppDiscoveryReturn {
   webApps: DiscoveredApp[];
   desktopApps: DiscoveredApp[];
   mobileDevices: MobileDevice[];
+  registeredApps: DiscoveredApp[];
   isScanning: boolean;
   isScanningWeb: boolean;
   isScanningDesktop: boolean;
@@ -64,6 +94,17 @@ export interface UseAppDiscoveryReturn {
   scanDesktop: () => Promise<void>;
   scanMobile: () => Promise<void>;
   forwardDevice: (deviceId: string, remotePort?: number) => Promise<ForwardDeviceResult | null>;
+
+  /** Manually refresh the registered-apps list. Auto-polled every 5s. */
+  refreshRegistered: () => Promise<void>;
+  /** Stop the background poll for registered apps. */
+  stopRegisteredPolling: () => void;
+  /** Start the background poll for registered apps (idempotent). */
+  startRegisteredPolling: () => void;
+  /** POST a registration payload to /ui-bridge/apps/register. */
+  registerApp: (payload: RegisterAppPayload) => Promise<DiscoveredApp | null>;
+  /** DELETE an entry from /ui-bridge/apps/register/:appId. */
+  deregisterApp: (appId: string) => Promise<boolean>;
 }
 
 // ============================================================================
@@ -74,10 +115,13 @@ export interface UseAppDiscoveryReturn {
 // Hook
 // ============================================================================
 
+const REGISTERED_POLL_INTERVAL_MS = 5_000;
+
 export function useAppDiscovery(): UseAppDiscoveryReturn {
   const [webApps, setWebApps] = useState<DiscoveredApp[]>([]);
   const [desktopApps, setDesktopApps] = useState<DiscoveredApp[]>([]);
   const [mobileDevices, setMobileDevices] = useState<MobileDevice[]>([]);
+  const [registeredApps, setRegisteredApps] = useState<DiscoveredApp[]>([]);
   const [isScanning, setIsScanning] = useState(false);
   const [isScanningWeb, setIsScanningWeb] = useState(false);
   const [isScanningDesktop, setIsScanningDesktop] = useState(false);
@@ -89,6 +133,8 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
   const scanningDesktopRef = useRef(false);
   const scanningMobileRef = useRef(false);
   const scanningWebRef = useRef(false);
+  const registeredPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const registeredInflightRef = useRef(false);
 
   const fetchJson = useCallback(async <T>(url: string, signal?: AbortSignal): Promise<T> => {
     const response = await tracedFetch(url, {
@@ -205,10 +251,121 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
     [],
   );
 
+  // --------------------------------------------------------------------------
+  // Phone-home registry (Phase 4 of discovery redesign)
+  // --------------------------------------------------------------------------
+
+  const refreshRegistered = useCallback(async () => {
+    // Coalesce overlapping polls so a slow runner doesn't stack up N requests.
+    if (registeredInflightRef.current) return;
+    registeredInflightRef.current = true;
+    try {
+      const response = await tracedFetch(`${getApiBase()}/ui-bridge/apps/registered`, {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      const json = await response.json();
+      if (!json.success) {
+        throw new Error(json.error || "Failed to fetch registered apps");
+      }
+      const apps = (json.data ?? []) as DiscoveredApp[];
+      setRegisteredApps(apps);
+    } catch (err) {
+      // Don't blow away the previous list on a transient poll failure — just
+      // surface the error for the UI. A later successful poll will replace it.
+      setError((err as Error).message);
+    } finally {
+      registeredInflightRef.current = false;
+    }
+  }, []);
+
+  const registerApp = useCallback(
+    async (payload: RegisterAppPayload): Promise<DiscoveredApp | null> => {
+      try {
+        const response = await tracedFetch(`${getApiBase()}/ui-bridge/apps/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        const json = await response.json();
+        if (!json.success) {
+          throw new Error(json.error || "Failed to register app");
+        }
+        // Refresh eagerly so callers see the new entry without waiting for
+        // the next poll tick.
+        await refreshRegistered();
+        return json.data as DiscoveredApp;
+      } catch (err) {
+        setError((err as Error).message);
+        return null;
+      }
+    },
+    [refreshRegistered],
+  );
+
+  const deregisterApp = useCallback(
+    async (appId: string): Promise<boolean> => {
+      try {
+        const response = await tracedFetch(
+          `${getApiBase()}/ui-bridge/apps/register/${encodeURIComponent(appId)}`,
+          {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        const json = await response.json();
+        if (!json.success) {
+          throw new Error(json.error || "Failed to deregister app");
+        }
+        await refreshRegistered();
+        return Boolean(json.data);
+      } catch (err) {
+        setError((err as Error).message);
+        return false;
+      }
+    },
+    [refreshRegistered],
+  );
+
+  const stopRegisteredPolling = useCallback(() => {
+    if (registeredPollRef.current !== null) {
+      clearInterval(registeredPollRef.current);
+      registeredPollRef.current = null;
+    }
+  }, []);
+
+  const startRegisteredPolling = useCallback(() => {
+    if (registeredPollRef.current !== null) return; // Idempotent.
+    // Kick off immediately so callers don't wait a full interval for the
+    // first result.
+    void refreshRegistered();
+    registeredPollRef.current = setInterval(() => {
+      void refreshRegistered();
+    }, REGISTERED_POLL_INTERVAL_MS);
+  }, [refreshRegistered]);
+
+  // Start polling on mount; stop on unmount.
+  useEffect(() => {
+    startRegisteredPolling();
+    return () => {
+      stopRegisteredPolling();
+    };
+  }, [startRegisteredPolling, stopRegisteredPolling]);
+
   return {
     webApps,
     desktopApps,
     mobileDevices,
+    registeredApps,
     isScanning,
     isScanningWeb,
     isScanningDesktop,
@@ -220,5 +377,10 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
     scanDesktop,
     scanMobile,
     forwardDevice,
+    refreshRegistered,
+    stopRegisteredPolling,
+    startRegisteredPolling,
+    registerApp,
+    deregisterApp,
   };
 }

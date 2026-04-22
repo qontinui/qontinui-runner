@@ -406,6 +406,7 @@ pub fn create_router(
         physical_device_registry: Arc::new(
             crate::mcp::physical_device::PhysicalDeviceRegistry::new(),
         ),
+        app_registry: crate::mcp::app_registry::AppRegistry::new(),
         pairing_manager: Arc::new(crate::mcp::transport::pairing::PairingManager::new()),
         tunnel_client: Arc::new(crate::tunnel::RatholeClient::new()),
         ios_transport: Arc::new(crate::mcp::transport::ios::IosTransport::new()),
@@ -416,6 +417,9 @@ pub fn create_router(
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
     // `State<'_, Arc<ApiState>>` (e.g. start_cloud_relay) can resolve it.
     app_handle.manage(api_state.clone());
+
+    // Spawn the background sweeper that evicts stale phone-home registrations.
+    crate::mcp::app_registry::spawn_sweeper(api_state.app_registry.clone());
 
     // Set up UI Bridge response listener
     // This listens for "ui-bridge-response" events from the React frontend

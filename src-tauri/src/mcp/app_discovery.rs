@@ -9,7 +9,7 @@
 //! - Mobile: Lists ADB devices and checks for UI Bridge via port forwarding
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::Json,
     routing::{get, post},
@@ -78,10 +78,25 @@ pub struct RegisterAppRequest {
     pub app_type: String,
     #[serde(default)]
     pub framework: Option<String>,
-    pub url: String,
-    pub port: u16,
     #[serde(default)]
-    pub base_path: String,
+    pub transport: Option<String>,
+    /// Absolute URL where the runner can reach this app's UI Bridge endpoints,
+    /// e.g. "http://127.0.0.1:9875/supervisor-bridge". Preferred.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Legacy — used when `base_url` is absent.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub base_path: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 // ============================================================================
@@ -97,6 +112,7 @@ const WEB_DEV_PORTS: &[u16] = &[
 
 const DESKTOP_APP_PORTS: &[u16] = &[
     1420, // Tauri dev server
+    9875, // Qontinui Supervisor
     9876, // Qontinui Runner
     9877, 9878, // Runner fallback ports
     8888, // Electron common
@@ -106,6 +122,7 @@ const DESKTOP_APP_PORTS: &[u16] = &[
 const HEALTH_PATHS: &[(&str, &str)] = &[
     ("/api/ui-bridge/health", "/api/ui-bridge"),
     ("/ui-bridge/health", "/ui-bridge"),
+    ("/supervisor-bridge/health", "/supervisor-bridge"),
     ("/health", ""),
 ];
 const SCAN_TIMEOUT_MS: u64 = 1500;
@@ -234,6 +251,32 @@ async fn scan_ports(ports: &[u16]) -> Vec<DiscoveredApp> {
         }
     }
     apps
+}
+
+/// Load user-configured discovery ports from `settings.json`. Performs the
+/// blocking disk read off the async runtime.
+async fn user_discovery_ports() -> Vec<u16> {
+    tokio::task::spawn_blocking(|| crate::settings::load_settings().discovery_ports)
+        .await
+        .unwrap_or_default()
+}
+
+/// Merge the hardcoded desktop port list with user-configured ports, dedup
+/// while preserving the original order (defaults first, user entries after).
+async fn desktop_ports_merged() -> Vec<u16> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged: Vec<u16> = Vec::with_capacity(DESKTOP_APP_PORTS.len());
+    for &p in DESKTOP_APP_PORTS {
+        if seen.insert(p) {
+            merged.push(p);
+        }
+    }
+    for p in user_discovery_ports().await {
+        if seen.insert(p) {
+            merged.push(p);
+        }
+    }
+    merged
 }
 
 // ============================================================================
@@ -370,10 +413,12 @@ async fn scan_all(
 ) -> Result<Json<ApiResponse<DiscoveryResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     let start = std::time::Instant::now();
 
+    let desktop_ports = desktop_ports_merged().await;
+
     // Run web and desktop scans in parallel
     let (web_apps, desktop_apps, mut mobile_devices) = tokio::join!(
         scan_ports(WEB_DEV_PORTS),
-        scan_ports(DESKTOP_APP_PORTS),
+        scan_ports(&desktop_ports),
         list_adb_devices()
     );
 
@@ -442,7 +487,8 @@ async fn scan_web(
 async fn scan_desktop(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<DiscoveredApp>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let apps = scan_ports(DESKTOP_APP_PORTS).await;
+    let ports = desktop_ports_merged().await;
+    let apps = scan_ports(&ports).await;
     Ok(Json(ApiResponse::success(apps)))
 }
 
@@ -607,26 +653,104 @@ async fn ios_forward(
     }
 }
 
-/// Manual app registration
+/// Phone-home registration from the SDK's `CommandRelayListener`.
+/// Also accepts the legacy manual `{url, port, basePath}` shape when `baseUrl`
+/// is absent, so existing callers keep working.
 async fn register_app(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Json(req): Json<RegisterAppRequest>,
 ) -> Result<Json<ApiResponse<DiscoveredApp>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Derive a canonical (origin, port, base_path) triple from either the
+    // preferred `base_url` or the legacy `url` + `port` + `base_path` shape.
+    let (origin_url, port, base_path) = match &req.base_url {
+        Some(raw) if !raw.is_empty() => match url::Url::parse(raw) {
+            Ok(parsed) => {
+                let port = parsed
+                    .port_or_known_default()
+                    .unwrap_or(match parsed.scheme() {
+                        "https" => 443,
+                        _ => 80,
+                    });
+                let host = parsed.host_str().unwrap_or("127.0.0.1");
+                let origin = format!("{}://{}:{}", parsed.scheme(), host, port);
+                let path = parsed.path().trim_end_matches('/').to_string();
+                (origin, port, path)
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::error(format!(
+                        "invalid baseUrl '{}': {}",
+                        raw, e
+                    ))),
+                ));
+            }
+        },
+        _ => {
+            // Legacy shape: url + port (+ optional basePath).
+            let url_val = req.url.clone().unwrap_or_default();
+            let port_val = req.port.unwrap_or(0);
+            if url_val.is_empty() || port_val == 0 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::error(
+                        "register_app requires either `baseUrl` or (`url` + `port`)",
+                    )),
+                ));
+            }
+            let base = req.base_path.clone().unwrap_or_default();
+            let base = base.trim_end_matches('/').to_string();
+            (url_val, port_val, base)
+        }
+    };
+
     let app = DiscoveredApp {
-        app_id: req.app_id,
+        app_id: req.app_id.clone(),
         app_name: req.app_name,
         app_type: req.app_type,
         framework: req.framework,
-        url: req.url,
-        port: req.port,
-        base_path: req.base_path,
-        version: None,
-        capabilities: Vec::new(),
+        url: origin_url,
+        port,
+        base_path,
+        version: req.version,
+        capabilities: req.capabilities.unwrap_or_default(),
         element_count: None,
         component_count: None,
         discovered_at: chrono::Utc::now().timestamp_millis(),
     };
+
+    state.app_registry.upsert(app.clone(), req.origin).await;
+
+    debug!(
+        "[app-registry] registered appId={} origin={} port={} basePath={}",
+        app.app_id, app.url, app.port, app.base_path
+    );
+
     Ok(Json(ApiResponse::success(app)))
+}
+
+/// List apps that have phoned home and are still within the TTL window.
+async fn list_registered_apps(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<Vec<DiscoveredApp>>> {
+    let apps = state
+        .app_registry
+        .list_live()
+        .await
+        .into_iter()
+        .map(|e| e.app)
+        .collect();
+    Json(ApiResponse::success(apps))
+}
+
+/// Explicit deregistration — useful on `beforeunload` when the SDK can still
+/// send a beacon. Returns `true` if an entry was removed.
+async fn deregister_app(
+    State(state): State<Arc<ApiState>>,
+    Path(app_id): Path<String>,
+) -> Json<ApiResponse<bool>> {
+    let removed = state.app_registry.remove(&app_id).await;
+    Json(ApiResponse::success(removed))
 }
 
 // ============================================================================
@@ -641,6 +765,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/apps/scan/mobile", get(scan_mobile))
         .route("/ui-bridge/apps/scan/ios", get(scan_ios))
         .route("/ui-bridge/apps/register", post(register_app))
+        .route("/ui-bridge/apps/registered", get(list_registered_apps))
+        .route(
+            "/ui-bridge/apps/register/:app_id",
+            axum::routing::delete(deregister_app),
+        )
         .route("/ui-bridge/apps/forward-device", post(forward_device))
         .route("/ui-bridge/ios/forward", post(ios_forward))
 }

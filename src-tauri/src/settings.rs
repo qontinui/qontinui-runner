@@ -996,6 +996,9 @@ pub struct Settings {
     /// Configured runner instances for multi-instance dev workflows
     #[serde(default)]
     pub runner_instances: Vec<RunnerInstanceConfig>,
+    /// Custom desktop ports to scan for UI Bridge endpoints (merged with defaults).
+    #[serde(default)]
+    pub discovery_ports: Vec<u16>,
     /// Directories containing Claude Code configs (each should have a `projects/` subdirectory).
     /// Used by Terminal > Browse Sessions to find transcript files.
     #[serde(default)]
