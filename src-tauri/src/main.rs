@@ -108,6 +108,7 @@ mod skills;
 mod slash_commands;
 mod spec_experimentation;
 mod spec_utils;
+mod state_discovery;
 mod state_explorer;
 mod state_machine_configs;
 mod stats;
@@ -131,6 +132,7 @@ mod timeout_config;
 mod tracing_layers;
 mod trigger_system;
 mod tunnel;
+mod ui_bridge_evaluate;
 mod ui_bridge_invoke;
 mod ui_bridge_invoke_probe;
 mod ui_bridge_plugin;
@@ -420,6 +422,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         token_flow: Arc::new(crate::server_mode::TokenFlowStore::new()),
         ui_error: Arc::new(ui_error::UiErrorState::new()),
         crash_dumps: Arc::new(crash_dumps::CrashDumpState::new()),
+        usb_transport: Arc::new(tokio::sync::OnceCell::new()),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -2257,6 +2260,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(ref manager) = *manager_guard {
                                     info!("Stopping all bridges via bridge manager");
                                     manager.remove_all().await;
+                                }
+                            });
+
+                            // Release ADB forwards installed by the USB scanner
+                            // so they don't linger in `adb forward --list`
+                            // across runner restarts. Graceful path only — the
+                            // supervisor force-kills via taskkill /F and this
+                            // code never runs for temp runners. See plan
+                            // adb-forwarder-port.md §1.6a.
+                            rt.block_on(async {
+                                if let Some(usb) =
+                                    app_state_clone.usb_transport.get()
+                                {
+                                    info!("Releasing ADB forwards on shutdown");
+                                    usb.release_all().await;
                                 }
                             });
                         }

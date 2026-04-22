@@ -37,6 +37,7 @@ import {
   useCloudRelayAutoConnect,
   UIBridgeEventHandler,
   UIBridgeInvokeHandler,
+  UIBridgeEvaluateHandler,
   SpecExecutionHandler,
 } from "./hooks";
 import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
@@ -726,6 +727,7 @@ export default function App() {
       >
         <UIBridgeEventHandler />
         <UIBridgeInvokeHandler />
+        <UIBridgeEvaluateHandler />
         <SpecExecutionHandler />
         <BundledSpecsLoader />
         <CtrAutoPopulator />

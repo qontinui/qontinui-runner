@@ -163,6 +163,8 @@ export { useUIBridgeEventHandler, UIBridgeEventHandler } from "./useUIBridgeEven
 
 export { useUIBridgeInvokeHandler, UIBridgeInvokeHandler } from "./useUIBridgeInvokeHandler";
 
+export { useUIBridgeEvaluateHandler, UIBridgeEvaluateHandler } from "./useUIBridgeEvaluateHandler";
+
 export { useSpecExecutionHandler, SpecExecutionHandler } from "./useSpecExecutionHandler";
 
 export { useWorkflowGenerator } from "./useWorkflowGenerator";

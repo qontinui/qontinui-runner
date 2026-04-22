@@ -2310,6 +2310,31 @@ pub async fn ui_bridge_get_snapshot_handler(
                 }
             }
 
+            // Fire-and-forget: enqueue a co-occurrence observation for this
+            // snapshot. Never block the snapshot response on this — any
+            // error downgrades to WARN inside `enqueue_observation`. See
+            // `state-definition-observation-pipeline.md` Step 2 for why
+            // capture sits after the response body is assembled.
+            //
+            // TODO: infer `spec_id` from snapshot/page context once the
+            // spec→page binding is available. For now capture is
+            // scope-agnostic and the derivation endpoint decides whether to
+            // filter by spec.
+            let pg_db_for_obs = state.app_state.pg_db.clone();
+            let snapshot_for_obs = data.clone();
+            let runner_instance = std::env::var("QONTINUI_RUNNER_ROLE")
+                .ok()
+                .unwrap_or_else(|| "primary".to_string());
+            tokio::spawn(async move {
+                crate::state_discovery::enqueue_observation(
+                    pg_db_for_obs,
+                    &snapshot_for_obs,
+                    None,
+                    runner_instance,
+                )
+                .await;
+            });
+
             Ok(Json(ApiResponse::success(data)))
         }
         Err(e) => {
@@ -3527,6 +3552,124 @@ pub async fn ui_bridge_page_evaluate_raw_handler(
     page_evaluate_inner(state, body, None, false).await
 }
 
+/// Default timeout for a tagged `/page/evaluate` call if the caller doesn't
+/// pin one explicitly. Matches the legacy IPC timeout envelope.
+const DEFAULT_PAGE_EVALUATE_TIMEOUT_MS: u64 = 10_000;
+
+/// Dispatch a page/evaluate request over the tagged
+/// `ui-bridge:evaluate-request` / `ui-bridge:evaluate-response` event pair,
+/// correlating the response through [`EvaluateRequestStore`].
+///
+/// Each call allocates its own uuid `request_id` so concurrent callers
+/// can't observe each other's results — the regression Plan item D
+/// targets. Returns the already-unwrapped frontend-side `data` object
+/// (shaped like the legacy IPC `page_evaluate` reply, i.e.
+/// `{ success: true, result: {...} }` or `{ success: false, error: "..." }`)
+/// so callers can reuse the existing success/error introspection in
+/// `page_evaluate_inner`.
+async fn tagged_page_evaluate(
+    state: &Arc<ApiState>,
+    expression: &str,
+    await_promise: bool,
+    timeout_ms: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_PAGE_EVALUATE_TIMEOUT_MS);
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    // Reserve the pending slot *before* emitting, so a racing response can
+    // never be delivered faster than we register (same invariant the
+    // invoke proxy preserves).
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    state
+        .ui_bridge_evaluate_store
+        .register(request_id.clone(), sender)
+        .await;
+
+    let payload = serde_json::json!({
+        "request_id": request_id,
+        "expression": expression,
+        "await_promise": await_promise,
+        "timeout_ms": timeout_ms,
+    });
+
+    if let Err(e) = state
+        .app_handle
+        .emit("ui-bridge:evaluate-request", &payload)
+    {
+        state
+            .ui_bridge_evaluate_store
+            .cancel(&request_id)
+            .await;
+        return Err(format!(
+            "Failed to emit ui-bridge:evaluate-request: {}",
+            e
+        ));
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), receiver).await {
+        Ok(Ok(resp)) => {
+            // Shape the return payload to match the pre-existing IPC
+            // contract expected by `page_evaluate_inner`:
+            //  - On success, the frontend's `result` object is returned
+            //    verbatim (`{ success: true, result: { value } | object }`),
+            //    so the HTTP `ApiResponse::success(data)` wrapper flows
+            //    through unchanged.
+            //  - On JS-side failure, surface `{ success: false, error: "…" }`
+            //    as `Ok(data)` — `page_evaluate_inner` pattern-matches on
+            //    `data.success == false` and returns HTTP 400 with the
+            //    error string. Returning `Err` here instead would wrongly
+            //    trigger the direct-WebView fallback for a pure JS error.
+            if resp.ok {
+                let result_value = resp.result.unwrap_or(serde_json::Value::Null);
+                let data = if result_value.is_object() {
+                    result_value
+                } else {
+                    serde_json::json!({
+                        "success": true,
+                        "result": { "value": result_value }
+                    })
+                };
+                Ok(data)
+            } else {
+                let err = resp.error.unwrap_or_else(|| {
+                    "page/evaluate: frontend reported failure without an error message".to_string()
+                });
+                Ok(serde_json::json!({
+                    "success": false,
+                    "error": err,
+                }))
+            }
+        }
+        Ok(Err(_)) => {
+            // Sender dropped — listener crashed or discarded the payload.
+            // Treat as a transport-level failure so the caller falls back
+            // to direct WebView eval (same as the legacy IPC-channel-closed
+            // branch in `ui_bridge_request_inner`).
+            state
+                .ui_bridge_evaluate_store
+                .cancel(&request_id)
+                .await;
+            Err(format!(
+                "page/evaluate: response channel closed before delivery (request_id={})",
+                request_id
+            ))
+        }
+        Err(_) => {
+            // Timeout is also a transport-level failure — fall back to
+            // direct WebView eval so slow renders don't bypass the runner's
+            // resilience layers.
+            state
+                .ui_bridge_evaluate_store
+                .cancel(&request_id)
+                .await;
+            Err(format!(
+                "UI Bridge page_evaluate timed out after {}ms",
+                timeout_ms
+            ))
+        }
+    }
+}
+
 async fn page_evaluate_inner(
     state: Arc<ApiState>,
     expression: String,
@@ -3536,27 +3679,14 @@ async fn page_evaluate_inner(
     let preview: String = expression.chars().take(80).collect();
     info!("UI Bridge API: Page evaluate ({}...)", preview);
 
-    // IPC path: the frontend handler already awaits any returned Promise
-    // unconditionally (see usePageEvents.ts → `await Promise.resolve(result)`),
-    // so `awaitPromise=true` is a no-op there. We still forward the flag for
-    // observability and future-proofing in case the frontend gains a
-    // non-awaiting mode.
-    let payload = serde_json::json!({
-        "expression": expression,
-        "awaitPromise": await_promise,
-    });
-
-    // Try IPC path first (fastest, uses SDK event handlers).
-    // Wrap with caller's timeout_ms when provided (e.g. for 3+ min pipelines).
-    let ipc_future = ui_bridge_request_sync(&state, "page_evaluate", payload);
-    let ipc_result = if let Some(ms) = timeout_ms {
-        match tokio::time::timeout(std::time::Duration::from_millis(ms), ipc_future).await {
-            Ok(result) => result,
-            Err(_) => Err(format!("UI Bridge page_evaluate timed out after {}ms", ms)),
-        }
-    } else {
-        ipc_future.await
-    };
+    // Primary IPC path: the tagged `ui-bridge:evaluate-request` / `-response`
+    // flow (Plan item D). Each call gets its own uuid request_id via the
+    // `EvaluateRequestStore`, so concurrent callers against the same runner
+    // can never interleave responses. The frontend hook
+    // (useUIBridgeEvaluateHandler) mirrors the Phase 3I invoke handler's
+    // structure but dispatches to the security-gated `new Function(...)`
+    // path used for page evaluation instead of `invoke(...)`.
+    let ipc_result = tagged_page_evaluate(&state, &expression, await_promise, timeout_ms).await;
     match ipc_result {
         Ok(data) => {
             // The SDK may return a payload with `success: false` and an `error`
@@ -12363,5 +12493,261 @@ mod manifest_drift_tests {
             "regex extracted only {} routes — likely broken",
             source_routes.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod page_evaluate_escaping_tests {
+    //! Regression tests for the `/control/page/evaluate` direct-WebView path:
+    //! the user's expression must be encoded as a JS string literal and
+    //! `eval()`ed, so literal newlines / quotes / backslashes inside the
+    //! expression survive the splice into the callback JS template.
+    //!
+    //! We can't spin up a real webview inside a unit test, so instead we
+    //! validate the two invariants that make the fix correct:
+    //!   1. `serde_json::to_string` produces a valid JS string literal.
+    //!   2. Splicing that literal into `eval(...)` yields a JS source where
+    //!      newlines in the original expression no longer appear as raw
+    //!      line terminators.
+
+    /// Helper mirroring the production encoding used in
+    /// `direct_webview_evaluate_with_result`.
+    fn build_eval_inner(expression: &str, await_promise: bool) -> String {
+        let expr_literal = serde_json::to_string(expression).expect("encode expression");
+        if await_promise {
+            format!("await Promise.resolve(eval({}))", expr_literal)
+        } else {
+            format!("eval({})", expr_literal)
+        }
+    }
+
+    #[test]
+    fn expression_with_newline_in_string_literal_is_escaped() {
+        // The original Phase 3J repro: `stack: "at A\n  at B"` decoded from
+        // JSON produces a real newline inside the expression. Before the fix,
+        // this newline appeared verbatim in the generated JS → SyntaxError.
+        let expression = "invoke(\"report_ui_error\", {stack: \"at A\n  at B\"})";
+        let emitted = build_eval_inner(expression, false);
+
+        // The raw literal newline from the source expression must NOT appear
+        // inside the emitted `eval(...)` argument — it should have been
+        // escaped to the two-character sequence \n by serde_json.
+        // (`emitted` itself still begins `eval("...` with no newlines.)
+        assert!(
+            !emitted.contains('\n'),
+            "emitted JS still contains a raw newline: {:?}",
+            emitted
+        );
+        // But the escaped sequence must be present.
+        assert!(
+            emitted.contains(r"\n"),
+            "emitted JS missing escaped newline: {:?}",
+            emitted
+        );
+        // Shape check: the wrapper is the eval form.
+        assert!(emitted.starts_with("eval(\""), "unexpected prefix: {:?}", emitted);
+        assert!(emitted.ends_with("\")"), "unexpected suffix: {:?}", emitted);
+    }
+
+    #[test]
+    fn await_promise_emits_promise_resolve_wrapper() {
+        let emitted = build_eval_inner("invoke(\"long_async_op\")", true);
+        assert!(
+            emitted.starts_with("await Promise.resolve(eval("),
+            "awaitPromise=true wrapper missing: {:?}",
+            emitted
+        );
+    }
+
+    #[test]
+    fn expression_with_quotes_and_backslashes_roundtrips() {
+        // A nasty mix: embedded double-quote, single-quote, backslash, and
+        // unicode. serde_json must escape all of these such that the emitted
+        // string is a single JS string literal — no premature termination.
+        let expression = r#"doc.querySelector('a[href="/x\\y"]').click() // "test""#;
+        let emitted = build_eval_inner(expression, false);
+
+        // Exactly one `eval("` opening and one `")` closing — no premature
+        // quote in the middle would split the literal into multiple tokens.
+        assert_eq!(emitted.matches("eval(\"").count(), 1);
+        assert!(emitted.ends_with("\")"));
+        // And the emitted blob must decode back to the original when parsed
+        // as a JSON string (proving the JS eval() would see the same bytes).
+        let inner = &emitted["eval(".len()..emitted.len() - 1];
+        let decoded: String = serde_json::from_str(inner).expect("decode back");
+        assert_eq!(decoded, expression);
+    }
+}
+
+#[cfg(test)]
+mod page_evaluate_tagging_tests {
+    //! Plan item D regression tests for request-tagged `/control/page/evaluate`.
+    //!
+    //! Concurrent `/page/evaluate` callers against the same runner must never
+    //! observe each other's responses. The HTTP handler path goes through
+    //! `tagged_page_evaluate` → `EvaluateRequestStore` → the
+    //! `ui-bridge:evaluate-response` listener installed in `mcp_api.rs`,
+    //! with per-call uuid request_ids keying the pending oneshots.
+    //!
+    //! We can't spin up Tauri inside a unit test, so these tests exercise the
+    //! store directly. The store is the sole correlation surface: every
+    //! arriving response has to round-trip through `deliver(request_id, …)`,
+    //! so showing the store's id-keyed routing is correct is equivalent to
+    //! showing the handler path is correct.
+    use crate::ui_bridge_evaluate::{EvaluateRequestStore, EvaluateResponse};
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+
+    /// Fire two concurrent "page_evaluate" calls through the store-level
+    /// surface that `tagged_page_evaluate` relies on. Each call registers
+    /// its own oneshot, deliveries land in the opposite order, and each
+    /// caller observes exactly its own result. This is the plan's
+    /// "unit test that fires two concurrent `/page/evaluate` calls and
+    /// asserts they each get their own result" verification criterion.
+    #[tokio::test]
+    async fn concurrent_page_evaluate_calls_do_not_interleave() {
+        let store = Arc::new(EvaluateRequestStore::new());
+
+        // Caller A: evaluates `document.title` → "Runner".
+        let request_id_a = "evaluate-call-a".to_string();
+        let (tx_a, rx_a) = oneshot::channel::<EvaluateResponse>();
+        store.register(request_id_a.clone(), tx_a).await;
+
+        // Caller B: evaluates `window.location.pathname` → "/dashboard".
+        let request_id_b = "evaluate-call-b".to_string();
+        let (tx_b, rx_b) = oneshot::channel::<EvaluateResponse>();
+        store.register(request_id_b.clone(), tx_b).await;
+
+        // Run both HTTP-handler-equivalent awaits concurrently. Each
+        // simulates `tagged_page_evaluate`'s `tokio::time::timeout(..., rx)`.
+        let caller_a = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx_a)
+                .await
+                .expect("caller A should not time out")
+                .expect("caller A sender should not drop")
+        });
+        let caller_b = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx_b)
+                .await
+                .expect("caller B should not time out")
+                .expect("caller B sender should not drop")
+        });
+
+        // Frontend (simulated) delivers B's response first, then A's —
+        // proving the store's id-keyed routing doesn't care about arrival
+        // order and that concurrent pending entries don't shadow each other.
+        let store_for_b = store.clone();
+        let deliver_b = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            store_for_b
+                .deliver(
+                    "evaluate-call-b",
+                    EvaluateResponse {
+                        ok: true,
+                        result: Some(serde_json::json!({
+                            "success": true,
+                            "result": { "value": "/dashboard" }
+                        })),
+                        error: None,
+                    },
+                )
+                .await
+        });
+        let store_for_a = store.clone();
+        let deliver_a = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            store_for_a
+                .deliver(
+                    "evaluate-call-a",
+                    EvaluateResponse {
+                        ok: true,
+                        result: Some(serde_json::json!({
+                            "success": true,
+                            "result": { "value": "Runner" }
+                        })),
+                        error: None,
+                    },
+                )
+                .await
+        });
+
+        assert!(deliver_a.await.expect("deliver_a join"));
+        assert!(deliver_b.await.expect("deliver_b join"));
+
+        let result_a = caller_a.await.expect("caller_a join");
+        let result_b = caller_b.await.expect("caller_b join");
+
+        // Each caller received its own expression's result, not the other's.
+        assert!(result_a.ok);
+        assert!(result_b.ok);
+        assert_eq!(
+            result_a
+                .result
+                .as_ref()
+                .and_then(|v| v.pointer("/result/value"))
+                .and_then(|v| v.as_str()),
+            Some("Runner"),
+            "caller A must see its own result, not caller B's"
+        );
+        assert_eq!(
+            result_b
+                .result
+                .as_ref()
+                .and_then(|v| v.pointer("/result/value"))
+                .and_then(|v| v.as_str()),
+            Some("/dashboard"),
+            "caller B must see its own result, not caller A's"
+        );
+
+        // Store should be fully drained after both deliveries.
+        assert_eq!(store.pending_len().await, 0);
+    }
+
+    /// Timing out one call must not strand the other call's pending slot.
+    /// Simulates: A times out (cancelled), B still delivers successfully.
+    #[tokio::test]
+    async fn timeout_of_one_page_evaluate_does_not_affect_sibling() {
+        let store = Arc::new(EvaluateRequestStore::new());
+
+        let request_id_a = "evaluate-timeout".to_string();
+        let (tx_a, rx_a) = oneshot::channel::<EvaluateResponse>();
+        store.register(request_id_a.clone(), tx_a).await;
+
+        let request_id_b = "evaluate-sibling".to_string();
+        let (tx_b, rx_b) = oneshot::channel::<EvaluateResponse>();
+        store.register(request_id_b.clone(), tx_b).await;
+
+        // Caller A times out while waiting (mirrors the Elapsed branch of
+        // tagged_page_evaluate). The handler cancels its slot.
+        let wait_a = tokio::time::timeout(std::time::Duration::from_millis(50), rx_a).await;
+        assert!(wait_a.is_err(), "caller A must time out");
+        store.cancel(&request_id_a).await;
+
+        // Caller B still gets a clean delivery afterwards.
+        let store_for_b = store.clone();
+        tokio::spawn(async move {
+            store_for_b
+                .deliver(
+                    "evaluate-sibling",
+                    EvaluateResponse {
+                        ok: true,
+                        result: Some(serde_json::json!({ "value": 7 })),
+                        error: None,
+                    },
+                )
+                .await
+        });
+
+        let result_b = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b)
+            .await
+            .expect("caller B should not time out")
+            .expect("caller B sender should not drop");
+
+        assert!(result_b.ok);
+        assert_eq!(
+            result_b.result.as_ref().and_then(|v| v.get("value")),
+            Some(&serde_json::json!(7))
+        );
+        assert_eq!(store.pending_len().await, 0);
     }
 }

@@ -231,6 +231,12 @@ pub struct ApiState {
     /// Keyed by request_id; HTTP handler awaits the oneshot receiver, the
     /// `ui-bridge:invoke-response` Tauri listener in `mcp_api.rs` fires the sender.
     pub ui_bridge_invoke_store: Arc<crate::ui_bridge_invoke::InvokeRequestStore>,
+    /// Pending UI Bridge page/evaluate requests (Plan item D, post-Phase-3J).
+    /// Mirrors `ui_bridge_invoke_store` but for the `/page/evaluate` HTTP
+    /// route — keyed by request_id so concurrent callers never interleave
+    /// responses. The `ui-bridge:evaluate-response` Tauri listener in
+    /// `mcp_api.rs` fires the sender on arrival.
+    pub ui_bridge_evaluate_store: Arc<crate::ui_bridge_evaluate::EvaluateRequestStore>,
 }
 
 /// Response for API endpoints

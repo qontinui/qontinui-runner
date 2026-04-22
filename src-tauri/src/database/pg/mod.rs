@@ -922,6 +922,54 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE unified_workflows ADD COLUMN IF NOT EXISTS htn_state_machine_path TEXT;
         "#,
     },
+    Migration {
+        version: 24,
+        description: "Add co-occurrence observation pipeline tables (observations, discovery artifacts, drift scores)",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS co_occurrence_observations (
+                id UUID PRIMARY KEY,
+                captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                spec_id TEXT,
+                runner_instance TEXT,
+                fingerprints JSONB NOT NULL,
+                snapshot_metadata JSONB,
+                invalidated_at TIMESTAMPTZ,
+                invalidated_reason TEXT,
+                invalidated_by TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_observations_captured_at
+                ON co_occurrence_observations (captured_at)
+                WHERE invalidated_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_observations_spec
+                ON co_occurrence_observations (spec_id, captured_at)
+                WHERE invalidated_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_observations_fingerprints
+                ON co_occurrence_observations USING gin(fingerprints);
+
+            CREATE TABLE IF NOT EXISTS state_discovery_artifacts (
+                id UUID PRIMARY KEY,
+                spec_id TEXT,
+                derived_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                window_days INTEGER NOT NULL,
+                artifact JSONB NOT NULL,
+                observation_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovery_spec_derived
+                ON state_discovery_artifacts (spec_id, derived_at DESC);
+
+            CREATE TABLE IF NOT EXISTS state_discovery_drift_scores (
+                id BIGSERIAL PRIMARY KEY,
+                spec_id TEXT,
+                computed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                window_size INTEGER NOT NULL,
+                fit_score DOUBLE PRECISION NOT NULL,
+                observations_considered INTEGER NOT NULL,
+                states_matched INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_drift_scores_spec_computed
+                ON state_discovery_drift_scores (spec_id, computed_at DESC);
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.

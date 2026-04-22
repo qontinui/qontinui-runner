@@ -25,6 +25,12 @@ use crate::mcp::adb_helper;
 /// no per-forward `killforward` API (only `forward_remove_all`, which would
 /// stomp every forward on the machine). Everything else (device listing,
 /// shell, screenshot, logcat, `establish_forward`) goes through `adb_helper`.
+///
+/// `Clone` is cheap: `active_forwards` is an `Arc<Mutex<_>>` shared across
+/// clones, and `adb_path` is a small `PathBuf`. We rely on cloning so the
+/// shutdown handler in `main.rs` can call `release_all` on the same forward
+/// registry the USB scanner task owns.
+#[derive(Clone)]
 pub struct UsbTransport {
     /// Path to the `adb` (or `adb.exe`) binary. Still needed for
     /// `release_forward` — see struct-level doc above.

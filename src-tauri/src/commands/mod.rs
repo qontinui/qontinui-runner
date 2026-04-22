@@ -270,6 +270,16 @@ pub struct AppState {
     /// restarted runner marks itself `errored` via `/health.derived_status`
     /// until the user dismisses the record via `dismiss_recent_crash`.
     pub crash_dumps: Arc<crate::crash_dumps::CrashDumpState>,
+    /// USB/ADB transport, published here by the `mcp_api` physical-device
+    /// scanner so the CloseRequested handler in `main.rs` can call
+    /// `release_all` on shutdown and clean up any `adb forward` entries this
+    /// process installed.
+    ///
+    /// Force-kill (supervisor `taskkill /F`) still leaks — this only helps
+    /// the graceful path where Tauri's window close event fires. Tracked in
+    /// the adb-forwarder-port plan §1.6a.
+    pub usb_transport:
+        Arc<tokio::sync::OnceCell<crate::mcp::transport::usb::UsbTransport>>,
 }
 
 impl AppState {

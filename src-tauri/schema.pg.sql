@@ -3845,4 +3845,58 @@ CREATE TABLE IF NOT EXISTS vga_shadow_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_vga_shadow_sm ON vga_shadow_samples(state_machine_id);
 CREATE INDEX IF NOT EXISTS idx_vga_shadow_target ON vga_shadow_samples(target_process);
+
+-- -----------------------------------------------------------------------------
+-- Co-occurrence observation pipeline (migration 24)
+-- -----------------------------------------------------------------------------
+-- Persists fingerprinted element sets from /control/snapshot captures so the
+-- state-discovery job can derive observed state definitions from real usage.
+-- `invalidated_at` is a soft-delete tombstone that preserves the audit trail
+-- and supports the 24h undo window for agent-triggered invalidations.
+CREATE TABLE IF NOT EXISTS co_occurrence_observations (
+    id UUID PRIMARY KEY,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    spec_id TEXT,
+    runner_instance TEXT,
+    fingerprints JSONB NOT NULL,
+    snapshot_metadata JSONB,
+    invalidated_at TIMESTAMPTZ,
+    invalidated_reason TEXT,
+    invalidated_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_observations_captured_at
+    ON co_occurrence_observations (captured_at)
+    WHERE invalidated_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_observations_spec
+    ON co_occurrence_observations (spec_id, captured_at)
+    WHERE invalidated_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_observations_fingerprints
+    ON co_occurrence_observations USING gin(fingerprints);
+
+-- One row per spec x derivation run. `artifact` shape:
+-- {states: [{state_hash, elements, support, contrast, last_observed}]}
+CREATE TABLE IF NOT EXISTS state_discovery_artifacts (
+    id UUID PRIMARY KEY,
+    spec_id TEXT,
+    derived_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    window_days INTEGER NOT NULL,
+    artifact JSONB NOT NULL,
+    observation_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_spec_derived
+    ON state_discovery_artifacts (spec_id, derived_at DESC);
+
+-- Drift detector writes per-window fit_score rows here. If fit_score drops
+-- below 0.9 across 3 consecutive windows the runner emits a warning event.
+CREATE TABLE IF NOT EXISTS state_discovery_drift_scores (
+    id BIGSERIAL PRIMARY KEY,
+    spec_id TEXT,
+    computed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    window_size INTEGER NOT NULL,
+    fit_score DOUBLE PRECISION NOT NULL,
+    observations_considered INTEGER NOT NULL,
+    states_matched INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_drift_scores_spec_computed
+    ON state_discovery_drift_scores (spec_id, computed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_vga_shadow_model ON vga_shadow_samples(model_used);
