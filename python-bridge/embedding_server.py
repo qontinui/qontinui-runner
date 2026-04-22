@@ -25,9 +25,9 @@ _QONTINUI_SRC = os.path.join(_WORKSPACE_ROOT, "qontinui", "src")
 if _QONTINUI_SRC not in sys.path and os.path.isdir(_QONTINUI_SRC):
     sys.path.insert(0, _QONTINUI_SRC)
 
-import uvicorn
-from fastapi import FastAPI
-from pydantic import BaseModel
+import uvicorn  # noqa: E402 — must load after sys.path fixup above
+from fastapi import FastAPI  # noqa: E402
+from pydantic import BaseModel  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded, thread-safe embedding provider singleton

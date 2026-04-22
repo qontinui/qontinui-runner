@@ -262,7 +262,7 @@ def run_capture(
     # Poll for each expected route to appear in the page-capture store
     deadline = time.time() + total_wait
     captured = {}
-    pending = set(base_url + r for r in routes)
+    pending = {base_url + r for r in routes}
     while pending and time.time() < deadline:
         try:
             r = requests.get(
