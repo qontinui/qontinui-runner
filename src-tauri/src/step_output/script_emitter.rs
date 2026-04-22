@@ -682,16 +682,19 @@ fn response_schema() -> serde_json::Value {
 /// Compose the prompt as a `(system_prefix, user_message)` pair.
 ///
 /// The `system_prefix` is stable across emit calls and is deliberately
-/// fattened with worked examples so it crosses Anthropic's Haiku
-/// caching minimum (~1024 tokens ≈ 4000 chars at ~4 chars/token). Without
-/// that, `cache_control: ephemeral` markers are silently ignored and the
-/// warm provider would pay the uncached rate on every call.
+/// fattened with worked examples so it crosses Anthropic's Haiku caching
+/// minimum. Haiku 3.x accepted ~1024 tokens (~4000 chars); Haiku 4.x
+/// raised the floor to ~2048 tokens (~8000 chars). Below that threshold
+/// `cache_control: ephemeral` is silently ignored and the warm provider
+/// pays the uncached rate on every call — confirmed empirically against
+/// `claude-haiku-4-5-20251001` on 2026-04-22 (cache_marker=true but
+/// `cache_read_input_tokens=0` on repeat calls).
 ///
 /// The `user_message` carries the per-call dynamic payload — goal,
 /// schema hint, output preview — which changes every call and must not
 /// be part of the cached prefix.
 ///
-/// **Versioning.** The trailing `Emitter system v1` line makes intentional
+/// **Versioning.** The trailing `Emitter system v2` line makes intentional
 /// preamble bumps invalidate the cache cleanly (distinct bytes → distinct
 /// cache key) instead of waiting for the 5-minute TTL.
 fn build_prompt_split(
@@ -699,9 +702,10 @@ fn build_prompt_split(
     schema_hint: &serde_json::Value,
     output_preview: &str,
 ) -> (String, String) {
-    // The stable prefix. Fattened with 6 worked examples to cross the
-    // ~1024-token (≈4000 char) Haiku caching minimum. Counted once at write
-    // time and asserted in tests — don't shrink without rechecking the bound.
+    // The stable prefix. Fattened with 13 worked examples to cross the
+    // ~2048-token (~8000 char) Haiku 4.x caching minimum with margin.
+    // Counted once at write time and asserted in tests — don't shrink
+    // without rechecking the bound against current Haiku cache telemetry.
     let system_prefix = concat!(
         "You synthesize a single-line JavaScript expression that, given a ",
         "variable `output` (a string containing the raw stdout of a shell/step ",
@@ -767,6 +771,31 @@ fn build_prompt_split(
         "schemaHint: {\"keys\": {\"status\": \"number\", \"url\": \"string\"}}\n",
         "outputPreview: \"*   Trying 93.184.216.34:443...\\n* Connected to example.com (93.184.216.34) port 443\\n> GET /about HTTP/1.1\\n> Host: example.com\\n> User-Agent: curl/8.4.0\\n>\\n< HTTP/1.1 200 OK\\n< Content-Type: text/html; charset=UTF-8\\n< Content-Length: 1256\\n<\\n\"\n",
         "expression: ({status: Number(((output.match(/^< HTTP\\/[0-9.]+\\s+(\\d{3})/m) || [])[1]) || 0), url: (((output.match(/^> GET\\s+(\\S+)\\s/m) || [])[1]) || '')})\n\n",
+        "### Example 9 — running containers from docker ps --format json\n",
+        "goal: list running container names and images\n",
+        "schemaHint: {\"keys\": {\"containers\": \"Array<{name: string, image: string}>\"}}\n",
+        "outputPreview: \"{\\\"Names\\\":\\\"api-1\\\",\\\"Image\\\":\\\"registry.local/api:v2.3.1\\\",\\\"Status\\\":\\\"Up 2 hours\\\"}\\n{\\\"Names\\\":\\\"db-1\\\",\\\"Image\\\":\\\"postgres:16.2\\\",\\\"Status\\\":\\\"Up 2 hours (healthy)\\\"}\\n{\\\"Names\\\":\\\"cache\\\",\\\"Image\\\":\\\"redis:7-alpine\\\",\\\"Status\\\":\\\"Up 5 minutes\\\"}\\n\"\n",
+        "expression: ({containers: output.split(/\\r?\\n/).filter(l => l.trim().startsWith('{')).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).map(c => ({name: c?.Names || '', image: c?.Image || ''})).slice(0, 50)})\n\n",
+        "### Example 10 — env var map from `env | sort`\n",
+        "goal: build a map of uppercase-named environment variables (skip lowercase and comments)\n",
+        "schemaHint: {\"keys\": {\"env\": \"Record<string, string>\"}}\n",
+        "outputPreview: \"# local overrides\\nHOME=/home/jq\\nPATH=/usr/local/bin:/usr/bin:/bin\\nLANG=en_US.UTF-8\\nSHELL=/bin/bash\\nrecent_files=/tmp/a,/tmp/b\\nTERM=xterm-256color\\n\"\n",
+        "expression: ({env: output.split(/\\r?\\n/).filter(l => /^[A-Z_][A-Z0-9_]*=/.test(l)).reduce((acc, l) => { const i = l.indexOf('='); if (i > 0) acc[l.slice(0, i)] = l.slice(i + 1); return acc; }, {})})\n\n",
+        "### Example 11 — semver from `tool --version`\n",
+        "goal: extract the version string (major.minor.patch) from a --version banner\n",
+        "schemaHint: {\"keys\": {\"version\": \"string\"}}\n",
+        "outputPreview: \"my-tool version 4.12.0 (build 2026-03-14, rev abc1234)\\nCopyright (c) 2026 Example Corp.\\n\"\n",
+        "expression: ({version: ((output.match(/\\b(\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?)\\b/) || [])[1]) || ''})\n\n",
+        "### Example 12 — pytest summary counts\n",
+        "goal: extract pass/fail/skip counts from a pytest summary line\n",
+        "schemaHint: {\"keys\": {\"passed\": \"number\", \"failed\": \"number\", \"skipped\": \"number\"}}\n",
+        "outputPreview: \"collected 47 items\\n\\ntests/test_api.py ..........F.....s....          [ 45%]\\ntests/test_db.py ............s.s..............          [100%]\\n\\n======== 42 passed, 1 failed, 4 skipped in 12.34s ========\\n\"\n",
+        "expression: ({passed: Number(((output.match(/(\\d+)\\s+passed/) || [])[1]) || 0), failed: Number(((output.match(/(\\d+)\\s+failed/) || [])[1]) || 0), skipped: Number(((output.match(/(\\d+)\\s+skipped/) || [])[1]) || 0)})\n\n",
+        "### Example 13 — unique IPs from access log\n",
+        "goal: count distinct client IPs that produced any 5xx response\n",
+        "schemaHint: {\"keys\": {\"error_ips\": \"string[]\", \"error_ip_count\": \"number\"}}\n",
+        "outputPreview: \"10.0.0.12 - - [21/Apr/2026:09:02:10] \\\"GET /api/a HTTP/1.1\\\" 200 1244\\n10.0.0.55 - - [21/Apr/2026:09:02:11] \\\"GET /api/b HTTP/1.1\\\" 502 41\\n10.0.0.12 - - [21/Apr/2026:09:02:13] \\\"GET /api/c HTTP/1.1\\\" 503 44\\n10.0.0.91 - - [21/Apr/2026:09:02:14] \\\"GET /api/d HTTP/1.1\\\" 200 1200\\n10.0.0.55 - - [21/Apr/2026:09:02:15] \\\"GET /api/b HTTP/1.1\\\" 500 47\\n\"\n",
+        "expression: (((ips) => ({error_ips: ips, error_ip_count: ips.length}))(Array.from(new Set(output.split(/\\r?\\n/).filter(l => /\"\\s+5\\d{2}\\s/.test(l)).map(l => (l.match(/^(\\d+\\.\\d+\\.\\d+\\.\\d+)/) || [])[1]).filter(Boolean))).slice(0, 50)))\n\n",
         "## Response format\n\n",
         "Respond ONLY with a single JSON object matching {\"expression\": \"<js>\"} via the supplied tool. Do not wrap in prose. Do not emit multiple tool calls. Keep the expression on a single line.\n\n",
         "## Anti-patterns to avoid\n\n",
@@ -775,7 +804,7 @@ fn build_prompt_split(
         "- Do not access globals like `process`, `require`, `fetch`, `window`, `document` — they are not in scope.\n",
         "- Do not assume the preview is the full `output` at runtime — `output` may be longer.\n",
         "- Do not rely on regex flags other than `g`, `i`, `m`, `s`, `u` — other flags are not guaranteed.\n\n",
-        "Emitter system v1"
+        "Emitter system v2"
     );
 
     let user_message = format!(
@@ -1123,15 +1152,18 @@ mod tests {
     fn build_prompt_split_meets_cache_threshold() {
         let hint = serde_json::json!({"keys": {"a": "string"}});
         let (system_prefix, _user) = build_prompt_split("some goal", &hint, "some preview");
-        // Plan decision 4: the system_prefix must cross ~4000 chars
-        // (Anthropic's ~1024-token Haiku caching minimum) or
-        // `cache_control: ephemeral` is a no-op. Don't shrink without
-        // re-measuring. NOTE: newer Haiku models raise the minimum to
-        // ~2048 tokens (~8000 chars); if real telemetry shows a zero
-        // cache_read rate against haiku-4-5, bump the examples further.
+        // Plan decision 4: the system_prefix must cross Anthropic's
+        // Haiku caching minimum or `cache_control: ephemeral` is a no-op.
+        // Haiku 3.x was ~1024 tokens (~4000 chars); Haiku 4.x raised the
+        // floor to ~2048 tokens (~8000 chars) — confirmed against
+        // `claude-haiku-4-5-20251001` on 2026-04-22 where a 5943-char
+        // prefix produced `cache_read_input_tokens=0` on repeat calls.
+        // If a future Haiku revision raises the minimum again and real
+        // telemetry shows a zero cache_read rate, bump examples further
+        // and update this bound.
         assert!(
-            system_prefix.len() >= 4000,
-            "system_prefix length {} is under the 4000-char cache threshold",
+            system_prefix.len() >= 8000,
+            "system_prefix length {} is under the 8000-char Haiku 4.x cache threshold",
             system_prefix.len()
         );
     }
@@ -1139,15 +1171,15 @@ mod tests {
     #[test]
     fn build_prompt_split_contains_version_suffix() {
         let (system_prefix, _user) = build_prompt_split("g", &serde_json::json!({}), "p");
-        // The trailing `Emitter system v1` marker lets intentional
+        // The trailing `Emitter system v2` marker lets intentional
         // preamble bumps invalidate the cache cleanly instead of
         // waiting for the 5-minute TTL.
         assert!(
-            system_prefix.trim_end().ends_with("Emitter system v1"),
+            system_prefix.trim_end().ends_with("Emitter system v2"),
             "system_prefix should end with the version suffix; got tail: {:?}",
             &system_prefix[system_prefix.len().saturating_sub(64)..]
         );
-        assert!(system_prefix.contains("Emitter system v1"));
+        assert!(system_prefix.contains("Emitter system v2"));
     }
 
     #[test]
