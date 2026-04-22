@@ -775,6 +775,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_machine_configs::sm_backfill_capture_screenshot_dimensions,
             commands::state_machine_configs::sm_audit_capture_screenshot_bounds,
             commands::state_machine_configs::sm_generate_static,
+            // Spec drift detection
+            commands::spec_drift::scan_spec_drift,
             // UI Bridge Baseline commands (visual regression persistent store)
             commands::ui_bridge_baselines::sm_save_baseline,
             commands::ui_bridge_baselines::sm_get_baseline,

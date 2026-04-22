@@ -22,6 +22,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import type { ConnectionState } from "./types";
+import { SpecDriftButton } from "./SpecDriftButton";
 
 interface ConnectionBarProps {
   connection: ConnectionState;
@@ -324,6 +325,13 @@ export function ConnectionBar({
             ref={syncRef}
             onClick={onSyncAllSpecs}
             disabled={isLoading || stats.totalSpecs === 0}
+            title={
+              "Re-runs the AI against every loaded spec whose structure looks stale " +
+              "(missing stateMachine section, or groups that don't line up with states) " +
+              "and merges the regenerated output back. Use this after editing groups to " +
+              "rebuild the state machine, or after bulk-adding assertions. Does not add " +
+              "new assertions for elements it finds in source — use Check Drift for that."
+            }
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
             bg-teal-600 text-white shadow-xs shadow-teal-600/25
             hover:bg-teal-700 disabled:opacity-50 transition-colors shrink-0"
@@ -332,10 +340,19 @@ export function ConnectionBar({
             Sync All Specs
           </button>
         )}
+        <SpecDriftButton />
         <button
           ref={compileRef}
           onClick={onCompileStateMachine}
           disabled={isLoading || stats.totalSpecs === 0}
+          title={
+            "Compiles the stateMachine sections of every loaded .spec.uibridge.json " +
+            "into one runtime state machine, loads it into the UI Bridge engine so the " +
+            "pathfinder can navigate by state, and persists it to the backend DB. " +
+            "This is the canonical build-from-declared-specs flow. " +
+            "Note: different from the State Machine page's 'Generate for Runner' button, " +
+            "which reverse-engineers a state machine by statically analyzing React source."
+          }
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
           bg-violet-600 text-white shadow-xs shadow-violet-600/25
           hover:bg-violet-700 disabled:opacity-50 transition-colors shrink-0"

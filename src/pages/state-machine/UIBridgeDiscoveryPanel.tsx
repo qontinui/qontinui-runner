@@ -437,6 +437,15 @@ export function UIBridgeDiscoveryPanel({
                   <button
                     onClick={handleGenerateForRunner}
                     disabled={isAnalyzing}
+                    title={
+                      "Statically analyzes the runner's own React source tree " +
+                      "(scanning useUIElement registrations and navigation wiring) " +
+                      "and emits a state machine JSON derived directly from code. " +
+                      "A reverse-engineering flow — it infers states from what the " +
+                      "code declares, independent of spec files. " +
+                      "Note: different from the Specs page's 'Compile State Machine' " +
+                      "button, which compiles from declared .spec.uibridge.json files."
+                    }
                     className="inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium bg-brand-primary text-white hover:bg-brand-primary/90 disabled:opacity-50"
                   >
                     {isAnalyzing ? (

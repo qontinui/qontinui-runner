@@ -111,6 +111,7 @@ pub mod security_settings;
 pub mod self_healing_settings;
 pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution
+pub mod spec_drift; // Spec drift detection (useUIElement vs spec assertions)
 pub mod state_explorer; // State explorer for AI-driven state machine exploration
 pub mod state_machine;
 pub mod state_machine_configs; // State machine config builder CRUD
