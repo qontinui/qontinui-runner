@@ -1179,9 +1179,16 @@ async fn handle_ai_execute(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/ai/execute", Some(body)).await {
+    match sdk_request(&state, Method::POST, "/ai/execute", Some(body.clone())).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_sdk_err) => {
+            debug!("SDK ai/execute unavailable, falling back to IPC control endpoint");
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "ai_execute", payload).await {
+                Ok(data) => Json(data),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -1190,9 +1197,16 @@ async fn handle_ai_assert(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/ai/assert", Some(body)).await {
+    match sdk_request(&state, Method::POST, "/ai/assert", Some(body.clone())).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_sdk_err) => {
+            debug!("SDK ai/assert unavailable, falling back to IPC control endpoint");
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "ai_assert", payload).await {
+                Ok(data) => Json(data),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -1400,7 +1414,13 @@ async fn handle_network_request(
 async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/ai/snapshot", None).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_sdk_err) => {
+            debug!("SDK ai/snapshot unavailable, falling back to IPC control endpoint");
+            match ui_bridge_request_sync(&state, "ai_snapshot", serde_json::json!({})).await {
+                Ok(data) => Json(data),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -1408,7 +1428,13 @@ async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_js
 async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/ai/summary", None).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_sdk_err) => {
+            debug!("SDK ai/summary unavailable, falling back to IPC control endpoint");
+            match ui_bridge_request_sync(&state, "ai_summary", serde_json::json!({})).await {
+                Ok(data) => Json(data),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -2756,9 +2782,16 @@ async fn handle_ai_find(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/ai/find", Some(body)).await {
+    match sdk_request(&state, Method::POST, "/ai/find", Some(body.clone())).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_sdk_err) => {
+            debug!("SDK ai/find unavailable, falling back to IPC control endpoint");
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "ai_find", payload).await {
+                Ok(data) => Json(data),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -2767,9 +2800,16 @@ async fn handle_ai_assert_batch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/ai/assert/batch", Some(body)).await {
+    match sdk_request(&state, Method::POST, "/ai/assert/batch", Some(body.clone())).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_sdk_err) => {
+            debug!("SDK ai/assert/batch unavailable, falling back to IPC control endpoint");
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "ai_assert_batch", payload).await {
+                Ok(data) => Json(data),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
