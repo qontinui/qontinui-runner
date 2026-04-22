@@ -140,7 +140,7 @@ qontinui-runner/
 
 - Follow PEP 8
 - Use type hints
-- Format with black
+- Format with `ruff format`
 - Minimal code - delegate to qontinui library
 
 ## Testing
