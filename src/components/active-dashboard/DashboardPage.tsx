@@ -189,6 +189,7 @@ export function DashboardPage({
       // Workflow just finished — batch state updates for completion overlay
       const finalStatus =
         state.status === "completed" || state.status === "failed" ? state.status : "completed";
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- transition detection (running → stopped)
       setCompletionStatus(finalStatus);
       setCompletionStats(computeStatsFromActivities(state.layout.activities));
 

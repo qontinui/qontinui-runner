@@ -74,6 +74,7 @@ export function useTaskRunLive(
   useEffect(() => {
     if (taskRunId !== prevTaskIdRef.current) {
       prevTaskIdRef.current = taskRunId;
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on task ID change
       setEvents([]);
       setOutputOffset(0);
     }

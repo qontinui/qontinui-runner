@@ -236,11 +236,12 @@ export class TauriScriptEmitter implements ScriptEmitter {
       if (typed && typeof typed.kind === "string") {
         throw new Error(
           `TauriScriptEmitter rejected (${typed.kind}): ${typed.message ?? "<no message>"}`,
+          { cause: err },
         );
       }
       // Transport / unexpected error — re-throw as-is (wrapped if not an Error).
       if (err instanceof Error) throw err;
-      throw new Error(`TauriScriptEmitter failed: ${String(err)}`);
+      throw new Error(`TauriScriptEmitter failed: ${String(err)}`, { cause: err });
     }
   }
 }
