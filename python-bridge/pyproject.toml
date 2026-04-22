@@ -27,8 +27,9 @@ aiohttp = "^3.9"
 # which will clobber the headless install unless pinned here. If you ever
 # see the above error, run:
 #   poetry run pip uninstall -y opencv-python
-#   poetry run pip install --force-reinstall --no-deps "opencv-python-headless==4.11.0.86"
-opencv-python-headless = "4.11.0.86"
+#   poetry run pip install --force-reinstall --no-deps "opencv-python-headless"
+# Version constraint must stay in sync with qontinui's own constraint.
+opencv-python-headless = "^4.13"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -69,6 +70,15 @@ disable = ["C0114", "C0115", "C0116"]
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+# Required because the `qontinui` path dep pins torch/torchvision to this
+# source. Poetry resolves a path dep's source requirements against the
+# parent project's configured sources, so this block must mirror
+# qontinui/pyproject.toml.
+[[tool.poetry.source]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+priority = "explicit"
 
 # Optional ML dependencies
 [tool.poetry.group.ml]
