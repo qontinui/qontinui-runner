@@ -2,6 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { useUIBridge } from "@qontinui/ui-bridge";
 import { tracedFetch } from "@/lib/traced-fetch";
 import { getApiBase } from "@/lib/runner-api";
+import { buildPageCatalog } from "./pageCatalog";
 
 export interface PlanStep {
   type: "navigate" | "action";
@@ -68,11 +69,14 @@ export function usePromptExecution(): UsePromptExecutionReturn {
       setPhase("planning");
 
       try {
-        // Step 1: Get the action plan from backend
+        // Step 1: Get the action plan from backend.
+        // Include a catalog of real element labels from loaded specs so the
+        // planner names actual buttons instead of hallucinating generic ones.
+        const pageCatalog = buildPageCatalog();
         const resp = await tracedFetch(`${getApiBase()}/prompt-home/plan`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt, explain }),
+          body: JSON.stringify({ prompt, explain, pageCatalog }),
         });
 
         if (!resp.ok) {

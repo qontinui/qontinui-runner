@@ -57,6 +57,18 @@ Rules:
 - Action instructions should be natural language like "type 'hello' in the search field" or "click the Submit button"
 - For simple navigation requests ("show me X"), just use a single navigate step
 - For complex tasks, break into navigate + action steps
+- When a page element catalog is provided below, prefer the exact labels from
+  the catalog when naming buttons/inputs in action instructions. Do not invent
+  generic names if a real one is listed.
+"#;
+
+const CATALOG_HEADER: &str = r#"
+=== Page Element Catalog ===
+Real element labels discovered from loaded specs. When writing action
+instructions, use these exact labels (or a close substring) so the runtime
+can find the element. If a control you need isn't listed, the user may need
+to open a panel or switch a tab first — plan accordingly.
+
 "#;
 
 const EXPLAIN_SUFFIX: &str = r#"
@@ -72,6 +84,11 @@ pub struct PlanIntentRequest {
     pub prompt: String,
     #[serde(default)]
     pub explain: bool,
+    /// Compact catalog of real element labels per spec, built on the client
+    /// from the SpecStore. Injected into the system prompt so the planner
+    /// uses actual button names instead of hallucinating generic ones.
+    #[serde(default, rename = "pageCatalog")]
+    pub page_catalog: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -121,11 +138,19 @@ pub async fn plan_intent_handler(
     }
 
     // Build combined prompt with system instructions + user request
-    let system_prompt = if request.explain {
-        format!("{}{}", SYSTEM_PROMPT_BASE, EXPLAIN_SUFFIX)
+    let suffix = if request.explain {
+        EXPLAIN_SUFFIX
     } else {
-        format!("{}{}", SYSTEM_PROMPT_BASE, BRIEF_SUFFIX)
+        BRIEF_SUFFIX
     };
+    let catalog_section = request
+        .page_catalog
+        .as_deref()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("{}{}\n", CATALOG_HEADER, c))
+        .unwrap_or_default();
+    let system_prompt = format!("{}{}{}", SYSTEM_PROMPT_BASE, suffix, catalog_section);
     let full_prompt = format!("{}\n\nUser request: {}", system_prompt, request.prompt);
 
     // Run through the configured AI provider (Claude CLI, Claude API, Gemini, etc.)
