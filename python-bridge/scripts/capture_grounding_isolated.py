@@ -122,7 +122,15 @@ COMPONENTS: dict[str, dict[str, list[str]]] = {
         "states": ["enabled", "disabled"],
     },
     "Badge": {
-        "variants": ["default", "secondary", "destructive", "outline", "success", "warning", "info"],
+        "variants": [
+            "default",
+            "secondary",
+            "destructive",
+            "outline",
+            "success",
+            "warning",
+            "info",
+        ],
         "sizes": ["default"],
         "states": ["enabled"],
     },
@@ -169,13 +177,36 @@ COMPONENTS: dict[str, dict[str, list[str]]] = {
 }
 
 BACKGROUNDS: list[str] = [
-    "solid-blue", "solid-red", "solid-green", "solid-purple", "solid-orange",
-    "solid-yellow", "solid-pink", "solid-teal", "solid-gray", "solid-white",
-    "solid-black", "solid-slate", "solid-zinc", "solid-stone", "solid-neutral",
-    "solid-indigo", "solid-violet", "solid-fuchsia", "solid-rose", "solid-cyan",
-    "solid-emerald", "solid-lime", "solid-amber", "solid-sky",
-    "gradient-purple-blue", "gradient-red-orange", "gradient-green-teal",
-    "gradient-pink-purple", "gradient-blue-cyan", "gradient-dark",
+    "solid-blue",
+    "solid-red",
+    "solid-green",
+    "solid-purple",
+    "solid-orange",
+    "solid-yellow",
+    "solid-pink",
+    "solid-teal",
+    "solid-gray",
+    "solid-white",
+    "solid-black",
+    "solid-slate",
+    "solid-zinc",
+    "solid-stone",
+    "solid-neutral",
+    "solid-indigo",
+    "solid-violet",
+    "solid-fuchsia",
+    "solid-rose",
+    "solid-cyan",
+    "solid-emerald",
+    "solid-lime",
+    "solid-amber",
+    "solid-sky",
+    "gradient-purple-blue",
+    "gradient-red-orange",
+    "gradient-green-teal",
+    "gradient-pink-purple",
+    "gradient-blue-cyan",
+    "gradient-dark",
 ]
 
 THEMES: list[str] = ["light", "dark"]
@@ -184,6 +215,7 @@ THEMES: list[str] = ["light", "dark"]
 # ---------------------------------------------------------------------------
 # UI Bridge HTTP client (mirrored from capture_grounding_static.py)
 # ---------------------------------------------------------------------------
+
 
 class UIBridgeClient:
     """Minimal HTTP client for UI Bridge control endpoints."""
@@ -244,7 +276,10 @@ class UIBridgeClient:
         return self._post("/control/viewport-constraints", {"restore": True})
 
     def element_action(
-        self, element_id: str, action: str, params: dict | None = None,
+        self,
+        element_id: str,
+        action: str,
+        params: dict | None = None,
     ) -> dict:
         """Invoke an action on a registered element (click, setValue, etc.)."""
         body: dict = {"action": action}
@@ -279,6 +314,7 @@ class UIBridgeClient:
 # Screenshot capture (mss — same pattern as trajectory_logger.py)
 # ---------------------------------------------------------------------------
 
+
 def capture_screen(monitor_index: int = 1) -> tuple[bytes, int, int]:
     """Capture a monitor as PNG bytes. Returns (png_bytes, width, height).
 
@@ -292,8 +328,7 @@ def capture_screen(monitor_index: int = 1) -> tuple[bytes, int, int]:
     with mss.mss() as sct:
         if monitor_index < 0 or monitor_index >= len(sct.monitors):
             raise ValueError(
-                f"monitor_index={monitor_index} out of range; "
-                f"available: 0..{len(sct.monitors) - 1}"
+                f"monitor_index={monitor_index} out of range; available: 0..{len(sct.monitors) - 1}"
             )
         mon = sct.monitors[monitor_index]
         shot = sct.grab(mon)
@@ -331,7 +366,9 @@ COMPONENT_SIZES: dict[str, tuple[int, int]] = {
 
 
 def estimate_target_bbox(
-    params: dict, screen_w: int, screen_h: int,
+    params: dict,
+    screen_w: int,
+    screen_h: int,
 ) -> GroundingElement:
     """Estimate the bounding box of the rendered component.
 
@@ -400,6 +437,7 @@ def find_target_element(snapshot: dict) -> GroundingElement | None:
 # ---------------------------------------------------------------------------
 # Sample generation
 # ---------------------------------------------------------------------------
+
 
 def build_sample_matrix() -> list[dict]:
     """Enumerate every (component, variant, size, state) combination."""
@@ -474,6 +512,7 @@ def build_api_isolated_url(params: dict, sample_index: int | None = None) -> str
 # Main capture loop
 # ---------------------------------------------------------------------------
 
+
 def _derive_host_url(ui_bridge_url: str, path: str = "/dev/grounding/capture-host") -> str:
     """Convert a UI Bridge URL like http://host:port/api/ui-bridge to a
     full page URL at ``path`` on the same origin."""
@@ -495,7 +534,8 @@ def _has_capture_host_elements(client: UIBridgeClient) -> bool:
 
 
 def _wait_for_capture_host(
-    client: UIBridgeClient, timeout_s: float = 15.0,
+    client: UIBridgeClient,
+    timeout_s: float = 15.0,
 ) -> bool:
     """Wait until a tab is connected AND it's the capture-host page."""
     deadline = time.time() + timeout_s
@@ -546,7 +586,8 @@ def _ensure_capture_host_connected(
         if tab_count > 0:
             try:
                 logger.info(
-                    "Redirecting existing tab to capture-host (attempt %d)", attempt,
+                    "Redirecting existing tab to capture-host (attempt %d)",
+                    attempt,
                 )
                 client.navigate("/dev/grounding/capture-host", hard=True)
                 if _wait_for_capture_host(client, timeout_s=15.0):
@@ -557,7 +598,8 @@ def _ensure_capture_host_connected(
 
         logger.info(
             "Opening capture-host in default browser: %s (attempt %d)",
-            host_url, attempt,
+            host_url,
+            attempt,
         )
         try:
             webbrowser.open(host_url, new=2)  # new=2 → new tab
@@ -571,7 +613,8 @@ def _ensure_capture_host_connected(
     logger.error(
         "Failed to bootstrap capture-host after %d attempts. "
         "Manually open %s in a browser and rerun.",
-        max_attempts, host_url,
+        max_attempts,
+        host_url,
     )
     sys.exit(1)
 
@@ -618,7 +661,9 @@ def run_capture_host(
             # The delay between the two commands lets React's controlled-input
             # onChange propagate before the button handler reads the state.
             client.element_action(
-                "capture-next-url", "setValue", {"value": sample_url},
+                "capture-next-url",
+                "setValue",
+                {"value": sample_url},
             )
             time.sleep(0.25)
             client.element_action("capture-advance", "click")
@@ -655,23 +700,17 @@ def run_capture_host(
                     snap = client.get_control_snapshot()
                     for el in snap.get("elements", []):
                         if el.get("id") not in (
-                            "capture-last-echo", "capture-last-bbox",
+                            "capture-last-echo",
+                            "capture-last-bbox",
                         ):
                             continue
-                        raw = (
-                            (el.get("state") or {}).get("value")
-                            or el.get("value")
-                            or ""
-                        )
+                        raw = (el.get("state") or {}).get("value") or el.get("value") or ""
                         if raw:
                             try:
                                 candidate = json.loads(raw)
                             except Exception:
                                 candidate = None
-                            if (
-                                candidate
-                                and int(candidate.get("sampleIndex", -1)) == idx
-                            ):
+                            if candidate and int(candidate.get("sampleIndex", -1)) == idx:
                                 bbox = candidate
                                 break
                     if bbox:
@@ -690,8 +729,7 @@ def run_capture_host(
             png_bytes = None
             screen_w = screen_h = 0
             screenshot_endpoint = (
-                f"{base_origin}/api/grounding-isolated/screenshot"
-                f"?sampleIndex={idx}"
+                f"{base_origin}/api/grounding-isolated/screenshot?sampleIndex={idx}"
             )
             shot_deadline = time.time() + 4.0
             while time.time() < shot_deadline:
@@ -741,14 +779,19 @@ def run_capture_host(
             bx, by, bw, bh = target_el.bbox
             if bw < 10 or bh < 10:
                 logger.debug(
-                    "Sample %d: bbox too small (%dx%d) — skipping", idx, bw, bh,
+                    "Sample %d: bbox too small (%dx%d) — skipping",
+                    idx,
+                    bw,
+                    bh,
                 )
                 total_skipped += 1
                 continue
             if screen_w < 200 or screen_h < 200:
                 logger.debug(
                     "Sample %d: screenshot too small (%dx%d) — skipping",
-                    idx, screen_w, screen_h,
+                    idx,
+                    screen_w,
+                    screen_h,
                 )
                 total_skipped += 1
                 continue
@@ -792,12 +835,18 @@ def run_capture_host(
         if (idx + 1) % 50 == 0:
             logger.info(
                 "Progress: %d/%d — written=%d skipped=%d errors=%d",
-                idx + 1, num_samples, total_written, total_skipped, total_errors,
+                idx + 1,
+                num_samples,
+                total_written,
+                total_skipped,
+                total_errors,
             )
 
     logger.info(
         "Done. written=%d skipped=%d errors=%d → %s",
-        total_written, total_skipped, total_errors,
+        total_written,
+        total_skipped,
+        total_errors,
         output_dir / "grounding.jsonl",
     )
 
@@ -917,11 +966,10 @@ def run_capture(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "Capture isolated component grounding data from qontinui-web via UI Bridge"
-        ),
+        description=("Capture isolated component grounding data from qontinui-web via UI Bridge"),
     )
     parser.add_argument(
         "--ui-bridge-url",

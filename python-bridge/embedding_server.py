@@ -124,7 +124,7 @@ def compute_batch_embedding(request: BatchEmbeddingRequest):
             embeddings=[row.tolist() for row in matrix],
             embedding_dim=int(matrix.shape[1]) if len(matrix) > 0 else 384,
         )
-    except Exception as e:
+    except Exception:
         return BatchEmbeddingResponse(
             success=False,
             embeddings=[],

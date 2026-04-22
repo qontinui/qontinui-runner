@@ -99,9 +99,9 @@ class WebExtractionService:
 
         # Store extraction results
         self._extraction_results: dict[str, Any] = {}  # extraction_id -> ExtractionResult
-        self._composite_results: dict[str, dict[str, Any]] = (
-            {}
-        )  # composite_id -> composite structure
+        self._composite_results: dict[
+            str, dict[str, Any]
+        ] = {}  # composite_id -> composite structure
 
         # Vision extraction (lazy initialized)
         self._vision_extractor: UnifiedVisionExtractor | None = None

@@ -96,6 +96,7 @@ SETTLE_DELAY = 1.0
 # UI Bridge HTTP helpers
 # ---------------------------------------------------------------------------
 
+
 class UIBridgeClient:
     """Minimal HTTP client for UI Bridge control endpoints."""
 
@@ -145,6 +146,7 @@ class UIBridgeClient:
 # Screenshot capture (mss — same pattern as trajectory_logger.py)
 # ---------------------------------------------------------------------------
 
+
 def capture_screen() -> tuple[bytes, int, int]:
     """Capture the primary monitor as PNG bytes. Returns (png_bytes, width, height)."""
     import mss
@@ -164,6 +166,7 @@ def capture_screen() -> tuple[bytes, int, int]:
 # ---------------------------------------------------------------------------
 # Element extraction (UI Bridge snapshot → GroundingElement)
 # ---------------------------------------------------------------------------
+
 
 def snapshot_to_elements(snapshot: dict) -> list[GroundingElement]:
     """Convert UI Bridge control snapshot elements to GroundingElements."""
@@ -200,6 +203,7 @@ def snapshot_to_elements(snapshot: dict) -> list[GroundingElement]:
 # ---------------------------------------------------------------------------
 # Main capture loop
 # ---------------------------------------------------------------------------
+
 
 def run_capture(
     ui_bridge_url: str,
@@ -293,6 +297,7 @@ def run_capture(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(

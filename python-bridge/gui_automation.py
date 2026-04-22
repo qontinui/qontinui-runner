@@ -136,10 +136,11 @@ class GUIAutomation:
                     if loop.is_running():
                         # We're already in an async context — use create_task
                         import concurrent.futures
+
                         with concurrent.futures.ThreadPoolExecutor() as pool:
-                            snapshot = pool.submit(
-                                asyncio.run, a11y_service.capture_tree()
-                            ).result(timeout=3.0)
+                            snapshot = pool.submit(asyncio.run, a11y_service.capture_tree()).result(
+                                timeout=3.0
+                            )
                     else:
                         snapshot = asyncio.run(a11y_service.capture_tree())
 
@@ -162,9 +163,7 @@ class GUIAutomation:
                 state_name = ""
                 if self.state_executor and self.state_executor.current_state:
                     state_name = f" in state '{self.state_executor.current_state}'"
-                text_content = (
-                    f"Action: {action_type} (success={success}){state_name}"
-                )
+                text_content = f"Action: {action_type} (success={success}){state_name}"
 
             capture_data = {
                 "textContent": text_content[:5000],  # Cap at 5KB

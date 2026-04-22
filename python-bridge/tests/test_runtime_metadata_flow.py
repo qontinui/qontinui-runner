@@ -249,9 +249,9 @@ class TestRuntimeMetadataFlow:
 
         # Verify typed text is in runtime
         assert "typed_text" in runtime, "Runtime must include typed_text"
-        assert (
-            runtime["typed_text"] == "l"
-        ), f"Expected typed_text='l', got '{runtime.get('typed_text')}'"
+        assert runtime["typed_text"] == "l", (
+            f"Expected typed_text='l', got '{runtime.get('typed_text')}'"
+        )
         print(f"✓ Typed text in runtime: '{runtime['typed_text']}'")
 
         # Verify config is complete

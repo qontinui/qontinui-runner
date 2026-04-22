@@ -564,9 +564,7 @@ class QontinuiExecutor:
                     trajectory_output = Path(
                         os.getenv("QONTINUI_EXPORT_DIR", str(run_dir / "dataset"))
                     )
-                    max_records = int(
-                        os.getenv("QONTINUI_TRAJECTORY_MAX_RECORDS", "500")
-                    )
+                    max_records = int(os.getenv("QONTINUI_TRAJECTORY_MAX_RECORDS", "500"))
 
                     # WSM is the preferred success-labelling source for
                     # grounding records. Gated by QONTINUI_WSM_ENABLED
@@ -587,16 +585,13 @@ class QontinuiExecutor:
                     # so existing E2E rigs keep working. Otherwise rely
                     # on TrajectoryLogger's lazy construction.
                     try:
-                        legacy_endpoint = os.getenv(
-                            "QONTINUI_WORLD_STATE_VERIFIER_LEGACY_ENDPOINT"
-                        )
+                        legacy_endpoint = os.getenv("QONTINUI_WORLD_STATE_VERIFIER_LEGACY_ENDPOINT")
                         if legacy_endpoint:
                             from tests.e2e.broken_accessibility._wsm_client import (
                                 WorldStateVerifierClient,
                             )
-                            wsm_client = WorldStateVerifierClient(
-                                endpoint=legacy_endpoint
-                            )
+
+                            wsm_client = WorldStateVerifierClient(endpoint=legacy_endpoint)
                     except ImportError:
                         pass
 
@@ -607,6 +602,7 @@ class QontinuiExecutor:
                             from qontinui.discovery.element_detection.omniparser_detector import (
                                 OmniParserDetector,
                             )
+
                             omniparser = OmniParserDetector()
                         except ImportError:
                             pass
@@ -764,15 +760,11 @@ class QontinuiExecutor:
             # Set pause event for synchronization
             self.gui_automation.set_pause_event(self._pause_event)
             # Set activity timeline capture callback (screenpipe-inspired)
-            self.gui_automation.set_timeline_capture_fn(
-                self.event_manager.emit_timeline_capture
-            )
+            self.gui_automation.set_timeline_capture_fn(self.event_manager.emit_timeline_capture)
 
             # Wire trajectory logger pre-action callback
             if self._trajectory_logger:
-                self.gui_automation._pre_action_callback = (
-                    self._trajectory_logger.on_action_start
-                )
+                self.gui_automation._pre_action_callback = self._trajectory_logger.on_action_start
 
             # Inject self as workflow executor for navigation
             if QONTINUI_AVAILABLE:

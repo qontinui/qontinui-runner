@@ -43,10 +43,6 @@ flake8 = "^7.3"
 pre-commit = "^4.4"
 types-requests = "^2.31"
 
-[tool.black]
-line-length = 100
-target-version = ['py311', 'py312']
-
 [tool.mypy]
 python_version = "3.12"
 warn_return_any = true

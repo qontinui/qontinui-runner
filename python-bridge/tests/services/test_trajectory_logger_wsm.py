@@ -103,7 +103,9 @@ from services.trajectory_logger import TrajectoryLogger  # noqa: E402
 
 
 class _FakeVerdict:
-    def __init__(self, success: bool, source: str, confidence: float = 0.9, reason: str = "ok") -> None:
+    def __init__(
+        self, success: bool, source: str, confidence: float = 0.9, reason: str = "ok"
+    ) -> None:
         self.success = success
         self.source = source
         self.confidence = confidence
@@ -133,7 +135,9 @@ def _make_record(**overrides: Any):
     return ActionExecutionRecord(**defaults)
 
 
-def _make_logger(tmp_path: Path, wsm_client: Any | None, wsm_enabled: bool = True) -> TrajectoryLogger:
+def _make_logger(
+    tmp_path: Path, wsm_client: Any | None, wsm_enabled: bool = True
+) -> TrajectoryLogger:
     return TrajectoryLogger(
         output_dir=tmp_path,
         max_records_per_session=10,
@@ -162,9 +166,7 @@ def test_wsm_verdict_success_source_is_wsm(tmp_path: Path) -> None:
     pre_arr = np.zeros((10, 10, 3), dtype=np.uint8)
     post_arr = np.zeros((10, 10, 3), dtype=np.uint8)
 
-    success, source = logger._compute_success_label(
-        record, pre, pre_arr, post, post_arr
-    )
+    success, source = logger._compute_success_label(record, pre, pre_arr, post, post_arr)
 
     assert success is True
     assert source == "wsm"
@@ -186,9 +188,7 @@ def test_wsm_verdict_source_pixel_diff_is_propagated(tmp_path: Path) -> None:
     pre_arr = np.zeros((10, 10, 3), dtype=np.uint8)
     post_arr = np.zeros((10, 10, 3), dtype=np.uint8)
 
-    success, source = logger._compute_success_label(
-        record, pre, pre_arr, post, post_arr
-    )
+    success, source = logger._compute_success_label(record, pre, pre_arr, post, post_arr)
 
     assert success is False
     assert source == "pixel_diff"
@@ -208,9 +208,7 @@ def test_wsm_exception_falls_through_to_pixel_diff(tmp_path: Path) -> None:
     pre_arr = np.zeros((50, 50, 3), dtype=np.uint8)
     post_arr = np.full((50, 50, 3), 255, dtype=np.uint8)
 
-    success, source = logger._compute_success_label(
-        record, pre, pre_arr, post, post_arr
-    )
+    success, source = logger._compute_success_label(record, pre, pre_arr, post, post_arr)
 
     assert source == "pixel_diff"
     # Arrays differ by 255 per channel ⇒ mean diff > threshold ⇒ success True
@@ -237,9 +235,7 @@ def test_legacy_client_with_status_field_still_works(tmp_path: Path) -> None:
     pre_arr = np.zeros((10, 10, 3), dtype=np.uint8)
     post_arr = np.zeros((10, 10, 3), dtype=np.uint8)
 
-    success, source = logger._compute_success_label(
-        record, pre, pre_arr, post, post_arr
-    )
+    success, source = logger._compute_success_label(record, pre, pre_arr, post, post_arr)
 
     assert success is True
     assert source == "wsm"
@@ -276,11 +272,12 @@ def test_disabled_wsm_ignores_explicit_client(tmp_path: Path) -> None:
 def test_enabled_wsm_lazy_constructs_default_client(tmp_path: Path) -> None:
     """wsm_enabled=True with no client → construct the canonical WSMClient."""
     sentinel = object()
-    with patch(
-        "services.trajectory_logger._CanonicalWSMClient",
-        return_value=sentinel,
-    ) as mock_ctor, patch(
-        "services.trajectory_logger._WSM_AVAILABLE", True
+    with (
+        patch(
+            "services.trajectory_logger._CanonicalWSMClient",
+            return_value=sentinel,
+        ) as mock_ctor,
+        patch("services.trajectory_logger._WSM_AVAILABLE", True),
     ):
         logger = TrajectoryLogger(
             output_dir=tmp_path,
@@ -294,10 +291,13 @@ def test_enabled_wsm_lazy_constructs_default_client(tmp_path: Path) -> None:
 
 def test_lazy_construction_failure_is_non_fatal(tmp_path: Path) -> None:
     """If lazy WSMClient construction raises, the logger still initialises."""
-    with patch(
-        "services.trajectory_logger._CanonicalWSMClient",
-        side_effect=RuntimeError("bad endpoint"),
-    ), patch("services.trajectory_logger._WSM_AVAILABLE", True):
+    with (
+        patch(
+            "services.trajectory_logger._CanonicalWSMClient",
+            side_effect=RuntimeError("bad endpoint"),
+        ),
+        patch("services.trajectory_logger._WSM_AVAILABLE", True),
+    ):
         logger = TrajectoryLogger(
             output_dir=tmp_path,
             max_records_per_session=5,

@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import importlib.util as _ilu
 import io
-import json
 import logging
 import sys
 import time
@@ -116,10 +115,7 @@ def _pick_live_tab(ui_bridge: str) -> str | None:
                 params={"tabId": tid},
                 timeout=10,
             )
-            ids = {
-                el.get("id")
-                for el in r.json().get("data", {}).get("elements", [])
-            }
+            ids = {el.get("id") for el in r.json().get("data", {}).get("elements", [])}
             if "capture-next-url" in ids and "capture-advance" in ids:
                 return tid
         except Exception:
@@ -226,6 +222,7 @@ def run_capture(
     interval_ms = int(settle_s * 1000)
     real_param = ",".join(routes)
     import urllib.parse
+
     host_url = (
         f"{base_url}/dev/grounding/capture-host"
         f"?real={urllib.parse.quote(real_param, safe=',/')}"
@@ -249,6 +246,7 @@ def run_capture(
         logger.warning("UI Bridge navigate failed (%s); trying webbrowser", exc)
         try:
             import webbrowser
+
             webbrowser.open(host_url, new=2)
         except Exception:
             pass
@@ -268,7 +266,8 @@ def run_capture(
     while pending and time.time() < deadline:
         try:
             r = requests.get(
-                f"{base_url}/api/grounding-isolated/page-capture", timeout=5,
+                f"{base_url}/api/grounding-isolated/page-capture",
+                timeout=5,
             )
             for e in r.json().get("entries", []):
                 key = e.get("key")
@@ -356,7 +355,10 @@ def run_capture(
             total_elements += len(els)
             logger.info(
                 "  %s: %d elements, %d×%d",
-                route, len(els), screen_w, screen_h,
+                route,
+                len(els),
+                screen_w,
+                screen_h,
             )
         else:
             total_skipped += 1

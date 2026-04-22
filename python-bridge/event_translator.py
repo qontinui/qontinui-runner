@@ -152,7 +152,11 @@ class EventTranslator:
             flush=True,
         )
         register_callback(QontinuiEventType.CASCADE_BACKEND_TRIED, self.on_cascade_backend_tried)
-        print("[EventTranslator] CASCADE_BACKEND_TRIED callback registered", file=sys.stderr, flush=True)
+        print(
+            "[EventTranslator] CASCADE_BACKEND_TRIED callback registered",
+            file=sys.stderr,
+            flush=True,
+        )
 
         print(
             "[EventTranslator] Registering CASCADE_HIT callback...",

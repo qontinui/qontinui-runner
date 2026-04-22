@@ -149,8 +149,7 @@ class TrajectoryLogger:
         self._pre_array: np.ndarray | None = None
 
         logger.info(
-            "TrajectoryLogger initialised: output_dir=%s, max_records=%d, "
-            "wsm=%s, omniparser=%s",
+            "TrajectoryLogger initialised: output_dir=%s, max_records=%d, wsm=%s, omniparser=%s",
             output_dir,
             max_records_per_session,
             "yes" if wsm_client else "no",
@@ -289,8 +288,10 @@ class TrajectoryLogger:
                 #   - Legacy clients (e.g. tests/e2e/broken_accessibility/
                 #     _wsm_client.WsmVerdict) expose .status where "pass" /
                 #     "partial" mean success.
-                if verdict is not None and hasattr(verdict, "source") and hasattr(
-                    verdict, "success"
+                if (
+                    verdict is not None
+                    and hasattr(verdict, "source")
+                    and hasattr(verdict, "success")
                 ):
                     return bool(verdict.success), str(verdict.source)
                 if verdict is not None:

@@ -444,9 +444,7 @@ class VerificationService:
         pattern = Pattern.from_file(
             img_path=str(file_path),
             name=element_name,
-        ).with_similarity(
-            0.8
-        )  # Default threshold
+        ).with_similarity(0.8)  # Default threshold
 
         # Perform find operation
         find_result = await action.find(
