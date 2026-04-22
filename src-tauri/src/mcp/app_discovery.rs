@@ -767,7 +767,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/apps/register", post(register_app))
         .route("/ui-bridge/apps/registered", get(list_registered_apps))
         .route(
-            "/ui-bridge/apps/register/:app_id",
+            "/ui-bridge/apps/register/{app_id}",
             axum::routing::delete(deregister_app),
         )
         .route("/ui-bridge/apps/forward-device", post(forward_device))
