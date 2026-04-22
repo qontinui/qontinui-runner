@@ -94,7 +94,8 @@ export type MainTabId =
   | "decision-trail"
   | "memory-search"
   | "online-learning"
-  | "dag-workflow-editor";
+  | "dag-workflow-editor"
+  | "project-explainer";
 
 const VALID_TAB_IDS: MainTabId[] = [
   "prompt-home",
@@ -191,6 +192,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "memory-search",
   "online-learning",
   "dag-workflow-editor",
+  "project-explainer",
 ];
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";

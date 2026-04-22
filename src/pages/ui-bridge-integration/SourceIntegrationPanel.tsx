@@ -205,8 +205,10 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
         generateDataPageIds: true,
         generateSpecs: true,
         generateTutorials: false, // Off by default to keep it faster
+        generateArchitectureDiagrams: false, // Off by default — opt in via the checklist
         generateDemoVideos: false,
         generateProductTours: false,
+        generateProjectExplainer: false, // Off by default — opt in via the checklist
       };
 
       window.dispatchEvent(
@@ -316,6 +318,12 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
             <button
               onClick={handlePrepareAll}
               disabled={preparingAll || integrating}
+              title={
+                "Fast shortcut: runs with Registrations + Page IDs + Specs enabled and " +
+                "Tutorials / Demo Videos / Product Tours disabled — good for a first pass. " +
+                "For a custom mix (including tutorials, videos, tours) use the Page " +
+                "Discovery checklist that appears below once the SDK is integrated."
+              }
               className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg
                          bg-gradient-to-r from-cyan-500/20 to-purple-500/20 text-foreground
                          border border-cyan-500/30 hover:border-purple-500/30
@@ -335,8 +343,8 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
             </button>
             <p className="text-[10px] text-muted-foreground text-center mt-1">
               {analysis.ui_bridge_status === "none"
-                ? "Installs SDK, discovers pages, generates registrations + specs for all pages"
-                : "Discovers pages, generates registrations + specs for all pages"}
+                ? "Installs SDK, discovers pages, generates registrations + specs for all pages. For a custom mix, use the checklist below."
+                : "Discovers pages, generates registrations + specs for all pages. For a custom mix (tutorials, videos, tours), use the checklist below."}
             </p>
           </div>
 

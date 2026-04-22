@@ -58,6 +58,12 @@ import {
   buildRegistrationPrompt,
   buildPageSpecPrompt,
   buildTutorialPrompt,
+  buildArchitectureDiagramPrompt,
+  buildExplainerIndexPrompt,
+  buildExplainerClusterPrompt,
+  buildExplainerPagePrompt,
+  type ExplainerSpecSummary,
+  type ExplainerCluster,
 } from "@/lib/page-analysis-prompt-builder";
 
 // =============================================================================
@@ -80,6 +86,137 @@ function extractGeneratedFiles(content: string): GeneratedFile[] {
     const filePath = match[1].trim();
     const fileContent = `// FILE: ${filePath}\n${match[2]}`;
     results.push({ filePath, content: fileContent });
+  }
+  return results;
+}
+
+/**
+ * Extract Mermaid diagram file from AI output. Mermaid uses `%%` for comments,
+ * so the prompt instructs the AI to emit `%% FILE: <path>` inside a
+ * ```mermaid block instead of the `// FILE:` convention used for TS files.
+ */
+function extractMermaidFile(content: string): GeneratedFile | null {
+  const regex = /```mermaid\s*\r?\n\s*%%\s*FILE:\s*(.+?)\r?\n([\s\S]*?)```/i;
+  const match = regex.exec(content);
+  if (!match) return null;
+  const filePath = match[1].trim();
+  const body = match[2].trimEnd();
+  return { filePath, content: `%% FILE: ${filePath}\n${body}\n` };
+}
+
+/**
+ * Collect explainer inputs from the set of files just generated during a
+ * per-page run: reads each .spec.uibridge.json + its paired .arch.mmd.
+ * Returns the parsed spec summaries and a map of specId → mermaid body.
+ */
+function gatherExplainerInputs(files: GeneratedFile[]): {
+  specs: ExplainerSpecSummary[];
+  arch: Map<string, string>;
+} {
+  const specs: ExplainerSpecSummary[] = [];
+  const arch = new Map<string, string>();
+  for (const f of files) {
+    if (f.filePath.endsWith(".spec.uibridge.json")) {
+      try {
+        const json = JSON.parse(f.content) as {
+          description?: string;
+          groups?: Array<{ id?: string; name?: string; description?: string }>;
+        };
+        const specId = f.filePath.replace(/^.*\//, "").replace(/\.spec\.uibridge\.json$/, "");
+        specs.push({
+          specId,
+          description: (json.description || "").trim(),
+          groups: (json.groups || [])
+            .filter((g) => g && g.name)
+            .map((g) => ({
+              id: g.id || "",
+              name: g.name || "",
+              description: (g.description || "").trim(),
+            })),
+        });
+      } catch {
+        /* skip malformed spec */
+      }
+    } else if (f.filePath.endsWith(".arch.mmd")) {
+      const specId = f.filePath.replace(/^.*\//, "").replace(/\.arch\.mmd$/, "");
+      // Strip the leading `%% FILE:` comment line from the content.
+      const body = f.content.replace(/^%%\s*FILE:.*\r?\n/, "").trim();
+      arch.set(specId, body);
+    }
+  }
+  return { specs, arch };
+}
+
+/**
+ * Heuristic clustering: group specs by shared first token (split by `-`).
+ * Singletons are merged into a catch-all "other" cluster so we don't emit
+ * clusters of one. Caps total clusters at 8.
+ */
+function clusterSpecsByPrefix(specs: ExplainerSpecSummary[]): ExplainerCluster[] {
+  const buckets = new Map<string, ExplainerSpecSummary[]>();
+  for (const s of specs) {
+    const token = s.specId.split(/[-/]/)[0] || s.specId;
+    if (!buckets.has(token)) buckets.set(token, []);
+    buckets.get(token)!.push(s);
+  }
+  // Promote buckets with >=2 specs; fold singletons into "other".
+  const multi: Array<{ id: string; specs: ExplainerSpecSummary[] }> = [];
+  const singletons: ExplainerSpecSummary[] = [];
+  for (const [id, items] of buckets) {
+    if (items.length >= 2) multi.push({ id, specs: items });
+    else singletons.push(...items);
+  }
+  multi.sort((a, b) => b.specs.length - a.specs.length);
+  const top = multi.slice(0, 7);
+  const overflow = multi.slice(7).flatMap((m) => m.specs);
+  const otherSpecs = [...overflow, ...singletons];
+  const result: ExplainerCluster[] = top.map((m) => ({
+    id: m.id,
+    name: m.id.replace(/\b\w/g, (c) => c.toUpperCase()),
+    description: `${m.specs.length} related pages under the "${m.id}" umbrella.`,
+    specIds: m.specs.map((s) => s.specId),
+  }));
+  if (otherSpecs.length > 0) {
+    result.push({
+      id: "other",
+      name: "Other",
+      description: `Pages that don't fit cleanly into the other clusters.`,
+      specIds: otherSpecs.map((s) => s.specId),
+    });
+  }
+  return result;
+}
+
+/**
+ * Extract multiple markdown files from AI output. Markdown has no native
+ * comment syntax, so the explainer prompts instruct the AI to use an HTML
+ * comment on the first line of each file: `<!-- FILE: <path> -->`. Files are
+ * delimited by the next FILE comment or end of content.
+ */
+function extractMarkdownFiles(content: string): GeneratedFile[] {
+  const regex = /<!--\s*FILE:\s*(.+?)\s*-->\s*\r?\n/g;
+  const results: GeneratedFile[] = [];
+  const matches: Array<{ path: string; startOfBody: number }> = [];
+  let match;
+  while ((match = regex.exec(content)) !== null) {
+    matches.push({ path: match[1].trim(), startOfBody: regex.lastIndex });
+  }
+  for (let i = 0; i < matches.length; i++) {
+    const { path, startOfBody } = matches[i];
+    const end = i + 1 < matches.length ? matches[i + 1].startOfBody : content.length;
+    // Walk back from `end` to before the next FILE marker's opening `<!--`.
+    let bodyEnd = end;
+    if (i + 1 < matches.length) {
+      // `matches[i+1].startOfBody` points past the `\n` after `-->`. Back up to
+      // before the `<!--` that opens the next marker so we don't include it.
+      const nextOpen = content.lastIndexOf("<!--", matches[i + 1].startOfBody);
+      if (nextOpen > 0) bodyEnd = nextOpen;
+    }
+    const body = content.slice(startOfBody, bodyEnd).trimEnd();
+    results.push({
+      filePath: path,
+      content: `<!-- FILE: ${path} -->\n${body}\n`,
+    });
   }
   return results;
 }
@@ -126,7 +263,11 @@ type IntegrationStep =
   | "page-registrations"
   | "page-spec"
   | "page-tutorial"
-  | "page-demo-script";
+  | "page-architecture-diagram"
+  | "page-demo-script"
+  | "explainer-index"
+  | "explainer-cluster"
+  | "explainer-page";
 
 interface StepStatus {
   state: "pending" | "active" | "done" | "skipped" | "error";
@@ -140,6 +281,8 @@ type PanelPhase =
   | "generating-page-registrations"
   | "generating-page-spec"
   | "generating-page-tutorial"
+  | "generating-page-architecture-diagram"
+  | "generating-project-explainer"
   | "preview"
   | "applying"
   | "applied";
@@ -250,6 +393,9 @@ export function HookGenerationPanel({
   );
   const [includeArchSpec, setIncludeArchSpec] = useState(true);
   const [generatedFiles, setGeneratedFiles] = useState<GeneratedFile[]>([]);
+  useEffect(() => {
+    allGeneratedFilesRef.current = generatedFiles;
+  }, [generatedFiles]);
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
   const [writeResult, setWriteResult] = useState<WriteHooksResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -263,13 +409,48 @@ export function HookGenerationPanel({
 
   // Per-page generation queue
   const pageQueueRef = useRef<PageComponent[]>([]);
+  // Budget: how many pages we process before rolling to a fresh AI session.
+  // Keeps context from growing unbounded on large projects — each page ships
+  // ~4-6 prompts (registrations, spec, tutorial, …) so 5 pages ≈ 20-30 turns,
+  // well inside a single session's window.
+  const SESSION_PAGE_BUDGET = 5;
+  const pagesInSessionRef = useRef(0);
+
+  // Project Explainer phase: kicks off after per-page generation when the
+  // `generateProjectExplainer` flag is set. One AI call per item below; each
+  // response is a single markdown file saved to src/specs/explainer/.
+  interface ExplainerQueueItem {
+    kind: "index" | "cluster" | "page";
+    /** For cluster/page items. */
+    clusterId?: string;
+    /** For page items. */
+    specId?: string;
+  }
+  const explainerQueueRef = useRef<ExplainerQueueItem[]>([]);
+  const explainerContextRef = useRef<{
+    specs: ExplainerSpecSummary[];
+    arch: Map<string, string>;
+    clusters: ExplainerCluster[];
+    projectName: string;
+  } | null>(null);
+  const explainerCurrentRef = useRef<ExplainerQueueItem | null>(null);
+  // Explainer calls share the SESSION_PAGE_BUDGET but count independently.
+  const explainerCallsInSessionRef = useRef(0);
+
+  // Ref mirror of `generatedFiles` so closures inside handleSessionTransition
+  // (which captures state at a moment in time) can read the latest list —
+  // the explainer phase starts once per-page generation finishes and needs
+  // the full set of just-generated specs + arch diagrams.
+  const allGeneratedFilesRef = useRef<GeneratedFile[]>([]);
   const pageOptionsRef = useRef<PageGenerationOptions>({
     generateRegistrations: true,
     generateDataPageIds: true,
     generateSpecs: true,
     generateTutorials: false,
+    generateArchitectureDiagrams: false,
     generateDemoVideos: false,
     generateProductTours: false,
+    generateProjectExplainer: false,
   });
   const currentPageRef = useRef<{
     page: PageComponent;
@@ -340,7 +521,11 @@ export function HookGenerationPanel({
       const isPerPageStep =
         currentStep === "page-registrations" ||
         currentStep === "page-spec" ||
-        currentStep === "page-tutorial";
+        currentStep === "page-tutorial" ||
+        currentStep === "page-architecture-diagram" ||
+        currentStep === "explainer-index" ||
+        currentStep === "explainer-cluster" ||
+        currentStep === "explainer-page";
       const relevantMessages = isPerPageStep
         ? aiMessages.slice(processedMessageCountRef.current)
         : aiMessages;
@@ -533,6 +718,8 @@ export function HookGenerationPanel({
             "",
           );
           sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
+        } else if (opts.generateArchitectureDiagrams && cur?.source) {
+          chainToArchitectureDiagram(cur);
         } else if (opts.generateDemoVideos || opts.generateProductTours) {
           // Skip to demo script / product tour planning
           chainToDemoScript(cur?.page.route ?? "", controller.signal);
@@ -572,6 +759,8 @@ export function HookGenerationPanel({
             jsonBlock || "",
           );
           sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
+        } else if (opts.generateArchitectureDiagrams && cur?.source) {
+          chainToArchitectureDiagram(cur);
         } else if (opts.generateDemoVideos || opts.generateProductTours) {
           chainToDemoScript(cur?.page.route ?? "", controller.signal);
         } else {
@@ -587,8 +776,31 @@ export function HookGenerationPanel({
           prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
         );
         const opts = pageOptionsRef.current;
+        const cur = currentPageRef.current;
+        if (opts.generateArchitectureDiagrams && cur?.source) {
+          chainToArchitectureDiagram(cur);
+        } else if (opts.generateDemoVideos || opts.generateProductTours) {
+          chainToDemoScript(cur?.page.route ?? "", controller.signal);
+        } else {
+          advanceToNextPage(controller.signal);
+        }
+      } else if (currentStep === "page-architecture-diagram") {
+        processedMessageCountRef.current = aiMessages.length;
+        const diag = extractMermaidFile(fullContent);
+        if (diag) {
+          setGeneratedFiles((prev) => [...prev, diag]);
+          setStepStatuses((prev) =>
+            prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+          );
+        } else {
+          // No Mermaid block came back — mark the step errored but keep going.
+          setStepStatuses((prev) =>
+            prev.map((s) => (s.state === "active" ? { ...s, state: "error" } : s)),
+          );
+        }
+        const opts = pageOptionsRef.current;
+        const cur = currentPageRef.current;
         if (opts.generateDemoVideos || opts.generateProductTours) {
-          const cur = currentPageRef.current;
           chainToDemoScript(cur?.page.route ?? "", controller.signal);
         } else {
           advanceToNextPage(controller.signal);
@@ -601,6 +813,51 @@ export function HookGenerationPanel({
           prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
         );
         advanceToNextPage(controller.signal);
+      } else if (
+        currentStep === "explainer-index" ||
+        currentStep === "explainer-cluster" ||
+        currentStep === "explainer-page"
+      ) {
+        processedMessageCountRef.current = aiMessages.length;
+        const files = extractMarkdownFiles(fullContent);
+        if (files.length > 0) {
+          setGeneratedFiles((prev) => [...prev, ...files]);
+          setStepStatuses((prev) =>
+            prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+          );
+        } else {
+          setStepStatuses((prev) =>
+            prev.map((s) => (s.state === "active" ? { ...s, state: "error" } : s)),
+          );
+        }
+        advanceExplainerQueue();
+      }
+
+      // Helper: chain to the architecture-diagram step. Uses the same source
+      // + registrations we already fetched for this page.
+      function chainToArchitectureDiagram(cur: {
+        page: PageComponent;
+        source: ReadPageSourceResult | null;
+        registrationOutput: string;
+      }) {
+        if (!cur.source) {
+          advanceToNextPage(controller.signal);
+          return;
+        }
+        pendingStepRef.current = "page-architecture-diagram";
+        setPhase("generating-page-architecture-diagram");
+        setStepStatuses((prev) => [
+          ...prev,
+          { state: "active", label: `Architecture diagram: ${cur.page.route}` },
+        ]);
+        const archPrompt = buildArchitectureDiagramPrompt(
+          cur.source.main_source,
+          cur.source.imported_sources,
+          cur.page.component_name,
+          cur.page.route,
+          cur.registrationOutput || "",
+        );
+        sendMessage(`Now generate the architecture diagram for this page.\n\n` + archPrompt);
       }
 
       // Helper: chain to demo script + product tour planning (non-AI — calls planner APIs directly)
@@ -663,6 +920,36 @@ export function HookGenerationPanel({
         const queue = pageQueueRef.current;
         if (queue.length > 0) {
           const nextPage = queue.shift()!;
+          // Count the page we just finished (the one before this advance).
+          pagesInSessionRef.current += 1;
+          // Rotate to a fresh AI session at the batch boundary so context
+          // doesn't grow unbounded on large projects. Each batch is
+          // independent — the per-page prompts already include the page
+          // source, so a fresh session doesn't lose information.
+          if (pagesInSessionRef.current >= SESSION_PAGE_BUDGET) {
+            pagesInSessionRef.current = 0;
+            setStepStatuses((prev) => [
+              ...prev,
+              { state: "active", label: `Rotating to fresh AI session...` },
+            ]);
+            (async () => {
+              if (signal.aborted) return;
+              await session.close();
+              if (signal.aborted) return;
+              session.resetSession();
+              const id = await session.createSession("Page Preparation: AI Generation (batch)");
+              if (signal.aborted) return;
+              if (!id) {
+                setError("Failed to rotate AI session");
+                return;
+              }
+              setStepStatuses((prev) =>
+                prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+              );
+              startPageGeneration(nextPage, signal);
+            })();
+            return;
+          }
           startPageGeneration(nextPage, signal);
         } else {
           // All pages done
@@ -714,11 +1001,139 @@ export function HookGenerationPanel({
               setStepStatuses((prev) =>
                 prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
               );
-              setPhase("preview");
+              if (!maybeStartExplainerPhase()) {
+                setPhase("preview");
+              }
             })();
-          } else {
+          } else if (!maybeStartExplainerPhase()) {
             setPhase("preview");
           }
+        }
+      }
+
+      /** If generateProjectExplainer is on and we haven't started yet, kick off
+       * the explainer phase (index → clusters → pages). Returns true when the
+       * phase was started so the caller knows to NOT transition to preview. */
+      function maybeStartExplainerPhase(): boolean {
+        if (!pageOptionsRef.current.generateProjectExplainer) return false;
+        if (explainerContextRef.current) return false; // already running
+        const { specs, arch } = gatherExplainerInputs(allGeneratedFilesRef.current);
+        if (specs.length === 0) return false; // nothing to explain
+        const clusters = clusterSpecsByPrefix(specs);
+        const projectName = projectPath.split(/[\\/]/).filter(Boolean).slice(-1)[0] || "Project";
+        explainerContextRef.current = { specs, arch, clusters, projectName };
+        // Build the queue: one index, N clusters, then all pages grouped by cluster.
+        const queue: ExplainerQueueItem[] = [{ kind: "index" }];
+        for (const c of clusters) queue.push({ kind: "cluster", clusterId: c.id });
+        for (const c of clusters) {
+          for (const specId of c.specIds) {
+            queue.push({ kind: "page", clusterId: c.id, specId });
+          }
+        }
+        explainerQueueRef.current = queue;
+        explainerCallsInSessionRef.current = 0;
+        setStepStatuses((prev) => [
+          ...prev,
+          {
+            state: "active",
+            label: `Project Explainer (${queue.length} files: index + ${clusters.length} clusters + ${specs.length} pages)`,
+          },
+        ]);
+        advanceExplainerQueue();
+        return true;
+      }
+
+      /** Pick the next explainer item and fire its prompt. Session-rotates at
+       * the same SESSION_PAGE_BUDGET boundary used by per-page generation. */
+      function advanceExplainerQueue() {
+        const queue = explainerQueueRef.current;
+        const ctx = explainerContextRef.current;
+        if (!ctx || queue.length === 0) {
+          explainerContextRef.current = null;
+          explainerCurrentRef.current = null;
+          setStepStatuses((prev) =>
+            prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+          );
+          setPhase("preview");
+          return;
+        }
+        // Session rotation
+        if (explainerCallsInSessionRef.current >= SESSION_PAGE_BUDGET) {
+          explainerCallsInSessionRef.current = 0;
+          setStepStatuses((prev) => [
+            ...prev,
+            { state: "active", label: `Rotating to fresh AI session (explainer)...` },
+          ]);
+          (async () => {
+            if (controller.signal.aborted) return;
+            await session.close();
+            if (controller.signal.aborted) return;
+            session.resetSession();
+            const id = await session.createSession("Project Explainer (batch)");
+            if (controller.signal.aborted) return;
+            if (!id) {
+              setError("Failed to rotate AI session during explainer phase");
+              return;
+            }
+            setStepStatuses((prev) =>
+              prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+            );
+            advanceExplainerQueue();
+          })();
+          return;
+        }
+        explainerCallsInSessionRef.current++;
+        const next = queue.shift()!;
+        explainerCurrentRef.current = next;
+        setPhase("generating-project-explainer");
+        if (next.kind === "index") {
+          pendingStepRef.current = "explainer-index";
+          setStepStatuses((prev) => [...prev, { state: "active", label: "Explainer: index.md" }]);
+          sendMessage(buildExplainerIndexPrompt(ctx.projectName, ctx.specs, ctx.clusters));
+        } else if (next.kind === "cluster") {
+          const cluster = ctx.clusters.find((c) => c.id === next.clusterId);
+          if (!cluster) return advanceExplainerQueue();
+          const specsInCluster = ctx.specs.filter((s) => cluster.specIds.includes(s.specId));
+          const otherClusters = ctx.clusters
+            .filter((c) => c.id !== cluster.id)
+            .map((c) => ({ id: c.id, name: c.name, description: c.description }));
+          pendingStepRef.current = "explainer-cluster";
+          setStepStatuses((prev) => [
+            ...prev,
+            { state: "active", label: `Explainer: ${cluster.id}.md (cluster)` },
+          ]);
+          sendMessage(
+            buildExplainerClusterPrompt(ctx.projectName, cluster, specsInCluster, otherClusters),
+          );
+        } else {
+          // kind === "page"
+          const cluster = ctx.clusters.find((c) => c.id === next.clusterId);
+          const spec = ctx.specs.find((s) => s.specId === next.specId);
+          if (!cluster || !spec) return advanceExplainerQueue();
+          const slug = spec.specId.replace(/[^a-z0-9-]/gi, "-");
+          const archDiagram = ctx.arch.get(spec.specId) || null;
+          const siblings = ctx.specs
+            .filter((s) => cluster.specIds.includes(s.specId) && s.specId !== spec.specId)
+            .map((s) => ({
+              slug: s.specId.replace(/[^a-z0-9-]/gi, "-"),
+              title: s.specId,
+              tagline: (s.description || "").replace(/\s+/g, " ").slice(0, 80),
+            }));
+          pendingStepRef.current = "explainer-page";
+          setStepStatuses((prev) => [
+            ...prev,
+            { state: "active", label: `Explainer: ${cluster.id}/${slug}.md` },
+          ]);
+          sendMessage(
+            buildExplainerPagePrompt(
+              ctx.projectName,
+              cluster.id,
+              slug,
+              spec,
+              archDiagram,
+              siblings,
+            ),
+          );
         }
       }
 
@@ -836,6 +1251,21 @@ export function HookGenerationPanel({
             "",
           );
           await sendMessage(`Generate a tutorial for ${page.route}.\n\n` + tutPrompt);
+        } else if (opts.generateArchitectureDiagrams) {
+          pendingStepRef.current = "page-architecture-diagram";
+          setPhase("generating-page-architecture-diagram");
+          setStepStatuses((prev) => [
+            ...prev.filter((s) => s.state !== "active"),
+            { state: "active", label: `Architecture diagram: ${page.route}` },
+          ]);
+          const archPrompt = buildArchitectureDiagramPrompt(
+            source.main_source,
+            source.imported_sources,
+            page.component_name,
+            page.route,
+            "",
+          );
+          await sendMessage(`Generate an architecture diagram for ${page.route}.\n\n` + archPrompt);
         } else if (opts.generateDemoVideos || opts.generateProductTours) {
           // Only demo videos / product tours selected — chain directly
           chainToDemoScript(page.route, signal);
@@ -1018,6 +1448,28 @@ export function HookGenerationPanel({
     async (pages: PageComponent[], options: PageGenerationOptions) => {
       if (pages.length === 0) return;
 
+      // Guard: the Project Explainer phase runs AFTER per-page generation
+      // and composes the just-generated specs + architecture diagrams. If
+      // no per-page work is selected there's nothing to compose from, and
+      // the initial-prompt dispatch below has no branch to fall into, so
+      // the run would stall silently. Surface this clearly instead.
+      const hasPerPageWork =
+        options.generateRegistrations ||
+        options.generateDataPageIds ||
+        options.generateSpecs ||
+        options.generateTutorials ||
+        options.generateArchitectureDiagrams ||
+        options.generateDemoVideos ||
+        options.generateProductTours;
+      if (!hasPerPageWork) {
+        setError(
+          options.generateProjectExplainer
+            ? "Project Explainer composes generated specs into a document — please also enable 'Page Specs' (and ideally 'Architecture Diagrams') so there is content to compose."
+            : "Please select at least one generation option.",
+        );
+        return;
+      }
+
       setError(null);
       setGeneratedFiles([]);
       setWriteResult(null);
@@ -1032,6 +1484,7 @@ export function HookGenerationPanel({
           options.generateRegistrations && "regs",
           options.generateSpecs && "spec",
           options.generateTutorials && "tutorial",
+          options.generateArchitectureDiagrams && "arch",
           options.generateDemoVideos && "demo",
           options.generateProductTours && "tour",
         ]
@@ -1048,6 +1501,7 @@ export function HookGenerationPanel({
         session.close();
         session.resetSession();
       }
+      pagesInSessionRef.current = 0;
 
       const id = await session.createSession("Page Preparation: AI Generation");
       if (!id) {
@@ -1122,7 +1576,25 @@ export function HookGenerationPanel({
           "",
         );
         await session.sendMessage(`Generate a tutorial for ${firstPage.route}.\n\n` + tutPrompt);
+      } else if (options.generateArchitectureDiagrams) {
+        pendingStepRef.current = "page-architecture-diagram";
+        setPhase("generating-page-architecture-diagram");
+        const archPrompt = buildArchitectureDiagramPrompt(
+          source.main_source,
+          source.imported_sources,
+          firstPage.component_name,
+          firstPage.route,
+          "",
+        );
+        await session.sendMessage(
+          `Generate an architecture diagram for ${firstPage.route}.\n\n` + archPrompt,
+        );
       }
+      // Pre-existing limitation: if ONLY demo/tour is checked, the first-page
+      // bootstrap has no branch to dispatch (chainToDemoScript lives inside
+      // handleSessionTransition's scope). Non-first-page startPageGeneration
+      // handles that case. Refactoring chainToDemoScript to module scope is a
+      // separate task.
     },
     [session, analysis, projectPath],
   );

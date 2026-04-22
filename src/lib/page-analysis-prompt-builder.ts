@@ -217,11 +217,30 @@ Generate a TypeScript file that exports a Tutorial object. The file must:
 
 ## Tutorial Structure
 
-- **8-12 steps** — enough to cover the feature without being overwhelming
-- **Start** with a centered modal (no targetElement) explaining what the page is
-- **Middle steps** spotlight specific UI elements to explain their purpose
-- **End** with a "what's next" step pointing to related features
-- Each step should take 30-90 seconds to read
+Structure the tutorial by the **groups** defined in the page spec. Each group
+represents a distinct feature area (e.g. "Workflow Sidebar Library", "Multi-
+Phase Editor"). This gives the tutorial a natural rhythm and lets users skim
+by section.
+
+For each non-trivial group in the spec, emit:
+1. **One section-intro step** with no \`targetElement\` (a centered modal).
+   - \`id\`: \`section-<group-id>\`
+   - \`title\`: the group's \`name\`
+   - \`content\`: start with a 1-sentence summary of the group's \`description\`,
+     then a short list of what this section will cover.
+2. **1-3 element steps** that spotlight the most important assertions in that
+   group. Use the assertion's \`target.label\` or the registered element id for
+   \`targetElement.selector\`. Skip trivial assertions (pure layout, aria-only).
+
+Bookends:
+- **Start** with ONE centered overview step (no targetElement) explaining what
+  the page is and listing the sections the tutorial will visit (echoes the
+  group names). Keep to ~4 lines.
+- **End** with a "what's next" step pointing to related features elsewhere in
+  the runner.
+
+Total target: **8-14 steps**. Skip sections that would add no value (e.g. pure
+"state consistency" groups with no user-visible elements).
 
 ## Step Content Guidelines
 
@@ -230,6 +249,7 @@ Generate a TypeScript file that exports a Tutorial object. The file must:
 - Use \`tips\` for non-essential but helpful info
 - Use \`details\` for expandable deep-dive content (architecture, algorithms)
 - For informational tutorials, focus on WHY things exist, not HOW to click them
+- Section-intro steps are purely informational — no action field, no validation
 
 ## File Header
 
@@ -272,6 +292,372 @@ export function buildTutorialPrompt(
     `Generate the tutorial file. Start with \`\`\`ts\\n// FILE: src/components/tutorial/data/${pageName.toLowerCase().replace(/\s+/g, "-")}.ts\``,
   );
 
+  return parts.join("\n");
+}
+
+// =============================================================================
+// Architecture Diagram
+// =============================================================================
+
+const ARCHITECTURE_DIAGRAM_INSTRUCTIONS = `
+# Page Architecture Diagram
+
+Generate a **Mermaid flowchart** documenting the structural architecture of a
+single page component. The diagram should answer: "what is this page made of,
+where does its data come from, and what does it call out to?"
+
+## What to include
+
+Group nodes into these labelled subgraphs (omit a subgraph when empty):
+
+1. **Page** — the top-level component itself (one node).
+2. **Components** — imported React components the page renders (child panels,
+   modals, list items). Only include meaningful custom components; skip tiny
+   primitives (Button, Icon, Loader, etc.).
+3. **State** — React context providers it reads from (via useX hooks),
+   custom hooks that hold state (useReducer, useQuery), and local store
+   references (Zustand, Jotai, etc.).
+4. **Services / API** — backend HTTP endpoints it fetches (list the route,
+   not the payload), GraphQL queries/mutations by name, Tauri invoke commands
+   by command name, and WebSocket / SSE streams.
+5. **External** — links to other pages the user can navigate to, and anything
+   that leaves the app (postMessage, window.open, external URLs).
+
+## Edge conventions
+
+- Page → Component: solid arrow \`-->\` labelled "renders" (label optional).
+- Component → State: dotted arrow \`-.->\` labelled "reads" or "writes".
+- Component / Page → API: solid arrow with the HTTP verb in the label,
+  e.g. \`-->|POST|\`.
+- Any node → External: thick arrow \`==>\` labelled "navigates" or "opens".
+
+## Output format
+
+Emit exactly one fenced \`\`\`mermaid block, preceded by a \`// FILE:\` comment
+line so the writer knows where to save it. No prose outside the block. Example
+shape:
+
+\`\`\`mermaid
+%% FILE: src/specs/architecture/<page-slug>.arch.mmd
+flowchart TD
+  subgraph Page
+    P["<PageName>"]
+  end
+  subgraph Components
+    C1["ChildPanel"]
+    C2["DetailView"]
+  end
+  subgraph State
+    S1[("useTaskRuns")]
+    S2[("AuthContext")]
+  end
+  subgraph Services
+    A1{{"GET /task-runs"}}
+    A2{{"invoke: start_workflow"}}
+  end
+  subgraph External
+    X1(("/results"))
+  end
+
+  P --> C1
+  P --> C2
+  C1 -.->|reads| S1
+  C1 -->|GET| A1
+  C2 -.->|reads| S2
+  C2 -->|POST| A2
+  P ==>|navigates| X1
+\`\`\`
+
+Keep the diagram readable: aim for 5-20 nodes total. Collapse noise into
+grouped subgraph labels if needed. Do not hallucinate endpoints or state —
+only include things you can see in the source.
+`;
+
+export function buildArchitectureDiagramPrompt(
+  pageSource: string,
+  importedSources: Array<{ path: string; content: string }>,
+  pageName: string,
+  route: string,
+  registrations: string,
+): string {
+  const parts: string[] = [];
+  parts.push(ARCHITECTURE_DIAGRAM_INSTRUCTIONS);
+
+  parts.push(`\n## Page Information\n`);
+  parts.push(`- **Page name:** ${pageName}`);
+  parts.push(`- **Route:** ${route}`);
+  const slug = route.replace(/^\//, "").replace(/\//g, "-") || "root";
+  parts.push(`- **Output filename:** src/specs/architecture/${slug}.arch.mmd`);
+
+  parts.push(`\n## Page Component Source\n\n\`\`\`tsx\n${pageSource.slice(0, 10000)}\n\`\`\`\n`);
+
+  if (importedSources.length > 0) {
+    parts.push(`\n## Imported Component Sources (trimmed)\n`);
+    for (const imp of importedSources.slice(0, 8)) {
+      parts.push(`\n### ${imp.path}\n\n\`\`\`tsx\n${imp.content.slice(0, 2500)}\n\`\`\``);
+    }
+  }
+
+  if (registrations) {
+    parts.push(
+      `\n## UI Bridge Registrations\n\n\`\`\`tsx\n${registrations.slice(0, 3000)}\n\`\`\``,
+    );
+  }
+
+  parts.push(`\n## Output\n`);
+  parts.push(
+    `Emit exactly one \`\`\`mermaid block that begins with the \`%% FILE:\` comment. ` +
+      `No text before or after the block.`,
+  );
+
+  return parts.join("\n");
+}
+
+// =============================================================================
+// Project Explainer (hierarchical, multi-file)
+// =============================================================================
+//
+// Three-pass generation to keep each AI turn bounded and easy to review:
+//   1. Index       — one prompt, one file: overview + cluster links
+//   2. Cluster     — one prompt per cluster: narrative + links to its pages
+//   3. Page        — one prompt per page: deep dive + embedded arch diagram
+//
+// All outputs are standalone .md files under src/specs/explainer/. The viewer
+// navigates hierarchically (index → cluster → page) using the markdown links
+// the AI writes; no extra metadata file is needed.
+
+export interface ExplainerSpecSummary {
+  specId: string;
+  description: string;
+  /** Group names + one-line descriptions, so clustering can be inferred. */
+  groups: Array<{ id: string; name: string; description: string }>;
+}
+
+export interface ExplainerCluster {
+  /** Short slug used for filenames — e.g. "orchestration". */
+  id: string;
+  /** Human-readable title. */
+  name: string;
+  /** One-paragraph description. */
+  description: string;
+  /** Spec IDs belonging to this cluster. */
+  specIds: string[];
+}
+
+const EXPLAINER_INDEX_INSTRUCTIONS = `You are writing the **index** of a project's hierarchical explainer — a
+navigable documentation surface generated from per-page specs and architecture
+diagrams. Readers land here first, so the index must orient them before they
+drill down.
+
+## Output structure (single markdown file)
+
+1. \`# <Project name>\` — the project's human-readable title.
+2. **Overview** (2-3 paragraphs, H2): what the project does, who it's for,
+   the core concepts (proper nouns) a reader should hold in their head before
+   reading anything else.
+3. **How this explainer is organized** (short paragraph): tell the reader they
+   will find high-level clusters here, then per-page deep-dives inside each
+   cluster.
+4. **Clusters** (H2), then one H3 per cluster:
+   - Cluster title
+   - 2-4 sentence description (what the pages in this cluster do *together*).
+   - A "Pages in this cluster" bulleted list linking to each page's file:
+     \`- [<page title>](./<cluster-id>/<page-slug>.md) — <one-line tagline>\`.
+   - A link to the cluster's own overview: \`[Read more →](./<cluster-id>.md)\`.
+5. **Glossary** (H2, optional): recurring proper nouns from the specs,
+   each with a 1-sentence definition. Skip if nothing recurs.
+
+## Tone
+
+- Write for a new engineer joining the project. Assume intelligence, not
+  context. Explain *why* each part exists before *how* it works.
+- Avoid marketing copy. Prefer concrete verbs ("executes workflows",
+  "records interactions") over vague ones ("enables", "empowers").
+
+## File header
+
+Begin the output with a single HTML comment on its own line:
+\`<!-- FILE: src/specs/explainer/index.md -->\`
+Then the markdown content.`;
+
+export function buildExplainerIndexPrompt(
+  projectName: string,
+  specs: ExplainerSpecSummary[],
+  clusters: ExplainerCluster[],
+): string {
+  const parts: string[] = [];
+  parts.push(EXPLAINER_INDEX_INSTRUCTIONS);
+
+  parts.push(`\n## Project\n`);
+  parts.push(`- **Name:** ${projectName}`);
+
+  parts.push(`\n## Proposed clusters\n`);
+  parts.push(
+    "Use these cluster groupings. If one is clearly wrong, merge or rename it, but keep the total between 3 and 8 clusters.\n",
+  );
+  for (const c of clusters) {
+    parts.push(`\n### ${c.name} (id: \`${c.id}\`)`);
+    parts.push(c.description);
+    parts.push(`Spec IDs: ${c.specIds.map((s) => `\`${s}\``).join(", ")}`);
+  }
+
+  parts.push(`\n## All spec descriptions\n`);
+  for (const s of specs) {
+    parts.push(`- **${s.specId}** — ${s.description.replace(/\s+/g, " ").slice(0, 220)}`);
+  }
+
+  parts.push(`\n## Output\n`);
+  parts.push(
+    "Emit exactly one markdown file. Start with the `<!-- FILE: src/specs/explainer/index.md -->` comment.",
+  );
+  return parts.join("\n");
+}
+
+const EXPLAINER_CLUSTER_INSTRUCTIONS = `You are writing the cluster-level page of a hierarchical project explainer.
+The reader came here from the index and wants a narrative explanation of a
+group of related pages *before* drilling into any one page.
+
+## Output structure
+
+1. \`# <Cluster name>\` at the top.
+2. **What this cluster does** (H2, 2-4 paragraphs): the *shared purpose* of
+   these pages. Explain the user journey across them, not page-by-page.
+3. **How the pieces fit together** (H2): walk the reader through the
+   interactions between pages in this cluster. Cite page names (with links)
+   but keep the narrative shape.
+4. **Pages in this cluster** (H2): one H3 per page, each with:
+   - A one-sentence tagline of that page's role *within this cluster*.
+   - A link: \`[Read full page explainer →](./<cluster-id>/<page-slug>.md)\`.
+5. **Connects to** (H2, bulleted): other clusters this one reads from or
+   hands off to, with links: \`- [<other cluster>](./<other-id>.md) — why\`.
+
+## Tone
+
+Same as the index: concrete, jargon only where it refers to a real concept,
+assume an attentive new-joiner reader.
+
+## File header
+
+Begin with \`<!-- FILE: src/specs/explainer/<cluster-id>.md -->\`.`;
+
+export function buildExplainerClusterPrompt(
+  projectName: string,
+  cluster: ExplainerCluster,
+  specsInCluster: ExplainerSpecSummary[],
+  otherClusters: Array<{ id: string; name: string; description: string }>,
+): string {
+  const parts: string[] = [];
+  parts.push(EXPLAINER_CLUSTER_INSTRUCTIONS);
+
+  parts.push(`\n## Project\n`);
+  parts.push(`- **Name:** ${projectName}`);
+
+  parts.push(`\n## Cluster\n`);
+  parts.push(`- **Name:** ${cluster.name}`);
+  parts.push(`- **Id (for filenames):** \`${cluster.id}\``);
+  parts.push(`- **Description:** ${cluster.description}`);
+
+  parts.push(`\n## Specs in this cluster\n`);
+  for (const s of specsInCluster) {
+    parts.push(`\n### ${s.specId}\n`);
+    parts.push(s.description.replace(/\s+/g, " ").slice(0, 600));
+    if (s.groups.length > 0) {
+      parts.push(`\nGroups:`);
+      for (const g of s.groups.slice(0, 8)) {
+        parts.push(`- **${g.name}** — ${g.description.replace(/\s+/g, " ").slice(0, 160)}`);
+      }
+    }
+  }
+
+  parts.push(`\n## Sibling clusters (for "Connects to" links)\n`);
+  for (const c of otherClusters) {
+    parts.push(`- \`${c.id}\` — ${c.name}: ${c.description.slice(0, 140)}`);
+  }
+
+  parts.push(`\n## Output\n`);
+  parts.push(
+    `Emit exactly one markdown file. Start with the \`<!-- FILE: src/specs/explainer/${cluster.id}.md -->\` comment.`,
+  );
+  return parts.join("\n");
+}
+
+const EXPLAINER_PAGE_INSTRUCTIONS = `You are writing the deep-dive explainer for a single page. The reader
+landed here from a cluster overview and wants to understand this specific
+page in depth.
+
+## Output structure
+
+1. \`# <Page title>\` at the top.
+2. **Purpose** (H2, 1-2 paragraphs): what this page does and who uses it.
+3. **Key interactions** (H2): for each meaningful spec *group*, an H3 with:
+   - 1-2 sentences of narrative
+   - A short bulleted list of the concrete controls / outcomes
+   (Skip trivial groups like pure layout or accessibility assertions.)
+4. **Architecture** (H2): render the page's architecture diagram as an
+   inline Mermaid codeblock if one was provided in the context. Follow the
+   diagram with 2-4 sentences describing the data flows it represents.
+5. **Connects to** (H2): other pages in the same cluster (or nearby
+   clusters) that this page reads from / hands off to, with relative links.
+
+## Tone
+
+Concrete, source-grounded. If the spec doesn't say something, don't
+invent it. If an assertion's purpose is unclear from its description, omit
+it rather than speculating.
+
+## File header
+
+Begin with \`<!-- FILE: src/specs/explainer/<cluster-id>/<page-slug>.md -->\`.`;
+
+export function buildExplainerPagePrompt(
+  projectName: string,
+  clusterId: string,
+  pageSlug: string,
+  spec: ExplainerSpecSummary,
+  archDiagram: string | null,
+  siblingPages: Array<{ slug: string; title: string; tagline: string }>,
+): string {
+  const parts: string[] = [];
+  parts.push(EXPLAINER_PAGE_INSTRUCTIONS);
+
+  parts.push(`\n## Project\n`);
+  parts.push(`- **Name:** ${projectName}`);
+
+  parts.push(`\n## Page\n`);
+  parts.push(`- **Spec id:** ${spec.specId}`);
+  parts.push(`- **Cluster:** ${clusterId}`);
+  parts.push(`- **Output filename:** src/specs/explainer/${clusterId}/${pageSlug}.md`);
+  parts.push(`- **Description:** ${spec.description}`);
+
+  parts.push(`\n## Groups in this page's spec\n`);
+  for (const g of spec.groups) {
+    parts.push(`\n### ${g.name}`);
+    parts.push(g.description.replace(/\s+/g, " ").slice(0, 500));
+  }
+
+  if (archDiagram) {
+    parts.push(`\n## Architecture diagram (embed this verbatim in the Architecture section)\n`);
+    parts.push("```mermaid");
+    parts.push(archDiagram.trim());
+    parts.push("```");
+  } else {
+    parts.push(
+      `\n## Architecture diagram\n\n_No diagram available; omit the Architecture section._`,
+    );
+  }
+
+  if (siblingPages.length > 0) {
+    parts.push(`\n## Sibling pages in this cluster (for "Connects to" links)\n`);
+    for (const p of siblingPages) {
+      parts.push(`- \`${p.slug}.md\` — **${p.title}**: ${p.tagline}`);
+    }
+  }
+
+  parts.push(`\n## Output\n`);
+  parts.push(
+    `Emit exactly one markdown file. Start with ` +
+      `\`<!-- FILE: src/specs/explainer/${clusterId}/${pageSlug}.md -->\`.`,
+  );
   return parts.join("\n");
 }
 

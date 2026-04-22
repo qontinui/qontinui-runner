@@ -36,8 +36,10 @@ export function PageSelectionPanel({
     generateDataPageIds: true,
     generateSpecs: true,
     generateTutorials: false,
+    generateArchitectureDiagrams: false,
     generateDemoVideos: false,
     generateProductTours: false,
+    generateProjectExplainer: false,
   });
 
   const discoverPages = useCallback(async () => {
@@ -215,90 +217,183 @@ export function PageSelectionPanel({
             </table>
           </div>
 
-          {/* Generation options */}
-          <div className="flex gap-4 text-xs">
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={options.generateRegistrations}
-                onChange={(e) =>
-                  setOptions({
-                    ...options,
-                    generateRegistrations: e.target.checked,
-                  })
+          {/* Generation options — hover each label for details */}
+          <div className="space-y-2">
+            <p className="text-[11px] text-muted-foreground">
+              Pick what to generate per selected page. Hover each option for details.
+            </p>
+            <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs">
+              <label
+                className="flex items-center gap-1.5 cursor-pointer"
+                title={
+                  "Insert useUIElement(...) registrations into your source so every " +
+                  "interactive control (buttons, inputs, dropdowns) has a stable ID the " +
+                  "UI Bridge runtime can discover. Without these, the NL executor and " +
+                  "pathfinder can only fuzzy-match on text."
                 }
-                className="rounded"
-              />
-              Registrations
-            </label>
-            <label
-              className="flex items-center gap-1.5 cursor-pointer"
-              title="Add data-page-id attributes to page root containers for state machine detection"
-            >
-              <input
-                type="checkbox"
-                checked={options.generateDataPageIds}
-                onChange={(e) =>
-                  setOptions({
-                    ...options,
-                    generateDataPageIds: e.target.checked,
-                  })
+              >
+                <input
+                  type="checkbox"
+                  checked={options.generateRegistrations}
+                  onChange={(e) =>
+                    setOptions({
+                      ...options,
+                      generateRegistrations: e.target.checked,
+                    })
+                  }
+                  className="rounded"
+                />
+                Registrations
+              </label>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer"
+                title={
+                  "Add a data-page-id attribute to each page's root container. The state " +
+                  "machine pathfinder uses it to detect which page is currently active."
                 }
-                className="rounded"
-              />
-              Page IDs
-            </label>
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={options.generateSpecs}
-                onChange={(e) => setOptions({ ...options, generateSpecs: e.target.checked })}
-                className="rounded"
-              />
-              Page Specs
-            </label>
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={options.generateTutorials}
-                onChange={(e) =>
-                  setOptions({
-                    ...options,
-                    generateTutorials: e.target.checked,
-                  })
+              >
+                <input
+                  type="checkbox"
+                  checked={options.generateDataPageIds}
+                  onChange={(e) =>
+                    setOptions({
+                      ...options,
+                      generateDataPageIds: e.target.checked,
+                    })
+                  }
+                  className="rounded"
+                />
+                Page IDs
+              </label>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer"
+                title={
+                  "Generate a .spec.uibridge.json file per page describing its UI structure " +
+                  "as groups of assertions (elements the page should have) plus a " +
+                  "stateMachine section (tabs, modals, panels with transitions). Feeds the " +
+                  "Compile State Machine button, the page-element catalog used by the " +
+                  "prompt-home planner, and the Check Drift tool."
                 }
-                className="rounded"
-              />
-              Tutorials
-            </label>
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={options.generateDemoVideos}
-                onChange={(e) =>
-                  setOptions({
-                    ...options,
-                    generateDemoVideos: e.target.checked,
-                  })
+              >
+                <input
+                  type="checkbox"
+                  checked={options.generateSpecs}
+                  onChange={(e) => setOptions({ ...options, generateSpecs: e.target.checked })}
+                  className="rounded"
+                />
+                Page Specs
+              </label>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer"
+                title={
+                  "Generate one interactive tutorial per page covering all features on " +
+                  "that page (registered with the Tutorial system). Shown via the Help tab " +
+                  "and auto-invoked by the Home page's Explain Steps mode. One tutorial per " +
+                  "page aligns with the per-page spec granularity and matches how users " +
+                  "browse the app."
                 }
-                className="rounded"
-              />
-              Demo Videos
-            </label>
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={options.generateProductTours}
-                onChange={(e) =>
-                  setOptions({
-                    ...options,
-                    generateProductTours: e.target.checked,
-                  })
+              >
+                <input
+                  type="checkbox"
+                  checked={options.generateTutorials}
+                  onChange={(e) =>
+                    setOptions({
+                      ...options,
+                      generateTutorials: e.target.checked,
+                    })
+                  }
+                  className="rounded"
+                />
+                Tutorials
+              </label>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer"
+                title={
+                  "Generate one Mermaid flowchart per page documenting its architecture: " +
+                  "the page component, imported child components, state/context reads, " +
+                  "API + Tauri command calls, and outbound navigations. Saved under " +
+                  "src/specs/architecture/<page>.arch.mmd — renderable inline by any " +
+                  "Mermaid-aware viewer (VS Code Markdown preview, GitHub, Obsidian)."
                 }
-                className="rounded"
-              />
-              Product Tours
-            </label>
+              >
+                <input
+                  type="checkbox"
+                  checked={options.generateArchitectureDiagrams}
+                  onChange={(e) =>
+                    setOptions({
+                      ...options,
+                      generateArchitectureDiagrams: e.target.checked,
+                    })
+                  }
+                  className="rounded"
+                />
+                Architecture Diagrams
+              </label>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer"
+                title={
+                  "Generate a recorded demo-video script per page (narrated sequence of " +
+                  "actions + expected states). Used for marketing/docs."
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={options.generateDemoVideos}
+                  onChange={(e) =>
+                    setOptions({
+                      ...options,
+                      generateDemoVideos: e.target.checked,
+                    })
+                  }
+                  className="rounded"
+                />
+                Demo Videos
+              </label>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer"
+                title={
+                  "Generate a product tour per page — a step-by-step guided walkthrough " +
+                  "that overlays on the live app to teach new users. Non-interactive, " +
+                  "driven by the TutorialProvider but without waiting on user actions."
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={options.generateProductTours}
+                  onChange={(e) =>
+                    setOptions({
+                      ...options,
+                      generateProductTours: e.target.checked,
+                    })
+                  }
+                  className="rounded"
+                />
+                Product Tours
+              </label>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer"
+                title={
+                  "Project-level (runs once after per-page generation): compose specs + " +
+                  "architecture diagrams into a hierarchical explainer. Produces " +
+                  "src/specs/explainer/index.md (overview + links), one .md per feature " +
+                  "cluster, and one .md per page — browsable from the LEARN > Explainer " +
+                  "tab with inline Mermaid rendering and an AI chat side panel."
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={options.generateProjectExplainer}
+                  onChange={(e) =>
+                    setOptions({
+                      ...options,
+                      generateProjectExplainer: e.target.checked,
+                    })
+                  }
+                  className="rounded"
+                />
+                Project Explainer
+              </label>
+            </div>
           </div>
 
           {/* Generate button */}

@@ -48,6 +48,7 @@ const PAGE_TO_TAB: Record<string, MainTabId> = {
   architecture: "architecture",
   "api-surface": "api-surface",
   "development-intelligence": "development-intelligence",
+  "project-explainer": "project-explainer",
   // Build
   "unified-workflow-builder": "unified-workflow-builder",
   "step-builders": "step-builders",

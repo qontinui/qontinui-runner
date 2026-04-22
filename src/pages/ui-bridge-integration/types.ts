@@ -169,8 +169,16 @@ export interface PageGenerationOptions {
   generateDataPageIds: boolean;
   generateSpecs: boolean;
   generateTutorials: boolean;
+  generateArchitectureDiagrams: boolean;
   generateDemoVideos: boolean;
   generateProductTours: boolean;
+  /**
+   * Project-level (not per-page): after all per-page generation finishes,
+   * compose specs + architecture diagrams into a hierarchical explainer
+   * under src/specs/explainer/ — index.md, per-cluster .md files, and
+   * per-page .md files. Navigable from the LEARN section.
+   */
+  generateProjectExplainer: boolean;
 }
 
 // --- API Response wrapper ---

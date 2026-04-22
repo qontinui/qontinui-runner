@@ -140,6 +140,11 @@ const PromptHomePage = lazy(() =>
 const DagWorkflowEditor = lazy(() =>
   import("../dag-workflow-editor").then((m) => ({ default: m.DagWorkflowEditor })),
 );
+const ProjectExplainerPage = lazy(() =>
+  import("../../pages/project-explainer/ProjectExplainerPage").then((m) => ({
+    default: m.ProjectExplainerPage,
+  })),
+);
 
 /** Register the active page with UI Bridge for AI discoverability */
 function PageRegistration({
@@ -1062,6 +1067,20 @@ export function TabContent({
           />
           <Suspense fallback={<LazyFallback />}>
             <DecisionTrailPage />
+          </Suspense>
+        </div>
+      );
+
+    case "project-explainer":
+      return (
+        <div data-page-id="project-explainer" className="h-full overflow-hidden">
+          <PageRegistration
+            id="project-explainer"
+            name="Project Explainer"
+            description="Navigable project documentation generated from specs + architecture diagrams, with an AI chat side panel"
+          />
+          <Suspense fallback={<LazyFallback />}>
+            <ProjectExplainerPage />
           </Suspense>
         </div>
       );
