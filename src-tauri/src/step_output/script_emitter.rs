@@ -292,48 +292,30 @@ pub async fn emit_extraction_script(
     let system_prefix_for_call = system_prefix.clone();
     let user_message_for_call = user_message.clone();
 
+    // Snapshot Gemma-local settings up front so the spawn_blocking closure
+    // doesn't need to reach back through the Tokio context. Cheap owned
+    // clones; the closure gets its own copies and the outer function still
+    // has access for the post-failure diagnostics.
+    let gemma_settings_snapshot: ScriptedOutputSettings = crate::config_facade::get_setting();
+    let gemma_settings_for_call = gemma_settings_snapshot.clone();
+
     let llm_call = async move {
         tokio::task::spawn_blocking(move || {
-            match provider_mode {
-                ScriptedOutputProviderMode::Auto | ScriptedOutputProviderMode::ClaudeApiWarm => {
-                    crate::ai_provider::claude_api_warm::run_claude_api_warm_with_structured_output(
-                        &system_prefix_for_call,
-                        &user_message_for_call,
-                        &ai_settings_snapshot.claude_api,
-                        Some(&model_owned),
-                        None,      // no Doctor handle — short synthetic call
-                        Some(0.0), // deterministic
-                        Some(512), // cap: expression is < 512 tokens always
-                        &schema_for_call,
-                        "scripted_output_extraction",
-                    )
-                }
-                ScriptedOutputProviderMode::ClaudeApi => {
-                    // Legacy keychain-API-key path. This path can't take a
-                    // split prompt, so concatenate the two halves. No
-                    // caching on this path — that's the point of the mode.
-                    let concatenated = format!(
-                        "{}\n\n---\n\n{}",
-                        system_prefix_for_call, user_message_for_call
-                    );
-                    run_prompt_with_structured_output(
-                        &concatenated,
-                        &schema_for_call,
-                        "scripted_output_extraction",
-                        None,
-                        Some(&model_owned),
-                        Some("claude_api"),
-                        Some(0.0),
-                        Some(512),
-                    )
-                }
-            }
+            call_provider(
+                provider_mode,
+                &system_prefix_for_call,
+                &user_message_for_call,
+                &ai_settings_snapshot.claude_api,
+                &gemma_settings_for_call,
+                &model_owned,
+                &schema_for_call,
+            )
         })
         .await
     };
 
-    let ai_response = match timeout(LLM_TIMEOUT, llm_call).await {
-        Ok(Ok(resp)) => resp,
+    let (ai_response, provider_label) = match timeout(LLM_TIMEOUT, llm_call).await {
+        Ok(Ok((resp, label))) => (resp, label),
         Ok(Err(join_err)) => {
             warn!(
                 "scripted-output emitter: spawn_blocking join error: {}",
@@ -357,26 +339,29 @@ pub async fn emit_extraction_script(
         }
     };
 
-    // Which string ends up in `EmitResult.provider` and in telemetry.
-    let provider_label = match provider_mode {
-        ScriptedOutputProviderMode::Auto | ScriptedOutputProviderMode::ClaudeApiWarm => {
-            "claude_api_warm"
-        }
-        ScriptedOutputProviderMode::ClaudeApi => "claude_api",
-    };
-
     if !ai_response.success {
         let err_text = ai_response.error.clone().unwrap_or_default();
 
-        // No-credentials outcome from the warm provider. On Auto, degrade to
-        // Disabled (same UX as if the settings flag were off) so the TS side
-        // takes its truncation fallback without a noisy error. On explicit
-        // ClaudeApiWarm, surface it loudly — the user asked for this path.
-        if crate::ai_provider::claude_api_warm::is_no_credential_error(&ai_response) {
+        // Unreachable credentials/server outcome after the full cascade.
+        // On Auto this already means every configured lane was tried and
+        // no usable credential or local endpoint was found, so degrade
+        // cleanly to Disabled. On a *forced* lane (ClaudeApiWarm /
+        // GemmaLocalWarm), surface a loud LlmError — the user asked
+        // specifically for that path.
+        let warm_missing =
+            crate::ai_provider::claude_api_warm::is_no_credential_error(&ai_response);
+        let gemma_missing =
+            crate::ai_provider::gemma_local_warm::is_no_server_error(&ai_response);
+        if warm_missing || gemma_missing {
             match provider_mode {
                 ScriptedOutputProviderMode::Auto => {
                     debug!(
-                        "scripted-output emitter: warm credentials unavailable under Auto mode; returning Disabled"
+                        "scripted-output emitter: all Auto lanes unavailable ({}); returning Disabled",
+                        if warm_missing {
+                            "no Claude credential, Gemma local server unreachable"
+                        } else {
+                            "Gemma local server unreachable"
+                        }
                     );
                     emit_fallback_event(&task_run_id, "disabled");
                     return Err(EmitError::Disabled);
@@ -389,6 +374,17 @@ pub async fn emit_extraction_script(
                     return Err(EmitError::LlmError(
                         "no warm-provider credentials configured".to_string(),
                     ));
+                }
+                ScriptedOutputProviderMode::GemmaLocalWarm => {
+                    warn!(
+                        "scripted-output emitter: GemmaLocalWarm forced but local server {} unreachable",
+                        gemma_settings_snapshot.gemma_local_endpoint
+                    );
+                    emit_fallback_event(&task_run_id, "emitter_error");
+                    return Err(EmitError::LlmError(format!(
+                        "gemma-local server at {} unreachable",
+                        gemma_settings_snapshot.gemma_local_endpoint
+                    )));
                 }
                 ScriptedOutputProviderMode::ClaudeApi => {
                     // Legacy path wouldn't emit the warm marker — unreachable.
@@ -482,6 +478,93 @@ fn check_budget_available(task_run_id: &str) -> Result<(), BudgetRejection> {
         return Err(BudgetRejection::OutputTokens);
     }
     Ok(())
+}
+
+/// Dispatch a single emit call to the provider selected by `mode`, returning
+/// both the provider response and the telemetry label that should end up in
+/// `EmitResult.provider` and in the `scripted_output.llm_ok` event.
+///
+/// `Auto` implements a two-step cascade:
+///   1. Claude warm (API key → OAuth fallback internal to `claude_api_warm`).
+///   2. On credentials-missing, fall through to Gemma local if the configured
+///      endpoint is reachable.
+/// If both lanes surface their respective "missing" markers the caller sees
+/// a final response carrying the Gemma server-unreachable marker; the main
+/// emit path maps that to `EmitError::Disabled` for `Auto`.
+///
+/// `ClaudeApiWarm` / `ClaudeApi` / `GemmaLocalWarm` are forced lanes — no
+/// fallback. The caller surfaces the underlying error as `LlmError` when a
+/// forced lane fails.
+fn call_provider(
+    mode: ScriptedOutputProviderMode,
+    system_prefix: &str,
+    user_message: &str,
+    claude_api_settings: &crate::settings::ClaudeApiSettings,
+    gemma_settings: &ScriptedOutputSettings,
+    model: &str,
+    schema: &serde_json::Value,
+) -> (crate::ai_provider::AiResponse, &'static str) {
+    const EXTRACTION_SCHEMA_NAME: &str = "scripted_output_extraction";
+    const MAX_EMITTER_TOKENS: u32 = 512;
+
+    let claude_warm = || {
+        crate::ai_provider::claude_api_warm::run_claude_api_warm_with_structured_output(
+            system_prefix,
+            user_message,
+            claude_api_settings,
+            Some(model),
+            None,      // no Doctor handle — short synthetic call
+            Some(0.0), // deterministic
+            Some(MAX_EMITTER_TOKENS),
+            schema,
+            EXTRACTION_SCHEMA_NAME,
+        )
+    };
+
+    let gemma_local = || {
+        crate::ai_provider::gemma_local_warm::run_gemma_local_warm_with_structured_output(
+            system_prefix,
+            user_message,
+            &gemma_settings.gemma_local_endpoint,
+            &gemma_settings.gemma_local_model_alias,
+            None,
+            Some(0.0),
+            Some(MAX_EMITTER_TOKENS),
+            schema,
+            EXTRACTION_SCHEMA_NAME,
+        )
+    };
+
+    match mode {
+        ScriptedOutputProviderMode::Auto => {
+            let warm = claude_warm();
+            if crate::ai_provider::claude_api_warm::is_no_credential_error(&warm) {
+                info!(
+                    "scripted-output emitter: Auto — Claude warm credentials missing, trying Gemma local"
+                );
+                let local = gemma_local();
+                (local, "gemma_local_warm")
+            } else {
+                (warm, "claude_api_warm")
+            }
+        }
+        ScriptedOutputProviderMode::ClaudeApiWarm => (claude_warm(), "claude_api_warm"),
+        ScriptedOutputProviderMode::ClaudeApi => {
+            let concatenated = format!("{}\n\n---\n\n{}", system_prefix, user_message);
+            let resp = run_prompt_with_structured_output(
+                &concatenated,
+                schema,
+                EXTRACTION_SCHEMA_NAME,
+                None,
+                Some(model),
+                Some("claude_api"),
+                Some(0.0),
+                Some(MAX_EMITTER_TOKENS),
+            );
+            (resp, "claude_api")
+        }
+        ScriptedOutputProviderMode::GemmaLocalWarm => (gemma_local(), "gemma_local_warm"),
+    }
 }
 
 fn consume_budget(task_run_id: &str, tokens_in: u32, tokens_out: u32) {
@@ -616,11 +699,16 @@ fn env_kill_switch_on() -> bool {
 /// `gemini_cli` value is intentionally not offered: subprocess-per-call
 /// providers can't satisfy the emitter's latency contract, and re-enabling
 /// them here would reintroduce the 100% timeout failure mode on dev runners.
+///
+/// `GemmaLocalWarm` is *not* a CLI-shaped provider — it's a long-lived HTTP
+/// server (llama.cpp serving Gemma 4 26B-A4B). The 2026-04-22 spike measured
+/// 1.1–1.4 s wall-time against the emitter's canonical test shape, ahead of
+/// the Claude Haiku 4.5 warm baseline, with zero dollars and zero quota.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptedOutputProviderMode {
-    /// Warm provider (API-key first, OAuth fallback). If neither credential
-    /// is available the emitter cleanly reports `disabled`. Default.
+    /// Cascade: Claude warm (API key first, OAuth second) → Gemma local
+    /// (if an endpoint is reachable) → `Disabled`. Default.
     #[default]
     Auto,
     /// Force the warm provider. If no credentials are available the
@@ -630,27 +718,53 @@ pub enum ScriptedOutputProviderMode {
     /// OAuth fallback). Useful for production runners with a dedicated
     /// Anthropic API key where billing boundaries matter.
     ClaudeApi,
+    /// Force the local llama.cpp / Gemma path. If the endpoint is
+    /// unreachable the emitter surfaces a loud `LlmError` rather than
+    /// falling back silently. Useful for dev machines that want to
+    /// deliberately avoid any Anthropic-side traffic.
+    GemmaLocalWarm,
 }
 
 /// Settings block for the scripted-output subsystem. Intentionally kept
-/// small: a bool, an optional model override, and a provider mode. Lives in
-/// the persistent `settings.json` so ops can flip the kill switch without a
-/// restart.
+/// small: a bool, an optional model override, a provider mode, and the
+/// local-Gemma endpoint knobs. Lives in the persistent `settings.json` so
+/// ops can flip the kill switch without a restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptedOutputSettings {
     #[serde(default = "default_scripted_output_enabled")]
     pub enabled: bool,
     /// Optional per-runner model override (e.g. `"claude-sonnet-4-5"` for
-    /// extraction-heavy deployments). `None` → [`DEFAULT_MODEL`].
+    /// extraction-heavy deployments). `None` → [`DEFAULT_MODEL`]. Only
+    /// consulted by the Claude lanes; the Gemma local lane always uses
+    /// the model the server was started with.
     #[serde(default)]
     pub model: Option<String>,
     /// Which provider serves emit calls. See [`ScriptedOutputProviderMode`].
     #[serde(default)]
     pub provider: ScriptedOutputProviderMode,
+    /// HTTP base URL of the local llama.cpp / Gemma server. Only consulted
+    /// by the `GemmaLocalWarm` lane (and by `Auto` when it cascades into
+    /// that lane). Default targets the sibling docker-compose in
+    /// `qontinui/docker/gemma-server/`.
+    #[serde(default = "default_gemma_local_endpoint")]
+    pub gemma_local_endpoint: String,
+    /// Alias the llama.cpp server registers for the loaded GGUF. Used in
+    /// log lines only; llama.cpp's `/completion` endpoint doesn't route on
+    /// model id.
+    #[serde(default = "default_gemma_local_model_alias")]
+    pub gemma_local_model_alias: String,
 }
 
 fn default_scripted_output_enabled() -> bool {
     true
+}
+
+fn default_gemma_local_endpoint() -> String {
+    crate::ai_provider::gemma_local_warm::DEFAULT_LOCAL_ENDPOINT.to_string()
+}
+
+fn default_gemma_local_model_alias() -> String {
+    crate::ai_provider::gemma_local_warm::DEFAULT_MODEL_ALIAS.to_string()
 }
 
 impl Default for ScriptedOutputSettings {
@@ -659,6 +773,8 @@ impl Default for ScriptedOutputSettings {
             enabled: default_scripted_output_enabled(),
             model: None,
             provider: ScriptedOutputProviderMode::Auto,
+            gemma_local_endpoint: default_gemma_local_endpoint(),
+            gemma_local_model_alias: default_gemma_local_model_alias(),
         }
     }
 }

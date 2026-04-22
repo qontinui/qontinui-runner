@@ -14,6 +14,7 @@ pub mod circuit_breaker;
 mod claude_api;
 pub(crate) mod claude_api_warm;
 mod claude_cli;
+pub(crate) mod gemma_local_warm;
 pub mod compaction_middleware;
 mod config;
 mod gemini_api;
