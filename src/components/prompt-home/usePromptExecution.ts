@@ -131,7 +131,12 @@ export function usePromptExecution(): UsePromptExecutionReturn {
             const executor = new NLActionExecutor();
             executor.updateElements(discovered.elements);
             executor.setActionExecutor(bridge as never);
-            await executor.execute({ instruction: step.instruction });
+            const result = await executor.execute({ instruction: step.instruction });
+            if (!result.success) {
+              throw new Error(
+                `Step ${i + 1} failed: ${result.error ?? result.errorCode ?? "action failed"} — could not ${step.instruction}`,
+              );
+            }
             // Wait for action to settle
             await new Promise((r) => setTimeout(r, 300));
           }
