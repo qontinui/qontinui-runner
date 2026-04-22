@@ -38,6 +38,8 @@ pub async fn enqueue_observation(
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // SAMPLE_RATE > 1 is guaranteed above, so modulo is well-defined.
+        #[allow(clippy::modulo_one)]
         if n % SAMPLE_RATE != 0 {
             return;
         }
