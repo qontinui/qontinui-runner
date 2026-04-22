@@ -70,7 +70,10 @@ const CONSECUTIVE_WINDOWS: usize = 3;
 /// guards against unexpected stalls (bridge pool starvation, pathologically
 /// large element sets).
 pub async fn run_drift_detector(app_state: Arc<crate::commands::AppState>) {
-    info!("drift-detector: starting (interval={}s)", TICK_INTERVAL.as_secs());
+    info!(
+        "drift-detector: starting (interval={}s)",
+        TICK_INTERVAL.as_secs()
+    );
     let mut interval = tokio::time::interval(TICK_INTERVAL);
     // Skip the first immediate tick — give the rest of startup a moment to
     // settle (Python bridge warming, PG pool initialising, auto-load landing).
@@ -146,11 +149,7 @@ async fn run_tick(app_state: &Arc<crate::commands::AppState>) -> Result<(), Stri
 
     info!(
         "drift-detector: config='{}' window={} considered={} matched={} fit_score={:.3}",
-        selected.config.name,
-        WINDOW_SIZE,
-        observations_considered,
-        states_matched,
-        fit_score
+        selected.config.name, WINDOW_SIZE, observations_considered, states_matched, fit_score
     );
 
     // 6. Persist.
@@ -172,11 +171,7 @@ async fn run_tick(app_state: &Arc<crate::commands::AppState>) -> Result<(), Stri
                 "drift-detector: fit_score has been below {:.2} for {} consecutive windows \
                  (latest={:.3}, spec_id={:?}, config='{}') — likely refactor; \
                  consider invalidating stale observations or re-deriving states",
-                DRIFT_THRESHOLD,
-                below,
-                fit_score,
-                spec_id,
-                selected.config.name
+                DRIFT_THRESHOLD, below, fit_score, spec_id, selected.config.name
             );
         }
     }
@@ -431,7 +426,10 @@ mod tests {
             ),
         ]);
         let map = build_state_fingerprint_map(&sm);
-        assert!(!map.contains_key("s1"), "empty-element state must be dropped");
+        assert!(
+            !map.contains_key("s1"),
+            "empty-element state must be dropped"
+        );
         assert!(map.contains_key("s2"));
         assert_eq!(map.get("s2").unwrap().len(), 1);
     }

@@ -62,10 +62,7 @@ pub async fn invalidate_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Require at least one narrowing filter. Soft-deleting the entire table
     // by sending an empty body should not be possible via this endpoint.
-    if body.fingerprint.is_none()
-        && body.fingerprint_pattern.is_none()
-        && body.spec_id.is_none()
-    {
+    if body.fingerprint.is_none() && body.fingerprint_pattern.is_none() && body.spec_id.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(api_error(
@@ -125,10 +122,8 @@ pub async fn invalidate_handler(
 
     // Owned storage so we can drop &dyn ToSql references into a Vec.
     let mut next_idx: usize = 4;
-    let fingerprint_json: Option<serde_json::Value> = body
-        .fingerprint
-        .as_ref()
-        .map(|fp| serde_json::json!([fp]));
+    let fingerprint_json: Option<serde_json::Value> =
+        body.fingerprint.as_ref().map(|fp| serde_json::json!([fp]));
     let pattern_like: Option<String> = body
         .fingerprint_pattern
         .as_ref()
