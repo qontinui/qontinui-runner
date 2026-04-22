@@ -981,6 +981,20 @@ const MIGRATIONS: &[Migration] = &[
                 WHERE invalidation_token IS NOT NULL;
         "#,
     },
+    Migration {
+        version: 26,
+        description: "Fix INTEGER → BIGINT drift on meta_optimizer_snapshots.runs_included (Rust struct declares i64; caused tokio-rt-worker panic 'error deserializing column 7' on read)",
+        sql: r#"
+            -- Rust reads this column via `r.get::<_, i64>(7)` in
+            -- database/pg/meta_optimizer.rs. Every install where this column
+            -- is still INT4 panics with "error retrieving column 7: error
+            -- deserializing column 7" the first time `get_latest_baseline_snapshot`
+            -- (or any of the 4 sibling readers) returns a row. Cast is
+            -- lossless since every INT4 fits in INT8.
+            ALTER TABLE meta_optimizer_snapshots
+                ALTER COLUMN runs_included TYPE BIGINT USING runs_included::bigint;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
@@ -1632,7 +1646,7 @@ impl PgDb {
                 metrics_json    TEXT NOT NULL,
                 breakdown_json  TEXT DEFAULT '{}',
                 recommendation_id TEXT,
-                runs_included   INTEGER NOT NULL DEFAULT 0,
+                runs_included   BIGINT NOT NULL DEFAULT 0,
                 created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_type ON meta_optimizer_snapshots(snapshot_type)",
