@@ -2322,6 +2322,187 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "sm-observation-pipeline",
+      "name": "Observation Pipeline Surface",
+      "description": "Co-occurrence observations drive state element lists via a derive → promote → invalidate → undo loop. The page surface exposes this via ObservationsPanel (mounted below the page header) and ProvenanceBadge (rendered next to each state name in the detail panel). ObservationsPanel shows the most recent drift fit_score (from GET /state-discovery/drift-scores), offers a 'Re-derive all' bulk action (POST /state-discovery/derive?window_days=90), an 'Invalidate spec observations' button (POST /co-occurrence/invalidate — disabled with tooltip when the StateMachineConfig has no spec_id), and an invalidation log table fed by GET /co-occurrence/invalidations. Each invalidation is grouped by undo_token; rows within the 24 h window show an Undo button (POST /co-occurrence/invalidate/undo). ProvenanceBadge renders three variants — green 'observed' (with support/contrast tooltip + observation count + age), gray 'ai-generated', yellow 'ai-fallback' (with invalidation age). Missing provenance on older compiled SMs silently falls back to 'ai-generated'.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sm-observations-panel-drift-label",
+          "description": "The ObservationsPanel mounts below the page header and shows a 'Drift fit score' label followed by either 'no drift data yet' (fresh runner) or a numeric fit_score with observations_matched/observations_considered and a timestamp.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "containsText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Drift fit score" },
+            "label": "Drift score widget label"
+          },
+          "expected": "Drift fit score",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-observations-re-derive-button",
+          "description": "A 'Re-derive all' button appears in the ObservationsPanel header row. Clicking it POSTs /state-discovery/derive (window_days=90), persists a state_discovery_artifact row, and shows a toast 'Derived N states from M observations' on success. While in flight, the button shows a spinner and is disabled.",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Re-derive all" },
+            "label": "Re-derive all button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-observations-invalidate-button",
+          "description": "An 'Invalidate spec observations' button appears next to 'Re-derive all'. When the active StateMachineConfig has a spec_id it is clickable and POSTs /co-occurrence/invalidate with that spec_id. When spec_id is absent (known gap: StateMachineConfig has no spec_id column yet) the button is disabled; its title tooltip reads 'Spec has no spec_id — invalidation-all is disabled'.",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Invalidate spec observations" },
+            "label": "Invalidate spec observations button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-observations-log-heading",
+          "description": "The ObservationsPanel renders an 'Invalidation log' heading. On a fresh runner the table shows 'No invalidations recorded for this spec.' Populated rows show columns When / Reason / By / Fingerprints / Action. Rows are grouped by undo_token so a single invalidate call producing N observation rows collapses into one log entry with summed fingerprints_count.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "containsText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Invalidation log" },
+            "label": "Invalidation log heading"
+          },
+          "expected": "Invalidation log",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-observations-log-empty-state",
+          "description": "When GET /co-occurrence/invalidations returns an empty array for the current spec, the log shows exactly 'No invalidations recorded for this spec.' rather than an empty table. This prevents ambiguity between 'still loading' and 'nothing to show'.",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "containsText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No invalidations" },
+            "label": "Empty invalidation log message"
+          },
+          "expected": "No invalidations recorded for this spec.",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-observations-undo-flow",
+          "description": "Each invalidation log row within 24 h of invalidated_at shows an 'Undo' action button. Clicking it POSTs /co-occurrence/invalidate/undo with the row's undo_token; the backend enforces the 24 h window via 'invalidated_at > now() - interval 24 hours' so expired undo tokens no-op server-side. On success the row is cleared from the log on next refresh and the observation_count used by /state-discovery/derive returns to its pre-invalidate value.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Invalidation log" },
+            "label": "Invalidation log undo flow"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one invalidation exists within the 24 h window",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-provenance-badge-observed",
+          "description": "When a state's compiled provenance is 'observed' (promoted from accumulated co-occurrence observations with support ≥ 0.75 and contrast ≥ 0.10), a green pill renders next to the state name in the State View detail panel. Its text reads 'observed' followed by '· N obs' (observationCount) and an age of the last_observed timestamp. Hovering surfaces a tooltip with the full support/contrast numbers.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "observed" },
+            "label": "Observed provenance badge"
+          },
+          "precondition": "At least one compiled state has provenance='observed' in stateMachine.states[].provenance",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-provenance-badge-ai-generated",
+          "description": "States authored from the spec JSON (or predating the provenance field) render a gray 'ai-generated' pill. Missing/undefined provenance falls back to this variant silently so older compiled SMs don't regress. The badge never throws or renders empty.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ai-generated" },
+            "label": "AI-generated provenance badge"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-provenance-badge-ai-fallback",
+          "description": "When a state was previously 'observed' but its observations were invalidated within the last 24 h, the compiler emits provenance='ai-fallback'. The badge renders yellow with text 'ai-fallback' plus an 'invalidated <Nh ago>' age from provenanceMeta.invalidatedAt. This signals the model is rebuilding from scratch — the JSON-authored element list is in use until re-derivation re-accumulates support above threshold.",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ai-fallback" },
+            "label": "AI-fallback provenance badge"
+          },
+          "precondition": "At least one state in the compiled SM was invalidated in the last 24 h",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-derive-one-state-per-cluster",
+          "description": "POST /state-discovery/derive returns an artifact whose states[] is the clustering of observation fingerprints via qontinui.discovery.discover_states_from_renders. The number of states shown in the response must equal the number of distinct element-set configurations in the observation window — not one per observation. A 3-observation run over a single page must produce exactly one state, not three. Repeated calls on the same observation set must produce the same state-hash set (input-order pinned by captured_at,id).",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Re-derive all" },
+            "label": "Derive output correctness"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-invariant-one-state-per-element",
+          "description": "Observed or ai-fallback states must satisfy the one-state-per-element invariant: no fingerprint may appear in more than one state's element list simultaneously. Violations cause compile-state-machine.ts to THROW (not just warn). For provenance='ai-generated' states the compiler downgrades to console.warn — they're sketches and may share elements until observations accumulate.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "State View" },
+            "label": "Cross-state element uniqueness"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "stateMachine": {

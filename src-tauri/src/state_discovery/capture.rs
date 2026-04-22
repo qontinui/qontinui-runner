@@ -111,14 +111,16 @@ pub async fn enqueue_observation(
         }
     };
 
-    // Cast $1 to uuid (the runner's tokio-postgres lacks with-uuid, so we
-    // pass the id as text and let PG parse). Cast $4/$5 to jsonb so the
-    // serde_json payload lands in JSONB columns rather than text.
+    // Cast $1 to uuid via ::text::uuid so tokio-postgres serializes the String
+    // as text (its uuid feature is not enabled) and PG coerces to uuid at
+    // insertion. A bare $1::uuid makes PG infer the parameter as uuid and
+    // String serialization fails. Cast $4/$5 to jsonb so the serde_json
+    // payload lands in JSONB columns rather than text.
     let res = conn
         .execute(
             r#"INSERT INTO co_occurrence_observations
                (id, spec_id, runner_instance, fingerprints, snapshot_metadata)
-               VALUES ($1::uuid, $2, $3, $4::jsonb, $5::jsonb)"#,
+               VALUES ($1::text::uuid, $2, $3, $4::jsonb, $5::jsonb)"#,
             &[
                 &id,
                 &spec_id as &(dyn tokio_postgres::types::ToSql + Sync),

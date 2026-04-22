@@ -970,6 +970,17 @@ const MIGRATIONS: &[Migration] = &[
                 ON state_discovery_drift_scores (spec_id, computed_at DESC);
         "#,
     },
+    Migration {
+        version: 25,
+        description: "Add invalidation_token to co_occurrence_observations for undo tracking",
+        sql: r#"
+            ALTER TABLE co_occurrence_observations
+                ADD COLUMN IF NOT EXISTS invalidation_token TEXT;
+            CREATE INDEX IF NOT EXISTS idx_observations_invalidation_token
+                ON co_occurrence_observations (invalidation_token)
+                WHERE invalidation_token IS NOT NULL;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.

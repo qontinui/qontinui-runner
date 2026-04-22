@@ -5,6 +5,14 @@
  * Collects all specs with stateMachine sections, flattens states and
  * transitions, converts spec element criteria to ElementQuery format,
  * and validates the result.
+ *
+ * This compiler also supports the observation-driven provenance pipeline
+ * (see `qontinui-dev-notes/session-prompts/state-definition-observation-pipeline.md`).
+ * Callers may optionally pass a `discoveryArtifact` produced by
+ * `POST /state-discovery/derive` plus an `invalidationState` map; states
+ * are then tagged `observed`, `ai-fallback`, or `ai-generated` and the
+ * observed/ai-fallback subset is checked for cross-state element
+ * uniqueness (the one-state-per-element invariant).
  */
 
 import type {
@@ -22,27 +30,130 @@ import type {
 } from "@qontinui/ui-bridge-auto";
 
 // ---------------------------------------------------------------------------
+// Provenance types and thresholds
+// ---------------------------------------------------------------------------
+
+/**
+ * Source of a compiled state's element list.
+ *
+ * - `ai-generated` — Spec JSON, not yet enough observations to promote.
+ * - `observed`     — Elements came from co-occurrence discovery artifact;
+ *                    the authoritative source.
+ * - `ai-fallback`  — State was previously `observed` but was invalidated
+ *                    (e.g. recent refactor); using JSON elements again
+ *                    until observations re-accumulate.
+ */
+export type StateProvenance = "ai-generated" | "observed" | "ai-fallback";
+
+/** Minimum per-state support (fraction) required to promote to `observed`. */
+export const MIN_SUPPORT = 0.75;
+/** Minimum contrast (gap from cross-cluster support) required for promotion. */
+export const MIN_CONTRAST = 0.1;
+/** Window during which a recently-invalidated state stays in `ai-fallback`. */
+export const INVALIDATION_WINDOW_HOURS = 24;
+
+// ---------------------------------------------------------------------------
+// Discovery artifact + invalidation state shapes (kept loose on purpose)
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape of the artifact persisted by `POST /state-discovery/derive`.
+ * Kept intentionally loose: Python clustering emits opaque fingerprint
+ * strings for `elements` and a `state_hash` rather than a human-readable
+ * name, so matching is by element-set shape rather than by name.
+ */
+export interface DiscoveryArtifact {
+  id?: string;
+  spec_id?: string | null;
+  derived_at?: string;
+  artifact: {
+    states: Array<{
+      state_hash?: string;
+      elements?: string[];
+      support?: number;
+      contrast?: number;
+      last_observed?: string;
+    }>;
+  };
+}
+
+/**
+ * Optional per-state invalidation metadata keyed by compiled-state ID.
+ * Values with `invalidatedAt` inside the 24h window force `ai-fallback`.
+ */
+export type InvalidationState = Record<string, { invalidatedAt: string }>;
+
+/** Metadata attached to a state describing how its provenance was decided. */
+export interface StateProvenanceMeta {
+  support?: number;
+  contrast?: number;
+  observationCount?: number;
+  lastObserved?: string;
+  /** Only populated when `provenance === "ai-fallback"`. */
+  invalidatedAt?: string;
+}
+
+/**
+ * A compiled state with provenance metadata. Extends the engine's
+ * `StateDefinition` (which does not know about provenance) with the two
+ * extra fields the pipeline needs.
+ */
+export type StateDefinitionWithProvenance = StateDefinition & {
+  provenance: StateProvenance;
+  provenanceMeta?: StateProvenanceMeta;
+};
+
+/**
+ * `PersistedStateMachine` enriched with provenance-bearing states.
+ * Type-compatible with the base shape because provenance fields are
+ * additive and consumers that don't care can treat states as plain
+ * `StateDefinition`s.
+ */
+export type PersistedStateMachineWithProvenance = Omit<PersistedStateMachine, "states"> & {
+  states: StateDefinitionWithProvenance[];
+};
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 export interface CompilationResult {
-  stateMachine: PersistedStateMachine;
+  stateMachine: PersistedStateMachineWithProvenance;
   stats: {
     specsProcessed: number;
     statesCompiled: number;
     transitionsCompiled: number;
     warnings: string[];
+    provenanceCounts: Record<StateProvenance, number>;
   };
 }
 
 /**
  * Compile all spec stateMachine sections into a single runtime state machine.
+ *
+ * @param specs               Authored spec configs.
+ * @param discoveryArtifact   Optional output of `/state-discovery/derive`.
+ *                            When provided, states whose element-set
+ *                            overlaps a cluster with sufficient support
+ *                            and contrast are promoted to `observed`.
+ * @param invalidationState   Optional map of compiled-state-id → invalidation
+ *                            timestamp. States invalidated within
+ *                            `INVALIDATION_WINDOW_HOURS` force `ai-fallback`.
  */
-export function compileStateMachineFromSpecs(specs: SpecConfig[]): CompilationResult {
+export function compileStateMachineFromSpecs(
+  specs: SpecConfig[],
+  discoveryArtifact?: DiscoveryArtifact,
+  invalidationState?: InvalidationState,
+): CompilationResult {
   const warnings: string[] = [];
-  const allStates: StateDefinition[] = [];
+  const allStates: StateDefinitionWithProvenance[] = [];
   const allTransitions: TransitionDefinition[] = [];
   const seenStateIds = new Set<string>();
+  const provenanceCounts: Record<StateProvenance, number> = {
+    "ai-generated": 0,
+    observed: 0,
+    "ai-fallback": 0,
+  };
   let specsProcessed = 0;
 
   for (const spec of specs) {
@@ -57,8 +168,19 @@ export function compileStateMachineFromSpecs(specs: SpecConfig[]): CompilationRe
       }
       seenStateIds.add(specState.id);
 
-      // Convert state
-      allStates.push(convertState(specState));
+      // Compile base state then decide its provenance.
+      const baseState = convertState(specState);
+      const promotion = choosePromotion(specState, discoveryArtifact, invalidationState);
+
+      const compiledState: StateDefinitionWithProvenance = {
+        ...baseState,
+        requiredElements: promotion.elements ?? baseState.requiredElements,
+        provenance: promotion.provenance,
+      };
+      if (promotion.meta) compiledState.provenanceMeta = promotion.meta;
+
+      provenanceCounts[promotion.provenance]++;
+      allStates.push(compiledState);
 
       // Convert transitions owned by this state
       for (const specTransition of specState.transitions) {
@@ -87,6 +209,13 @@ export function compileStateMachineFromSpecs(specs: SpecConfig[]): CompilationRe
     }
   }
 
+  // Cross-state element uniqueness: throw on collisions between
+  // observed/ai-fallback states (those are claimed to be authoritative or
+  // recently-authoritative); warn only on ai-generated collisions
+  // (sketches — violations are expected and will be resolved by the
+  // promotion step once observations accumulate).
+  enforceElementUniqueness(allStates, warnings);
+
   const now = Date.now();
   return {
     stateMachine: {
@@ -101,6 +230,7 @@ export function compileStateMachineFromSpecs(specs: SpecConfig[]): CompilationRe
       statesCompiled: allStates.length,
       transitionsCompiled: allTransitions.length,
       warnings,
+      provenanceCounts,
     },
   };
 }
@@ -184,6 +314,245 @@ function convertAction(specAction: SpecTransitionAction): EngineTransitionAction
     params: specAction.params,
     waitAfter: specAction.waitAfter as EngineTransitionAction["waitAfter"],
   };
+}
+
+// ---------------------------------------------------------------------------
+// Provenance: spec-state ↔ artifact-cluster matching & promotion
+// ---------------------------------------------------------------------------
+
+interface PromotionChoice {
+  provenance: StateProvenance;
+  /** New element list to use, or `undefined` to keep the spec's list. */
+  elements?: ElementQuery[];
+  meta?: StateProvenanceMeta;
+}
+
+/**
+ * Decide a compiled state's provenance given the discovery artifact and
+ * any pending invalidation. See the "Merging" table in the observation
+ * pipeline plan for the priority order.
+ */
+function choosePromotion(
+  specState: SpecState,
+  artifact: DiscoveryArtifact | undefined,
+  invalidationState: InvalidationState | undefined,
+): PromotionChoice {
+  // Priority 1: recent invalidation → ai-fallback.
+  const invalidation = invalidationState?.[specState.id];
+  if (invalidation?.invalidatedAt) {
+    const invalidatedMs = Date.parse(invalidation.invalidatedAt);
+    if (!Number.isNaN(invalidatedMs)) {
+      const ageHours = (Date.now() - invalidatedMs) / 3_600_000;
+      if (ageHours >= 0 && ageHours < INVALIDATION_WINDOW_HOURS) {
+        return {
+          provenance: "ai-fallback",
+          meta: { invalidatedAt: invalidation.invalidatedAt },
+        };
+      }
+    }
+  }
+
+  // Priority 2: artifact match with sufficient support + contrast → observed.
+  const match = artifact ? matchArtifactCluster(specState, artifact) : undefined;
+  if (
+    match &&
+    (match.cluster.support ?? 0) >= MIN_SUPPORT &&
+    (match.cluster.contrast ?? 0) >= MIN_CONTRAST
+  ) {
+    const elements = artifactElementsToQueries(match.cluster.elements ?? []);
+    if (elements.length > 0) {
+      return {
+        provenance: "observed",
+        elements,
+        meta: {
+          support: match.cluster.support,
+          contrast: match.cluster.contrast,
+          observationCount: match.cluster.elements?.length,
+          lastObserved: match.cluster.last_observed,
+        },
+      };
+    }
+  }
+
+  // Priority 3: default — keep AI-authored elements.
+  return { provenance: "ai-generated" };
+}
+
+/**
+ * Match a spec state to an artifact cluster.
+ *
+ * The TS side does not have access to the Rust `stable_element_fingerprint`
+ * function, and in practice artifact `elements[]` are opaque hash strings
+ * produced by clustering. So we cannot compare spec elements to artifact
+ * elements directly. The fallback heuristic for this first iteration:
+ *
+ * 1. Build a loose key for each spec element from `(role, accessibleName
+ *    ?? label ?? textContent, tagName)`.
+ * 2. If any artifact cluster's `elements[]` contain a string that equals
+ *    one of these loose keys, prefer that cluster (rich case — means the
+ *    artifact side exposed structured fingerprints, not opaque hashes).
+ * 3. Otherwise fall back to cluster-size proximity: pick the cluster whose
+ *    element count is closest to the spec state's element count.
+ * 4. If the artifact has no states, return undefined and the caller will
+ *    choose `ai-generated`.
+ */
+function matchArtifactCluster(
+  specState: SpecState,
+  artifact: DiscoveryArtifact,
+): { cluster: DiscoveryArtifact["artifact"]["states"][number] } | undefined {
+  const clusters = artifact.artifact?.states ?? [];
+  if (clusters.length === 0) return undefined;
+
+  const specKeys = specState.elements.map(looseElementKey).filter((k) => k.length > 0);
+
+  // Rich case: artifact elements look like structured keys.
+  if (specKeys.length > 0) {
+    let best: { cluster: (typeof clusters)[number]; overlap: number } | undefined;
+    for (const cluster of clusters) {
+      const els = cluster.elements ?? [];
+      let overlap = 0;
+      for (const key of specKeys) {
+        if (els.includes(key)) overlap++;
+      }
+      if (overlap > 0 && (!best || overlap > best.overlap)) {
+        best = { cluster, overlap };
+      }
+    }
+    if (best) return { cluster: best.cluster };
+  }
+
+  // Opaque case: match by cluster-size proximity.
+  const specCount = specState.elements.length;
+  if (specCount === 0) return undefined;
+  let closest: { cluster: (typeof clusters)[number]; diff: number } | undefined;
+  for (const cluster of clusters) {
+    const count = cluster.elements?.length ?? 0;
+    if (count === 0) continue;
+    const diff = Math.abs(count - specCount);
+    if (!closest || diff < closest.diff) {
+      closest = { cluster, diff };
+    }
+  }
+  // Require at least rough shape alignment; if no cluster exists within
+  // 2× the spec count, treat as unmatched — safer to fall back to AI.
+  if (closest && closest.diff <= Math.max(2, Math.ceil(specCount / 2))) {
+    return { cluster: closest.cluster };
+  }
+  return undefined;
+}
+
+/**
+ * Loose element key mirroring the matching formula specified in the plan:
+ *   `${role}|${(accessibleName||label||textContent||'').slice(0,60)}|${tagName?.toLowerCase()||''}`
+ * Used both for spec elements and (opportunistically) for artifact
+ * elements that happen to carry structured text.
+ */
+function looseElementKey(criteria: Record<string, unknown>): string {
+  const role = (criteria.role as string | undefined) ?? "";
+  const name =
+    (criteria.accessibleName as string | undefined) ??
+    (criteria.label as string | undefined) ??
+    (criteria.textContent as string | undefined) ??
+    "";
+  const tag = ((criteria.tagName as string | undefined) ?? "").toLowerCase();
+  return `${role}|${name.slice(0, 60)}|${tag}`;
+}
+
+/**
+ * Convert artifact element strings to engine ElementQuery objects. If
+ * the string matches the loose-key shape (`role|name|tagName`) we recover
+ * structured fields; otherwise we stash the opaque fingerprint in an
+ * attribute so downstream consumers can still reason about uniqueness.
+ */
+function artifactElementsToQueries(elements: string[]): ElementQuery[] {
+  const queries: ElementQuery[] = [];
+  for (const el of elements) {
+    if (!el) continue;
+    const parts = el.split("|");
+    if (parts.length === 3) {
+      const [role, name, tag] = parts;
+      const q: ElementQuery = {};
+      if (role) q.role = role;
+      if (name) q.ariaLabel = name;
+      if (tag) q.tagName = tag;
+      queries.push(q);
+    } else {
+      // Opaque fingerprint — preserve it in a synthetic attribute for
+      // equality checks in enforceElementUniqueness.
+      queries.push({ attributes: { "data-fingerprint": el } });
+    }
+  }
+  return queries;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-state uniqueness check
+// ---------------------------------------------------------------------------
+
+/**
+ * Enforce the one-state-per-element invariant. Collisions between
+ * observed/ai-fallback states throw; collisions involving only
+ * ai-generated states warn.
+ */
+function enforceElementUniqueness(
+  states: StateDefinitionWithProvenance[],
+  warnings: string[],
+): void {
+  // Map element-key → array of {stateId, provenance}.
+  const seen = new Map<string, Array<{ stateId: string; provenance: StateProvenance }>>();
+  for (const state of states) {
+    for (const el of state.requiredElements) {
+      const key = elementQueryKey(el);
+      if (!key) continue;
+      const bucket = seen.get(key) ?? [];
+      bucket.push({ stateId: state.id, provenance: state.provenance });
+      seen.set(key, bucket);
+    }
+  }
+
+  for (const [key, bucket] of seen.entries()) {
+    if (bucket.length < 2) continue;
+    // Deduplicate by stateId — multiple copies of the same element
+    // criteria in a single state are fine; cross-state duplicates are not.
+    const byState = new Map<string, StateProvenance>();
+    for (const entry of bucket) {
+      if (!byState.has(entry.stateId)) byState.set(entry.stateId, entry.provenance);
+    }
+    if (byState.size < 2) continue;
+
+    const observedOrFallback = [...byState.entries()].filter(
+      ([, p]) => p === "observed" || p === "ai-fallback",
+    );
+    if (observedOrFallback.length >= 2) {
+      const stateList = observedOrFallback.map(([id, p]) => `${id} (${p})`).join(", ");
+      throw new Error(
+        `[compile-state-machine] one-state-per-element invariant violated: ` +
+          `element "${key}" is claimed by multiple observed/ai-fallback states: ${stateList}`,
+      );
+    }
+    const stateList = [...byState.entries()].map(([id, p]) => `${id} (${p})`).join(", ");
+    const msg =
+      `Element "${key}" appears in multiple states (${stateList}); ` +
+      `ai-generated sketches only — will resolve on promotion.`;
+    warnings.push(msg);
+    console.warn(`[compile-state-machine] ${msg}`);
+  }
+}
+
+/**
+ * Stable string key for an ElementQuery suitable for equality checks in
+ * the uniqueness pass. We prefer the opaque fingerprint attribute (exact
+ * artifact-level match) before falling back to the loose role/name/tag
+ * triple.
+ */
+function elementQueryKey(q: ElementQuery): string {
+  const fp = q.attributes?.["data-fingerprint"];
+  if (fp) return `fp:${fp}`;
+  const role = q.role ?? "";
+  const name = q.ariaLabel ?? q.text ?? q.textContains ?? "";
+  const tag = (q.tagName ?? "").toLowerCase();
+  if (!role && !name && !tag) return "";
+  return `lk:${role}|${name.slice(0, 60)}|${tag}`;
 }
 
 // ---------------------------------------------------------------------------

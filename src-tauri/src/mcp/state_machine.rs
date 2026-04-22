@@ -942,10 +942,22 @@ pub async fn save_compiled_state_machine(
                 .cloned()
                 .unwrap_or(serde_json::json!([]));
             let path_cost = s.get("pathCost").cloned().unwrap_or(serde_json::json!(1.0));
-            let extra = serde_json::json!({
-                "requiredElements": required_elements,
-                "pathCost": path_cost,
-            });
+            // Preserve provenance metadata from the TS compiler so the State
+            // Machine page can render the ProvenanceBadge without needing a
+            // separate round-trip. Fields are optional; absent compilers
+            // simply don't set them and the badge falls back to "ai-generated".
+            let provenance = s.get("provenance").cloned();
+            let provenance_meta = s.get("provenanceMeta").cloned();
+            let mut extra_map = serde_json::Map::new();
+            extra_map.insert("requiredElements".to_string(), required_elements);
+            extra_map.insert("pathCost".to_string(), path_cost);
+            if let Some(p) = provenance {
+                extra_map.insert("provenance".to_string(), p);
+            }
+            if let Some(pm) = provenance_meta {
+                extra_map.insert("provenanceMeta".to_string(), pm);
+            }
+            let extra = serde_json::Value::Object(extra_map);
             let req = CreateSmStateRequest {
                 state_id: Some(state_id),
                 name,

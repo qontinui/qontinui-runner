@@ -47,6 +47,10 @@ import { useToast } from "@/hooks/useToast";
 import { UIBridgeStateGraph } from "./UIBridgeStateGraph";
 import { UIBridgeDiscoveryPanel } from "./UIBridgeDiscoveryPanel";
 import { ExportPanel } from "./ExportPanel";
+import { ProvenanceBadge } from "./ProvenanceBadge";
+import { ObservationsPanel } from "./ObservationsPanel";
+import { getApiBase } from "@/lib/runner-api";
+import type { StateProvenance, StateProvenanceMeta } from "@/lib/compile-state-machine";
 import { ToastContainer } from "@/components/ToastContainer";
 import { StateExplorationResultsViewer } from "@/components/state-explorer/StateExplorationResultsViewer";
 import { createRunnerDataAdapter } from "@/lib/workflow-builder/runner-data-adapter";
@@ -235,6 +239,72 @@ export function UIBridgeStateMachinePage() {
   const showTransitionPanel = (selectedTransition || showNewTransition) && !selectedState;
   const noConfig = !sm.activeConfig;
   const hasConfig = !!sm.activeConfig;
+
+  // ======================================================================
+  // Observation-pipeline provenance — read compiled state's provenance +
+  // meta from extra_metadata (populated by save-compiled after the TS
+  // compiler assigned them). Absent fields fall back to ai-generated in the
+  // ProvenanceBadge so older compiled SMs don't require a re-compile to
+  // render cleanly.
+  // ======================================================================
+  const selectedProvenance: StateProvenance | undefined = (() => {
+    const raw = selectedState?.extra_metadata?.provenance;
+    if (raw === "observed" || raw === "ai-generated" || raw === "ai-fallback") {
+      return raw;
+    }
+    return undefined;
+  })();
+  const selectedProvenanceMeta: StateProvenanceMeta | undefined = (() => {
+    const raw = selectedState?.extra_metadata?.provenanceMeta;
+    if (raw && typeof raw === "object") {
+      return raw as StateProvenanceMeta;
+    }
+    return undefined;
+  })();
+
+  // `StateMachineConfig` currently has no `spec_id` column (the plan notes
+  // this — add it in a later migration). Until then, pass undefined to
+  // ObservationsPanel, which maps to "default (NULL) spec_id" on the
+  // backend — matching the drift detector's own NULL-scope behaviour.
+  const activeSpecId: string | undefined = undefined;
+
+  const handleInvalidateState = useCallback(async () => {
+    // Invalidation is spec-scoped per the plan; without a spec_id we don't
+    // fire — the endpoint rejects filter-less calls to prevent nuking the
+    // entire observations table.
+    if (!activeSpecId) {
+      showToast("Invalidation needs a spec_id on this SM config. Add one and re-compile.", "error");
+      return;
+    }
+    try {
+      const resp = await fetch(`${getApiBase()}/co-occurrence/invalidate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spec_id: activeSpecId,
+          reason: `manual invalidation of state '${selectedState?.name ?? selectedState?.state_id}' from State Machine page`,
+          invalidated_by: "state-machine-page",
+        }),
+      });
+      const json = (await resp.json()) as {
+        success: boolean;
+        data?: { count: number; undo_token: string };
+        error?: string;
+      };
+      if (!resp.ok || !json.success || !json.data) {
+        throw new Error(json.error ?? `HTTP ${resp.status}`);
+      }
+      showToast(
+        `Invalidated ${json.data.count} observation(s) for this spec. Undo (valid for 24 h) — token: ${json.data.undo_token.slice(0, 8)}…`,
+        "success",
+      );
+    } catch (err) {
+      showToast(
+        `Invalidation failed: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
+  }, [activeSpecId, selectedState, showToast]);
 
   // Refetch permitted/blocked triggers when the Transitions tab opens or
   // the active config changes. When no config is loaded, clear both lists.
@@ -440,6 +510,9 @@ export function UIBridgeStateMachinePage() {
         </div>
       </div>
 
+      {/* Observations panel — drift score, re-derive, invalidation log */}
+      {hasConfig && <ObservationsPanel specId={activeSpecId} showToast={showToast} />}
+
       {/* Tab Navigation */}
       <div className="border-b border-border-primary bg-surface-primary px-6">
         <div className="inline-flex h-9 w-fit items-center justify-center rounded-lg p-[3px]">
@@ -530,11 +603,34 @@ export function UIBridgeStateMachinePage() {
             }
           >
             {selectedState && (
-              <StateDetailPanel
-                state={selectedState}
-                onSave={handleSaveState}
-                onClose={() => setSelectedStateId(null)}
-              />
+              <>
+                {/* Provenance header — observation-pipeline signal above the
+                    stock StateDetailPanel so user sees the state's lifecycle
+                    status + can invalidate its observations with one click. */}
+                <div className="flex items-center justify-between gap-2 px-4 pt-4 pb-2 border-b border-border-secondary">
+                  <ProvenanceBadge
+                    provenance={selectedProvenance}
+                    provenanceMeta={selectedProvenanceMeta}
+                  />
+                  <button
+                    onClick={() => void handleInvalidateState()}
+                    disabled={!activeSpecId}
+                    className="text-[10px] px-2 py-0.5 rounded border border-border-primary text-text-secondary hover:text-text-primary hover:bg-surface-secondary disabled:opacity-50"
+                    title={
+                      activeSpecId
+                        ? "Soft-delete all observations for this spec (24 h undo)"
+                        : "Spec has no spec_id — invalidation disabled"
+                    }
+                  >
+                    Invalidate observations
+                  </button>
+                </div>
+                <StateDetailPanel
+                  state={selectedState}
+                  onSave={handleSaveState}
+                  onClose={() => setSelectedStateId(null)}
+                />
+              </>
             )}
           </div>
 

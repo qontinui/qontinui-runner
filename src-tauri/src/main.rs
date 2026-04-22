@@ -1617,10 +1617,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(sm_state) = sm_state_opt {
                         let restate_enabled = crate::settings::load_settings().restate.enabled;
                         let ui_error_state = startup_app_state.ui_error.clone();
+                        let crash_dump_state = startup_app_state.crash_dumps.clone();
                         crate::server_mode::spawn_background_tasks(
                             sm_state,
                             restate_enabled,
                             ui_error_state,
+                            crash_dump_state,
                         );
                     }
                 });
@@ -1670,6 +1672,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     app.state::<Arc<commands::AppState>>().inner().clone();
                 tauri::async_runtime::spawn(async move {
                     crate::mcp::state_machine::auto_load_default_state_machine(&sm_app_state).await;
+                });
+            }
+
+            // Start the state-discovery drift detector (Step 6). Scores recent
+            // co-occurrence observations against the currently loaded compiled
+            // SM every 10 min, persists to `state_discovery_drift_scores`, and
+            // logs a WARN when fit_score has been below 0.9 for 3 windows in a
+            // row. Fire-and-forget: a transient failure inside the loop is
+            // logged and the next tick runs normally; process death kills the
+            // task cleanly.
+            {
+                let drift_app_state: Arc<commands::AppState> =
+                    app.state::<Arc<commands::AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::state_discovery::run_drift_detector(drift_app_state).await;
                 });
             }
 

@@ -261,12 +261,13 @@ async fn persist_artifact(
 
     let spec_id_owned: Option<String> = spec_id.map(|s| s.to_string());
 
-    // $1::uuid cast — tokio-postgres lacks the uuid feature here, so we
-    // pass the id as text and let PG coerce.
+    // $1::text::uuid — tokio-postgres lacks the uuid feature; a bare $1::uuid
+    // makes PG infer the parameter as uuid (fails on String). ::text::uuid
+    // keeps $1 typed as text and coerces at insertion.
     conn.execute(
         r#"INSERT INTO state_discovery_artifacts
            (id, spec_id, window_days, artifact, observation_count)
-           VALUES ($1::uuid, $2, $3, $4::jsonb, $5)"#,
+           VALUES ($1::text::uuid, $2, $3, $4::jsonb, $5)"#,
         &[
             &artifact_id,
             &spec_id_owned as &(dyn tokio_postgres::types::ToSql + Sync),

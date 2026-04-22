@@ -8,14 +8,35 @@
 
 pub mod capture;
 pub mod derive;
+pub mod drift;
+pub mod drift_scores;
 pub mod fingerprint;
+pub mod invalidate;
 
 pub use capture::enqueue_observation;
+pub use drift::run_drift_detector;
 pub use fingerprint::stable_element_fingerprint;
 
 /// Axum routes exported by this module. Wire into the main router in
 /// `mcp_api.rs` with `.merge(crate::state_discovery::routes())`.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
-    use axum::routing::post;
-    axum::Router::new().route("/state-discovery/derive", post(derive::derive_handler))
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/state-discovery/derive", post(derive::derive_handler))
+        .route(
+            "/state-discovery/drift-scores",
+            get(drift_scores::list_handler),
+        )
+        .route(
+            "/co-occurrence/invalidate",
+            post(invalidate::invalidate_handler),
+        )
+        .route(
+            "/co-occurrence/invalidate/undo",
+            post(invalidate::undo_handler),
+        )
+        .route(
+            "/co-occurrence/invalidations",
+            get(invalidate::list_handler),
+        )
 }

@@ -3862,7 +3862,8 @@ CREATE TABLE IF NOT EXISTS co_occurrence_observations (
     snapshot_metadata JSONB,
     invalidated_at TIMESTAMPTZ,
     invalidated_reason TEXT,
-    invalidated_by TEXT
+    invalidated_by TEXT,
+    invalidation_token TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_observations_captured_at
     ON co_occurrence_observations (captured_at)
@@ -3872,6 +3873,9 @@ CREATE INDEX IF NOT EXISTS idx_observations_spec
     WHERE invalidated_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_observations_fingerprints
     ON co_occurrence_observations USING gin(fingerprints);
+CREATE INDEX IF NOT EXISTS idx_observations_invalidation_token
+    ON co_occurrence_observations (invalidation_token)
+    WHERE invalidation_token IS NOT NULL;
 
 -- One row per spec x derivation run. `artifact` shape:
 -- {states: [{state_hash, elements, support, contrast, last_observed}]}
