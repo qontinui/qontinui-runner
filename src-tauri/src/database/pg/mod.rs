@@ -968,6 +968,56 @@ const MIGRATIONS: &[Migration] = &[
                 ALTER COLUMN runs_included TYPE BIGINT USING runs_included::bigint;
         "#,
     },
+    Migration {
+        version: 27,
+        description: "Fix 12 more INT4 → BIGINT drifts across 7 tables where Rust reads with r.get::<_, i64> (sister bugs of v26; same panic class)",
+        sql: r#"
+            -- Same pattern as v26. An audit of every `INTEGER` column in
+            -- schema.pg.sql against `r.get::<_, i64>` / `Option<i64>` reads
+            -- in database/pg/*.rs found 12 additional mismatches. Each
+            -- would panic with "error deserializing column N" the first
+            -- time the corresponding SELECT returned a row. Cast INT4 →
+            -- INT8 is lossless; indexes rebuild automatically.
+
+            -- task_runs.rs:1929-1930 (get_step_progress_markers)
+            ALTER TABLE step_progress_markers
+                ALTER COLUMN current_value TYPE BIGINT USING current_value::bigint,
+                ALTER COLUMN total_value   TYPE BIGINT USING total_value::bigint;
+
+            -- task_runs.rs:1277, :1329 (get_automation_* readers). INSERT
+            -- at task_runs.rs:2165 already casts to i32, so reads are the
+            -- drift; migrating to BIGINT aligns both.
+            ALTER TABLE task_run_automation
+                ALTER COLUMN iteration_number TYPE BIGINT USING iteration_number::bigint;
+
+            -- pipeline_traces.rs:153-155 (get_pipeline_traces_for_task).
+            -- duration_ms especially needs BIGINT — i32 ms caps at ~24 days
+            -- of trace, which is well under a long autonomous run.
+            ALTER TABLE pipeline_agent_traces
+                ALTER COLUMN duration_ms TYPE BIGINT USING duration_ms::bigint,
+                ALTER COLUMN tokens_in   TYPE BIGINT USING tokens_in::bigint,
+                ALTER COLUMN tokens_out  TYPE BIGINT USING tokens_out::bigint;
+
+            -- generation_artifacts.rs:452 (total_duration_ms reader).
+            ALTER TABLE generation_pipeline_artifacts
+                ALTER COLUMN total_duration_ms TYPE BIGINT USING total_duration_ms::bigint;
+
+            -- checks.rs:565-567 (get_check_results reader).
+            ALTER TABLE check_results
+                ALTER COLUMN issues_found  TYPE BIGINT USING issues_found::bigint,
+                ALTER COLUMN issues_fixed  TYPE BIGINT USING issues_fixed::bigint,
+                ALTER COLUMN files_checked TYPE BIGINT USING files_checked::bigint;
+
+            -- checkpoints.rs:511 (get_checkpoints reader).
+            ALTER TABLE orchestrator_checkpoints
+                ALTER COLUMN iteration TYPE BIGINT USING iteration::bigint;
+
+            -- generation.rs:334 (get_exploration_stats reader). Sister
+            -- columns total_candidates/search_depth stay INT4 (read as i32).
+            ALTER TABLE exploration_stats
+                ALTER COLUMN search_duration_ms TYPE BIGINT USING search_duration_ms::bigint;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
@@ -1482,7 +1532,7 @@ impl PgDb {
             "CREATE TABLE IF NOT EXISTS orchestrator_checkpoints (
                 id              TEXT PRIMARY KEY,
                 task_id         TEXT NOT NULL,
-                iteration       INTEGER NOT NULL DEFAULT 0,
+                iteration       BIGINT NOT NULL DEFAULT 0,
                 trigger         TEXT NOT NULL,
                 state           TEXT NOT NULL DEFAULT '{}',
                 name            TEXT,
@@ -1623,7 +1673,7 @@ impl PgDb {
                 autofix_duration_ms INTEGER,
                 verification_duration_ms INTEGER,
                 hardener_duration_ms INTEGER,
-                total_duration_ms INTEGER,
+                total_duration_ms BIGINT,
                 discovery_calls TEXT,
                 builder_raw_output TEXT,
                 builder_parsed_json TEXT,
@@ -1660,9 +1710,9 @@ impl PgDb {
                 input_snapshot  TEXT NOT NULL DEFAULT '{}',
                 output_snapshot TEXT NOT NULL DEFAULT '{}',
                 config_json     TEXT NOT NULL DEFAULT '{}',
-                duration_ms     INTEGER NOT NULL DEFAULT 0,
-                tokens_in       INTEGER NOT NULL DEFAULT 0,
-                tokens_out      INTEGER NOT NULL DEFAULT 0,
+                duration_ms     BIGINT NOT NULL DEFAULT 0,
+                tokens_in       BIGINT NOT NULL DEFAULT 0,
+                tokens_out      BIGINT NOT NULL DEFAULT 0,
                 cost_usd        DOUBLE PRECISION NOT NULL DEFAULT 0.0,
                 downstream_success BOOLEAN,
                 output_quality_score DOUBLE PRECISION,
@@ -1902,7 +1952,7 @@ impl PgDb {
                 task_run_id         TEXT,
                 total_candidates    INTEGER NOT NULL DEFAULT 0,
                 search_depth        INTEGER NOT NULL DEFAULT 0,
-                search_duration_ms  INTEGER NOT NULL DEFAULT 0,
+                search_duration_ms  BIGINT NOT NULL DEFAULT 0,
                 best_score          DOUBLE PRECISION,
                 strategy_used       TEXT,
                 score_progression   TEXT,
