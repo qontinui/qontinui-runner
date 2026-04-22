@@ -245,15 +245,21 @@ pub fn get_missing_dev_services(
         .collect()
 }
 
-/// Upgrade legacy configs and remove duplicate configs on dev-service ports.
+/// Sync user configs to dev-service defaults and dedupe duplicate configs on
+/// dev-service ports.
 ///
 /// Two responsibilities, run in order:
 ///
-/// 1. **Upgrade:** if a user-added config matches a dev-service port but has
-///    `auto_start: false`, bump `auto_start`, `start_group`, `dev_only`, and
-///    replace `command/args/cwd/env` with the dev-service defaults. Legacy
-///    configs often carry wrong commands (e.g. bare `python` instead of
-///    `poetry run python run.py`).
+/// 1. **Sync:** for every enabled config whose `health_port` matches a
+///    dev-service default, overwrite the launch-critical fields
+///    (`command/args/cwd/env/start_group/dev_only/auto_start/build_command/
+///    build_args`) with the current default. This keeps stale user entries —
+///    old commands like `python -m uvicorn main:app` pointing at files that
+///    no longer exist — aligned with whatever `get_default_dev_services` says
+///    today. Per project stance (no external users yet, dev mode), silent
+///    sync is preferred to leaving broken configs in place. User-only fields
+///    (`id`, `name`, `buffer_size`, `ignore_patterns`, `rebuild_enabled`)
+///    are preserved.
 ///
 /// 2. **Dedupe:** for each dev-service port, collapse to a single config.
 ///    Prefer the canonical dev-service entry (deterministic UUID v5) when
@@ -268,23 +274,46 @@ pub fn upgrade_and_dedupe_configs(configs: &mut Vec<ProcessConfig>, workspace: &
     let mut changed = false;
 
     for config in configs.iter_mut() {
-        if !config.auto_start && config.enabled {
-            if let Some(port) = config.health_port {
-                if let Some(dev_default) = defaults.iter().find(|d| d.health_port == Some(port)) {
-                    info!(
-                        "Dev-mode: upgrading legacy config '{}' (port {}) -> command='{}', start_group={}, dev_only=true",
-                        config.name, port, dev_default.command, dev_default.start_group
-                    );
-                    config.auto_start = true;
-                    config.start_group = dev_default.start_group;
-                    config.dev_only = true;
-                    config.command = dev_default.command.clone();
-                    config.args = dev_default.args.clone();
-                    config.cwd = dev_default.cwd.clone();
-                    config.env = dev_default.env.clone();
-                    changed = true;
-                }
-            }
+        if !config.enabled {
+            continue;
+        }
+        let Some(port) = config.health_port else {
+            continue;
+        };
+        let Some(dev_default) = defaults.iter().find(|d| d.health_port == Some(port)) else {
+            continue;
+        };
+
+        let differs = config.command != dev_default.command
+            || config.args != dev_default.args
+            || config.cwd != dev_default.cwd
+            || config.env != dev_default.env
+            || config.start_group != dev_default.start_group
+            || config.dev_only != dev_default.dev_only
+            || config.auto_start != dev_default.auto_start
+            || config.build_command != dev_default.build_command
+            || config.build_args != dev_default.build_args;
+
+        if differs {
+            info!(
+                "Dev-mode: syncing config '{}' (port {}) to dev-service defaults -> command='{}', start_group={}, dev_only={}, auto_start={}",
+                config.name,
+                port,
+                dev_default.command,
+                dev_default.start_group,
+                dev_default.dev_only,
+                dev_default.auto_start
+            );
+            config.command = dev_default.command.clone();
+            config.args = dev_default.args.clone();
+            config.cwd = dev_default.cwd.clone();
+            config.env = dev_default.env.clone();
+            config.start_group = dev_default.start_group;
+            config.dev_only = dev_default.dev_only;
+            config.auto_start = dev_default.auto_start;
+            config.build_command = dev_default.build_command.clone();
+            config.build_args = dev_default.build_args.clone();
+            changed = true;
         }
     }
 

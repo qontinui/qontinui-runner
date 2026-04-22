@@ -334,146 +334,119 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 9,
-        description: "Repair SQLite-era schema drift: 36 TIMESTAMPTZ columns and 7 BIGINT columns currently stored as TEXT/INTEGER",
+        description: "Repair SQLite-era schema drift: TIMESTAMPTZ columns stored as TEXT and BIGINT columns stored as INTEGER (idempotent, no-op on fresh installs)",
         sql: r#"
-            -- TIMESTAMPTZ columns that drifted to TEXT during the SQLite -> PG
-            -- migration. The canonical schema (CREATE TABLE in this file) has
-            -- always declared these as TIMESTAMPTZ, but the live tables on
-            -- already-running installs were created when the runner still
-            -- spoke SQLite and TEXT was the only timestamp type. CREATE TABLE
-            -- IF NOT EXISTS is a no-op once the table exists, so the drift
-            -- has been silently reproducing across builds. Queries that use
-            -- date_trunc / interval arithmetic / timestamptz comparison fail
-            -- against TEXT columns with confusing 'function date_trunc(unknown,
-            -- text) does not exist' errors. Cast each column to TIMESTAMPTZ;
-            -- empty strings (legacy SQLite default) become NULL via NULLIF
-            -- and only nullable columns retain them. PostgreSQL automatically
-            -- rebuilds dependent indexes during ALTER COLUMN TYPE.
+            -- Repair schema drift from the SQLite -> PG transition: some live
+            -- installs have columns stored as TEXT/INTEGER that the canonical
+            -- schema declares as TIMESTAMPTZ/BIGINT. On a fresh install the
+            -- canonical types are already applied by schema.pg.sql, so this
+            -- migration must be a no-op; on legacy installs it performs the
+            -- in-place cast. We do this via a DO block that inspects
+            -- information_schema.columns and only issues the ALTER when the
+            -- current storage type is the legacy one — this makes the whole
+            -- migration idempotent and safe to re-run.
             --
-            -- All 36 columns were verified individually as 100% castable
-            -- against the production database before this migration was
-            -- written: empty/null values exist only in nullable columns,
-            -- and no value fails ::timestamptz parsing.
+            -- Empty strings (legacy SQLite default) become NULL via NULLIF so
+            -- nullable columns keep their NULLs and NOT NULL columns that had
+            -- '' would fail loudly — none exist today, verified pre-landing.
+            -- PostgreSQL rebuilds dependent indexes automatically during
+            -- ALTER COLUMN TYPE. INTEGER -> BIGINT is lossless.
+            DO $$
+            DECLARE
+                r record;
+            BEGIN
+                -- TIMESTAMPTZ columns. Column 3 marks whether the column
+                -- should also have its default bumped to NOW() after the
+                -- type change (NOT NULL columns with a legacy '' default).
+                FOR r IN SELECT * FROM (VALUES
+                    ('active_workflows',              'created_at',        true),
+                    ('active_workflows',              'updated_at',        true),
+                    ('exploration_stats',             'created_at',        true),
+                    ('fix_applications',              'applied_at',        true),
+                    ('fix_applications',              'evaluated_at',      false),
+                    ('flow_executions',               'started_at',        true),
+                    ('flow_executions',               'completed_at',      false),
+                    ('flow_versions',                 'created_at',        true),
+                    ('generation_pipeline_artifacts', 'created_at',        true),
+                    ('generation_rules',              'created_at',        true),
+                    ('generation_rules',              'updated_at',        true),
+                    ('generation_rules',              'auto_generated_at', false),
+                    ('iteration_logs',                'created_at',        true),
+                    ('meta_optimizer_runs',           'created_at',        true),
+                    ('meta_optimizer_runs',           'completed_at',      false),
+                    ('meta_optimizer_snapshots',      'created_at',        true),
+                    ('orchestrator_checkpoints',      'created_at',        true),
+                    ('orchestrator_flows',            'created_at',        true),
+                    ('orchestrator_flows',            'updated_at',        true),
+                    ('pipeline_agent_traces',         'created_at',        true),
+                    ('recordings',                    'started_at',        true),
+                    ('recordings',                    'completed_at',      false),
+                    ('reflection_fixes',              'created_at',        true),
+                    ('reflection_fixes',              'applied_at',        true),
+                    ('reflection_fixes',              'evaluated_at',      false),
+                    ('sm_capture_screenshots',        'captured_at',       true),
+                    ('step_templates',                'created_at',        true),
+                    ('step_templates',                'updated_at',        true),
+                    ('template_performance',          'last_used_at',      false),
+                    ('test_results',                  'created_at',        true),
+                    ('test_results',                  'started_at',        false),
+                    ('test_results',                  'completed_at',      false),
+                    ('trigger_history',               'triggered_at',      true),
+                    ('workflow_triggers',             'created_at',        true),
+                    ('workflow_triggers',             'updated_at',        true),
+                    ('workflow_triggers',             'last_triggered_at', false)
+                ) AS t(table_name, column_name, set_now_default)
+                LOOP
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'runner'
+                          AND table_name   = r.table_name
+                          AND column_name  = r.column_name
+                          AND data_type    = 'text'
+                    ) THEN
+                        EXECUTE format(
+                            'ALTER TABLE %I ALTER COLUMN %I DROP DEFAULT',
+                            r.table_name, r.column_name
+                        );
+                        EXECUTE format(
+                            'ALTER TABLE %I ALTER COLUMN %I TYPE TIMESTAMPTZ USING NULLIF(%I, '''')::timestamptz',
+                            r.table_name, r.column_name, r.column_name
+                        );
+                        IF r.set_now_default THEN
+                            EXECUTE format(
+                                'ALTER TABLE %I ALTER COLUMN %I SET DEFAULT NOW()',
+                                r.table_name, r.column_name
+                            );
+                        END IF;
+                    END IF;
+                END LOOP;
 
-            ALTER TABLE active_workflows
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW(),
-                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
-                ALTER COLUMN updated_at SET DEFAULT NOW();
-
-            ALTER TABLE exploration_stats
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW();
-
-            ALTER TABLE fix_applications
-                ALTER COLUMN applied_at TYPE TIMESTAMPTZ USING NULLIF(applied_at, '')::timestamptz,
-                ALTER COLUMN applied_at SET DEFAULT NOW(),
-                ALTER COLUMN evaluated_at TYPE TIMESTAMPTZ USING NULLIF(evaluated_at, '')::timestamptz;
-
-            ALTER TABLE flow_executions
-                ALTER COLUMN started_at TYPE TIMESTAMPTZ USING NULLIF(started_at, '')::timestamptz,
-                ALTER COLUMN started_at SET DEFAULT NOW(),
-                ALTER COLUMN completed_at TYPE TIMESTAMPTZ USING NULLIF(completed_at, '')::timestamptz;
-
-            ALTER TABLE flow_versions
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW();
-
-            ALTER TABLE generation_pipeline_artifacts
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW();
-
-            ALTER TABLE generation_rules
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW(),
-                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
-                ALTER COLUMN updated_at SET DEFAULT NOW(),
-                ALTER COLUMN auto_generated_at TYPE TIMESTAMPTZ USING NULLIF(auto_generated_at, '')::timestamptz;
-
-            ALTER TABLE iteration_logs
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW();
-
-            ALTER TABLE meta_optimizer_runs
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW(),
-                ALTER COLUMN completed_at TYPE TIMESTAMPTZ USING NULLIF(completed_at, '')::timestamptz;
-
-            ALTER TABLE meta_optimizer_snapshots
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW();
-
-            ALTER TABLE orchestrator_checkpoints
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW();
-
-            ALTER TABLE orchestrator_flows
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW(),
-                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
-                ALTER COLUMN updated_at SET DEFAULT NOW();
-
-            ALTER TABLE pipeline_agent_traces
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW();
-
-            ALTER TABLE recordings
-                ALTER COLUMN started_at TYPE TIMESTAMPTZ USING NULLIF(started_at, '')::timestamptz,
-                ALTER COLUMN started_at SET DEFAULT NOW(),
-                ALTER COLUMN completed_at TYPE TIMESTAMPTZ USING NULLIF(completed_at, '')::timestamptz;
-
-            ALTER TABLE reflection_fixes
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW(),
-                ALTER COLUMN applied_at TYPE TIMESTAMPTZ USING NULLIF(applied_at, '')::timestamptz,
-                ALTER COLUMN applied_at SET DEFAULT NOW(),
-                ALTER COLUMN evaluated_at TYPE TIMESTAMPTZ USING NULLIF(evaluated_at, '')::timestamptz;
-
-            ALTER TABLE sm_capture_screenshots
-                ALTER COLUMN captured_at TYPE TIMESTAMPTZ USING NULLIF(captured_at, '')::timestamptz,
-                ALTER COLUMN captured_at SET DEFAULT NOW();
-
-            ALTER TABLE step_templates
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW(),
-                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
-                ALTER COLUMN updated_at SET DEFAULT NOW();
-
-            ALTER TABLE template_performance
-                ALTER COLUMN last_used_at TYPE TIMESTAMPTZ USING NULLIF(last_used_at, '')::timestamptz;
-
-            ALTER TABLE test_results
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW(),
-                ALTER COLUMN started_at TYPE TIMESTAMPTZ USING NULLIF(started_at, '')::timestamptz,
-                ALTER COLUMN completed_at TYPE TIMESTAMPTZ USING NULLIF(completed_at, '')::timestamptz;
-
-            ALTER TABLE trigger_history
-                ALTER COLUMN triggered_at TYPE TIMESTAMPTZ USING NULLIF(triggered_at, '')::timestamptz,
-                ALTER COLUMN triggered_at SET DEFAULT NOW();
-
-            ALTER TABLE workflow_triggers
-                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
-                ALTER COLUMN created_at SET DEFAULT NOW(),
-                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
-                ALTER COLUMN updated_at SET DEFAULT NOW(),
-                ALTER COLUMN last_triggered_at TYPE TIMESTAMPTZ USING NULLIF(last_triggered_at, '')::timestamptz;
-
-            -- BIGINT columns that drifted to INTEGER. Same root cause: the
-            -- canonical CREATE TABLE has always declared BIGINT but the live
-            -- tables were created when only INTEGER was used. INTEGER is
-            -- forward-compatible with BIGINT (every INTEGER fits a BIGINT),
-            -- so the cast is lossless. Indexes rebuild automatically.
-            ALTER TABLE canary_rollouts
-                ALTER COLUMN percentage TYPE BIGINT USING percentage::bigint,
-                ALTER COLUMN baseline_run_count TYPE BIGINT USING baseline_run_count::bigint,
-                ALTER COLUMN canary_run_count TYPE BIGINT USING canary_run_count::bigint;
-
-            ALTER TABLE workflow_triggers
-                ALTER COLUMN debounce_ms TYPE BIGINT USING debounce_ms::bigint,
-                ALTER COLUMN cooldown_seconds TYPE BIGINT USING cooldown_seconds::bigint,
-                ALTER COLUMN retry_delay_seconds TYPE BIGINT USING retry_delay_seconds::bigint,
-                ALTER COLUMN trigger_count TYPE BIGINT USING trigger_count::bigint;
+                -- BIGINT columns that drifted to INTEGER. INTEGER -> BIGINT
+                -- is a lossless widening cast.
+                FOR r IN SELECT * FROM (VALUES
+                    ('canary_rollouts',   'percentage'),
+                    ('canary_rollouts',   'baseline_run_count'),
+                    ('canary_rollouts',   'canary_run_count'),
+                    ('workflow_triggers', 'debounce_ms'),
+                    ('workflow_triggers', 'cooldown_seconds'),
+                    ('workflow_triggers', 'retry_delay_seconds'),
+                    ('workflow_triggers', 'trigger_count')
+                ) AS t(table_name, column_name)
+                LOOP
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'runner'
+                          AND table_name   = r.table_name
+                          AND column_name  = r.column_name
+                          AND data_type    = 'integer'
+                    ) THEN
+                        EXECUTE format(
+                            'ALTER TABLE %I ALTER COLUMN %I TYPE BIGINT USING %I::bigint',
+                            r.table_name, r.column_name, r.column_name
+                        );
+                    END IF;
+                END LOOP;
+            END $$;
         "#,
     },
     Migration {
@@ -1071,20 +1044,98 @@ impl PgDb {
             .await
             .map_err(|e| format!("PostgreSQL connection failed: {}", e))?;
 
-        // Verify the runner schema exists (search_path is already set by post_create)
-        conn.query_one(
-            "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'runner'",
-            &[],
+        // Self-bootstrap: create the `runner` schema and `vector` extension
+        // if they don't exist yet. On a first-boot docker volume the
+        // init-scripts/01-create-runner-schema.sql does this; on pre-existing
+        // volumes or non-docker Postgres deployments, those scripts never run,
+        // so we do it ourselves. Idempotent via IF NOT EXISTS.
+        conn.batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS runner; \
+             CREATE EXTENSION IF NOT EXISTS vector;",
         )
         .await
-        .map_err(|e| format!("Runner schema not found in PostgreSQL: {}", e))?;
+        .map_err(|e| format!("Failed to bootstrap runner schema/extension: {}", e))?;
 
         info!("PostgreSQL connected (deadpool, max_size=16, schema=runner)");
 
         let db = Self { pool };
+        db.apply_canonical_schema().await?;
         db.ensure_tables().await;
         db.run_migrations().await?;
         Ok(db)
+    }
+
+    /// Apply the canonical schema from `schema.pg.sql` (the Clorinde source
+    /// of truth). All statements are `CREATE TABLE IF NOT EXISTS` / `CREATE
+    /// INDEX IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so
+    /// this is idempotent and safe to run on every startup. It handles fresh
+    /// installs (no tables) and upgrades (adds columns declared in the
+    /// canonical schema). Runs before `ensure_tables()` and `run_migrations()`
+    /// so that migrations can safely `ALTER` tables declared only in
+    /// schema.pg.sql (e.g. `mcp_servers`).
+    async fn apply_canonical_schema(&self) -> Result<(), String> {
+        const CANONICAL_SCHEMA: &str = include_str!("../../../schema.pg.sql");
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error during canonical schema apply: {}", e))?;
+
+        // Split schema.pg.sql into individual statements and execute each on
+        // its own. `batch_execute` wraps the whole string in an implicit
+        // transaction, so one failure rolls back every prior statement —
+        // which is too strict for legacy installs where a pre-existing table
+        // may be missing a column that a later `CREATE INDEX IF NOT EXISTS`
+        // references. Individual execution lets us `warn!` on those drift
+        // failures (idempotent intent preserved) and still apply the rest of
+        // the schema. This mirrors `ensure_tables`'s warn-on-failure loop.
+        //
+        // The split is a naive `;` split: safe here because schema.pg.sql is
+        // DDL only — no string literals containing semicolons, no PL/pgSQL
+        // functions. The checked-in `check_schema_drift` test would catch a
+        // future statement that needed DO/$$ blocks.
+        let mut applied = 0usize;
+        let mut failed = 0usize;
+        for raw in CANONICAL_SCHEMA.split(';') {
+            // Strip line-leading `-- ` comments and blank lines so we don't
+            // send empty or comment-only statements to PG.
+            let stmt: String = raw
+                .lines()
+                .map(|l| {
+                    let t = l.trim_start();
+                    if t.starts_with("--") {
+                        ""
+                    } else {
+                        l
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let trimmed = stmt.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Err(e) = conn.execute(trimmed, &[]).await {
+                failed += 1;
+                let first_line = trimmed.lines().next().unwrap_or(trimmed);
+                let detail = match e.as_db_error() {
+                    Some(db) => format!("[{}] {}", db.code().code(), db.message()),
+                    None => format!("{}", e),
+                };
+                warn!(
+                    "Canonical schema statement failed (drift, non-fatal): {} — stmt: {}",
+                    detail,
+                    first_line.chars().take(120).collect::<String>()
+                );
+            } else {
+                applied += 1;
+            }
+        }
+        info!(
+            "Canonical schema applied from schema.pg.sql ({} statements applied, {} skipped due to drift)",
+            applied, failed
+        );
+        Ok(())
     }
 
     /// Ensure all required tables exist. Runs CREATE TABLE IF NOT EXISTS

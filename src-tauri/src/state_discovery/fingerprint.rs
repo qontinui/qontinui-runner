@@ -23,10 +23,10 @@ const NAME_TRUNC: usize = 60;
 /// Inputs consulted (first-match wins within each group):
 /// - `role`      : `element.role` or `element.accessibility.role`
 /// - `name`      : `element.accessibleName` or `element.accessibility.accessibleName`
-///                 or `element.label` or `element.text` (truncated to NAME_TRUNC)
+///   or `element.label` or `element.text` (truncated to NAME_TRUNC)
 /// - `tag`       : `element.tagName` (lowercased)
 /// - `structure` : normalized structural hint — `element.parent` with digits
-///                 stripped when present, else `element.id` with digits stripped.
+///   stripped when present, else `element.id` with digits stripped.
 ///
 /// Volatile bits explicitly ignored: `bounds`, `selector`, `xpath`,
 /// `dataAttributes.*` with numeric tails, `children` array contents.
