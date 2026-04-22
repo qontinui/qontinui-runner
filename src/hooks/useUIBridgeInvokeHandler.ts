@@ -37,6 +37,28 @@ import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
 
+/**
+ * Serialize an invoke() rejection into a string the Rust side can forward.
+ *
+ * Tauri commands that return `Result<_, SomeStruct>` reject the invoke
+ * promise with a plain JSON Object (e.g. `{ kind, message }`), which
+ * `String(obj)` flattens to the useless `"[object Object]"`. Preserve the
+ * original structure instead so HTTP callers and Rust logs see the real
+ * error `kind` / `message` fields.
+ */
+function serializeInvokeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (err !== null && typeof err === "object") {
+    try {
+      return JSON.stringify(err);
+    } catch {
+      // Fall through to getErrorMessage for circular refs etc.
+    }
+  }
+  return getErrorMessage(err);
+}
+
 const log = createLogger("UIBridgeInvokeHandler");
 
 interface InvokeRequestPayload {
@@ -89,7 +111,7 @@ export function useUIBridgeInvokeHandler(): void {
               result: result as unknown,
             };
           } catch (err) {
-            const message = getErrorMessage(err);
+            const message = serializeInvokeError(err);
             log.debug(`invoke(${command}) threw:`, message);
             response = {
               request_id,

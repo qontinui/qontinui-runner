@@ -197,7 +197,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "emit_extraction_script",
-        description: "Synthesise a one-line JS extraction expression for the scripted-output indirection (already registered in Tauri — this entry only allowlists it over HTTP). Maps to a 500 with `{ kind, message }` error body on failure; `kind` is one of `cost_cap` (per-task_run call cap exceeded), `token_budget` (input/output token budget exhausted), `timeout` (LLM exceeded 3s), `breaker_open` (shared Claude circuit breaker is Open), `disabled` (global kill switch off), `llm_error`, or `invalid_response`.",
+        description: "Synthesise a one-line JS extraction expression for the scripted-output indirection (already registered in Tauri — this entry only allowlists it over HTTP). Maps to a 500 with `{ kind, message }` error body on failure; `kind` is one of `cost_cap` (per-task_run call cap exceeded), `token_budget` (input/output token budget exhausted), `timeout` (LLM exceeded 5s), `breaker_open` (shared Claude circuit breaker is Open), `disabled` (global kill switch off), `llm_error`, or `invalid_response`.",
         args_schema: "{ \"goal\": string, \"schemaHint\": object, \"outputPreview\": string, \"taskRunId\"?: string | null }",
         response_schema: "{ \"expression\": string, \"modelId\": string, \"tokensIn\": number, \"tokensOut\": number, \"source\": \"cache\" | \"llm\", \"cacheTier\": number | null, \"provider\": string, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
         probe_with_empty_args: true,
@@ -219,8 +219,8 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "report_ui_error",
         description: "Record a UI error observed by the React error boundary. Coalesces repeat reports with the same message/digest into a single record (incrementing `count`, refreshing `reported_at`, pinning `first_seen`).",
-        args_schema: r#"{"type":"object","properties":{"message":{"type":"string"},"stack":{"type":["string","null"]},"componentStack":{"type":["string","null"]},"digest":{"type":["string","null"]}},"required":["message"]}"#,
-        response_schema: r#"{"type":"null"}"#,
+        args_schema: "{ \"message\": string, \"stack\"?: string | null, \"componentStack\"?: string | null, \"digest\"?: string | null }",
+        response_schema: "null",
         probe_with_empty_args: true,
     },
     ProxyableCommand {

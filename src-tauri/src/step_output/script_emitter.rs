@@ -70,7 +70,7 @@ const MAX_OUTPUT_TOKENS_PER_TASK_RUN: u32 = 2_000;
 
 /// LLM call timeout. Deliberately tight so a slow model loses to the
 /// truncation fallback rather than blocking the hot path.
-const LLM_TIMEOUT: Duration = Duration::from_secs(3);
+const LLM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Only the first N bytes of the output preview contribute to the cache
 /// key. Keeps keys stable across runs that differ only in tail data.
@@ -440,6 +440,7 @@ pub async fn emit_extraction_script(
         tokens_in,
         tokens_out,
         &model,
+        provider_label,
         cache_creation_tokens,
         cache_read_tokens,
     );
@@ -834,6 +835,7 @@ fn emit_llm_ok_event(
     tokens_in: u32,
     tokens_out: u32,
     model: &str,
+    provider: &str,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
 ) {
@@ -844,6 +846,7 @@ fn emit_llm_ok_event(
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "model": model,
+            "provider": provider,
             "cache_creation_tokens": cache_creation_tokens,
             "cache_read_tokens": cache_read_tokens,
         }),
