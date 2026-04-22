@@ -278,8 +278,7 @@ pub struct AppState {
     /// Force-kill (supervisor `taskkill /F`) still leaks — this only helps
     /// the graceful path where Tauri's window close event fires. Tracked in
     /// the adb-forwarder-port plan §1.6a.
-    pub usb_transport:
-        Arc<tokio::sync::OnceCell<crate::mcp::transport::usb::UsbTransport>>,
+    pub usb_transport: Arc<tokio::sync::OnceCell<crate::mcp::transport::usb::UsbTransport>>,
 }
 
 impl AppState {

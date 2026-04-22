@@ -201,9 +201,7 @@ mod tests {
     #[tokio::test]
     async fn first_report_sets_count_and_timestamps() {
         let state = UiErrorState::new();
-        state
-            .report("boom".to_string(), None, None, None)
-            .await;
+        state.report("boom".to_string(), None, None, None).await;
         let got = state.get().await.expect("state should be populated");
         assert_eq!(got.message, "boom");
         assert_eq!(got.count, 1);
@@ -213,9 +211,7 @@ mod tests {
     #[tokio::test]
     async fn repeat_same_message_coalesces() {
         let state = UiErrorState::new();
-        state
-            .report("boom".to_string(), None, None, None)
-            .await;
+        state.report("boom".to_string(), None, None, None).await;
         let first_seen = state.get().await.unwrap().first_seen;
 
         // Small gap so reported_at moves forward measurably.
@@ -234,12 +230,8 @@ mod tests {
     #[tokio::test]
     async fn different_message_replaces_record() {
         let state = UiErrorState::new();
-        state
-            .report("boom".to_string(), None, None, None)
-            .await;
-        state
-            .report("other".to_string(), None, None, None)
-            .await;
+        state.report("boom".to_string(), None, None, None).await;
+        state.report("other".to_string(), None, None, None).await;
         let got = state.get().await.unwrap();
         assert_eq!(got.message, "other");
         assert_eq!(got.count, 1);
@@ -274,9 +266,7 @@ mod tests {
     #[tokio::test]
     async fn clear_wipes_state() {
         let state = UiErrorState::new();
-        state
-            .report("boom".to_string(), None, None, None)
-            .await;
+        state.report("boom".to_string(), None, None, None).await;
         state.clear().await;
         assert!(state.get().await.is_none());
     }

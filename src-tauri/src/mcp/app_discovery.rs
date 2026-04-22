@@ -466,9 +466,7 @@ async fn scan_ios(
     let ios_devices = match state.ios_transport.list_devices().await {
         Ok(d) => d,
         Err(e) => {
-            return Ok(Json(ApiResponse::error(format!(
-                "iOS scan failed: {e}"
-            ))));
+            return Ok(Json(ApiResponse::error(format!("iOS scan failed: {e}"))));
         }
     };
 

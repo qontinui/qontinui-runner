@@ -171,8 +171,7 @@ pub async fn apply_web_integration_settings(
     {
         let mut full = settings::load_settings();
         full.web_integration = normalized.clone();
-        settings::save_settings(&full)
-            .map_err(|e| format!("failed to save settings: {}", e))?;
+        settings::save_settings(&full).map_err(|e| format!("failed to save settings: {}", e))?;
     }
 
     // Hot-reload: shut down the old state, build the new one.
@@ -385,7 +384,11 @@ pub async fn test_web_integration_connection(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         let msg = if status.as_u16() == 401 || status.as_u16() == 403 {
-            format!("auth failed ({}): {}", status, body.chars().take(200).collect::<String>())
+            format!(
+                "auth failed ({}): {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            )
         } else {
             format!(
                 "register returned {}: {}",
@@ -517,12 +520,13 @@ pub async fn start_web_token_flow(
             trimmed
         }
         None => {
-            let persisted = settings::load_settings().web_integration.backend_url.clone();
+            let persisted = settings::load_settings()
+                .web_integration
+                .backend_url
+                .clone();
             let trimmed = trim_backend_url(&persisted);
             if trimmed.is_empty() {
-                return Err(
-                    "backend_url not configured — please enter one first".to_string(),
-                );
+                return Err("backend_url not configured — please enter one first".to_string());
             }
             trimmed
         }

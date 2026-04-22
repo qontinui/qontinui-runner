@@ -59,8 +59,16 @@ pub fn stable_element_fingerprint(element_json: &serde_json::Value) -> String {
 fn extract_role(el: &serde_json::Value) -> Option<String> {
     el.get("role")
         .and_then(|v| v.as_str())
-        .or_else(|| el.get("accessibility").and_then(|a| a.get("role")).and_then(|v| v.as_str()))
-        .or_else(|| el.get("attributes").and_then(|a| a.get("role")).and_then(|v| v.as_str()))
+        .or_else(|| {
+            el.get("accessibility")
+                .and_then(|a| a.get("role"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            el.get("attributes")
+                .and_then(|a| a.get("role"))
+                .and_then(|v| v.as_str())
+        })
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -122,7 +130,9 @@ fn extract_structural_hint(el: &serde_json::Value) -> Option<String> {
         out.push(ch);
     }
 
-    let trimmed = out.trim_matches(|c: char| matches!(c, ':' | '-' | '_')).to_string();
+    let trimmed = out
+        .trim_matches(|c: char| matches!(c, ':' | '-' | '_'))
+        .to_string();
     if trimmed.is_empty() {
         None
     } else {

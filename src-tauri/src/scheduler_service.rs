@@ -48,10 +48,7 @@ impl SchedulerService {
     }
 
     /// Create a new scheduler service with AppState for port-aware URL construction.
-    pub fn with_app_state(
-        pg_db: impl Into<Option<Arc<PgDb>>>,
-        app_state: Arc<AppState>,
-    ) -> Self {
+    pub fn with_app_state(pg_db: impl Into<Option<Arc<PgDb>>>, app_state: Arc<AppState>) -> Self {
         Self {
             pg_db: pg_db.into(),
             app_state: Some(app_state),
@@ -66,7 +63,8 @@ impl SchedulerService {
     fn self_base_url(&self) -> String {
         match &self.app_state {
             Some(state) => crate::mcp::types::get_self_base_url(state),
-            None => {
+            None =>
+            {
                 #[allow(deprecated)]
                 crate::mcp::types::get_self_base_url_from_env()
             }

@@ -192,7 +192,6 @@ pub fn get_task_run_stats(task_run_id: &str) -> Option<TaskRunEmitterStats> {
         .map(|r| r.value().clone())
 }
 
-
 // ============================================================================
 // Entry point
 // ============================================================================
@@ -302,9 +301,9 @@ pub async fn emit_extraction_script(
                         &user_message_for_call,
                         &ai_settings_snapshot.claude_api,
                         Some(&model_owned),
-                        None,            // no Doctor handle — short synthetic call
-                        Some(0.0),       // deterministic
-                        Some(512),       // cap: expression is < 512 tokens always
+                        None,      // no Doctor handle — short synthetic call
+                        Some(0.0), // deterministic
+                        Some(512), // cap: expression is < 512 tokens always
                         &schema_for_call,
                         "scripted_output_extraction",
                     )
@@ -336,7 +335,10 @@ pub async fn emit_extraction_script(
     let ai_response = match timeout(LLM_TIMEOUT, llm_call).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(join_err)) => {
-            warn!("scripted-output emitter: spawn_blocking join error: {}", join_err);
+            warn!(
+                "scripted-output emitter: spawn_blocking join error: {}",
+                join_err
+            );
             emit_fallback_event(&task_run_id, "emitter_error");
             return Err(EmitError::LlmError(format!(
                 "spawn_blocking join error: {}",
@@ -526,11 +528,7 @@ fn store_cached(key: &str, expression: &str, model_id: &str) {
 /// Build the Tier-1 cache key. The schema hint is canonicalised (sorted
 /// keys, whitespace-free JSON) so two calls with the same logical shape
 /// hit the same entry regardless of key order.
-fn build_cache_key(
-    goal: &str,
-    schema_hint: &serde_json::Value,
-    output_preview: &str,
-) -> String {
+fn build_cache_key(goal: &str, schema_hint: &serde_json::Value, output_preview: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(goal.as_bytes());
     hasher.update(b"|");
@@ -793,8 +791,8 @@ fn build_prompt_split(
 /// The structured-output path returns the schema-compliant JSON directly
 /// as the response content.
 fn extract_expression(raw: &str) -> Result<String, String> {
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .map_err(|e| format!("response is not JSON: {}", e))?;
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("response is not JSON: {}", e))?;
     let expr = v
         .get("expression")
         .and_then(|e| e.as_str())
@@ -899,7 +897,10 @@ fn spawn_activity_event(
     metadata: serde_json::Value,
 ) {
     let Some(pg) = PgDb::try_global() else {
-        debug!("scripted-output telemetry: PgDb not initialised yet; skipping '{}'", event_name);
+        debug!(
+            "scripted-output telemetry: PgDb not initialised yet; skipping '{}'",
+            event_name
+        );
         return;
     };
     // activity_timeline.task_run_id has a FK to task_runs(id). An "unassigned"
@@ -908,8 +909,7 @@ fn spawn_activity_event(
     // metadata_json for debuggability; spawn a task that validates the FK by
     // pre-check, and falls back to NULL on miss.
     let mut metadata_with_tr = metadata;
-    if let (serde_json::Value::Object(map), Some(s)) =
-        (&mut metadata_with_tr, task_run_id.as_ref())
+    if let (serde_json::Value::Object(map), Some(s)) = (&mut metadata_with_tr, task_run_id.as_ref())
     {
         map.insert(
             "task_run_id_raw".to_string(),
@@ -999,7 +999,10 @@ mod tests {
         let hint_b = serde_json::json!({ "b": "number", "a": "string" });
         let k1 = build_cache_key("goal", &hint_a, "preview");
         let k2 = build_cache_key("goal", &hint_b, "preview");
-        assert_eq!(k1, k2, "cache key should be stable under schema key reorder");
+        assert_eq!(
+            k1, k2,
+            "cache key should be stable under schema key reorder"
+        );
     }
 
     #[test]
@@ -1016,7 +1019,10 @@ mod tests {
         let base = "x".repeat(CACHE_KEY_PREVIEW_BYTES);
         let k1 = build_cache_key("g", &hint, &base);
         let k2 = build_cache_key("g", &hint, &(base.clone() + "TAIL"));
-        assert_eq!(k1, k2, "bytes past the cache-key cutoff must not change the key");
+        assert_eq!(
+            k1, k2,
+            "bytes past the cache-key cutoff must not change the key"
+        );
     }
 
     #[test]
@@ -1113,8 +1119,7 @@ mod tests {
     #[test]
     fn build_prompt_split_meets_cache_threshold() {
         let hint = serde_json::json!({"keys": {"a": "string"}});
-        let (system_prefix, _user) =
-            build_prompt_split("some goal", &hint, "some preview");
+        let (system_prefix, _user) = build_prompt_split("some goal", &hint, "some preview");
         // Plan decision 4: the system_prefix must cross ~4000 chars
         // (Anthropic's ~1024-token Haiku caching minimum) or
         // `cache_control: ephemeral` is a no-op. Don't shrink without
@@ -1130,8 +1135,7 @@ mod tests {
 
     #[test]
     fn build_prompt_split_contains_version_suffix() {
-        let (system_prefix, _user) =
-            build_prompt_split("g", &serde_json::json!({}), "p");
+        let (system_prefix, _user) = build_prompt_split("g", &serde_json::json!({}), "p");
         // The trailing `Emitter system v1` marker lets intentional
         // preamble bumps invalidate the cache cleanly instead of
         // waiting for the 5-minute TTL.
@@ -1149,7 +1153,10 @@ mod tests {
         let hint = serde_json::json!({"keys": {"q": "number"}});
         let preview = "some-unique-preview-token-abc123";
         let (_system, user) = build_prompt_split(goal, &hint, preview);
-        assert!(user.contains(goal), "user_message should contain goal literal");
+        assert!(
+            user.contains(goal),
+            "user_message should contain goal literal"
+        );
         assert!(
             user.contains("\"q\""),
             "user_message should contain serialised schema_hint keys"

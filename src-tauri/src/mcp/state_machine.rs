@@ -937,7 +937,10 @@ pub async fn save_compiled_state_machine(
                 .and_then(|v| v.as_str())
                 .unwrap_or(&state_id)
                 .to_string();
-            let required_elements = s.get("requiredElements").cloned().unwrap_or(serde_json::json!([]));
+            let required_elements = s
+                .get("requiredElements")
+                .cloned()
+                .unwrap_or(serde_json::json!([]));
             let path_cost = s.get("pathCost").cloned().unwrap_or(serde_json::json!(1.0));
             let extra = serde_json::json!({
                 "requiredElements": required_elements,
@@ -946,7 +949,10 @@ pub async fn save_compiled_state_machine(
             let req = CreateSmStateRequest {
                 state_id: Some(state_id),
                 name,
-                description: s.get("description").and_then(|v| v.as_str()).map(String::from),
+                description: s
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 element_ids: Some(Vec::new()),
                 render_ids: Some(Vec::new()),
                 confidence: None,

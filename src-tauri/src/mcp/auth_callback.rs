@@ -275,7 +275,8 @@ async fn runner_token_callback_handler(
                 "runner_token_callback: applied new runner token (token_id={:?}, backend={})",
                 params.token_id, pending.backend_url
             );
-            let body = SUCCESS_HTML.replace("__RUNNER_NAME__", &html_escape(&runner_name_for_display));
+            let body =
+                SUCCESS_HTML.replace("__RUNNER_NAME__", &html_escape(&runner_name_for_display));
             html_response(StatusCode::OK, body).into_response()
         }
         Err(e) => {

@@ -1180,7 +1180,8 @@ impl StepHandler for UiBridgeHandler {
                     let matched = elements
                         .iter()
                         .find(|el| element_matches_criteria(el, &criteria_map));
-                    let target_id = match matched.and_then(|e| e.get("id")).and_then(|i| i.as_str()) {
+                    let target_id = match matched.and_then(|e| e.get("id")).and_then(|i| i.as_str())
+                    {
                         Some(id) => id.to_string(),
                         None => {
                             return StepHandlerResult::failure(format!(
@@ -1530,9 +1531,7 @@ impl UiBridgeHandler {
         let bbox_identifier = extract_bbox_identifier(&criteria);
         let bbox_target = bbox_identifier
             .as_ref()
-            .and_then(|ident| {
-                super::click_providers::resolve_click_target(ident, &snapshot)
-            });
+            .and_then(|ident| super::click_providers::resolve_click_target(ident, &snapshot));
 
         let element_id: String = if let Some(ref target) = bbox_target {
             info!(

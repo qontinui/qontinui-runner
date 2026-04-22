@@ -410,9 +410,7 @@ pub fn create_router(
         tunnel_client: Arc::new(crate::tunnel::RatholeClient::new()),
         ios_transport: Arc::new(crate::mcp::transport::ios::IosTransport::new()),
         ui_bridge_invoke_store: Arc::new(crate::ui_bridge_invoke::InvokeRequestStore::new()),
-        ui_bridge_evaluate_store: Arc::new(
-            crate::ui_bridge_evaluate::EvaluateRequestStore::new(),
-        ),
+        ui_bridge_evaluate_store: Arc::new(crate::ui_bridge_evaluate::EvaluateRequestStore::new()),
     });
 
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
@@ -666,12 +664,11 @@ pub fn create_router(
             // Give the React side a moment to mount the invoke-response
             // listener before we start firing probes at it.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let results =
-                crate::ui_bridge_invoke_probe::probe_allowlist_wire_contracts(
-                    &probe_handle,
-                    probe_store,
-                )
-                .await;
+            let results = crate::ui_bridge_invoke_probe::probe_allowlist_wire_contracts(
+                &probe_handle,
+                probe_store,
+            )
+            .await;
             crate::ui_bridge_invoke_probe::log_probe_results(&results);
             tracing::debug!(
                 probe_count = results.len(),

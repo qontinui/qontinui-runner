@@ -92,10 +92,12 @@ pub async fn get_capture(
                 .header(header::CONTENT_TYPE, "image/png")
                 .header(header::CACHE_CONTROL, "no-cache")
                 .body(Body::from(png_bytes))
-                .unwrap_or_else(|_| error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to build capture response",
-                ))
+                .unwrap_or_else(|_| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to build capture response",
+                    )
+                })
         }
         Ok(Err(e)) => {
             error!(error = %e, "vga capture failed");
@@ -109,9 +111,7 @@ pub async fn get_capture(
 }
 
 /// `GET /vga/monitors` — monitor enumeration as JSON.
-pub async fn get_monitors(
-    State(_state): State<Arc<ApiState>>,
-) -> Response {
+pub async fn get_monitors(State(_state): State<Arc<ApiState>>) -> Response {
     let result = tokio::task::spawn_blocking(enumerate_monitors).await;
 
     match result {

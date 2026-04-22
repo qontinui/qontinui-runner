@@ -2026,12 +2026,7 @@ pub async fn ui_bridge_discover_handler(
 
                     let title = tokio::time::timeout(
                         diag_timeout,
-                        direct_webview_evaluate_with_result(
-                            &state,
-                            "document.title",
-                            None,
-                            false,
-                        ),
+                        direct_webview_evaluate_with_result(&state, "document.title", None, false),
                     )
                     .await
                     .ok()
@@ -3596,14 +3591,8 @@ async fn tagged_page_evaluate(
         .app_handle
         .emit("ui-bridge:evaluate-request", &payload)
     {
-        state
-            .ui_bridge_evaluate_store
-            .cancel(&request_id)
-            .await;
-        return Err(format!(
-            "Failed to emit ui-bridge:evaluate-request: {}",
-            e
-        ));
+        state.ui_bridge_evaluate_store.cancel(&request_id).await;
+        return Err(format!("Failed to emit ui-bridge:evaluate-request: {}", e));
     }
 
     match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), receiver).await {
@@ -3645,10 +3634,7 @@ async fn tagged_page_evaluate(
             // Treat as a transport-level failure so the caller falls back
             // to direct WebView eval (same as the legacy IPC-channel-closed
             // branch in `ui_bridge_request_inner`).
-            state
-                .ui_bridge_evaluate_store
-                .cancel(&request_id)
-                .await;
+            state.ui_bridge_evaluate_store.cancel(&request_id).await;
             Err(format!(
                 "page/evaluate: response channel closed before delivery (request_id={})",
                 request_id
@@ -3658,10 +3644,7 @@ async fn tagged_page_evaluate(
             // Timeout is also a transport-level failure — fall back to
             // direct WebView eval so slow renders don't bypass the runner's
             // resilience layers.
-            state
-                .ui_bridge_evaluate_store
-                .cancel(&request_id)
-                .await;
+            state.ui_bridge_evaluate_store.cancel(&request_id).await;
             Err(format!(
                 "UI Bridge page_evaluate timed out after {}ms",
                 timeout_ms
@@ -12545,7 +12528,11 @@ mod page_evaluate_escaping_tests {
             emitted
         );
         // Shape check: the wrapper is the eval form.
-        assert!(emitted.starts_with("eval(\""), "unexpected prefix: {:?}", emitted);
+        assert!(
+            emitted.starts_with("eval(\""),
+            "unexpected prefix: {:?}",
+            emitted
+        );
         assert!(emitted.ends_with("\")"), "unexpected suffix: {:?}", emitted);
     }
 

@@ -109,8 +109,10 @@ impl StepHandler for VgaAutomateHandler {
 
         // 3. Write action_sequence to a temp JSON file (shared with Python worker)
         let temp_dir = std::env::temp_dir();
-        let action_file =
-            temp_dir.join(format!("qontinui-vga-actions-{}.json", uuid::Uuid::new_v4()));
+        let action_file = temp_dir.join(format!(
+            "qontinui-vga-actions-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         let action_json = match serde_json::to_string(&action_sequence) {
             Ok(s) => s,
             Err(e) => {
@@ -138,7 +140,12 @@ impl StepHandler for VgaAutomateHandler {
                 .to_string()
         });
 
-        let mut cmd = match build_vga_worker_command(&state_machine_id, &action_file, &target_process, &pg_url) {
+        let mut cmd = match build_vga_worker_command(
+            &state_machine_id,
+            &action_file,
+            &target_process,
+            &pg_url,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&action_file).await;
@@ -228,10 +235,7 @@ impl StepHandler for VgaAutomateHandler {
                                 info!(
                                     "vga.step: action={} status={} iou={:?}",
                                     value.get("action").and_then(|v| v.as_str()).unwrap_or("?"),
-                                    value
-                                        .get("status")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("?"),
+                                    value.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
                                     value.get("iou").and_then(|v| v.as_f64()),
                                 );
                                 // Surface progress as an intermediate tree event so
@@ -272,14 +276,14 @@ impl StepHandler for VgaAutomateHandler {
                                     .get("run_id")
                                     .and_then(|r| r.as_str())
                                     .map(|s| s.to_string());
-                                info!(
-                                    "vga.done: status={:?} run_id={:?}",
-                                    terminal_status, run_id
-                                );
+                                info!("vga.done: status={:?} run_id={:?}", terminal_status, run_id);
                                 break;
                             }
                             other => {
-                                debug!("[vga.worker stdout unknown kind] kind={} line={}", other, trimmed);
+                                debug!(
+                                    "[vga.worker stdout unknown kind] kind={} line={}",
+                                    other, trimmed
+                                );
                             }
                         }
                     }

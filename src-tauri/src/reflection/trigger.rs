@@ -119,11 +119,8 @@ pub fn launch_reflection(
     let loop_config =
         super::workflow::build_reflection_config(&reflection_id, &reflection_name, &workflow_name);
 
-    let setup_steps = super::workflow::build_setup_steps(
-        &source_task_run_id,
-        &workflow_name,
-        &deps.app_state,
-    );
+    let setup_steps =
+        super::workflow::build_setup_steps(&source_task_run_id, &workflow_name, &deps.app_state);
     let verification_steps =
         super::workflow::build_verification_steps(&source_task_run_id, &deps.app_state);
     let mut completion_steps = super::workflow::build_completion_steps(

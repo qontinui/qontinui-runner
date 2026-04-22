@@ -201,11 +201,7 @@ impl IosTransport {
     }
 
     /// Open a local TCP forward for a device port. Returns the local port.
-    pub async fn forward_port(
-        &self,
-        udid: &str,
-        device_port: u16,
-    ) -> Result<u16, TransportError> {
+    pub async fn forward_port(&self, udid: &str, device_port: u16) -> Result<u16, TransportError> {
         let port = self.start_service().await?;
         let url = format!("http://127.0.0.1:{port}/forward");
         let client = reqwest::Client::builder()
@@ -302,5 +298,9 @@ fn resolve_python_bin() -> PathBuf {
         return PathBuf::from(env_py);
     }
     // `python` works on Windows (Python launcher) and Unix.
-    PathBuf::from(if cfg!(windows) { "python.exe" } else { "python3" })
+    PathBuf::from(if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python3"
+    })
 }

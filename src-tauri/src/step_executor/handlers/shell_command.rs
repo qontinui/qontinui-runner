@@ -862,7 +862,10 @@ mod tests {
             got.starts_with(r"C:\Program Files\Git\usr\bin;"),
             "augmented path should start with the bash parent dir, got: {got}"
         );
-        assert!(got.ends_with(path), "augmented path should end with the original PATH");
+        assert!(
+            got.ends_with(path),
+            "augmented path should end with the original PATH"
+        );
     }
 
     #[test]
@@ -1066,8 +1069,7 @@ mod tests {
 
     #[test]
     fn test_extract_state_machine_navigate_port_ipv4() {
-        let cmd =
-            "curl -sf -X POST http://127.0.0.1:1234/state-machine/navigate -d '{}'";
+        let cmd = "curl -sf -X POST http://127.0.0.1:1234/state-machine/navigate -d '{}'";
         assert_eq!(
             ShellCommandHandler::extract_state_machine_navigate_port(cmd),
             Some(1234)

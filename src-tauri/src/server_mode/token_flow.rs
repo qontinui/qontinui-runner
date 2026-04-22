@@ -96,10 +96,7 @@ impl TokenFlowStore {
             expires_at: Instant::now() + PENDING_FLOW_TTL,
         };
 
-        let mut guard = self
-            .pending
-            .lock()
-            .expect("TokenFlowStore mutex poisoned");
+        let mut guard = self.pending.lock().expect("TokenFlowStore mutex poisoned");
         *guard = Some(flow);
         state
     }
@@ -117,10 +114,7 @@ impl TokenFlowStore {
     /// On a mismatch the pending flow is left intact (so a spurious hit
     /// with a different state doesn't cancel the real flow).
     pub fn consume(&self, state: &str) -> Option<PendingTokenFlow> {
-        let mut guard = self
-            .pending
-            .lock()
-            .expect("TokenFlowStore mutex poisoned");
+        let mut guard = self.pending.lock().expect("TokenFlowStore mutex poisoned");
 
         let matched = match guard.as_ref() {
             Some(flow) if flow.state == state => true,
@@ -148,10 +142,7 @@ impl TokenFlowStore {
     /// use — the main flow relies on TTL expiry + replacement on re-start.
     #[allow(dead_code)]
     pub fn cancel(&self) {
-        let mut guard = self
-            .pending
-            .lock()
-            .expect("TokenFlowStore mutex poisoned");
+        let mut guard = self.pending.lock().expect("TokenFlowStore mutex poisoned");
         *guard = None;
     }
 }

@@ -56,12 +56,12 @@ impl UsbTransport {
         adb_serial: &str,
         remote_port: u16,
     ) -> Result<u16, TransportError> {
-        let local_port = adb_helper::pick_free_local_port()
-            .await
-            .map_err(|e| TransportError::ForwardFailed {
+        let local_port = adb_helper::pick_free_local_port().await.map_err(|e| {
+            TransportError::ForwardFailed {
                 device_id: adb_serial.to_string(),
                 reason: format!("pick local port: {e}"),
-            })?;
+            }
+        })?;
 
         adb_helper::forward_tcp(adb_serial.to_string(), local_port, remote_port)
             .await

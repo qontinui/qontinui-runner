@@ -351,7 +351,9 @@ mod tests {
         assert!(is_crash_dump_filename(Path::new("/tmp/crash_20260421.txt")));
         assert!(!is_crash_dump_filename(Path::new("/tmp/latest_crash.txt")));
         assert!(!is_crash_dump_filename(Path::new("/tmp/other.txt")));
-        assert!(!is_crash_dump_filename(Path::new("/tmp/crash_20260421.log")));
+        assert!(!is_crash_dump_filename(Path::new(
+            "/tmp/crash_20260421.log"
+        )));
     }
 
     #[test]

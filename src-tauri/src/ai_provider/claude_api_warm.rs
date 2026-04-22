@@ -23,7 +23,9 @@
 
 #![allow(dead_code)]
 
-use super::cache_aware_builder::{parse_cache_tokens, MIN_CACHEABLE_CHARS, PROMPT_CACHING_BETA_HEADER};
+use super::cache_aware_builder::{
+    parse_cache_tokens, MIN_CACHEABLE_CHARS, PROMPT_CACHING_BETA_HEADER,
+};
 use super::retry::retry_with_backoff;
 use super::types::AiResponse;
 use crate::config_facade::ai_keychain;
@@ -87,15 +89,16 @@ pub(super) fn resolve_warm_credential() -> Option<WarmCredential> {
         }
         Ok(None) => {}
         Err(e) => {
-            warn!("Warm credential: keychain lookup failed ({}); falling through to OAuth", e);
+            warn!(
+                "Warm credential: keychain lookup failed ({}); falling through to OAuth",
+                e
+            );
         }
     }
 
     // 2. OAuth fallback via the Claude CLI credentials file.
-    let creds_path =
-        crate::commands::ai_settings::find_claude_credentials_path()?;
-    resolve_oauth_from_path(&creds_path)
-        .map(WarmCredential::OAuth)
+    let creds_path = crate::commands::ai_settings::find_claude_credentials_path()?;
+    resolve_oauth_from_path(&creds_path).map(WarmCredential::OAuth)
 }
 
 /// Read and validate an OAuth credential from a specific credentials file path.
@@ -196,7 +199,13 @@ pub(crate) fn is_no_credential_error(resp: &AiResponse) -> bool {
 fn sanitize_tool_name(schema_name: &str) -> String {
     schema_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -321,15 +330,13 @@ pub(crate) fn run_claude_api_warm(
                         }
 
                         match (input_tokens, output_tokens) {
-                            (Some(input), Some(output)) => {
-                                AiResponse::success_with_cache_tokens(
-                                    content,
-                                    input,
-                                    output,
-                                    cache_creation,
-                                    cache_read,
-                                )
-                            }
+                            (Some(input), Some(output)) => AiResponse::success_with_cache_tokens(
+                                content,
+                                input,
+                                output,
+                                cache_creation,
+                                cache_read,
+                            ),
                             _ => AiResponse::success(content),
                         }
                     }
@@ -455,15 +462,13 @@ pub(crate) fn run_claude_api_warm_with_structured_output(
                         }
 
                         match (input_tokens, output_tokens) {
-                            (Some(input), Some(output)) => {
-                                AiResponse::success_with_cache_tokens(
-                                    content,
-                                    input,
-                                    output,
-                                    cache_creation,
-                                    cache_read,
-                                )
-                            }
+                            (Some(input), Some(output)) => AiResponse::success_with_cache_tokens(
+                                content,
+                                input,
+                                output,
+                                cache_creation,
+                                cache_read,
+                            ),
                             _ => AiResponse::success(content),
                         }
                     }

@@ -319,8 +319,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
             &fixer_name_clone,
             &workflow_name_clone,
         );
-        let setup_steps =
-            super::workflow::build_setup_steps(&source_id_clone, &deps.app_state);
+        let setup_steps = super::workflow::build_setup_steps(&source_id_clone, &deps.app_state);
         let verification_steps = super::workflow::build_verification_steps();
 
         let step_injection_ctx = crate::step_injection::types::StepInjectionContext {

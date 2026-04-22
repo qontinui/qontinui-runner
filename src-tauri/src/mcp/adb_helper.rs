@@ -193,11 +193,7 @@ pub async fn server_reachable() -> bool {
 /// Note on argument order: `adb_client::ADBServerDevice::forward` takes
 /// `(remote, local)` (the ADB wire format is `host:forward:<local>;<remote>`
 /// but the `Forward(remote, local)` enum variant reorders them for the caller).
-pub async fn forward_tcp(
-    serial: String,
-    local_port: u16,
-    remote_port: u16,
-) -> Result<(), String> {
+pub async fn forward_tcp(serial: String, local_port: u16, remote_port: u16) -> Result<(), String> {
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
         device

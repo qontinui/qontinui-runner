@@ -205,9 +205,7 @@ pub async fn get_scripted_output_stats(
     state: State<'_, Arc<AppState>>,
 ) -> Result<ScriptedOutputStats, String> {
     let pg = &state.pg_db;
-    let rows = pg
-        .get_scripted_output_rows(task_run_id.as_deref())
-        .await?;
+    let rows = pg.get_scripted_output_rows(task_run_id.as_deref()).await?;
 
     let mut stats = ScriptedOutputStats {
         attempted: 0,
@@ -240,21 +238,14 @@ pub async fn get_scripted_output_stats(
             "scripted_output.llm_ok" => {
                 stats.llm_ok += 1;
                 if let Some(m) = meta.as_ref() {
-                    if let Some(n) = m
-                        .get("tokens_in")
-                        .and_then(|v| v.as_u64())
-                    {
+                    if let Some(n) = m.get("tokens_in").and_then(|v| v.as_u64()) {
                         stats.total_tokens_in = stats.total_tokens_in.saturating_add(n);
                     }
-                    if let Some(n) = m
-                        .get("tokens_out")
-                        .and_then(|v| v.as_u64())
-                    {
+                    if let Some(n) = m.get("tokens_out").and_then(|v| v.as_u64()) {
                         stats.total_tokens_out = stats.total_tokens_out.saturating_add(n);
                     }
                     if let Some(n) = m.get("cache_creation_tokens").and_then(|v| v.as_u64()) {
-                        stats.cache_creation_tokens =
-                            stats.cache_creation_tokens.saturating_add(n);
+                        stats.cache_creation_tokens = stats.cache_creation_tokens.saturating_add(n);
                     }
                     if let Some(n) = m.get("cache_read_tokens").and_then(|v| v.as_u64()) {
                         stats.cache_read_tokens = stats.cache_read_tokens.saturating_add(n);
@@ -287,8 +278,6 @@ pub async fn get_scripted_output_stats(
 /// Extract a `bytes_avoided` integer from a metadata JSON object, tolerating
 /// both integer and floating-point representations.
 fn read_bytes_avoided(meta: &serde_json::Value) -> Option<u64> {
-    meta.get("bytes_avoided").and_then(|v| {
-        v.as_u64()
-            .or_else(|| v.as_f64().map(|f| f.max(0.0) as u64))
-    })
+    meta.get("bytes_avoided")
+        .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
 }
