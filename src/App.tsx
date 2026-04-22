@@ -663,9 +663,10 @@ function TauriEventNamesLoader() {
     const attempt = async (delayMs: number, attemptNum: number): Promise<void> => {
       if (cancelled) return;
       try {
-        const { getApiBase } = await import("@/lib/runner-api");
-        const { setPendingTauriEventNames } =
-          await import("./hooks/ui-bridge-events/useChangeTrackingEvents");
+        const [{ getApiBase }, { setPendingTauriEventNames }] = await Promise.all([
+          import("@/lib/runner-api"),
+          import("./hooks/ui-bridge-events/useChangeTrackingEvents"),
+        ]);
         // The API base URL is set asynchronously after the Tauri backend
         // publishes its bound port (see useApiReady). Until that resolves,
         // getApiBase() still returns the default primary-runner port

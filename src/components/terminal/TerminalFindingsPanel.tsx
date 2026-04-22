@@ -136,7 +136,6 @@ export function TerminalFindingsPanel({
         {/* Fix selected finding button */}
         {onFix && (
           <button
-            role="button"
             onClick={() => {
               if (selected) onFix(selected);
             }}
@@ -153,7 +152,6 @@ export function TerminalFindingsPanel({
         {/* Respond to selected finding button */}
         {onRespond && (
           <button
-            role="button"
             onClick={() => {
               if (selected) setResponseFocusTick((t) => t + 1);
             }}
