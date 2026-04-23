@@ -207,7 +207,8 @@ export function useWebSocketEvents(
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shouldReconnectRef = useRef(true);
-  const isTauriRef = useRef(isTauriEnvironment());
+  // Captured once at mount — environment doesn't change during hook lifetime.
+  const [isTauri] = useState(() => isTauriEnvironment());
 
   // Handle incoming WebSocket messages
   const handleMessage = useCallback(
@@ -356,7 +357,7 @@ export function useWebSocketEvents(
   // Auto-connect when enabled and not in Tauri environment
   useEffect(() => {
     // Skip WebSocket connection in Tauri environment - Tauri events are used instead
-    if (isTauriRef.current) {
+    if (isTauri) {
       logger.debug("Tauri environment detected, skipping WebSocket");
       return;
     }
@@ -371,7 +372,7 @@ export function useWebSocketEvents(
     return () => {
       disconnect();
     };
-  }, [enabled, connect, disconnect]);
+  }, [enabled, isTauri, connect, disconnect]);
 
   return {
     isConnected,
@@ -379,7 +380,7 @@ export function useWebSocketEvents(
     error,
     reconnectAttempts,
 
-    isTauriEnvironment: isTauriRef.current,
+    isTauriEnvironment: isTauri,
     connect,
     disconnect,
     lastOrchestratorState,
