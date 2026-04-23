@@ -79,7 +79,15 @@ export function SkillApprovalPanel() {
   }, []);
 
   useEffect(() => {
-    fetchSkills();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside fetchSkills.
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchSkills();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchSkills]);
 
   const fetchProvenance = async (skill: SkillDefinition) => {
