@@ -5,6 +5,8 @@
 //! `window.focus()` is blocked by the browser.
 
 use crate::window_manager::{self, WindowInfo};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 
 /// List visible top-level OS windows, optionally filtered by title substring.
 #[tauri::command]
@@ -26,4 +28,16 @@ pub fn activate_system_window(pid: Option<u32>, title: Option<String>) -> bool {
     } else {
         false
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_window_manager")
+        .invoke_handler(tauri::generate_handler![
+            list_system_windows,
+            activate_system_window,
+        ])
+        .build()
 }

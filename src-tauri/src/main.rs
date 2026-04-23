@@ -469,6 +469,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(ui_bridge_plugin::init())
+        // Per-module plugins (Phase 1 of commands/ → plugin migration).
+        // See commands/<module>.rs's plugin() fn for the handler list. Modules
+        // not yet migrated remain in generate_handler! below.
+        .plugin(commands::clipboard::plugin())
+        .plugin(commands::debug::plugin())
+        .plugin(commands::dev_findings::plugin())
+        .plugin(commands::file_browser::plugin())
+        .plugin(commands::window_manager::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -501,16 +509,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::is_api_ready,
             commands::auth::get_api_port,
             commands::auth::get_test_auto_login,
-            // Dev-only: seed synthetic findings (gated on QONTINUI_DEV_ENDPOINTS=1)
-            commands::dev_findings::is_dev_endpoints_enabled,
-            commands::dev_findings::dev_seed_finding,
-            // Clipboard sync and file sharing commands
-            commands::clipboard::share_to_mobile,
-            commands::clipboard::share_file_to_mobile,
-            // File browser commands (safe directory browsing for mobile)
-            commands::file_browser::get_safe_browse_roots,
-            commands::file_browser::browse_directory,
-            commands::file_browser::read_file_content,
+            // NOTE: clipboard, dev_findings, and file_browser handlers moved to
+            // per-module plugins (see .plugin() calls above).
             // Configuration commands
             commands::config::load_configuration,
             commands::config::get_current_configuration,
@@ -564,9 +564,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_machine::get_available_transitions,
             commands::state_machine::get_action_log_view,
             commands::state_machine::clear_action_log,
-            // Debug commands
-            commands::debug::get_debug_settings,
-            commands::debug::set_debug_settings,
+            // NOTE: debug handlers moved to per-module plugin (see .plugin() calls above).
             // WebSocket commands
             commands::websocket::configure_websocket,
             commands::websocket::connect_websocket,
@@ -1379,9 +1377,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Cost dashboard commands (unified token/cache/budget overview)
             commands::cost_dashboard::get_cost_dashboard,
             commands::cost_dashboard::get_active_budget_status,
-            // Window manager commands (OS-level window enumeration/activation)
-            commands::window_manager::list_system_windows,
-            commands::window_manager::activate_system_window,
+            // NOTE: window_manager handlers moved to per-module plugin (see .plugin() calls above).
             // Web-integration settings commands (Phase 3G: runner↔web toggle)
             commands::web_integration::get_web_integration_status,
             commands::web_integration::save_web_integration_settings,

@@ -25,6 +25,33 @@
 //! # Shared Types
 //!
 //! Common types and state used across all command modules are defined here.
+//!
+//! # Handler registration
+//!
+//! Modules are transitioning to Tauri plugin self-registration. Two patterns
+//! coexist:
+//!
+//! **Plugin pattern (preferred)** — module exposes `pub fn plugin<R: Runtime>()
+//! -> TauriPlugin<R>` holding its own `tauri::generate_handler![...]`. main.rs
+//! adds one `.plugin(commands::foo::plugin())` call. Adding a command to a
+//! migrated module is a single-file edit.
+//!
+//! **Central pattern (legacy)** — handlers listed in main.rs's central
+//! `tauri::generate_handler![...]`. Requires editing main.rs for every new
+//! command; tracked for migration.
+//!
+//! Migrated modules: clipboard, debug, dev_findings, file_browser,
+//! window_manager (as of this commit).
+//!
+//! To migrate a module `foo.rs`:
+//! 1. Add `use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};` and
+//!    `use tauri::Runtime;` at the top.
+//! 2. Add `pub fn plugin<R: Runtime>() -> TauriPlugin<R>` at the bottom that
+//!    returns `PluginBuilder::new("qontinui_foo").invoke_handler(...).build()`.
+//! 3. In `main.rs`, remove the module's entries from the central
+//!    `generate_handler!` list and add `.plugin(commands::foo::plugin())`
+//!    right after the existing per-module plugin block.
+//! 4. Plugin name convention: `qontinui_<module_name>` (lowercase snake_case).
 
 use crate::config::QontinuiConfig;
 use crate::container::isolated_executor::IsolatedExecutor;

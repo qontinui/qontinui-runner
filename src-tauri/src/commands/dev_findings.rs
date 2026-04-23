@@ -19,7 +19,8 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::{AppHandle, Emitter, Runtime};
 
 /// Environment variable that gates all dev-only endpoints in this module.
 const DEV_ENV_VAR: &str = "QONTINUI_DEV_ENDPOINTS";
@@ -73,8 +74,8 @@ struct SeedFindingPayload {
 /// A JSON object `{ "seeded": N, "ids": [...] }` describing the findings
 /// that were emitted.
 #[tauri::command]
-pub async fn dev_seed_finding(
-    app_handle: AppHandle,
+pub async fn dev_seed_finding<R: Runtime>(
+    app_handle: AppHandle<R>,
     count: Option<u32>,
     category: Option<String>,
     status: Option<String>,
@@ -132,6 +133,18 @@ pub async fn dev_seed_finding(
         "seeded": n,
         "ids": ids,
     }))
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_dev_findings")
+        .invoke_handler(tauri::generate_handler![
+            is_dev_endpoints_enabled,
+            dev_seed_finding,
+        ])
+        .build()
 }
 
 #[cfg(test)]

@@ -8,7 +8,8 @@
 use crate::settings;
 use serde_json;
 use std::sync::Arc;
-use tauri::State;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::{Runtime, State};
 use tracing::{error, info};
 
 use super::{AppState, CommandResponse};
@@ -97,4 +98,16 @@ pub async fn set_debug_settings(
         message: Some("Debug settings saved".to_string()),
         data: None,
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_debug")
+        .invoke_handler(tauri::generate_handler![
+            get_debug_settings,
+            set_debug_settings,
+        ])
+        .build()
 }

@@ -7,6 +7,8 @@ use crate::auth::AuthManager;
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{error, info};
 
 /// Response from POST /api/v1/clipboard
@@ -236,4 +238,16 @@ pub async fn share_file_to_mobile(file_path: String) -> Result<SharedFileRespons
         entry.id, entry.filename
     );
     Ok(entry)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_clipboard")
+        .invoke_handler(tauri::generate_handler![
+            share_to_mobile,
+            share_file_to_mobile,
+        ])
+        .build()
 }
