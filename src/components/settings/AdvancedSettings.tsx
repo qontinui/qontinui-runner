@@ -52,13 +52,6 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
   const [deviceInfoLoading, setDeviceInfoLoading] = useState(true);
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadSettings();
-
-    loadDeviceInfo();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -98,6 +91,13 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
       setDeviceInfoLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+
+    loadDeviceInfo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const copyToClipboard = async (text: string, fieldName: string) => {
     try {
