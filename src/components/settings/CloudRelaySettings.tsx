@@ -61,12 +61,6 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
     init();
   }, []);
 
-  // Periodic status polling while the settings page is mounted
-  useEffect(() => {
-    const interval = setInterval(loadStatus, 5000);
-    return () => clearInterval(interval);
-  }, []);
-
   const _loadSettings = async () => {
     try {
       const result = await invoke<CloudRelaySettingsData>("get_cloud_relay_settings");
@@ -90,6 +84,12 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
       console.error("Failed to load Cloud Relay status:", err);
     }
   };
+
+  // Periodic status polling while the settings page is mounted
+  useEffect(() => {
+    const interval = setInterval(loadStatus, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   const handleSave = async () => {
     setIsSaving(true);
