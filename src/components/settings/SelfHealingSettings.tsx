@@ -74,18 +74,6 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
   const [hasApiKey, setHasApiKey] = useState(false);
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
 
-  useEffect(() => {
-    loadSettings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Check for API key when provider changes
-  useEffect(() => {
-    if (settings.llm_mode === "remote_api") {
-      checkApiKey(settings.api_provider);
-    }
-  }, [settings.api_provider, settings.llm_mode]);
-
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -123,6 +111,18 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
       console.error("Failed to check API key:", err);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Check for API key when provider changes
+  useEffect(() => {
+    if (settings.llm_mode === "remote_api") {
+      checkApiKey(settings.api_provider);
+    }
+  }, [settings.api_provider, settings.llm_mode]);
 
   const saveSettings = async () => {
     try {
