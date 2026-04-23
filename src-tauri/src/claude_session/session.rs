@@ -559,14 +559,17 @@ impl ClaudeSession {
                                         );
                                     }));
 
-                                // Async-enrich security findings with vulnerability intelligence
+                                // Async-enrich security findings with vulnerability intelligence.
+                                // Must use the captured runtime handle — bare `tokio::spawn`
+                                // calls `Handle::current()` internally and would panic on this
+                                // sync std::thread (same reactor-missing class as 46a426c1f).
                                 if parsed_finding.category
                                     == crate::findings::FindingCategory::Security
                                 {
                                     let description = finding.description.clone();
                                     let task_run_id = ctx.task_run_id.clone();
                                     let finding_title = finding.title.clone();
-                                    tokio::spawn(async move {
+                                    rt.spawn(async move {
                                         let ka =
                                             crate::knowledge_acquisition::KnowledgeAcquisition::new(
                                             );
