@@ -35,7 +35,13 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
   };
 
   useEffect(() => {
-    discoverDirs();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void discoverDirs();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const toggleDir = useCallback((path: string) => {
