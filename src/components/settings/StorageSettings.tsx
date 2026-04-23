@@ -78,7 +78,13 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
   };
 
   useEffect(() => {
-    loadStorageInfo();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadStorageInfo();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const handleDeleteOldSessions = async (type: "screenshots" | "videos", days: number) => {
