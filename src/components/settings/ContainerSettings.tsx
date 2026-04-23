@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Box, Check, Info, X, Wifi, WifiOff } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
@@ -98,7 +98,7 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
     }
   };
 
-  const checkDocker = useCallback(async () => {
+  const checkDocker = async () => {
     setDockerStatus("checking");
     try {
       const result = await invoke<{ available: boolean }>("check_docker_status");
@@ -106,7 +106,7 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
     } catch {
       setDockerStatus("disconnected");
     }
-  }, []);
+  };
 
   const saveSettings = async () => {
     try {
