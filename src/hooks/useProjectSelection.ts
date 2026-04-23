@@ -113,33 +113,30 @@ export function useProjectSelection(): UseProjectSelectionReturn {
   /**
    * Set the selected project and persist to localStorage
    */
-  const setSelectedProject = useCallback(
-    (projectId: string | null) => {
-      setSelectedProjectIdState(projectId);
+  const setSelectedProject = (projectId: string | null) => {
+    setSelectedProjectIdState(projectId);
 
-      // Find the project name
-      const project = projects.find((p) => p.id === projectId);
-      const projectName = project?.name || null;
-      setSelectedProjectName(projectName);
+    // Find the project name
+    const project = projects.find((p) => p.id === projectId);
+    const projectName = project?.name || null;
+    setSelectedProjectName(projectName);
 
-      // Persist to localStorage
-      const state: ProjectSelectionState = {
-        selectedProjectId: projectId,
-        selectedProjectName: projectName,
-      };
-      instanceStorage.setJSON(SELECTED_PROJECT_STORAGE_KEY, state);
+    // Persist to localStorage
+    const state: ProjectSelectionState = {
+      selectedProjectId: projectId,
+      selectedProjectName: projectName,
+    };
+    instanceStorage.setJSON(SELECTED_PROJECT_STORAGE_KEY, state);
 
-      // Dispatch event for StatusIndicator
-      window.dispatchEvent(
-        new CustomEvent("project-selection-changed", {
-          detail: { projectId, projectName },
-        }),
-      );
+    // Dispatch event for StatusIndicator
+    window.dispatchEvent(
+      new CustomEvent("project-selection-changed", {
+        detail: { projectId, projectName },
+      }),
+    );
 
-      log.debug("Selected project:", projectId, projectName);
-    },
-    [projects],
-  );
+    log.debug("Selected project:", projectId, projectName);
+  };
 
   // When projects change, update the selected project name if needed
   useEffect(() => {
