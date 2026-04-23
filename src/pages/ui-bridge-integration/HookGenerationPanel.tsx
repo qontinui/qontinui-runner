@@ -870,6 +870,9 @@ export function HookGenerationPanel({
       }
 
       // Helper: chain to demo script + product tour planning (non-AI — calls planner APIs directly)
+      // Exposed via ref so handleGeneratePages can invoke it for demo/tour-only
+      // re-runs that have no AI prompt to anchor the first-page flow on.
+      chainToDemoScriptRef.current = chainToDemoScript;
       function chainToDemoScript(route: string, signal: AbortSignal) {
         pendingStepRef.current = "page-demo-script";
         const opts = pageOptionsRef.current;
@@ -1298,6 +1301,7 @@ export function HookGenerationPanel({
 
   useEffect(() => {
     const controller = new AbortController();
+    currentControllerRef.current = controller;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
     const prevState = prevSessionStateRef.current;
@@ -1318,6 +1322,9 @@ export function HookGenerationPanel({
 
     return () => {
       controller.abort();
+      if (currentControllerRef.current === controller) {
+        currentControllerRef.current = null;
+      }
       if (retryTimer) clearTimeout(retryTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
