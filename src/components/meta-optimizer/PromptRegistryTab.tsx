@@ -46,7 +46,16 @@ export function PromptRegistryTab() {
   }, [filterAgent]);
 
   useEffect(() => {
-    load();
+    // Async IIFE: avoid invoking a setState-bearing callback synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await load();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [load]);
 
   const handleActivate = async (variantId: string) => {

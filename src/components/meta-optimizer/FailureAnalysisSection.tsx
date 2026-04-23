@@ -445,7 +445,13 @@ export function FailureAnalysisSection({ category = "main" }: FailureAnalysisSec
   }, [category]);
 
   useEffect(() => {
-    load();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void load();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [load]);
 
   if (loading) {
