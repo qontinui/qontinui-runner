@@ -78,7 +78,13 @@ export function ClaudeCliSection({
   }, []);
 
   useEffect(() => {
-    refreshLiveAccounts();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void refreshLiveAccounts();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [refreshLiveAccounts]);
 
   const handleSwitchAccount = useCallback(
