@@ -152,7 +152,15 @@ export function ProgressTab() {
   }, [category]);
 
   useEffect(() => {
-    load();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside load.
+    void Promise.resolve().then(() => {
+      if (!cancelled) void load();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [load]);
 
   const handleCaptureBaseline = async () => {
