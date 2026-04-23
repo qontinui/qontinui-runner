@@ -34,6 +34,19 @@ export function PromptLibraryPicker({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [categoryFilter, setCategoryFilter] = useState<string>("");
 
+  // Reset UI state when the modal opens. Detect the false→true
+  // transition during render so setStates are inline (allowed pattern)
+  // instead of via a post-render effect (set-state-in-effect).
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  if (prevIsOpen !== isOpen) {
+    setPrevIsOpen(isOpen);
+    if (isOpen) {
+      setSearchQuery("");
+      setSelectedId(null);
+      setCategoryFilter("");
+    }
+  }
+
   // Fetch saved prompts
   useEffect(() => {
     if (!isOpen) return;
@@ -62,11 +75,7 @@ export function PromptLibraryPicker({
       }
     };
 
-    fetchPrompts();
-
-    setSearchQuery("");
-    setSelectedId(null);
-    setCategoryFilter("");
+    void fetchPrompts();
 
     return () => {
       cancelled = true;
