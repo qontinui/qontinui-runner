@@ -64,7 +64,9 @@ export function useBrowserErrors(options: UseBrowserErrorsOptions = {}): UseBrow
 
   const enabledRef = useRef(enabled);
 
-  enabledRef.current = enabled;
+  useEffect(() => {
+    enabledRef.current = enabled;
+  });
 
   const fetchReport = useCallback(async () => {
     if (!enabledRef.current) return;
