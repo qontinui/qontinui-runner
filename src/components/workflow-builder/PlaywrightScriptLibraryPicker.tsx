@@ -93,14 +93,18 @@ export function PlaywrightScriptLibraryPicker({
     };
   }, [isOpen]);
 
-  // Reset selection when modal opens
-  useEffect(() => {
-    if (isOpen) {
-      setSelectedId(null);
-      setSearchQuery("");
-      setFilterCategory(null);
-    }
-  }, [isOpen]);
+  // Reset selection when the modal transitions from closed -> open. Done via
+  // the "compare prev prop during render" pattern (React docs) rather than a
+  // useEffect that would synchronously setState (react-hooks/set-state-in-effect).
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  if (isOpen && !prevIsOpen) {
+    setPrevIsOpen(true);
+    setSelectedId(null);
+    setSearchQuery("");
+    setFilterCategory(null);
+  } else if (!isOpen && prevIsOpen) {
+    setPrevIsOpen(false);
+  }
 
   // Filter scripts
   const filteredScripts = scripts.filter((script) => {
