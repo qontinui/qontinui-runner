@@ -96,9 +96,17 @@ export function useErrorEvents(options: UseErrorEventsOptions = {}): UseErrorEve
     }
   }, []);
 
-  // Initial fetch
+  // Initial fetch. Deferred into a microtask so the setState inside
+  // fetchErrors doesn't fire synchronously from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    fetchErrors();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchErrors();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchErrors]);
 
   // Auto-refresh
@@ -202,7 +210,13 @@ export function useErrorSummary(options: UseErrorSummaryOptions = {}): UseErrorS
   }, []);
 
   useEffect(() => {
-    fetchSummary();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchSummary();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchSummary]);
 
   useEffect(() => {
@@ -286,7 +300,13 @@ export function useDebugContext(options: UseDebugContextOptions = {}): UseDebugC
   }, []);
 
   useEffect(() => {
-    fetchContext();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchContext();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchContext]);
 
   const getAiContext = useCallback(async () => {
