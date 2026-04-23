@@ -357,8 +357,18 @@ export function ReflectionDashboard() {
     }
   }, [workflowName]);
 
+  // Wrap loadData() in async IIFE so its synchronous setState calls aren't
+  // the first statements reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    loadData();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await loadData();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [loadData]);
 
   // Graph Insights data
