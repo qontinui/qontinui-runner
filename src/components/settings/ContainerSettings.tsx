@@ -73,13 +73,6 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
   const [error, setError] = useState<string | null>(null);
   const [dockerStatus, setDockerStatus] = useState<DockerStatus>("checking");
 
-  useEffect(() => {
-    loadSettings();
-
-    checkDocker();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -107,6 +100,13 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
       setDockerStatus("disconnected");
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+
+    checkDocker();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const saveSettings = async () => {
     try {
