@@ -192,30 +192,33 @@ export function ApprovalDialog({ taskRunId, onResolved }: ApprovalDialogProps) {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [approvals, dismissed, responding, handleRespond]);
 
-  // Fetch approval history
-  const fetchHistory = useCallback(async () => {
-    setHistoryLoading(true);
-    try {
-      const resp = await tracedFetch(`${getApiBase()}/task-runs/${taskRunId}/approval-gates`);
-      if (resp.ok) {
-        const data = await resp.json();
-        // Filter to only resolved gates (not the currently pending one)
-        const resolved = (data as ApprovalGateRecord[]).filter((g) => g.status !== "pending");
-        setHistory(resolved);
-      }
-    } catch {
-      // API not available, ignore
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, [taskRunId]);
-
-  // Fetch history when toggled on
+  // Fetch approval history when toggled on. setHistoryLoading(true) lives
+  // inside the IIFE so it isn't the first statement reached from the effect
+  // body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (showHistory) {
-      fetchHistory();
-    }
-  }, [showHistory, fetchHistory]);
+    if (!showHistory) return;
+    let cancelled = false;
+    (async () => {
+      setHistoryLoading(true);
+      try {
+        const resp = await tracedFetch(`${getApiBase()}/task-runs/${taskRunId}/approval-gates`);
+        if (cancelled) return;
+        if (resp.ok) {
+          const data = await resp.json();
+          // Filter to only resolved gates (not the currently pending one)
+          const resolved = (data as ApprovalGateRecord[]).filter((g) => g.status !== "pending");
+          if (!cancelled) setHistory(resolved);
+        }
+      } catch {
+        // API not available, ignore
+      } finally {
+        if (!cancelled) setHistoryLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [showHistory, taskRunId]);
 
   if (approvals.length === 0) {
     return null;

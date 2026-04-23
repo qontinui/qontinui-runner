@@ -222,15 +222,13 @@ function AppContent() {
     handleRunLastWorkflow,
   } = useRunLastWorkflow(lastRun, setActiveTab);
 
-  const [editWorkflowId, setEditWorkflowId] = useState<string | null>(null);
+  const [rawEditWorkflowId, setEditWorkflowId] = useState<string | null>(null);
   const [activeLogSubTab, setActiveLogSubTab] = useState<LogSubTab>("general");
   const [showLogSourcePicker, setShowLogSourcePicker] = useState(false);
 
-  useEffect(() => {
-    if (activeTab !== "unified-workflow-builder") {
-      setEditWorkflowId(null);
-    }
-  }, [activeTab]);
+  // Derive: only surface editWorkflowId when on the builder tab. Avoids a
+  // sync setState in useEffect to clear on tab-switch (set-state-in-effect).
+  const editWorkflowId = activeTab === "unified-workflow-builder" ? rawEditWorkflowId : null;
 
   const {
     logs,
