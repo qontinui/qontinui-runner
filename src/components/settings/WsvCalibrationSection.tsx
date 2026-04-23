@@ -141,11 +141,20 @@ export function WsvCalibrationSection({ mode, onLog }: WsvCalibrationSectionProp
   }, []);
 
   useEffect(() => {
-    loadRows(true);
+    // Async IIFE: avoid invoking a setState-bearing callback synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await loadRows(true);
+    })();
     const timer = setInterval(() => {
       loadRows(false);
     }, POLL_INTERVAL_MS);
-    return () => clearInterval(timer);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   }, [loadRows]);
 
   const filtered = useMemo(() => applyFilter(rows, filter), [rows, filter]);
