@@ -37,9 +37,13 @@ export function useProviderCircuitBreakers(): UseProviderCircuitBreakersResult {
   }, []);
 
   useEffect(() => {
-    // Initial fetch for current snapshot
-
-    refresh();
+    // Initial fetch for current snapshot. Wrapped in a microtask so the
+    // effect body itself doesn't synchronously trigger setState inside
+    // refresh.
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void refresh();
+    });
 
     // Subscribe to real-time circuit breaker state-change events
     const unlisten = listen<ProviderCircuitState>("circuit-breaker-change", (event) => {
@@ -55,6 +59,7 @@ export function useProviderCircuitBreakers(): UseProviderCircuitBreakersResult {
     });
 
     return () => {
+      cancelled = true;
       unlisten.then((fn) => fn());
     };
   }, [refresh]);
