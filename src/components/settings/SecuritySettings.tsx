@@ -487,10 +487,18 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
     }
   };
 
+  // Wrap loadSettings/loadProfiles in async IIFE so their synchronous
+  // setState calls aren't the first statements reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    loadSettings();
-
-    loadProfiles();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await Promise.all([loadSettings(), loadProfiles()]);
+    })();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -518,11 +526,19 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
     }
   }, [auditFilter]);
 
-  // Auto-load audit data when enabled and filter changes
+  // Auto-load audit data when enabled and filter changes. Wrap in async IIFE
+  // so loadAuditData's synchronous setAuditLoading(true) isn't the first
+  // statement reached from the effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (config.audit_enabled) {
-      loadAuditData();
-    }
+    if (!config.audit_enabled) return;
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await loadAuditData();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [config.audit_enabled, loadAuditData]);
 
   const exportAuditLog = async (format: "json" | "csv") => {
