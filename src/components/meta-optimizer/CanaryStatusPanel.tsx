@@ -65,9 +65,13 @@ export function CanaryStatusPanel() {
   }, []);
 
   useEffect(() => {
-    load();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void load();
+    });
     intervalRef.current = setInterval(load, 30000);
     return () => {
+      cancelled = true;
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
   }, [load]);
