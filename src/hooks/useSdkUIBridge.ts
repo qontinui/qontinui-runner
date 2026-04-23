@@ -14,7 +14,7 @@
  * for SRP compliance.
  */
 
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import {
   useConnection,
   useElements,
@@ -73,8 +73,9 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
   );
 
   // Wire up the stable ref now that elementsHook exists
-
-  fetchElementsRef.current = elementsHook.fetchElements;
+  useEffect(() => {
+    fetchElementsRef.current = elementsHook.fetchElements;
+  });
 
   // --- Connection ---
   const clearElementState = useCallback(() => {
@@ -88,8 +89,9 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
   const connectionHook = useConnection(elementsHook.fetchElements, clearElementState);
 
   // Keep connectedAppRef in sync with connection state
-
-  connectedAppRef.current = connectionHook.connectedApp;
+  useEffect(() => {
+    connectedAppRef.current = connectionHook.connectedApp;
+  });
 
   // --- Commands ---
   const commandsHook = useCommands(
