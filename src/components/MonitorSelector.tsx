@@ -84,7 +84,13 @@ export function MonitorSelector({
   };
 
   useEffect(() => {
-    loadMonitors();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadMonitors();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const handleMonitorClick = (index: number) => {
