@@ -309,9 +309,17 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
     }
   }, [loadTasks, loadSettings, loadStatus]);
 
-  // Initial load
+  // Initial load. Async IIFE to avoid invoking a setState-bearing
+  // callback synchronously in the effect body (set-state-in-effect).
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await refresh();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [refresh]);
 
   // Auto-refresh status

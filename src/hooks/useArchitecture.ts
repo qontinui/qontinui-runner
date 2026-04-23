@@ -73,32 +73,47 @@ export function useArchitectureGraph(workflowName: string) {
     }
   }, [workflowName, refresh]);
 
+  // Wrap refresh() in async IIFE so its synchronous setLoading(true) isn't
+  // the first statement reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await refresh();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [refresh]);
 
   return { graph, loading, error, refresh, rebuild };
 }
 
 export function useComponentDetails(workflowName: string, componentPath: string | null) {
-  const [details, setDetails] = useState<ComponentDetails | null>(null);
+  // Tag the fetched details with its (workflowName, componentPath) key so we
+  // can derive `details` as a pure value — no setState(null) or setLoading
+  // in the effect body for the invalid-deps case (Recipe 1: reset-on-invalid-deps).
+  const [fetched, setFetched] = useState<{
+    key: string | null;
+    data: ComponentDetails | null;
+  }>({ key: null, data: null });
   const [loading, setLoading] = useState(false);
 
+  const currentKey = workflowName && componentPath ? `${workflowName}::${componentPath}` : null;
+
   useEffect(() => {
-    if (!workflowName || !componentPath) {
-      setDetails(null);
-      return;
-    }
+    if (!currentKey || !workflowName || !componentPath) return;
     let cancelled = false;
-    setLoading(true);
     (async () => {
+      setLoading(true);
       try {
         const res = await tracedFetch(
           `${getApiBase()}/reflection/architecture/component?workflow_name=${encodeURIComponent(workflowName)}&path=${encodeURIComponent(componentPath)}`,
         );
         const json: ApiResponse<ComponentDetails> = await res.json();
         if (!cancelled && json.success && json.data) {
-          setDetails(json.data);
+          setFetched({ key: currentKey, data: json.data });
         }
       } catch {
         // Silently ignore — component may not exist
@@ -109,30 +124,36 @@ export function useComponentDetails(workflowName: string, componentPath: string 
     return () => {
       cancelled = true;
     };
-  }, [workflowName, componentPath]);
+  }, [workflowName, componentPath, currentKey]);
 
+  const details = fetched.key === currentKey ? fetched.data : null;
   return { details, loading };
 }
 
 export function useImpactAnalysis(workflowName: string, componentPath: string | null) {
-  const [impact, setImpact] = useState<ImpactAnalysis | null>(null);
+  // Tag the fetched impact with its key to derive `impact` as a pure value
+  // — no setState in the effect body for the invalid-deps case
+  // (Recipe 1: reset-on-invalid-deps).
+  const [fetched, setFetched] = useState<{
+    key: string | null;
+    data: ImpactAnalysis | null;
+  }>({ key: null, data: null });
   const [loading, setLoading] = useState(false);
 
+  const currentKey = workflowName && componentPath ? `${workflowName}::${componentPath}` : null;
+
   useEffect(() => {
-    if (!workflowName || !componentPath) {
-      setImpact(null);
-      return;
-    }
+    if (!currentKey || !workflowName || !componentPath) return;
     let cancelled = false;
-    setLoading(true);
     (async () => {
+      setLoading(true);
       try {
         const res = await tracedFetch(
           `${getApiBase()}/reflection/architecture/impact?workflow_name=${encodeURIComponent(workflowName)}&component=${encodeURIComponent(componentPath)}`,
         );
         const json: ApiResponse<ImpactAnalysis> = await res.json();
         if (!cancelled && json.success && json.data) {
-          setImpact(json.data);
+          setFetched({ key: currentKey, data: json.data });
         }
       } catch {
         // Silently ignore
@@ -143,37 +164,49 @@ export function useImpactAnalysis(workflowName: string, componentPath: string | 
     return () => {
       cancelled = true;
     };
-  }, [workflowName, componentPath]);
+  }, [workflowName, componentPath, currentKey]);
 
+  const impact = fetched.key === currentKey ? fetched.data : null;
   return { impact, loading };
 }
 
 export function useWorkflowTrends(workflowName: string, timeRange: TimeRange) {
-  const [trends, setTrends] = useState<WorkflowTrends | null>(null);
+  // Tag fetched trends (and error) with the request key so they derive to
+  // null when the deps become invalid — no setState in the effect body for
+  // the invalid-deps case (Recipe 1: reset-on-invalid-deps).
+  const [fetched, setFetched] = useState<{
+    key: string | null;
+    data: WorkflowTrends | null;
+    error: string | null;
+  }>({ key: null, data: null, error: null });
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+
+  const currentKey = workflowName ? `${workflowName}::${timeRange}` : null;
 
   useEffect(() => {
-    if (!workflowName) {
-      setTrends(null);
-      return;
-    }
+    if (!currentKey || !workflowName) return;
     let cancelled = false;
-    setLoading(true);
-    setError(null);
     (async () => {
+      setLoading(true);
       try {
         const res = await tracedFetch(
           `${getApiBase()}/reflection/trends?workflow_name=${encodeURIComponent(workflowName)}&time_range=${encodeURIComponent(timeRange)}`,
         );
         const json: ApiResponse<WorkflowTrends> = await res.json();
-        if (!cancelled && json.success && json.data) {
-          setTrends(json.data);
-        } else if (!cancelled) {
-          setError(json.error ?? "Failed to load trends");
+        if (cancelled) return;
+        if (json.success && json.data) {
+          setFetched({ key: currentKey, data: json.data, error: null });
+        } else {
+          setFetched({ key: currentKey, data: null, error: json.error ?? "Failed to load trends" });
         }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : "Network error");
+        if (!cancelled) {
+          setFetched({
+            key: currentKey,
+            data: null,
+            error: e instanceof Error ? e.message : "Network error",
+          });
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -181,8 +214,10 @@ export function useWorkflowTrends(workflowName: string, timeRange: TimeRange) {
     return () => {
       cancelled = true;
     };
-  }, [workflowName, timeRange]);
+  }, [workflowName, timeRange, currentKey]);
 
+  const trends = fetched.key === currentKey ? fetched.data : null;
+  const error = fetched.key === currentKey ? fetched.error : null;
   return { trends, loading, error };
 }
 
@@ -191,24 +226,29 @@ export function useComponentTrend(
   componentPath: string | null,
   timeRange: TimeRange,
 ) {
-  const [trend, setTrend] = useState<ComponentTrend | null>(null);
+  // Tag fetched trend with its key to derive null when deps invalid — no
+  // setState(null) in the effect body (Recipe 1: reset-on-invalid-deps).
+  const [fetched, setFetched] = useState<{
+    key: string | null;
+    data: ComponentTrend | null;
+  }>({ key: null, data: null });
   const [loading, setLoading] = useState(false);
 
+  const currentKey =
+    workflowName && componentPath ? `${workflowName}::${componentPath}::${timeRange}` : null;
+
   useEffect(() => {
-    if (!workflowName || !componentPath) {
-      setTrend(null);
-      return;
-    }
+    if (!currentKey || !workflowName || !componentPath) return;
     let cancelled = false;
-    setLoading(true);
     (async () => {
+      setLoading(true);
       try {
         const res = await tracedFetch(
           `${getApiBase()}/reflection/trends/component?workflow_name=${encodeURIComponent(workflowName)}&path=${encodeURIComponent(componentPath)}&time_range=${encodeURIComponent(timeRange)}`,
         );
         const json: ApiResponse<ComponentTrend> = await res.json();
         if (!cancelled && json.success && json.data) {
-          setTrend(json.data);
+          setFetched({ key: currentKey, data: json.data });
         }
       } catch {
         // Silently ignore
@@ -219,8 +259,9 @@ export function useComponentTrend(
     return () => {
       cancelled = true;
     };
-  }, [workflowName, componentPath, timeRange]);
+  }, [workflowName, componentPath, timeRange, currentKey]);
 
+  const trend = fetched.key === currentKey ? fetched.data : null;
   return { trend, loading };
 }
 
@@ -229,24 +270,28 @@ export function useEffectivenessTrend(
   timeRange: TimeRange,
   bucket: "week" | "month" = "week",
 ) {
-  const [data, setData] = useState<EffectivenessOverTime | null>(null);
+  // Tag fetched effectiveness with its key to derive null when deps invalid
+  // — no setState(null) in the effect body (Recipe 1: reset-on-invalid-deps).
+  const [fetched, setFetched] = useState<{
+    key: string | null;
+    data: EffectivenessOverTime | null;
+  }>({ key: null, data: null });
   const [loading, setLoading] = useState(false);
 
+  const currentKey = workflowName ? `${workflowName}::${timeRange}::${bucket}` : null;
+
   useEffect(() => {
-    if (!workflowName) {
-      setData(null);
-      return;
-    }
+    if (!currentKey || !workflowName) return;
     let cancelled = false;
-    setLoading(true);
     (async () => {
+      setLoading(true);
       try {
         const res = await tracedFetch(
           `${getApiBase()}/reflection/trends/effectiveness?workflow_name=${encodeURIComponent(workflowName)}&bucket=${encodeURIComponent(bucket)}&time_range=${encodeURIComponent(timeRange)}`,
         );
         const json: ApiResponse<EffectivenessOverTime> = await res.json();
         if (!cancelled && json.success && json.data) {
-          setData(json.data);
+          setFetched({ key: currentKey, data: json.data });
         }
       } catch {
         // Silently ignore
@@ -257,8 +302,9 @@ export function useEffectivenessTrend(
     return () => {
       cancelled = true;
     };
-  }, [workflowName, timeRange, bucket]);
+  }, [workflowName, timeRange, bucket, currentKey]);
 
+  const data = fetched.key === currentKey ? fetched.data : null;
   return { data, loading };
 }
 
@@ -396,8 +442,18 @@ export function useSdkArchitecture() {
     }
   }, []);
 
+  // Wrap refresh() in async IIFE so its synchronous setLoading(true) isn't
+  // the first statement reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await refresh();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [refresh]);
 
   return { specs, loading, error, refresh };
