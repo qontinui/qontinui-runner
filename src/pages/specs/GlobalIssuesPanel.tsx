@@ -458,7 +458,13 @@ export function GlobalIssuesPanel() {
   }, [statusFilter, categoryFilter, severityFilter]);
 
   useEffect(() => {
-    loadIssues();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadIssues();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadIssues]);
 
   // Listen for auto-detected known issues
