@@ -101,18 +101,31 @@ export function useGuiAutomationData(): GuiAutomationData {
     }
   }, [fetchActionLog, fetchScreenshots]);
 
-  // Initial fetch and polling
+  // Initial fetch and polling. Wrapped in a microtask so the effect body
+  // itself doesn't synchronously trigger setState inside refresh.
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void refresh();
+    });
     const interval = setInterval(refresh, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [refresh]);
 
-  // Update elapsed time
+  // Update elapsed time. No sync setState in the effect body — the initial
+  // value update is deferred via a microtask, then the 1s interval takes over.
   useEffect(() => {
+    let cancelled = false;
     if (!startTime) {
-      setElapsedTime(0);
-      return;
+      void Promise.resolve().then(() => {
+        if (!cancelled) setElapsedTime(0);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
     const updateElapsed = () => {
@@ -120,9 +133,14 @@ export function useGuiAutomationData(): GuiAutomationData {
       setElapsedTime(Math.floor(now - startTime));
     };
 
-    updateElapsed();
+    void Promise.resolve().then(() => {
+      if (!cancelled) updateElapsed();
+    });
     const interval = setInterval(updateElapsed, 1000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [startTime]);
 
   // Map action log data to ActionItem[]
