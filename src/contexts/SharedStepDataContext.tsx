@@ -101,13 +101,20 @@ export function SharedStepDataProvider({ children }: SharedStepDataProviderProps
     }, DEBOUNCE_MS);
   }, [fetchSteps]);
 
-  // Initial fetch + fallback polling
+  // Initial fetch + fallback polling. Async IIFE to avoid invoking a
+  // setState-bearing callback synchronously in the effect body
+  // (set-state-in-effect).
   useEffect(() => {
     mountedRef.current = true;
 
-    fetchSteps();
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await fetchSteps();
+    })();
     const interval = setInterval(fetchSteps, POLL_INTERVAL_MS);
     return () => {
+      cancelled = true;
       mountedRef.current = false;
       clearInterval(interval);
       if (debounceTimerRef.current) {
