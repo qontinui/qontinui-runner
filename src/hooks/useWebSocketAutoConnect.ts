@@ -77,15 +77,6 @@ export function useWebSocketAutoConnect({
   // Track when the last connect was initiated (to prevent rapid reconnection)
   const lastConnectTimeRef = useRef<number>(0);
 
-  // Load connection info when authenticated
-  useEffect(() => {
-    if (isAuthenticated) {
-      loadConnectionInfo();
-    } else {
-      setConnectionInfo(null);
-    }
-  }, [isAuthenticated]);
-
   const loadConnectionInfo = async () => {
     try {
       const info = await invoke<ConnectionInfo>("get_connection_info");
@@ -96,6 +87,15 @@ export function useWebSocketAutoConnect({
       setError(err as string);
     }
   };
+
+  // Load connection info when authenticated
+  useEffect(() => {
+    if (isAuthenticated) {
+      loadConnectionInfo();
+    } else {
+      setConnectionInfo(null);
+    }
+  }, [isAuthenticated]);
 
   const connect = useCallback(async () => {
     if (!connectionInfo) {
