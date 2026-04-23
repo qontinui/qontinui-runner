@@ -425,11 +425,19 @@ export function useTaskDetection(options?: UseTaskDetectionOptions): UseTaskDete
     };
   }, [refresh]);
 
-  // Initial fetch and fallback polling (reduced frequency since we have real-time events)
+  // Initial fetch and fallback polling (reduced frequency since we have
+  // real-time events). Wrapped in a microtask so the effect body itself
+  // doesn't synchronously trigger setState inside refresh.
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void refresh();
+    });
     const interval = setInterval(refresh, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [refresh]);
 
   // Derive taskInfo based on selectedRunId or default to first task
