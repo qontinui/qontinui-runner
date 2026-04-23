@@ -203,12 +203,18 @@ export function MultiLoopPanel() {
     }
   }, []);
 
+  // Initial fetch + polling. Wrap callbacks in async IIFE so the synchronous
+  // setState inside fetchMultiStatus isn't the first statement reached from
+  // the effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    fetchMultiStatus();
-    loadRunnerInstances();
-    loadWorkflows();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await Promise.all([fetchMultiStatus(), loadRunnerInstances(), loadWorkflows()]);
+    })();
     pollRef.current = setInterval(fetchMultiStatus, 3000);
     return () => {
+      cancelled = true;
       if (pollRef.current) clearInterval(pollRef.current);
     };
   }, [fetchMultiStatus, loadRunnerInstances, loadWorkflows]);
