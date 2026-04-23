@@ -64,9 +64,17 @@ export function HooksManagerPanel() {
     }
   }, []);
 
-  // Initial load
+  // Initial load. Async IIFE to avoid invoking a setState-bearing callback
+  // synchronously in the effect body (set-state-in-effect).
   useEffect(() => {
-    loadHooks();
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await loadHooks();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [loadHooks]);
 
   // Create or update hook
