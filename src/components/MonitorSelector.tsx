@@ -65,10 +65,6 @@ export function MonitorSelector({
   const [monitors, setMonitors] = useState<BackendMonitor[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    loadMonitors();
-  }, []);
-
   const loadMonitors = async () => {
     try {
       setLoading(true);
@@ -86,6 +82,10 @@ export function MonitorSelector({
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadMonitors();
+  }, []);
 
   const handleMonitorClick = (index: number) => {
     // Don't allow changes in read-only mode
