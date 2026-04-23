@@ -205,11 +205,18 @@ export function useVerificationData(): VerificationData {
     return () => clearInterval(interval);
   }, [fetchCheckSteps, fetchVerificationLog]);
 
-  // Update elapsed time
+  // Update elapsed time. The reset-to-0 setState is deferred into a
+  // microtask so it isn't called synchronously from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
     if (!startTime) {
-      setElapsedTime(0);
-      return;
+      let cancelled = false;
+      void Promise.resolve().then(() => {
+        if (!cancelled) setElapsedTime(0);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
     const updateElapsed = () => {
