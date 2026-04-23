@@ -131,9 +131,17 @@ export function useWorkflowGeneration({
     }
   }, []);
 
-  // Load plan content once on mount (best-effort)
+  // Load plan content once on mount (best-effort). Deferred into a
+  // microtask so the setState inside loadPlanContent doesn't fire
+  // synchronously from the effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    loadPlanContent();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadPlanContent();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadPlanContent]);
 
   // ── Session selection ──────────────────────────────────────────────────────
