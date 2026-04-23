@@ -46,10 +46,6 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
   });
   const [storageLoading, setStorageLoading] = useState(false);
 
-  useEffect(() => {
-    loadStorageInfo();
-  }, []);
-
   const loadStorageInfo = async () => {
     try {
       setStorageLoading(true);
@@ -80,6 +76,10 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
       setStorageLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadStorageInfo();
+  }, []);
 
   const handleDeleteOldSessions = async (type: "screenshots" | "videos", days: number) => {
     try {
