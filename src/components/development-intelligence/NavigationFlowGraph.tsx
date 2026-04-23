@@ -6,7 +6,7 @@
  * Layout: LR flow showing user journeys.
  */
 
-import { useMemo, useState, useEffect, useCallback, useRef } from "react";
+import { useMemo, useState, useEffect, useCallback } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -254,17 +254,15 @@ export function NavigationFlowGraph() {
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  const prevInitialRef = useRef({ nodes: initialNodes, edges: initialEdges });
-
-  if (prevInitialRef.current.nodes !== initialNodes) {
-    prevInitialRef.current.nodes = initialNodes;
+  // Reset ReactFlow's internal node/edge state whenever the graph is rebuilt
+  // from new specs/navLinks.
+  useEffect(() => {
     setNodes(initialNodes);
-  }
+  }, [initialNodes, setNodes]);
 
-  if (prevInitialRef.current.edges !== initialEdges) {
-    prevInitialRef.current.edges = initialEdges;
+  useEffect(() => {
     setEdges(initialEdges);
-  }
+  }, [initialEdges, setEdges]);
 
   if (loading) {
     return (
