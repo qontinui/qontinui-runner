@@ -88,7 +88,75 @@ Start the file with:
 This marker is used to extract the file from your response.`;
 
 /**
+ * A `useUIElement` / `useUIComponent` call found inline in page source.
+ * Captured so the registration prompt can tell the LLM "these elements are
+ * already tagged; don't re-emit them in the generated side-file."
+ */
+export interface InlineRegistration {
+  /** Which hook was called: `useUIElement` or `useUIComponent`. */
+  hook: "useUIElement" | "useUIComponent";
+  /** The `id:` string literal. */
+  id: string;
+  /** The `label:` or `name:` string literal, if present. */
+  label?: string;
+  /** The `type:` string literal, if present. */
+  type?: string;
+}
+
+/**
+ * Regex-scan a page source for inline `useUIElement(...)` / `useUIComponent(...)`
+ * calls and extract the `id` (always) plus `label`/`name` and `type` (when
+ * present). Robust enough for common call shapes; doesn't attempt to handle
+ * computed keys or template literals.
+ *
+ * The output is a summary the AI prompt uses to know which elements are
+ * already covered inline — so the side-file it generates doesn't duplicate.
+ */
+export function extractInlineRegistrations(pageSource: string): InlineRegistration[] {
+  const results: InlineRegistration[] = [];
+  // Match either hook followed by (  { ... } up to the next `})` that isn't
+  // inside a nested object. Simple non-greedy scan works for the shapes the
+  // runner's existing registrations use. We walk with an index + brace
+  // counter rather than a single regex to handle nested braces correctly.
+  const hookPattern = /\b(useUIElement|useUIComponent)\s*\(\s*\{/g;
+  let match: RegExpExecArray | null;
+  while ((match = hookPattern.exec(pageSource)) !== null) {
+    const hook = match[1] as InlineRegistration["hook"];
+    // Position right after the opening brace.
+    let i = match.index + match[0].length;
+    let depth = 1;
+    const start = i;
+    while (i < pageSource.length && depth > 0) {
+      const ch = pageSource[i];
+      if (ch === "{") depth++;
+      else if (ch === "}") depth--;
+      i++;
+    }
+    if (depth !== 0) continue; // Unbalanced — skip silently.
+    const body = pageSource.slice(start, i - 1);
+
+    const idMatch = /\bid\s*:\s*["'`]([^"'`]+)["'`]/.exec(body);
+    if (!idMatch) continue; // No string-literal id — skip (can't summarize a computed id).
+    const labelMatch = /\b(?:label|name)\s*:\s*["'`]([^"'`]+)["'`]/.exec(body);
+    const typeMatch = /\btype\s*:\s*["'`]([^"'`]+)["'`]/.exec(body);
+
+    results.push({
+      hook,
+      id: idMatch[1],
+      label: labelMatch ? labelMatch[1] : undefined,
+      type: typeMatch ? typeMatch[1] : undefined,
+    });
+  }
+  return results;
+}
+
+/**
  * Build a prompt for generating useUIElement/useUIComponent registrations.
+ *
+ * `inlineRegistrations` — if provided, these are `useUIElement`/`useUIComponent`
+ * calls already present inline in the page source. The prompt tells the LLM
+ * to treat those elements as already covered and NOT to duplicate them in
+ * the generated side-file (which would cause runtime double-registration).
  */
 export function buildRegistrationPrompt(
   pageSource: string,
@@ -97,6 +165,7 @@ export function buildRegistrationPrompt(
   route: string,
   framework: string,
   existingRegistrations?: string,
+  inlineRegistrations?: InlineRegistration[],
 ): string {
   const parts: string[] = [];
 
@@ -120,6 +189,21 @@ export function buildRegistrationPrompt(
       parts.push(imp.content.slice(0, 8000)); // Cap each import
       parts.push("```\n");
     }
+  }
+
+  if (inlineRegistrations && inlineRegistrations.length > 0) {
+    parts.push(`\n## Elements Already Tagged Inline (DO NOT RE-EMIT)\n`);
+    parts.push(
+      "The page component above already contains the following `useUIElement` / `useUIComponent` calls inline. These elements are ALREADY registered by the page itself — if you include them in the generated side-file, runtime will register them twice and the second call will collide on `id`. Emit registrations ONLY for elements that are NOT in this list:\n",
+    );
+    for (const reg of inlineRegistrations) {
+      const label = reg.label ? ` — ${JSON.stringify(reg.label)}` : "";
+      const type = reg.type ? ` (type: ${reg.type})` : "";
+      parts.push(`- \`${reg.hook}\` id=\`${reg.id}\`${type}${label}`);
+    }
+    parts.push(
+      "\nSpecifically: **skip** any element whose id appears above. If you believe an inline-tagged element needs different metadata, note it in a comment in your output — do NOT re-emit a `useUIElement` / `useUIComponent` call for it.",
+    );
   }
 
   if (existingRegistrations) {

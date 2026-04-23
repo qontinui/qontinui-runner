@@ -56,6 +56,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import {
   buildRegistrationPrompt,
+  extractInlineRegistrations,
   buildPageSpecPrompt,
   buildTutorialPrompt,
   buildArchitectureDiagramPrompt,
@@ -1297,6 +1298,10 @@ export function HookGenerationPanel({
             page.route,
             analysis.framework,
             existingRegs || undefined,
+            // Inline `useUIElement` / `useUIComponent` calls the page already
+            // contains. Without this, the side-file the LLM emits would
+            // duplicate them and runtime would double-register.
+            extractInlineRegistrations(source.main_source),
           );
           await sendMessage(
             `Analyze the page at ${page.route} and generate UI Bridge registrations.\n\n` + prompt,
@@ -1635,6 +1640,10 @@ export function HookGenerationPanel({
           firstPage.component_name,
           firstPage.route,
           analysis.framework,
+          undefined,
+          // Inline `useUIElement` / `useUIComponent` calls the page already
+          // contains. Prevents duplicate registrations in the side-file.
+          extractInlineRegistrations(source.main_source),
         );
         await session.sendMessage(
           `Analyze the page at ${firstPage.route} and generate UI Bridge registrations.\n\n` +
