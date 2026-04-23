@@ -2625,62 +2625,88 @@ impl LoopController {
         config: &mut LoopConfig,
         outcome: &AgenticOutcome,
     ) -> LoopState {
-        // Check if the AI signaled unfixable errors.
-        // Prefer the structured `parsed` output, fall back to raw marker check.
-        let is_unfixable = if let Some(parsed) = outcome.parsed() {
-            parsed.unfixable
-        } else if let Some(output) = outcome.output() {
-            output.contains("[UNFIXABLE_ERRORS]") || output.contains("[UNFIXABLE_ERROR]")
-        } else {
-            false
+        use super::loop_handlers_decisions::{
+            decide_post_agentic_signals, PostAgenticSignalsDecision, PostAgenticSignalsSnapshot,
         };
-        if is_unfixable {
-            let reason = outcome
-                .parsed()
-                .and_then(|p| p.unfixable_reason.as_deref())
-                .unwrap_or("(no reason provided)");
-            warn!(
-                "AI signaled unfixable errors on iteration {} - exiting loop gracefully. Reason: {}",
-                ctx.iteration, reason
-            );
 
-            // Log the unfixable signal to the task output
-            let unfixable_msg = format!(
-                "\n=== AI SIGNALED UNFIXABLE ERRORS ===\nThe AI has determined that some errors cannot be fixed automatically.\nReason: {}\nProceeding to completion phase.\n",
-                reason
-            );
-            let _ = self
-                .app_state
-                .pg_db
-                .append_task_output_ex(&config.execution_id, &unfixable_msg, false, false)
-                .await;
+        // ---- Read state -----------------------------------------------------
+        let parsed_unfixable = outcome.parsed().map(|p| p.unfixable);
+        let raw_output_has_unfixable_marker = outcome
+            .output()
+            .map(|o| o.contains("[UNFIXABLE_ERRORS]") || o.contains("[UNFIXABLE_ERROR]"))
+            .unwrap_or(false);
+        let unfixable_reason = outcome
+            .parsed()
+            .and_then(|p| p.unfixable_reason.clone());
 
-            return LoopState::Complete {
-                reason: CompletionReason::UnfixableErrors,
-            };
+        let stopped_before_pause = self.is_task_stopped(&config.execution_id);
+
+        // ---- Pre-pause decision (just to short-circuit on stop/unfixable) ---
+        // We materialize the full snapshot only after the pause wait so the
+        // post-pause stop flag is accurate, but the unfixable branch must
+        // fire BEFORE we wait — preserving original sequencing.
+        let pre_pause_snap = PostAgenticSignalsSnapshot {
+            parsed_unfixable,
+            raw_output_has_unfixable_marker,
+            unfixable_reason: unfixable_reason.clone(),
+            stopped_before_pause,
+            stopped_after_pause: false, // not yet observed
+        };
+        match decide_post_agentic_signals(&pre_pause_snap) {
+            PostAgenticSignalsDecision::Unfixable { reason } => {
+                warn!(
+                    "AI signaled unfixable errors on iteration {} - exiting loop gracefully. Reason: {}",
+                    ctx.iteration, reason
+                );
+                let unfixable_msg = format!(
+                    "\n=== AI SIGNALED UNFIXABLE ERRORS ===\nThe AI has determined that some errors cannot be fixed automatically.\nReason: {}\nProceeding to completion phase.\n",
+                    reason
+                );
+                let _ = self
+                    .app_state
+                    .pg_db
+                    .append_task_output_ex(&config.execution_id, &unfixable_msg, false, false)
+                    .await;
+                return LoopState::Complete {
+                    reason: CompletionReason::UnfixableErrors,
+                };
+            }
+            PostAgenticSignalsDecision::Stopped => {
+                warn!("Task was stopped during agentic phase - exiting loop");
+                return LoopState::Complete {
+                    reason: CompletionReason::Stopped,
+                };
+            }
+            PostAgenticSignalsDecision::ProceedToApproval => { /* fall through */ }
         }
 
-        // Check if the task was stopped during the agentic phase
-        if self.is_task_stopped(&config.execution_id) {
-            warn!("Task was stopped during agentic phase - exiting loop");
-            return LoopState::Complete {
-                reason: CompletionReason::Stopped,
-            };
-        }
-
-        // Wait if paused after agentic phase
+        // ---- Wait while paused, then re-check stop --------------------------
         self.wait_while_paused(&config.execution_id).await;
 
-        // Re-check stop after unpause
-        if self.is_task_stopped(&config.execution_id) {
-            warn!("Task was stopped while paused (post-agentic) - exiting loop");
-            return LoopState::Complete {
-                reason: CompletionReason::Stopped,
-            };
-        }
-
-        LoopState::ApprovalGate {
-            outcome: outcome.clone(),
+        let post_pause_snap = PostAgenticSignalsSnapshot {
+            parsed_unfixable,
+            raw_output_has_unfixable_marker,
+            unfixable_reason,
+            stopped_before_pause: false, // already passed earlier check
+            stopped_after_pause: self.is_task_stopped(&config.execution_id),
+        };
+        match decide_post_agentic_signals(&post_pause_snap) {
+            PostAgenticSignalsDecision::Stopped => {
+                warn!("Task was stopped while paused (post-agentic) - exiting loop");
+                LoopState::Complete {
+                    reason: CompletionReason::Stopped,
+                }
+            }
+            PostAgenticSignalsDecision::Unfixable { .. } => {
+                // Cannot occur — unfixable inputs are unchanged from pre-pause
+                // and we already proved they didn't fire. Defensive arm only.
+                LoopState::ApprovalGate {
+                    outcome: outcome.clone(),
+                }
+            }
+            PostAgenticSignalsDecision::ProceedToApproval => LoopState::ApprovalGate {
+                outcome: outcome.clone(),
+            },
         }
     }
 

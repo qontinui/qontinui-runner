@@ -738,13 +738,7 @@ async fn sync_context_to_web(project_id: &str, ctx: &context::Context) -> Result
         .map_err(|e| format!("Failed to get access token: {}", e))?;
 
     // Get the API base URL
-    let api_url = std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
-        if cfg!(debug_assertions) {
-            "http://127.0.0.1:8000".to_string()
-        } else {
-            "https://qontinui-prod-py.eba-km2u4s23.eu-central-1.elasticbeanstalk.com".to_string()
-        }
-    });
+    let api_url = crate::api_config::get_api_base_url();
 
     let client = reqwest::Client::new();
 

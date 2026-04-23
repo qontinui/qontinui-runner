@@ -69,6 +69,7 @@ pub mod deferred_feedback;
 mod health_monitor;
 mod loop_controller;
 mod loop_handlers;
+mod loop_handlers_decisions;
 pub(crate) mod loop_state_machine;
 pub mod multi_agent_fixer;
 pub(crate) mod multi_agent_pipeline_loop;

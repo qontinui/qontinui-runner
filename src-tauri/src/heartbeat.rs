@@ -75,7 +75,7 @@ impl From<crate::crash_dumps::RecentCrash> for HeartbeatRecentCrash {
 /// is set), also sends a heartbeat to the primary runner every 15 seconds.
 pub fn start_heartbeat(app_state: Arc<AppState>) {
     let backend_url = std::env::var("QONTINUI_WEB_BACKEND_URL")
-        .unwrap_or_else(|_| "http://localhost:8000".to_string());
+        .unwrap_or_else(|_| crate::api_config::get_api_base_url());
 
     let heartbeat_url = format!("{}/api/v1/dev-dashboard/heartbeat", backend_url);
 

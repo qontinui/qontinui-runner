@@ -1271,10 +1271,11 @@ pub mod commands {
         *guard = Some(relay);
     }
 
-    /// Probe localhost:8000 to see if a local backend is running.
-    /// Returns the URL if reachable, None otherwise.
+    /// Probe the configured local backend (default `http://127.0.0.1:8000`)
+    /// to see if a local backend is running. Returns the URL if reachable,
+    /// None otherwise.
     async fn detect_local_backend() -> Option<String> {
-        let url = "http://localhost:8000";
+        let url = crate::api_config::get_api_base_url();
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
@@ -1283,7 +1284,7 @@ pub mod commands {
             Err(_) => return None,
         };
         match client.get(format!("{}/health", url)).send().await {
-            Ok(resp) if resp.status().is_success() => Some(url.to_string()),
+            Ok(resp) if resp.status().is_success() => Some(url),
             _ => None,
         }
     }

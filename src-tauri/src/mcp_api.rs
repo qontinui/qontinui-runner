@@ -1121,7 +1121,7 @@ pub fn create_router(
             // with the backend. The tunnel URL (Cloudflare) may reject WS upgrades.
             let cloud_transport =
                 std::sync::Arc::new(crate::mcp::transport::cloud::CloudTransport::new(
-                    "http://127.0.0.1:8000".to_string(),
+                    crate::api_config::get_api_base_url(),
                 ));
 
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -1561,7 +1561,7 @@ async fn cloud_relay_poll_devices_diagnostic(
             // machine as the backend, no need to go through the Cloudflare tunnel
             // which may reject WS upgrades from non-browser clients (403).
             if let Some(device) = devices.first() {
-                let local_backend = "http://127.0.0.1:8000".to_string();
+                let local_backend = crate::api_config::get_api_base_url();
                 let cloud_transport =
                     crate::mcp::transport::cloud::CloudTransport::new(local_backend);
                 match cloud_transport.open_tunnel(&device.device_id, &token).await {

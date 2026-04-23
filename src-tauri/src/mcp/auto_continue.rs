@@ -115,18 +115,19 @@ pub async fn set_workflow_auto_continue(
     }
 }
 
-/// Check if the supervisor is available on port 9875.
+/// Check if the supervisor is available on its configured port (default 9875).
 /// Used to determine what restart instructions to give AI sessions.
 pub fn check_supervisor_available() -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
 
     // Try to connect to supervisor health endpoint
-    TcpStream::connect_timeout(
-        &"127.0.0.1:9875".parse().unwrap(),
-        Duration::from_millis(500),
-    )
-    .is_ok()
+    let addr = crate::api_config::get_supervisor_socket_addr();
+    let socket_addr = match addr.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&socket_addr, Duration::from_millis(500)).is_ok()
 }
 
 /// Create routes for auto-continue settings.

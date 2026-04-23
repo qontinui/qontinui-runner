@@ -1580,11 +1580,15 @@ async fn spawn_instance(
     // Register with supervisor if reachable (best-effort).
     // If no supervisor, the primary runner is already the coordinator via
     // the instance registry (Phase 1-4 of multi-instance awareness).
-    let supervisor_port: u16 = std::env::var("QONTINUI_SUPERVISOR_PORT")
+    // QONTINUI_SUPERVISOR_PORT (legacy) takes precedence over the registry
+    // for backward compatibility.
+    let sup_url = match std::env::var("QONTINUI_SUPERVISOR_PORT")
         .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9875);
-    let sup_url = format!("http://127.0.0.1:{}/runners", supervisor_port);
+        .and_then(|p| p.parse::<u16>().ok())
+    {
+        Some(port) => format!("http://127.0.0.1:{}/runners", port),
+        None => format!("{}/runners", crate::api_config::get_supervisor_url()),
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()

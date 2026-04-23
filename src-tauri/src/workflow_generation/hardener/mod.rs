@@ -18,6 +18,24 @@
 //!
 //! The hardener runs once after the verification/fixer loop, best-effort.
 //! On error it falls back to the original workflow.
+//!
+//! ## Per-step rule pipeline
+//!
+//! The per-step command sanitization that used to live inline in
+//! `sanitize_commands_in_steps` is implemented as a trait-based pipeline:
+//! [`rule::HardenRule`] + [`engine::RuleEngine`]. Each rule lives in its
+//! own file under `rules/`. The engine walks the step list exactly once
+//! per call and applies every registered rule in order.
+//!
+//! The engine enforces a `working_directory` protection invariant: only
+//! rules that declare `requires_working_dir() -> true` can mutate that
+//! field. Every other rule's `working_directory` edits are snapshotted
+//! and reverted, guarding against the recurring "hardener normalized
+//! working_directory to '.' and broke cargo" bug.
+
+pub mod engine;
+pub mod rule;
+pub mod rules;
 
 use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
@@ -26,7 +44,7 @@ use crate::doctor::DoctorHandle;
 use crate::skills::SkillRegistry;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::generator::extract_json_from_response;
-use crate::workflow_generation::rules;
+use crate::workflow_generation::rules as generation_rules;
 use crate::workflow_generation::schema_context::{
     format_skills_for_generator, format_skills_for_generator_filtered,
 };
@@ -1112,430 +1130,48 @@ fn inject_retries_after_navigation(steps: &mut [Value]) -> usize {
 /// 2. Fixes Python f-string escaping issues
 /// 3. Normalizes nested `retry` objects to flat `retry_count`/`retry_delay_ms` fields
 /// 4. Removes `curl -f` flag in piped commands (suppresses output on HTTP errors)
+///
+/// Implemented as a trait-based pipeline in [`engine::RuleEngine`]; every
+/// per-step rule lives in `rules/<name>.rs` and is registered in order by
+/// [`rules::default_rules`]. Behavior matches the prior hand-inlined
+/// sanitizer exactly (including the `continue` short-circuit after a
+/// jq→python replacement — preserved via `StepMut::mark_command_replaced`).
 pub fn sanitize_commands_in_steps(steps: &mut [Value]) -> usize {
-    let mut count = 0;
-
-    for step in steps.iter_mut() {
-        // Inject missing `mode` on command steps. The executor requires `mode` to be
-        // one of: shell, check, check_group, test. Builder output (and older stored
-        // workflows from before mode was mandatory) occasionally omits this field,
-        // which surfaces as "invalid or missing mode: '<missing>'" at execution
-        // time. Infer the intended mode from sibling fields rather than failing
-        // the whole workflow:
-        //   - `test_type` present        → mode: "test"
-        //   - `check_type` present       → mode: "check"
-        //   - `check_group` array present→ mode: "check_group"
-        //   - otherwise                  → mode: "shell"
-        let is_command_step = step
-            .get("type")
-            .or_else(|| step.get("step_type"))
-            .and_then(|v| v.as_str())
-            == Some("command");
-        let has_mode = step
-            .get("mode")
-            .or_else(|| step.get("command_mode"))
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        if is_command_step && !has_mode {
-            let inferred = if step.get("test_type").is_some() {
-                "test"
-            } else if step
-                .get("check_group")
-                .map(|v| v.is_array())
-                .unwrap_or(false)
-            {
-                "check_group"
-            } else if step.get("check_type").is_some() {
-                "check"
-            } else {
-                "shell"
-            };
-            if let Some(obj) = step.as_object_mut() {
-                obj.insert("mode".to_string(), Value::String(inferred.to_string()));
-                count += 1;
-                info!(
-                    "Injected missing mode='{}' on command step '{}'",
-                    inferred,
-                    step.get("name").and_then(|v| v.as_str()).unwrap_or("?")
-                );
-            }
-        }
-
-        // Fix nested retry format: {"retry": {"count": N, "delay_ms": M}} -> retry_count/retry_delay_ms
-        if let Some(retry_obj) = step.get("retry").cloned() {
-            if let Some(obj) = step.as_object_mut() {
-                if let Some(c) = retry_obj.get("count").and_then(|v| v.as_u64()) {
-                    obj.insert("retry_count".to_string(), Value::Number(c.into()));
-                }
-                if let Some(d) = retry_obj.get("delay_ms").and_then(|v| v.as_u64()) {
-                    obj.insert("retry_delay_ms".to_string(), Value::Number(d.into()));
-                }
-                obj.remove("retry");
-                count += 1;
-            }
-        }
-
-        // Check both "command" and "shell_command" keys — workflows use "command" during
-        // generation but "shell_command" after deserialization through ExecutionStepConfig.
-        let (cmd_key, cmd) = match step.get("command").and_then(|v| v.as_str()) {
-            Some(c) => ("command", c.to_string()),
-            None => match step.get("shell_command").and_then(|v| v.as_str()) {
-                Some(c) => ("shell_command", c.to_string()),
-                None => continue,
-            },
-        };
-
-        // Replace jq commands with python -c equivalents (jq unavailable on Windows MSYS)
-        if cmd.contains("| jq ") {
-            if let Some(fixed) = replace_jq_with_python(&cmd) {
-                if let Some(obj) = step.as_object_mut() {
-                    obj.insert(cmd_key.to_string(), Value::String(fixed));
-                    count += 1;
-                }
-                continue;
-            }
-        }
-
-        // Fix f-string escaping issues in python commands → replace with clean python
-        if cmd.contains("python -c")
-            && cmd.contains("json.load")
-            && (cmd.contains("f'") || cmd.contains("f\""))
-        {
-            if let Some(fixed) = replace_python_fstring_with_clean(&cmd) {
-                if let Some(obj) = step.as_object_mut() {
-                    obj.insert(cmd_key.to_string(), Value::String(fixed));
-                    count += 1;
-                }
-            }
-        }
-
-        // Replace bash negation prefix `! command` with explicit exit code handling.
-        // `! grep ...` is bash-specific; the shell router may not detect `!` as bash syntax,
-        // causing it to be routed to cmd.exe where it fails.
-        // Fix: `! grep -qE 'pat' file` → `grep -qE 'pat' file && exit 1 || exit 0`
-        let current_cmd_for_negation = step.get(cmd_key).and_then(|v| v.as_str()).unwrap_or(&cmd);
-        if current_cmd_for_negation.trim().starts_with("! ") {
-            let inner_cmd = current_cmd_for_negation.trim().strip_prefix("! ").unwrap();
-            let fixed = format!("{} && exit 1 || exit 0", inner_cmd);
-            if let Some(obj) = step.as_object_mut() {
-                obj.insert(cmd_key.to_string(), Value::String(fixed));
-                count += 1;
-            }
-        }
-
-        // Fix `curl -sf` (or `-sف`) in piped commands: the -f flag suppresses ALL output
-        // on HTTP errors, so the downstream command (python, grep) receives empty stdin
-        // and fails with a confusing error. Replace with `curl -s` when output is piped.
-        let current_cmd_for_curl = step.get(cmd_key).and_then(|v| v.as_str()).unwrap_or(&cmd);
-        if current_cmd_for_curl.contains("| ") {
-            let fixed_curl = fix_curl_sf_in_piped_commands(current_cmd_for_curl);
-            if fixed_curl != current_cmd_for_curl {
-                if let Some(obj) = step.as_object_mut() {
-                    obj.insert(cmd_key.to_string(), Value::String(fixed_curl));
-                    count += 1;
-                }
-            }
-        }
-
-        // Fix incorrect health check assertions: d.get('status')=='ok' → d.get('success')==True
-        // The runner API returns {"success": true, "data": "ok"}, not {"status": "ok"}.
-        // AI models frequently generate the wrong assertion despite schema_context documentation.
-        let current_cmd_for_health = step.get(cmd_key).and_then(|v| v.as_str()).unwrap_or(&cmd);
-        if current_cmd_for_health.contains("/health")
-            && current_cmd_for_health.contains("python")
-            && current_cmd_for_health.contains("d.get('status')")
-        {
-            let fixed_health = current_cmd_for_health.replace(
-                "d.get('status')=='ok'",
-                "d.get('success')==True and d.get('data')=='ok'",
-            );
-            if fixed_health != current_cmd_for_health {
-                if let Some(obj) = step.as_object_mut() {
-                    obj.insert(cmd_key.to_string(), Value::String(fixed_health));
-                    count += 1;
-                    info!("Fixed incorrect health check assertion: status → success/data");
-                }
-            }
-        }
-
-        // Quote URLs containing & in curl commands — unquoted & is misinterpreted
-        // as a shell command separator by bash, e.g.:
-        //   curl http://host/api?a=1&b=2 | grep x
-        // bash parses as: (curl http://host/api?a=1) & (b=2 | grep x)
-        // Fix: wrap the URL in double quotes so & is treated as literal
-        let current_cmd = step.get(cmd_key).and_then(|v| v.as_str()).unwrap_or(&cmd);
-        if let Some(fixed) = quote_curl_urls_with_ampersand(current_cmd) {
-            if let Some(obj) = step.as_object_mut() {
-                obj.insert(cmd_key.to_string(), Value::String(fixed));
-                count += 1;
-            }
-        }
-    }
-
-    count
+    let engine = engine::RuleEngine::new(rules::default_rules());
+    let report = engine.apply(steps);
+    report.mutation_count
 }
 
-/// Replace `jq` commands with Python equivalents since jq is not available on Windows MSYS.
-///
-/// Handles patterns like:
-/// - `curl ... | jq -e '.elements | length > N'` → `curl ... | python -c "import sys,json; ..."`
-/// - `curl ... | jq -e '.total > N'` → `curl ... | python -c "import sys,json; ..."`
-/// - `curl ... | jq -e '.data | length > N'` → `curl ... | python -c "import sys,json; ..."`
-///
-/// Note: UI Bridge SDK `/elements` endpoint returns `{"data": [...]}` (not `{"elements": [...], "total": N}`).
-/// The `.total` pattern is mapped to `len(data)` for SDK element endpoints.
+// The per-rule helper functions that used to live here have been moved
+// into their own files under rules/<name>.rs and are now invoked by
+// [`engine::RuleEngine`]. The thin shims below are retained only for the
+// existing test suite inside this module — they forward to the rule
+// module implementations so the tests still exercise the same logic via
+// the same entry points.
+
+#[cfg(test)]
 fn replace_jq_with_python(cmd: &str) -> Option<String> {
-    let pipe_idx = cmd.find("| jq ")?;
-    let curl_part = cmd[..pipe_idx].trim();
-    let jq_part = &cmd[pipe_idx + 5..]; // skip "| jq "
-
-    // Extract the jq expression (may be quoted with -e flag)
-    let jq_expr = jq_part
-        .trim()
-        .trim_start_matches("-e ")
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'');
-
-    // Detect if this is an SDK elements endpoint (returns {data: [...]} not {elements: [...]})
-    let is_sdk_elements = curl_part.contains("ui-bridge/sdk/elements");
-
-    // Pattern: .data | length > N (SDK elements response format)
-    if jq_expr.contains("data") && jq_expr.contains("length") {
-        let threshold = extract_number_threshold(jq_expr).unwrap_or(0);
-        return Some(format!(
-            "{} | python -c \"import sys,json; d=json.load(sys.stdin); items=d.get('data',[]); assert len(items)>{}, 'Expected >{} items, got '+str(len(items))\"",
-            curl_part, threshold, threshold
-        ));
-    }
-
-    // Pattern: .elements | length > N
-    if jq_expr.contains("elements") && jq_expr.contains("length") {
-        let threshold = extract_number_threshold(jq_expr).unwrap_or(0);
-        if is_sdk_elements {
-            // SDK /elements returns {data: [...]} not {elements: [...]}
-            return Some(format!(
-                "{} | python -c \"import sys,json; d=json.load(sys.stdin); elems=d.get('data',[]); assert len(elems)>{}, 'Expected >{} elements, got '+str(len(elems))\"",
-                curl_part, threshold, threshold
-            ));
-        }
-        return Some(format!(
-            "{} | python -c \"import sys,json; d=json.load(sys.stdin); elems=d.get('elements',d.get('data',[])); assert len(elems)>{}, 'Expected >{} elements, got '+str(len(elems))\"",
-            curl_part, threshold, threshold
-        ));
-    }
-
-    // Pattern: .total > N
-    if jq_expr.contains("total") {
-        let threshold = extract_number_threshold(jq_expr).unwrap_or(0);
-        if is_sdk_elements {
-            // SDK /elements returns {data: [...]} — use len(data) instead of nonexistent total field
-            return Some(format!(
-                "{} | python -c \"import sys,json; d=json.load(sys.stdin); items=d.get('data',[]); assert len(items)>{}, 'Expected >{} elements, got '+str(len(items))\"",
-                curl_part, threshold, threshold
-            ));
-        }
-        return Some(format!(
-            "{} | python -c \"import sys,json; d=json.load(sys.stdin); t=d.get('total',len(d.get('data',[]))); assert t>{}, 'Expected total>{}, got '+str(t)\"",
-            curl_part, threshold, threshold
-        ));
-    }
-
-    // Pattern: .results | length > N
-    if jq_expr.contains("results") && jq_expr.contains("length") {
-        let threshold = extract_number_threshold(jq_expr).unwrap_or(0);
-        return Some(format!(
-            "{} | python -c \"import sys,json; d=json.load(sys.stdin); r=d.get('results',[]); assert len(r)>{}, 'Expected >{} results, got '+str(len(r))\"",
-            curl_part, threshold, threshold
-        ));
-    }
-
-    None
+    rules::replace_jq_with_python::replace_jq_with_python(cmd)
 }
 
-/// Replace a `python -c` command with f-strings with a clean version without f-strings.
+#[cfg(test)]
 fn replace_python_fstring_with_clean(cmd: &str) -> Option<String> {
-    let pipe_idx = cmd.find("| python")?;
-    let curl_part = cmd[..pipe_idx].trim();
-    let python_part = &cmd[pipe_idx..];
-
-    // Detect if this is an SDK elements endpoint (returns {data: [...]} not {elements: [...]})
-    let is_sdk_elements = curl_part.contains("ui-bridge/sdk/elements");
-
-    // Detect element count assertions
-    if python_part.contains("elements") && python_part.contains("len(") {
-        let threshold = extract_number_threshold(python_part).unwrap_or(0);
-        let key = if is_sdk_elements { "data" } else { "elements" };
-        return Some(format!(
-            "{} | python -c \"import sys,json; d=json.load(sys.stdin); elems=d.get('{}',d.get('data',[])); assert len(elems)>{}, 'Expected >{} elements, got '+str(len(elems))\"",
-            curl_part, key, threshold, threshold
-        ));
-    }
-
-    // Detect total assertions
-    if python_part.contains("total") {
-        let threshold = extract_number_threshold(python_part).unwrap_or(0);
-        if is_sdk_elements {
-            // SDK /elements returns {data: [...]} — use len(data) instead of nonexistent total
-            return Some(format!(
-                "{} | python -c \"import sys,json; d=json.load(sys.stdin); items=d.get('data',[]); assert len(items)>{}, 'Expected >{} elements, got '+str(len(items))\"",
-                curl_part, threshold, threshold
-            ));
-        }
-        return Some(format!(
-            "{} | python -c \"import sys,json; d=json.load(sys.stdin); t=d.get('total',len(d.get('data',[]))); assert t>{}, 'Expected total>{}, got '+str(t)\"",
-            curl_part, threshold, threshold
-        ));
-    }
-
-    None
+    rules::replace_python_fstring::replace_python_fstring_with_clean(cmd)
 }
 
-/// Fix `curl -sf` in piped commands by removing the `-f` flag.
-///
-/// The `-f` (fail) flag makes curl suppress ALL output on HTTP error status codes (4xx/5xx).
-/// When the output is piped to another command (e.g., `python -c`, `grep`), the downstream
-/// command receives empty stdin and fails with a confusing error like `JSONDecodeError`.
-///
-/// This function removes `-f` from curl flags when the command pipes to another program.
+#[cfg(test)]
 fn fix_curl_sf_in_piped_commands(cmd: &str) -> String {
-    if !cmd.contains("curl ") || !cmd.contains("| ") {
-        return cmd.to_string();
-    }
-
-    // Match patterns: "curl -sf", "curl -fs", "curl -sfL", "curl -fsL", etc.
-    // We need to remove just the 'f' from the flags group.
-    let mut result = cmd.to_string();
-    let mut changed = false;
-
-    // Find curl invocations and their flag groups
-    for (i, _) in cmd.match_indices("curl ") {
-        let after_curl = &cmd[i + 5..];
-        // Look for a flags group starting with -
-        if let Some(flags_start) = after_curl.find('-') {
-            let flags_abs = i + 5 + flags_start;
-            // Extract the flag group (everything until next space)
-            let flags_end = after_curl[flags_start..]
-                .find(' ')
-                .map(|p| flags_abs + p)
-                .unwrap_or(cmd.len());
-            let flags = &cmd[flags_abs..flags_end];
-
-            // Only process single-letter flag groups (like -sf, -sfL, -fsL)
-            // Skip long flags like --fail
-            if flags.starts_with('-') && !flags.starts_with("--") && flags.contains('f') {
-                let new_flags: String = flags.chars().filter(|c| *c != 'f').collect();
-                if new_flags == "-" {
-                    // Only had -f, replace with -s if not already present
-                    result = format!("{}-s{}", &result[..flags_abs], &result[flags_end..]);
-                } else {
-                    result = format!(
-                        "{}{}{}",
-                        &result[..flags_abs],
-                        new_flags,
-                        &result[flags_end..]
-                    );
-                }
-                changed = true;
-                break; // Only fix the first curl invocation
-            }
-        }
-    }
-
-    if changed {
-        result
-    } else {
-        cmd.to_string()
-    }
+    rules::fix_curl_sf_piped::fix_curl_sf_in_piped_commands(cmd)
 }
 
-/// Quote URLs containing `&` in curl commands so bash doesn't interpret `&` as a
-/// background operator / command separator.
-///
-/// For example:
-/// ```text
-/// curl -sf http://host/api?a=1&b=2 | grep x
-/// ```
-/// becomes:
-/// ```text
-/// curl -sf "http://host/api?a=1&b=2" | grep x
-/// ```
-///
-/// Returns `None` if no fix is needed (no unquoted URLs with `&`).
+#[cfg(test)]
 fn quote_curl_urls_with_ampersand(cmd: &str) -> Option<String> {
-    if !cmd.contains("curl ") || !cmd.contains('&') {
-        return None;
-    }
-
-    // Find URL-like tokens in the command: http:// or https:// followed by non-whitespace
-    // that contain both ? and & (multi-param query strings)
-    let mut result = cmd.to_string();
-    let mut changed = false;
-
-    // Scan for http(s):// URLs that are NOT already quoted
-    let url_prefixes = ["http://", "https://"];
-    for prefix in &url_prefixes {
-        let mut search_from = 0;
-        loop {
-            let Some(url_start) = result[search_from..].find(prefix).map(|i| i + search_from)
-            else {
-                break;
-            };
-
-            // Check if URL is already quoted (preceded by " or ')
-            if url_start > 0 {
-                let prev_char = result.as_bytes()[url_start - 1];
-                if prev_char == b'"' || prev_char == b'\'' {
-                    search_from = url_start + prefix.len();
-                    continue;
-                }
-            }
-
-            // Find end of URL (next whitespace, pipe, or end of string)
-            let url_end = result[url_start..]
-                .find(|c: char| c.is_whitespace() || c == '|' || c == ';' || c == ')' || c == '\'')
-                .map(|i| i + url_start)
-                .unwrap_or(result.len());
-
-            let url = &result[url_start..url_end];
-
-            // Only fix if URL has query params with & (the problematic case)
-            if url.contains('?') && url.contains('&') {
-                let quoted = format!("\"{}\"", url);
-                result = format!("{}{}{}", &result[..url_start], quoted, &result[url_end..]);
-                changed = true;
-                search_from = url_start + quoted.len();
-            } else {
-                search_from = url_end;
-            }
-        }
-    }
-
-    if changed {
-        Some(result)
-    } else {
-        None
-    }
+    rules::quote_curl_ampersand_urls::quote_curl_urls_with_ampersand(cmd)
 }
 
-/// Extract a numeric threshold from an assertion string like "len(...)>2" or "... > 0"
+#[cfg(test)]
 fn extract_number_threshold(s: &str) -> Option<u32> {
-    // Look for patterns like ">2", "> 2", ">0", "> 0"
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b'>' && i + 1 < bytes.len() {
-            let rest = &s[i + 1..].trim_start();
-            if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
-                if let Ok(n) = rest[..end].parse() {
-                    return Some(n);
-                }
-            } else if let Ok(n) = rest.parse() {
-                return Some(n);
-            }
-        }
-    }
-    None
+    rules::common::extract_number_threshold(s)
 }
 
 /// Count verification steps that are candidates for hardening.
@@ -1835,7 +1471,7 @@ verify that the tab has spatial visualization content. Add content-specific chec
         });
         if !critical.is_empty() {
             let mut s = String::from("\n## Critical Rules\n\n");
-            s.push_str(&rules::format_rules_as_markdown(&critical));
+            s.push_str(&generation_rules::format_rules_as_markdown(&critical));
             Some(s)
         } else {
             None
