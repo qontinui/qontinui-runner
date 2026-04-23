@@ -184,20 +184,25 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   };
 
   useEffect(() => {
-    loadSettings();
-
-    checkApiKey();
-
-    checkGeminiApiKey();
-
-    checkCliAuth();
-    loadClaudeConfigDirs();
+    let cancelled = false;
+    // All sync setState-bearing fetches are deferred into a microtask so
+    // the effect body itself doesn't synchronously trigger state updates
+    // (react-hooks/set-state-in-effect).
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      loadSettings();
+      checkApiKey();
+      checkGeminiApiKey();
+      checkCliAuth();
+      loadClaudeConfigDirs();
+    });
 
     const unlisten = listen<CliAuthStatus>("cli-auth-expired", (event) => {
       setCliAuth(event.payload);
     });
 
     return () => {
+      cancelled = true;
       unlisten.then((fn) => fn());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
