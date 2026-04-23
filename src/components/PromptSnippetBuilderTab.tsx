@@ -130,16 +130,6 @@ export function PromptSnippetBuilderTab({
     return promptSnippets.filter((s) => selectedIds.has(s.id)).map((s) => s.name);
   }, [promptSnippets, selectedIds]);
 
-  // Load prompt snippet for editing
-  useEffect(() => {
-    if (editPromptSnippetId && promptSnippets.length > 0) {
-      const snippet = promptSnippets.find((s) => s.id === editPromptSnippetId);
-      if (snippet) {
-        selectSnippet(snippet);
-      }
-    }
-  }, [editPromptSnippetId, promptSnippets]);
-
   // Select a prompt snippet for editing
   const selectSnippet = (snippet: PromptSnippet) => {
     setSelectedSnippet(snippet);
@@ -149,6 +139,16 @@ export function PromptSnippetBuilderTab({
     setFormCategory(snippet.category);
     setFormTags(snippet.tags.join(", "));
   };
+
+  // Load prompt snippet for editing
+  useEffect(() => {
+    if (editPromptSnippetId && promptSnippets.length > 0) {
+      const snippet = promptSnippets.find((s) => s.id === editPromptSnippetId);
+      if (snippet) {
+        selectSnippet(snippet);
+      }
+    }
+  }, [editPromptSnippetId, promptSnippets]);
 
   // Start creating a new prompt snippet
   const startCreate = () => {
