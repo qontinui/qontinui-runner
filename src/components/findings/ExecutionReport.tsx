@@ -117,8 +117,11 @@ export function ExecutionReport({
   const runSelection = useRunSelectionOptional();
   const selectedRun = runSelection?.selectedRun;
 
-  // Subscribe to live findings updates
+  // Subscribe to live findings updates. The initial sync is wrapped in a
+  // microtask so the effect body itself doesn't synchronously setState — the
+  // subscription callback still fires setState normally once updates arrive.
   useEffect(() => {
+    let cancelled = false;
     const unsubscribe = findingsTracker.subscribe((event) => {
       if (
         event.type === "finding_detected" ||
@@ -131,10 +134,14 @@ export function ExecutionReport({
     });
 
     // Initialize with current findings
+    void Promise.resolve().then(() => {
+      if (!cancelled) setLiveFindings(findingsTracker.getAllFindings());
+    });
 
-    setLiveFindings(findingsTracker.getAllFindings());
-
-    return unsubscribe;
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
   // Load auto-fix setting on mount
