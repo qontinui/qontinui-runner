@@ -458,13 +458,6 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditFilter, setAuditFilter] = useState<string>("all");
 
-  useEffect(() => {
-    loadSettings();
-
-    loadProfiles();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -493,6 +486,13 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
       console.error("Failed to load security profiles:", err);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+
+    loadProfiles();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const loadAuditData = useCallback(async () => {
     setAuditLoading(true);
