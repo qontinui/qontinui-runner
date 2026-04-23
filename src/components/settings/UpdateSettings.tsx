@@ -48,7 +48,13 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
   };
 
   useEffect(() => {
-    checkForUpdates();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void checkForUpdates();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
