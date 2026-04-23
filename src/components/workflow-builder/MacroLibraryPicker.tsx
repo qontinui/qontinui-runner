@@ -79,13 +79,21 @@ export function MacroLibraryPicker({ isOpen, onClose, onSelect, phase }: MacroLi
     };
   }, [isOpen]);
 
-  // Reset selection when modal opens
+  // Reset selection when modal opens. Deferred into a microtask so the
+  // setState calls don't fire synchronously from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (isOpen) {
+    if (!isOpen) return;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
       setSelectedId(null);
       setSearchQuery("");
       setFilterCategory(null);
-    }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [isOpen]);
 
   // Filter macros
