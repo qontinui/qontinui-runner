@@ -42,6 +42,9 @@ export { useExecutionControl } from "./useExecutionControl";
 export { useProjectSelection } from "./useProjectSelection";
 export type { ProjectSelectionState } from "./useProjectSelection";
 
+export { useSavedProjects } from "./useSavedProjects";
+export type { SavedProject, UseSavedProjectsResult } from "./useSavedProjects";
+
 export { useProjectLogs } from "./project-logs";
 export type { UseProjectLogsReturn } from "./project-logs";
 

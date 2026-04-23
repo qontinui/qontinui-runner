@@ -2,12 +2,27 @@ import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderOpen, Search, Loader2, Package, CheckSquare, Square } from "lucide-react";
+import type { SavedProject } from "../../hooks/useSavedProjects";
 
 interface Project {
   path: string;
   name: string;
   type: string;
   manifest: string;
+}
+
+/**
+ * Map the wizard's internal Project shape to the persistence wire shape.
+ * The only difference is `type` -> `projectType` (camelCase JSON contract
+ * expected by the Rust `save_saved_projects` command).
+ */
+function toSavedProject(project: Project): SavedProject {
+  return {
+    path: project.path,
+    name: project.name,
+    projectType: project.type,
+    manifest: project.manifest,
+  };
 }
 
 interface ProjectStepProps {
@@ -113,6 +128,22 @@ export function ProjectStep({
     onProjectsChange([]);
   }, [onProjectsChange]);
 
+  /**
+   * Persist the current selection to the saved-projects store before advancing.
+   * The Tauri command lives in `src-tauri/src/commands/saved_projects.rs`.
+   * Save failures are logged but must not block navigation — the user can
+   * still proceed through the wizard if persistence is unavailable.
+   */
+  const handleNext = useCallback(async () => {
+    try {
+      const wireProjects = selectedProjects.map(toSavedProject);
+      await invoke<void>("save_saved_projects", { projects: wireProjects });
+    } catch (err) {
+      console.warn("[ProjectStep] Failed to persist saved projects; continuing anyway:", err);
+    }
+    onNext();
+  }, [selectedProjects, onNext]);
+
   return (
     <div className="tutorial-fade-in flex flex-col gap-6 py-4 px-4">
       <div className="text-center">
@@ -213,7 +244,7 @@ export function ProjectStep({
         <button className="btn-secondary" onClick={onBack}>
           Back
         </button>
-        <button className="btn-primary" onClick={onNext} disabled={!scanned}>
+        <button className="btn-primary" onClick={handleNext} disabled={!scanned}>
           {selectedProjects.length > 0
             ? `Continue with ${selectedProjects.length} project${selectedProjects.length !== 1 ? "s" : ""}`
             : "Skip"}
