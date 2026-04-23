@@ -16,6 +16,7 @@ import { UpdateSettings } from "./UpdateSettings";
 import { AiSettings } from "./AiSettings";
 import { AgenticSettings } from "./AgenticSettings";
 import { BackupSettings } from "./BackupSettings";
+import { DiscoverySettings } from "./DiscoverySettings";
 import { PlaywrightSettings } from "./PlaywrightSettings";
 import { SelfHealingSettings } from "./SelfHealingSettings";
 import { WorldStateVerifierSettings } from "./WorldStateVerifierSettings";
@@ -62,6 +63,7 @@ type SettingsTab =
   | "playwright"
   | "mobile"
   | "cloud-relay"
+  | "discovery"
   | "web-integration"
   | "mcp"
   | "log-sources"
@@ -88,6 +90,7 @@ const VALID_TABS = [
   "playwright",
   "mobile",
   "cloud-relay",
+  "discovery",
   "web-integration",
   "mcp",
   "log-sources",
@@ -201,6 +204,8 @@ export function Settings({
         return <MobileSettings onLog={onLog} />;
       case "cloud-relay":
         return <CloudRelaySettings onLog={onLog} />;
+      case "discovery":
+        return <DiscoverySettings onLog={onLog} />;
       case "web-integration":
         return <WebIntegrationSettings onLog={onLog} />;
       case "mcp":

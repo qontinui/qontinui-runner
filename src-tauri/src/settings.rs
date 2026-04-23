@@ -1398,6 +1398,16 @@ pub fn save_auto_load_last_config(enabled: bool) -> Result<(), String> {
     crate::config_facade::save_auto_load_last_config(enabled)
 }
 
+/// Get the user-configured custom UI Bridge discovery ports
+pub fn get_discovery_ports() -> Vec<u16> {
+    crate::config_facade::get_discovery_ports()
+}
+
+/// Save the user-configured custom UI Bridge discovery ports
+pub fn save_discovery_ports(ports: Vec<u16>) -> Result<(), String> {
+    crate::config_facade::save_discovery_ports(ports)
+}
+
 /// Get the configured Claude Code config directories
 pub fn get_claude_config_dirs() -> Vec<String> {
     crate::config_facade::get_claude_config_dirs()

@@ -934,6 +934,7 @@ export function TabContent({
     case "settings-playwright":
     case "settings-mobile":
     case "settings-cloud-relay":
+    case "settings-discovery":
     case "settings-web-integration":
     case "settings-mcp":
     case "settings-log-sources":
@@ -955,6 +956,7 @@ export function TabContent({
         "settings-playwright": "playwright",
         "settings-mobile": "mobile",
         "settings-cloud-relay": "cloud-relay",
+        "settings-discovery": "discovery",
         "settings-web-integration": "web-integration",
         "settings-mcp": "mcp",
         "settings-log-sources": "log-sources",

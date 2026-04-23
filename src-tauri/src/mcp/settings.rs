@@ -888,6 +888,57 @@ async fn get_accessibility_settings(
 }
 
 // ============================================================================
+// Discovery Ports (UI Bridge app scanner — user-configurable port list)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryPortsPayload {
+    /// Extra ports to probe during `/ui-bridge/apps/scan/desktop`. Merged with
+    /// the hardcoded defaults — duplicates and out-of-range values are dropped.
+    pub ports: Vec<u16>,
+}
+
+/// GET /settings/discovery-ports
+async fn get_discovery_ports_setting(
+) -> Result<Json<ApiResponse<DiscoveryPortsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let ports = tokio::task::spawn_blocking(settings::get_discovery_ports)
+        .await
+        .map_err(|e| {
+            error!("Failed to get discovery ports: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Task failed: {}", e))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(DiscoveryPortsPayload { ports })))
+}
+
+/// PUT /settings/discovery-ports
+async fn save_discovery_ports_setting(
+    Json(payload): Json<DiscoveryPortsPayload>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result =
+        tokio::task::spawn_blocking(move || settings::save_discovery_ports(payload.ports))
+            .await
+            .map_err(|e| {
+                error!("Failed to save discovery ports: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Task failed: {}", e))),
+                )
+            })?;
+
+    match result {
+        Ok(()) => {
+            info!("Discovery ports saved via HTTP");
+            Ok(Json(ApiResponse::success(())))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+// ============================================================================
 // Routes
 // ============================================================================
 
@@ -953,6 +1004,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Accessibility settings
         .route("/settings/accessibility", get(get_accessibility_settings))
+        // UI Bridge discovery — user-configurable port list
+        .route(
+            "/settings/discovery-ports",
+            get(get_discovery_ports_setting).put(save_discovery_ports_setting),
+        )
         // Storage
         .route("/settings/storage", get(get_storage_info))
         .route("/settings/storage/cleanup", post(cleanup_storage))

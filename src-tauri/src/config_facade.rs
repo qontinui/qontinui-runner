@@ -627,6 +627,26 @@ pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
     save_settings(&settings)
 }
 
+/// Get the user-configured custom UI Bridge discovery ports.
+/// These are merged with the hardcoded `DESKTOP_APP_PORTS` at scan time.
+pub fn get_discovery_ports() -> Vec<u16> {
+    load_settings().discovery_ports
+}
+
+/// Save the user-configured custom UI Bridge discovery ports.
+/// Values outside the valid port range (1..=65535) are filtered out; duplicates
+/// are collapsed. Hardcoded default ports may appear here without effect —
+/// `desktop_ports_merged()` in `app_discovery.rs` dedupes against defaults.
+pub fn save_discovery_ports(ports: Vec<u16>) -> Result<(), String> {
+    let mut cleaned: Vec<u16> = ports.into_iter().filter(|p| *p > 0).collect();
+    cleaned.sort_unstable();
+    cleaned.dedup();
+    info!("Saving {} custom discovery port(s)", cleaned.len());
+    let mut settings = load_settings();
+    settings.discovery_ports = cleaned;
+    save_settings(&settings)
+}
+
 /// Get the configured Claude Code config directories.
 pub fn get_claude_config_dirs() -> Vec<String> {
     load_settings().claude_config_dirs

@@ -111,9 +111,10 @@ export function TestResultsTab() {
   const [expandedResults, setExpandedResults] = useState<Set<string>>(new Set());
 
   // Fetch test results for the selected run
+  const selectedRunId = selectedRun?.id;
 
   const fetchResults = useCallback(async () => {
-    if (!selectedRun?.id) {
+    if (!selectedRunId) {
       setResults([]);
       return;
     }
@@ -123,7 +124,7 @@ export function TestResultsTab() {
 
     try {
       const response = await invoke<TestResultsResponse>("list_test_results", {
-        taskRunId: selectedRun.id,
+        taskRunId: selectedRunId,
         limit: 100,
       });
 
@@ -158,7 +159,7 @@ export function TestResultsTab() {
     } finally {
       setIsLoading(false);
     }
-  }, [selectedRun?.id]);
+  }, [selectedRunId]);
 
   // Fetch results when selected run changes
   useEffect(() => {
