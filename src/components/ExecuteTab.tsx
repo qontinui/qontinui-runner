@@ -71,7 +71,16 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   }, []);
 
   useEffect(() => {
-    fetchMacros();
+    // Async IIFE: avoid invoking a setState-bearing callback synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await fetchMacros();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [fetchMacros]);
 
   const runMacro = async (macro: SavedMacro) => {

@@ -74,11 +74,20 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
     }
   }, [initialProjectPath]);
 
-  // Auto-analyze when path is set from outside (initialProjectPath)
+  // Auto-analyze when path is set from outside (initialProjectPath). Wrapped
+  // in a microtask so the effect body itself doesn't synchronously trigger
+  // setState inside analyze.
   useEffect(() => {
-    if (initialProjectPath && projectPath === initialProjectPath && !analysis && !analyzing) {
-      analyze();
+    if (!(initialProjectPath && projectPath === initialProjectPath && !analysis && !analyzing)) {
+      return;
     }
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void analyze();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectPath, initialProjectPath]);
 
