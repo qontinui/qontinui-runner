@@ -92,16 +92,27 @@ export function useGuiLock(enabled = true): UseGuiLockResult {
     }
   }, []);
 
-  // Initial fetch and polling
+  // Initial fetch and polling. Setstate calls are deferred via a microtask so
+  // the effect body itself doesn't call setState synchronously.
   useEffect(() => {
+    let cancelled = false;
     if (!enabled) {
-      setIsLoading(false);
-      return;
+      void Promise.resolve().then(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
-    refresh();
+    void Promise.resolve().then(() => {
+      if (!cancelled) void refresh();
+    });
     const interval = setInterval(refresh, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [enabled, refresh]);
 
   /**
