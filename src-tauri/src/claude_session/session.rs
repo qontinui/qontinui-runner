@@ -467,11 +467,19 @@ impl ClaudeSession {
         let finding_ctx_for_processor = finding_ctx.clone();
         let session_ctx_for_findings = session_ctx.clone();
 
+        // Capture the tokio runtime handle here — `thread::spawn` creates a
+        // bare OS thread with no runtime context, so `Handle::current()`
+        // inside the closure would panic with "there is no reactor running"
+        // (observed 2026-04-23 under load). Cloning an existing Handle is
+        // cheap and lets us call `handle.block_on(..)` from the sync thread.
+        let finding_rt_handle = tokio::runtime::Handle::try_current().ok();
+
         let finding_handle = thread::spawn(move || {
             let mut detected_findings: Vec<Finding> = Vec::new();
 
             if let Some(ctx) = finding_ctx_for_processor {
-                let pg_available = crate::database::pg::PgDb::try_global().is_some();
+                let pg_available = crate::database::pg::PgDb::try_global().is_some()
+                    && finding_rt_handle.is_some();
 
                 while let Ok(parsed_finding) = finding_rx.recv() {
                     info!(
@@ -484,17 +492,21 @@ impl ClaudeSession {
                     if pg_available {
                         let is_resolved = parsed_finding.is_resolved;
 
-                        // PG-primary: sync thread context, use block_in_place
+                        // Use the captured handle's `block_on` — `block_in_place`
+                        // cannot be used here because it itself requires being
+                        // inside a multi-threaded runtime, which this std::thread
+                        // is not.
                         let pg = crate::database::pg::PgDb::global();
-                        let insert_result = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                pg.insert_parsed_finding(
-                                    &ctx.task_run_id,
-                                    ctx.session_num,
-                                    &parsed_finding,
-                                )
-                                .await
-                            })
+                        let rt = finding_rt_handle.as_ref().expect(
+                            "pg_available gated on finding_rt_handle.is_some()",
+                        );
+                        let insert_result = rt.block_on(async {
+                            pg.insert_parsed_finding(
+                                &ctx.task_run_id,
+                                ctx.session_num,
+                                &parsed_finding,
+                            )
+                            .await
                         });
                         match insert_result {
                             Ok(finding) => {
