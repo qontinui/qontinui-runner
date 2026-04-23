@@ -67,7 +67,13 @@ export function WorkflowRunnerPanel({
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
   const [advancedSettingsOpen, setAdvancedSettingsOpen] = useState(false);
-  const [calculatedScreens, setCalculatedScreens] = useState<number[]>([]);
+  // `fetchedScreens` is keyed by the workflow id it came from, so we can
+  // derive `calculatedScreens` as a pure value — no setState(default) in the
+  // effect body when deps become invalid (react-hooks/set-state-in-effect).
+  const [fetchedScreens, setFetchedScreens] = useState<{
+    workflowId: string | null;
+    screens: number[];
+  }>({ workflowId: null, screens: [] });
   const [isCalculating, setIsCalculating] = useState(false);
   const [availableMonitors, setAvailableMonitors] = useState<number[]>([]);
 
@@ -125,42 +131,50 @@ export function WorkflowRunnerPanel({
     loadMonitors();
   }, []);
 
-  // Calculate required screens when workflow changes
+  // Calculate required screens when workflow changes. setIsCalculating lives
+  // inside the IIFE and the invalid-deps branch returns without setState;
+  // the final display derives from `fetchedScreens` keyed by workflow id.
   useEffect(() => {
-    if (!selectedWorkflow || !configLoaded) {
-      setCalculatedScreens([]);
-      return;
-    }
+    if (!selectedWorkflow || !configLoaded) return;
+    let cancelled = false;
 
-    const calculateScreens = async () => {
+    (async () => {
       setIsCalculating(true);
       try {
         const result = await invoke<{ success: boolean; data?: { screens: number[] } }>(
           "get_workflow_required_screens",
           { workflowId: selectedWorkflow },
         );
+        if (cancelled) return;
 
         if (result?.success && result.data?.screens && result.data.screens.length > 0) {
-          setCalculatedScreens(result.data.screens);
+          setFetchedScreens({ workflowId: selectedWorkflow, screens: result.data.screens });
           onMonitorSelectionChange(result.data.screens);
         } else {
           const defaultScreen = availableMonitors.length > 0 ? [availableMonitors[0]] : [0];
-          setCalculatedScreens(defaultScreen);
+          setFetchedScreens({ workflowId: selectedWorkflow, screens: defaultScreen });
           onMonitorSelectionChange(defaultScreen);
         }
       } catch (err) {
         console.error("Failed to calculate required screens:", err);
+        if (cancelled) return;
         const defaultScreen = availableMonitors.length > 0 ? [availableMonitors[0]] : [0];
-        setCalculatedScreens(defaultScreen);
+        setFetchedScreens({ workflowId: selectedWorkflow, screens: defaultScreen });
         onMonitorSelectionChange(defaultScreen);
       } finally {
-        setIsCalculating(false);
+        if (!cancelled) setIsCalculating(false);
       }
+    })();
+    return () => {
+      cancelled = true;
     };
-
-    calculateScreens();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedWorkflow, configLoaded, availableMonitors]);
+
+  const calculatedScreens =
+    selectedWorkflow && fetchedScreens.workflowId === selectedWorkflow
+      ? fetchedScreens.screens
+      : [];
 
   const handleWorkflowSelect = (workflowId: string) => {
     onWorkflowSelect(workflowId);
