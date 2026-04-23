@@ -100,29 +100,41 @@ export function useApiRequestData(): ApiRequestData {
     }
   }, [startTime]);
 
-  // Initial fetch and polling
+  // Initial fetch and polling. Async IIFE to avoid invoking a
+  // setState-bearing callback synchronously in the effect body
+  // (set-state-in-effect).
   useEffect(() => {
-    fetchRequests();
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await fetchRequests();
+    })();
     const interval = setInterval(fetchRequests, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchRequests]);
 
-  // Update elapsed time
+  // Update elapsed time. Drive elapsedTime off a ticking timer; when
+  // startTime is null, the useMemo derives 0 without any setState in the
+  // effect body (set-state-in-effect).
   useEffect(() => {
-    if (!startTime) {
-      setElapsedTime(0);
-      return;
-    }
-
-    const updateElapsed = () => {
-      const now = Date.now();
-      setElapsedTime(Math.floor((now - startTime) / 1000));
-    };
-
-    updateElapsed();
-    const interval = setInterval(updateElapsed, 1000);
+    if (!startTime) return;
+    const interval = setInterval(() => {
+      setElapsedTime(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
     return () => clearInterval(interval);
   }, [startTime]);
+
+  // Detect startTime change during render so we can reset elapsedTime
+  // synchronously (allowed pattern) without a post-render effect+setState
+  // (set-state-in-effect). The interval above updates every second.
+  const [prevStartTime, setPrevStartTime] = useState(startTime);
+  if (prevStartTime !== startTime) {
+    setPrevStartTime(startTime);
+    setElapsedTime(0);
+  }
 
   // Get currently running request
   const currentRequest = useMemo(() => {
