@@ -79,14 +79,6 @@ export function VerificationStep({
     startedRef.current = false;
   }, [runId]);
 
-  useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
-
-    void runCheck();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runId]);
-
   const update = (id: string, patch: Partial<Stage>) => {
     setStages((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
   };
@@ -184,6 +176,14 @@ export function VerificationStep({
       api.setError(msg);
     }
   };
+
+  useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+
+    void runCheck();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId]);
 
   const failed = stages.some((s) => s.state === "fail");
 

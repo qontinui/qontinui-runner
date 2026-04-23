@@ -396,9 +396,14 @@ export function LearningDashboard() {
     }
   }, []);
 
-  // Auto-refresh: event listener + 60s interval
+  // Auto-refresh: event listener + 60s interval. The initial loadData call is
+  // wrapped in a microtask so the effect body itself doesn't synchronously
+  // trigger setState inside loadData.
   useEffect(() => {
-    loadData();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadData();
+    });
 
     let unlisten: UnlistenFn | null = null;
     listen("learning-update", () => {
@@ -410,6 +415,7 @@ export function LearningDashboard() {
     intervalRef.current = setInterval(loadData, 60_000);
 
     return () => {
+      cancelled = true;
       if (unlisten) unlisten();
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
