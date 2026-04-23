@@ -248,9 +248,18 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
     setLoading(false);
   }, [loadTriggers, loadStatus]);
 
-  // Initial load
+  // Initial load. Wrap refresh() in async IIFE so its synchronous
+  // setLoading(true) isn't the first statement reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await refresh();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [refresh]);
 
   // Auto-refresh
