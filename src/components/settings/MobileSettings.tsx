@@ -52,13 +52,6 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
   const [isSaving, setIsSaving] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
 
-  useEffect(() => {
-    loadSettings();
-
-    refreshDevices();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       const result = await invoke<TauriResult<MobileSettingsData>>("get_mobile_settings");
@@ -86,6 +79,13 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       setLoadingDevices(false);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+
+    refreshDevices();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleSave = async () => {
     setIsSaving(true);
