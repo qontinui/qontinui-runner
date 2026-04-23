@@ -211,15 +211,26 @@ export function useOrchestratorState(
     };
   }, [useUnifiedContext, isTauri, taskId, isRunning, fetchState]);
 
-  // Initial fetch - skip when using unified context
+  // Initial fetch - skip when using unified context. All setState calls
+  // are deferred into a microtask so the effect body itself doesn't
+  // synchronously trigger state updates (react-hooks/set-state-in-effect).
   useEffect(() => {
     if (useUnifiedContext) return;
-    if (taskId) {
-      setIsLoading(true);
-      fetchState().finally(() => setIsLoading(false));
-    } else {
-      setState(null);
-    }
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      if (taskId) {
+        setIsLoading(true);
+        fetchState().finally(() => {
+          if (!cancelled) setIsLoading(false);
+        });
+      } else {
+        setState(null);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [useUnifiedContext, taskId, fetchState]);
 
   // Fallback polling while running (reduced frequency since we have real-time events)
