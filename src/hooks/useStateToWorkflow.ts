@@ -208,9 +208,16 @@ export function useStateToWorkflow(): UseStateToWorkflowReturn {
     }
   }, []);
 
-  // Load states on mount
+  // Load states on mount. Wrapped in a microtask so the effect body itself
+  // doesn't synchronously trigger setState inside refreshStates.
   useEffect(() => {
-    refreshStates();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void refreshStates();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [refreshStates]);
 
   /**
