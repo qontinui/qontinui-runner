@@ -90,13 +90,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
   const [retryExpanded, setRetryExpanded] = useState(true);
   const [routingExpanded, setRoutingExpanded] = useState(true);
 
-  useEffect(() => {
-    loadSettings();
-
-    loadReflectionSettings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -197,6 +190,13 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
       onLog("debug", `Failed to load reflection settings: ${err}`);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+
+    loadReflectionSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const toggleReflection = async (enabled: boolean) => {
     setReflectionEnabled(enabled);
