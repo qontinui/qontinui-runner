@@ -331,10 +331,20 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
 
   // Initial fetch and polling. `refresh` has stable identity (empty deps), so
   // this effect runs exactly once and the interval survives re-renders.
+  // Wrap the initial call in an async IIFE so refresh()'s synchronous
+  // setState calls aren't the first statement reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await refresh();
+    })();
     const interval = setInterval(refresh, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [refresh]);
 
   /**
