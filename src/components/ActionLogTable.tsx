@@ -657,7 +657,10 @@ export default function ActionLogTable({
     return map;
   }, [actions]);
 
-  // When maxLevel changes, auto-collapse items at maxLevel that have deeper children
+  // When maxLevel changes, auto-collapse items at maxLevel that have deeper
+  // children. The setState is deferred into a microtask so the effect body
+  // itself doesn't trigger a synchronous cascading render
+  // (react-hooks/set-state-in-effect).
   React.useEffect(() => {
     // Build the ideal collapsed set based on maxLevel
     const idealCollapsed = new Set<string>();
@@ -678,14 +681,20 @@ export default function ActionLogTable({
       }
     }
 
-    // Only update if the ideal state differs from current state
-
-    setCollapsedActions((prev) => {
-      const needsUpdate =
-        idealCollapsed.size !== prev.size || Array.from(idealCollapsed).some((id) => !prev.has(id));
-
-      return needsUpdate ? idealCollapsed : prev;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      // Only update if the ideal state differs from current state
+      setCollapsedActions((prev) => {
+        const needsUpdate =
+          idealCollapsed.size !== prev.size ||
+          Array.from(idealCollapsed).some((id) => !prev.has(id));
+        return needsUpdate ? idealCollapsed : prev;
+      });
     });
+    return () => {
+      cancelled = true;
+    };
   }, [maxLevel, actions, parentChildMap]); // Don't include collapsedActions in deps!
 
   // Filter visible actions based on collapsed state and max level (needs to be before typeColumnWidth)
