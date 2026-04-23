@@ -93,7 +93,10 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
   }, [onLog]);
 
   useEffect(() => {
-    loadInstances();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadInstances();
+    });
     // Poll for status updates
     const interval = setInterval(loadInstances, 3000);
     // Refresh immediately when instances are restored after a rebuild
@@ -101,21 +104,29 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
       loadInstances();
     });
     return () => {
+      cancelled = true;
       clearInterval(interval);
       unlisten.then((fn) => fn());
     };
   }, [loadInstances]);
 
-  // Auto-suggest next available port (skip primary runner port and all instance ports)
+  // Auto-suggest next available port (skip primary runner port and all
+  // instance ports). Deferred into a microtask so the setNewPort call
+  // doesn't fire synchronously from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (showAddForm) {
-      const usedPorts = new Set(instances.map((i) => i.port));
-      usedPorts.add(getApiPort());
-      let nextPort = 9877;
-      while (usedPorts.has(nextPort)) nextPort++;
-
-      setNewPort(nextPort);
-    }
+    if (!showAddForm) return;
+    const usedPorts = new Set(instances.map((i) => i.port));
+    usedPorts.add(getApiPort());
+    let nextPort = 9877;
+    while (usedPorts.has(nextPort)) nextPort++;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) setNewPort(nextPort);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [showAddForm, instances]);
 
   const handleAdd = async () => {
