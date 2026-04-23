@@ -134,9 +134,18 @@ export function useObservationMemory(
     }
   }, [projectId, maxResults, observationType, enabled]);
 
-  // Initial fetch
+  // Initial fetch. Wrap fetchContext() in async IIFE so its synchronous
+  // setState calls aren't the first statement reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    fetchContext();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await fetchContext();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [fetchContext]);
 
   // Optional auto-refresh
