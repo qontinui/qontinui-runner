@@ -91,26 +91,6 @@ export function AiSettings({ onLog }: AiSettingsProps) {
     }
   };
 
-  useEffect(() => {
-    loadSettings();
-
-    checkApiKey();
-
-    checkGeminiApiKey();
-
-    checkCliAuth();
-    loadClaudeConfigDirs();
-
-    const unlisten = listen<CliAuthStatus>("cli-auth-expired", (event) => {
-      setCliAuth(event.payload);
-    });
-
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -202,6 +182,26 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       console.error("Failed to check Gemini API key:", err);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+
+    checkApiKey();
+
+    checkGeminiApiKey();
+
+    checkCliAuth();
+    loadClaudeConfigDirs();
+
+    const unlisten = listen<CliAuthStatus>("cli-auth-expired", (event) => {
+      setCliAuth(event.payload);
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const saveSettings = async () => {
     try {
