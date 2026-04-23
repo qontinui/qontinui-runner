@@ -261,6 +261,20 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     return () => clearInterval(interval);
   }, [startTime, useUnifiedContext]);
 
+  // Track when the synthetic "processing" phase began. Computed in an effect
+  // so we never call Date.now() during render (react-hooks/purity). Reset
+  // when a real step is running or there is no active stage.
+  const [syntheticProcessingStart, setSyntheticProcessingStart] = useState<number | null>(null);
+  useEffect(() => {
+    const hasRunning = allSteps.some((s) => s.status === "running");
+    const needsSynthetic = !hasRunning && Boolean(currentStage) && allSteps.length > 0;
+    if (needsSynthetic) {
+      setSyntheticProcessingStart((prev) => prev ?? Date.now());
+    } else {
+      setSyntheticProcessingStart((prev) => (prev === null ? prev : null));
+    }
+  }, [allSteps, currentStage]);
+
   // Get currently running step
   // If no step is running but the workflow is active (has a currentStage),
   // return a synthetic "processing" step to indicate the orchestrator is working
@@ -296,12 +310,12 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
         stageIndex: lastCompleted?.stageIndex ?? 0,
         stepIndex: -1,
 
-        startTime: lastCompleted?.endTime ?? Date.now(),
+        startTime: lastCompleted?.endTime ?? syntheticProcessingStart ?? 0,
       };
     }
 
     return null;
-  }, [allSteps, currentStage]);
+  }, [allSteps, currentStage, syntheticProcessingStart]);
 
   // Detect current phase from steps or API
   const currentPhase = useMemo((): WorkflowStage | null => {
