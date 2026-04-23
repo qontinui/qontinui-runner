@@ -55,6 +55,11 @@ export function ConnectedUIBridgeInspector() {
   const [overlaysEnabled, setOverlaysEnabled] = useState(false);
   const eventIdRef = useRef(0);
 
+  // Snapshot freshness timestamp. Updated by the event handlers that actually
+  // mutate bridge state (refresh, availability change) rather than called
+  // during render, which would violate react-hooks/purity.
+  const [snapshotTimestamp, setSnapshotTimestamp] = useState<number>(0);
+
   // Convert bridge data to snapshot format
   const snapshot: UIBridgeSnapshot | null = bridge.available
     ? {
@@ -63,7 +68,7 @@ export function ConnectedUIBridgeInspector() {
         transitions: [], // UI Bridge doesn't have transitions yet
         activeStates: [],
 
-        timestamp: Date.now(),
+        timestamp: snapshotTimestamp,
       }
     : null;
 
@@ -92,6 +97,7 @@ export function ConnectedUIBridgeInspector() {
     try {
       // Trigger a discovery to refresh the element list
       const result = await bridge.discover();
+      setSnapshotTimestamp(Date.now());
       addEvent("element_discovered", {
         result: { count: result.elements.length },
         durationMs: 0,
@@ -182,6 +188,7 @@ export function ConnectedUIBridgeInspector() {
   // Log connection status changes - only when transitioning TO available
   useEffect(() => {
     if (bridge.available && !prevAvailable.current) {
+      setSnapshotTimestamp(Date.now());
       addEvent("navigation_completed", {
         result: { elementCount: bridge.elements.length },
       });
