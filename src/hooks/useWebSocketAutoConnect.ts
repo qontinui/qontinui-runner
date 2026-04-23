@@ -88,13 +88,22 @@ export function useWebSocketAutoConnect({
     }
   };
 
-  // Load connection info when authenticated
+  // Load connection info when authenticated. Async IIFE to avoid
+  // invoking a setState-bearing callback synchronously in the effect
+  // body (set-state-in-effect).
   useEffect(() => {
-    if (isAuthenticated) {
-      loadConnectionInfo();
-    } else {
-      setConnectionInfo(null);
-    }
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      if (isAuthenticated) {
+        await loadConnectionInfo();
+      } else {
+        setConnectionInfo(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [isAuthenticated]);
 
   const connect = useCallback(async () => {
