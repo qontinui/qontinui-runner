@@ -115,12 +115,6 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
     name: string;
   } | null>(null);
 
-  // Load settings on mount
-  useEffect(() => {
-    loadSettings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     setLoading(true);
     try {
@@ -135,6 +129,12 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
       setLoading(false);
     }
   };
+
+  // Load settings on mount
+  useEffect(() => {
+    loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const saveSettings = async () => {
     setSaving(true);
