@@ -124,12 +124,19 @@ export function useStepProgressMarkers(
     }
   }, [taskRunId, checkpointId]);
 
-  // Initial fetch
+  // Initial fetch. Async IIFE + setIsLoading inside the IIFE so we don't
+  // call setState synchronously in the effect body (set-state-in-effect).
   useEffect(() => {
-    if (taskRunId && checkpointId) {
+    if (!taskRunId || !checkpointId) return;
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
       setIsLoading(true);
-      fetchProgress();
-    }
+      await fetchProgress();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [taskRunId, checkpointId, fetchProgress]);
 
   // Auto-refresh while running
