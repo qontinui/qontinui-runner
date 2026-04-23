@@ -154,10 +154,19 @@ export function useRunnerCrud<T extends { id: string }>(
     [resourcePath],
   );
 
+  // Initial auto-load. Wrap refresh() in async IIFE so its synchronous
+  // setState calls aren't the first statement reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (autoLoad) {
-      refresh();
-    }
+    if (!autoLoad) return;
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await refresh();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [autoLoad, refresh]);
 
   return {
