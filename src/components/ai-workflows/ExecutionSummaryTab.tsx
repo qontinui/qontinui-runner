@@ -109,6 +109,15 @@ export function ExecutionSummaryTab() {
   const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
 
+  // Live "now" tick so the "recently completed" spinner disappears once the
+  // 2-minute window passes without requiring a manual re-render. Reads
+  // Date.now() from an effect instead of during render (react-hooks/purity).
+  const [now, setNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 30 * 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   const queryClient = useQueryClient();
 
   // Use RunSelectionContext if available
@@ -488,7 +497,6 @@ export function ExecutionSummaryTab() {
             ? new Date(selectedRun.completed_at).getTime()
             : null;
 
-          const now = Date.now();
           const isRecentlyCompleted = completedAt && now - completedAt < 2 * 60 * 1000;
 
           if (isRecentlyCompleted || isGeneratingSummary) {
