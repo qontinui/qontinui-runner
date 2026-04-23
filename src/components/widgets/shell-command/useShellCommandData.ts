@@ -98,18 +98,32 @@ export function useShellCommandData(): ShellCommandData {
     }
   }, [startTime]);
 
-  // Initial fetch and polling
+  // Initial fetch and polling. Wrapped in a microtask so the effect body
+  // itself doesn't synchronously trigger setState inside fetchCommands.
   useEffect(() => {
-    fetchCommands();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchCommands();
+    });
     const interval = setInterval(fetchCommands, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchCommands]);
 
-  // Update elapsed time
+  // Update elapsed time. The initial value write (0 when no startTime, or the
+  // first tick when there is) is deferred via a microtask so the effect body
+  // itself doesn't call setState synchronously.
   useEffect(() => {
+    let cancelled = false;
     if (!startTime) {
-      setElapsedTime(0);
-      return;
+      void Promise.resolve().then(() => {
+        if (!cancelled) setElapsedTime(0);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
     const updateElapsed = () => {
@@ -117,9 +131,14 @@ export function useShellCommandData(): ShellCommandData {
       setElapsedTime(Math.floor((now - startTime) / 1000));
     };
 
-    updateElapsed();
+    void Promise.resolve().then(() => {
+      if (!cancelled) updateElapsed();
+    });
     const interval = setInterval(updateElapsed, 1000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [startTime]);
 
   // Get currently running command

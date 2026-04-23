@@ -216,12 +216,37 @@ export function EmitterProviderControl() {
 
   return (
     <div ref={rootRef} className="bg-card rounded-lg border border-border p-4 mb-4">
+      {/* Header is a grid row that always stays above the fold — the Save
+          control lives here (not at the bottom of the body) so a tall
+          Gemma subsection doesn't push it off-screen at ~800px viewport
+          heights, which was the real layout bug behind earlier tests
+          missing the button in `visibleOnly=true` snapshots. */}
       <div className="flex items-center gap-2 mb-3">
-        <Sliders className="w-4 h-4" />
+        <Sliders className="w-4 h-4 shrink-0" />
         <h3 className="font-semibold">Emitter provider</h3>
         {hasUnsavedChanges && (
-          <span className="ml-auto text-xs text-amber-500">unsaved changes</span>
+          <span className="text-xs text-amber-500 shrink-0">unsaved changes</span>
         )}
+        {!hasUnsavedChanges && saveState !== "saved" && settings && (
+          <span className="text-xs text-muted-foreground truncate">
+            current: <span className="font-mono">{settings.provider}</span>
+          </span>
+        )}
+        <div className="ml-auto flex items-center gap-2">
+          {saveError && (
+            <span className="text-xs text-red-500 truncate max-w-xs" title={saveError}>
+              {saveError}
+            </span>
+          )}
+          <button
+            ref={saveButtonRef}
+            onClick={onSave}
+            disabled={!hasUnsavedChanges || saveState === "saving"}
+            className="px-3 py-1 rounded-md bg-primary text-primary-foreground text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-primary/90"
+          >
+            {saveState === "saving" ? "Saving…" : saveState === "saved" ? "Saved" : "Save"}
+          </button>
+        </div>
       </div>
 
       <div className="space-y-3">
@@ -279,23 +304,6 @@ export function EmitterProviderControl() {
             </label>
           </div>
         )}
-
-        <div className="flex items-center gap-3 pt-1">
-          <button
-            ref={saveButtonRef}
-            onClick={onSave}
-            disabled={!hasUnsavedChanges || saveState === "saving"}
-            className="px-4 py-1.5 rounded-md bg-primary text-primary-foreground text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-primary/90"
-          >
-            {saveState === "saving" ? "Saving…" : saveState === "saved" ? "Saved" : "Save"}
-          </button>
-          {saveError && <span className="text-xs text-red-500 truncate">{saveError}</span>}
-          {!hasUnsavedChanges && saveState !== "saved" && settings && (
-            <span className="text-xs text-muted-foreground">
-              current: <span className="font-mono">{settings.provider}</span>
-            </span>
-          )}
-        </div>
       </div>
     </div>
   );
