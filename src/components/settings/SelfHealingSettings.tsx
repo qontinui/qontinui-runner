@@ -113,15 +113,28 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
   };
 
   useEffect(() => {
-    loadSettings();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadSettings();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Check for API key when provider changes
   useEffect(() => {
-    if (settings.llm_mode === "remote_api") {
-      checkApiKey(settings.api_provider);
-    }
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      if (settings.llm_mode === "remote_api") {
+        void checkApiKey(settings.api_provider);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [settings.api_provider, settings.llm_mode]);
 
   const saveSettings = async () => {
