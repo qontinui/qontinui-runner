@@ -204,23 +204,39 @@ export function AddStateStepsModal({
     return detectConfigType(states);
   }, [states]);
 
-  // Refresh states when modal opens and set defaults based on config type
-  useEffect(() => {
+  // Refresh states when modal opens. Detect the false→true transition
+  // during render so setStates are inline (allowed pattern) instead of
+  // via a post-render effect (set-state-in-effect).
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  if (prevIsOpen !== isOpen) {
+    setPrevIsOpen(isOpen);
     if (isOpen) {
-      refreshStates();
-
       setSelectedStateId(null);
       setExpandedStateId(null);
     }
+  }
+  useEffect(() => {
+    if (isOpen) {
+      // refreshStates is fire-and-forget; its own setStates live inside
+      // the callback, not in this effect body.
+      void refreshStates();
+    }
   }, [isOpen, refreshStates]);
 
-  // Update defaults when config type is detected
-  useEffect(() => {
+  // Update defaults when config type is detected. Detect the
+  // configTypeInfo change during render to keep setStates out of the
+  // post-render effect body (set-state-in-effect).
+  const [prevConfigKey, setPrevConfigKey] = useState<string>(
+    `${configTypeInfo.type}:${states.length}`,
+  );
+  const configKey = `${configTypeInfo.type}:${states.length}`;
+  if (prevConfigKey !== configKey) {
+    setPrevConfigKey(configKey);
     if (states.length > 0 && configTypeInfo.type !== "unknown") {
       setIncludeVisionTest(configTypeInfo.recommendedVision);
       setIncludePlaywrightTest(configTypeInfo.recommendedPlaywright);
     }
-  }, [configTypeInfo, states.length]);
+  }
 
   // Get the selected state
   const selectedState = useMemo(() => {
