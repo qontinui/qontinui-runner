@@ -10,7 +10,7 @@
  *   GET /ui-bridge/sdk/console/browser-events?severity=error&deduplicate=true
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import type {
   BrowserHealthReport,
@@ -136,11 +136,17 @@ export function useBrowserErrors(options: UseBrowserErrorsOptions = {}): UseBrow
     }
   }, []);
 
-  // Initial fetch
+  // Initial fetch. Wrapped in a microtask so the effect body itself doesn't
+  // synchronously trigger setState inside fetchReport.
   useEffect(() => {
-    if (enabled) {
-      fetchReport();
-    }
+    if (!enabled) return;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchReport();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [enabled, fetchReport]);
 
   // Auto-refresh
@@ -155,21 +161,12 @@ export function useBrowserErrors(options: UseBrowserErrorsOptions = {}): UseBrow
   const health = report?.health ?? null;
   const recentErrors = report?.recentErrors ?? [];
 
-  // We need to store deduplicated separately since our composite report
-  // does not include it directly.
-  const [deduplicatedErrors, setDeduplicatedErrors] = useState<FingerprintedEvent[]>([]);
-
-  // Update deduplicated errors when report changes
-  useEffect(() => {
-    if (!report) {
-      setDeduplicatedErrors([]);
-      return;
-    }
-
-    // The report.recentErrors came from the browser-events call which also
-    // returns deduplicated groups in the same response. Since we cannot store
-    // those inside the composite report cleanly, we re-derive them: group by
-    // type+message as a lightweight fingerprint.
+  // Deduplicated errors are a pure derivation of `report.recentErrors` —
+  // group by type+message as a lightweight fingerprint. Using useMemo keeps
+  // the dedup out of an effect body so React isn't asked to setState
+  // synchronously inside an effect.
+  const deduplicatedErrors: FingerprintedEvent[] = useMemo(() => {
+    if (!report) return [];
     const groups = new Map<string, FingerprintedEvent>();
     for (const event of report.recentErrors) {
       const key = `${event.type}:${event.message ?? event.errorMessage ?? event.requestUrl ?? "unknown"}`;
@@ -188,7 +185,7 @@ export function useBrowserErrors(options: UseBrowserErrorsOptions = {}): UseBrow
         });
       }
     }
-    setDeduplicatedErrors(Array.from(groups.values()).sort((a, b) => b.lastSeen - a.lastSeen));
+    return Array.from(groups.values()).sort((a, b) => b.lastSeen - a.lastSeen);
   }, [report]);
 
   return {

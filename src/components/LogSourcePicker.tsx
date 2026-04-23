@@ -5,7 +5,7 @@
  * Sources are managed in Settings > Log Sources — this just picks which ones.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { X, Check, Settings, FolderOpen } from "lucide-react";
 
@@ -83,26 +83,30 @@ export function LogSourcePicker({
     setPrevIsOpen(isOpen);
   }
 
-  // Load global log source settings
-  const loadSettings = useCallback(async () => {
-    setLoading(true);
-    try {
-      const result = await invoke<TauriResult<GlobalLogSourceSettings>>("get_global_log_sources");
-      if (result.success && result.data) {
-        setSettings(result.data);
-      }
-    } catch (err) {
-      console.error("Failed to load global log source settings:", err);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
+  // Load global log source settings when the dialog opens. setLoading(true)
+  // lives inside the IIFE so it isn't the first statement reached from the
+  // effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (isOpen) {
-      loadSettings();
-    }
-  }, [isOpen, loadSettings]);
+    if (!isOpen) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      try {
+        const result = await invoke<TauriResult<GlobalLogSourceSettings>>("get_global_log_sources");
+        if (cancelled) return;
+        if (result.success && result.data) {
+          setSettings(result.data);
+        }
+      } catch (err) {
+        console.error("Failed to load global log source settings:", err);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
