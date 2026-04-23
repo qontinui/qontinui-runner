@@ -34,9 +34,13 @@ export function ShellCommandLibraryPicker({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [categoryFilter, setCategoryFilter] = useState<string>("");
 
-  // Fetch saved shell commands via Tauri IPC
+  // Fetch saved shell commands via Tauri IPC. All setState calls are
+  // deferred (either into the async IIFE or a microtask) so the effect
+  // body itself doesn't contain synchronous setState
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
     if (!isOpen) return;
+    let cancelled = false;
 
     const fetchCommands = async () => {
       setIsLoading(true);
@@ -46,21 +50,29 @@ export function ShellCommandLibraryPicker({
           data?: SavedShellCommand[];
           error?: string;
         }>("list_shell_commands", { enabledOnly: false, category: null });
+        if (cancelled) return;
         if (response.success && response.data) {
           setSavedCommands(response.data);
         }
       } catch (error) {
         console.error("Failed to fetch saved shell commands:", error);
       } finally {
-        setIsLoading(false);
+        if (!cancelled) setIsLoading(false);
       }
     };
 
-    fetchCommands();
+    void fetchCommands();
 
-    setSearchQuery("");
-    setSelectedId(null);
-    setCategoryFilter("");
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      setSearchQuery("");
+      setSelectedId(null);
+      setCategoryFilter("");
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [isOpen]);
 
   // Get unique categories

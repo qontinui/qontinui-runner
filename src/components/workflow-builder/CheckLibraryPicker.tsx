@@ -97,14 +97,18 @@ export function CheckLibraryPicker({ isOpen, onClose, onSelect, phase }: CheckLi
     fetchChecks();
   }, [isOpen]);
 
-  // Reset selection when modal opens
-  useEffect(() => {
+  // Reset selection when modal opens. Detect the false→true transition
+  // during render so setStates are inline (allowed pattern) instead of
+  // via a post-render effect (set-state-in-effect).
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  if (prevIsOpen !== isOpen) {
+    setPrevIsOpen(isOpen);
     if (isOpen) {
       setSelectedId(null);
       setSearchQuery("");
       setFilterType(null);
     }
-  }, [isOpen]);
+  }
 
   // Filter checks
   const filteredChecks = checks.filter((check) => {
