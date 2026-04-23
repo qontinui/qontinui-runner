@@ -161,9 +161,17 @@ export function TestResultsTab() {
     }
   }, [selectedRunId]);
 
-  // Fetch results when selected run changes
+  // Fetch results when selected run changes. Wrapped in a microtask so the
+  // effect body itself doesn't synchronously trigger setState inside
+  // fetchResults.
   useEffect(() => {
-    fetchResults();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchResults();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchResults]);
 
   // Toggle result expansion
