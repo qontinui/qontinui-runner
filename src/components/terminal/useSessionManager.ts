@@ -452,6 +452,17 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     return () => clearInterval(interval);
   }, [fetchExternalProcesses]);
 
+  // ── Live "now" tick for time-based status thresholds ───────────────────────
+  // Used by allSessions below to compute "active-external" vs "frozen" based
+  // on how recently a session was modified. Keeping this as state (rather than
+  // calling Date.now() during render) preserves the live-update semantics while
+  // satisfying react-hooks/purity.
+  const [now, setNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 30 * 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   // ── Build tab lookup for live status correlation ───────────────────────────
 
   const tabSessionMap = useMemo(() => {
@@ -496,7 +507,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           // it's likely active externally rather than frozen
           if (externalProcessCount > 0) {
             try {
-              const age = Date.now() - new Date(s.last_modified).getTime();
+              const age = now - new Date(s.last_modified).getTime();
               if (age < 10 * 60 * 1000) {
                 // Modified within last 10 minutes — likely active externally
                 liveStatus = "active-external";
@@ -512,7 +523,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         } else if (externalProcessCount > 0 && !tab) {
           // Check if this non-frozen session might be running externally
           try {
-            const age = Date.now() - new Date(s.last_modified).getTime();
+            const age = now - new Date(s.last_modified).getTime();
             if (age < 2 * 60 * 1000) {
               // Very recently modified (within 2 min) and not in a zone — likely external
               liveStatus = "active-external";
@@ -546,7 +557,15 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           _transcript: s,
         };
       });
-  }, [transcriptSessions, tabSessionMap, sessionStates, staleTabs, digests, externalProcessCount]);
+  }, [
+    transcriptSessions,
+    tabSessionMap,
+    sessionStates,
+    staleTabs,
+    digests,
+    externalProcessCount,
+    now,
+  ]);
 
   // ── Filter and sort ────────────────────────────────────────────────────────
 
