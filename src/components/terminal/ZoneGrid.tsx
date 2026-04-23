@@ -117,6 +117,12 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
     pageId,
     markReconnected,
   } = useTerminalCore();
+  // terminalRefsRef holds a stable Map<tabId, ref> — it's a per-tab ref cache
+  // that's written by TerminalInstance's ref callbacks, not state that drives
+  // rendering. The Map identity is stable for the component's lifetime, so
+  // reading .current during render is safe. react-hooks/refs can't tell this
+  // apart from a ref whose .current mutation should trigger a re-render.
+  // eslint-disable-next-line react-hooks/refs
   const terminalRefs = terminalRefsRef.current;
   const layout = zoneLayout.layout;
   const assignments = zoneLayout.assignments;
@@ -271,6 +277,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
           </div>
         )}
 
+        {/* eslint-disable-next-line react-hooks/refs -- terminalRefs is a stable Map-cache (see above). */}
         {layout.zones.map((_, zoneIdx) => {
           const zoneTabId = assignments[zoneIdx];
           const zoneTab = tabs.find((t) => t.id === zoneTabId);
@@ -304,6 +311,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
           );
         })}
 
+        {/* eslint-disable-next-line react-hooks/refs -- renderHiddenTabs reads the stable terminalRefs Map-cache (see above). */}
         {renderHiddenTabs(unassignedTerminals)}
       </div>
     );
@@ -321,6 +329,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
       }}
       onDragEnd={() => dispatch({ type: "SET_DROP_TARGET", zone: null })}
     >
+      {/* eslint-disable-next-line react-hooks/refs -- ZoneCell receives the stable terminalRefs Map-cache (see above). */}
       {layout.zones.map((zone, zoneIdx) => (
         <ZoneCell
           key={`zone-${zoneIdx}`}
@@ -473,6 +482,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
           );
         })}
 
+      {/* eslint-disable-next-line react-hooks/refs -- renderHiddenTabs reads the stable terminalRefs Map-cache (see above). */}
       {renderHiddenTabs(unassignedTerminals)}
 
       {gridState.contextMenu &&
