@@ -13,9 +13,13 @@ pub mod analytics;
 pub mod bookmarks;
 pub mod circuit_breaker;
 pub mod design;
+pub mod errors;
+pub mod exploration;
 pub mod forms;
 pub mod helpers;
 pub mod history;
+pub mod network;
+pub mod page;
 pub mod request;
 pub mod types;
 
@@ -47,10 +51,45 @@ pub use design::{
     ui_bridge_design_load_style_guide_handler, ui_bridge_design_responsive_handler,
     ui_bridge_design_snapshot_handler, ui_bridge_design_state_styles_handler,
 };
+pub use errors::{
+    ui_bridge_capture_error_baseline_handler, ui_bridge_circuit_breaker_reset_handler,
+    ui_bridge_compare_error_baseline_handler, ui_bridge_diagnostics_handler,
+    ui_bridge_end_error_session_handler, ui_bridge_get_error_report_handler,
+    ui_bridge_get_error_sessions_handler, ui_bridge_get_error_snapshots_handler,
+    ui_bridge_get_health_report_handler, ui_bridge_get_idle_signal_handler,
+    ui_bridge_get_idle_status_handler, ui_bridge_health_signals_handler,
+    ui_bridge_readiness_handler, ui_bridge_start_error_session_handler, ErrorBaselineRequest,
+    ErrorSessionStartRequest, ErrorSnapshotsQuery, UiBridgeHealthSignals,
+};
+pub use exploration::{
+    discover_states_from_renders, get_ui_bridge_exploration_results,
+    get_ui_bridge_exploration_status, start_ui_bridge_exploration, stop_ui_bridge_exploration,
+    ui_bridge_list_windows_handler, WindowInfo,
+};
 pub use forms::{
     ui_bridge_clipboard_read_handler, ui_bridge_clipboard_write_handler,
     ui_bridge_diff_forms_handler, ui_bridge_fill_form_handler, ui_bridge_get_forms_handler,
     ui_bridge_snapshot_forms_handler,
+};
+pub use network::{
+    ui_bridge_clear_console_errors_handler, ui_bridge_get_browser_events_handler,
+    ui_bridge_get_console_errors_handler, ui_bridge_get_network_chains_handler,
+    ui_bridge_get_network_request_handler, ui_bridge_get_network_requests_handler,
+    ui_bridge_get_network_requests_in_flight_handler, ui_bridge_get_timeline_handler,
+    ui_bridge_wait_for_network_request_handler, BrowserEventsQuery, ConsoleErrorsQuery,
+    NetworkChainsQuery, NetworkRequestsQuery, TimelineQuery,
+};
+pub use page::{
+    ui_bridge_activate_tab_handler, ui_bridge_navigate_and_wait_handler,
+    ui_bridge_page_close_request_handler, ui_bridge_page_evaluate_batch_handler,
+    ui_bridge_page_evaluate_handler, ui_bridge_page_evaluate_raw_handler,
+    ui_bridge_page_evaluate_safe_handler, ui_bridge_page_go_back_handler,
+    ui_bridge_page_go_forward_handler, ui_bridge_page_hard_refresh_handler,
+    ui_bridge_page_navigate_handler, ui_bridge_page_refresh_handler,
+    ui_bridge_page_set_tab_handler, ui_bridge_page_summary_handler,
+    ui_bridge_query_selector_handler, BatchEvaluateRequest, BatchExpression,
+    BatchExpressionResult, NavigateAndWaitRequest, PageEvaluateRequest, PageNavigateRequest,
+    QuerySelectorRequest, SetTabRequest, SetTabResponse,
 };
 pub use circuit_breaker::{CircuitBreakerState, UiBridgeCircuitBreaker};
 pub use history::{
@@ -1334,150 +1373,6 @@ pub async fn ui_bridge_get_snapshot_handler(
     }
 }
 
-/// Navigate-and-wait: execute an action, wait for the DOM to stabilize, then
-/// return a fresh snapshot.  Replaces the common 4-step manual test pattern:
-///   click → sleep → discover → snapshot
-///
-/// Request body: `{ elementId, action, params?, waitForStableMs?, timeoutMs? }`
-/// Response: the post-navigation snapshot (same shape as GET /control/snapshot).
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NavigateAndWaitRequest {
-    pub element_id: String,
-    #[serde(default = "default_nav_action")]
-    pub action: String,
-    #[serde(default)]
-    pub params: Option<serde_json::Value>,
-    /// How long (ms) the element count must be stable before we consider the
-    /// page settled.  Default: 800ms.
-    #[serde(default = "default_stable_ms")]
-    pub wait_for_stable_ms: u64,
-    /// Overall timeout (ms) for the entire operation.  Default: 8000ms.
-    #[serde(default = "default_timeout_ms")]
-    pub timeout_ms: u64,
-}
-fn default_nav_action() -> String {
-    "click".into()
-}
-fn default_stable_ms() -> u64 {
-    800
-}
-fn default_timeout_ms() -> u64 {
-    8000
-}
-
-pub async fn ui_bridge_navigate_and_wait_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(req): Json<NavigateAndWaitRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use tokio::time::{sleep, Instant};
-
-    info!(
-        "UI Bridge API: navigate-and-wait — {} on {}",
-        req.action, req.element_id
-    );
-
-    let deadline = Instant::now() + std::time::Duration::from_millis(req.timeout_ms);
-    let stable_dur = std::time::Duration::from_millis(req.wait_for_stable_ms);
-
-    // 1. Execute the action
-    let action_payload = serde_json::json!({
-        "elementId": req.element_id,
-        "action": {
-            "action": req.action,
-            "params": req.params.unwrap_or(serde_json::json!({})),
-        }
-    });
-    match ui_bridge_request_sync(&state, "execute_action", action_payload).await {
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Ok(ref data) => {
-            // The frontend SDK returns success=false inside the payload when the
-            // element doesn't exist or the action fails. Surface this as an error
-            // instead of silently proceeding to the stability-polling phase.
-            if let Some(false) = data.get("success").and_then(|v| v.as_bool()) {
-                let msg = data
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Action failed on element");
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(api_error(format!(
-                        "navigate-and-wait: action '{}' on '{}' failed: {}",
-                        req.action, req.element_id, msg
-                    ))),
-                ));
-            }
-        }
-    }
-
-    // 2. Brief initial delay for route transition / React render to start
-    sleep(std::time::Duration::from_millis(200)).await;
-
-    // 3. Poll for DOM stability: discover repeatedly, wait until element count
-    //    is unchanged for `waitForStableMs`.
-    let mut last_count: Option<usize> = None;
-    let mut stable_since = Instant::now();
-    let mut timed_out = false;
-
-    loop {
-        if Instant::now() >= deadline {
-            timed_out = true;
-            break;
-        }
-
-        let count = match ui_bridge_request_sync(
-            &state,
-            "discover",
-            serde_json::json!({"interactive_only": false}),
-        )
-        .await
-        {
-            Ok(data) => data
-                .get("elements")
-                .and_then(|e| e.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0),
-            Err(_) => 0,
-        };
-
-        match last_count {
-            Some(prev) if prev == count => {
-                if stable_since.elapsed() >= stable_dur {
-                    break; // DOM is stable
-                }
-            }
-            _ => {
-                // Count changed — reset stability timer
-                last_count = Some(count);
-                stable_since = Instant::now();
-            }
-        }
-
-        sleep(std::time::Duration::from_millis(200)).await;
-    }
-
-    // 4. Return fresh snapshot
-    let snapshot = ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await;
-
-    match snapshot {
-        Ok(mut data) => {
-            if timed_out {
-                if let Some(obj) = data.as_object_mut() {
-                    obj.insert(
-                        "navigateAndWait".to_string(),
-                        serde_json::json!({
-                            "timedOut": true,
-                            "timeoutMs": req.timeout_ms,
-                            "lastElementCount": last_count,
-                        }),
-                    );
-                }
-            }
-            Ok(Json(ApiResponse::success(data)))
-        }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
-}
 
 /// Get undo/redo state from the UI Bridge.
 pub async fn ui_bridge_get_undo_state_handler(
@@ -1525,377 +1420,6 @@ pub async fn ui_bridge_redo_handler(
 }
 
 /// Get console errors captured by the UI Bridge ConsoleCapture.
-pub async fn ui_bridge_get_console_errors_handler(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<ConsoleErrorsQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting console errors");
-
-    let payload = serde_json::json!({
-        "params": {
-            "since": query.since,
-            "limit": query.limit,
-            "group": query.group,
-            "groupBy": query.group_by
-        }
-    });
-
-    let is_grouped = query.group.unwrap_or(false);
-
-    match ui_bridge_request_sync(&state, "get_console_errors", payload).await {
-        Ok(data) => {
-            // Update the console error count for the health endpoint
-            if !is_grouped {
-                if let Some(errors) = data.get("errors").and_then(|e| e.as_array()) {
-                    state
-                        .ui_bridge_console_error_count
-                        .store(errors.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-            } else if let Some(total) = data.get("totalErrors").and_then(|t| t.as_u64()) {
-                state
-                    .ui_bridge_console_error_count
-                    .store(total, std::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(Json(ApiResponse::success(data)))
-        }
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Clear console errors captured by the UI Bridge ConsoleCapture.
-pub async fn ui_bridge_clear_console_errors_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Clearing console errors");
-
-    match ui_bridge_request_sync(&state, "clear_console_errors", serde_json::json!({})).await {
-        Ok(data) => {
-            state
-                .ui_bridge_console_error_count
-                .store(0, std::sync::atomic::Ordering::Relaxed);
-            Ok(Json(ApiResponse::success(data)))
-        }
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-// ============================================================================
-// Browser Events & Timeline Handlers
-// ============================================================================
-
-/// Query parameters for browser events endpoint
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BrowserEventsQuery {
-    #[serde(default, rename = "type")]
-    event_type: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_timestamp")]
-    since: Option<f64>,
-    #[serde(default)]
-    limit: Option<u32>,
-}
-
-/// Query parameters for timeline endpoint
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TimelineQuery {
-    #[serde(default, deserialize_with = "deserialize_timestamp")]
-    since: Option<f64>,
-    #[serde(default)]
-    limit: Option<u32>,
-}
-
-/// Query parameters for error snapshots endpoint
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ErrorSnapshotsQuery {
-    #[serde(default)]
-    limit: Option<u32>,
-}
-
-/// Query parameters for network chains endpoint
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NetworkChainsQuery {
-    #[serde(default)]
-    limit: Option<u32>,
-}
-
-/// Request body for starting an error session
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ErrorSessionStartRequest {
-    #[serde(default)]
-    label: Option<String>,
-}
-
-/// Request body for capturing/comparing an error baseline
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ErrorBaselineRequest {
-    label: String,
-}
-
-/// Get browser events captured by the UI Bridge BrowserCapture.
-pub async fn ui_bridge_get_browser_events_handler(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<BrowserEventsQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting browser events");
-
-    let payload = serde_json::json!({
-        "params": {
-            "type": query.event_type,
-            "since": query.since,
-            "limit": query.limit
-        }
-    });
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "get_browser_events", payload).await)
-}
-
-/// Get timeline events captured by the UI Bridge BrowserCapture.
-pub async fn ui_bridge_get_timeline_handler(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<TimelineQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting timeline");
-
-    let payload = serde_json::json!({
-        "params": {
-            "since": query.since,
-            "limit": query.limit
-        }
-    });
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "get_timeline", payload).await)
-}
-
-/// Get a health report from the UI Bridge BrowserCapture.
-pub async fn ui_bridge_get_health_report_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting health report");
-
-    wrap_ipc_result(
-        ui_bridge_request_sync(&state, "get_health_report", serde_json::json!({})).await,
-    )
-}
-
-/// Get network request chains from the UI Bridge BrowserCapture.
-pub async fn ui_bridge_get_network_chains_handler(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<NetworkChainsQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting network chains");
-
-    let payload = serde_json::json!({
-        "params": {
-            "limit": query.limit
-        }
-    });
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "get_network_chains", payload).await)
-}
-
-/// Get recent error snapshots from the UI Bridge BrowserCapture.
-pub async fn ui_bridge_get_error_snapshots_handler(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<ErrorSnapshotsQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting error snapshots");
-
-    let payload = serde_json::json!({
-        "params": {
-            "limit": query.limit
-        }
-    });
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "get_error_snapshots", payload).await)
-}
-
-/// Get a comprehensive error report from the UI Bridge.
-pub async fn ui_bridge_get_error_report_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting error report");
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "get_error_report", serde_json::json!({})).await)
-}
-
-// ============================================================================
-// Error Session Handlers
-// ============================================================================
-
-/// Start an error monitoring session.
-pub async fn ui_bridge_start_error_session_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<ErrorSessionStartRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Starting error session");
-
-    let payload = serde_json::json!({
-        "params": {
-            "label": body.label
-        }
-    });
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "start_error_session", payload).await)
-}
-
-/// End the active error monitoring session.
-pub async fn ui_bridge_end_error_session_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Ending error session");
-
-    wrap_ipc_result(
-        ui_bridge_request_sync(&state, "end_error_session", serde_json::json!({})).await,
-    )
-}
-
-/// Get all error sessions (completed and active).
-pub async fn ui_bridge_get_error_sessions_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting error sessions");
-
-    wrap_ipc_result(
-        ui_bridge_request_sync(&state, "get_error_sessions", serde_json::json!({})).await,
-    )
-}
-
-// ============================================================================
-// Error Baseline Handlers
-// ============================================================================
-
-/// Capture an error baseline with a given label.
-pub async fn ui_bridge_capture_error_baseline_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<ErrorBaselineRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Capturing error baseline '{}'", body.label);
-
-    let payload = serde_json::json!({
-        "params": {
-            "label": body.label
-        }
-    });
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "capture_error_baseline", payload).await)
-}
-
-/// Compare current errors against a previously captured baseline.
-pub async fn ui_bridge_compare_error_baseline_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<ErrorBaselineRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Comparing error baseline '{}'", body.label);
-
-    let payload = serde_json::json!({
-        "params": {
-            "label": body.label
-        }
-    });
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "compare_error_baseline", payload).await)
-}
-
-// ============================================================================
-// Network Request Monitoring Handlers
-// ============================================================================
-
-/// List network requests with optional filters.
-pub async fn ui_bridge_get_network_requests_handler(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<NetworkRequestsQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting network requests");
-
-    let payload = serde_json::json!({
-        "params": {
-            "status": query.status,
-            "method": query.method,
-            "urlPattern": query.url_pattern,
-            "failuresOnly": query.failures_only,
-            "since": query.since,
-            "limit": query.limit
-        }
-    });
-
-    match ui_bridge_request_sync(&state, "get_network_requests", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Get currently in-flight network requests.
-pub async fn ui_bridge_get_network_requests_in_flight_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting in-flight network requests");
-
-    match ui_bridge_request_sync(
-        &state,
-        "get_network_requests_in_flight",
-        serde_json::json!({}),
-    )
-    .await
-    {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Wait for a specific network request matching criteria.
-pub async fn ui_bridge_wait_for_network_request_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Wait for network request");
-
-    match ui_bridge_request_sync(&state, "wait_for_network_request", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Get a specific network request by ID.
-pub async fn ui_bridge_get_network_request_handler(
-    State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting network request {}", id);
-
-    match ui_bridge_request_sync(
-        &state,
-        "get_network_request",
-        serde_json::json!({ "id": id }),
-    )
-    .await
-    {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
 
 /// Get all loaded specs from the SpecStore.
 pub async fn ui_bridge_get_specs_handler(
@@ -1932,162 +1456,6 @@ pub async fn ui_bridge_get_spec_handler(
 // Page Navigation Handlers
 // ============================================================================
 
-/// Query parameters for console errors endpoint.
-/// Accepts `since` as either numeric (epoch ms) or ISO 8601 string.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConsoleErrorsQuery {
-    #[serde(default, deserialize_with = "deserialize_timestamp")]
-    since: Option<f64>,
-    #[serde(default)]
-    limit: Option<u32>,
-    #[serde(default)]
-    group: Option<bool>,
-    #[serde(default)]
-    group_by: Option<String>,
-}
-
-/// Deserialize a timestamp that can be either a number (epoch ms) or an ISO 8601 string.
-fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de;
-
-    struct TimestampVisitor;
-    impl<'de> de::Visitor<'de> for TimestampVisitor {
-        type Value = Option<f64>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a number (epoch ms) or ISO 8601 string")
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_some<D: serde::Deserializer<'de>>(
-            self,
-            deserializer: D,
-        ) -> Result<Self::Value, D::Error> {
-            deserializer.deserialize_any(TimestampInnerVisitor)
-        }
-
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-    }
-
-    struct TimestampInnerVisitor;
-    impl<'de> de::Visitor<'de> for TimestampInnerVisitor {
-        type Value = Option<f64>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a number or ISO 8601 string")
-        }
-
-        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-            Ok(Some(v))
-        }
-
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            Ok(Some(v as f64))
-        }
-
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            Ok(Some(v as f64))
-        }
-
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            // Try parsing as float first
-            if let Ok(f) = v.parse::<f64>() {
-                return Ok(Some(f));
-            }
-            // Try ISO 8601
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
-                return Ok(Some(dt.timestamp_millis() as f64));
-            }
-            // Try common ISO variants
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M:%S") {
-                return Ok(Some(dt.and_utc().timestamp_millis() as f64));
-            }
-            Err(de::Error::custom(format!(
-                "invalid timestamp: expected number (epoch ms) or ISO 8601 string, got '{}'",
-                v
-            )))
-        }
-    }
-
-    deserializer.deserialize_option(TimestampVisitor)
-}
-
-/// Query parameters for network requests endpoint
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NetworkRequestsQuery {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    method: Option<String>,
-    #[serde(default)]
-    url_pattern: Option<String>,
-    #[serde(default)]
-    failures_only: Option<bool>,
-    #[serde(default, deserialize_with = "deserialize_timestamp")]
-    since: Option<f64>,
-    #[serde(default)]
-    limit: Option<u32>,
-}
-
-/// Request for page navigation
-#[derive(Debug, Deserialize)]
-pub struct PageNavigateRequest {
-    url: String,
-}
-
-/// Request for CSS selector query
-#[derive(Debug, Deserialize)]
-pub struct QuerySelectorRequest {
-    pub selector: String,
-    /// Optional action to perform on matched element(s): "click"
-    pub action: Option<String>,
-    /// Index of the matched element to perform the action on (default: 0)
-    pub index: Option<u32>,
-}
-
-/// Request for page evaluation
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PageEvaluateRequest {
-    pub expression: String,
-    /// Optional timeout override in milliseconds (clamped to [1000, 600000]).
-    /// Default: 10s. Use for long-running async expressions like
-    /// `invoke("generate_workflow_standalone", ...)` that can take minutes.
-    #[serde(default)]
-    pub timeout_ms: Option<u64>,
-    /// When true, if the expression returns a Promise the runner awaits it
-    /// before sending the response. Mirrors Chrome DevTools'
-    /// `Runtime.evaluate.awaitPromise` contract. Default: false (keeps
-    /// existing behavior for non-async expressions). The IPC path already
-    /// awaits unconditionally; this flag governs the direct WebView fallback.
-    #[serde(default)]
-    pub await_promise: bool,
-}
-
-/// Request to evaluate multiple JS expressions in one round-trip.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BatchEvaluateRequest {
-    pub expressions: Vec<BatchExpression>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BatchExpression {
-    pub id: String,
-    pub expression: String,
-}
-
 /// Request for a structured UI assertion.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2123,574 +1491,13 @@ pub struct AssertResult {
     pub message: String,
 }
 
-/// Result of a single batch expression evaluation.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BatchExpressionResult {
-    pub id: String,
-    pub success: bool,
-    pub value: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Refresh the page.
-pub async fn ui_bridge_page_refresh_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Page refresh");
-
-    match ui_bridge_request_sync(&state, "page_refresh", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Hard refresh the page, bypassing browser cache.
-/// Uses Tauri's webview eval to clear caches and force reload.
-pub async fn ui_bridge_page_hard_refresh_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use tauri::Manager;
-    info!("UI Bridge API: Hard refresh (cache bypass)");
-
-    if let Some(window) = state
-        .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
-    {
-        // Use fetch cache-busting + location replacement to bypass browser cache.
-        // This is safer than deleting the EBWebView Cache directory.
-        let js = r#"
-            (function() {
-                // Add cache-buster to current URL and navigate
-                var url = new URL(location.href);
-                url.searchParams.set('_hrc', Date.now());
-                location.replace(url.toString());
-            })();
-        "#;
-        window.eval(js).map_err(|e| {
-            let msg = format!("Failed to hard refresh: {}", e);
-            error!("{}", msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg)))
-        })?;
-        Ok(Json(ApiResponse::success(serde_json::json!({
-            "success": true,
-            "message": "Hard refresh triggered"
-        }))))
-    } else {
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error("Main webview window not found".to_string())),
-        ))
-    }
-}
-
-/// Simulate a user clicking the window's X button.
-///
-/// Calls `WebviewWindow::close()` on the main window, which routes through
-/// Tauri's native window API and fires a proper `WindowEvent::CloseRequested`
-/// event — exactly the same path the OS's X-button click takes.
-///
-/// Needed by automation tests that want to verify the close handler's cleanup
-/// logic runs correctly. `window.close()` via `/control/page/evaluate`
-/// silently no-ops for top-level webviews (it's a browser convention that
-/// only windows opened by JS can be closed by JS), so dropping down to the
-/// native API is the only way to exercise this path through UI Bridge.
-pub async fn ui_bridge_page_close_request_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use tauri::Manager;
-    info!("UI Bridge API: Close request (simulating X-button click)");
-
-    if let Some(window) = state
-        .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
-    {
-        window.close().map_err(|e| {
-            let msg = format!("Failed to close main window: {}", e);
-            error!("{}", msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg)))
-        })?;
-        Ok(Json(ApiResponse::success(serde_json::json!({
-            "success": true,
-            "message": "Close requested; Tauri WindowEvent::CloseRequested handler should now fire"
-        }))))
-    } else {
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error("Main webview window not found".to_string())),
-        ))
-    }
-}
-
-/// Navigate to a URL.
-pub async fn ui_bridge_page_navigate_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<PageNavigateRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Page navigate to {}", request.url);
-
-    // Validate URL
-    let url = request.url.trim();
-    if url.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error("URL cannot be empty".to_string())),
-        ));
-    }
-    if url.starts_with("about:") || url.starts_with("javascript:") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(format!("Unsafe URL scheme rejected: {}", url))),
-        ));
-    }
-    if !url.starts_with('/') {
-        // Validate absolute URLs: must be http(s)://localhost or http(s)://127.0.0.1
-        // Use strict patterns that prevent authority confusion (e.g. http://localhost@evil.com)
-        let is_valid_localhost = [
-            "http://localhost/",
-            "http://localhost:",
-            "https://localhost/",
-            "https://localhost:",
-            "http://127.0.0.1/",
-            "http://127.0.0.1:",
-            "https://127.0.0.1/",
-            "https://127.0.0.1:",
-        ]
-        .iter()
-        .any(|prefix| url.starts_with(prefix))
-            || url == "http://localhost"
-            || url == "https://localhost"
-            || url == "http://127.0.0.1"
-            || url == "https://127.0.0.1";
-
-        if !is_valid_localhost {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(api_error(format!(
-                    "Only relative URLs (starting with /) or localhost URLs are allowed, got: {}",
-                    url
-                ))),
-            ));
-        }
-    }
-
-    let payload = serde_json::json!({ "url": url });
-
-    match ui_bridge_request_sync(&state, "page_navigate", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Go back in browser history.
-pub async fn ui_bridge_page_go_back_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Page go back");
-
-    match ui_bridge_request_sync(&state, "page_go_back", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Go forward in browser history.
-pub async fn ui_bridge_page_go_forward_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Page go forward");
-
-    match ui_bridge_request_sync(&state, "page_go_forward", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Query elements by CSS selector, optionally performing an action.
-pub async fn ui_bridge_query_selector_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<QuerySelectorRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Query selector '{}'", request.selector);
-
-    let payload = serde_json::json!({
-        "selector": request.selector,
-        "index": request.index,
-        "params": {
-            "action": request.action,
-        },
-    });
-
-    match ui_bridge_request_sync(&state, "query_selector", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Evaluate a JavaScript expression in the webview.
-///
-/// First attempts the IPC path (through the SDK event handlers).
-/// If IPC fails (SDK not responding, timeout), falls back to direct
-/// WebView evaluation via Tauri's window.eval() + a response callback.
-pub async fn ui_bridge_page_evaluate_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<PageEvaluateRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let timeout = request.timeout_ms.map(|ms| ms.clamp(1000, 600_000));
-    page_evaluate_inner(state, request.expression, timeout, request.await_promise).await
-}
-
-/// `POST /ui-bridge/control/page/evaluate-raw`
-///
-/// Same as `page/evaluate` but accepts the JavaScript expression as the
-/// raw request body (any content-type) instead of a JSON-wrapped string.
-/// This avoids the JSON-escape gauntlet for multi-line expressions with
-/// regex / backslashes — the test report flagged this as a real
-/// ergonomics problem (`Failed to parse the request body as JSON:
-/// invalid escape`).
-///
-/// This is an undocumented escape hatch; for normal use prefer
-/// `/page/evaluate`. Use the raw endpoint only when you want to bypass
-/// JSON decoding and send arbitrary JS source as the raw request body.
-/// The raw body is taken verbatim — the caller is responsible for any
-/// pre-escaping — so the JS-string-literal newline issue that affects
-/// `/page/evaluate` does not apply here.
-///
-/// Body: a JavaScript expression, e.g.
-/// ```text
-/// (() => document.querySelectorAll('.foo').length)()
-/// ```
-pub async fn ui_bridge_page_evaluate_raw_handler(
-    State(state): State<Arc<ApiState>>,
-    body: String,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    if body.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error("page/evaluate-raw: body is empty".to_string())),
-        ));
-    }
-    page_evaluate_inner(state, body, None, false).await
-}
-
-/// Default timeout for a tagged `/page/evaluate` call if the caller doesn't
-/// pin one explicitly. Matches the legacy IPC timeout envelope.
-const DEFAULT_PAGE_EVALUATE_TIMEOUT_MS: u64 = 10_000;
-
-/// Dispatch a page/evaluate request over the tagged
-/// `ui-bridge:evaluate-request` / `ui-bridge:evaluate-response` event pair,
-/// correlating the response through [`EvaluateRequestStore`].
-///
-/// Each call allocates its own uuid `request_id` so concurrent callers
-/// can't observe each other's results — the regression Plan item D
-/// targets. Returns the already-unwrapped frontend-side `data` object
-/// (shaped like the legacy IPC `page_evaluate` reply, i.e.
-/// `{ success: true, result: {...} }` or `{ success: false, error: "..." }`)
-/// so callers can reuse the existing success/error introspection in
-/// `page_evaluate_inner`.
-async fn tagged_page_evaluate(
-    state: &Arc<ApiState>,
-    expression: &str,
-    await_promise: bool,
-    timeout_ms: Option<u64>,
-) -> Result<serde_json::Value, String> {
-    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_PAGE_EVALUATE_TIMEOUT_MS);
-    let request_id = uuid::Uuid::new_v4().to_string();
-
-    // Reserve the pending slot *before* emitting, so a racing response can
-    // never be delivered faster than we register (same invariant the
-    // invoke proxy preserves).
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    state
-        .ui_bridge_evaluate_store
-        .register(request_id.clone(), sender)
-        .await;
-
-    let payload = serde_json::json!({
-        "request_id": request_id,
-        "expression": expression,
-        "await_promise": await_promise,
-        "timeout_ms": timeout_ms,
-    });
-
-    if let Err(e) = state
-        .app_handle
-        .emit("ui-bridge:evaluate-request", &payload)
-    {
-        state.ui_bridge_evaluate_store.cancel(&request_id).await;
-        return Err(format!("Failed to emit ui-bridge:evaluate-request: {}", e));
-    }
-
-    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), receiver).await {
-        Ok(Ok(resp)) => {
-            // Shape the return payload to match the pre-existing IPC
-            // contract expected by `page_evaluate_inner`:
-            //  - On success, the frontend's `result` object is returned
-            //    verbatim (`{ success: true, result: { value } | object }`),
-            //    so the HTTP `ApiResponse::success(data)` wrapper flows
-            //    through unchanged.
-            //  - On JS-side failure, surface `{ success: false, error: "…" }`
-            //    as `Ok(data)` — `page_evaluate_inner` pattern-matches on
-            //    `data.success == false` and returns HTTP 400 with the
-            //    error string. Returning `Err` here instead would wrongly
-            //    trigger the direct-WebView fallback for a pure JS error.
-            if resp.ok {
-                let result_value = resp.result.unwrap_or(serde_json::Value::Null);
-                let data = if result_value.is_object() {
-                    result_value
-                } else {
-                    serde_json::json!({
-                        "success": true,
-                        "result": { "value": result_value }
-                    })
-                };
-                Ok(data)
-            } else {
-                let err = resp.error.unwrap_or_else(|| {
-                    "page/evaluate: frontend reported failure without an error message".to_string()
-                });
-                Ok(serde_json::json!({
-                    "success": false,
-                    "error": err,
-                }))
-            }
-        }
-        Ok(Err(_)) => {
-            // Sender dropped — listener crashed or discarded the payload.
-            // Treat as a transport-level failure so the caller falls back
-            // to direct WebView eval (same as the legacy IPC-channel-closed
-            // branch in `ui_bridge_request_inner`).
-            state.ui_bridge_evaluate_store.cancel(&request_id).await;
-            Err(format!(
-                "page/evaluate: response channel closed before delivery (request_id={})",
-                request_id
-            ))
-        }
-        Err(_) => {
-            // Timeout is also a transport-level failure — fall back to
-            // direct WebView eval so slow renders don't bypass the runner's
-            // resilience layers.
-            state.ui_bridge_evaluate_store.cancel(&request_id).await;
-            Err(format!(
-                "UI Bridge page_evaluate timed out after {}ms",
-                timeout_ms
-            ))
-        }
-    }
-}
-
-async fn page_evaluate_inner(
-    state: Arc<ApiState>,
-    expression: String,
-    timeout_ms: Option<u64>,
-    await_promise: bool,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let preview: String = expression.chars().take(80).collect();
-    info!("UI Bridge API: Page evaluate ({}...)", preview);
-
-    // Primary IPC path: the tagged `ui-bridge:evaluate-request` / `-response`
-    // flow (Plan item D). Each call gets its own uuid request_id via the
-    // `EvaluateRequestStore`, so concurrent callers against the same runner
-    // can never interleave responses. The frontend hook
-    // (useUIBridgeEvaluateHandler) mirrors the Phase 3I invoke handler's
-    // structure but dispatches to the security-gated `new Function(...)`
-    // path used for page evaluation instead of `invoke(...)`.
-    let ipc_result = tagged_page_evaluate(&state, &expression, await_promise, timeout_ms).await;
-    match ipc_result {
-        Ok(data) => {
-            // The SDK may return a payload with `success: false` and an `error`
-            // field when the JS expression itself throws (e.g., SyntaxError).
-            // Surface that as a proper HTTP 400 instead of wrapping it in
-            // `ApiResponse::success`, which would make the outer success flag
-            // misleading.
-            if let Some(false) = data.get("success").and_then(|v| v.as_bool()) {
-                let error_msg = data
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "JS evaluation failed".to_string());
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(api_error(format!("JS evaluation error: {}", error_msg))),
-                ));
-            }
-            Ok(Json(ApiResponse::success(data)))
-        }
-        Err(ipc_err) => {
-            // IPC failed — try direct WebView evaluation as fallback
-            debug!(
-                "UI Bridge: IPC evaluate failed ({}), trying direct WebView eval",
-                ipc_err
-            );
-
-            match direct_webview_evaluate_with_result(
-                &state,
-                &expression,
-                timeout_ms,
-                await_promise,
-            )
-            .await
-            {
-                Ok(result) => Ok(Json(ApiResponse::success(serde_json::json!({
-                    "result": { "value": result },
-                    "source": "direct_eval"
-                })))),
-                Err(direct_err) => {
-                    error!(
-                        "UI Bridge API: Both IPC and direct eval failed. IPC: {}, Direct: {}",
-                        ipc_err, direct_err
-                    );
-                    Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(api_error(format!(
-                            "IPC: {}. Direct eval: {}",
-                            ipc_err, direct_err
-                        ))),
-                    ))
-                }
-            }
-        }
-    }
-}
 
 // ============================================================================
-// Safe Page Evaluate (Task 20: error capture)
+// Direct tab navigation moved to `page::routes()` — see `page.rs`.
 // ============================================================================
-
-/// POST /ui-bridge/control/page/evaluate-safe
-///
-/// Like page/evaluate but wraps the expression in try/catch so evaluation
-/// errors return as JSON responses instead of crashing the HTTP connection.
-pub async fn ui_bridge_page_evaluate_safe_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<PageEvaluateRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let preview: String = request.expression.chars().take(80).collect();
-    info!("UI Bridge API: Safe evaluate ({}...)", preview);
-
-    // `safe_evaluate` already converts JS errors to Err(String), so there's
-    // no nested `{ success: false }` to unwrap on the Ok branch — any value
-    // returned there is the user's legitimate JS return value.
-    match safe_evaluate(&state, &format!("return {}", request.expression)).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(format!("JS evaluation error: {}", e))),
-        )),
-    }
-}
-
-// ============================================================================
-// Batch Evaluate (Task 19: multiple expressions in one round-trip)
-// ============================================================================
-
-/// POST /ui-bridge/control/page/evaluate-batch
-///
-/// Evaluate multiple JS expressions in a single IPC round-trip.
-/// Each expression runs sequentially in the same JS context, preventing
-/// re-render races that occur with sequential HTTP evaluate calls.
-pub async fn ui_bridge_page_evaluate_batch_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<BatchEvaluateRequest>,
-) -> Result<Json<ApiResponse<Vec<BatchExpressionResult>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!(
-        "UI Bridge API: Batch evaluate ({} expressions)",
-        request.expressions.len()
-    );
-
-    if request.expressions.is_empty() {
-        return Ok(Json(ApiResponse::success(vec![])));
-    }
-
-    if request.expressions.len() > 50 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error("Maximum 50 expressions per batch".to_string())),
-        ));
-    }
-
-    // Build a single JS expression that evaluates all sub-expressions
-    // and returns an array of results
-    let mut js_parts = Vec::new();
-    for (i, expr) in request.expressions.iter().enumerate() {
-        js_parts.push(format!(
-            r#"(() => {{ try {{ var v = (function() {{ return {}; }})(); return {{ id: "{}", success: true, value: v === undefined ? null : v }}; }} catch(e) {{ return {{ id: "{}", success: false, error: e.message }}; }} }})()"#,
-            expr.expression,
-            expr.id.replace('"', r#"\""#),
-            expr.id.replace('"', r#"\""#),
-        ));
-    }
-
-    let combined = format!("return JSON.stringify([{}])", js_parts.join(","));
-    let payload = serde_json::json!({ "expression": format!("(() => {{ {} }})()", combined) });
-
-    match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
-        Ok(data) => {
-            // Parse the combined result array
-            let result_str = data
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("[]");
-
-            let results: Vec<BatchExpressionResult> = serde_json::from_str(result_str)
-                .unwrap_or_else(|_| {
-                    request
-                        .expressions
-                        .iter()
-                        .map(|e| BatchExpressionResult {
-                            id: e.id.clone(),
-                            success: false,
-                            value: serde_json::Value::Null,
-                            error: Some("Failed to parse batch result".to_string()),
-                        })
-                        .collect()
-                });
-
-            Ok(Json(ApiResponse::success(results)))
-        }
-        Err(e) => {
-            error!("UI Bridge API: Batch evaluate failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-// ============================================================================
-// Direct tab navigation (dispatches CustomEvent("ui-bridge-set-tab") + pageId
-// read-back). Exists alongside `navigate_tab` — which routes through the SDK
-// IPC event bus — so callers can force a tab change synchronously from HTTP
-// without depending on the SDK being responsive, and get back the resulting
-// `data-page-id` as a verification signal.
-// ============================================================================
-
-/// Valid `MainTabId` values, mirroring `src/components/app/tab-types.ts`.
-/// Kept in sync manually; the frontend's `migrateTabId()` also handles
-/// legacy aliases, so callers can pass either a canonical id or a known
-/// legacy alias — the JS callback will re-normalize through `migrateTabId`.
-const VALID_TAB_IDS: &[&str] = &[
-    "prompt-home",
-    "gui-automation",
-    "workflow-queue",
-    "active",
-    "runs",
-    "history",
+#[cfg(any())]
+const _REMOVED_TAB_LIST: &[&str] = &[
+    // Superseded block below (kept inside cfg(any()) so it never compiles).
     "error-monitor",
     "processes",
     "reflection",
@@ -2781,196 +1588,6 @@ const VALID_TAB_IDS: &[&str] = &[
     "dag-workflow-editor",
     "project-explainer",
 ];
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetTabRequest {
-    pub tab: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetTabResponse {
-    pub success: bool,
-    pub tab: String,
-    /// Value of `[data-page-id]` on the active page after the tab change
-    /// (null if no element with that attribute is present — rare but legal).
-    pub page_id: Option<String>,
-}
-
-/// POST /ui-bridge/control/page/set-tab
-///
-/// Directly dispatch `CustomEvent("ui-bridge-set-tab", { detail: { tab } })`
-/// on the webview window (handled by `useAppNavigation`'s `directHandler`),
-/// wait 100ms for React to re-render, then read back `[data-page-id]` so the
-/// caller can verify the navigation took effect.
-///
-/// This is a simpler, more direct alternative to `POST /navigate-tab`:
-/// - no IPC round-trip through the SDK event bus (works even when SDK is
-///   unresponsive), and
-/// - returns the resulting `pageId` as a verification signal, so callers
-///   don't have to follow up with a separate `page/evaluate` call.
-///
-/// Request: `{ "tab": "<MainTabId>" }`
-/// Response: `{ "success": true, "tab": "<resolved>", "pageId": "<id>" | null }`
-/// Errors: 400 if `tab` is missing or not a known `MainTabId`.
-pub async fn ui_bridge_page_set_tab_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<SetTabRequest>,
-) -> Result<Json<ApiResponse<SetTabResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let tab = request.tab.trim().to_string();
-    if tab.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(
-                "page/set-tab: `tab` is required (non-empty string)".to_string(),
-            )),
-        ));
-    }
-
-    if !VALID_TAB_IDS.contains(&tab.as_str()) {
-        let preview: Vec<&str> = VALID_TAB_IDS.iter().take(12).copied().collect();
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(format!(
-                "page/set-tab: unknown tab `{}`. Valid tabs include: {} (and {} more — see \
-                 src/components/app/tab-types.ts for the full list).",
-                tab,
-                preview.join(", "),
-                VALID_TAB_IDS.len() - preview.len()
-            ))),
-        ));
-    }
-
-    info!("UI Bridge API: page/set-tab → {}", tab);
-
-    // Dispatch the event, wait 100ms for React to re-render, then read back
-    // the active page id. We wrap everything in one async IIFE so the
-    // webview performs the whole sequence before reporting back.
-    //
-    // `JSON.stringify(...)` wraps the tab so embedded quotes can never break
-    // the generated JS; the result is JSON-serializable.
-    let escaped_tab = serde_json::to_string(&tab).unwrap_or_else(|_| "\"\"".to_string());
-    let expression = format!(
-        r#"(async () => {{
-            window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", {{ detail: {{ tab: {} }} }}));
-            await new Promise(r => setTimeout(r, 100));
-            var el = document.querySelector("[data-page-id]");
-            var pageId = el && el.getAttribute ? el.getAttribute("data-page-id") : null;
-            return JSON.stringify({{ pageId: pageId }});
-        }})()"#,
-        escaped_tab
-    );
-
-    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), false).await {
-        Ok(result_str) => {
-            // direct_webview_evaluate_with_result returns the JS-side
-            // JSON.stringify output. Parse it back out to get pageId.
-            let page_id = serde_json::from_str::<serde_json::Value>(&result_str)
-                .ok()
-                .and_then(|v| {
-                    v.get("pageId")
-                        .and_then(|p| p.as_str())
-                        .map(|s| s.to_string())
-                });
-            Ok(Json(ApiResponse::success(SetTabResponse {
-                success: true,
-                tab,
-                page_id,
-            })))
-        }
-        Err(e) => {
-            error!("UI Bridge API: page/set-tab direct eval failed: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "page/set-tab: failed to dispatch event: {}",
-                    e
-                ))),
-            ))
-        }
-    }
-}
-
-/// POST /ui-bridge/control/activate-tab/{tab_id}
-///
-/// Switch the runner's main tab via a native Tauri event. Validates
-/// `tab_id` against the known `MainTabId` list, emits
-/// `ui-bridge:activate-tab` with `{ tab_id }`, returns 200 immediately
-/// (fire-and-forget). The frontend's `useAppNavigation` hook subscribes
-/// to this event and calls `setActiveTab(tab_id)`.
-///
-/// Unlike `POST /ui-bridge/control/page/set-tab`, this endpoint:
-/// - uses a URL-path parameter for the tab id (more RESTful),
-/// - emits a Tauri-native event instead of a JS CustomEvent via
-///   `page/evaluate` (survives webview slowness), and
-/// - returns immediately without waiting for a page-id readback.
-///
-/// For `settings-*` tab ids, the sub-tab propagation is handled entirely
-/// by the existing `TabContent` routing: setting `activeTab` to e.g.
-/// `settings-web-integration` causes `TabContent` to render `<Settings
-/// defaultTab="web-integration" />`, and `Settings`'s existing
-/// `useEffect([defaultTab])` re-seeds its internal sub-tab state. No
-/// extra localStorage write or custom event is required — activating
-/// `settings-web-integration` lands on the Web Integration sub-tab on
-/// the next render.
-///
-/// Request: path parameter `tab_id` (e.g. `settings-web-integration`).
-/// Response: `{ "success": true, "tab_id": "<resolved>" }`
-/// Errors: 400 if `tab_id` is empty or not a known `MainTabId`;
-/// 500 if emitting the Tauri event fails.
-pub async fn ui_bridge_activate_tab_handler(
-    State(state): State<Arc<ApiState>>,
-    Path(tab_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let trimmed = tab_id.trim().to_string();
-    if trimmed.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(
-                "activate-tab: `tab_id` path parameter is required (non-empty string)".to_string(),
-            )),
-        ));
-    }
-
-    if !VALID_TAB_IDS.contains(&trimmed.as_str()) {
-        let preview: Vec<&str> = VALID_TAB_IDS.iter().take(12).copied().collect();
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(format!(
-                "activate-tab: unknown tab_id `{}`. Valid tab_ids include: {} (and {} more — \
-                 see src/components/app/tab-types.ts for the full list).",
-                trimmed,
-                preview.join(", "),
-                VALID_TAB_IDS.len() - preview.len()
-            ))),
-        ));
-    }
-
-    info!("UI Bridge API: activate-tab -> {}", trimmed);
-
-    state
-        .app_handle
-        .emit(
-            "ui-bridge:activate-tab",
-            serde_json::json!({ "tab_id": trimmed }),
-        )
-        .map_err(|e| {
-            error!("UI Bridge API: activate-tab emit failed: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "activate-tab: failed to emit ui-bridge:activate-tab: {}",
-                    e
-                ))),
-            )
-        })?;
-
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "success": true,
-        "tab_id": trimmed,
-    }))))
-}
 
 // ============================================================================
 // Structured Assert (Task 18: declarative assertions)
@@ -3152,420 +1769,11 @@ pub async fn ui_bridge_structured_assert_handler(
 // Exploration Handlers
 // ============================================================================
 
-/// Start UI Bridge exploration using qontinui library
-/// Returns a job_id that can be used to poll for status and results
-pub async fn start_ui_bridge_exploration(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let request: StartUIBridgeExplorationRequest = match serde_json::from_value(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(ApiResponse::error(format!(
-                    "Invalid request: {}. Required fields: connection_url (string). \
-                     Optional: target_type (\"web\"|\"desktop\"|\"mobile\", default \"web\"), \
-                     max_depth (int, default 2), max_elements_per_page (int, default 20), \
-                     max_total_elements (int, default 100), action_delay_ms (int, default 500), \
-                     blocked_keywords (string[]), safe_keywords (string[]), \
-                     blocked_selectors (string[]), capture_screenshots (bool, default false), \
-                     run_state_discovery (bool, default true). \
-                     Example: {{\"connection_url\": \"http://localhost:3001\", \"target_type\": \"web\"}}",
-                    e
-                ))),
-            ));
-        }
-    };
-    info!(
-        "MCP API: Starting UI Bridge exploration for URL: {} (type: {})",
-        request.connection_url, request.target_type
-    );
-
-    let app_state = state.app_state.clone();
-
-    // Build parameters for Python command
-    let params = serde_json::json!({
-        "target_type": request.target_type,
-        "connection_url": request.connection_url,
-        "max_depth": request.max_depth.unwrap_or(2),
-        "max_elements_per_page": request.max_elements_per_page.unwrap_or(20),
-        "max_total_elements": request.max_total_elements.unwrap_or(100),
-        "action_delay_ms": request.action_delay_ms.unwrap_or(500),
-        "blocked_keywords": request.blocked_keywords.clone().unwrap_or_default(),
-        "safe_keywords": request.safe_keywords.clone().unwrap_or_default(),
-        "blocked_selectors": request.blocked_selectors.clone().unwrap_or_default(),
-        "capture_screenshots": request.capture_screenshots.unwrap_or(false),
-        "run_state_discovery": request.run_state_discovery.unwrap_or(true),
-    });
-
-    // Short timeout since this just starts the background job
-    let timeout = std::time::Duration::from_secs(30);
-
-    let result = tokio::task::spawn_blocking(move || {
-        with_default_bridge(&app_state, |bridge| {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
-            bridge.send_command_and_wait("start_ui_bridge_exploration", Some(params), timeout)
-        })?
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(response) => {
-            if response.success {
-                info!("MCP API: UI Bridge exploration job started");
-                if let Some(data) = response.data {
-                    Ok(Json(ApiResponse::success(data)))
-                } else {
-                    Ok(Json(ApiResponse::success(serde_json::json!({
-                        "success": true
-                    }))))
-                }
-            } else {
-                let error_msg = response
-                    .error
-                    .unwrap_or_else(|| "Failed to start UI Bridge exploration".to_string());
-                error!(
-                    "MCP API: Failed to start UI Bridge exploration: {}",
-                    error_msg
-                );
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(error_msg)),
-                ))
-            }
-        }
-        Err(e) => {
-            error!("MCP API: Failed to start UI Bridge exploration: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Get UI Bridge exploration status
-pub async fn get_ui_bridge_exploration_status(
-    State(state): State<Arc<ApiState>>,
-    Query(request): Query<UIBridgeExplorationStatusRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let app_state = state.app_state.clone();
-
-    let params = serde_json::json!({
-        "job_id": request.job_id,
-    });
-
-    let timeout = std::time::Duration::from_secs(10);
-
-    let result = tokio::task::spawn_blocking(move || {
-        with_default_bridge(&app_state, |bridge| {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
-            bridge.send_command_and_wait("get_ui_bridge_exploration_status", Some(params), timeout)
-        })?
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(response) => {
-            if response.success {
-                if let Some(data) = response.data {
-                    Ok(Json(ApiResponse::success(data)))
-                } else {
-                    Ok(Json(ApiResponse::success(serde_json::json!({
-                        "status": "unknown"
-                    }))))
-                }
-            } else {
-                let error_msg = response
-                    .error
-                    .unwrap_or_else(|| "Failed to get exploration status".to_string());
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(error_msg)),
-                ))
-            }
-        }
-        Err(e) => {
-            error!("MCP API: Failed to get UI Bridge exploration status: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Get UI Bridge exploration results
-pub async fn get_ui_bridge_exploration_results(
-    State(state): State<Arc<ApiState>>,
-    Query(request): Query<UIBridgeExplorationStatusRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let app_state = state.app_state.clone();
-
-    let params = serde_json::json!({
-        "job_id": request.job_id,
-    });
-
-    let timeout = std::time::Duration::from_secs(30);
-
-    let result = tokio::task::spawn_blocking(move || {
-        with_default_bridge(&app_state, |bridge| {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
-            bridge.send_command_and_wait("get_ui_bridge_exploration_results", Some(params), timeout)
-        })?
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(response) => {
-            if response.success {
-                if let Some(data) = response.data {
-                    Ok(Json(ApiResponse::success(data)))
-                } else {
-                    Ok(Json(ApiResponse::success(serde_json::json!({
-                        "data": null
-                    }))))
-                }
-            } else {
-                let error_msg = response
-                    .error
-                    .unwrap_or_else(|| "Failed to get exploration results".to_string());
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(error_msg)),
-                ))
-            }
-        }
-        Err(e) => {
-            error!(
-                "MCP API: Failed to get UI Bridge exploration results: {}",
-                e
-            );
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Stop UI Bridge exploration
-pub async fn stop_ui_bridge_exploration(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("MCP API: Stopping UI Bridge exploration");
-
-    let app_state = state.app_state.clone();
-
-    let timeout = std::time::Duration::from_secs(10);
-
-    let result = tokio::task::spawn_blocking(move || {
-        with_default_bridge(&app_state, |bridge| {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
-            bridge.send_command_and_wait("stop_ui_bridge_exploration", None, timeout)
-        })?
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(response) => {
-            if response.success {
-                info!("MCP API: UI Bridge exploration stop requested");
-                Ok(Json(ApiResponse::success(serde_json::json!({
-                    "message": "Stop requested"
-                }))))
-            } else {
-                let error_msg = response
-                    .error
-                    .unwrap_or_else(|| "Failed to stop exploration".to_string());
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(error_msg)),
-                ))
-            }
-        }
-        Err(e) => {
-            error!("MCP API: Failed to stop UI Bridge exploration: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Discover states from render logs using co-occurrence analysis
-/// This endpoint runs state discovery on existing render logs without exploration
-pub async fn discover_states_from_renders(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<DiscoverStatesRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!(
-        "MCP API: Discovering states from {} render logs",
-        request.render_logs.len()
-    );
-
-    let app_state = state.app_state.clone();
-
-    // Build parameters for Python command
-    let params = serde_json::json!({
-        "render_logs": request.render_logs,
-    });
-
-    // Allow more time for analysis of large render logs
-    let timeout = std::time::Duration::from_secs(60);
-
-    let result = tokio::task::spawn_blocking(move || {
-        with_default_bridge(&app_state, |bridge| {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
-            bridge.send_command_and_wait("discover_states_from_renders", Some(params), timeout)
-        })?
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(response) => {
-            if response.success {
-                info!("MCP API: State discovery completed successfully");
-                if let Some(data) = response.data {
-                    Ok(Json(ApiResponse::success(data)))
-                } else {
-                    Ok(Json(ApiResponse::success(serde_json::json!({
-                        "states": [],
-                        "elements": [],
-                        "elementToRenders": {},
-                        "renderCount": 0,
-                        "uniqueElementCount": 0
-                    }))))
-                }
-            } else {
-                let error_msg = response
-                    .error
-                    .unwrap_or_else(|| "Failed to discover states from renders".to_string());
-                error!("MCP API: Failed to discover states: {}", error_msg);
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(error_msg)),
-                ))
-            }
-        }
-        Err(e) => {
-            error!("MCP API: Failed to discover states from renders: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
 
 // =============================================================================
-// Window Listing & App-Specific Screenshots (xcap)
+// App-Specific Screenshots (xcap)
+// Window listing moved to `exploration::routes()` — see `exploration.rs`.
 // =============================================================================
-
-/// Info about a capturable window
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WindowInfo {
-    id: u32,
-    title: String,
-    app_name: String,
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    is_minimized: bool,
-    is_maximized: bool,
-    is_focused: bool,
-}
-
-/// List all capturable windows using xcap.
-fn list_windows_native() -> Result<Vec<WindowInfo>, String> {
-    use xcap::Window;
-
-    let windows = Window::all().map_err(|e| format!("Failed to enumerate windows: {}", e))?;
-    let mut result = Vec::new();
-
-    for w in &windows {
-        let id = w.id().unwrap_or(0);
-        let title = w.title().unwrap_or_default();
-        let app_name = w.app_name().unwrap_or_default();
-
-        // Skip windows with no title (background/system windows)
-        if title.is_empty() {
-            continue;
-        }
-
-        result.push(WindowInfo {
-            id,
-            title,
-            app_name,
-            x: w.x().unwrap_or(0),
-            y: w.y().unwrap_or(0),
-            width: w.width().unwrap_or(0),
-            height: w.height().unwrap_or(0),
-            is_minimized: w.is_minimized().unwrap_or(false),
-            is_maximized: w.is_maximized().unwrap_or(false),
-            is_focused: w.is_focused().unwrap_or(false),
-        });
-    }
-
-    Ok(result)
-}
-
-/// GET /ui-bridge/control/windows — List all capturable windows
-pub async fn ui_bridge_list_windows_handler(
-    State(_state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<Vec<WindowInfo>>> {
-    match tokio::task::spawn_blocking(list_windows_native).await {
-        Ok(Ok(windows)) => {
-            info!("UI Bridge: Listed {} capturable windows", windows.len());
-            Json(ApiResponse::success(windows))
-        }
-        Ok(Err(e)) => {
-            error!("UI Bridge: Failed to list windows: {}", e);
-            Json(ApiResponse::error(format!("Failed to list windows: {}", e)))
-        }
-        Err(e) => {
-            error!("UI Bridge: Window list task failed: {}", e);
-            Json(ApiResponse::error(format!(
-                "Window list task failed: {}",
-                e
-            )))
-        }
-    }
-}
 
 /// Query parameters for annotated screenshot
 #[derive(Debug, Deserialize)]
@@ -4275,19 +2483,6 @@ pub async fn ui_bridge_get_keyboard_shortcuts_handler(
 // ============================================================================
 
 /// Get composite idle status.
-pub async fn ui_bridge_get_idle_status_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting idle status");
-
-    match ui_bridge_request_sync(&state, "get_idle_status", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
 
 /// Wait for an element to appear in the UI.
 ///
@@ -6281,20 +4476,6 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
 }
 
 /// Get individual idle signal status.
-pub async fn ui_bridge_get_idle_signal_handler(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Path(signal): axum::extract::Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Get idle signal '{}'", signal);
-    let payload = serde_json::json!({ "params": { "signal": signal } });
-    match ui_bridge_request_sync(&state, "get_idle_signal", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Get idle signal failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
 
 /// Wait for a specific idle signal.
 pub async fn ui_bridge_wait_for_idle_signal_handler(
@@ -7062,155 +5243,6 @@ pub async fn ui_bridge_append_render_log_handler(
 }
 
 /// Manually reset the UI Bridge circuit breaker to Closed state.
-pub async fn ui_bridge_circuit_breaker_reset_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Circuit breaker manual reset");
-    state.ui_bridge_circuit_breaker.reset().await;
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "reset": true,
-        "state": "Closed"
-    }))))
-}
-
-/// UI Bridge diagnostics endpoint.
-pub async fn ui_bridge_diagnostics_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use tauri::Manager;
-    info!("UI Bridge API: Diagnostics");
-
-    let cb_state = state.ui_bridge_circuit_breaker.get_state().await;
-    let failure_count = state.ui_bridge_circuit_breaker.get_failure_count().await;
-    let available_permits = state.ui_bridge_semaphore.available_permits();
-    let last_pong = state
-        .ui_bridge_last_pong
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let pending_count = state
-        .ui_bridge_pending_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let console_error_count = state
-        .ui_bridge_console_error_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let process_uptime_ms = state.started_at.elapsed().as_millis() as u64;
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let last_pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
-
-    // Check Tauri main window state
-    let main_window = state
-        .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label());
-    let window_exists = main_window.is_some();
-    let window_visible = main_window
-        .as_ref()
-        .and_then(|w| w.is_visible().ok())
-        .unwrap_or(false);
-    let webview_url = main_window
-        .as_ref()
-        .and_then(|w| w.url().ok())
-        .map(|u| u.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let ready = last_pong > 0;
-    let readiness_hint = if !window_exists {
-        "Main WebView window does not exist — window creation may have failed"
-    } else if !ready && process_uptime_ms < 3000 {
-        "Process just started — frontend may still be loading"
-    } else if !ready && console_error_count > 0 {
-        "Frontend never sent pong and console errors recorded — likely crashed during mount"
-    } else if !ready && !window_visible {
-        "Frontend never sent pong and main window not visible — WebView may not have rendered"
-    } else if !ready {
-        "Frontend never sent initial pong — WebView may not have loaded"
-    } else if last_pong_age_ms > 30000 {
-        "Frontend stopped responding over 30s ago — may have crashed or frozen"
-    } else {
-        "Frontend is responsive"
-    };
-
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "circuitBreaker": {
-            "state": format!("{:?}", cb_state),
-            "failuresInWindow": failure_count
-        },
-        "semaphore": {
-            "availablePermits": available_permits,
-            "maxPermits": 6
-        },
-        "frontend": {
-            "lastPongTimestamp": last_pong,
-            "lastPongAgeMs": last_pong_age_ms,
-            "ready": ready,
-            "sdkConnected": ready,
-            "consoleErrorCount": console_error_count
-        },
-        "tauriMainWindow": {
-            "exists": window_exists,
-            "visible": window_visible,
-            "webviewUrl": webview_url
-        },
-        "pendingRequestCount": pending_count,
-        "processUptimeMs": process_uptime_ms,
-        "readiness": {
-            "ready": ready,
-            "hint": readiness_hint
-        }
-    }))))
-}
-
-/// Proactive readiness check endpoint.
-/// Agents can call this before issuing real requests to check if the frontend is ready.
-pub async fn ui_bridge_readiness_handler(
-    State(state): State<Arc<ApiState>>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let diag = gather_readiness_diagnostics(&state).await;
-    let last_pong = state
-        .ui_bridge_last_pong
-        .load(std::sync::atomic::Ordering::Relaxed);
-
-    if last_pong > 0 {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let age_ms = now_ms.saturating_sub(last_pong);
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ready": true,
-                "sdk_connected": true,
-                "last_pong_age_ms": age_ms,
-                "uptime_ms": state.started_at.elapsed().as_millis() as u64,
-                "lastPongMs": last_pong
-            })),
-        )
-    } else {
-        // When the frontend is not ready and the process has been up for >30s,
-        // attach a native screenshot + boot errors so agents can diagnose the
-        // webview state without needing a separate call.
-        let uptime_ms = state.started_at.elapsed().as_millis() as u64;
-        let mut result = diag;
-        if uptime_ms >= 30_000 {
-            if let Some((screenshot, width, height)) = capture_runner_window_base64(&state).await {
-                if let Some(obj) = result.as_object_mut() {
-                    obj.insert(
-                        "diagnosticScreenshot".to_string(),
-                        serde_json::json!({
-                            "screenshot": screenshot,
-                            "width": width,
-                            "height": height,
-                        }),
-                    );
-                }
-            }
-        }
-        (StatusCode::SERVICE_UNAVAILABLE, Json(result))
-    }
-}
 
 /// Handle UI Bridge pong from frontend.
 pub async fn ui_bridge_pong_handler(
@@ -7928,49 +5960,6 @@ async fn ui_bridge_batch_handler(
 
 // Create routes for this module.
 
-// ============================================================================
-// Health signals endpoint (combined idle + stuck screen diagnosis)
-// ============================================================================
-
-/// Combined UI Bridge health signals for stall detection integration.
-#[derive(Debug, Serialize)]
-pub struct UiBridgeHealthSignals {
-    pub idle: serde_json::Value,
-    pub stuck_screen: serde_json::Value,
-}
-
-/// Get combined health signals from the UI Bridge SDK.
-///
-/// Combines idle status and stuck screen diagnosis into a single response
-/// for use by the stall detection system.
-pub async fn ui_bridge_health_signals_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<UiBridgeHealthSignals>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Fetch idle status and stuck screen diagnosis in parallel
-    let idle_future = ui_bridge_request_sync(&state, "get_idle_status", serde_json::json!({}));
-    let stuck_future = ui_bridge_request_sync(
-        &state,
-        "diagnose_stuck_screen",
-        serde_json::json!({"observationWindowMs": 2000}),
-    );
-
-    let (idle_result, stuck_result) = tokio::join!(idle_future, stuck_future);
-
-    let idle = idle_result.unwrap_or_else(|e| {
-        warn!("Failed to get idle status: {}", e);
-        serde_json::json!({"error": e})
-    });
-
-    let stuck_screen = stuck_result.unwrap_or_else(|e| {
-        warn!("Failed to diagnose stuck screen: {}", e);
-        serde_json::json!({"error": e})
-    });
-
-    Ok(Json(ApiResponse::success(UiBridgeHealthSignals {
-        idle,
-        stuck_screen,
-    })))
-}
 
 
 // =========================================================================
@@ -8278,48 +6267,6 @@ pub async fn ui_bridge_type_into_handler(
     }
 }
 
-/// Get a summary of the current page state.
-/// POST /ui-bridge/control/page/summary
-///
-/// Body is optional — callers may POST with no body at all, an empty body,
-/// or `{}`. The body is not currently read by this handler; the argument is
-/// `Option<Json<Value>>` solely so that Axum tolerates a missing or malformed
-/// body instead of returning "EOF while parsing a value".
-pub async fn ui_bridge_page_summary_handler(
-    State(state): State<Arc<ApiState>>,
-    _body: Option<Json<serde_json::Value>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let js = r#"(() => {
-        var vis = function(sel) { return Array.from(document.querySelectorAll(sel)).filter(function(el) { return el.offsetParent !== null; }); };
-        return JSON.stringify({
-            title: document.title,
-            url: document.URL,
-            headings: vis('h1, h2, h3').map(function(el) { return { tag: el.tagName, text: el.textContent.trim().slice(0, 100) }; }).slice(0, 10),
-            buttons: vis('button').filter(function(el) { return el.textContent.trim().length > 0; }).map(function(el) { return el.textContent.trim().slice(0, 40); }).filter(function(t) { return t.length < 30; }).slice(0, 20),
-            inputs: vis('input, textarea, select').map(function(el) { return { tag: el.tagName, type: el.type || null, placeholder: (el.placeholder || '').slice(0, 40) || null, hasValue: (el.value || '').length > 0 }; }).slice(0, 15),
-            links: vis('a[href]').filter(function(el) { return el.textContent.trim().length > 0; }).map(function(el) { return { text: el.textContent.trim().slice(0, 40), href: (el.getAttribute('href') || '').slice(0, 60) }; }).slice(0, 15),
-            modals: vis('[role="dialog"]').map(function(el) { return el.textContent.trim().slice(0, 100); }).slice(0, 3),
-            errors: vis('[role="alert"]').filter(function(el) { return el.textContent.trim().length > 0; }).map(function(el) { return el.textContent.trim().slice(0, 100); }).slice(0, 5),
-            elementCounts: {
-                buttons: document.querySelectorAll('button').length,
-                inputs: document.querySelectorAll('input').length,
-                textareas: document.querySelectorAll('textarea').length,
-                selects: document.querySelectorAll('select').length,
-                links: document.querySelectorAll('a').length,
-                images: document.querySelectorAll('img').length
-            }
-        });
-    })()"#;
-
-    match evaluate_js_expression(&state, js).await {
-        Ok(result) => {
-            let parsed: serde_json::Value = serde_json::from_str(&result)
-                .unwrap_or(serde_json::json!({"error": "Parse error"}));
-            Ok(Json(ApiResponse::success(parsed)))
-        }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
-}
 
 /// POST /ui-bridge/control/wait-for-element-state
 ///
@@ -8736,7 +6683,11 @@ fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(local_route_entries());
         all.extend_from_slice(bookmarks::route_entries());
         all.extend_from_slice(design::route_entries());
+        all.extend_from_slice(errors::route_entries());
+        all.extend_from_slice(exploration::route_entries());
         all.extend_from_slice(forms::route_entries());
+        all.extend_from_slice(network::route_entries());
+        all.extend_from_slice(page::route_entries());
         all
     })
 }
@@ -8764,51 +6715,19 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
         ),
         ("POST", "/ui-bridge/control/discover"),
         ("GET", "/ui-bridge/control/snapshot"),
-        ("GET", "/ui-bridge/control/windows"),
         ("GET", "/ui-bridge/control/annotated-screenshot"),
-        ("GET", "/ui-bridge/control/console-errors"),
-        ("POST", "/ui-bridge/control/console-errors/clear"),
-        ("GET", "/ui-bridge/control/browser-events"),
-        ("GET", "/ui-bridge/control/timeline"),
-        ("GET", "/ui-bridge/control/network-chains"),
-        ("GET", "/ui-bridge/control/error-snapshots"),
-        ("GET", "/ui-bridge/control/error-report"),
-        ("POST", "/ui-bridge/control/error-sessions/start"),
-        ("POST", "/ui-bridge/control/error-sessions/end"),
-        ("GET", "/ui-bridge/control/error-sessions"),
-        ("GET", "/ui-bridge/control/network-requests"),
-        ("GET", "/ui-bridge/control/network-requests/in-flight"),
-        ("POST", "/ui-bridge/control/network-requests/wait"),
-        ("GET", "/ui-bridge/control/network-request/{id}"),
         ("GET", "/ui-bridge/control/specs"),
         ("GET", "/ui-bridge/control/spec/{id}"),
-        ("POST", "/ui-bridge/control/page/refresh"),
-        ("POST", "/ui-bridge/control/page/hard-refresh"),
-        ("POST", "/ui-bridge/control/page/close-request"),
-        ("POST", "/ui-bridge/control/page/navigate"),
-        ("POST", "/ui-bridge/control/page/back"),
-        ("POST", "/ui-bridge/control/page/forward"),
-        ("POST", "/ui-bridge/control/query-selector"),
-        ("POST", "/ui-bridge/control/page/evaluate"),
-        ("POST", "/ui-bridge/control/page/evaluate-raw"),
-        ("POST", "/ui-bridge/control/page/evaluate-safe"),
-        ("POST", "/ui-bridge/control/page/evaluate-batch"),
-        ("POST", "/ui-bridge/control/page/set-tab"),
-        ("POST", "/ui-bridge/control/activate-tab/{tab_id}"),
         ("POST", "/ui-bridge/control/page/find-by-text"),
         ("POST", "/ui-bridge/control/page/click-by-text"),
         ("POST", "/ui-bridge/control/page/click-by-selector"),
         ("POST", "/ui-bridge/control/page/read-value"),
         ("POST", "/ui-bridge/control/page/type-into"),
-        ("POST", "/ui-bridge/control/page/summary"),
-        ("POST", "/ui-bridge/ai/page-summary"),
         ("POST", "/ui-bridge/control/assert"),
         ("GET", "/ui-bridge/control/keyboard-shortcuts"),
-        ("GET", "/ui-bridge/control/idle-status"),
         ("POST", "/ui-bridge/control/wait-for-navigation"),
         ("POST", "/ui-bridge/ai/wait-for-navigation"),
         ("POST", "/ui-bridge/control/wait-for-idle"),
-        ("GET", "/ui-bridge/ai/idle-status"),
         ("POST", "/ui-bridge/ai/wait-for-idle"),
         ("POST", "/ui-bridge/control/wait-for-element"),
         ("POST", "/ui-bridge/ai/wait-for-element"),
@@ -8838,16 +6757,8 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/action-plan/cache"),
         ("GET", "/ui-bridge/control/action-plan/cache/stats"),
         ("POST", "/ui-bridge/batch"),
-        ("GET", "/ui-bridge/diagnostics"),
-        ("GET", "/ui-bridge/diagnostics/readiness"),
-        ("POST", "/ui-bridge/circuit-breaker/reset"),
         ("POST", "/ui-bridge/pong"),
         ("POST", "/ui-bridge/ipc-response"),
-        ("POST", "/ui-bridge/explore"),
-        ("GET", "/ui-bridge/explore/status"),
-        ("GET", "/ui-bridge/explore/results"),
-        ("POST", "/ui-bridge/explore/stop"),
-        ("POST", "/ui-bridge/discover-states"),
         ("POST", "/ui-bridge/ai/search"),
         ("POST", "/ui-bridge/ai/find"),
         ("POST", "/ui-bridge/ai/execute"),
@@ -8856,7 +6767,6 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/ai/snapshot"),
         ("GET", "/ui-bridge/ai/summary"),
         ("GET", "/ui-bridge/capabilities"),
-        ("GET", "/ui-bridge/control/idle-status/{signal}"),
         ("POST", "/ui-bridge/control/wait-for-idle/{signal}"),
         ("POST", "/ui-bridge/control/wait-for-targets"),
         ("GET", "/ui-bridge/control/action-history"),
@@ -8916,7 +6826,6 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/intents/execute-from-query"),
         ("GET", "/ui-bridge/debug/element-tree"),
         ("POST", "/ui-bridge/debug/highlight/{id}"),
-        ("GET", "/ui-bridge/control/health-signals"),
         ("GET", "/ui-bridge/history/elements"),
         ("GET", "/ui-bridge/history/element/{id}"),
         ("GET", "/ui-bridge/history/flaky"),
@@ -8934,13 +6843,9 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/analytics/recommendations"),
         ("POST", "/ui-bridge/control/navigate-tab"),
         ("POST", "/ui-bridge/control/clear-storage"),
-        ("POST", "/ui-bridge/control/navigate-and-wait"),
-        ("GET", "/ui-bridge/control/health"),
         ("POST", "/ui-bridge/control/undo"),
         ("POST", "/ui-bridge/control/redo"),
         ("GET", "/ui-bridge/control/undo-state"),
-        ("POST", "/ui-bridge/control/error-baselines/capture"),
-        ("POST", "/ui-bridge/control/error-baselines/compare"),
         // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy
         ("GET", "/ui-bridge/commands"),
         ("POST", "/ui-bridge/invoke/{command_name}"),
@@ -9009,68 +6914,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(ui_bridge_get_snapshot_handler),
         )
         .route(
-            "/ui-bridge/control/windows",
-            get(ui_bridge_list_windows_handler),
-        )
-        .route(
             "/ui-bridge/control/annotated-screenshot",
             get(ui_bridge_annotated_screenshot_handler),
-        )
-        .route(
-            "/ui-bridge/control/console-errors",
-            get(ui_bridge_get_console_errors_handler),
-        )
-        .route(
-            "/ui-bridge/control/console-errors/clear",
-            post(ui_bridge_clear_console_errors_handler),
-        )
-        // Browser events & timeline
-        .route(
-            "/ui-bridge/control/browser-events",
-            get(ui_bridge_get_browser_events_handler),
-        )
-        .route(
-            "/ui-bridge/control/timeline",
-            get(ui_bridge_get_timeline_handler),
-        )
-        .route(
-            "/ui-bridge/control/network-chains",
-            get(ui_bridge_get_network_chains_handler),
-        )
-        .route(
-            "/ui-bridge/control/error-snapshots",
-            get(ui_bridge_get_error_snapshots_handler),
-        )
-        .route(
-            "/ui-bridge/control/error-report",
-            get(ui_bridge_get_error_report_handler),
-        )
-        // Error sessions
-        .route(
-            "/ui-bridge/control/error-sessions/start",
-            post(ui_bridge_start_error_session_handler),
-        )
-        .route(
-            "/ui-bridge/control/error-sessions/end",
-            post(ui_bridge_end_error_session_handler),
-        )
-        .route(
-            "/ui-bridge/control/error-sessions",
-            get(ui_bridge_get_error_sessions_handler),
-        )
-        // Error baselines
-        .route(
-            "/ui-bridge/control/error-baselines/capture",
-            post(ui_bridge_capture_error_baseline_handler),
-        )
-        .route(
-            "/ui-bridge/control/error-baselines/compare",
-            post(ui_bridge_compare_error_baseline_handler),
-        )
-        // Detailed health (separate from /health which is app-level)
-        .route(
-            "/ui-bridge/control/health",
-            get(ui_bridge_get_health_report_handler),
         )
         // Undo/Redo awareness
         .route(
@@ -9079,88 +6924,18 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/ui-bridge/control/undo", post(ui_bridge_undo_handler))
         .route("/ui-bridge/control/redo", post(ui_bridge_redo_handler))
-        // Navigate-and-wait composite: click + wait for stable DOM + snapshot
-        .route(
-            "/ui-bridge/control/navigate-and-wait",
-            post(ui_bridge_navigate_and_wait_handler),
-        )
         // Form state awareness, /ai/* form aliases, and clipboard live in
         // `forms::routes()` — see `forms.rs`.
         // /ai/design-audit lives in `design::routes()` — see `design.rs`.
-        // Network request monitoring
-        .route(
-            "/ui-bridge/control/network-requests",
-            get(ui_bridge_get_network_requests_handler),
-        )
-        .route(
-            "/ui-bridge/control/network-requests/in-flight",
-            get(ui_bridge_get_network_requests_in_flight_handler),
-        )
-        .route(
-            "/ui-bridge/control/network-requests/wait",
-            post(ui_bridge_wait_for_network_request_handler),
-        )
-        .route(
-            "/ui-bridge/control/network-request/{id}",
-            get(ui_bridge_get_network_request_handler),
-        )
+        // Network request monitoring, console errors, browser events, and
+        // timeline live in `network::routes()` — see `network.rs`.
         .route("/ui-bridge/control/specs", get(ui_bridge_get_specs_handler))
         .route(
             "/ui-bridge/control/spec/{id}",
             get(ui_bridge_get_spec_handler),
         )
-        .route(
-            "/ui-bridge/control/page/refresh",
-            post(ui_bridge_page_refresh_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/hard-refresh",
-            post(ui_bridge_page_hard_refresh_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/close-request",
-            post(ui_bridge_page_close_request_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/navigate",
-            post(ui_bridge_page_navigate_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/back",
-            post(ui_bridge_page_go_back_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/forward",
-            post(ui_bridge_page_go_forward_handler),
-        )
-        .route(
-            "/ui-bridge/control/query-selector",
-            post(ui_bridge_query_selector_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/evaluate",
-            post(ui_bridge_page_evaluate_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/evaluate-raw",
-            post(ui_bridge_page_evaluate_raw_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/evaluate-safe",
-            post(ui_bridge_page_evaluate_safe_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/evaluate-batch",
-            post(ui_bridge_page_evaluate_batch_handler),
-        )
-        .route(
-            "/ui-bridge/control/page/set-tab",
-            post(ui_bridge_page_set_tab_handler),
-        )
-        .route(
-            "/ui-bridge/control/activate-tab/{tab_id}",
-            post(ui_bridge_activate_tab_handler),
-        )
+        // Page navigation, evaluation, tab switching, navigate-and-wait, and
+        // page summary live in `page::routes()` — see `page.rs`.
         // Convenience DOM interaction endpoints
         .route(
             "/ui-bridge/control/page/find-by-text",
@@ -9183,15 +6958,6 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(ui_bridge_type_into_handler),
         )
         .route(
-            "/ui-bridge/control/page/summary",
-            post(ui_bridge_page_summary_handler),
-        )
-        // Aliases under /ai/ namespace
-        .route(
-            "/ui-bridge/ai/page-summary",
-            post(ui_bridge_page_summary_handler),
-        )
-        .route(
             "/ui-bridge/control/assert",
             post(ui_bridge_structured_assert_handler),
         )
@@ -9205,11 +6971,6 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/control/keyboard-shortcuts",
             get(ui_bridge_get_keyboard_shortcuts_handler),
         )
-        // Idle detection
-        .route(
-            "/ui-bridge/control/idle-status",
-            get(ui_bridge_get_idle_status_handler),
-        )
         .route(
             "/ui-bridge/control/wait-for-navigation",
             post(ui_bridge_wait_for_navigation_handler),
@@ -9222,14 +6983,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/control/wait-for-idle",
             post(ui_bridge_wait_for_idle_handler),
         )
-        // Aliases under /ui-bridge/ai/* for namespace consistency with
-        // ai/page-summary, ai/find, ai/execute, etc. Hitting ai/idle-status
-        // used to 404 silently (empty body) which misled callers into
-        // thinking the endpoint was broken.
-        .route(
-            "/ui-bridge/ai/idle-status",
-            get(ui_bridge_get_idle_status_handler),
-        )
+        // /ai/idle-status alias moved to `errors::routes()` for namespace
+        // consistency with ai/page-summary, ai/find, ai/execute, etc.
         .route(
             "/ui-bridge/ai/wait-for-idle",
             post(ui_bridge_wait_for_idle_handler),
@@ -9343,36 +7098,13 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         // Batch execution
         .route("/ui-bridge/batch", post(ui_bridge_batch_handler))
-        // Diagnostics & health
-        .route("/ui-bridge/diagnostics", get(ui_bridge_diagnostics_handler))
-        .route(
-            "/ui-bridge/diagnostics/readiness",
-            get(ui_bridge_readiness_handler),
-        )
-        .route(
-            "/ui-bridge/circuit-breaker/reset",
-            post(ui_bridge_circuit_breaker_reset_handler),
-        )
         .route("/ui-bridge/pong", post(ui_bridge_pong_handler))
         .route(
             "/ui-bridge/ipc-response",
             post(ui_bridge_ipc_response_handler),
         )
-        // Exploration
-        .route("/ui-bridge/explore", post(start_ui_bridge_exploration))
-        .route(
-            "/ui-bridge/explore/status",
-            get(get_ui_bridge_exploration_status),
-        )
-        .route(
-            "/ui-bridge/explore/results",
-            get(get_ui_bridge_exploration_results),
-        )
-        .route("/ui-bridge/explore/stop", post(stop_ui_bridge_exploration))
-        .route(
-            "/ui-bridge/discover-states",
-            post(discover_states_from_renders),
-        )
+        // Exploration + window listing live in `exploration::routes()` —
+        // see `exploration.rs`.
         // /ai/* bookmark aliases live in `bookmarks::routes()` —
         // see `bookmarks.rs`.
         .route("/ui-bridge/ai/search", post(ui_bridge_ai_search_handler))
@@ -9391,11 +7123,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/capabilities",
             get(ui_bridge_capabilities_handler),
         )
-        // Phase 4: Idle sub-signals
-        .route(
-            "/ui-bridge/control/idle-status/{signal}",
-            get(ui_bridge_get_idle_signal_handler),
-        )
+        // Phase 4: Idle sub-signal wait (get moved to errors::routes())
         .route(
             "/ui-bridge/control/wait-for-idle/{signal}",
             post(ui_bridge_wait_for_idle_signal_handler),
@@ -9632,11 +7360,6 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/debug/highlight/{id}",
             post(ui_bridge_highlight_element_handler),
         )
-        // Combined health signals for stall detection
-        .route(
-            "/ui-bridge/control/health-signals",
-            get(ui_bridge_health_signals_handler),
-        )
         // Persisted interaction history (cross-run analysis)
         .route(
             "/ui-bridge/history/elements",
@@ -9712,8 +7435,18 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(bookmarks::routes())
         // Design Review handlers (extracted to design.rs)
         .merge(design::routes())
+        // Health, error snapshots/sessions/baselines, diagnostics, idle status
+        // (extracted to errors.rs)
+        .merge(errors::routes())
         // Form state + clipboard handlers (extracted to forms.rs)
         .merge(forms::routes())
+        // Console errors, browser events, timeline, network requests
+        // (extracted to network.rs)
+        .merge(network::routes())
+        // UI Bridge exploration + window listing (extracted to exploration.rs)
+        .merge(exploration::routes())
+        // Page navigation / evaluation / tab switching (extracted to page.rs)
+        .merge(page::routes())
         // Tier 2.1 — safelisted Tauri command proxy
         .merge(crate::mcp::tauri_proxy::routes())
         // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy (HTTP → Tauri invoke round-trip)

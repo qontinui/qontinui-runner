@@ -656,3 +656,80 @@ pub(super) fn compute_snapshot_diff(
         "postCount": post_ids.len(),
     })
 }
+
+/// Deserialize a timestamp that can be either a number (epoch ms) or an ISO 8601 string.
+///
+/// Used by Query types across `errors.rs` and `network.rs`
+/// (`since` field on console errors, browser events, timeline, network requests).
+pub(super) fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct TimestampVisitor;
+    impl<'de> de::Visitor<'de> for TimestampVisitor {
+        type Value = Option<f64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a number (epoch ms) or ISO 8601 string")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(TimestampInnerVisitor)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    struct TimestampInnerVisitor;
+    impl<'de> de::Visitor<'de> for TimestampInnerVisitor {
+        type Value = Option<f64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a number or ISO 8601 string")
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            // Try parsing as float first
+            if let Ok(f) = v.parse::<f64>() {
+                return Ok(Some(f));
+            }
+            // Try ISO 8601
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
+                return Ok(Some(dt.timestamp_millis() as f64));
+            }
+            // Try common ISO variants
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M:%S") {
+                return Ok(Some(dt.and_utc().timestamp_millis() as f64));
+            }
+            Err(de::Error::custom(format!(
+                "invalid timestamp: expected number (epoch ms) or ISO 8601 string, got '{}'",
+                v
+            )))
+        }
+    }
+
+    deserializer.deserialize_option(TimestampVisitor)
+}
