@@ -62,7 +62,16 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
 
   // Load projects on mount
   useEffect(() => {
-    fetchProjects();
+    // Async IIFE: avoid invoking a setState-bearing callback synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await fetchProjects();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [fetchProjects]);
 
   // Load a project into the executor

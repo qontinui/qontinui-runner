@@ -104,7 +104,13 @@ export function PromptSnippetBuilderTab({
   }, [onLog]);
 
   useEffect(() => {
-    fetchPromptSnippets();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchPromptSnippets();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchPromptSnippets]);
 
   // Delete selected prompt snippets
@@ -140,14 +146,20 @@ export function PromptSnippetBuilderTab({
     setFormTags(snippet.tags.join(", "));
   };
 
-  // Load prompt snippet for editing
+  // Load prompt snippet for editing. Deferred into a microtask so the
+  // synchronous selectSnippet() setState calls don't cascade from the
+  // effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (editPromptSnippetId && promptSnippets.length > 0) {
-      const snippet = promptSnippets.find((s) => s.id === editPromptSnippetId);
-      if (snippet) {
-        selectSnippet(snippet);
-      }
-    }
+    if (!editPromptSnippetId || promptSnippets.length === 0) return;
+    const snippet = promptSnippets.find((s) => s.id === editPromptSnippetId);
+    if (!snippet) return;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) selectSnippet(snippet);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [editPromptSnippetId, promptSnippets]);
 
   // Start creating a new prompt snippet
