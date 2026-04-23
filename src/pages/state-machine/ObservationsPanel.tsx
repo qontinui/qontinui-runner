@@ -179,8 +179,17 @@ export function ObservationsPanel({ specId, showToast }: ObservationsPanelProps)
   }, [buildQuery]);
 
   useEffect(() => {
-    void loadDrift();
-    void loadInvalidations();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside loadDrift/loadInvalidations.
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      void loadDrift();
+      void loadInvalidations();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadDrift, loadInvalidations]);
 
   // --------------------------------------------------------------------
