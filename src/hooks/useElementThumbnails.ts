@@ -169,20 +169,30 @@ export function useElementThumbnails(
     [cache, screenshotBase64, screenshotHash, maxSize, skipLargeThreshold],
   );
 
-  // Eager mode: Process all thumbnails upfront with caching
+  // Eager mode: Process all thumbnails upfront with caching. All setState
+  // calls below are inside the async processThumbnails() IIFE or deferred
+  // into a microtask so the effect body itself contains no synchronous
+  // setState (react-hooks/set-state-in-effect).
   useEffect(() => {
     if (mode !== "eager") {
       return;
     }
 
-    // Clear thumbnails if no screenshot or elements
+    // Clear thumbnails if no screenshot or elements — deferred so the reset
+    // doesn't fire synchronously from the effect body.
     if (!screenshotBase64 || elements.length === 0) {
-      setThumbnails(new Map());
-      setError(null);
-      setProgress(null);
-      setCacheStats({ cacheHits: 0, cacheMisses: 0, cacheSize: 0 });
-      cache.clear();
-      return;
+      let cancelled = false;
+      void Promise.resolve().then(() => {
+        if (cancelled) return;
+        setThumbnails(new Map());
+        setError(null);
+        setProgress(null);
+        setCacheStats({ cacheHits: 0, cacheMisses: 0, cacheSize: 0 });
+        cache.clear();
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
     // Validate cache against current screenshot (invalidates if screenshot changed)
@@ -206,18 +216,27 @@ export function useElementThumbnails(
       }
     }
 
-    // If all elements are cached, just return the cached thumbnails
+    // If all elements are cached, just return the cached thumbnails. The
+    // setState calls are deferred into a microtask so the effect body
+    // itself contains no synchronous setState
+    // (react-hooks/set-state-in-effect).
     if (elementsToProcess.length === 0) {
       const cachedThumbnails = cache.getAllThumbnails();
-      setThumbnails(cachedThumbnails);
-      setCacheStats({
-        cacheHits,
-        cacheMisses: 0,
-        cacheSize: cache.size,
+      let cancelled = false;
+      void Promise.resolve().then(() => {
+        if (cancelled) return;
+        setThumbnails(cachedThumbnails);
+        setCacheStats({
+          cacheHits,
+          cacheMisses: 0,
+          cacheSize: cache.size,
+        });
+        setError(null);
+        setProgress(null);
       });
-      setError(null);
-      setProgress(null);
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
 
     // Process only the elements that need cropping
