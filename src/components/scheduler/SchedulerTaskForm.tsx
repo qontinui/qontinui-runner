@@ -180,14 +180,16 @@ export function SchedulerTaskForm({
     initConditions?.timeoutMinutes ?? undefined,
   );
 
-  // Auto-enable conditions when Condition schedule type is selected
-  useEffect(() => {
-    if (scheduleType === "condition") {
-      if (!requireIdle && !requireRepoInactive) {
-        setRequireIdle(true);
-      }
+  // Auto-enable conditions when Condition schedule type is selected.
+  // Detect the transition during render so the setState is inline (allowed
+  // pattern) instead of via a post-render effect (set-state-in-effect).
+  const [prevScheduleType, setPrevScheduleType] = useState(scheduleType);
+  if (prevScheduleType !== scheduleType) {
+    setPrevScheduleType(scheduleType);
+    if (scheduleType === "condition" && !requireIdle && !requireRepoInactive) {
+      setRequireIdle(true);
     }
-  }, [scheduleType]); // eslint-disable-line react-hooks/exhaustive-deps
+  }
 
   // Unified workflows from API
   const [unifiedWorkflows, setUnifiedWorkflows] = useState<UnifiedWorkflow[]>([]);
