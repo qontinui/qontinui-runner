@@ -52,7 +52,6 @@ export function useWorkflowRefData(): WorkflowRefData {
   const [isLoading, setIsLoading] = useState(true);
   const [error, _setError] = useState<string | null>(null);
   const [startTime, setStartTime] = useState<number | null>(null);
-  const [elapsedTime, setElapsedTime] = useState(0);
 
   // Fetch workflow ref executions
   const fetchWorkflows = useCallback(async () => {
@@ -102,29 +101,40 @@ export function useWorkflowRefData(): WorkflowRefData {
     }
   }, [startTime]);
 
-  // Initial fetch and polling
+  // Initial fetch and polling. Wrap fetchWorkflows in async IIFE so its
+  // synchronous setIsLoading(false) / setWorkflows isn't the first statement
+  // reached from the effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    fetchWorkflows();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await fetchWorkflows();
+    })();
     const interval = setInterval(fetchWorkflows, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchWorkflows]);
 
-  // Update elapsed time
+  // Update elapsed time. The no-startTime branch returns without setState;
+  // we derive 0 via `elapsedTime` below instead of resetting state in the
+  // effect (Recipe 1: reset-on-invalid-deps).
+  const [rawElapsed, setRawElapsed] = useState(0);
   useEffect(() => {
-    if (!startTime) {
-      setElapsedTime(0);
-      return;
-    }
+    if (!startTime) return;
 
     const updateElapsed = () => {
       const now = Date.now();
-      setElapsedTime(Math.floor((now - startTime) / 1000));
+      setRawElapsed(Math.floor((now - startTime) / 1000));
     };
 
     updateElapsed();
     const interval = setInterval(updateElapsed, 1000);
     return () => clearInterval(interval);
   }, [startTime]);
+
+  const elapsedTime = startTime ? rawElapsed : 0;
 
   // Get currently running workflow
   const currentWorkflow = useMemo(() => {
