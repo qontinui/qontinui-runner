@@ -83,10 +83,12 @@ export function useRenderPerformance(
   const { componentName, enabled = import.meta.env.DEV, logToConsole = false } = options;
 
   const [metrics, setMetrics] = useState<RenderMetrics | null>(null);
+  const [renderStats, setRenderStats] = useState<{
+    renderCount: number;
+    totalRenderTime: number;
+    lastRenderTime: number;
+  }>({ renderCount: 0, totalRenderTime: 0, lastRenderTime: 0 });
   const dataChangeTimeRef = useRef<number | null>(null);
-  const renderCountRef = useRef(0);
-  const totalRenderTimeRef = useRef(0);
-  const lastRenderTimeRef = useRef(0);
 
   // Update local state from performance monitor
   useEffect(() => {
@@ -115,9 +117,11 @@ export function useRenderPerformance(
     ) => {
       if (!enabled) return;
 
-      renderCountRef.current++;
-      totalRenderTimeRef.current += actualDuration;
-      lastRenderTimeRef.current = actualDuration;
+      setRenderStats((prev) => ({
+        renderCount: prev.renderCount + 1,
+        totalRenderTime: prev.totalRenderTime + actualDuration,
+        lastRenderTime: actualDuration,
+      }));
 
       // Record in performance monitor
       getPerformanceMonitor().recordRender(componentName, actualDuration);
@@ -171,10 +175,10 @@ export function useRenderPerformance(
   return {
     ProfilerWrapper,
     metrics,
-    renderCount: renderCountRef.current,
+    renderCount: renderStats.renderCount,
     averageRenderTime:
-      renderCountRef.current > 0 ? totalRenderTimeRef.current / renderCountRef.current : 0,
-    lastRenderTime: lastRenderTimeRef.current,
+      renderStats.renderCount > 0 ? renderStats.totalRenderTime / renderStats.renderCount : 0,
+    lastRenderTime: renderStats.lastRenderTime,
     markDataChange,
     getTimeSinceDataChange,
   };
