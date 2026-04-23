@@ -74,13 +74,24 @@ export function useWorkflowLibrary(
   }, []);
 
   useEffect(() => {
-    fetchWorkflows();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchWorkflows();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchWorkflows]);
 
   useEffect(() => {
-    if (!isSaving && currentWorkflowId) {
-      fetchWorkflows();
-    }
+    if (isSaving || !currentWorkflowId) return;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchWorkflows();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [isSaving, currentWorkflowId, fetchWorkflows]);
 
   const toggleFavorite = useCallback(async (workflowId: string) => {
