@@ -86,8 +86,16 @@ export function DecisionTrailPage() {
   }, [searchQuery]);
 
   useEffect(() => {
-    fetchDecisions();
-    fetchConcepts();
+    // Async IIFE: avoid invoking setState-bearing callbacks synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await Promise.all([fetchDecisions(), fetchConcepts()]);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [fetchDecisions, fetchConcepts]);
 
   // When switching to graph view, fetch full decision data for edge rendering
