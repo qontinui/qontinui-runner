@@ -93,9 +93,15 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
   };
 
   useEffect(() => {
-    loadSettings();
-
-    loadDeviceInfo();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      void loadSettings();
+      void loadDeviceInfo();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
