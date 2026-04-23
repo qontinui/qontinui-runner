@@ -221,7 +221,22 @@ interface DiffViewProps {
 }
 
 function UnifiedDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
-  let lineNumber = 0;
+  // Precompute starting line number for each part (before render) so we don't
+  // have to mutate a counter while rendering.
+  const partStartLineNumbers: number[] = [];
+  {
+    let running = 0;
+    for (const part of diffResult) {
+      partStartLineNumbers.push(running);
+      const partLines = part.value.split("\n");
+      if (partLines[partLines.length - 1] === "") {
+        partLines.pop();
+      }
+      if (!part.removed) {
+        running += partLines.length;
+      }
+    }
+  }
 
   return (
     <div className="font-mono text-sm">
@@ -241,7 +256,6 @@ function UnifiedDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
               ...lines.slice(-3),
             ];
 
-            lineNumber += lines.length;
             return (
               <div key={partIndex} className="text-muted-foreground">
                 {contextLines.map((line, i) => (
@@ -257,12 +271,12 @@ function UnifiedDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
           }
         }
 
+        const partStart = partStartLineNumbers[partIndex] ?? 0;
+
         return (
           <div key={partIndex}>
             {lines.map((line, lineIndex) => {
-              if (!part.removed) {
-                lineNumber++;
-              }
+              const lineNumber = part.removed ? 0 : partStart + lineIndex + 1;
 
               const bgClass = part.added ? "bg-green-900/30" : part.removed ? "bg-red-900/30" : "";
 
