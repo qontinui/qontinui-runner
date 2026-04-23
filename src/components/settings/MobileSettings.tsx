@@ -81,9 +81,15 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
   };
 
   useEffect(() => {
-    loadSettings();
-
-    refreshDevices();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      void loadSettings();
+      void refreshDevices();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
