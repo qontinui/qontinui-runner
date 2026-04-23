@@ -588,10 +588,15 @@ export function NaturalLanguagePanel({
   const [showSuggestions, setShowSuggestions] = useState(true);
   const [showHistory, setShowHistory] = useState(false);
 
-  // Persisted element descriptions for enhanced matching
-  const [descriptions, setDescriptions] = useState<Map<string, PersistedElementDescription>>(
-    new Map(),
-  );
+  // Persisted element descriptions for enhanced matching. We key the loaded
+  // map by the page URL it came from, so the "reset when URL becomes null"
+  // branch can be expressed as a pure derivation below — no setState in the
+  // effect body for the invalid-deps case (react-hooks/set-state-in-effect).
+  const EMPTY_DESCRIPTIONS: Map<string, PersistedElementDescription> = new Map();
+  const [loadedDescriptions, setLoadedDescriptions] = useState<{
+    url: string | null;
+    map: Map<string, PersistedElementDescription>;
+  }>({ url: null, map: EMPTY_DESCRIPTIONS });
   const loadedPageRef = useRef<string | null>(null);
 
   // Command history
@@ -621,12 +626,12 @@ export function NaturalLanguagePanel({
     instanceStorage.setItem("nlp-ai-matching-enabled", String(aiMatchingEnabled));
   }, [aiMatchingEnabled]);
 
-  // Load persisted descriptions when page context changes
+  // Load persisted descriptions when page context changes. The invalid-deps
+  // branch returns without setState; `descriptions` below derives empty when
+  // pageContext.url is missing (Recipe 1: reset-on-invalid-deps).
   useEffect(() => {
     if (!pageContext?.url) {
       loadedPageRef.current = null;
-
-      setDescriptions(new Map());
       return;
     }
 
@@ -636,9 +641,16 @@ export function NaturalLanguagePanel({
 
     loadedPageRef.current = pageContext.url;
     const loaded = ElementDescriptionService.loadDescriptions(pageContext.url);
-    setDescriptions(loaded);
+    setLoadedDescriptions({ url: pageContext.url, map: loaded });
     logger.debug(`Loaded ${loaded.size} descriptions for enhanced matching`);
   }, [pageContext?.url]);
+
+  // Derived descriptions: only use the loaded map if it matches the current
+  // page URL; otherwise treat as empty.
+  const descriptions: Map<string, PersistedElementDescription> =
+    pageContext?.url && loadedDescriptions.url === pageContext.url
+      ? loadedDescriptions.map
+      : EMPTY_DESCRIPTIONS;
 
   // Save command history to instanceStorage
   useEffect(() => {
@@ -685,12 +697,9 @@ export function NaturalLanguagePanel({
     prevElementsRef.current = elements;
   }, [elements]);
 
-  // Collapse suggestions when user starts typing their own query
-  useEffect(() => {
-    if (input.trim().length > 0) {
-      setShowSuggestions(false);
-    }
-  }, [input]);
+  // Collapse-when-typing is handled inline by the textarea's onChange below
+  // (no useEffect), to avoid a setState synchronously in an effect body
+  // (react-hooks/set-state-in-effect).
 
   // Handle clicking a suggestion
   const handleSuggestionClick = useCallback(
@@ -998,7 +1007,10 @@ export function NaturalLanguagePanel({
             <MessageSquare className="absolute left-2.5 top-3 w-4 h-4 text-muted-foreground" />
             <textarea
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value);
+                if (e.target.value.trim().length > 0) setShowSuggestions(false);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
