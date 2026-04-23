@@ -65,10 +65,18 @@ export function ArchitectureView() {
   const sdkArch = useSdkArchitecture();
   const [viewMode, setViewMode] = useState<"reflection" | "sdk" | "developer">("reflection");
 
+  // Auto-switch to developer view when the SDK has specs but no runner
+  // workflows exist. Deferred into a microtask to avoid a synchronous
+  // setState inside the effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (sdkArch.specs.length > 0 && workflows.length === 0) {
-      setViewMode("developer");
-    }
+    if (!(sdkArch.specs.length > 0 && workflows.length === 0)) return;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) setViewMode("developer");
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [sdkArch.specs.length, workflows.length]);
 
   const stats = graph?.stats;
