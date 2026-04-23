@@ -1040,6 +1040,38 @@ pub struct Settings {
     /// controls headless-window behavior).
     #[serde(default)]
     pub web_integration: WebIntegrationSettings,
+    /// User-curated list of projects. Populated primarily from the setup
+    /// wizard's project-picker step and surfaced to other UI (e.g. the UI
+    /// Bridge Integration panel) as a dropdown of known project paths.
+    /// Back-compat: missing key in an existing settings.json loads as empty.
+    #[serde(default)]
+    pub saved_projects: Vec<SavedProject>,
+}
+
+// ============================================================================
+// Saved Projects (user-curated project registry)
+// ============================================================================
+
+/// A project the user has told the runner about (typically via the setup
+/// wizard's project picker). Persisted to `settings.json` under the
+/// `saved_projects` key.
+///
+/// Serialized as camelCase on the wire so JS/TS consumers (wizard, UI Bridge
+/// Integration panel) can bind directly. The struct is deliberately loose —
+/// `project_type` is a free-form string so new frameworks do not require a
+/// schema change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedProject {
+    /// Absolute path to the project root.
+    pub path: String,
+    /// Human-friendly display name (usually the directory basename).
+    pub name: String,
+    /// Framework/language tag, e.g. "react", "python", "rust", "node".
+    /// Kept loose (String) so future frameworks need no schema change.
+    pub project_type: String,
+    /// Manifest file that identified the project (e.g. "package.json").
+    pub manifest: String,
 }
 
 // ============================================================================
@@ -1700,4 +1732,23 @@ pub fn get_otel_settings() -> crate::otel::OtelConfig {
 /// Note: OTel cannot be hot-reloaded; changes take effect on next runner restart.
 pub fn save_otel_settings(config: crate::otel::OtelConfig) -> Result<(), String> {
     crate::config_facade::save_setting(config)
+}
+
+// ============================================================================
+// Saved Projects accessors
+// ============================================================================
+
+/// Get the user-curated saved project list.
+/// Returns an empty `Vec` on first-run (no entry yet in `settings.json`).
+pub fn get_saved_projects() -> Vec<SavedProject> {
+    load_settings().saved_projects
+}
+
+/// Replace the saved-projects list atomically. Used by the wizard when the
+/// user commits their project selection, and by the `saved_projects`
+/// Tauri-command module.
+pub fn save_saved_projects(projects: Vec<SavedProject>) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.saved_projects = projects;
+    save_settings(&settings)
 }
