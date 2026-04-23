@@ -427,9 +427,17 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   }, []);
 
   useEffect(() => {
-    fetchFileLocks();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside fetchFileLocks.
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchFileLocks();
+    });
     const interval = setInterval(fetchFileLocks, 10_000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchFileLocks]);
 
   // ── Detect external Claude processes (every 30s) ────────────────────────────
@@ -447,9 +455,17 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   }, []);
 
   useEffect(() => {
-    fetchExternalProcesses();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside fetchExternalProcesses.
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchExternalProcesses();
+    });
     const interval = setInterval(fetchExternalProcesses, 30 * 1000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchExternalProcesses]);
 
   // ── Live "now" tick for time-based status thresholds ───────────────────────
