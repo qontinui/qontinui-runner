@@ -240,9 +240,18 @@ export function DocFinderModal({ onSelect, onClose, defaultRoot }: DocFinderModa
     }
   }, []);
 
-  // Scan on mount and root change
+  // Scan on mount and root change. Async IIFE to avoid invoking a
+  // setState-bearing callback synchronously in the effect body
+  // (set-state-in-effect).
   useEffect(() => {
-    runScan(root);
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await runScan(root);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [root, runScan]);
 
   // Fuzzy-filtered search results
