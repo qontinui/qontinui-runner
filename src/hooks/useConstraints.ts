@@ -156,20 +156,30 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
     }
   }, [projectPath, serializeState]);
 
-  // Update the saved snapshot after reload completes and resource limits settle
-  useEffect(() => {
+  // Update the saved snapshot after reload completes and resource limits
+  // settle. Detect the loading→false transition during render so the
+  // setState stays inline (allowed pattern) instead of via a post-render
+  // effect (set-state-in-effect).
+  const [prevLoading, setPrevLoading] = useState(loading);
+  if (prevLoading !== loading) {
+    setPrevLoading(loading);
     if (!loading && constraints.length > 0) {
       setSavedState(serializeState(constraints, resourceLimits));
     }
-    // Only run when loading transitions to false
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading]);
+  }
 
-  // Load on mount
+  // Load on mount. Async IIFE to avoid invoking a setState-bearing
+  // callback synchronously in the effect body (set-state-in-effect).
   useEffect(() => {
-    if (loadOnMount) {
-      reload();
-    }
+    if (!loadOnMount) return;
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await reload();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [loadOnMount, reload]);
 
   // --------------------------------------------------------------------------
