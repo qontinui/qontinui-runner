@@ -83,11 +83,6 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
   // Env var testing state
   const [envVarStatus, setEnvVarStatus] = useState<Record<string, boolean | null>>({});
 
-  useEffect(() => {
-    loadSettings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -124,6 +119,11 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const saveSettings = async () => {
     try {
