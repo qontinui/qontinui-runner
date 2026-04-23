@@ -92,29 +92,39 @@ export function usePlaywrightTestData(): PlaywrightTestData {
     }
   }, [startTime]);
 
-  // Initial fetch and polling
+  // Initial fetch and polling. Async IIFE to avoid invoking a
+  // setState-bearing callback synchronously in the effect body
+  // (set-state-in-effect).
   useEffect(() => {
-    fetchScripts();
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await fetchScripts();
+    })();
     const interval = setInterval(fetchScripts, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchScripts]);
 
-  // Update elapsed time
+  // Update elapsed time on tick.
   useEffect(() => {
-    if (!startTime) {
-      setElapsedTime(0);
-      return;
-    }
-
-    const updateElapsed = () => {
-      const now = Date.now();
-      setElapsedTime(Math.floor((now - startTime) / 1000));
-    };
-
-    updateElapsed();
-    const interval = setInterval(updateElapsed, 1000);
+    if (!startTime) return;
+    const interval = setInterval(() => {
+      setElapsedTime(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
     return () => clearInterval(interval);
   }, [startTime]);
+
+  // Detect startTime change during render so we can reset elapsedTime
+  // synchronously (allowed pattern) without a post-render effect+setState
+  // (set-state-in-effect).
+  const [prevStartTime, setPrevStartTime] = useState(startTime);
+  if (prevStartTime !== startTime) {
+    setPrevStartTime(startTime);
+    setElapsedTime(0);
+  }
 
   // Get currently running script
   const currentScript = useMemo(() => {

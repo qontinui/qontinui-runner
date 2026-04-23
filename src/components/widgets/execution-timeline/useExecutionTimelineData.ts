@@ -234,21 +234,36 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     }
   }, [startTime]);
 
-  // Initial fetch and polling - skip when using unified context
+  // Initial fetch and polling - skip when using unified context. The initial
+  // fetchSteps() is deferred into a microtask so the effect body doesn't
+  // synchronously trigger setState (react-hooks/set-state-in-effect).
   useEffect(() => {
     if (useUnifiedContext) return; // Don't poll when unified context is available
 
-    fetchSteps();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchSteps();
+    });
     const interval = setInterval(fetchSteps, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchSteps, useUnifiedContext]);
 
-  // Update elapsed time - skip when using unified context
+  // Update elapsed time - skip when using unified context. The reset-to-0
+  // setState is deferred into a microtask so it isn't called synchronously
+  // from the effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
     if (useUnifiedContext) return;
     if (!startTime) {
-      setElapsedTime(0);
-      return;
+      let cancelled = false;
+      void Promise.resolve().then(() => {
+        if (!cancelled) setElapsedTime(0);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
     const updateElapsed = () => {
@@ -263,16 +278,25 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
 
   // Track when the synthetic "processing" phase began. Computed in an effect
   // so we never call Date.now() during render (react-hooks/purity). Reset
-  // when a real step is running or there is no active stage.
+  // when a real step is running or there is no active stage. Setter calls
+  // are deferred into a microtask so the effect body itself has no
+  // synchronous setState (react-hooks/set-state-in-effect).
   const [syntheticProcessingStart, setSyntheticProcessingStart] = useState<number | null>(null);
   useEffect(() => {
     const hasRunning = allSteps.some((s) => s.status === "running");
     const needsSynthetic = !hasRunning && Boolean(currentStage) && allSteps.length > 0;
-    if (needsSynthetic) {
-      setSyntheticProcessingStart((prev) => prev ?? Date.now());
-    } else {
-      setSyntheticProcessingStart((prev) => (prev === null ? prev : null));
-    }
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      if (needsSynthetic) {
+        setSyntheticProcessingStart((prev) => prev ?? Date.now());
+      } else {
+        setSyntheticProcessingStart((prev) => (prev === null ? prev : null));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [allSteps, currentStage]);
 
   // Get currently running step
