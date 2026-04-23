@@ -54,44 +54,46 @@ impl LanTransport {
                     reason: format!("invalid JSON: {}", e),
                 })?;
 
+        // UI Bridge Native wraps every response in `{ success, data, timestamp }`, so the
+        // metadata block lives at `data.uiBridge`. Fall back to the top level for any caller
+        // that emits flat, and accept the device even when the block is missing entirely —
+        // every field below already has a sensible port/IP-based default.
         let ui_bridge = body
-            .get("uiBridge")
-            .ok_or_else(|| TransportError::HealthCheckFailed {
-                address: address.to_string(),
-                reason: "response missing 'uiBridge' field".to_string(),
-            })?;
+            .get("data")
+            .and_then(|d| d.get("uiBridge"))
+            .or_else(|| body.get("uiBridge"));
 
         let now = chrono::Utc::now().timestamp_millis();
 
         Ok(DiscoveredApp {
             app_id: ui_bridge
-                .get("appId")
+                .and_then(|u| u.get("appId"))
                 .and_then(|v| v.as_str())
-                .unwrap_or(&format!("lan-{}", address.port()))
-                .to_string(),
+                .map(String::from)
+                .unwrap_or_else(|| format!("lan-{}", address.port())),
             app_name: ui_bridge
-                .get("appName")
+                .and_then(|u| u.get("appName"))
                 .and_then(|v| v.as_str())
-                .unwrap_or(&format!("Device at {}", address.ip()))
-                .to_string(),
+                .map(String::from)
+                .unwrap_or_else(|| format!("Device at {}", address.ip())),
             app_type: ui_bridge
-                .get("appType")
+                .and_then(|u| u.get("appType"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("mobile")
                 .to_string(),
             framework: ui_bridge
-                .get("framework")
+                .and_then(|u| u.get("framework"))
                 .and_then(|v| v.as_str())
                 .map(String::from),
             url: format!("http://{}", address),
             port: address.port(),
             base_path: "/ui-bridge".to_string(),
             version: ui_bridge
-                .get("version")
+                .and_then(|u| u.get("version"))
                 .and_then(|v| v.as_str())
                 .map(String::from),
             capabilities: ui_bridge
-                .get("capabilities")
+                .and_then(|u| u.get("capabilities"))
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()

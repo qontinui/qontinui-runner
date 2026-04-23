@@ -497,9 +497,9 @@ impl ClaudeSession {
                         // inside a multi-threaded runtime, which this std::thread
                         // is not.
                         let pg = crate::database::pg::PgDb::global();
-                        let rt = finding_rt_handle.as_ref().expect(
-                            "pg_available gated on finding_rt_handle.is_some()",
-                        );
+                        let rt = finding_rt_handle
+                            .as_ref()
+                            .expect("pg_available gated on finding_rt_handle.is_some()");
                         let insert_result = rt.block_on(async {
                             pg.insert_parsed_finding(
                                 &ctx.task_run_id,

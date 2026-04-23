@@ -99,8 +99,7 @@ fn local_client() -> &'static reqwest::blocking::Client {
 /// keyed on the token prefix of the full prompt).
 pub(super) fn build_gemma_prompt(system_prefix: &str, user_message: &str) -> String {
     // Keep the concatenation cheap: one allocation, no Vec<String>.
-    let mut out =
-        String::with_capacity(system_prefix.len() + user_message.len() + 32);
+    let mut out = String::with_capacity(system_prefix.len() + user_message.len() + 32);
     out.push_str("<user|>");
     if !system_prefix.is_empty() {
         out.push_str(system_prefix);
@@ -295,9 +294,11 @@ pub(crate) fn run_gemma_local_warm_with_structured_output(
                         }
 
                         match (input_tokens, output_tokens) {
-                            (Some(input), Some(output)) => {
-                                AiResponse::success_with_tokens(final_content.to_string(), input, output)
-                            }
+                            (Some(input), Some(output)) => AiResponse::success_with_tokens(
+                                final_content.to_string(),
+                                input,
+                                output,
+                            ),
                             _ => AiResponse::success(final_content.to_string()),
                         }
                     }
@@ -416,7 +417,10 @@ mod tests {
     #[test]
     fn extract_first_json_object_handles_escaped_quote_in_string() {
         let s = r#"{"expression":"a\"b","k":1}tail"#;
-        assert_eq!(extract_first_json_object(s), r#"{"expression":"a\"b","k":1}"#);
+        assert_eq!(
+            extract_first_json_object(s),
+            r#"{"expression":"a\"b","k":1}"#
+        );
     }
 
     #[test]

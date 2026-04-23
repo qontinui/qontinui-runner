@@ -350,8 +350,7 @@ pub async fn emit_extraction_script(
         // specifically for that path.
         let warm_missing =
             crate::ai_provider::claude_api_warm::is_no_credential_error(&ai_response);
-        let gemma_missing =
-            crate::ai_provider::gemma_local_warm::is_no_server_error(&ai_response);
+        let gemma_missing = crate::ai_provider::gemma_local_warm::is_no_server_error(&ai_response);
         if warm_missing || gemma_missing {
             match provider_mode {
                 ScriptedOutputProviderMode::Auto => {
