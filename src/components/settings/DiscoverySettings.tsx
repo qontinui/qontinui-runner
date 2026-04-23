@@ -68,7 +68,13 @@ export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
   }, [onLog]);
 
   useEffect(() => {
-    void loadPorts();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadPorts();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadPorts]);
 
   const hasChanges =
