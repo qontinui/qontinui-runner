@@ -121,20 +121,24 @@ export function ExecutionControlPanel({
     loadMonitors();
   }, []);
 
-  // Calculate required screens when workflow changes
+  // Calculate required screens when workflow changes. All setState calls are
+  // deferred into the async IIFE so the effect body itself doesn't contain a
+  // synchronous setState (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (!selectedWorkflow || !configLoaded) {
-      setCalculatedScreens([]);
-      return;
-    }
+    let cancelled = false;
 
     const calculateScreens = async () => {
+      if (!selectedWorkflow || !configLoaded) {
+        if (!cancelled) setCalculatedScreens([]);
+        return;
+      }
       setIsCalculating(true);
       try {
         const result = await invoke<{ success: boolean; data?: { screens: number[] } }>(
           "get_workflow_required_screens",
           { workflowId: selectedWorkflow },
         );
+        if (cancelled) return;
 
         if (result?.success && result.data?.screens && result.data.screens.length > 0) {
           setCalculatedScreens(result.data.screens);
@@ -148,16 +152,20 @@ export function ExecutionControlPanel({
         }
       } catch (err) {
         console.error("Failed to calculate required screens:", err);
+        if (cancelled) return;
         // Default to primary monitor on error
         const defaultScreen = availableMonitors.length > 0 ? [availableMonitors[0]] : [0];
         setCalculatedScreens(defaultScreen);
         onMonitorSelectionChange(defaultScreen);
       } finally {
-        setIsCalculating(false);
+        if (!cancelled) setIsCalculating(false);
       }
     };
 
-    calculateScreens();
+    void calculateScreens();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- onMonitorSelectionChange is stable, including it causes infinite loops
   }, [selectedWorkflow, configLoaded, availableMonitors]);
 
