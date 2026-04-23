@@ -69,7 +69,13 @@ export function WatcherManagementPanel() {
   }, []);
 
   useEffect(() => {
-    loadWatchers();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadWatchers();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadWatchers]);
 
   const handleCreate = async () => {
