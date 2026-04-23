@@ -442,6 +442,15 @@ export function HookGenerationPanel({
   // the explainer phase starts once per-page generation finishes and needs
   // the full set of just-generated specs + arch diagrams.
   const allGeneratedFilesRef = useRef<GeneratedFile[]>([]);
+
+  // Bridged from handleSessionTransition so handleGeneratePages can invoke
+  // chainToDemoScript for the first page in a demo/tour-only run (where no
+  // AI prompt anchors the flow). The function is nested inside the session-
+  // transition useEffect's closure; flattening the whole graph would be
+  // disruptive, so we pass it out via a ref instead.
+  const chainToDemoScriptRef = useRef<((route: string, signal: AbortSignal) => void) | null>(null);
+  const currentControllerRef = useRef<AbortController | null>(null);
+
   const pageOptionsRef = useRef<PageGenerationOptions>({
     generateRegistrations: true,
     generateDataPageIds: true,
@@ -874,6 +883,17 @@ export function HookGenerationPanel({
         ]);
 
         (async () => {
+          // If this run didn't generate specs (demo/tour-only re-run), the
+          // in-memory lastSpecJsonRef is either empty or leftover from a
+          // previous page — neither is right for the current page. Always
+          // re-read the current page's spec from disk in that case so each
+          // page's demo/tour uses its own spec.
+          if (!opts.generateSpecs) {
+            const slug = route.replace(/^\//, "").replace(/\//g, "-") || "root";
+            const existing = await readProjectFile(`src/specs/${slug}.spec.uibridge.json`, signal);
+            if (signal.aborted) return;
+            lastSpecJsonRef.current = existing || "";
+          }
           // Parse the last generated spec JSON into a SpecConfig
           let specConfig: SpecConfig | null = null;
           if (lastSpecJsonRef.current) {
@@ -1589,12 +1609,24 @@ export function HookGenerationPanel({
         await session.sendMessage(
           `Generate an architecture diagram for ${firstPage.route}.\n\n` + archPrompt,
         );
+      } else if (options.generateDemoVideos || options.generateProductTours) {
+        // Demo/tour-only is non-AI planning; there's no prompt to send to
+        // anchor the first-page flow on. Invoke chainToDemoScript directly
+        // via the ref bridged out of handleSessionTransition's nested scope.
+        // chainToDemoScript handles per-page spec loading (from disk when
+        // specs weren't generated this run), planning, and advancement to
+        // subsequent pages / the all-done branch.
+        const chain = chainToDemoScriptRef.current;
+        const ctrl = currentControllerRef.current;
+        if (chain && ctrl) {
+          chain(firstPage.route, ctrl.signal);
+        } else {
+          setError(
+            "Demo/tour bootstrap couldn't dispatch: session helpers not ready. Try again in a moment.",
+          );
+          setPhase("idle");
+        }
       }
-      // Pre-existing limitation: if ONLY demo/tour is checked, the first-page
-      // bootstrap has no branch to dispatch (chainToDemoScript lives inside
-      // handleSessionTransition's scope). Non-first-page startPageGeneration
-      // handles that case. Refactoring chainToDemoScript to module scope is a
-      // separate task.
     },
     [session, analysis, projectPath],
   );
