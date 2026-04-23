@@ -74,6 +74,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
   // Wire up the stable ref now that elementsHook exists
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability -- legit mutable ref used to break circular dep between useCaptureSession and useElements
     fetchElementsRef.current = elementsHook.fetchElements;
   });
 
