@@ -6,7 +6,7 @@
  * editing state with dirty tracking, and exposes save/validate via the API.
  */
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import type {
   Constraint,
   ResourceLimits,
@@ -93,8 +93,9 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Snapshot of the last saved/loaded state for dirty tracking
-  const savedStateRef = useRef<string>("");
+  // Snapshot of the last saved/loaded state for dirty tracking.
+  // State (not ref) so isDirty can be derived in render without a refs violation.
+  const [savedState, setSavedState] = useState<string>("");
 
   /** Serialize current state to a string for dirty comparison. */
   const serializeState = useCallback((cs: Constraint[], rl: ResourceLimits): string => {
@@ -118,8 +119,8 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
   );
 
   const isDirty = useMemo(
-    () => serializeState(constraints, resourceLimits) !== savedStateRef.current,
-    [constraints, resourceLimits, serializeState],
+    () => serializeState(constraints, resourceLimits) !== savedState,
+    [constraints, resourceLimits, serializeState, savedState],
   );
 
   // --------------------------------------------------------------------------
@@ -145,7 +146,7 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
       setResourceLimits(loadedLimits);
 
       // Snapshot the loaded state (use local var to avoid stale closure)
-      savedStateRef.current = serializeState(activeConstraints, loadedLimits);
+      setSavedState(serializeState(activeConstraints, loadedLimits));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[useConstraints] reload failed:", err);
@@ -158,7 +159,7 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
   // Update the saved snapshot after reload completes and resource limits settle
   useEffect(() => {
     if (!loading && constraints.length > 0) {
-      savedStateRef.current = serializeState(constraints, resourceLimits);
+      setSavedState(serializeState(constraints, resourceLimits));
     }
     // Only run when loading transitions to false
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -236,7 +237,7 @@ export function useConstraints(options: UseConstraintsOptions = {}): UseConstrai
 
       // Update config path and snapshot
       setConfigPath(result.path);
-      savedStateRef.current = serializeState(constraints, resourceLimits);
+      setSavedState(serializeState(constraints, resourceLimits));
       return true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
