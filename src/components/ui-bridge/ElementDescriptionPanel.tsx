@@ -302,7 +302,8 @@ export function ElementDescriptionPanel({
   disabled = false,
 }: ElementDescriptionPanelProps) {
   const [descriptions, setDescriptions] = useState<Map<string, ElementDescription>>(new Map());
-  const [pageSummary, setPageSummary] = useState<PageSummary | null>(null);
+  // pageSummary is pure derivation from pageContext+elements (see useMemo
+  // below) — avoids a set-state-in-effect for the heuristic path.
   const [isGeneratingAi, setIsGeneratingAi] = useState(false);
   const [isGeneratingBulk, setIsGeneratingBulk] = useState(false);
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number } | null>(null);
@@ -337,32 +338,44 @@ export function ElementDescriptionPanel({
     }
   }, [selectedFramework]);
 
-  // Check if AI is available on mount
+  // Check if AI is available on mount. Defer sync setState calls off the
+  // effect body (set-state-in-effect) via microtask / async IIFE.
   useEffect(() => {
-    const checkAi = async () => {
+    let cancelled = false;
+    void (async () => {
       try {
         // Check if AI settings are configured
         const result = await invoke<{ success: boolean; data?: { provider?: string } }>(
           "get_ai_settings",
         );
+        if (cancelled) return;
         setAiAvailable(result.success && !!result.data?.provider);
       } catch {
+        if (cancelled) return;
         setAiAvailable(false);
       }
-    };
-    checkAi();
+    })();
 
-    // Load storage stats
+    // Load storage stats (sync read, defer setState to avoid cascading
+    // render during the same commit).
     const stats = ElementDescriptionService.getStats();
-
-    setStorageStats({
-      totalPages: stats.totalPages,
-      totalDescriptions: stats.totalDescriptions,
-      aiDescriptions: stats.aiDescriptions,
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setStorageStats({
+        totalPages: stats.totalPages,
+        totalDescriptions: stats.totalDescriptions,
+        aiDescriptions: stats.aiDescriptions,
+      });
     });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // Load persisted descriptions when page context changes
+  // Load persisted descriptions when page context changes. Defer setState
+  // off the effect body via microtask to avoid cascading renders during
+  // the same commit (set-state-in-effect).
   useEffect(() => {
     if (!pageContext?.url) {
       loadedPageRef.current = null;
@@ -378,26 +391,33 @@ export function ElementDescriptionPanel({
 
     // Load from persistence
     const persisted = ElementDescriptionService.loadDescriptions(pageContext.url);
-    if (persisted.size > 0) {
-      // Convert to ElementDescription format
-      const loaded = new Map<string, ElementDescription>();
-      for (const [elementId, desc] of persisted) {
-        loaded.set(elementId, {
-          elementId: desc.elementId,
-          description: desc.description,
-          purpose: desc.purpose,
-          aliases: desc.aliases,
-          suggestedActions: desc.suggestedActions,
-          source: desc.source,
-          generatedAt: desc.generatedAt,
-          interaction: desc.interaction,
-          accessibilityNotes: desc.accessibilityNotes,
-        });
-      }
+    if (persisted.size === 0) return;
 
+    // Convert to ElementDescription format
+    const loaded = new Map<string, ElementDescription>();
+    for (const [elementId, desc] of persisted) {
+      loaded.set(elementId, {
+        elementId: desc.elementId,
+        description: desc.description,
+        purpose: desc.purpose,
+        aliases: desc.aliases,
+        suggestedActions: desc.suggestedActions,
+        source: desc.source,
+        generatedAt: desc.generatedAt,
+        interaction: desc.interaction,
+        accessibilityNotes: desc.accessibilityNotes,
+      });
+    }
+
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
       setDescriptions(loaded);
       logger.debug(`Loaded ${loaded.size} persisted descriptions`);
-    }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [pageContext?.url]);
 
   // Generate heuristic description for selected element
@@ -418,13 +438,13 @@ export function ElementDescriptionPanel({
     return buildDOMContext(selectedElement, elements);
   }, [selectedElement, elements]);
 
-  // Generate page summary when context changes
-  useEffect(() => {
+  // Page summary is pure derivation — compute via useMemo instead of an
+  // effect+setState to avoid set-state-in-effect.
+  const pageSummary = useMemo<PageSummary | null>(() => {
     if (pageContext && elements.length > 0) {
-      setPageSummary(generateHeuristicPageSummary(pageContext, elements));
-    } else {
-      setPageSummary(null);
+      return generateHeuristicPageSummary(pageContext, elements);
     }
+    return null;
   }, [pageContext, elements]);
 
   // Toggle section expansion
