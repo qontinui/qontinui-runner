@@ -665,7 +665,15 @@ export function ImageQualityTestsPage() {
   }, []);
 
   useEffect(() => {
-    loadManifest();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside loadManifest.
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadManifest();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadManifest]);
 
   const handleDelete = useCallback(
