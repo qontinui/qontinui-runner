@@ -138,20 +138,26 @@ export function useProjectSelection(): UseProjectSelectionReturn {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- setSelectedProject is stable
   }, [selectedProjectId]);
 
-  // When projects change, update the selected project name if needed
+  // When projects change, update the selected project name if needed.
+  // Defer setState off the effect body via microtask so we don't cascade
+  // renders during the same commit (set-state-in-effect).
   useEffect(() => {
-    if (selectedProjectId && projects.length > 0) {
-      const project = projects.find((p) => p.id === selectedProjectId);
-      if (project && project.name !== selectedProjectName) {
-        setSelectedProjectName(project.name);
-        // Update localStorage
-        const state: ProjectSelectionState = {
-          selectedProjectId,
-          selectedProjectName: project.name,
-        };
-        instanceStorage.setJSON(SELECTED_PROJECT_STORAGE_KEY, state);
-      }
-    }
+    if (!selectedProjectId || projects.length === 0) return;
+    const project = projects.find((p) => p.id === selectedProjectId);
+    if (!project || project.name === selectedProjectName) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setSelectedProjectName(project.name);
+      const state: ProjectSelectionState = {
+        selectedProjectId,
+        selectedProjectName: project.name,
+      };
+      instanceStorage.setJSON(SELECTED_PROJECT_STORAGE_KEY, state);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [projects, selectedProjectId, selectedProjectName]);
 
   return {
