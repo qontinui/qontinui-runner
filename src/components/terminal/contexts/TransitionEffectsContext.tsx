@@ -6,7 +6,7 @@
  * Reads from TerminalCore, SessionState, and ZoneMetadata contexts.
  */
 
-import { createContext, useCallback, useMemo, useRef, type ReactNode } from "react";
+import { createContext, useCallback, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useTerminalCore } from "./useTerminalCore";
 import { useSessionState } from "./useSessionState";
 import { useZoneMetadata } from "./useZoneMetadata";
@@ -65,7 +65,9 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
     ],
   );
 
-  handleRestartInZoneRef.current = handleRestartInZone;
+  useEffect(() => {
+    handleRestartInZoneRef.current = handleRestartInZone;
+  });
 
   const transitionEffects = useStateTransitionEffects({
     sessionStates: stateTracking.sessionStates,
