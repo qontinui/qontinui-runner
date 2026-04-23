@@ -101,12 +101,10 @@ export function useElementThumbnails(
   });
   const [progress, setProgress] = useState<ThumbnailProgress | null>(null);
 
-  // Persistent cache instance that tracks both element ID and bounds
-  const cacheRef = useRef<ThumbnailCache | null>(null);
-
-  if (!cacheRef.current) {
-    cacheRef.current = new ThumbnailCache();
-  }
+  // Persistent cache instance that tracks both element ID and bounds.
+  // useState's lazy initializer gives us a single instance for the hook's
+  // lifetime without touching ref.current during render.
+  const [cache] = useState(() => new ThumbnailCache());
 
   // Track in-flight processing to handle concurrent updates
   const processingIdRef = useRef(0);
@@ -129,8 +127,6 @@ export function useElementThumbnails(
   // Request a single thumbnail (for lazy loading)
   const requestThumbnail = useCallback(
     async (elementId: string, bounds: ElementBounds): Promise<string | null> => {
-      const cache = cacheRef.current!;
-
       if (!screenshotBase64) {
         return null;
       }
@@ -170,7 +166,7 @@ export function useElementThumbnails(
         return null;
       }
     },
-    [screenshotBase64, screenshotHash, maxSize, skipLargeThreshold],
+    [cache, screenshotBase64, screenshotHash, maxSize, skipLargeThreshold],
   );
 
   // Eager mode: Process all thumbnails upfront with caching
@@ -178,8 +174,6 @@ export function useElementThumbnails(
     if (mode !== "eager") {
       return;
     }
-
-    const cache = cacheRef.current!;
 
     // Clear thumbnails if no screenshot or elements
     if (!screenshotBase64 || elements.length === 0) {
@@ -301,13 +295,13 @@ export function useElementThumbnails(
       // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentionally incrementing to invalidate in-flight work
       processingIdRef.current++;
     };
-  }, [screenshotBase64, screenshotHash, elements, maxSize, mode, skipLargeThreshold]);
+  }, [cache, screenshotBase64, screenshotHash, elements, maxSize, mode, skipLargeThreshold]);
 
   // Get the current cache as a simple Map for backwards compatibility
   // Note: We intentionally trigger recomputation based on thumbnails state changes
-  // even though we read from cacheRef - this ensures the returned Map is fresh
+  // even though we read from cache - this ensures the returned Map is fresh
   const thumbnailCache = useMemo(() => {
-    return cacheRef.current?.getAllThumbnails() ?? new Map<string, string>();
+    return cache.getAllThumbnails();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- thumbnails triggers cache refresh
   }, [thumbnails]);
 
