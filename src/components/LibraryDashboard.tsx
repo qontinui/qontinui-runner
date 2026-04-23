@@ -371,7 +371,15 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
   }, [onLog]);
 
   useEffect(() => {
-    fetchAllItems();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside fetchAllItems.
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchAllItems();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchAllItems]);
 
   // Toggle favorite on a workflow (optimistic update with rollback)
