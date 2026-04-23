@@ -127,10 +127,20 @@ export function ProcessManagerTab() {
   }, []);
 
   useEffect(() => {
-    loadProcesses();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside loadProcesses.
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadProcesses();
+    });
     invoke<RunnerIdentity>("get_runner_identity")
-      .then(setIdentity)
+      .then((id) => {
+        if (!cancelled) setIdentity(id);
+      })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [loadProcesses]);
 
   // Listen for state changes
