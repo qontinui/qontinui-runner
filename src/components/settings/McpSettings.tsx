@@ -83,11 +83,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
   const [connecting, setConnecting] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<McpServerConfig | null>(null);
 
-  useEffect(() => {
-    loadServers();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadServers = async () => {
     setLoading(true);
     try {
@@ -104,6 +99,11 @@ export function McpSettings({ onLog }: McpSettingsProps) {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadServers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const loadAllStatus = async () => {
     try {
