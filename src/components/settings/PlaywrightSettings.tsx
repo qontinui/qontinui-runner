@@ -39,11 +39,6 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
   const [isSaving, setIsSaving] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
 
-  useEffect(() => {
-    loadSettings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       const result = await invoke<TauriResult<PlaywrightSettingsData>>("get_playwright_settings");
@@ -56,6 +51,11 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
       onLog("error", `Failed to load Playwright settings: ${err}`);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleSave = async () => {
     setIsSaving(true);
