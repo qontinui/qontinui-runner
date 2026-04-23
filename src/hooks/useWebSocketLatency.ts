@@ -8,7 +8,7 @@
  * Only active in development mode.
  */
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getPerformanceMonitor } from "../lib/performance";
 
 // ============================================================================
@@ -97,7 +97,13 @@ export function useWebSocketLatency(
   const reconnectsRef = useRef(0);
   const connectedRef = useRef(false);
 
-  const startTimeRef = useRef(Date.now());
+  // Seeded to 0 and initialized by the mount effect below so we never call
+  // Date.now() during render (react-hooks/purity). All reads of .current
+  // happen inside event-driven callbacks (recordMessage, reset).
+  const startTimeRef = useRef<number>(0);
+  useEffect(() => {
+    startTimeRef.current = Date.now();
+  }, []);
 
   // Calculate latency from server timestamp
   const calculateLatency = useCallback((serverTimestamp: number): number => {
