@@ -181,9 +181,17 @@ export function PhysicalDeviceManager() {
   }, [loading]);
 
   useEffect(() => {
-    fetchDevices();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside fetchDevices.
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchDevices();
+    });
     const interval = setInterval(fetchDevices, 10000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
