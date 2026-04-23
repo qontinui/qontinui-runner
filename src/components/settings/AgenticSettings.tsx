@@ -192,9 +192,15 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
   };
 
   useEffect(() => {
-    loadSettings();
-
-    loadReflectionSettings();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      void loadSettings();
+      void loadReflectionSettings();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
