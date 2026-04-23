@@ -95,9 +95,17 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
     }
   }, []);
 
-  // Auto-load stats on mount
+  // Auto-load stats on mount. Deferred into a microtask so the setState
+  // inside loadStats doesn't fire synchronously from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    loadStats();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadStats();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadStats]);
 
   // Create handler
