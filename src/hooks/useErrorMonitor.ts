@@ -65,7 +65,9 @@ export function useErrorEvents(options: UseErrorEventsOptions = {}): UseErrorEve
   const [error, setError] = useState<string | null>(null);
   const optionsRef = useRef(options);
 
-  optionsRef.current = options;
+  useEffect(() => {
+    optionsRef.current = options;
+  });
 
   const fetchErrors = useCallback(async () => {
     try {
@@ -175,7 +177,9 @@ export function useErrorSummary(options: UseErrorSummaryOptions = {}): UseErrorS
   const [error, setError] = useState<string | null>(null);
   const optionsRef = useRef(options);
 
-  optionsRef.current = options;
+  useEffect(() => {
+    optionsRef.current = options;
+  });
 
   const fetchSummary = useCallback(async () => {
     try {
@@ -254,7 +258,9 @@ export function useDebugContext(options: UseDebugContextOptions = {}): UseDebugC
   const [error, setError] = useState<string | null>(null);
   const optionsRef = useRef(options);
 
-  optionsRef.current = options;
+  useEffect(() => {
+    optionsRef.current = options;
+  });
 
   const fetchContext = useCallback(async () => {
     try {
