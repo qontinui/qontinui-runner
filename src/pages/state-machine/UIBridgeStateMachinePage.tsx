@@ -112,6 +112,18 @@ function SMTabButton({
 
 export function UIBridgeStateMachinePage() {
   const sm = useStateMachineConfig();
+  // Destructure stable method references so callbacks and effects that depend
+  // on individual sm methods don't re-create on every render because `sm` is a
+  // new object reference each time.
+  const {
+    createTransition: smCreateTransition,
+    updateTransition: smUpdateTransition,
+    deleteTransition: smDeleteTransition,
+    updateState: smUpdateState,
+    importConfig: smImportConfig,
+    loadConfigs: smLoadConfigs,
+    loadConfig: smLoadConfig,
+  } = sm;
   const { toasts, showToast, dismissToast } = useToast();
   const discovery = useUIBridgeDiscovery(sm, showToast);
 
@@ -409,33 +421,33 @@ export function UIBridgeStateMachinePage() {
   // Transition operations
   const handleCreateTransition = useCallback(
     async (data: StateMachineTransitionCreate) => {
-      await sm.createTransition(data);
+      await smCreateTransition(data);
       setShowNewTransition(false);
     },
-    [sm],
+    [smCreateTransition],
   );
 
   const handleUpdateTransition = useCallback(
     async (id: string, data: Partial<StateMachineTransitionCreate>) => {
-      await sm.updateTransition(id, data);
+      await smUpdateTransition(id, data);
     },
-    [sm],
+    [smUpdateTransition],
   );
 
   const handleDeleteTransition = useCallback(
     async (id: string) => {
-      await sm.deleteTransition(id);
+      await smDeleteTransition(id);
       setSelectedTransitionId(null);
     },
-    [sm],
+    [smDeleteTransition],
   );
 
   // State update for drag-and-drop
   const handleSaveState = useCallback(
     async (stateId: string, updates: StateMachineStateUpdate) => {
-      await sm.updateState(stateId, updates);
+      await smUpdateState(stateId, updates);
     },
-    [sm],
+    [smUpdateState],
   );
 
   const handleUpdateStateElements = useCallback(
@@ -470,7 +482,7 @@ export function UIBridgeStateMachinePage() {
       };
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await sm.importConfig(detail.name, detail.config as any);
+        await smImportConfig(detail.name, detail.config as any);
         showToast(
           `Imported static state machine: ${detail.stateCount} states, ${detail.transitionCount} transitions`,
           "success",
@@ -482,16 +494,16 @@ export function UIBridgeStateMachinePage() {
     };
     window.addEventListener("sm-import-static", handleStaticImport);
     return () => window.removeEventListener("sm-import-static", handleStaticImport);
-  }, [sm, showToast]);
+  }, [smImportConfig, showToast]);
 
   // When discovery creates a config, select it and switch to graph
   const handleConfigCreated = useCallback(
     async (configId: string) => {
-      await sm.loadConfigs();
-      await sm.loadConfig(configId);
+      await smLoadConfigs();
+      await smLoadConfig(configId);
       setActiveTab("graph");
     },
-    [sm],
+    [smLoadConfigs, smLoadConfig],
   );
 
   return (

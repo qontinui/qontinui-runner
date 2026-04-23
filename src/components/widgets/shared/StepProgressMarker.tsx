@@ -107,6 +107,7 @@ export function useStepProgressMarkers(
       return;
     }
 
+    setIsLoading(true);
     try {
       const response = await tracedFetch(
         `${getApiBase()}/task-runs/${taskRunId}/steps/${checkpointId}/progress`,
@@ -270,5 +271,3 @@ export function StepProgressIndicator({
     </ProgressErrorBoundary>
   );
 }
-
-export default StepProgressMarker;

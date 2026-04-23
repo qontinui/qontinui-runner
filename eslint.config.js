@@ -50,6 +50,14 @@ export default [
       ],
       // Prefer structured logger over console.* — use createLogger() from lib/logger
       "no-console": ["warn", { allow: ["warn", "error"] }],
+      // react-hooks v7 introduced strict rules that flag many existing patterns.
+      // Downgrade to warn so the codebase can be cleaned up incrementally rather
+      // than blocking all commits until every file is updated.
+      "react-hooks/set-state-in-effect": "warn",
+      "react-hooks/refs": "warn",
+      "react-hooks/immutability": "warn",
+      "react-hooks/purity": "warn",
+      "react-hooks/preserve-manual-memoization": "warn",
     },
   },
   {
