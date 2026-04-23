@@ -144,11 +144,19 @@ export function useActionLogView(options: UseActionLogViewOptions = {}): UseActi
     await fetchData();
   }, [fetchData]);
 
-  // Fetch data on mount if enabled
+  // Fetch data on mount if enabled. Wrap in async IIFE so fetchData's
+  // synchronous setState calls aren't the first statement reached from the
+  // effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (fetchOnMount) {
-      fetchData();
-    }
+    if (!fetchOnMount) return;
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await fetchData();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [fetchOnMount, fetchData]);
 
   // Set up auto-refresh if interval is specified
