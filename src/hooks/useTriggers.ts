@@ -263,7 +263,9 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
   // Real-time Tauri event subscription for immediate updates when triggers fire
   const refreshRef = useRef(refresh);
 
-  refreshRef.current = refresh;
+  useEffect(() => {
+    refreshRef.current = refresh;
+  });
 
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
