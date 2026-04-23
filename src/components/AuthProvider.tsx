@@ -205,8 +205,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
    */
   useEffect(() => {
     log.debug("useEffect[checkAuthStatus] - checking auth status on mount");
-
-    checkAuthStatus();
+    // Async IIFE so we don't invoke a setState-bearing callback synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await checkAuthStatus();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [checkAuthStatus]);
 
   /**
@@ -265,7 +273,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
     if (authStatus?.authenticated) {
       log.debug("Dev mode: Authenticated, clearing devAutoLoginPending");
 
-      setDevAutoLoginPending(false);
       if (devLoginRetryTimer.current) {
         clearTimeout(devLoginRetryTimer.current);
         devLoginRetryTimer.current = null;
@@ -273,11 +280,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
       devLoginRetryCount.current = 0;
       devLoginFailed.current = false;
 
-      // Signal UI Bridge to re-discover elements now that the
-      // authenticated page is rendered. Without this, the auto-register's
-      // initial scan captures login-page DOM and agents only see the
-      // login form elements in /control/snapshot.
-      window.dispatchEvent(new CustomEvent("ui-bridge-auth-complete"));
+      // Defer setState off the effect body to avoid cascading renders
+      // during the same commit (set-state-in-effect).
+      queueMicrotask(() => {
+        setDevAutoLoginPending(false);
+        // Signal UI Bridge to re-discover elements now that the
+        // authenticated page is rendered. Without this, the auto-register's
+        // initial scan captures login-page DOM and agents only see the
+        // login form elements in /control/snapshot.
+        window.dispatchEvent(new CustomEvent("ui-bridge-auth-complete"));
+      });
 
       return;
     }
