@@ -32,7 +32,13 @@ export function AccountUsageCard() {
   };
 
   useEffect(() => {
-    fetchUsage();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchUsage();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const valid = accounts.filter((a) => !a.error);
