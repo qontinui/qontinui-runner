@@ -336,11 +336,16 @@ export function OrchestrationLoopPanel() {
   }, []);
 
   useEffect(() => {
-    fetchStatus();
-    loadSavedConfigs();
-    loadRunnerInstances();
+    // Async IIFE: avoid invoking setState-bearing callbacks synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await Promise.all([fetchStatus(), loadSavedConfigs(), loadRunnerInstances()]);
+    })();
     pollRef.current = setInterval(fetchStatus, 3000);
     return () => {
+      cancelled = true;
       if (pollRef.current) clearInterval(pollRef.current);
     };
   }, [fetchStatus, loadSavedConfigs, loadRunnerInstances]);
