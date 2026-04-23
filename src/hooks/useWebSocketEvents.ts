@@ -369,14 +369,26 @@ export function useWebSocketEvents(
       return;
     }
 
+    let cancelled = false;
+
+    // disconnect() invokes setState, so defer it into a microtask to keep
+    // the effect body free of synchronous setState
+    // (react-hooks/set-state-in-effect).
     if (!enabled) {
-      disconnect();
-      return;
+      void Promise.resolve().then(() => {
+        if (!cancelled) disconnect();
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
-    connect();
+    void Promise.resolve().then(() => {
+      if (!cancelled) connect();
+    });
 
     return () => {
+      cancelled = true;
       disconnect();
     };
   }, [enabled, isTauri, connect, disconnect]);
