@@ -68,11 +68,6 @@ export function OtelSettings({ onLog }: OtelSettingsProps) {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadSettings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -90,6 +85,11 @@ export function OtelSettings({ onLog }: OtelSettingsProps) {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const saveSettings = async () => {
     try {
