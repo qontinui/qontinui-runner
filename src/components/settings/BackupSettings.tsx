@@ -208,7 +208,13 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
 
   // Load export summary on mount
   useEffect(() => {
-    loadExportSummary();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadExportSummary();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
