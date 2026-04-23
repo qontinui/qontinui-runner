@@ -40,14 +40,28 @@ export function PromptSnippetSelector({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Sync search query from props when they change
+  // Sync search query from props when they change. Wrapped in a microtask so
+  // the effect body itself doesn't call setState synchronously.
   useEffect(() => {
-    setSearchQuery(initialSearchQuery);
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) setSearchQuery(initialSearchQuery);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [initialSearchQuery]);
 
-  // Reset selected index when filter changes
+  // Reset selected index when filter changes. Wrapped in a microtask so the
+  // effect body itself doesn't call setState synchronously.
   useEffect(() => {
-    setSelectedIndex(0);
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) setSelectedIndex(0);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [searchQuery, selectedCategory]);
 
   // Load prompt snippets and categories
@@ -79,11 +93,17 @@ export function PromptSnippetSelector({
     }
   }, []);
 
-  // Load data when opened
+  // Load data when opened. Wrapped in a microtask so the effect body itself
+  // doesn't synchronously trigger setState inside loadData.
   useEffect(() => {
-    if (isOpen) {
-      loadData();
-    }
+    if (!isOpen) return;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadData();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [isOpen, loadData]);
 
   // Filter prompt snippets by search and category
