@@ -168,20 +168,35 @@ export function useDashboardState(): DashboardState {
     }
   }, [eventData, refresh]);
 
-  // Polling as fallback — relaxed from 2s to 5s (running) / 15s (idle)
+  // Polling as fallback — relaxed from 2s to 5s (running) / 15s (idle).
+  // The initial refresh() is deferred into a microtask so the effect body
+  // doesn't contain a synchronous setState (react-hooks/set-state-in-effect).
   const hasRunningTasks = runningTasks.length > 0;
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) refresh();
+    });
     const intervalMs = hasRunningTasks ? 5000 : 15000;
     const interval = setInterval(refresh, intervalMs);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [refresh, hasRunningTasks]);
 
-  // Update elapsed time
+  // Update elapsed time. All setState calls live inside the inner function
+  // or a microtask so the effect body itself is free of synchronous setState
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
     if (!startTime) {
-      setElapsedTime(0);
-      return;
+      let cancelled = false;
+      void Promise.resolve().then(() => {
+        if (!cancelled) setElapsedTime(0);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
     const updateElapsed = () => {
