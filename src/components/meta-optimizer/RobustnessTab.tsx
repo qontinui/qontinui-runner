@@ -81,11 +81,27 @@ export function RobustnessTab() {
   }, [agentType]);
 
   useEffect(() => {
-    loadReports();
+    // Async IIFE: avoid invoking setState-bearing callbacks synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await loadReports();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [loadReports]);
 
   useEffect(() => {
-    loadDatasets();
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await loadDatasets();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [loadDatasets]);
 
   const handleRunTest = useCallback(async () => {
