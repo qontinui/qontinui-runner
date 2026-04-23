@@ -114,7 +114,6 @@ export function OrchestrationLoopBanner() {
     const key = `${sub.running}:${sub.phase}:${sub.currentIteration}`;
     if (key !== lastPhaseRef.current) {
       lastPhaseRef.current = key;
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription-driven refetch on phase change
       fetchStatus();
     }
   }, [subData, fetchStatus]);
