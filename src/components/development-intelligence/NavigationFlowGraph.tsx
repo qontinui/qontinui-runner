@@ -238,8 +238,11 @@ export function NavigationFlowGraph() {
   }, []);
   useEffect(() => {
     const controller = new AbortController();
-
-    loadSpecs(controller.signal);
+    // Deferred into a microtask so the setState inside loadSpecs doesn't
+    // fire synchronously from the effect body (set-state-in-effect).
+    void Promise.resolve().then(() => {
+      if (!controller.signal.aborted) void loadSpecs(controller.signal);
+    });
     return () => {
       controller.abort();
     };
