@@ -15,11 +15,6 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
   const [error, setError] = useState<string | null>(null);
   const [lastChecked, setLastChecked] = useState<Date | null>(null);
 
-  useEffect(() => {
-    checkForUpdates();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const checkForUpdates = async () => {
     setStatus("checking");
     setError(null);
@@ -51,6 +46,11 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
       onLog("error", `Failed to check for updates: ${errorMessage}`);
     }
   };
+
+  useEffect(() => {
+    checkForUpdates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const installUpdate = async () => {
     if (!updateInfo?.available) return;
