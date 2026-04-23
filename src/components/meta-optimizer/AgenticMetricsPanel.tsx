@@ -45,7 +45,13 @@ function scoreBarColor(score: number): string {
 export function AgenticMetricsPanel({ selectedTaskRunId, days = 30 }: AgenticMetricsPanelProps) {
   const [aggregates, setAggregates] = useState<AgenticMetricAggregate[]>([]);
   const [trend, setTrend] = useState<CompositeScoreTrendPoint[]>([]);
-  const [runScores, setRunScores] = useState<AgenticMetricScore[]>([]);
+  // Run scores are fetched keyed by selectedTaskRunId. Storing the key with
+  // the scores lets us treat "no selection" / "selection changed" as a pure
+  // derivation instead of a sync setState in an effect body.
+  const [fetchedRunScores, setFetchedRunScores] = useState<{
+    taskRunId: string | null;
+    scores: AgenticMetricScore[];
+  }>({ taskRunId: null, scores: [] });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -66,22 +72,42 @@ export function AgenticMetricsPanel({ selectedTaskRunId, days = 30 }: AgenticMet
     }
   }, [days]);
 
-  // Load aggregates and trend on mount
+  // Load aggregates and trend on mount. Wrapped in a microtask so the effect
+  // body itself doesn't synchronously trigger setState inside loadData.
   useEffect(() => {
-    loadData();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadData();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadData]);
 
-  // Load per-run scores when a task run is selected
+  // Load per-run scores when a task run is selected. No reset-on-invalid-deps
+  // setState here — the derived `runScores` below evaluates to [] whenever
+  // the key doesn't match the active selection.
   useEffect(() => {
-    if (!selectedTaskRunId) {
-      setRunScores([]);
-      return;
-    }
+    if (!selectedTaskRunId) return;
+    let cancelled = false;
     agenticMetricsService
       .getScoresForRun(selectedTaskRunId)
-      .then(setRunScores)
-      .catch(() => setRunScores([]));
+      .then((scores) => {
+        if (!cancelled) setFetchedRunScores({ taskRunId: selectedTaskRunId, scores });
+      })
+      .catch(() => {
+        if (!cancelled) setFetchedRunScores({ taskRunId: selectedTaskRunId, scores: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [selectedTaskRunId]);
+
+  // Pure derivation: only expose scores when the key matches the current run.
+  const runScores: AgenticMetricScore[] =
+    selectedTaskRunId && fetchedRunScores.taskRunId === selectedTaskRunId
+      ? fetchedRunScores.scores
+      : [];
 
   if (loading) {
     return <div className="p-4 text-zinc-500 text-sm">Loading agentic metrics...</div>;
