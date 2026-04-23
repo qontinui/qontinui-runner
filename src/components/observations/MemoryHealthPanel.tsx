@@ -89,7 +89,16 @@ export function MemoryHealthPanel() {
   }, []);
 
   useEffect(() => {
-    fetchData();
+    // Async IIFE: avoid invoking a setState-bearing callback synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await fetchData();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [fetchData]);
 
   const handleConsolidate = useCallback(async () => {

@@ -150,7 +150,13 @@ export function RecommendationsTab() {
   }, [filterType, filterStatus]);
 
   useEffect(() => {
-    load();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void load();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [load]);
 
   const handleAction = async (id: string, action: "apply" | "reject" | "rollback" | "canary") => {
