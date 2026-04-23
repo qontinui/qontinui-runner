@@ -56,6 +56,34 @@ export function useProjectSelection(): UseProjectSelectionReturn {
   const [error, setError] = useState<string | null>(null);
 
   /**
+   * Set the selected project and persist to localStorage
+   */
+  const setSelectedProject = (projectId: string | null) => {
+    setSelectedProjectIdState(projectId);
+
+    // Find the project name
+    const project = projects.find((p) => p.id === projectId);
+    const projectName = project?.name || null;
+    setSelectedProjectName(projectName);
+
+    // Persist to localStorage
+    const state: ProjectSelectionState = {
+      selectedProjectId: projectId,
+      selectedProjectName: projectName,
+    };
+    instanceStorage.setJSON(SELECTED_PROJECT_STORAGE_KEY, state);
+
+    // Dispatch event for StatusIndicator
+    window.dispatchEvent(
+      new CustomEvent("project-selection-changed", {
+        detail: { projectId, projectName },
+      }),
+    );
+
+    log.debug("Selected project:", projectId, projectName);
+  };
+
+  /**
    * Load projects from the backend
    * Retries once on auth failure to handle race conditions with keychain access
    */
@@ -107,36 +135,8 @@ export function useProjectSelection(): UseProjectSelectionReturn {
     } finally {
       setLoading(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- setSelectedProject is defined below and stable
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- setSelectedProject is stable
   }, [selectedProjectId]);
-
-  /**
-   * Set the selected project and persist to localStorage
-   */
-  const setSelectedProject = (projectId: string | null) => {
-    setSelectedProjectIdState(projectId);
-
-    // Find the project name
-    const project = projects.find((p) => p.id === projectId);
-    const projectName = project?.name || null;
-    setSelectedProjectName(projectName);
-
-    // Persist to localStorage
-    const state: ProjectSelectionState = {
-      selectedProjectId: projectId,
-      selectedProjectName: projectName,
-    };
-    instanceStorage.setJSON(SELECTED_PROJECT_STORAGE_KEY, state);
-
-    // Dispatch event for StatusIndicator
-    window.dispatchEvent(
-      new CustomEvent("project-selection-changed", {
-        detail: { projectId, projectName },
-      }),
-    );
-
-    log.debug("Selected project:", projectId, projectName);
-  };
 
   // When projects change, update the selected project name if needed
   useEffect(() => {
