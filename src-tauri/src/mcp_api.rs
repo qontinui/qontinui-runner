@@ -170,7 +170,8 @@ async fn embedding_service_health() -> serde_json::Value {
     })
 }
 
-/// Health check endpoint.
+/// Health check endpoint (also served at `/ui-bridge/health` and
+/// `/ui-bridge/status` — all three share this handler).
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
 /// Returns rich diagnostics: frontend responsiveness, uptime, circuit breaker state.
 async fn health(
@@ -1329,6 +1330,7 @@ pub fn create_router(
         // Local routes
         .route("/health", get(health))
         .route("/ui-bridge/health", get(health))
+        .route("/ui-bridge/status", get(health))
         // AWAS routes (imported directly)
         .route("/awas/discover", post(awas_discover))
         .route("/awas/execute", post(awas_execute))
