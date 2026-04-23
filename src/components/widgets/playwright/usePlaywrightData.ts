@@ -195,11 +195,19 @@ export function usePlaywrightData(): PlaywrightData {
     }
   }, []);
 
-  // Initial fetch and polling
+  // Initial fetch and polling. Initial fetchData() is deferred into a
+  // microtask so the effect body doesn't synchronously trigger setState
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    fetchData();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchData();
+    });
     const interval = setInterval(fetchData, 2000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchData]);
 
   return data;
@@ -247,9 +255,15 @@ export function usePlaywrightDataWithStatus(): {
   }, []);
 
   useEffect(() => {
-    fetchData();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchData();
+    });
     const interval = setInterval(fetchData, 2000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchData]);
 
   return { data, isLoading, error };
