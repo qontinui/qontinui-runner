@@ -72,9 +72,13 @@ export function usePromptCanaryList(): UsePromptCanaryListReturn {
   }, []);
 
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void refresh();
+    });
     intervalRef.current = setInterval(refresh, 30000);
     return () => {
+      cancelled = true;
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
   }, [refresh]);
