@@ -67,11 +67,6 @@ export function WorldStateVerifierSettings({ onLog }: WorldStateVerifierSettings
   const [error, setError] = useState<string | null>(null);
   const [testState, setTestState] = useState<TestState>({ kind: "idle" });
 
-  useEffect(() => {
-    loadSettings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadSettings = async () => {
     try {
       setLoading(true);
@@ -92,6 +87,11 @@ export function WorldStateVerifierSettings({ onLog }: WorldStateVerifierSettings
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const saveSettings = async () => {
     try {
