@@ -54,11 +54,18 @@ export function PromptEvolutionPanel() {
     }
   }, []);
 
-  // Initial load + auto-refresh interval
+  // Initial load + auto-refresh interval. Async IIFE to avoid invoking a
+  // setState-bearing callback synchronously in the effect body
+  // (set-state-in-effect).
   useEffect(() => {
-    loadRuns();
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await loadRuns();
+    })();
     intervalRef.current = setInterval(loadRuns, AUTO_REFRESH_MS);
     return () => {
+      cancelled = true;
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
   }, [loadRuns]);
