@@ -130,34 +130,42 @@ export function UIBridgeStateMachinePage() {
   const [selectedTransitionId, setSelectedTransitionId] = useState<string | null>(null);
   const [showNewTransition, setShowNewTransition] = useState(false);
   const [highlightedPath, setHighlightedPath] = useState<PathfindingResult["steps"] | undefined>();
-  // Thumbnails loaded from database when config changes, with localStorage fallback
-  const [elementThumbnails, setElementThumbnails] = useState<Record<string, string> | undefined>(
-    () => {
-      try {
-        const stored = localStorage.getItem("qontinui-runner-sm-thumbnails");
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          if (parsed && Object.keys(parsed).length > 0) return parsed;
+  // Thumbnails are fetched from the database keyed by configId. Storing the
+  // configId alongside the thumbs lets us reset-on-config-change as a pure
+  // derivation (see `elementThumbnails` below) instead of a useEffect with a
+  // sync setState in its body.
+  //
+  // `fetchedConfigId: null` on initial mount signals the localStorage fallback
+  // — show those thumbs as a hint until the fresh fetch lands, regardless of
+  // the current active config.
+  const [fetchedThumbs, setFetchedThumbs] = useState<{
+    configId: string | null;
+    thumbs: Record<string, string> | undefined;
+  }>(() => {
+    try {
+      const stored = localStorage.getItem("qontinui-runner-sm-thumbnails");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed && Object.keys(parsed).length > 0) {
+          return { configId: null, thumbs: parsed };
         }
-      } catch {
-        /* */
       }
-      return undefined;
-    },
-  );
+    } catch {
+      /* */
+    }
+    return { configId: null, thumbs: undefined };
+  });
   const activeConfigId = sm.activeConfig?.id;
   useEffect(() => {
-    if (!activeConfigId) {
-      setElementThumbnails(undefined);
-      return;
-    }
+    if (!activeConfigId) return;
     let isCancelled = false;
     invoke<Record<string, string>>("sm_get_thumbnails", { configId: activeConfigId })
       .then((thumbs) => {
         if (isCancelled) return;
-        if (Object.keys(thumbs).length > 0) {
-          setElementThumbnails(thumbs);
-        }
+        setFetchedThumbs({
+          configId: activeConfigId,
+          thumbs: Object.keys(thumbs).length > 0 ? thumbs : undefined,
+        });
       })
       .catch(() => {
         // Command may not be available in older runner builds
@@ -174,24 +182,26 @@ export function UIBridgeStateMachinePage() {
     return () => window.removeEventListener("sm-show-exploration", handler);
   }, []);
 
-  // Capture screenshots for screenshot state view
-  const [captureScreenshots, setCaptureScreenshots] = useState<
-    CaptureScreenshotMeta[] | undefined
-  >();
+  // Capture screenshots for screenshot state view. Same config-keyed pattern
+  // as thumbnails above so the reset-on-config-change is a pure derivation.
+  const [fetchedScreenshots, setFetchedScreenshots] = useState<{
+    configId: string | null;
+    screenshots: CaptureScreenshotMeta[] | undefined;
+  }>({ configId: null, screenshots: undefined });
   const screenshotImageCache = useRef<Map<string, string>>(new Map());
   useEffect(() => {
-    if (!activeConfigId) {
-      setCaptureScreenshots(undefined);
-      screenshotImageCache.current.clear();
-      return;
-    }
+    // Invalidate the in-memory image cache whenever we switch configs — the
+    // cached data-URLs belong to the previous config's screenshots.
     screenshotImageCache.current.clear();
-    setCaptureScreenshots(undefined);
+    if (!activeConfigId) return;
     let isCancelled = false;
     invoke<CaptureScreenshotMeta[]>("sm_get_capture_screenshots", { configId: activeConfigId })
       .then((screenshots) => {
         if (isCancelled) return;
-        setCaptureScreenshots(screenshots.length > 0 ? screenshots : undefined);
+        setFetchedScreenshots({
+          configId: activeConfigId,
+          screenshots: screenshots.length > 0 ? screenshots : undefined,
+        });
       })
       .catch(() => {
         // Command may not be available in older runner builds
@@ -200,6 +210,9 @@ export function UIBridgeStateMachinePage() {
       isCancelled = true;
     };
   }, [activeConfigId]);
+
+  const captureScreenshots =
+    fetchedScreenshots.configId === activeConfigId ? fetchedScreenshots.screenshots : undefined;
 
   // Load screenshot image on demand (returns data URL, cached in component)
   const loadScreenshotImage = useCallback(async (screenshotId: string): Promise<string> => {
@@ -210,13 +223,17 @@ export function UIBridgeStateMachinePage() {
     return dataUrl;
   }, []);
 
-  // Also sync from discovery co-occurrence data (available during exploration before save)
+  // Live thumbnails from the discovery co-occurrence stream take precedence
+  // over the fetched-from-DB ones during exploration. When `configId` is null
+  // on fetchedThumbs, it's the localStorage-fallback at mount — show it as a
+  // hint regardless of the active config, until the fresh fetch lands.
   const coocThumbs = discovery.cooccurrenceData?.elementThumbnails;
-  useEffect(() => {
-    if (coocThumbs && Object.keys(coocThumbs).length > 0) {
-      setElementThumbnails(coocThumbs);
-    }
-  }, [coocThumbs]);
+  const elementThumbnails =
+    coocThumbs && Object.keys(coocThumbs).length > 0
+      ? coocThumbs
+      : fetchedThumbs.configId === null || fetchedThumbs.configId === activeConfigId
+        ? fetchedThumbs.thumbs
+        : undefined;
 
   // Derived state
   const states = sm.activeConfig?.states ?? [];
@@ -346,13 +363,23 @@ export function UIBridgeStateMachinePage() {
   const [diagramLoading, setDiagramLoading] = useState(false);
   const [diagramRefreshNonce, setDiagramRefreshNonce] = useState(0);
 
+  // Mermaid can't render state graphs of arbitrary size — above ~50 nodes
+  // its layout engine bogs down or crashes WebView2. Skip the fetch entirely
+  // past this threshold and show a message via DiagramTab.unavailableReason.
+  const DIAGRAM_MAX_NODES = 50;
+  const diagramUnavailableReason =
+    states.length > DIAGRAM_MAX_NODES
+      ? `Diagram is too large to render (${states.length} states). Mermaid chokes above ~${DIAGRAM_MAX_NODES} nodes — use the State View or Graph Editor tabs instead.`
+      : undefined;
+
   useEffect(() => {
     if (activeTab !== "diagram" || !hasConfig) return;
+    if (diagramUnavailableReason) return;
     if (!dataAdapter.getMermaidDiagram) return;
     let cancelled = false;
 
-    setDiagramLoading(true);
     (async () => {
+      setDiagramLoading(true);
       try {
         const src = await dataAdapter.getMermaidDiagram!(introspectionActiveIds);
         if (cancelled) return;
@@ -366,7 +393,14 @@ export function UIBridgeStateMachinePage() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, hasConfig, activeConfigId, introspectionActiveIds, diagramRefreshNonce]);
+  }, [
+    activeTab,
+    hasConfig,
+    activeConfigId,
+    introspectionActiveIds,
+    diagramRefreshNonce,
+    diagramUnavailableReason,
+  ]);
 
   const handleRefreshDiagram = useCallback(() => {
     setDiagramRefreshNonce((n) => n + 1);
@@ -705,6 +739,7 @@ export function UIBridgeStateMachinePage() {
           <TransitionsPanel
             states={states}
             transitions={transitions}
+            selectedTransitionId={selectedTransitionId}
             onSelectTransition={(id) => {
               setSelectedTransitionId(id);
               setSelectedStateId(null);
@@ -733,6 +768,7 @@ export function UIBridgeStateMachinePage() {
             diagramSource={diagramSource}
             isLoading={diagramLoading}
             onRefresh={handleRefreshDiagram}
+            unavailableReason={diagramUnavailableReason}
           />
         </div>
       </div>
