@@ -20,10 +20,6 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    discoverDirs();
-  }, []);
-
   const discoverDirs = async () => {
     setLoading(true);
     try {
@@ -37,6 +33,10 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    discoverDirs();
+  }, []);
 
   const toggleDir = useCallback((path: string) => {
     setChecked((prev) => {
