@@ -127,9 +127,17 @@ export function useStateExplorer(): UseStateExplorerReturn {
     }
   }, []);
 
-  // Load history on mount
+  // Load history on mount. Deferred into a microtask so the setState
+  // inside refreshHistory doesn't fire synchronously from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    refreshHistory();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void refreshHistory();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [refreshHistory]);
 
   // Load a specific report
