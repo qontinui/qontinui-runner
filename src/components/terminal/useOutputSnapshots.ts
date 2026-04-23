@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 export function useOutputSnapshots(lastOutputLines: Record<string, string[]>): {
   snapshotZone: (tabId: string) => void;
@@ -9,33 +9,30 @@ export function useOutputSnapshots(lastOutputLines: Record<string, string[]>): {
   diffZones: [number, number] | null;
   setDiffZones: (zones: [number, number] | null) => void;
 } {
-  const outputSnapshotsRef = useRef<Record<string, string[]>>({});
+  const [outputSnapshots, setOutputSnapshots] = useState<Record<string, string[]>>({});
   const [snapshotDiff, setSnapshotDiff] = useState<{
     tabId: string;
     snapshot: string[];
     current: string[];
   } | null>(null);
-  const [snapshotCounter, setSnapshotCounter] = useState(0);
   const [diffZones, setDiffZones] = useState<[number, number] | null>(null);
 
   // Set of tab IDs that have output snapshots stored
-  const snapshotZones = useMemo(
-    () => new Set(Object.keys(outputSnapshotsRef.current)),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [snapshotCounter],
-  );
+  const snapshotZones = useMemo(() => new Set(Object.keys(outputSnapshots)), [outputSnapshots]);
 
   const snapshotZone = useCallback(
     (tabId: string) => {
-      outputSnapshotsRef.current[tabId] = [...(lastOutputLines[tabId] ?? [])];
-      setSnapshotCounter((c) => c + 1);
+      setOutputSnapshots((prev) => ({
+        ...prev,
+        [tabId]: [...(lastOutputLines[tabId] ?? [])],
+      }));
     },
     [lastOutputLines],
   );
 
   const compareSnapshot = useCallback(
     (tabId: string) => {
-      const snapshot = outputSnapshotsRef.current[tabId];
+      const snapshot = outputSnapshots[tabId];
       if (snapshot) {
         setSnapshotDiff({
           tabId,
@@ -44,7 +41,7 @@ export function useOutputSnapshots(lastOutputLines: Record<string, string[]>): {
         });
       }
     },
-    [lastOutputLines],
+    [outputSnapshots, lastOutputLines],
   );
 
   const clearSnapshotDiff = useCallback(() => {
