@@ -13,7 +13,7 @@
  * 3. Runner override (this hook) - highest priority
  */
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback } from "react";
 import type { InitialStatesSource } from "../types/state-machine";
 import { createLogger } from "@/lib/logger";
 
@@ -58,25 +58,26 @@ export function useInitialStatesOverride(
 ): UseInitialStatesOverrideReturn {
   const [overrideStateIds, setOverrideStateIdsInternal] = useState<string[] | null>(null);
 
-  // Clear override when workflow changes
-  useEffect(() => {
+  // Clear override when workflow or config version changes. Done via the
+  // "compare prev prop during render" pattern (React docs) rather than a
+  // useEffect that would synchronously setState
+  // (react-hooks/set-state-in-effect).
+  const [prevWorkflow, setPrevWorkflow] = useState(selectedWorkflow);
+  const [prevConfigVersion, setPrevConfigVersion] = useState(configVersion);
+  if (selectedWorkflow !== prevWorkflow) {
+    setPrevWorkflow(selectedWorkflow);
     if (overrideStateIds !== null) {
       log.debug("Clearing override due to workflow change");
-
       setOverrideStateIdsInternal(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Only trigger on workflow change, not on overrideStateIds
-  }, [selectedWorkflow]);
-
-  // Clear override when config is reloaded
-  useEffect(() => {
+  }
+  if (configVersion !== prevConfigVersion) {
+    setPrevConfigVersion(configVersion);
     if (configVersion > 0 && overrideStateIds !== null) {
       log.debug("Clearing override due to config reload");
-
       setOverrideStateIdsInternal(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Only trigger on config version change
-  }, [configVersion]);
+  }
 
   /**
    * Set the override state IDs
