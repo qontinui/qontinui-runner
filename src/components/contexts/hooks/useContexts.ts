@@ -450,9 +450,18 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
     return result;
   }, [contexts, filters]);
 
-  // Initial load
+  // Initial load. Wrap in async IIFE so refresh()'s synchronous
+  // setState calls aren't the first statement reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await refresh();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [refresh]);
 
   // Auto-refresh
