@@ -2366,6 +2366,14 @@ async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, Strin
         }
     }
 
+    // Tauri apps are typically tab-based (no route files) — their convention
+    // is `src/**/<Name>Page.tsx`. If `src-tauri/` exists, scan for that
+    // pattern in addition to whatever the framework-specific discovery
+    // already found (they're deduped below).
+    if project.join("src-tauri").exists() {
+        discover_tauri_pages(&project, &mut pages).await;
+    }
+
     // Deduplicate pages by component_path
     pages.sort_by(|a, b| a.component_path.cmp(&b.component_path));
     pages.dedup_by(|a, b| a.component_path == b.component_path);
@@ -2472,6 +2480,126 @@ async fn discover_generic_pages(project: &PathBuf, pages: &mut Vec<PageComponent
     discover_react_pages(project, pages).await;
     // Also check Next.js patterns
     discover_nextjs_pages(project, pages).await;
+}
+
+/// Discover pages in a Tauri (tab-based) app. The convention is files named
+/// `<Something>Page.tsx` anywhere under `src/` — these back tab entries in a
+/// TabContent switch rather than URL routes. Route slugs are derived from
+/// the filename (PascalCase stripped of the `Page` suffix → kebab-case).
+async fn discover_tauri_pages(project: &PathBuf, pages: &mut Vec<PageComponent>) {
+    let src_dir = project.join("src");
+    if !src_dir.exists() {
+        return;
+    }
+    let mut stack = vec![src_dir];
+    while let Some(current) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&current).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            // Skip noise / generated output.
+            if file_name.starts_with('.')
+                || file_name == "node_modules"
+                || file_name == "dist"
+                || file_name == "build"
+                || file_name == "specs"
+            {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            // Match <Name>Page.tsx / <Name>Page.jsx but not test/stories files.
+            let matches_page = (file_name.ends_with("Page.tsx") || file_name.ends_with("Page.jsx"))
+                && !file_name.ends_with(".test.tsx")
+                && !file_name.ends_with(".test.jsx")
+                && !file_name.ends_with(".stories.tsx")
+                && !file_name.ends_with(".stories.jsx");
+            if !matches_page {
+                continue;
+            }
+            let rel_path = path
+                .strip_prefix(project)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let component_name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Page")
+                .to_string();
+            let route = pascal_name_to_route(&component_name);
+            pages.push(PageComponent {
+                route,
+                component_path: rel_path,
+                component_name,
+                has_registrations: false,
+                has_data_page_id: false,
+                has_spec: false,
+                has_tutorial: false,
+            });
+        }
+    }
+}
+
+/// Convert a PascalCase component name (typically ending in `Page`) into a
+/// route slug. Examples:
+///   - "PromptHomePage" -> "/prompt-home"
+///   - "UIBridgeIntegrationPage" -> "/ui-bridge-integration"
+///   - "ProjectExplainerPage" -> "/project-explainer"
+fn pascal_name_to_route(name: &str) -> String {
+    let trimmed = name.strip_suffix("Page").unwrap_or(name);
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    // Insert a `-` before each uppercase letter that follows a lowercase one
+    // OR a sequence boundary within an acronym (e.g. `UIBridge` -> `ui-bridge`).
+    let mut out = String::with_capacity(trimmed.len() + 4);
+    let chars: Vec<char> = trimmed.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if i > 0 && c.is_ascii_uppercase() {
+            let prev = chars[i - 1];
+            let next = chars.get(i + 1).copied();
+            // Split on lower-to-upper boundary, and on acronym-to-word
+            // boundary (e.g. `UIB` -> `ui-b` when followed by lowercase).
+            let insert_dash = prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase()
+                    && next.is_some_and(|n| n.is_ascii_lowercase()));
+            if insert_dash {
+                out.push('-');
+            }
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    format!("/{}", out)
+}
+
+#[cfg(test)]
+mod pascal_route_tests {
+    use super::pascal_name_to_route;
+    #[test]
+    fn converts_page_names() {
+        assert_eq!(pascal_name_to_route("PromptHomePage"), "/prompt-home");
+        assert_eq!(
+            pascal_name_to_route("UIBridgeIntegrationPage"),
+            "/ui-bridge-integration"
+        );
+        assert_eq!(
+            pascal_name_to_route("ProjectExplainerPage"),
+            "/project-explainer"
+        );
+        assert_eq!(pascal_name_to_route("HomePage"), "/home");
+        assert_eq!(pascal_name_to_route("Page"), "/");
+    }
 }
 
 /// Recursively walk a directory for page files.

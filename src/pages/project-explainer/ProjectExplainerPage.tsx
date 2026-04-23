@@ -95,6 +95,12 @@ export function ProjectExplainerPage() {
     actions: ["click"],
   });
 
+  // Strip the leading `<!-- FILE: path -->` marker the explainer generator
+  // embeds on line 1 of every file. react-markdown renders raw HTML comments
+  // as literal text, so leaving it in makes the marker visible to the user.
+  const stripFileMarker = (content: string): string =>
+    content.replace(/^\s*<!--\s*FILE:[^>]*-->\s*\r?\n?/, "");
+
   const loadFile = useCallback(
     async (relPath: string, pushHistory = true) => {
       if (!projectPath.trim()) return;
@@ -122,10 +128,11 @@ export function ProjectExplainerPage() {
           setMarkdown("");
           return;
         }
-        cacheRef.current[relPath] = data.data;
+        const stripped = stripFileMarker(data.data);
+        cacheRef.current[relPath] = stripped;
         if (pushHistory && currentFile !== relPath) setHistory((h) => [...h, currentFile]);
         setCurrentFile(relPath);
-        setMarkdown(data.data);
+        setMarkdown(stripped);
       } catch (e) {
         setLoadError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -188,10 +195,13 @@ export function ProjectExplainerPage() {
     [resolveLink, loadFile],
   );
 
-  // On project path set, load the index.
+  // On project path set, load the index. Intentionally resets the file cache
+  // + history (setState in effect) because switching projects is a fresh
+  // start — the alternative (remounting via a key) is more invasive.
   useEffect(() => {
     if (!projectPath.trim()) return;
     cacheRef.current = {};
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional reset on project switch
     setHistory([]);
     void loadFile("index.md", false);
     // eslint-disable-next-line react-hooks/exhaustive-deps

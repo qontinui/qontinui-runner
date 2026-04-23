@@ -451,6 +451,12 @@ export function HookGenerationPanel({
   const chainToDemoScriptRef = useRef<((route: string, signal: AbortSignal) => void) | null>(null);
   const currentControllerRef = useRef<AbortController | null>(null);
 
+  // Pages as originally passed to handleGeneratePages — pageQueueRef gets
+  // drained during the run, so the Project Explainer falls back to this
+  // when it needs to load specs from disk (for demo/tour + explainer runs
+  // where no fresh specs were generated).
+  const originalPagesRef = useRef<PageComponent[]>([]);
+
   const pageOptionsRef = useRef<PageGenerationOptions>({
     generateRegistrations: true,
     generateDataPageIds: true,
@@ -1024,24 +1030,69 @@ export function HookGenerationPanel({
               setStepStatuses((prev) =>
                 prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
               );
-              if (!maybeStartExplainerPhase()) {
+              if (!(await maybeStartExplainerPhase())) {
                 setPhase("preview");
               }
             })();
-          } else if (!maybeStartExplainerPhase()) {
-            setPhase("preview");
+          } else {
+            (async () => {
+              if (!(await maybeStartExplainerPhase())) {
+                setPhase("preview");
+              }
+            })();
           }
         }
       }
 
       /** If generateProjectExplainer is on and we haven't started yet, kick off
        * the explainer phase (index → clusters → pages). Returns true when the
-       * phase was started so the caller knows to NOT transition to preview. */
-      function maybeStartExplainerPhase(): boolean {
+       * phase was started so the caller knows to NOT transition to preview.
+       *
+       * Async because when no specs were generated in this run (e.g. a
+       * demo/tour + explainer re-run), we fall back to reading existing specs
+       * + architecture diagrams from disk for every page in the run, so the
+       * explainer can still compose a document. */
+      async function maybeStartExplainerPhase(): Promise<boolean> {
         if (!pageOptionsRef.current.generateProjectExplainer) return false;
         if (explainerContextRef.current) return false; // already running
-        const { specs, arch } = gatherExplainerInputs(allGeneratedFilesRef.current);
-        if (specs.length === 0) return false; // nothing to explain
+
+        let { specs, arch } = gatherExplainerInputs(allGeneratedFilesRef.current);
+
+        if (specs.length === 0) {
+          // No fresh specs in memory — fall back to reading existing specs +
+          // architecture diagrams from disk for each page we were asked about.
+          const diskFiles: GeneratedFile[] = [];
+          for (const p of originalPagesRef.current) {
+            if (controller.signal.aborted) return false;
+            const slug = p.route.replace(/^\//, "").replace(/\//g, "-") || "root";
+            const specBody = await readProjectFile(
+              `src/specs/${slug}.spec.uibridge.json`,
+              controller.signal,
+            );
+            if (specBody) {
+              diskFiles.push({
+                filePath: `${slug}.spec.uibridge.json`,
+                content: specBody,
+              });
+            }
+            const archBody = await readProjectFile(
+              `src/specs/architecture/${slug}.arch.mmd`,
+              controller.signal,
+            );
+            if (archBody) {
+              diskFiles.push({
+                filePath: `src/specs/architecture/${slug}.arch.mmd`,
+                content: archBody,
+              });
+            }
+          }
+          if (controller.signal.aborted) return false;
+          const fromDisk = gatherExplainerInputs(diskFiles);
+          specs = fromDisk.specs;
+          arch = fromDisk.arch;
+        }
+
+        if (specs.length === 0) return false; // still nothing — give up
         const clusters = clusterSpecsByPrefix(specs);
         const projectName = projectPath.split(/[\\/]/).filter(Boolean).slice(-1)[0] || "Project";
         explainerContextRef.current = { specs, arch, clusters, projectName };
@@ -1501,6 +1552,7 @@ export function HookGenerationPanel({
       setGeneratedFiles([]);
       setWriteResult(null);
       pageQueueRef.current = [...pages];
+      originalPagesRef.current = [...pages];
       pageOptionsRef.current = options;
       processedMessageCountRef.current = 0;
 
