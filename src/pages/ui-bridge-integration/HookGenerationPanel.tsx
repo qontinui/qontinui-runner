@@ -1392,12 +1392,17 @@ export function HookGenerationPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.sessionState, handleSessionTransition]);
 
-  // When entering preview, ensure all files are expanded
-  useEffect(() => {
+  // When entering preview, ensure all files are expanded. Detect the
+  // transition during render so the setState is inline (allowed pattern)
+  // instead of via a post-render effect (set-state-in-effect).
+  const [prevPreviewKey, setPrevPreviewKey] = useState<string | null>(null);
+  const previewKey = phase === "preview" ? generatedFiles.map((f) => f.filePath).join("\n") : null;
+  if (prevPreviewKey !== previewKey) {
+    setPrevPreviewKey(previewKey);
     if (phase === "preview") {
       setExpandedFiles(new Set(generatedFiles.map((f) => f.filePath)));
     }
-  }, [phase, generatedFiles]);
+  }
 
   // Toggle category selection
   const toggleCategory = useCallback((cat: HookCategory) => {
@@ -1722,6 +1727,54 @@ export function HookGenerationPanel({
     window.addEventListener("ui-bridge-generate-pages", handler);
     return () => window.removeEventListener("ui-bridge-generate-pages", handler);
   }, [handleGeneratePages]);
+
+  // Broadcast phase transitions so the top-level coordinator (one-click
+  // "Integrate this Project" flow) can react without reading our internal
+  // state. We emit three events:
+  //   - ui-bridge-generate-pages-complete : phase → "preview" (files ready)
+  //   - ui-bridge-generate-pages-applied  : phase → "applied" (files on disk)
+  //   - ui-bridge-generate-pages-error    : error set while generating
+  // The detail payload uses the step-statuses array which already tracks
+  // per-page success/failure, so the coordinator can render "Retry failed"
+  // without duplicating state here.
+  const prevPhaseRef = useRef<PanelPhase>(phase);
+  useEffect(() => {
+    const prev = prevPhaseRef.current;
+    prevPhaseRef.current = phase;
+    if (prev === phase) return;
+    if (phase === "preview") {
+      const failedLabels = stepStatuses.filter((s) => s.state === "error").map((s) => s.label);
+      const doneLabels = stepStatuses.filter((s) => s.state === "done").map((s) => s.label);
+      window.dispatchEvent(
+        new CustomEvent("ui-bridge-generate-pages-complete", {
+          detail: {
+            filesGenerated: allGeneratedFilesRef.current.length,
+            doneSteps: doneLabels,
+            failedSteps: failedLabels,
+          },
+        }),
+      );
+    } else if (phase === "applied") {
+      window.dispatchEvent(
+        new CustomEvent("ui-bridge-generate-pages-applied", {
+          detail: { filesWritten: writeResult?.files_written ?? [] },
+        }),
+      );
+    }
+  }, [phase, stepStatuses, writeResult]);
+
+  // Mirror errors during generation onto the coordinator's progress UI.
+  const prevErrorRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (error && error !== prevErrorRef.current) {
+      window.dispatchEvent(
+        new CustomEvent("ui-bridge-generate-pages-error", {
+          detail: { message: error },
+        }),
+      );
+    }
+    prevErrorRef.current = error;
+  }, [error]);
 
   // Apply generated files to project
   const handleApply = useCallback(async () => {

@@ -77,12 +77,17 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
     error: registeredError,
   } = useAppDiscovery();
 
-  // Collapse "Your Projects" when a project is selected
-  useEffect(() => {
+  // Collapse "Your Projects" when a project becomes selected. Done via the
+  // "compare prev prop during render" pattern (React docs) rather than a
+  // useEffect that would synchronously setState
+  // (react-hooks/set-state-in-effect).
+  const [prevSelectedProjectPath, setPrevSelectedProjectPath] = useState(selectedProjectPath);
+  if (selectedProjectPath !== prevSelectedProjectPath) {
+    setPrevSelectedProjectPath(selectedProjectPath);
     if (selectedProjectPath) {
       setProjectsExpanded(false);
     }
-  }, [selectedProjectPath]);
+  }
 
   // Load process configs via Tauri IPC on mount
   useEffect(() => {
