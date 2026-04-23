@@ -83,6 +83,21 @@ export function McpSettings({ onLog }: McpSettingsProps) {
   const [connecting, setConnecting] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<McpServerConfig | null>(null);
 
+  const loadAllStatus = async () => {
+    try {
+      const result = await invoke<TauriResult<McpServerStatus[]>>("get_mcp_servers_status");
+      if (result?.success && result.data) {
+        const statusMap = new Map<string, McpServerStatus>();
+        for (const status of result.data) {
+          statusMap.set(status.serverId, status);
+        }
+        setServerStatus(statusMap);
+      }
+    } catch (err) {
+      console.error("Failed to load server status:", err);
+    }
+  };
+
   const loadServers = async () => {
     setLoading(true);
     try {
@@ -104,21 +119,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
     loadServers();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const loadAllStatus = async () => {
-    try {
-      const result = await invoke<TauriResult<McpServerStatus[]>>("get_mcp_servers_status");
-      if (result?.success && result.data) {
-        const statusMap = new Map<string, McpServerStatus>();
-        for (const status of result.data) {
-          statusMap.set(status.serverId, status);
-        }
-        setServerStatus(statusMap);
-      }
-    } catch (err) {
-      console.error("Failed to load server status:", err);
-    }
-  };
 
   const handleConnect = async (serverId: string) => {
     setConnecting(serverId);
