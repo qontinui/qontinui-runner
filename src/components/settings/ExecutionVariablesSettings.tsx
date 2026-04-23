@@ -121,7 +121,13 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
   };
 
   useEffect(() => {
-    loadSettings();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadSettings();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
