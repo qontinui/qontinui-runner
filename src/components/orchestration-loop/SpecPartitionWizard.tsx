@@ -59,15 +59,23 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
   // Preview
   const [result, setResult] = useState<MultiRunnerSpecWorkflowResult | null>(null);
 
-  // Load data on mount
+  // Load data on mount. Both setState calls are deferred into a microtask
+  // so the effect body itself doesn't synchronously trigger state updates
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    const allSpecs = getAllSpecs();
-
-    setSpecs(allSpecs);
-
-    invoke<RunnerInstance[]>("get_runner_instances")
-      .then((instances) => setRunnerInstances(instances))
-      .catch(() => {});
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      setSpecs(getAllSpecs());
+      invoke<RunnerInstance[]>("get_runner_instances")
+        .then((instances) => {
+          if (!cancelled) setRunnerInstances(instances);
+        })
+        .catch(() => {});
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const runningRunners = runnerInstances.filter((r) => r.running);
