@@ -482,6 +482,10 @@ export function HookGenerationPanel({
   // Track how many AI messages we've already processed to avoid duplicate extraction
   const processedMessageCountRef = useRef(0);
 
+  // Page route being processed — mirrored from currentPageRef so the UI can
+  // re-render on page transitions without reading the ref during render.
+  const [currentPageName, setCurrentPageName] = useState<string>("");
+
   const isRegenHooks = analysis.has_generated_hooks;
   const isRegenSpec = analysis.has_architecture_spec;
 
@@ -984,6 +988,7 @@ export function HookGenerationPanel({
           // All pages done
           pendingStepRef.current = null;
           currentPageRef.current = null;
+          setCurrentPageName("");
 
           // Save product tours if any were generated
           const tours = productToursRef.current;
@@ -1230,6 +1235,7 @@ export function HookGenerationPanel({
 
       async function startPageGeneration(page: PageComponent, signal: AbortSignal) {
         currentPageRef.current = { page, source: null, registrationOutput: "" };
+        setCurrentPageName(page.route);
         setStepStatuses((prev) => [
           ...prev,
           { state: "active", label: `Registrations: ${page.route}` },
@@ -1591,6 +1597,7 @@ export function HookGenerationPanel({
       // Start first page
       const firstPage = pageQueueRef.current.shift()!;
       currentPageRef.current = { page: firstPage, source: null, registrationOutput: "" };
+      setCurrentPageName(firstPage.route);
       setStepStatuses((prev) => prev.map((s, i) => (i === 0 ? { ...s, state: "active" } : s)));
 
       // Fetch page source and send first prompt
@@ -1786,8 +1793,6 @@ export function HookGenerationPanel({
     phase === "generating-page-tutorial";
   const isGenerating =
     phase === "generating-hooks" || phase === "generating-spec" || isPerPagePhase;
-
-  const currentPageName = currentPageRef.current?.page.route || "";
 
   // Group generated files by page for preview
   const groupedFiles = generatedFiles.reduce<Record<string, GeneratedFile[]>>((acc, f) => {
