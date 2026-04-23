@@ -11,6 +11,8 @@ use crate::commands::{AppState, CommandResponse};
 use crate::orchestrator::hooks::{Hook, HookAction, HookCondition, HookContext, HookTrigger};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -858,4 +860,22 @@ pub async fn test_hook(
                 .map_err(|e| format!("Failed to serialize result: {}", e))?,
         ),
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_hooks")
+        .invoke_handler(tauri::generate_handler![
+            get_all_hooks,
+            get_hook,
+            create_hook,
+            update_hook,
+            delete_hook,
+            set_hook_enabled,
+            reorder_hooks,
+            test_hook,
+        ])
+        .build()
 }

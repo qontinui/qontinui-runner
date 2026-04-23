@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 use crate::commands::AppState;
@@ -68,4 +70,13 @@ pub async fn search_events(
             score: r.score as f64,
         })
         .collect())
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_event_search")
+        .invoke_handler(tauri::generate_handler![search_events,])
+        .build()
 }

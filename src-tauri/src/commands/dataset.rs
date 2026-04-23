@@ -14,6 +14,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info, warn};
 use zip::ZipArchive;
@@ -504,4 +506,13 @@ names: [{}]
             format!("Failed to serialize package result: {}", e)
         })?),
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_dataset")
+        .invoke_handler(tauri::generate_handler![scan_local_images, package_dataset,])
+        .build()
 }

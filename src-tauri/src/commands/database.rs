@@ -7,6 +7,8 @@
 
 use crate::database::DatabaseStats;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -120,4 +122,17 @@ pub async fn explain_query_plan(
             "plan": plan
         })),
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_database")
+        .invoke_handler(tauri::generate_handler![
+            optimize_database,
+            get_database_stats,
+            explain_query_plan,
+        ])
+        .build()
 }

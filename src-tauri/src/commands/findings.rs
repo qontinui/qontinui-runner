@@ -4,6 +4,8 @@
 //! stored in the checkpoint database.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -127,4 +129,22 @@ pub async fn list_task_knowledge_cmd(
         .pg_db
         .list_task_knowledge(&task_run_id, category.as_deref(), false, false)
         .await
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_findings")
+        .invoke_handler(tauri::generate_handler![
+            get_task_findings,
+            get_findings_by_status_cmd,
+            get_finding_by_id,
+            update_finding,
+            resolve_finding,
+            provide_finding_response,
+            get_findings_summary,
+            list_task_knowledge_cmd,
+        ])
+        .build()
 }

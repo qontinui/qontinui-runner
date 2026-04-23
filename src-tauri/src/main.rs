@@ -477,6 +477,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::dev_findings::plugin())
         .plugin(commands::file_browser::plugin())
         .plugin(commands::window_manager::plugin())
+        .plugin(commands::checks::plugin())
+        .plugin(commands::checkpoints::plugin())
+        .plugin(commands::comparison::plugin())
+        .plugin(commands::container_settings::plugin())
+        .plugin(commands::dag_workflows::plugin())
+        .plugin(commands::database::plugin())
+        .plugin(commands::dataset::plugin())
+        .plugin(commands::discoveries::plugin())
+        .plugin(commands::event_search::plugin())
+        .plugin(commands::findings::plugin())
+        .plugin(commands::hooks::plugin())
+        .plugin(commands::issues::plugin())
+        .plugin(commands::known_issues::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -527,9 +540,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::save_claude_config_dirs,
             commands::config::get_claude_account_launch_commands,
             commands::config::save_claude_account_launch_commands,
-            // Dataset commands
-            commands::dataset::scan_local_images,
-            commands::dataset::package_dataset,
+            // NOTE: dataset handlers moved to per-module plugin (see .plugin() calls above).
             // Execution commands - python_executor
             commands::execution::python_executor::start_python_executor,
             commands::execution::python_executor::stop_python_executor,
@@ -702,8 +713,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution_variables::save_execution_variables_settings,
             commands::execution_variables::get_resolved_execution_context,
             commands::execution_variables::test_env_var,
-            // Issues sync commands
-            commands::issues::sync_issues_to_backend,
+            // NOTE: issues handlers moved to per-module plugin (see .plugin() calls above).
             // Unified execution reporting commands
             commands::execution_reporting::create_execution_run,
             commands::execution_reporting::report_action_executions,
@@ -712,44 +722,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution_reporting::complete_execution_run,
             // Workflow events (mobile push notifications)
             commands::workflow_events::emit_workflow_event,
-            // DAG workflow commands
-            commands::dag_workflows::validate_dag_workflow,
-            commands::dag_workflows::import_dag_workflow,
-            commands::dag_workflows::import_dag_workflows_from_project,
-            commands::dag_workflows::export_dag_workflow,
-            commands::dag_workflows::respond_dag_approval,
-            // Checkpoint/session commands (PostgreSQL)
-            commands::checkpoints::checkpoint_get,
-            commands::checkpoints::checkpoint_save,
-            commands::checkpoints::checkpoint_delete,
-            commands::checkpoints::checkpoint_list_active,
-            commands::checkpoints::checkpoint_status,
-            commands::checkpoints::checkpoint_history,
-            commands::checkpoints::session_create,
-            commands::checkpoints::session_update_status,
-            commands::checkpoints::setting_get,
-            commands::checkpoints::setting_set,
-            commands::checkpoints::settings_get_all,
-            // Findings commands (AI-detected issues)
-            commands::findings::get_task_findings,
-            commands::findings::get_findings_by_status_cmd,
-            commands::findings::get_finding_by_id,
-            commands::findings::update_finding,
-            commands::findings::resolve_finding,
-            commands::findings::provide_finding_response,
-            commands::findings::get_findings_summary,
-            commands::findings::list_task_knowledge_cmd,
-            // Known Issues Registry commands
-            commands::known_issues::list_known_issues,
-            commands::known_issues::find_issues_for_spec,
-            commands::known_issues::create_known_issue,
-            commands::known_issues::update_known_issue,
-            commands::known_issues::delete_known_issue,
-            commands::known_issues::resolve_known_issue,
-            commands::known_issues::list_pattern_templates,
-            commands::known_issues::create_pattern_template,
-            commands::known_issues::export_known_issues,
-            commands::known_issues::import_known_issues,
+            // NOTE: dag_workflows, checkpoints, findings, known_issues handlers moved to
+            // per-module plugins (see .plugin() calls above).
             // State Machine Config Builder commands (CRUD for configs, states, transitions)
             commands::state_machine_configs::sm_list_configs,
             commands::state_machine_configs::sm_get_config,
@@ -804,13 +778,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // AI Session History commands (for Runs page)
             commands::tiered_info::get_ai_session_history,
             commands::tiered_info::delete_ai_session,
-            // Discovery Push commands
-            commands::discoveries::get_pending_discoveries_cmd,
-            commands::discoveries::get_discovery_summary,
-            commands::discoveries::sync_discoveries,
-            commands::discoveries::clear_discovery,
-            commands::discoveries::clear_failed_discoveries,
-            commands::discoveries::get_discovery_sync_status,
+            // NOTE: discoveries handlers moved to per-module plugin (see .plugin() calls above).
             // Context commands (AI knowledge snippets)
             commands::context::get_all_contexts,
             commands::context::get_context,
@@ -902,39 +870,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::testing::generate_test_metadata,
             commands::testing::list_recent_task_runs,
             commands::testing::get_workflow_run_context,
-            // Code quality check commands
-            commands::checks::execute_code_check,
-            commands::checks::execute_code_check_suite,
-            commands::checks::execute_check_by_id,
-            commands::checks::list_checks,
-            commands::checks::get_check,
-            commands::checks::create_check,
-            commands::checks::update_check,
-            commands::checks::delete_check,
-            commands::checks::detect_project_check_suggestions,
-            commands::checks::get_check_tool_info,
-            commands::checks::get_check_results,
-            // Check group commands
-            commands::checks::list_check_groups,
-            commands::checks::get_check_group,
-            commands::checks::create_check_group,
-            commands::checks::update_check_group,
-            commands::checks::delete_check_group,
-            commands::checks::get_checks_in_group,
-            commands::checks::set_checks_in_group,
-            commands::checks::execute_check_group,
-            commands::checks::repair_check_group_associations,
+            // NOTE: checks handlers moved to per-module plugin (see .plugin() calls above).
             // Screenshot listing commands
             commands::screenshots::list_screenshots,
-            // Lifecycle Hooks commands
-            commands::hooks::get_all_hooks,
-            commands::hooks::get_hook,
-            commands::hooks::create_hook,
-            commands::hooks::update_hook,
-            commands::hooks::delete_hook,
-            commands::hooks::set_hook_enabled,
-            commands::hooks::reorder_hooks,
-            commands::hooks::test_hook,
+            // NOTE: hooks handlers moved to per-module plugin (see .plugin() calls above).
             // Learning insights dashboard commands
             commands::learning::get_learning_summary,
             commands::learning::get_learning_patterns,
@@ -1049,10 +988,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::durable_execution::get_iteration_diffs,
             commands::durable_execution::get_iteration_commits,
             commands::durable_execution::get_phase_results,
-            // Database maintenance commands
-            commands::database::optimize_database,
-            commands::database::get_database_stats,
-            commands::database::explain_query_plan,
+            // NOTE: database handlers moved to per-module plugin (see .plugin() calls above).
             // Comprehensive backup commands
             commands::backup::get_export_summary,
             commands::backup::export_all_data,
@@ -1323,10 +1259,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::meta_optimizer::get_prompt_evolution_history,
             commands::meta_optimizer::get_prompt_variant_content,
             commands::meta_optimizer::get_prompt_evolution_diff,
-            // Comparison commands
-            commands::comparison::start_comparison,
-            commands::comparison::get_comparison_status,
-            commands::comparison::list_comparisons,
+            // NOTE: comparison handlers moved to per-module plugin (see .plugin() calls above).
             // Spec experimentation commands
             spec_experimentation::commands::get_spec_compliance_history,
             spec_experimentation::commands::get_spec_compliance_summary,
@@ -1364,8 +1297,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::activity_timeline::get_scripted_output_stats,
             commands::scripted_output_settings::get_scripted_output_settings,
             commands::scripted_output_settings::save_scripted_output_settings,
-            // Unified event search across activity_timeline, observations, deferred_questions, error_events
-            commands::event_search::search_events,
+            // NOTE: event_search handlers moved to per-module plugin (see .plugin() calls above).
             // Watcher commands (screenpipe-inspired reactive AI agents)
             commands::watchers::create_watcher,
             commands::watchers::get_watcher,
@@ -1373,10 +1305,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::watchers::update_watcher,
             commands::watchers::delete_watcher,
             commands::watchers::set_watcher_enabled,
-            // Container settings commands (Docker isolation)
-            commands::container_settings::get_container_settings,
-            commands::container_settings::update_container_settings,
-            commands::container_settings::check_docker_status,
+            // NOTE: container_settings handlers moved to per-module plugin (see .plugin() calls above).
             // Security settings commands (sandbox policies, profiles)
             commands::security_settings::get_security_settings,
             commands::security_settings::update_security_settings,

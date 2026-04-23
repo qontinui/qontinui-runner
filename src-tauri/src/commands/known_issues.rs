@@ -4,6 +4,8 @@
 //! stored in PostgreSQL.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -294,4 +296,24 @@ pub async fn create_pattern_template(
         template.name, template.id
     );
     Ok(template)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_known_issues")
+        .invoke_handler(tauri::generate_handler![
+            list_known_issues,
+            find_issues_for_spec,
+            create_known_issue,
+            update_known_issue,
+            delete_known_issue,
+            resolve_known_issue,
+            list_pattern_templates,
+            create_pattern_template,
+            export_known_issues,
+            import_known_issues,
+        ])
+        .build()
 }

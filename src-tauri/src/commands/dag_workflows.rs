@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 use super::AppState;
@@ -112,4 +114,19 @@ pub async fn respond_dag_approval(
     _state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     crate::step_executor::handlers::dag_nodes::resolve_approval(&approval_id, approved)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_dag_workflows")
+        .invoke_handler(tauri::generate_handler![
+            validate_dag_workflow,
+            import_dag_workflow,
+            import_dag_workflows_from_project,
+            export_dag_workflow,
+            respond_dag_approval,
+        ])
+        .build()
 }

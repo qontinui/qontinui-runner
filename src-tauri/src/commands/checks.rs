@@ -21,6 +21,8 @@ use crate::database::{
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -810,4 +812,34 @@ pub async fn repair_check_group_associations(
             data: None,
         }),
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_checks")
+        .invoke_handler(tauri::generate_handler![
+            execute_code_check,
+            execute_code_check_suite,
+            execute_check_by_id,
+            list_checks,
+            get_check,
+            create_check,
+            update_check,
+            delete_check,
+            detect_project_check_suggestions,
+            get_check_tool_info,
+            get_check_results,
+            list_check_groups,
+            get_check_group,
+            create_check_group,
+            update_check_group,
+            delete_check_group,
+            get_checks_in_group,
+            set_checks_in_group,
+            execute_check_group,
+            repair_check_group_associations,
+        ])
+        .build()
 }

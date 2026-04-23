@@ -5,6 +5,8 @@
 
 use crate::auth::AuthManager;
 use serde::{Deserialize, Serialize};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
@@ -238,4 +240,13 @@ pub async fn sync_issues_to_backend(
     }
 
     Ok(sync_response)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_issues")
+        .invoke_handler(tauri::generate_handler![sync_issues_to_backend,])
+        .build()
 }

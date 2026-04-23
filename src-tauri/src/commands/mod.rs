@@ -41,7 +41,9 @@
 //! command; tracked for migration.
 //!
 //! Migrated modules: clipboard, debug, dev_findings, file_browser,
-//! window_manager (as of this commit).
+//! window_manager, checks, checkpoints, comparison, container_settings,
+//! dag_workflows, database, dataset, discoveries, event_search, findings,
+//! hooks, issues, known_issues (as of this commit).
 //!
 //! To migrate a module `foo.rs`:
 //! 1. Add `use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};` and

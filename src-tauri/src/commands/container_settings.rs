@@ -10,6 +10,8 @@ use crate::container::docker_client::DockerManager;
 use crate::container::isolated_executor::IsolatedExecutor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -138,4 +140,17 @@ pub async fn check_docker_status(
                 .map_err(|e| format!("Failed to serialize status: {}", e))?,
         ),
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_container_settings")
+        .invoke_handler(tauri::generate_handler![
+            get_container_settings,
+            update_container_settings,
+            check_docker_status,
+        ])
+        .build()
 }
