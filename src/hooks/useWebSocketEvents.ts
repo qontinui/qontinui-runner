@@ -338,7 +338,6 @@ export function useWebSocketEvents(
 
   // Keep the stable ref in sync with the latest connect() callback.
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability -- legit mutable ref used to break self-reference in connect's setTimeout
     connectRef.current = connect;
   }, [connect]);
 
