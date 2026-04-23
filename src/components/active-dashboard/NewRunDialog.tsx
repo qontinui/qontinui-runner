@@ -6,7 +6,7 @@
  * Headless mode (parallel, no GUI control).
  */
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { X, Monitor, Cloud, AlertTriangle, Loader2 } from "lucide-react";
 import { Button } from "../ui";
@@ -58,14 +58,19 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Reset state when dialog opens
-  useEffect(() => {
+  // Reset state when dialog opens. Track prevOpen in state so the
+  // false→true transition is detected during render; calling setState
+  // inline during render is the sanctioned React pattern for this,
+  // avoiding a post-render effect (set-state-in-effect).
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (prevOpen !== open) {
+    setPrevOpen(open);
     if (open) {
       setSelectedMode("headless");
       setForceGuiLock(false);
       setError(null);
     }
-  }, [open]);
+  }
 
   // Check if GUI lock is held by another bridge
   const guiLockConflict = selectedMode === "gui" && guiLockHolderId !== null;
