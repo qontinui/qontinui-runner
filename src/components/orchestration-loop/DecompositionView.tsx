@@ -210,10 +210,19 @@ export function DecompositionView({ running }: DecompositionViewProps) {
       return;
     }
 
-    setLoading(true);
-    fetchPlan();
+    // Defer the initial setLoading + fetchPlan via microtask so the effect
+    // body itself doesn't synchronously trigger setState.
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      setLoading(true);
+      void fetchPlan();
+    });
     const interval = setInterval(fetchPlan, 3000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [running]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Nothing to show
