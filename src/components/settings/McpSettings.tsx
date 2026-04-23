@@ -116,7 +116,13 @@ export function McpSettings({ onLog }: McpSettingsProps) {
   };
 
   useEffect(() => {
-    loadServers();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadServers();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
