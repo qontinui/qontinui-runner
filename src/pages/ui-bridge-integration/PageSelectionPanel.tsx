@@ -75,9 +75,14 @@ export function PageSelectionPanel({
   }, [projectPath]);
 
   useEffect(() => {
-    if (projectPath) {
-      discoverPages();
-    }
+    if (!projectPath) return;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void discoverPages();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [projectPath, discoverPages]);
 
   const togglePage = (path: string) => {
