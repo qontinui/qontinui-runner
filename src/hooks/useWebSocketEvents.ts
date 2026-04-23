@@ -207,6 +207,8 @@ export function useWebSocketEvents(
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shouldReconnectRef = useRef(true);
+  // Stable ref to break the self-referential loop in `connect`'s reconnect logic.
+  const connectRef = useRef<() => void>(() => {});
   // Captured once at mount — environment doesn't change during hook lifetime.
   const [isTauri] = useState(() => isTauriEnvironment());
 
@@ -299,7 +301,7 @@ export function useWebSocketEvents(
           reconnectTimeoutRef.current = setTimeout(() => {
             setReconnectAttempts((prev) => prev + 1);
 
-            connect();
+            connectRef.current();
           }, delay);
         }
       };
@@ -333,6 +335,12 @@ export function useWebSocketEvents(
     onDisconnected,
     onError,
   ]);
+
+  // Keep the stable ref in sync with the latest connect() callback.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability -- legit mutable ref used to break self-reference in connect's setTimeout
+    connectRef.current = connect;
+  }, [connect]);
 
   // Disconnect from WebSocket
   const disconnect = useCallback(() => {
