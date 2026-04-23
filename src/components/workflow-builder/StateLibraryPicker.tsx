@@ -83,12 +83,19 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
     };
   }, [isOpen]);
 
-  // Reset selection when modal opens
+  // Reset selection when modal opens. The resets are deferred via a microtask
+  // so the effect body itself doesn't call setState synchronously.
   useEffect(() => {
-    if (isOpen) {
+    if (!isOpen) return;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
       setSelectedId(null);
       setSearchQuery("");
-    }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [isOpen]);
 
   // Filter states
