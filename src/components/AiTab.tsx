@@ -162,7 +162,13 @@ export function AiTab({
   const [lastResult, setLastResult] = useState<{ success: boolean; message: string } | null>(null);
 
   // Per-run auto-continue setting
-  const [runAutoContinue, setRunAutoContinue] = useState<boolean | null>(null);
+  // Per-run auto-continue is fetched keyed by sessionId. Storing the key with
+  // the value lets us treat "session changed" as a pure derivation (see
+  // `runAutoContinue` below) instead of a sync setState in an effect body.
+  const [fetchedRunAutoContinue, setFetchedRunAutoContinue] = useState<{
+    sessionId: string | null;
+    value: boolean | null;
+  }>({ sessionId: null, value: null });
   const [runAutoContinueLoading, setRunAutoContinueLoading] = useState(false);
 
   // Filter AI output lines by selected run if available from RunSelectionContext
@@ -183,50 +189,61 @@ export function AiTab({
     [runFilteredAiOutputLines],
   );
 
-  // Handle pending navigation from Recap page (auto-select matching session)
+  // Handle pending navigation from Recap page (auto-select matching session).
+  // Wrapped in a microtask so the effect body itself doesn't call setState
+  // synchronously — this is a one-shot navigation intent, not a render-time
+  // derivation.
   useEffect(() => {
     if (loops.length === 0) return;
+    let cancelled = false;
 
-    try {
-      const pending = instanceStorage.getItem("qontinui-ai-output-navigate");
-      if (!pending) return;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      try {
+        const pending = instanceStorage.getItem("qontinui-ai-output-navigate");
+        if (!pending) return;
 
-      // Consume the navigation intent immediately
-      instanceStorage.removeItem("qontinui-ai-output-navigate");
+        // Consume the navigation intent immediately
+        instanceStorage.removeItem("qontinui-ai-output-navigate");
 
-      const { phase, phaseIteration } = JSON.parse(pending) as {
-        phase: string;
-        phaseIteration?: number;
-      };
+        const { phase, phaseIteration } = JSON.parse(pending) as {
+          phase: string;
+          phaseIteration?: number;
+        };
 
-      // Find matching loop: match phase, and optionally phaseIteration
-      let matchedLoop: AiLoop | undefined;
+        // Find matching loop: match phase, and optionally phaseIteration
+        let matchedLoop: AiLoop | undefined;
 
-      if (phaseIteration !== undefined) {
-        // Prefer exact match on phase + phaseIteration
-        matchedLoop = loops.find(
-          (loop) =>
-            loop.phase === phase &&
-            loop.entries.length > 0 &&
-            loop.entries[0].phaseIteration === phaseIteration,
-        );
-      }
-
-      // Fall back to just phase match (pick last one of that phase)
-      if (!matchedLoop) {
-        const phaseLoops = loops.filter((loop) => loop.phase === phase);
-        if (phaseLoops.length > 0) {
-          matchedLoop = phaseLoops[phaseLoops.length - 1];
+        if (phaseIteration !== undefined) {
+          // Prefer exact match on phase + phaseIteration
+          matchedLoop = loops.find(
+            (loop) =>
+              loop.phase === phase &&
+              loop.entries.length > 0 &&
+              loop.entries[0].phaseIteration === phaseIteration,
+          );
         }
-      }
 
-      if (matchedLoop) {
-        setSelectedSessionId(matchedLoop.id);
+        // Fall back to just phase match (pick last one of that phase)
+        if (!matchedLoop) {
+          const phaseLoops = loops.filter((loop) => loop.phase === phase);
+          if (phaseLoops.length > 0) {
+            matchedLoop = phaseLoops[phaseLoops.length - 1];
+          }
+        }
+
+        if (matchedLoop) {
+          setSelectedSessionId(matchedLoop.id);
+        }
+      } catch {
+        // Ignore parse errors
+        instanceStorage.removeItem("qontinui-ai-output-navigate");
       }
-    } catch {
-      // Ignore parse errors
-      instanceStorage.removeItem("qontinui-ai-output-navigate");
-    }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [loops]);
 
   // Persist stats collapse state
@@ -351,12 +368,11 @@ export function AiTab({
     }
   }, [autoFixEnabled, autoFixLoading]);
 
-  // Load per-run auto-continue setting when a specific run is selected
+  // Load per-run auto-continue setting when a specific run is selected.
+  // No reset-on-invalid-deps setState — the derived `runAutoContinue` below
+  // evaluates to null whenever the key doesn't match the active session.
   useEffect(() => {
-    if (!selectedSessionId || selectedSessionId === ALL_SESSIONS) {
-      setRunAutoContinue(null);
-      return;
-    }
+    if (!selectedSessionId || selectedSessionId === ALL_SESSIONS) return;
 
     const controller = new AbortController();
     let cancelled = false;
@@ -369,12 +385,15 @@ export function AiTab({
         );
         const result = await response.json();
         if (!cancelled && result.auto_continue !== undefined) {
-          setRunAutoContinue(result.auto_continue);
+          setFetchedRunAutoContinue({
+            sessionId: selectedSessionId,
+            value: result.auto_continue,
+          });
         }
       } catch (error) {
         if (!cancelled) {
           console.error("Failed to load per-run auto-continue setting:", error);
-          setRunAutoContinue(null);
+          setFetchedRunAutoContinue({ sessionId: selectedSessionId, value: null });
         }
       }
     };
@@ -384,6 +403,15 @@ export function AiTab({
       controller.abort();
     };
   }, [selectedSessionId]);
+
+  // Pure derivation: only expose the fetched value when its key matches the
+  // currently-selected session. Otherwise treat as "not loaded yet".
+  const runAutoContinue =
+    selectedSessionId &&
+    selectedSessionId !== ALL_SESSIONS &&
+    fetchedRunAutoContinue.sessionId === selectedSessionId
+      ? fetchedRunAutoContinue.value
+      : null;
 
   // Toggle per-run auto-continue setting
   const toggleRunAutoContinue = useCallback(async () => {
@@ -406,8 +434,11 @@ export function AiTab({
         },
       );
       const result = await response.json();
-      if (result.success) {
-        setRunAutoContinue(result.auto_continue);
+      if (result.success && selectedSessionId) {
+        setFetchedRunAutoContinue({
+          sessionId: selectedSessionId,
+          value: result.auto_continue,
+        });
       }
     } catch (error) {
       console.error("Failed to toggle per-run auto-continue setting:", error);
