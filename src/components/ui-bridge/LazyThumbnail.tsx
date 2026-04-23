@@ -80,15 +80,15 @@ export function LazyThumbnail({
   const [isLoading, setIsLoading] = useState(false);
   const [hasError, setHasError] = useState(false);
 
-  // Keep a ref to the cache so the IntersectionObserver callback always
-  // reads/writes the latest Map reference, avoiding stale closures.
+  // Keep refs to the cache and onLoad callback so the IntersectionObserver
+  // callback always reads the latest values, avoiding stale closures.
   const cacheRef = useRef(thumbnailCache);
-
-  cacheRef.current = thumbnailCache;
-
   const onLoadRef = useRef(onLoad);
 
-  onLoadRef.current = onLoad;
+  useEffect(() => {
+    cacheRef.current = thumbnailCache;
+    onLoadRef.current = onLoad;
+  });
 
   // Crop the thumbnail
   const loadThumbnail = useCallback(async () => {
