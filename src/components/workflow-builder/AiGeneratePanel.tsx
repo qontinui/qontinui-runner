@@ -306,7 +306,15 @@ export function AiGeneratePanel({
   }, []);
 
   // --- Remaining local state ---
-  const [description, setDescription] = useState("");
+  // Hydrate from storage in the initializer so we don't need a sync setState
+  // in an effect body. instanceStorage.getItem is a one-shot synchronous read.
+  const [description, setDescription] = useState<string>(() => {
+    try {
+      return instanceStorage.getItem("generate-workflow-prompt") ?? "";
+    } catch {
+      return "";
+    }
+  });
   const [selectedContextIds, setSelectedContextIds] = useState<string[]>([]);
   const [inlineContext, setInlineContext] = useState("");
   const [filePath, setFilePath] = useState("");
@@ -321,13 +329,6 @@ export function AiGeneratePanel({
   } | null>(null);
   const [showContext, setShowContext] = useState(false);
   const [contextTab, setContextTab] = useState<"saved" | "custom" | "file">("saved");
-
-  // Hydrate description from storage after mount
-  useEffect(() => {
-    const saved = instanceStorage.getItem("generate-workflow-prompt");
-
-    if (saved) setDescription(saved);
-  }, []);
 
   // Persist prompt to storage on change
   useEffect(() => {
