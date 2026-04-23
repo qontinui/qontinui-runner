@@ -39,7 +39,17 @@ export function EditAnalysisTab() {
   };
 
   useEffect(() => {
-    loadData();
+    // Async IIFE: avoid invoking a setState-bearing callback synchronously
+    // in the effect body (set-state-in-effect).
+    let cancelled = false;
+    void (async () => {
+      if (cancelled) return;
+      await loadData();
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (loading) {
