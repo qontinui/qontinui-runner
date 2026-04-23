@@ -193,12 +193,6 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
   const [importProgress, setImportProgress] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load export summary on mount
-  useEffect(() => {
-    loadExportSummary();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const loadExportSummary = async () => {
     setIsLoadingSummary(true);
     try {
@@ -211,6 +205,12 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       setIsLoadingSummary(false);
     }
   };
+
+  // Load export summary on mount
+  useEffect(() => {
+    loadExportSummary();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleExportAllData = async () => {
     setIsExporting(true);
