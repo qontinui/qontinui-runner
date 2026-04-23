@@ -102,9 +102,15 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
   };
 
   useEffect(() => {
-    loadSettings();
-
-    checkDocker();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      void loadSettings();
+      void checkDocker();
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
