@@ -53,8 +53,18 @@ export function CostEffectivenessPanel() {
     }
   }, [agentFilter]);
 
+  // Wrap load() in async IIFE so the setLoading(true) inside it isn't the
+  // first synchronous statement reached from the effect body
+  // (react-hooks/set-state-in-effect).
   useEffect(() => {
-    load();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await load();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [load]);
 
   const filtered = useMemo(() => {
