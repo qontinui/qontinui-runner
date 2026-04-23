@@ -7,7 +7,15 @@
  * of the Terminal page.
  */
 
-import { createContext, useState, useCallback, useRef, useMemo, type ReactNode } from "react";
+import {
+  createContext,
+  useState,
+  useCallback,
+  useEffect,
+  useRef,
+  useMemo,
+  type ReactNode,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTerminalCore } from "./useTerminalCore";
 import { useSessionState } from "./useSessionState";
@@ -180,10 +188,10 @@ export function AiFeaturesProvider({
   );
 
   // Wire the cross-hook refs now that workflowGen is defined
-
-  rightPanelModeSetterRef.current = workflowGen.setRightPanelMode;
-
-  selectedSessionSetterRef.current = workflowGen.setSelectedTranscriptSessionId;
+  useEffect(() => {
+    rightPanelModeSetterRef.current = workflowGen.setRightPanelMode;
+    selectedSessionSetterRef.current = workflowGen.setSelectedTranscriptSessionId;
+  });
 
   const value = useMemo<AiFeaturesContextValue>(
     () => ({
