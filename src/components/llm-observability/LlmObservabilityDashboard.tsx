@@ -22,6 +22,7 @@ import { TaskRunCostTable } from "./TaskRunCostTable";
 import { CostByTargetAppChart } from "./CostByTargetAppChart";
 import { AccountUsageCard } from "./AccountUsageCard";
 import { ScriptedOutputPanel } from "./ScriptedOutputPanel";
+import { EmitterProviderControl } from "./EmitterProviderControl";
 
 const TIME_RANGE_OPTIONS: LlmTimeRange[] = ["1d", "7d", "30d", "all"];
 
@@ -184,6 +185,10 @@ export default function LlmObservabilityDashboard() {
             <p className="text-sm mt-2">Run some workflows to start collecting LLM analytics</p>
           </div>
         </div>
+        {/* Emitter provider control is always visible so fresh installs
+            can switch to local Gemma before any emit has fired. Rendered
+            above the panel in both zero-state and data branches. */}
+        <EmitterProviderControl />
         {/* Scripted-output still renders in the zero-usage empty state: the
             think-in-code path can record fallback/attempted events even when
             no LLM call has succeeded yet. */}
@@ -216,6 +221,9 @@ export default function LlmObservabilityDashboard() {
           <CostTrendChart />
         </div>
 
+        {/* Emitter provider control — lets users switch between Claude and
+            local Gemma without hand-editing settings.json. */}
+        <EmitterProviderControl />
         {/* Scripted-output (think-in-code) aggregates — Phase C of script-emitter-wiring */}
         <ScriptedOutputPanel />
 

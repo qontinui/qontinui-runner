@@ -217,6 +217,22 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: true,
     },
     ProxyableCommand {
+        name: "get_scripted_output_settings",
+        description: "Read the persisted `ScriptedOutputSettings` (provider mode, model override, Gemma local endpoint, Gemma model alias, kill switch). Used by the provider-selection panel on the LLM Analytics tab to render form state.",
+        args_schema: "{}",
+        response_schema: "{ \"enabled\": boolean, \"model\": string | null, \"provider\": \"auto\" | \"claude_api_warm\" | \"claude_api\" | \"gemma_local_warm\", \"gemma_local_endpoint\": string, \"gemma_local_model_alias\": string }",
+        probe_with_empty_args: true,
+    },
+    ProxyableCommand {
+        name: "save_scripted_output_settings",
+        description: "Persist a new `ScriptedOutputSettings`. Picked up by the next emit call with no runner restart. Callers should pass the full object — missing optional fields default via serde at load time.",
+        args_schema: "{ \"settings\": { \"enabled\": boolean, \"model\"?: string | null, \"provider\": \"auto\" | \"claude_api_warm\" | \"claude_api\" | \"gemma_local_warm\", \"gemma_local_endpoint\": string, \"gemma_local_model_alias\": string } }",
+        response_schema: "{ \"enabled\": boolean, \"model\": string | null, \"provider\": \"auto\" | \"claude_api_warm\" | \"claude_api\" | \"gemma_local_warm\", \"gemma_local_endpoint\": string, \"gemma_local_model_alias\": string }",
+        // Write command — skip the startup empty-args probe so we never
+        // race the settings file during boot.
+        probe_with_empty_args: false,
+    },
+    ProxyableCommand {
         name: "report_ui_error",
         description: "Record a UI error observed by the React error boundary. Coalesces repeat reports with the same message/digest into a single record (incrementing `count`, refreshing `reported_at`, pinning `first_seen`).",
         args_schema: "{ \"message\": string, \"stack\"?: string | null, \"componentStack\"?: string | null, \"digest\"?: string | null }",

@@ -1357,6 +1357,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::activity_timeline::delete_activity_timeline_entry,
             commands::activity_timeline::get_activity_timeline_stats,
             commands::activity_timeline::get_scripted_output_stats,
+            commands::scripted_output_settings::get_scripted_output_settings,
+            commands::scripted_output_settings::save_scripted_output_settings,
             // Unified event search across activity_timeline, observations, deferred_questions, error_events
             commands::event_search::search_events,
             // Watcher commands (screenpipe-inspired reactive AI agents)

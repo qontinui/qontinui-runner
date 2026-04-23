@@ -134,6 +134,7 @@ pub mod recap; // Session recap overview
 pub mod screenshot;
 pub mod screenshots;
 pub mod script_emitter; // Scripted-output (think-in-code) extraction-script emitter (Phase A)
+pub mod scripted_output_settings; // get/save the ScriptedOutputSettings (provider, endpoint, ...)
 pub mod security_settings;
 pub mod self_healing_settings;
 pub mod setup_wizard; // First-launch setup wizard commands
