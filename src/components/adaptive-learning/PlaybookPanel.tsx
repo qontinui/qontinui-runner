@@ -78,8 +78,18 @@ export function PlaybookPanel() {
     }
   }, [domainFilter, statusFilter]);
 
+  // Initial + filter-change load. Body wraps loadEntries() in an IIFE so the
+  // synchronous setLoading(true) inside it isn't the first statement reached
+  // from the effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    loadEntries();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await loadEntries();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [loadEntries]);
 
   // Auto-refresh on learning-update events
