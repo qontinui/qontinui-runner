@@ -83,25 +83,22 @@ export function AiOutputTab({
     return allLoops;
   }, [lines, filterSessionIds]);
 
-  // Get current loop (selected or most recent)
-  const currentLoop = useMemo(() => {
+  // Get current loop (selected or most recent). `effectiveLoopId` is what the
+  // UI should treat as selected — falls back to the latest loop when the user
+  // hasn't picked one yet, or their pick has been removed. Deriving rather
+  // than syncing via useEffect+setState avoids cascading renders.
+  const effectiveLoopId = useMemo(() => {
     if (loops.length === 0) return null;
-    if (selectedLoopId) {
-      return loops.find((loop) => loop.id === selectedLoopId) || loops[loops.length - 1];
+    if (selectedLoopId && loops.some((l) => l.id === selectedLoopId)) {
+      return selectedLoopId;
     }
-    return loops[loops.length - 1];
+    return loops[loops.length - 1].id;
   }, [loops, selectedLoopId]);
 
-  // Auto-select the latest loop when a new one is created
-  useEffect(() => {
-    if (loops.length > 0) {
-      const latestLoop = loops[loops.length - 1];
-      // Only auto-select if we don't have a selection or the selected loop no longer exists
-      if (!selectedLoopId || !loops.find((l) => l.id === selectedLoopId)) {
-        setSelectedLoopId(latestLoop.id);
-      }
-    }
-  }, [loops, selectedLoopId]);
+  const currentLoop = useMemo(() => {
+    if (loops.length === 0) return null;
+    return loops.find((loop) => loop.id === effectiveLoopId) ?? loops[loops.length - 1];
+  }, [loops, effectiveLoopId]);
 
   // Build conversation history from lines
   const buildConversationHistory = useCallback(() => {
@@ -314,19 +311,32 @@ export function AiOutputTab({
     }
   }, [lines]);
 
-  // Poll executor status when we have lines
+  // Poll executor status when we have lines. When there are no lines, reset
+  // the working flag inside the async IIFE so the effect body itself doesn't
+  // call setState synchronously.
   useEffect(() => {
+    let cancelled = false;
     if (lines.length === 0) {
-      setIsAiWorking(false);
-      return;
+      void Promise.resolve().then(() => {
+        if (!cancelled) setIsAiWorking(false);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
-    // Check immediately
-    checkAiStatus();
+    // Check immediately (via microtask so the effect body itself doesn't
+    // synchronously trigger setState inside checkAiStatus).
+    void Promise.resolve().then(() => {
+      if (!cancelled) void checkAiStatus();
+    });
 
     // Then poll periodically
     const interval = setInterval(checkAiStatus, STATUS_POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [lines, checkAiStatus]);
 
   // Auto-scroll to bottom when new lines arrive in current loop
@@ -451,7 +461,7 @@ export function AiOutputTab({
             {/* Sessions displayed with latest on left */}
             {[...loops].reverse().map((loop, reversedIndex) => {
               const isLatest = reversedIndex === 0;
-              const isSelected = loop.id === selectedLoopId;
+              const isSelected = loop.id === effectiveLoopId;
               return (
                 <button
                   key={`${loop.id}-${reversedIndex}`}
