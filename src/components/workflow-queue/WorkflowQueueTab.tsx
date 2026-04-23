@@ -154,7 +154,15 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
   }, [onLog]);
 
   useEffect(() => {
-    fetchWorkflows();
+    let cancelled = false;
+    // Defer via microtask so the effect body itself doesn't synchronously
+    // trigger setState inside fetchWorkflows.
+    void Promise.resolve().then(() => {
+      if (!cancelled) void fetchWorkflows();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchWorkflows]);
 
   // Toggle favorite on a workflow (optimistic update with rollback)
