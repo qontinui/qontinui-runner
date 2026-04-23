@@ -42,11 +42,20 @@ export function useCanvasData(): CanvasData {
     }
   }, []);
 
-  // Initial fetch and polling
+  // Initial fetch and polling. Wrap fetchPanels in async IIFE so its
+  // synchronous setIsLoading(false) / setPanelMap isn't the first statement
+  // reached from the effect body (react-hooks/set-state-in-effect).
   useEffect(() => {
-    fetchPanels();
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      await fetchPanels();
+    })();
     const interval = setInterval(fetchPanels, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [fetchPanels]);
 
   // Subscribe to Tauri canvas-update events for real-time updates
