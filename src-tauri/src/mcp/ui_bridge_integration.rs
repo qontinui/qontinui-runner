@@ -2473,6 +2473,87 @@ async fn discover_react_pages(project: &PathBuf, pages: &mut Vec<PageComponent>)
             .await;
         }
     }
+    // react-router convention: one component file per route, placed flat in
+    // `src/pages/` (e.g. `src/pages/Dashboard.tsx`). The Next.js-style
+    // `walk_for_pages` above only matches `index.tsx` / `page.tsx`, so these
+    // slip through. Scan `src/pages/` non-recursively for capitalized
+    // component files and derive the route from the filename, same way the
+    // Tauri tab-discovery helper does.
+    discover_react_router_flat_pages(&project.join("src/pages"), project, pages).await;
+}
+
+/// Flat (non-recursive) scan of a directory for `<PascalName>.tsx` /
+/// `<PascalName>.jsx` page components. Used as a fallback after the
+/// Next.js-style `walk_for_pages` pass so react-router projects that keep
+/// one component file per route under `src/pages/` are discoverable.
+async fn discover_react_router_flat_pages(
+    dir: &std::path::Path,
+    project: &std::path::Path,
+    pages: &mut Vec<PageComponent>,
+) {
+    if !dir.exists() {
+        return;
+    }
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip subdirs — those are handled by the Next.js-style
+            // `walk_for_pages` pass that preceded this call.
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        // Only .tsx / .jsx files; skip test + stories + the Next.js-style
+        // files that would double-count with walk_for_pages.
+        let is_candidate = (file_name.ends_with(".tsx") || file_name.ends_with(".jsx"))
+            && !file_name.ends_with(".test.tsx")
+            && !file_name.ends_with(".test.jsx")
+            && !file_name.ends_with(".stories.tsx")
+            && !file_name.ends_with(".stories.jsx")
+            && file_name != "index.tsx"
+            && file_name != "index.jsx"
+            && file_name != "page.tsx"
+            && file_name != "page.jsx";
+        if !is_candidate {
+            continue;
+        }
+        let component_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Page")
+            .to_string();
+        // Components start with an uppercase letter; anything else is likely
+        // a hook/util placed in pages/ by mistake.
+        if !component_name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+        {
+            continue;
+        }
+        let rel_path = path
+            .strip_prefix(project)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let route = pascal_name_to_route(&component_name);
+        pages.push(PageComponent {
+            route,
+            component_path: rel_path,
+            component_name,
+            has_registrations: false,
+            has_data_page_id: false,
+            has_spec: false,
+            has_tutorial: false,
+        });
+    }
 }
 
 /// Discover pages generically (scan common patterns).
