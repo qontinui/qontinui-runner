@@ -116,7 +116,13 @@ export function EmitterProviderControl() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [reach, setReach] = useState<ReachState>("unknown");
+  // Probe result keyed by endpoint. Storing the key with the value lets us
+  // treat "endpoint changed" as a pure derivation (see `reach` below) instead
+  // of a sync setState in the probe effect body.
+  const [probedReach, setProbedReach] = useState<{
+    endpoint: string;
+    state: ReachState;
+  }>({ endpoint: "", state: "unknown" });
 
   // Hydrate from backend on mount.
   useEffect(() => {
@@ -143,20 +149,24 @@ export function EmitterProviderControl() {
   const probeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     const endpoint = dirty?.gemma_local_endpoint ?? "";
-    if (!endpoint) {
-      setReach("unknown");
-      return;
-    }
-    setReach("probing");
+    if (!endpoint) return;
     if (probeTimer.current) clearTimeout(probeTimer.current);
     probeTimer.current = setTimeout(async () => {
       const ok = await probeGemmaHealth(endpoint);
-      setReach(ok ? "reachable" : "unreachable");
+      setProbedReach({ endpoint, state: ok ? "reachable" : "unreachable" });
     }, 300);
     return () => {
       if (probeTimer.current) clearTimeout(probeTimer.current);
     };
   }, [dirty?.gemma_local_endpoint]);
+
+  // Pure derivation of reachability for display.
+  const currentEndpoint = dirty?.gemma_local_endpoint ?? "";
+  const reach: ReachState = !currentEndpoint
+    ? "unknown"
+    : probedReach.endpoint === currentEndpoint
+      ? probedReach.state
+      : "probing";
 
   const hasUnsavedChanges =
     !!settings && !!dirty && JSON.stringify(settings) !== JSON.stringify(dirty);
