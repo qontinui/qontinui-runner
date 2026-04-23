@@ -101,16 +101,23 @@ export function McpServerToolPicker({
     fetchServers();
   }, [isOpen]);
 
-  // Reset state when modal opens
+  // Reset state when modal opens. The resets are deferred via a microtask so
+  // the effect body itself doesn't call setState synchronously.
   useEffect(() => {
-    if (isOpen) {
+    if (!isOpen) return;
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
       setMode("servers");
       setSelectedServer(null);
       setSelectedToolName(null);
       setTools([]);
       setSearchQuery("");
       setError(null);
-    }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [isOpen]);
 
   // Connect to server and fetch tools
