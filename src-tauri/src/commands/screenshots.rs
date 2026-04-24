@@ -7,6 +7,8 @@
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::info;
 
 /// Information about a single screenshot file
@@ -163,4 +165,13 @@ mod tests {
         assert!(response.data.is_none());
         assert_eq!(response.error, Some("Test error".to_string()));
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_screenshots")
+        .invoke_handler(tauri::generate_handler![
+            list_screenshots,
+        ])
+        .build()
 }

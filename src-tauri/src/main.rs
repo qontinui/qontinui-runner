@@ -528,6 +528,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::storage::plugin())
         .plugin(commands::extraction::plugin())
         .plugin(commands::screenshot::plugin())
+        .plugin(commands::screenshots::plugin())
+        .plugin(commands::script_emitter::plugin())
+        .plugin(commands::verification::plugin())
+        .plugin(commands::project_logs::plugin())
+        .plugin(commands::global_log_sources::plugin())
+        .plugin(commands::execution_reporting::plugin())
+        .plugin(commands::workflow_events::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -576,36 +583,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: websocket, video, interaction, storage handlers moved to per-module plugins (see .plugin() calls above).
             // NOTE: extraction handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: screenshot handlers moved to per-module plugin (see .plugin() calls above).
-            // Scripted-output emitter (think-in-code extraction script)
-            commands::script_emitter::emit_extraction_script,
-            commands::script_emitter::emit_scripted_output_event,
+            // NOTE: script_emitter handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: logging handlers moved to per-module plugin (see .plugin() calls above).
-            // Verification commands (AI self-healing)
-            commands::verification::save_pending_verification,
-            commands::verification::load_pending_verification,
-            commands::verification::clear_pending_verification,
-            commands::verification::update_verification_status,
+            // NOTE: verification handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: rag handlers moved to per-module plugin (see .plugin() calls above).
-            // Project logs commands
-            commands::project_logs::get_project_log_config,
-            commands::project_logs::save_project_log_config,
-            commands::project_logs::list_project_configs,
-            commands::project_logs::delete_project_config,
-            commands::project_logs::read_log_source,
-            commands::project_logs::read_project_logs,
-            commands::project_logs::get_project_directories,
-            commands::project_logs::append_project_log,
-            // AI log source discovery (global)
-            commands::global_log_sources::find_log_sources_with_ai,
+            // NOTE: project_logs handlers moved to per-module plugin (see .plugin() calls above).
+            // NOTE: global_log_sources handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: issues handlers moved to per-module plugin (see .plugin() calls above).
-            // Unified execution reporting commands
-            commands::execution_reporting::create_execution_run,
-            commands::execution_reporting::report_action_executions,
-            commands::execution_reporting::upload_execution_screenshot,
-            commands::execution_reporting::report_execution_issues,
-            commands::execution_reporting::complete_execution_run,
-            // Workflow events (mobile push notifications)
-            commands::workflow_events::emit_workflow_event,
+            // NOTE: execution_reporting, workflow_events handlers moved to per-module plugins (see .plugin() calls above).
             // NOTE: dag_workflows, checkpoints, findings, known_issues handlers moved to
             // per-module plugins (see .plugin() calls above).
             // State Machine Config Builder commands (CRUD for configs, states, transitions)
@@ -714,8 +699,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::testing::list_recent_task_runs,
             commands::testing::get_workflow_run_context,
             // NOTE: checks handlers moved to per-module plugin (see .plugin() calls above).
-            // Screenshot listing commands
-            commands::screenshots::list_screenshots,
+            // NOTE: screenshots handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: hooks handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: learning handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: adaptive_learning handlers moved to per-module plugin (see .plugin() calls above).
@@ -807,21 +791,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::mobile::create_mobile_log,
             commands::mobile::capture_mobile_feedback,
             commands::mobile::delete_mobile_data,
-            // Global log source management commands
-            commands::global_log_sources::get_global_log_sources,
-            commands::global_log_sources::save_global_log_sources,
-            commands::global_log_sources::add_global_log_source,
-            commands::global_log_sources::update_global_log_source,
-            commands::global_log_sources::delete_global_log_source,
-            commands::global_log_sources::create_global_log_source_profile,
-            commands::global_log_sources::update_global_log_source_profile,
-            commands::global_log_sources::delete_global_log_source_profile,
-            commands::global_log_sources::set_default_log_source_profile,
-            commands::global_log_sources::set_log_source_ai_selection_mode,
-            commands::global_log_sources::read_global_log_sources,
-            commands::global_log_sources::read_log_sources_by_profile,
-            commands::global_log_sources::migrate_project_sources_to_global,
-            commands::global_log_sources::select_log_sources_for_context,
+            // NOTE: global_log_sources handlers consolidated above.
             // Setup wizard commands (first-launch setup)
             commands::setup_wizard::check_setup_completed,
             commands::setup_wizard::complete_setup,
