@@ -17,6 +17,8 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 /// Global checkpoint manager instance for in-memory operations (replay, comparison).
@@ -704,4 +706,34 @@ pub async fn get_checkpoints_count(
     task_id: Option<String>,
 ) -> Result<i64, String> {
     state.pg_db.get_checkpoints_count(task_id.as_deref()).await
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_checkpoint_browser")
+        .invoke_handler(tauri::generate_handler![
+            list_orchestrator_checkpoints,
+            get_orchestrator_checkpoint,
+            create_orchestrator_checkpoint,
+            delete_orchestrator_checkpoint,
+            find_checkpoints_by_tag,
+            compare_orchestrator_checkpoints,
+            get_latest_checkpoint,
+            start_replay_session,
+            get_checkpoint_count,
+            get_checkpoint_task_ids,
+            clear_all_checkpoints,
+            add_sample_checkpoints,
+            get_checkpoint_stats,
+            replay_from_checkpoint,
+            get_replay_lineage,
+            register_task_for_lineage,
+            get_task_lineage_info,
+            list_active_replay_sessions,
+            complete_replay_session,
+            fail_replay_session,
+            get_checkpoints_filtered,
+            get_checkpoints_paginated,
+            get_checkpoints_count,
+        ])
+        .build()
 }

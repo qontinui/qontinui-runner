@@ -512,6 +512,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::adaptive_learning::plugin())
         .plugin(commands::ai_generation::plugin())
         .plugin(commands::backup::plugin())
+        .plugin(commands::checkpoint_browser::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -862,32 +863,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::flow::import_flow_yaml,
             commands::flow::export_flows_bulk,
             commands::flow::import_flows_bulk,
-            // Checkpoint browser commands (time-travel debugging)
-            commands::checkpoint_browser::list_orchestrator_checkpoints,
-            commands::checkpoint_browser::get_orchestrator_checkpoint,
-            commands::checkpoint_browser::create_orchestrator_checkpoint,
-            commands::checkpoint_browser::delete_orchestrator_checkpoint,
-            commands::checkpoint_browser::find_checkpoints_by_tag,
-            commands::checkpoint_browser::compare_orchestrator_checkpoints,
-            commands::checkpoint_browser::get_latest_checkpoint,
-            commands::checkpoint_browser::start_replay_session,
-            commands::checkpoint_browser::get_checkpoint_count,
-            commands::checkpoint_browser::get_checkpoint_task_ids,
-            commands::checkpoint_browser::clear_all_checkpoints,
-            commands::checkpoint_browser::add_sample_checkpoints,
-            commands::checkpoint_browser::get_checkpoint_stats,
-            // Replay commands (time-travel debugging)
-            commands::checkpoint_browser::replay_from_checkpoint,
-            commands::checkpoint_browser::get_replay_lineage,
-            commands::checkpoint_browser::register_task_for_lineage,
-            commands::checkpoint_browser::get_task_lineage_info,
-            commands::checkpoint_browser::list_active_replay_sessions,
-            commands::checkpoint_browser::complete_replay_session,
-            commands::checkpoint_browser::fail_replay_session,
-            // Enhanced checkpoint queries (filtering, pagination)
-            commands::checkpoint_browser::get_checkpoints_filtered,
-            commands::checkpoint_browser::get_checkpoints_paginated,
-            commands::checkpoint_browser::get_checkpoints_count,
+            // NOTE: checkpoint_browser handlers moved to per-module plugin (see .plugin() calls above).
             // Durable execution commands (Conductor-inspired replay/rollback)
             commands::durable_execution::list_replay_points,
             commands::durable_execution::replay_workflow,
