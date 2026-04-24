@@ -4,6 +4,8 @@
 //! in-memory `InMemoryBaselineStore` that loses data on reload.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -121,4 +123,16 @@ pub async fn sm_delete_baseline(
         info!("Deleted baseline id={}", id);
     }
     Ok(deleted)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_ui_bridge_baselines")
+        .invoke_handler(tauri::generate_handler![
+            sm_save_baseline,
+            sm_get_baseline,
+            sm_list_baselines,
+            sm_delete_baseline,
+        ])
+        .build()
 }
