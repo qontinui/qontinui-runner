@@ -16,6 +16,7 @@ pub mod bookmarks;
 pub mod capabilities;
 pub mod circuit_breaker;
 pub mod design;
+pub mod design_eval;
 pub mod elements;
 pub mod errors;
 pub mod exploration;
@@ -409,20 +410,8 @@ ipc_handler_get!(
     "clear_performance_entries"
 );
 
-// Design evaluation
-ipc_handler_post!(ui_bridge_design_evaluate_handler, "design_evaluate");
-ipc_handler_post!(
-    ui_bridge_design_evaluate_baseline_handler,
-    "design_evaluate_baseline"
-);
-ipc_handler_get!(
-    ui_bridge_design_evaluate_contexts_handler,
-    "design_evaluate_contexts"
-);
-ipc_handler_post!(
-    ui_bridge_design_evaluate_diff_handler,
-    "design_evaluate_diff"
-);
+// Design evaluation handlers live in `design_eval::routes()` —
+// see `design_eval.rs`.
 
 // Annotations import
 ipc_handler_post!(ui_bridge_annotations_import_handler, "annotations_import");
@@ -474,6 +463,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(bookmarks::route_entries());
         all.extend_from_slice(capabilities::route_entries());
         all.extend_from_slice(design::route_entries());
+        all.extend_from_slice(design_eval::route_entries());
         all.extend_from_slice(elements::route_entries());
         all.extend_from_slice(errors::route_entries());
         all.extend_from_slice(exploration::route_entries());
@@ -503,10 +493,6 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/page/scroll"),
         ("GET", "/ui-bridge/control/performance-entries"),
         ("POST", "/ui-bridge/control/performance-entries/clear"),
-        ("POST", "/ui-bridge/control/design/evaluate"),
-        ("POST", "/ui-bridge/control/design/evaluate/baseline"),
-        ("GET", "/ui-bridge/control/design/evaluate/contexts"),
-        ("POST", "/ui-bridge/control/design/evaluate/diff"),
         ("POST", "/ui-bridge/control/annotations/import"),
         ("POST", "/ui-bridge/control/intents/execute-from-query"),
         ("GET", "/ui-bridge/debug/element-tree"),
@@ -639,23 +625,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/control/performance-entries/clear",
             post(ui_bridge_clear_performance_entries_handler),
         )
-        // Design evaluation
-        .route(
-            "/ui-bridge/control/design/evaluate",
-            post(ui_bridge_design_evaluate_handler),
-        )
-        .route(
-            "/ui-bridge/control/design/evaluate/baseline",
-            post(ui_bridge_design_evaluate_baseline_handler),
-        )
-        .route(
-            "/ui-bridge/control/design/evaluate/contexts",
-            get(ui_bridge_design_evaluate_contexts_handler),
-        )
-        .route(
-            "/ui-bridge/control/design/evaluate/diff",
-            post(ui_bridge_design_evaluate_diff_handler),
-        )
+        // Design evaluation handlers (extracted to design_eval.rs) merged below.
         // Element-screenshot routes live in `screenshots::routes()`.
         // Annotations import
         .route(
@@ -771,6 +741,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(state_machine::routes())
         // AI analyze / semantic search / image-diff handlers (extracted to ai_analyze.rs)
         .merge(ai_analyze::routes())
+        // Design evaluate handlers (extracted to design_eval.rs)
+        .merge(design_eval::routes())
         // UI Bridge exploration + window listing (extracted to exploration.rs)
         .merge(exploration::routes())
         // Page navigation / evaluation / tab switching (extracted to page.rs)
