@@ -83,6 +83,26 @@
 //!    `generate_handler!` list and add `.plugin(commands::foo::plugin())`
 //!    right after the existing per-module plugin block.
 //! 4. Plugin name convention: `qontinui_<module_name>` (lowercase snake_case).
+//!
+//! # Migrating a module to a compartment (Workstream C)
+//!
+//! [`compartments`] defines five scoped wrappers around `Arc<AppState>` —
+//! `BridgeCompartment`, `ExecutionCompartment`, `IntegrationCompartment`,
+//! `HealthCompartment`, `StorageCompartment` — each exposing only the fields
+//! in its domain. To migrate a module `foo.rs`:
+//! 1. Pick the compartment whose accessors cover every AppState field the
+//!    module reads (see `compartments.rs` for the field partitioning).
+//! 2. Replace `use super::AppState;` with
+//!    `use super::compartments::<Compartment>;`.
+//! 3. In handler signatures, change `State<'_, Arc<AppState>>` to
+//!    `State<'_, <Compartment>>`. Drop the now-unused `std::sync::Arc` import.
+//! 4. In handler bodies, change `state.<field>` to `state.<field>()` (each
+//!    accessor returns the same `&Field` reference — lock/atomic semantics
+//!    are unchanged).
+//! 5. Add a `// Migrated to <Compartment> (Workstream C).` marker comment
+//!    near the module's `use` block so future sessions can audit progress.
+//! 6. The existing `.manage(shared_app_state)` stays — unmigrated modules
+//!    continue to use it until they migrate individually.
 
 use crate::config::QontinuiConfig;
 use crate::container::isolated_executor::IsolatedExecutor;
