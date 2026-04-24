@@ -527,6 +527,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::interaction::plugin())
         .plugin(commands::storage::plugin())
         .plugin(commands::extraction::plugin())
+        .plugin(commands::screenshot::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -574,11 +575,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: debug handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: websocket, video, interaction, storage handlers moved to per-module plugins (see .plugin() calls above).
             // NOTE: extraction handlers moved to per-module plugin (see .plugin() calls above).
-            // Screenshot capture commands
-            commands::screenshot::get_screenshot_monitors,
-            commands::screenshot::capture_screenshot,
-            commands::screenshot::capture_and_upload_screenshot,
-            commands::screenshot::capture_screenshot_via_python,
+            // NOTE: screenshot handlers moved to per-module plugin (see .plugin() calls above).
             // Scripted-output emitter (think-in-code extraction script)
             commands::script_emitter::emit_extraction_script,
             commands::script_emitter::emit_scripted_output_event,

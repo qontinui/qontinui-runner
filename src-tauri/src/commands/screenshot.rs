@@ -13,6 +13,8 @@ use crate::executor::with_default_bridge;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::State;
@@ -435,4 +437,16 @@ pub fn capture_screenshot_via_python(
             data: None,
         })
     })?
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_screenshot")
+        .invoke_handler(tauri::generate_handler![
+            get_screenshot_monitors,
+            capture_screenshot,
+            capture_and_upload_screenshot,
+            capture_screenshot_via_python,
+        ])
+        .build()
 }
