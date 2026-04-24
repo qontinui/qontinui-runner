@@ -3,17 +3,18 @@
 //! Provides commands for querying and managing known issues
 //! stored in PostgreSQL.
 
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::known_issues::{
     CreateKnownIssueRequest, CreatePatternTemplateRequest, IssuePatternTemplate, KnownIssue,
     ListKnownIssuesQuery, UpdateKnownIssueRequest,
 };
+
+// Migrated to StorageCompartment (Workstream C).
 
 // ── Export / Import types ──────────────────────────────────────────────
 
@@ -99,9 +100,9 @@ pub struct ImportResult {
 #[tauri::command]
 pub async fn list_known_issues(
     query: ListKnownIssuesQuery,
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<Vec<KnownIssue>, String> {
-    app_state.pg_db.list_known_issues(&query).await
+    app_state.pg_db().list_known_issues(&query).await
 }
 
 /// Find known issues relevant to a specific spec.
@@ -109,10 +110,10 @@ pub async fn list_known_issues(
 pub async fn find_issues_for_spec(
     spec_id: String,
     page_url: Option<String>,
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<Vec<KnownIssue>, String> {
     app_state
-        .pg_db
+        .pg_db()
         .find_issues_for_spec(&spec_id, page_url.as_deref())
         .await
 }
@@ -121,9 +122,9 @@ pub async fn find_issues_for_spec(
 #[tauri::command]
 pub async fn create_known_issue(
     request: CreateKnownIssueRequest,
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<KnownIssue, String> {
-    let issue = app_state.pg_db.create_known_issue(&request).await?;
+    let issue = app_state.pg_db().create_known_issue(&request).await?;
     info!("Created known issue: {} ({})", issue.title, issue.id);
     Ok(issue)
 }
@@ -133,9 +134,9 @@ pub async fn create_known_issue(
 pub async fn update_known_issue(
     id: String,
     request: UpdateKnownIssueRequest,
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<KnownIssue, String> {
-    let issue = app_state.pg_db.update_known_issue(&id, &request).await?;
+    let issue = app_state.pg_db().update_known_issue(&id, &request).await?;
     info!("Updated known issue: {} ({})", issue.title, issue.id);
     Ok(issue)
 }
@@ -144,9 +145,9 @@ pub async fn update_known_issue(
 #[tauri::command]
 pub async fn delete_known_issue(
     id: String,
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<bool, String> {
-    let deleted = app_state.pg_db.delete_known_issue(&id).await?;
+    let deleted = app_state.pg_db().delete_known_issue(&id).await?;
     if deleted {
         info!("Deleted known issue: {}", id);
     }
@@ -158,10 +159,10 @@ pub async fn delete_known_issue(
 pub async fn resolve_known_issue(
     id: String,
     resolution: Option<String>,
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<(), String> {
     app_state
-        .pg_db
+        .pg_db()
         .resolve_known_issue(&id, resolution.as_deref())
         .await?;
     info!("Resolved known issue: {}", id);
@@ -171,9 +172,9 @@ pub async fn resolve_known_issue(
 /// List all issue pattern templates.
 #[tauri::command]
 pub async fn list_pattern_templates(
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<Vec<IssuePatternTemplate>, String> {
-    app_state.pg_db.list_pattern_templates().await
+    app_state.pg_db().list_pattern_templates().await
 }
 
 /// Export known issues as a portable JSON string.
@@ -185,7 +186,7 @@ pub async fn list_pattern_templates(
 pub async fn export_known_issues(
     status: Option<String>,
     category: Option<String>,
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<String, String> {
     let query = ListKnownIssuesQuery {
         status,
@@ -193,7 +194,7 @@ pub async fn export_known_issues(
         ..Default::default()
     };
 
-    let issues = app_state.pg_db.list_known_issues(&query).await?;
+    let issues = app_state.pg_db().list_known_issues(&query).await?;
 
     let export = KnownIssuesExport {
         version: "1.0".to_string(),
@@ -213,7 +214,7 @@ pub async fn export_known_issues(
 #[tauri::command]
 pub async fn import_known_issues(
     json_data: String,
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<ImportResult, String> {
     let export: KnownIssuesExport =
         serde_json::from_str(&json_data).map_err(|e| format!("Invalid JSON: {e}"))?;
@@ -227,7 +228,7 @@ pub async fn import_known_issues(
 
     // Collect existing titles for dedup.
     let existing = app_state
-        .pg_db
+        .pg_db()
         .list_known_issues(&ListKnownIssuesQuery::default())
         .await?;
     let existing_titles: std::collections::HashSet<String> =
@@ -265,7 +266,7 @@ pub async fn import_known_issues(
             verification_step_template: item.verification_step_template.clone(),
         };
 
-        match app_state.pg_db.create_known_issue(&req).await {
+        match app_state.pg_db().create_known_issue(&req).await {
             Ok(issue) => {
                 info!("Imported known issue: {} ({})", issue.title, issue.id);
                 imported += 1;
@@ -288,9 +289,9 @@ pub async fn import_known_issues(
 #[tauri::command]
 pub async fn create_pattern_template(
     request: CreatePatternTemplateRequest,
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
 ) -> Result<IssuePatternTemplate, String> {
-    let template = app_state.pg_db.insert_pattern_template(&request).await?;
+    let template = app_state.pg_db().insert_pattern_template(&request).await?;
     info!(
         "Created pattern template: {} ({})",
         template.name, template.id
