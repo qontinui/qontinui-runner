@@ -5,6 +5,8 @@
 //! so that all runners have equal access to managed process state and logs.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 use crate::commands::AppState;
@@ -300,4 +302,27 @@ pub async fn search_process_logs(
         .pg_db
         .search_process_logs(&query, config_id.as_deref(), limit.unwrap_or(200))
         .await
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_process_capture_commands")
+        .invoke_handler(tauri::generate_handler![
+            start_managed_process,
+            stop_managed_process,
+            restart_managed_process,
+            rebuild_and_restart_process,
+            start_all_managed_processes,
+            stop_all_managed_processes,
+            get_managed_processes,
+            get_process_output,
+            get_process_configs,
+            save_process_config,
+            delete_process_config,
+            get_process_sessions_from_db,
+            get_process_session_output_from_db,
+            get_process_log_context,
+            search_process_logs,
+        ])
+        .build()
 }

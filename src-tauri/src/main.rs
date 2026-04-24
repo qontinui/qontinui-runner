@@ -560,6 +560,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::execution::plugin())
         .plugin(doctor::commands::plugin())
         .plugin(error_monitor::commands::plugin())
+        .plugin(process_capture::commands::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -631,22 +632,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             mcp::backend_relay::commands::get_cloud_relay_status,
             mcp::backend_relay::commands::save_cloud_relay_settings,
             mcp::backend_relay::commands::get_cloud_relay_settings,
-            // Process capture commands
-            process_capture::commands::start_managed_process,
-            process_capture::commands::stop_managed_process,
-            process_capture::commands::restart_managed_process,
-            process_capture::commands::rebuild_and_restart_process,
-            process_capture::commands::start_all_managed_processes,
-            process_capture::commands::stop_all_managed_processes,
-            process_capture::commands::get_managed_processes,
-            process_capture::commands::get_process_output,
-            process_capture::commands::get_process_configs,
-            process_capture::commands::save_process_config,
-            process_capture::commands::delete_process_config,
-            process_capture::commands::get_process_sessions_from_db,
-            process_capture::commands::get_process_session_output_from_db,
-            process_capture::commands::get_process_log_context,
-            process_capture::commands::search_process_logs,
+            // NOTE: process_capture handlers moved to per-module plugin (see .plugin() calls above).
             // Orchestration loop commands (runner-side workflow loop)
             orchestration_loop::commands::start_orchestration_loop,
             orchestration_loop::commands::stop_orchestration_loop,
