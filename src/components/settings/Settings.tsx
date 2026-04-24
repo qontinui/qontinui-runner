@@ -81,31 +81,45 @@ type SettingsTab =
 
 const STORAGE_KEY = "qontinui-settings-active-tab";
 
-const VALID_TABS = [
-  "account",
-  "ai",
-  "agentic",
-  "self-healing",
-  "world-state-verifier",
-  "playwright",
-  "mobile",
-  "cloud-relay",
-  "discovery",
-  "web-integration",
-  "mcp",
-  "log-sources",
-  "execution-variables",
-  "notifications",
-  "general",
-  "storage",
-  "backup",
-  "instances",
-  "otel",
-  "containers",
-  "security",
-  "advanced",
-  "updates",
-] as const;
+/**
+ * Canonical list of settings sub-tabs.
+ *
+ * Exposed through the UI Bridge `list-tabs` action so AI drivers can enumerate
+ * the available tabs without DOM scraping. The `id` is the internal identifier
+ * (also used by the `switch-tab` action) and the `label` is a human-readable
+ * name suitable for UI discovery.
+ *
+ * When adding a new settings tab, add an entry here AND a case in the
+ * `switch (activeTab)` block below — `VALID_TABS` is derived from this list,
+ * so the type system will catch mismatches.
+ */
+const SETTINGS_TABS = [
+  { id: "account", label: "Account" },
+  { id: "ai", label: "AI Providers" },
+  { id: "agentic", label: "Advanced AI" },
+  { id: "self-healing", label: "Self-Healing" },
+  { id: "world-state-verifier", label: "World State Verifier" },
+  { id: "playwright", label: "Playwright" },
+  { id: "mobile", label: "Mobile" },
+  { id: "cloud-relay", label: "Cloud Relay" },
+  { id: "discovery", label: "Discovery" },
+  { id: "web-integration", label: "Web Integration" },
+  { id: "mcp", label: "MCP Servers" },
+  { id: "log-sources", label: "Log Sources" },
+  { id: "execution-variables", label: "Execution Variables" },
+  { id: "notifications", label: "Notifications" },
+  { id: "general", label: "General" },
+  { id: "storage", label: "Storage" },
+  { id: "backup", label: "Backup" },
+  { id: "instances", label: "Runner Instances" },
+  { id: "otel", label: "OpenTelemetry" },
+  { id: "containers", label: "Container Isolation" },
+  { id: "security", label: "Security" },
+  { id: "advanced", label: "Debug" },
+  { id: "updates", label: "Updates" },
+] as const satisfies ReadonlyArray<{ id: SettingsTab; label: string }>;
+
+const VALID_TABS = SETTINGS_TABS.map((t) => t.id);
 
 export function Settings({
   defaultTab,
@@ -173,6 +187,32 @@ export function Settings({
           setActiveTab("account");
           onLog("info", "Settings reset to defaults");
         },
+      },
+      {
+        id: "switch-tab",
+        label: "Switch settings tab",
+        description: "Select a settings sub-tab by id (use list-tabs to enumerate).",
+        paramSchema: { tabId: "string (one of the ids from list-tabs)" },
+        handler: (params?: unknown) => {
+          const { tabId } = (params ?? {}) as { tabId?: string };
+          if (!tabId || typeof tabId !== "string") {
+            throw new Error("switch-tab requires { tabId: string }");
+          }
+          const tab = SETTINGS_TABS.find((t) => t.id === tabId);
+          if (!tab) {
+            throw new Error(
+              `Unknown settings tab: ${tabId}. Available: ${SETTINGS_TABS.map((t) => t.id).join(", ")}`,
+            );
+          }
+          setActiveTab(tab.id);
+          return { switched: true, activeTab: tab.id };
+        },
+      },
+      {
+        id: "list-tabs",
+        label: "List available settings tabs",
+        description: "Return the id + label of every settings sub-tab.",
+        handler: () => SETTINGS_TABS.map((t) => ({ id: t.id, label: t.label })),
       },
     ],
   });
