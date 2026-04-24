@@ -10,6 +10,7 @@
 //! and will be extracted in subsequent passes.
 
 pub mod ai;
+pub mod ai_analyze;
 pub mod analytics;
 pub mod bookmarks;
 pub mod capabilities;
@@ -379,9 +380,8 @@ pub(crate) use ipc_handler_post;
 ipc_handler_post!(ui_bridge_navigate_tab_handler, "navigate_tab");
 ipc_handler_post!(ui_bridge_clear_storage_handler, "clear_storage");
 
-// AI semantic search & diff
-ipc_handler_post!(ui_bridge_ai_semantic_search_handler, "ai_semantic_search");
-ipc_handler_get!(ui_bridge_ai_diff_handler, "ai_diff");
+// AI semantic search & diff, AI analysis, media compare, and image-diff
+// handlers live in `ai_analyze::routes()` — see `ai_analyze.rs`.
 
 // Intents
 ipc_handler_get!(ui_bridge_get_intents_handler, "get_intents");
@@ -409,19 +409,6 @@ ipc_handler_get!(
     "clear_performance_entries"
 );
 
-// AI analysis
-ipc_handler_post!(ui_bridge_ai_analyze_data_handler, "ai_analyze_data");
-ipc_handler_post!(ui_bridge_ai_analyze_regions_handler, "ai_analyze_regions");
-ipc_handler_post!(
-    ui_bridge_ai_analyze_structured_handler,
-    "ai_analyze_structured_data"
-);
-ipc_handler_post!(
-    ui_bridge_ai_analyze_cross_app_handler,
-    "ai_analyze_cross_app"
-);
-ipc_handler_post!(ui_bridge_ai_recovery_attempt_handler, "ai_recovery_attempt");
-
 // Design evaluation
 ipc_handler_post!(ui_bridge_design_evaluate_handler, "design_evaluate");
 ipc_handler_post!(
@@ -436,13 +423,6 @@ ipc_handler_post!(
     ui_bridge_design_evaluate_diff_handler,
     "design_evaluate_diff"
 );
-
-// Media compare
-ipc_handler_post!(ui_bridge_media_compare_handler, "media_compare");
-
-// Pixel-accurate image diff (compareVisualRegression alias)
-ipc_handler_post!(ui_bridge_image_diff_handler, "image_diff");
-
 
 // Annotations import
 ipc_handler_post!(ui_bridge_annotations_import_handler, "annotations_import");
@@ -490,6 +470,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         let mut all: Vec<(&'static str, &'static str)> = Vec::new();
         all.extend_from_slice(local_route_entries());
         all.extend_from_slice(ai::route_entries());
+        all.extend_from_slice(ai_analyze::route_entries());
         all.extend_from_slice(bookmarks::route_entries());
         all.extend_from_slice(capabilities::route_entries());
         all.extend_from_slice(design::route_entries());
@@ -514,8 +495,6 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
     &[
         ("GET", "/ui-bridge/control/specs"),
         ("GET", "/ui-bridge/control/spec/{id}"),
-        ("POST", "/ui-bridge/ai/semantic-search"),
-        ("GET", "/ui-bridge/ai/diff"),
         ("GET", "/ui-bridge/control/intents"),
         ("POST", "/ui-bridge/control/intents"),
         ("POST", "/ui-bridge/control/intents/find"),
@@ -524,18 +503,10 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/page/scroll"),
         ("GET", "/ui-bridge/control/performance-entries"),
         ("POST", "/ui-bridge/control/performance-entries/clear"),
-        ("POST", "/ui-bridge/ai/analyze/data"),
-        ("POST", "/ui-bridge/ai/analyze/regions"),
-        ("POST", "/ui-bridge/ai/analyze/structured-data"),
-        ("POST", "/ui-bridge/ai/analyze/cross-app-compare"),
-        ("POST", "/ui-bridge/ai/recovery/attempt"),
         ("POST", "/ui-bridge/control/design/evaluate"),
         ("POST", "/ui-bridge/control/design/evaluate/baseline"),
         ("GET", "/ui-bridge/control/design/evaluate/contexts"),
         ("POST", "/ui-bridge/control/design/evaluate/diff"),
-        ("POST", "/ui-bridge/ai/media/compare"),
-        ("POST", "/ui-bridge/ai/image-diff"),
-        ("POST", "/ui-bridge/control/ai/image-diff"),
         ("POST", "/ui-bridge/control/annotations/import"),
         ("POST", "/ui-bridge/control/intents/execute-from-query"),
         ("GET", "/ui-bridge/debug/element-tree"),
@@ -634,12 +605,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // post moved to intents::routes()).
         // Annotations CRUD and media routes live in `screenshots::routes()`.
         // State machine routes (extracted to state_machine.rs) merged below.
-        // AI semantic search & diff
-        .route(
-            "/ui-bridge/ai/semantic-search",
-            post(ui_bridge_ai_semantic_search_handler),
-        )
-        .route("/ui-bridge/ai/diff", get(ui_bridge_ai_diff_handler))
+        // AI semantic search / diff / analyze / recovery / media-compare /
+        // image-diff handlers (extracted to ai_analyze.rs) merged below.
         // Intents
         .route(
             "/ui-bridge/control/intents",
@@ -672,27 +639,6 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/control/performance-entries/clear",
             post(ui_bridge_clear_performance_entries_handler),
         )
-        // AI analysis
-        .route(
-            "/ui-bridge/ai/analyze/data",
-            post(ui_bridge_ai_analyze_data_handler),
-        )
-        .route(
-            "/ui-bridge/ai/analyze/regions",
-            post(ui_bridge_ai_analyze_regions_handler),
-        )
-        .route(
-            "/ui-bridge/ai/analyze/structured-data",
-            post(ui_bridge_ai_analyze_structured_handler),
-        )
-        .route(
-            "/ui-bridge/ai/analyze/cross-app-compare",
-            post(ui_bridge_ai_analyze_cross_app_handler),
-        )
-        .route(
-            "/ui-bridge/ai/recovery/attempt",
-            post(ui_bridge_ai_recovery_attempt_handler),
-        )
         // Design evaluation
         .route(
             "/ui-bridge/control/design/evaluate",
@@ -709,20 +655,6 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/design/evaluate/diff",
             post(ui_bridge_design_evaluate_diff_handler),
-        )
-        // Media compare
-        .route(
-            "/ui-bridge/ai/media/compare",
-            post(ui_bridge_media_compare_handler),
-        )
-        // Pixel-accurate image diff (canonical visual regression)
-        .route(
-            "/ui-bridge/ai/image-diff",
-            post(ui_bridge_image_diff_handler),
-        )
-        .route(
-            "/ui-bridge/control/ai/image-diff",
-            post(ui_bridge_image_diff_handler),
         )
         // Element-screenshot routes live in `screenshots::routes()`.
         // Annotations import
@@ -837,6 +769,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(stubs::routes())
         // State machine handlers (extracted to state_machine.rs)
         .merge(state_machine::routes())
+        // AI analyze / semantic search / image-diff handlers (extracted to ai_analyze.rs)
+        .merge(ai_analyze::routes())
         // UI Bridge exploration + window listing (extracted to exploration.rs)
         .merge(exploration::routes())
         // Page navigation / evaluation / tab switching (extracted to page.rs)
