@@ -19,7 +19,6 @@
 //! emits a `web-integration-changed` Tauri event so live status views can
 //! refresh.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +26,7 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Runtime, State};
 use tracing::{info, warn};
 
+use crate::commands::compartments::{HealthCompartment, IntegrationCompartment};
 use crate::commands::AppState;
 use crate::server_mode::{ServerModeConfig, ServerModeState};
 use crate::settings::{self, WebIntegrationSettings};
@@ -116,10 +116,10 @@ pub struct GetWebIntegrationStatusResponse {
 
 #[tauri::command]
 pub async fn get_web_integration_status(
-    app_state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
 ) -> Result<GetWebIntegrationStatusResponse, String> {
     let persisted = settings::load_settings().web_integration.clone();
-    let sm_state_opt = app_state.current_server_mode().await;
+    let sm_state_opt = integration.server_mode().read().await.clone();
 
     let (runner_id, last_heartbeat_at, registration_error) = match sm_state_opt {
         Some(sm) => (
@@ -255,7 +255,7 @@ pub async fn apply_web_integration_settings<R: Runtime>(
 /// can refresh.
 #[tauri::command]
 pub async fn save_web_integration_settings<R: Runtime>(
-    app_state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
     app_handle: AppHandle<R>,
     enabled: bool,
     backend_url: String,
@@ -272,7 +272,11 @@ pub async fn save_web_integration_settings<R: Runtime>(
             .map(str::to_string),
         runner_token,
     };
-    apply_web_integration_settings(app_state.inner().as_ref(), &app_handle, settings).await
+    // `apply_web_integration_settings` takes `&AppState` because it is also
+    // invoked from the axum auth-callback handler. The compartment's inner
+    // `Arc<AppState>` is `pub(crate)`, so we can deref it cross-module to
+    // satisfy the existing signature without restructuring the helper.
+    apply_web_integration_settings(&integration.0, &app_handle, settings).await
 }
 
 // ---------------------------------------------------------------------------
@@ -495,7 +499,8 @@ fn get_hostname_for_browser() -> String {
 /// - `open::that` fails to launch the browser (e.g. no default handler).
 #[tauri::command]
 pub async fn start_web_token_flow<R: Runtime>(
-    app_state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
+    health: State<'_, HealthCompartment>,
     app_handle: AppHandle<R>,
     backend_url: Option<String>,
 ) -> Result<(), String> {
@@ -540,7 +545,7 @@ pub async fn start_web_token_flow<R: Runtime>(
     };
 
     // Generate state and store it.
-    let state = app_state.token_flow.start(effective_backend.clone());
+    let state = integration.token_flow().start(effective_backend.clone());
 
     // Build callback URL (runner's own HTTP API). Use 127.0.0.1 not
     // localhost so the regex on the web side can validate it strictly.
@@ -550,8 +555,8 @@ pub async fn start_web_token_flow<R: Runtime>(
         // where this command fires before the HTTP server has recorded its
         // port. The callback route lives on the same axum router, so once
         // that router is up the port matches.
-        let bound = app_state
-            .api_port
+        let bound = health
+            .api_port()
             .load(std::sync::atomic::Ordering::Relaxed);
         if bound > 0 {
             bound
