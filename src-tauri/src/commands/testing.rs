@@ -9,17 +9,15 @@
 //!
 //! Also provides CRUD operations for managing tests in the database.
 
-use super::compartments::StorageCompartment;
+use super::compartments::{BridgeCompartment, StorageCompartment};
 use super::CommandResponse;
 use crate::database::{CreateVerificationTestInput, TriggerPoint, VerificationTest};
-use crate::executor::{is_default_bridge_running, with_default_bridge};
+use crate::executor::{is_default_bridge_running_compartment, with_default_bridge_compartment};
 use crate::test_executor::{
     execute_test, execute_test_suite, RepoTestConfig, TestCategory, TestDefinition,
     TestExecutionResult, TestStatus, TestSuiteSummary, TestType, VisionConfig,
 };
-use crate::AppState;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -712,9 +710,9 @@ pub async fn create_test_association(
     trigger_point: String,
     action_id: Option<String>,
     execution_order: Option<i32>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
+    let _db = state.pg_db();
     let _test_id = test_id;
     let _config_id = config_id;
     let _workflow_name = workflow_name;
@@ -735,9 +733,9 @@ pub async fn create_test_association(
 pub async fn get_config_test_associations(
     config_id: String,
     trigger_point: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
+    let _db = state.pg_db();
     let _config_id = config_id;
     let _trigger_point = trigger_point;
 
@@ -753,9 +751,9 @@ pub async fn get_config_test_associations(
 #[tauri::command]
 pub async fn delete_test_association(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
+    let _db = state.pg_db();
     let _id = id;
 
     // delete_test_association not yet implemented on PgDb — stub
@@ -823,9 +821,9 @@ pub struct ImportSummary {
 pub async fn export_tests_to_file(
     test_ids: Vec<String>,
     file_path: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!("Exporting {} tests to {}", test_ids.len(), file_path);
 
@@ -909,9 +907,9 @@ pub async fn export_tests_to_file(
 #[tauri::command]
 pub async fn export_all_tests_to_file(
     file_path: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
+    let _db = state.pg_db();
 
     info!("Exporting all tests to {}", file_path);
 
@@ -931,9 +929,9 @@ pub async fn export_all_tests_to_file(
 pub async fn import_tests_from_file(
     file_path: String,
     update_existing: bool,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
+    let _db = state.pg_db();
     let _update_existing = update_existing;
 
     info!(
@@ -976,12 +974,12 @@ pub struct PageAnalysisResponse {
 #[tauri::command]
 pub fn analyze_page_playwright(
     cdp_port: Option<u16>,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> CommandResponse {
     let port = cdp_port.unwrap_or(9222);
     info!("Analyzing page via Playwright CDP on port {}", port);
 
-    if !is_default_bridge_running(&state) {
+    if !is_default_bridge_running_compartment(&bridge) {
         return CommandResponse {
             success: false,
             message: Some(
@@ -996,7 +994,7 @@ pub fn analyze_page_playwright(
     });
 
     // Use send_command_and_wait for synchronous response
-    let result = with_default_bridge(&state, |bridge| {
+    let result = with_default_bridge_compartment(&bridge, |bridge| {
         bridge.send_command_and_wait(
             "analyze_page_playwright",
             Some(params),
@@ -1049,14 +1047,14 @@ pub fn analyze_page_playwright(
 #[tauri::command]
 pub fn analyze_page_playwright_script(
     script: String,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> CommandResponse {
     info!(
         "Analyzing page via Playwright script ({} chars)",
         script.len()
     );
 
-    if !is_default_bridge_running(&state) {
+    if !is_default_bridge_running_compartment(&bridge) {
         return CommandResponse {
             success: false,
             message: Some(
@@ -1071,7 +1069,7 @@ pub fn analyze_page_playwright_script(
     });
 
     // Use longer timeout for script execution (may include navigation, waiting, etc.)
-    let result = with_default_bridge(&state, |bridge| {
+    let result = with_default_bridge_compartment(&bridge, |bridge| {
         bridge.send_command_and_wait(
             "analyze_page_playwright_script",
             Some(params),
@@ -1123,12 +1121,12 @@ pub fn analyze_page_playwright_script(
 #[tauri::command]
 pub fn analyze_page_vision(
     monitor_index: Option<i32>,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> CommandResponse {
     let monitor = monitor_index.unwrap_or(0);
     info!("Analyzing page via Vision on monitor {}", monitor);
 
-    if !is_default_bridge_running(&state) {
+    if !is_default_bridge_running_compartment(&bridge) {
         return CommandResponse {
             success: false,
             message: Some(
@@ -1143,7 +1141,7 @@ pub fn analyze_page_vision(
     });
 
     // Use send_command_and_wait for synchronous response
-    let result = with_default_bridge(&state, |bridge| {
+    let result = with_default_bridge_compartment(&bridge, |bridge| {
         bridge.send_command_and_wait(
             "analyze_page_vision",
             Some(params),
@@ -1237,7 +1235,7 @@ pub struct GenerateTestInput {
 #[tauri::command]
 pub async fn generate_test_with_ai(
     input: GenerateTestInput,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
 
@@ -1289,7 +1287,7 @@ pub async fn generate_test_with_ai(
     };
 
     // Clone state for use in spawn_blocking
-    let app_state = state.inner().clone();
+    let bridge_compartment = bridge.inner().clone();
 
     // Build params before moving into spawn_blocking
     let params = serde_json::json!({
@@ -1306,7 +1304,7 @@ pub async fn generate_test_with_ai(
 
     // SQLite: complex function — Python bridge IPC for AI test generation (sync bridge call)
     let result = tokio::task::spawn_blocking(move || {
-        if !is_default_bridge_running(&app_state) {
+        if !is_default_bridge_running_compartment(&bridge_compartment) {
             return CommandResponse {
                 success: false,
                 message: Some(
@@ -1317,7 +1315,7 @@ pub async fn generate_test_with_ai(
         }
 
         // Use longer timeout for AI generation (can take time)
-        let bridge_result = with_default_bridge(&app_state, |bridge| {
+        let bridge_result = with_default_bridge_compartment(&bridge_compartment, |bridge| {
             bridge.send_command_and_wait(
                 "generate_test_with_ai",
                 Some(params),
@@ -1650,12 +1648,12 @@ pub struct WorkflowRunContext {
 #[tauri::command]
 pub async fn list_recent_task_runs(
     limit: Option<i32>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("[list_recent_task_runs] Called with limit: {:?}", limit);
     let limit = limit.unwrap_or(20);
 
-    let pg_runs = state.pg_db.list_recent_task_runs_pg(limit).await?;
+    let pg_runs = state.pg_db().list_recent_task_runs_pg(limit).await?;
 
     let runs: Vec<TaskRunSummary> = pg_runs
         .into_iter()
@@ -1687,9 +1685,9 @@ pub async fn list_recent_task_runs(
 #[tauri::command]
 pub async fn get_workflow_run_context(
     task_run_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    match state.pg_db.get_workflow_run_context_pg(&task_run_id).await {
+    match state.pg_db().get_workflow_run_context_pg(&task_run_id).await {
         Ok(Some(context)) => Ok(CommandResponse {
             success: true,
             message: None,
