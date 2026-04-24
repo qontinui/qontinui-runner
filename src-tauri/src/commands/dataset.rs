@@ -13,14 +13,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info, warn};
 use zip::ZipArchive;
 
-use super::{AppState, CommandResponse};
+use super::compartments::StorageCompartment;
+use super::CommandResponse;
+use crate::error::AppError;
+
+// Migrated to StorageCompartment (Workstream C).
 
 /// Image metadata from the manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,23 +119,19 @@ fn calculate_file_hash(path: &Path) -> Result<String> {
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with scan results
 /// * `Err(String)` - Error if scan operation fails
-#[tauri::command]
-pub fn scan_local_images(
+fn scan_local_images_impl(
     manifest_path: String,
-    state: State<Arc<AppState>>,
-) -> Result<CommandResponse, String> {
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!("Scanning local images for manifest: {}", manifest_path);
 
     // Read and parse manifest
     let manifest_content = fs::read_to_string(&manifest_path).map_err(|e| {
         error!("Failed to read manifest: {}", e);
-        format!("Failed to read manifest: {}", e)
+        AppError::IoError(e)
     })?;
 
-    let manifest: ImageManifest = serde_json::from_str(&manifest_content).map_err(|e| {
-        error!("Failed to parse manifest: {}", e);
-        format!("Failed to parse manifest: {}", e)
-    })?;
+    let manifest: ImageManifest = serde_json::from_str(&manifest_content)?;
 
     info!(
         "Manifest loaded: dataset={}, total_images={}",
@@ -140,7 +139,7 @@ pub fn scan_local_images(
     );
 
     // Get screenshot base path from storage
-    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
+    let storage = crate::safe_lock::safe_lock_or_recover(state.local_storage(), "local_storage");
     let screenshot_path = &storage.config.screenshot_path;
 
     let mut matched: Vec<MatchedImage> = Vec::new();
@@ -151,18 +150,14 @@ pub fn scan_local_images(
     if screenshot_path.exists() {
         for session_entry in fs::read_dir(screenshot_path).map_err(|e| {
             error!("Failed to read screenshot directory: {}", e);
-            format!("Failed to read screenshot directory: {}", e)
+            AppError::IoError(e)
         })? {
-            let session_entry =
-                session_entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+            let session_entry = session_entry?;
             let session_path = session_entry.path();
 
             if session_path.is_dir() {
-                for img_entry in fs::read_dir(&session_path)
-                    .map_err(|e| format!("Failed to read session directory: {}", e))?
-                {
-                    let img_entry =
-                        img_entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+                for img_entry in fs::read_dir(&session_path)? {
+                    let img_entry = img_entry?;
                     let img_path = img_entry.path();
 
                     if img_path.is_file() {
@@ -234,11 +229,28 @@ pub fn scan_local_images(
             result.matched.len(),
             result.total_in_manifest
         )),
-        data: Some(serde_json::to_value(&result).map_err(|e| {
-            error!("Failed to serialize scan result: {}", e);
-            format!("Failed to serialize scan result: {}", e)
-        })?),
+        data: Some(serde_json::to_value(&result)?),
     })
+}
+
+/// Scan local storage for images matching the manifest.
+///
+/// Reads the image_manifest.json from the annotation export and searches
+/// local screenshot storage for matching images.
+///
+/// # Arguments
+/// * `manifest_path` - Path to the image_manifest.json file
+/// * `state` - Application state containing the local storage service
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with scan results
+/// * `Err(String)` - Error if scan operation fails
+#[tauri::command]
+pub fn scan_local_images(
+    manifest_path: String,
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, String> {
+    scan_local_images_impl(manifest_path, &state).map_err(String::from)
 }
 
 /// Package dataset with annotations and images into YOLO format.
@@ -256,59 +268,53 @@ pub fn scan_local_images(
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with packaging results
 /// * `Err(String)` - Error if packaging fails
-#[tauri::command]
-pub fn package_dataset(
+fn package_dataset_impl(
     config: PackageConfig,
-    _state: State<Arc<AppState>>,
-) -> Result<CommandResponse, String> {
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!("Packaging dataset to: {}", config.output_path);
 
     // Validate splits
     let total_split = config.train_split + config.val_split + config.test_split;
     if (total_split - 1.0).abs() > 0.001 {
-        return Err(format!(
+        return Err(AppError::ValidationError(format!(
             "Split percentages must sum to 1.0, got {}",
             total_split
-        ));
+        )));
     }
 
     // Read manifest
     let manifest_content = fs::read_to_string(&config.manifest_path).map_err(|e| {
         error!("Failed to read manifest: {}", e);
-        format!("Failed to read manifest: {}", e)
+        AppError::IoError(e)
     })?;
 
-    let manifest: ImageManifest = serde_json::from_str(&manifest_content).map_err(|e| {
-        error!("Failed to parse manifest: {}", e);
-        format!("Failed to parse manifest: {}", e)
-    })?;
+    let manifest: ImageManifest = serde_json::from_str(&manifest_content)?;
 
     // Open annotation ZIP
     let zip_file = fs::File::open(&config.annotation_zip_path).map_err(|e| {
         error!("Failed to open annotation ZIP: {}", e);
-        format!("Failed to open annotation ZIP: {}", e)
+        AppError::IoError(e)
     })?;
 
     let mut archive = ZipArchive::new(zip_file).map_err(|e| {
         error!("Failed to read ZIP archive: {}", e);
-        format!("Failed to read ZIP archive: {}", e)
+        AppError::ParseError(format!("Failed to read ZIP archive: {}", e))
     })?;
 
     // Create output directory structure
     let output_path = Path::new(&config.output_path);
     fs::create_dir_all(output_path).map_err(|e| {
         error!("Failed to create output directory: {}", e);
-        format!("Failed to create output directory: {}", e)
+        AppError::IoError(e)
     })?;
 
     let images_dir = output_path.join("images");
     let labels_dir = output_path.join("labels");
 
     for split in &["train", "val", "test"] {
-        fs::create_dir_all(images_dir.join(split))
-            .map_err(|e| format!("Failed to create images/{} directory: {}", split, e))?;
-        fs::create_dir_all(labels_dir.join(split))
-            .map_err(|e| format!("Failed to create labels/{} directory: {}", split, e))?;
+        fs::create_dir_all(images_dir.join(split))?;
+        fs::create_dir_all(labels_dir.join(split))?;
     }
 
     // Extract all annotations from ZIP to a temporary map
@@ -318,13 +324,12 @@ pub fn package_dataset(
     for i in 0..archive.len() {
         let mut file = archive
             .by_index(i)
-            .map_err(|e| format!("Failed to read ZIP entry {}: {}", i, e))?;
+            .map_err(|e| AppError::ParseError(format!("Failed to read ZIP entry {}: {}", i, e)))?;
 
         let filename = file.name().to_string();
         if filename.ends_with(".txt") && filename.contains("labels/") {
             let mut content = String::new();
-            file.read_to_string(&mut content)
-                .map_err(|e| format!("Failed to read annotation file {}: {}", filename, e))?;
+            file.read_to_string(&mut content)?;
 
             // Extract class IDs from YOLO format annotations
             for line in content.lines() {
@@ -343,25 +348,19 @@ pub fn package_dataset(
     info!("Extracted {} annotations from ZIP", annotations.len());
 
     // Get screenshot base path from storage
-    let storage = crate::safe_lock::safe_lock_or_recover(&_state.local_storage, "local_storage");
+    let storage = crate::safe_lock::safe_lock_or_recover(state.local_storage(), "local_storage");
     let screenshot_path = &storage.config.screenshot_path;
 
     // Build a map of all local images (same as scan_local_images)
     let mut local_images: HashMap<String, PathBuf> = HashMap::new();
     if screenshot_path.exists() {
-        for session_entry in fs::read_dir(screenshot_path)
-            .map_err(|e| format!("Failed to read screenshot directory: {}", e))?
-        {
-            let session_entry =
-                session_entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        for session_entry in fs::read_dir(screenshot_path)? {
+            let session_entry = session_entry?;
             let session_path = session_entry.path();
 
             if session_path.is_dir() {
-                for img_entry in fs::read_dir(&session_path)
-                    .map_err(|e| format!("Failed to read session directory: {}", e))?
-                {
-                    let img_entry =
-                        img_entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+                for img_entry in fs::read_dir(&session_path)? {
+                    let img_entry = img_entry?;
                     let img_path = img_entry.path();
 
                     if img_path.is_file() {
@@ -390,7 +389,9 @@ pub fn package_dataset(
     }
 
     if matched_items.is_empty() {
-        return Err("No matched images with annotations found".to_string());
+        return Err(AppError::ValidationError(
+            "No matched images with annotations found".to_string(),
+        ));
     }
 
     info!(
@@ -414,25 +415,22 @@ pub fn package_dataset(
     let test_items = &matched_items[val_end..];
 
     // Copy images and annotations
-    let copy_split = |items: &[(PathBuf, String)], split: &str| -> Result<(), String> {
+    let copy_split = |items: &[(PathBuf, String)], split: &str| -> Result<(), AppError> {
         for (img_path, annotation) in items {
             let filename = img_path
                 .file_name()
-                .ok_or_else(|| "Invalid image filename".to_string())?
+                .ok_or_else(|| AppError::ValidationError("Invalid image filename".to_string()))?
                 .to_string_lossy()
                 .to_string();
 
             // Copy image
             let dest_img = images_dir.join(split).join(&filename);
-            fs::copy(img_path, &dest_img)
-                .map_err(|e| format!("Failed to copy image {}: {}", filename, e))?;
+            fs::copy(img_path, &dest_img)?;
 
             // Write annotation
             let annotation_filename = filename.replace(".png", ".txt");
             let dest_label = labels_dir.join(split).join(&annotation_filename);
-            fs::write(&dest_label, annotation).map_err(|e| {
-                format!("Failed to write annotation {}: {}", annotation_filename, e)
-            })?;
+            fs::write(&dest_label, annotation)?;
         }
         Ok(())
     };
@@ -456,8 +454,7 @@ pub fn package_dataset(
             .cmp(&b.parse::<u32>().unwrap_or(u32::MAX))
     });
     let classes_content = classes.join("\n");
-    fs::write(output_path.join("classes.txt"), &classes_content)
-        .map_err(|e| format!("Failed to write classes.txt: {}", e))?;
+    fs::write(output_path.join("classes.txt"), &classes_content)?;
 
     // Create data.yaml
     let data_yaml = format!(
@@ -481,8 +478,7 @@ names: [{}]
             .join(", ")
     );
 
-    fs::write(output_path.join("data.yaml"), &data_yaml)
-        .map_err(|e| format!("Failed to write data.yaml: {}", e))?;
+    fs::write(output_path.join("data.yaml"), &data_yaml)?;
 
     let result = PackageResult {
         success: true,
@@ -501,11 +497,31 @@ names: [{}]
             "Dataset packaged successfully: {} images total",
             total
         )),
-        data: Some(serde_json::to_value(&result).map_err(|e| {
-            error!("Failed to serialize package result: {}", e);
-            format!("Failed to serialize package result: {}", e)
-        })?),
+        data: Some(serde_json::to_value(&result)?),
     })
+}
+
+/// Package dataset with annotations and images into YOLO format.
+///
+/// Creates a complete YOLO dataset structure with:
+/// - images/ and labels/ directories
+/// - train/val/test splits
+/// - data.yaml configuration
+/// - classes.txt file
+///
+/// # Arguments
+/// * `config` - Packaging configuration
+/// * `state` - Application state (unused but kept for consistency)
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with packaging results
+/// * `Err(String)` - Error if packaging fails
+#[tauri::command]
+pub fn package_dataset(
+    config: PackageConfig,
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, String> {
+    package_dataset_impl(config, &state).map_err(String::from)
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.

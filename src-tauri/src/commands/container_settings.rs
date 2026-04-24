@@ -21,7 +21,8 @@
 //! change is backward-compatible for display; it only affects consumers
 //! that substring-match the prefix (none in this module's call chain).
 
-use crate::commands::{AppState, CommandResponse};
+use crate::commands::compartments::ExecutionCompartment;
+use crate::commands::CommandResponse;
 use crate::container::container_config::ContainerConfig;
 use crate::container::docker_client::DockerManager;
 use crate::container::isolated_executor::IsolatedExecutor;
@@ -32,6 +33,8 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::info;
+
+// Migrated to ExecutionCompartment (Workstream C).
 
 /// Response for Docker/container status checks
 #[derive(Debug, Serialize, Deserialize)]
@@ -64,7 +67,7 @@ async fn get_container_settings_impl() -> Result<CommandResponse, AppError> {
 /// Get the current container isolation settings.
 #[tauri::command]
 pub async fn get_container_settings(
-    _state: State<'_, Arc<AppState>>,
+    _state: State<'_, ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     get_container_settings_impl().await.map_err(String::from)
 }
@@ -77,7 +80,7 @@ pub async fn get_container_settings(
 /// blanket `From<serde_json::Error>` impl.
 async fn update_container_settings_impl(
     config: ContainerConfig,
-    state: &Arc<AppState>,
+    state: &ExecutionCompartment,
 ) -> Result<CommandResponse, AppError> {
     info!(
         "Updating container settings: enabled={}, image={}",
@@ -88,7 +91,7 @@ async fn update_container_settings_impl(
     crate::settings::save_container_settings(config.clone()).map_err(AppError::ConfigError)?;
 
     // Update the runtime executor
-    let mut executor_guard = state.container_executor.lock().await;
+    let mut executor_guard = state.container_executor().lock().await;
     if config.enabled {
         // Initialize DockerManager and IsolatedExecutor
         let docker = Arc::new(DockerManager::new().await);
@@ -127,7 +130,7 @@ async fn update_container_settings_impl(
 #[tauri::command]
 pub async fn update_container_settings(
     config: ContainerConfig,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     update_container_settings_impl(config, &state)
         .await
@@ -135,11 +138,13 @@ pub async fn update_container_settings(
 }
 
 /// Internal implementation of [`check_docker_status`] returning [`AppError`].
-async fn check_docker_status_impl(state: &Arc<AppState>) -> Result<CommandResponse, AppError> {
+async fn check_docker_status_impl(
+    state: &ExecutionCompartment,
+) -> Result<CommandResponse, AppError> {
     info!("Checking Docker status");
 
     // Check if we have an active executor
-    let executor_guard = state.container_executor.lock().await;
+    let executor_guard = state.container_executor().lock().await;
     let executor_ready = executor_guard
         .as_ref()
         .map(|e| e.is_available())
@@ -179,7 +184,7 @@ async fn check_docker_status_impl(state: &Arc<AppState>) -> Result<CommandRespon
 /// This performs a live ping to the Docker socket.
 #[tauri::command]
 pub async fn check_docker_status(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     check_docker_status_impl(&state).await.map_err(String::from)
 }
