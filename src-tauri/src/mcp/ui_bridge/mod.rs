@@ -24,6 +24,7 @@ pub mod forms;
 pub mod helpers;
 pub mod history;
 pub mod intents;
+pub mod intents_registry;
 pub mod network;
 pub mod page;
 pub mod request;
@@ -384,11 +385,8 @@ ipc_handler_post!(ui_bridge_clear_storage_handler, "clear_storage");
 // AI semantic search & diff, AI analysis, media compare, and image-diff
 // handlers live in `ai_analyze::routes()` — see `ai_analyze.rs`.
 
-// Intents
-ipc_handler_get!(ui_bridge_get_intents_handler, "get_intents");
-ipc_handler_post!(ui_bridge_register_intent_handler, "register_intent");
-ipc_handler_post!(ui_bridge_find_intent_handler, "find_intent");
-ipc_handler_post!(ui_bridge_execute_intent_handler, "execute_intent");
+// Intent registry handlers (list/register/find/execute/execute-from-query)
+// live in `intents_registry::routes()` — see `intents_registry.rs`.
 
 // Component state
 ipc_handler_path_get!(
@@ -415,12 +413,6 @@ ipc_handler_get!(
 
 // Annotations import
 ipc_handler_post!(ui_bridge_annotations_import_handler, "annotations_import");
-
-// Intents from NL query
-ipc_handler_post!(
-    ui_bridge_execute_intent_from_query_handler,
-    "execute_intent_from_query"
-);
 
 // Debug
 ipc_handler_get!(ui_bridge_get_element_tree_handler, "get_element_tree");
@@ -469,6 +461,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(exploration::route_entries());
         all.extend_from_slice(forms::route_entries());
         all.extend_from_slice(intents::route_entries());
+        all.extend_from_slice(intents_registry::route_entries());
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
         all.extend_from_slice(screenshots::route_entries());
@@ -485,16 +478,11 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
     &[
         ("GET", "/ui-bridge/control/specs"),
         ("GET", "/ui-bridge/control/spec/{id}"),
-        ("GET", "/ui-bridge/control/intents"),
-        ("POST", "/ui-bridge/control/intents"),
-        ("POST", "/ui-bridge/control/intents/find"),
-        ("POST", "/ui-bridge/control/intents/execute"),
         ("GET", "/ui-bridge/control/component/{id}/state"),
         ("POST", "/ui-bridge/control/page/scroll"),
         ("GET", "/ui-bridge/control/performance-entries"),
         ("POST", "/ui-bridge/control/performance-entries/clear"),
         ("POST", "/ui-bridge/control/annotations/import"),
-        ("POST", "/ui-bridge/control/intents/execute-from-query"),
         ("GET", "/ui-bridge/debug/element-tree"),
         ("POST", "/ui-bridge/debug/highlight/{id}"),
         ("GET", "/ui-bridge/history/elements"),
@@ -593,19 +581,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // State machine routes (extracted to state_machine.rs) merged below.
         // AI semantic search / diff / analyze / recovery / media-compare /
         // image-diff handlers (extracted to ai_analyze.rs) merged below.
-        // Intents
-        .route(
-            "/ui-bridge/control/intents",
-            get(ui_bridge_get_intents_handler).post(ui_bridge_register_intent_handler),
-        )
-        .route(
-            "/ui-bridge/control/intents/find",
-            post(ui_bridge_find_intent_handler),
-        )
-        .route(
-            "/ui-bridge/control/intents/execute",
-            post(ui_bridge_execute_intent_handler),
-        )
+        // Intent registry handlers (extracted to intents_registry.rs) merged below.
         // Component state
         .route(
             "/ui-bridge/control/component/{id}/state",
@@ -631,11 +607,6 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/annotations/import",
             post(ui_bridge_annotations_import_handler),
-        )
-        // Intents from NL query
-        .route(
-            "/ui-bridge/control/intents/execute-from-query",
-            post(ui_bridge_execute_intent_from_query_handler),
         )
         // Debug
         .route(
@@ -743,6 +714,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(ai_analyze::routes())
         // Design evaluate handlers (extracted to design_eval.rs)
         .merge(design_eval::routes())
+        // Intent registry handlers (extracted to intents_registry.rs)
+        .merge(intents_registry::routes())
         // UI Bridge exploration + window listing (extracted to exploration.rs)
         .merge(exploration::routes())
         // Page navigation / evaluation / tab switching (extracted to page.rs)
