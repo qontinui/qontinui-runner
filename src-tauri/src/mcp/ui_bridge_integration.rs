@@ -2653,8 +2653,7 @@ fn pascal_name_to_route(name: &str) -> String {
             // boundary (e.g. `UIB` -> `ui-b` when followed by lowercase).
             let insert_dash = prev.is_ascii_lowercase()
                 || prev.is_ascii_digit()
-                || (prev.is_ascii_uppercase()
-                    && next.is_some_and(|n| n.is_ascii_lowercase()));
+                || (prev.is_ascii_uppercase() && next.is_some_and(|n| n.is_ascii_lowercase()));
             if insert_dash {
                 out.push('-');
             }

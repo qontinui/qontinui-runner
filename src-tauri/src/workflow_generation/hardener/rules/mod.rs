@@ -13,10 +13,10 @@
 use super::rule::HardenRule;
 
 pub mod ensure_command_mode;
-pub mod flatten_retry_object;
 pub mod fix_bash_negation;
 pub mod fix_curl_sf_piped;
 pub mod fix_health_check_assertion;
+pub mod flatten_retry_object;
 pub mod quote_curl_ampersand_urls;
 pub mod replace_jq_with_python;
 pub mod replace_python_fstring;

@@ -1148,7 +1148,13 @@ impl PgDb {
         // every runner startup wedges in apply_canonical_schema.
         let schema_no_comments: String = CANONICAL_SCHEMA
             .lines()
-            .map(|l| if l.trim_start().starts_with("--") { "" } else { l })
+            .map(|l| {
+                if l.trim_start().starts_with("--") {
+                    ""
+                } else {
+                    l
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let mut applied = 0usize;

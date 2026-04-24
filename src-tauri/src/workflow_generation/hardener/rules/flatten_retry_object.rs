@@ -34,6 +34,10 @@ impl HardenRule for FlattenRetryObject {
             obj.insert("retry_delay_ms".to_string(), Value::Number(d.into()));
         }
         obj.remove("retry");
-        emit_mutated(report, "flatten_retry_object", "retry→retry_count/retry_delay_ms");
+        emit_mutated(
+            report,
+            "flatten_retry_object",
+            "retry→retry_count/retry_delay_ms",
+        );
     }
 }

@@ -116,7 +116,10 @@ pub fn add_saved_project(project: SavedProject) -> Result<(), String> {
     let project = normalize_project(project);
     let mut current = settings::get_saved_projects();
 
-    if current.iter().any(|p| normalize_path(&p.path) == project.path) {
+    if current
+        .iter()
+        .any(|p| normalize_path(&p.path) == project.path)
+    {
         // Already present — idempotent no-op.
         info!(
             "Saved project already present, skipping add: {}",
@@ -219,7 +222,11 @@ mod tests {
         let mut current = vec![sample("/tmp/a/"), sample("/tmp/b")];
         let target = normalize_path("/tmp/a");
         current.retain(|p| normalize_path(&p.path) != target);
-        assert_eq!(current.len(), 1, "trailing-slash variant should still match");
+        assert_eq!(
+            current.len(),
+            1,
+            "trailing-slash variant should still match"
+        );
         assert_eq!(current[0].path, "/tmp/b");
     }
 }

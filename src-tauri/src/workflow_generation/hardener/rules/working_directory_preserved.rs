@@ -37,12 +37,7 @@ impl HardenRule for WorkingDirectoryPreserved {
         true
     }
 
-    fn apply(
-        &self,
-        _step: &mut StepMut<'_>,
-        _ctx: &RuleCtx<'_>,
-        _report: &mut HardenReport,
-    ) {
+    fn apply(&self, _step: &mut StepMut<'_>, _ctx: &RuleCtx<'_>, _report: &mut HardenReport) {
         // Intentional no-op: no working_directory fix-ups are needed today.
         // When one becomes necessary, implement it here. The engine will
         // grant the capability token via `ctx.working_dir_cap` (Some), and

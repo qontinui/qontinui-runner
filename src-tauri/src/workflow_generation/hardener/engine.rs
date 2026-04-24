@@ -10,9 +10,7 @@
 use serde_json::Value;
 use tracing::warn;
 
-use super::rule::{
-    HardenReport, HardenRule, RuleCtx, RuleEvent, StepMut, WorkingDirCapability,
-};
+use super::rule::{HardenReport, HardenRule, RuleCtx, RuleEvent, StepMut, WorkingDirCapability};
 
 /// Ordered collection of rules that operates as a single traversal.
 pub struct RuleEngine {

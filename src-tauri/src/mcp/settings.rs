@@ -918,16 +918,15 @@ async fn get_discovery_ports_setting(
 async fn save_discovery_ports_setting(
     Json(payload): Json<DiscoveryPortsPayload>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result =
-        tokio::task::spawn_blocking(move || settings::save_discovery_ports(payload.ports))
-            .await
-            .map_err(|e| {
-                error!("Failed to save discovery ports: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Task failed: {}", e))),
-                )
-            })?;
+    let result = tokio::task::spawn_blocking(move || settings::save_discovery_ports(payload.ports))
+        .await
+        .map_err(|e| {
+            error!("Failed to save discovery ports: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Task failed: {}", e))),
+            )
+        })?;
 
     match result {
         Ok(()) => {

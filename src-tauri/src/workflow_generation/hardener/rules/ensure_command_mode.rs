@@ -67,11 +67,7 @@ impl HardenRule for EnsureCommandMode {
                 "Injected missing mode='{}' on command step '{}'",
                 inferred, step_name
             );
-            emit_mutated(
-                report,
-                "ensure_command_mode",
-                format!("mode={}", inferred),
-            );
+            emit_mutated(report, "ensure_command_mode", format!("mode={}", inferred));
         }
     }
 }

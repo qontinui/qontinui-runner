@@ -1268,7 +1268,10 @@ function helperFn() {}
         };
         parse_typescript(content, "src/data.ts", &mut graph, false);
 
-        assert!(!graph.functions.is_empty(), "Should find fetchData function");
+        assert!(
+            !graph.functions.is_empty(),
+            "Should find fetchData function"
+        );
         assert!(!graph.classes.is_empty(), "Should find DataService class");
         assert!(
             graph.imports.len() >= 2,

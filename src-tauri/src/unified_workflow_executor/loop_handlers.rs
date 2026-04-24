@@ -2635,9 +2635,7 @@ impl LoopController {
             .output()
             .map(|o| o.contains("[UNFIXABLE_ERRORS]") || o.contains("[UNFIXABLE_ERROR]"))
             .unwrap_or(false);
-        let unfixable_reason = outcome
-            .parsed()
-            .and_then(|p| p.unfixable_reason.clone());
+        let unfixable_reason = outcome.parsed().and_then(|p| p.unfixable_reason.clone());
 
         let stopped_before_pause = self.is_task_stopped(&config.execution_id);
 

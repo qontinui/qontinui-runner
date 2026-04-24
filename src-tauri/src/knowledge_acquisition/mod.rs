@@ -102,13 +102,12 @@ impl KnowledgeAcquisition {
             .or_else(|| Perplexity::from_env(client.clone()));
         // Tauri dev server URL (the runner's own React UI). Falls back to the
         // default debug port (1420) when not explicitly set.
-        let ui_bridge_base = crate::api_config::get_tauri_dev_server_url()
-            .unwrap_or_else(|| {
-                format!(
-                    "http://127.0.0.1:{}",
-                    crate::api_config::DEFAULT_TAURI_DEV_PORT
-                )
-            });
+        let ui_bridge_base = crate::api_config::get_tauri_dev_server_url().unwrap_or_else(|| {
+            format!(
+                "http://127.0.0.1:{}",
+                crate::api_config::DEFAULT_TAURI_DEV_PORT
+            )
+        });
         let ui_bridge = UiBridgeFetch::new(client.clone(), &ui_bridge_base);
 
         Self {

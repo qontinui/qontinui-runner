@@ -45,6 +45,7 @@ pub use bookmarks::{
     ui_bridge_structured_changes_handler, ui_bridge_summarize_diff_handler,
     ui_bridge_wait_for_change_handler, ui_bridge_with_diff_handler,
 };
+pub use circuit_breaker::{CircuitBreakerState, UiBridgeCircuitBreaker};
 pub use design::{
     ui_bridge_design_audit_handler, ui_bridge_design_clear_style_guide_handler,
     ui_bridge_design_element_styles_handler, ui_bridge_design_get_style_guide_handler,
@@ -71,6 +72,11 @@ pub use forms::{
     ui_bridge_diff_forms_handler, ui_bridge_fill_form_handler, ui_bridge_get_forms_handler,
     ui_bridge_snapshot_forms_handler,
 };
+pub use history::{
+    ui_bridge_element_reliability_handler, ui_bridge_history_element_handler,
+    ui_bridge_history_elements_handler, ui_bridge_history_flaky_handler, ElementReliabilityQuery,
+    FlakyElementsQuery, HistoryElementQuery, HistoryElementsQuery,
+};
 pub use network::{
     ui_bridge_clear_console_errors_handler, ui_bridge_get_browser_events_handler,
     ui_bridge_get_console_errors_handler, ui_bridge_get_network_chains_handler,
@@ -87,15 +93,9 @@ pub use page::{
     ui_bridge_page_go_forward_handler, ui_bridge_page_hard_refresh_handler,
     ui_bridge_page_navigate_handler, ui_bridge_page_refresh_handler,
     ui_bridge_page_set_tab_handler, ui_bridge_page_summary_handler,
-    ui_bridge_query_selector_handler, BatchEvaluateRequest, BatchExpression,
-    BatchExpressionResult, NavigateAndWaitRequest, PageEvaluateRequest, PageNavigateRequest,
-    QuerySelectorRequest, SetTabRequest, SetTabResponse,
-};
-pub use circuit_breaker::{CircuitBreakerState, UiBridgeCircuitBreaker};
-pub use history::{
-    ui_bridge_element_reliability_handler, ui_bridge_history_element_handler,
-    ui_bridge_history_elements_handler, ui_bridge_history_flaky_handler, ElementReliabilityQuery,
-    FlakyElementsQuery, HistoryElementQuery, HistoryElementsQuery,
+    ui_bridge_query_selector_handler, BatchEvaluateRequest, BatchExpression, BatchExpressionResult,
+    NavigateAndWaitRequest, PageEvaluateRequest, PageNavigateRequest, QuerySelectorRequest,
+    SetTabRequest, SetTabResponse,
 };
 pub use request::{handle_ui_bridge_response, ui_bridge_request_sync};
 pub use types::{
@@ -135,7 +135,6 @@ use helpers::{
     extract_get_element_match, filter_element_fields, glob_match, safe_evaluate,
     snapshot_signature,
 };
-
 
 /// Get all registered UI elements from the React UI Bridge.
 pub async fn ui_bridge_get_elements_handler(
@@ -1373,7 +1372,6 @@ pub async fn ui_bridge_get_snapshot_handler(
     }
 }
 
-
 /// Get undo/redo state from the UI Bridge.
 pub async fn ui_bridge_get_undo_state_handler(
     State(state): State<Arc<ApiState>>,
@@ -1488,7 +1486,6 @@ pub struct AssertResult {
     pub expected: serde_json::Value,
     pub message: String,
 }
-
 
 // ============================================================================
 // Direct tab navigation moved to `page::routes()` — see `page.rs`.
@@ -1766,7 +1763,6 @@ pub async fn ui_bridge_structured_assert_handler(
 // ============================================================================
 // Exploration Handlers
 // ============================================================================
-
 
 // =============================================================================
 // App-Specific Screenshots (xcap)
@@ -5949,10 +5945,7 @@ async fn ui_bridge_batch_handler(
     Ok(Json(ApiResponse::success(response)))
 }
 
-
 // Create routes for this module.
-
-
 
 // =========================================================================
 // Convenience endpoints — app-agnostic DOM interaction helpers
@@ -6258,7 +6251,6 @@ pub async fn ui_bridge_type_into_handler(
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
-
 
 /// POST /ui-bridge/control/wait-for-element-state
 ///
