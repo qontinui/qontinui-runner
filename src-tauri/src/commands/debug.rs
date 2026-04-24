@@ -7,12 +7,14 @@
 
 use crate::settings;
 use serde_json;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{Runtime, State};
 use tracing::{error, info};
 
-use super::{AppState, CommandResponse};
+use super::compartments::BridgeCompartment;
+use super::CommandResponse;
+
+// Migrated to BridgeCompartment (Workstream C proof-of-pattern).
 
 /// Get the current debug settings.
 ///
@@ -54,7 +56,7 @@ pub fn get_debug_settings() -> Result<CommandResponse, String> {
 pub async fn set_debug_settings(
     enable_image_debug: bool,
     top_matches_count: u32,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Setting debug settings: enable_image_debug={}, top_matches_count={}",
@@ -72,7 +74,7 @@ pub async fn set_debug_settings(
 
     // If Python bridge is running, send the settings
     // NOTE: We use spawn_blocking because PythonBridge methods use block_on internally
-    let manager_guard = state.bridge_manager.lock().await;
+    let manager_guard = state.bridge_manager().lock().await;
     if let Some(ref manager) = *manager_guard {
         // Use async check to avoid nested runtime panic
         if manager.is_default_bridge_running_async().await {
