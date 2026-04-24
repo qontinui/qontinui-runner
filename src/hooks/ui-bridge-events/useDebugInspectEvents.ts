@@ -8,12 +8,32 @@ import { getAllSpecs } from "../../lib/spec-registry";
 // Browser / Console capture type interfaces
 // ---------------------------------------------------------------------------
 
+/**
+ * Response shape from the SDK's cursor-based `getConsoleRecent({sinceId, limit})`
+ * overload. Mirrors `ConsoleRecentResponse` in
+ * `@qontinui/ui-bridge/debug/browser-capture` so we can forward the new
+ * pagination fields (`nextSinceId`), eviction counter (`droppedCount`), and
+ * current buffer size (`bufferedCount`) through the runner's HTTP handler.
+ */
+interface ConsoleRecentResponseAPI {
+  errors: unknown[];
+  nextSinceId: number;
+  droppedCount: number;
+  bufferedCount: number;
+}
+
 /** Subset of BrowserCapture methods used by event handlers */
 interface BrowserCaptureAPI {
   getByType: (type: string) => unknown[];
   getSince: (ts: number) => unknown[];
   getRecent: (n: number) => unknown[];
-  getConsoleRecent: (n: number) => unknown[];
+  // Overloaded: numeric arg returns a bare CapturedError[]; the options
+  // object opts into the new {errors, nextSinceId, droppedCount,
+  // bufferedCount} envelope. Both overloads exist in the SDK.
+  getConsoleRecent: {
+    (options: { sinceId?: number; limit?: number }): ConsoleRecentResponseAPI;
+    (n?: number): unknown[];
+  };
   getConsoleSince: (ts: number) => unknown[];
   getMemoryTrend?: () => unknown;
   getFrameworkOverlays?: () => unknown;
@@ -133,12 +153,27 @@ export function useDebugInspectEvents(
           }
 
           const since = payload.params?.since as number | undefined;
+          const sinceId = payload.params?.sinceId as number | undefined;
           const limit = payload.params?.limit as number | undefined;
           const shouldGroup = (payload.params?.group as boolean) ?? false;
-          // Use console-specific methods to filter out navigation/long-task events
-          const errors = since
-            ? capture.getConsoleSince(since)
-            : capture.getConsoleRecent(limit ?? 50);
+
+          // When the caller supplies a sinceId we use the SDK's new cursor
+          // overload — getConsoleRecent({sinceId, limit}) — and return the
+          // richer {errors, nextSinceId, droppedCount, bufferedCount}
+          // response shape unchanged. Legacy callers (no sinceId) still hit
+          // the bare-array overload and receive the original {errors, count}
+          // shape. Grouped requests always fall back to the bare-array
+          // overload because the fingerprinting path needs the CapturedError
+          // objects and not the cursor envelope.
+          const cursorResponse =
+            typeof sinceId === "number" && !shouldGroup
+              ? capture.getConsoleRecent({ sinceId, limit })
+              : null;
+          const errors = cursorResponse
+            ? cursorResponse.errors
+            : since
+              ? capture.getConsoleSince(since)
+              : capture.getConsoleRecent(limit ?? 50);
 
           if (shouldGroup) {
             const { computeFingerprint: fingerprint } = await import("@qontinui/ui-bridge/debug");
@@ -175,6 +210,23 @@ export function useDebugInspectEvents(
               type,
               success: true,
               data: { groups, totalErrors: errors.length, totalGroups: groups.length },
+              timestamp: Date.now(),
+            });
+          } else if (cursorResponse) {
+            // Cursor response: pass the full envelope through so callers
+            // can paginate via nextSinceId and see the running
+            // droppedCount / bufferedCount from the SDK's ring buffer.
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                errors: cursorResponse.errors,
+                count: cursorResponse.errors.length,
+                nextSinceId: cursorResponse.nextSinceId,
+                droppedCount: cursorResponse.droppedCount,
+                bufferedCount: cursorResponse.bufferedCount,
+              },
               timestamp: Date.now(),
             });
           } else {
@@ -1075,6 +1127,44 @@ export function useDebugInspectEvents(
               timestamp: Date.now(),
             });
           }
+          return true;
+        }
+
+        case "get_toast_buffer": {
+          // Fetch entries from the SDK's toast ring buffer, optionally
+          // filtered by sinceMs and limited. Falls back gracefully if the
+          // singleton has never been touched (returns an empty list).
+          const sinceMsRaw = payload.params?.sinceMs;
+          const sinceMs =
+            typeof sinceMsRaw === "number"
+              ? sinceMsRaw
+              : typeof sinceMsRaw === "string" && sinceMsRaw !== ""
+                ? Number(sinceMsRaw)
+                : undefined;
+          const limitRaw = payload.params?.limit;
+          const limit =
+            typeof limitRaw === "number"
+              ? limitRaw
+              : typeof limitRaw === "string" && limitRaw !== ""
+                ? Number(limitRaw)
+                : undefined;
+
+          let toasts: unknown[] = [];
+          try {
+            const { toastBuffer } = await import("@qontinui/ui-bridge");
+            toasts = toastBuffer.getSince(sinceMs, limit);
+          } catch {
+            // Module not yet loaded / no buffer — return empty list.
+            toasts = [];
+          }
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { toasts },
+            timestamp: Date.now(),
+          });
           return true;
         }
 

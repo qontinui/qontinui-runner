@@ -31,6 +31,13 @@ use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 pub struct ConsoleErrorsQuery {
     #[serde(default, deserialize_with = "deserialize_timestamp")]
     since: Option<f64>,
+    /// Cursor for the new sinceId-aware BrowserEventCapture query.
+    /// When present, the frontend uses the cursor overload of
+    /// `getConsoleRecent({sinceId, limit})` and returns the richer
+    /// `{errors, nextSinceId, droppedCount, bufferedCount}` shape which
+    /// this handler forwards through verbatim.
+    #[serde(default)]
+    since_id: Option<u64>,
     #[serde(default)]
     limit: Option<u32>,
     #[serde(default)]
@@ -101,6 +108,7 @@ pub async fn ui_bridge_get_console_errors_handler(
     let payload = serde_json::json!({
         "params": {
             "since": query.since,
+            "sinceId": query.since_id,
             "limit": query.limit,
             "group": query.group,
             "groupBy": query.group_by
@@ -123,6 +131,10 @@ pub async fn ui_bridge_get_console_errors_handler(
                     .ui_bridge_console_error_count
                     .store(total, std::sync::atomic::Ordering::Relaxed);
             }
+            // The SDK's new cursor overload returns {errors, nextSinceId,
+            // droppedCount, bufferedCount}; legacy callers (no sinceId) see
+            // only {errors, count}. Either shape passes through unchanged
+            // because `data` is the serde_json::Value the frontend emitted.
             Ok(Json(ApiResponse::success(data)))
         }
         Err(e) => {
