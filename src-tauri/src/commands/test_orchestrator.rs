@@ -2,13 +2,13 @@
 //!
 //! Tauri commands for AI-driven multi-step API test orchestration.
 
-use crate::commands::{AppState, CommandResponse};
+use crate::commands::compartments::{HealthCompartment, StorageCompartment};
+use crate::commands::CommandResponse;
 use crate::test_orchestrator::{
     create_orchestration_plan, generate_test_from_execution, GenerateTestRequest,
     OrchestrationExecutionResult, TestOrchestrationPlan, TestOrchestrationRequest,
     TestOrchestrator,
 };
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -21,7 +21,8 @@ use tracing::{error, info};
 #[tauri::command]
 pub async fn plan_test_orchestration(
     request: TestOrchestrationRequest,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
+    health: State<'_, HealthCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Planning test orchestration with {} requests",
@@ -29,8 +30,8 @@ pub async fn plan_test_orchestration(
     );
 
     // Get saved API requests from database
-    let saved_requests_json = state
-        .pg_db
+    let saved_requests_json = storage
+        .pg_db()
         .list_saved_api_requests()
         .await
         .map_err(|e| format!("Failed to list saved requests: {}", e))?;
@@ -40,7 +41,7 @@ pub async fn plan_test_orchestration(
         .collect();
 
     // Extract DoctorHandle for AI health monitoring
-    let doctor_handle = state.doctor_handle.lock().await.clone();
+    let doctor_handle = health.doctor_handle().lock().await.clone();
 
     // Create the plan using AI
     match create_orchestration_plan(&request, &saved_requests, doctor_handle.as_ref()) {
@@ -69,13 +70,13 @@ pub async fn plan_test_orchestration(
 #[tauri::command]
 pub async fn execute_test_orchestration(
     plan: TestOrchestrationPlan,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Executing orchestration plan: {}", plan.id);
 
     // Get saved API requests from database
-    let saved_requests_json = state
-        .pg_db
+    let saved_requests_json = storage
+        .pg_db()
         .list_saved_api_requests()
         .await
         .map_err(|e| format!("Failed to list saved requests: {}", e))?;
@@ -130,11 +131,11 @@ pub async fn generate_test_from_orchestration(
     plan: TestOrchestrationPlan,
     test_type: String,
     additional_instructions: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    health: State<'_, HealthCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Generating {} test from orchestration execution", test_type);
 
-    let doctor_handle = state.doctor_handle.lock().await.clone();
+    let doctor_handle = health.doctor_handle().lock().await.clone();
 
     let request = GenerateTestRequest {
         execution_result,
@@ -165,12 +166,12 @@ pub async fn generate_test_from_orchestration(
 /// Returns the list of saved API requests that can be selected for orchestration.
 #[tauri::command]
 pub async fn get_saved_requests_for_orchestration(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting saved API requests for orchestration");
 
-    let requests_result: Result<serde_json::Value, String> = state
-        .pg_db
+    let requests_result: Result<serde_json::Value, String> = storage
+        .pg_db()
         .list_saved_api_requests()
         .await
         .map(|v| serde_json::to_value(&v).unwrap_or_default());
@@ -198,7 +199,7 @@ pub async fn get_saved_requests_for_orchestration(
 #[tauri::command]
 pub async fn save_orchestration_plan(
     plan: TestOrchestrationPlan,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Saving orchestration plan: {}", plan.id);
 
@@ -208,7 +209,7 @@ pub async fn save_orchestration_plan(
 
     // Store as a setting
     let key = format!("orchestration_plan_{}", plan.id);
-    let save_err = state.pg_db.set_setting(&key, &plan_value).await.err();
+    let save_err = storage.pg_db().set_setting(&key, &plan_value).await.err();
     if let Some(e) = save_err {
         error!("Failed to save orchestration plan: {}", e);
         return Ok(CommandResponse {
@@ -228,13 +229,13 @@ pub async fn save_orchestration_plan(
 /// List saved orchestration plans
 #[tauri::command]
 pub async fn list_orchestration_plans(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Listing saved orchestration plans");
 
     // Get all settings
-    let all_settings = state
-        .pg_db
+    let all_settings = storage
+        .pg_db()
         .get_all_settings()
         .await
         .map_err(|e| format!("Failed to get settings: {}", e))?;
@@ -260,14 +261,14 @@ pub async fn list_orchestration_plans(
 #[tauri::command]
 pub async fn delete_orchestration_plan(
     plan_id: String,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Deleting orchestration plan: {}", plan_id);
 
     // Set the value to null to effectively delete the setting
     let key = format!("orchestration_plan_{}", plan_id);
-    let del_err = state
-        .pg_db
+    let del_err = storage
+        .pg_db()
         .set_setting(&key, &serde_json::Value::Null)
         .await
         .err();
