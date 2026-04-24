@@ -29,6 +29,10 @@ interface UIBridgeStateGraphProps {
   dropTargetStateId?: string | null;
   onDeleteTransition?: (id: string) => void;
   elementThumbnails?: Record<string, string>;
+  /** User-chosen chunk labels keyed by chunk id (chunked view). */
+  chunkLabels?: Map<string, string>;
+  /** Save a chunk label override. Empty string reverts to auto-derived name. */
+  onSaveChunkLabel?: (chunkId: string, label: string) => void;
 }
 
 export function UIBridgeStateGraph({
@@ -46,6 +50,8 @@ export function UIBridgeStateGraph({
   dropTargetStateId,
   onDeleteTransition,
   elementThumbnails,
+  chunkLabels,
+  onSaveChunkLabel,
 }: UIBridgeStateGraphProps) {
   return (
     <StateMachineGraphView
@@ -70,6 +76,8 @@ export function UIBridgeStateGraph({
         ["Move element", "Alt+Drag"],
       ]}
       elementThumbnails={elementThumbnails}
+      chunkLabels={chunkLabels}
+      onSaveChunkLabel={onSaveChunkLabel}
     />
   );
 }

@@ -14,6 +14,7 @@ pub mod canary;
 pub mod canvas;
 pub mod checkpoints;
 pub mod checks;
+pub mod chunk_labels;
 pub mod comparison;
 pub mod compensation;
 pub mod contradiction;

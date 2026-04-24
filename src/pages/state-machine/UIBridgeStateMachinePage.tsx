@@ -42,6 +42,7 @@ import type { PermittedTrigger, BlockedTrigger } from "@qontinui/workflow-ui";
 
 import { useStateMachineConfig } from "@/hooks/useStateMachineConfig";
 import { useElementDrag } from "@/hooks/useElementDrag";
+import { useChunkLabels } from "@/hooks/useChunkLabels";
 import { useUIBridgeDiscovery } from "@/hooks/useUIBridgeDiscovery";
 import { useToast } from "@/hooks/useToast";
 import { UIBridgeStateGraph } from "./UIBridgeStateGraph";
@@ -168,6 +169,12 @@ export function UIBridgeStateMachinePage() {
     return { configId: null, thumbs: undefined };
   });
   const activeConfigId = sm.activeConfig?.id;
+
+  // Per-config user-chosen chunk label overrides for the chunked graph view.
+  const { labels: chunkLabels, saveLabel: onSaveChunkLabel } = useChunkLabels(
+    activeConfigId ?? null,
+  );
+
   useEffect(() => {
     if (!activeConfigId) return;
     let isCancelled = false;
@@ -643,6 +650,8 @@ export function UIBridgeStateMachinePage() {
               isDragging={elementDrag.isDragging}
               dropTargetStateId={elementDrag.dropTargetStateId}
               onDeleteTransition={handleDeleteTransition}
+              chunkLabels={chunkLabels}
+              onSaveChunkLabel={onSaveChunkLabel}
             />
           </div>
 

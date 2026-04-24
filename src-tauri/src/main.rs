@@ -508,6 +508,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::window_manager::plugin())
         .plugin(commands::checks::plugin())
         .plugin(commands::checkpoints::plugin())
+        .plugin(commands::chunk_labels::plugin())
         .plugin(commands::comparison::plugin())
         .plugin(commands::container_settings::plugin())
         .plugin(commands::dag_workflows::plugin())

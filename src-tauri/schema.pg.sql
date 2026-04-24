@@ -3904,3 +3904,17 @@ CREATE TABLE IF NOT EXISTS state_discovery_drift_scores (
 CREATE INDEX IF NOT EXISTS idx_drift_scores_spec_computed
     ON state_discovery_drift_scores (spec_id, computed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_vga_shadow_model ON vga_shadow_samples(model_used);
+
+-- Chunk labels — per-(config_id, chunk_id) user-chosen override for the
+-- auto-derived chunk name shown in the chunked state-machine graph view.
+-- chunk_id is stable under input permutations (djb2 hash of sorted state
+-- ids produced by chunkStateMachine in @qontinui/workflow-utils).
+CREATE TABLE IF NOT EXISTS chunk_labels (
+    config_id  TEXT NOT NULL,
+    chunk_id   TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (config_id, chunk_id)
+);
+CREATE INDEX IF NOT EXISTS idx_chunk_labels_config ON chunk_labels(config_id);
