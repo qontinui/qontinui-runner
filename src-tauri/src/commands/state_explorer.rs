@@ -10,6 +10,7 @@ use tauri::State;
 use tracing::{error, info};
 
 use super::{AppState, CommandResponse};
+use crate::commands::compartments::ExecutionCompartment;
 use crate::state_explorer::{ExplorationConfig, ExplorationStrategy, ExplorationTask};
 
 /// Start a state exploration task
@@ -132,13 +133,13 @@ pub async fn get_exploration_strategies() -> Result<CommandResponse, String> {
 #[tauri::command]
 pub async fn preview_exploration_plan(
     config: ExplorationConfig,
-    state: State<'_, Arc<AppState>>,
+    execution: State<'_, ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Generating exploration plan for {}", config.config_path);
 
     // Load the current config
     let config_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
+        crate::safe_lock::safe_lock_or_recover(execution.current_config(), "current_config");
     let qontinui_config = match config_lock.as_ref() {
         Some(c) => c,
         None => {
