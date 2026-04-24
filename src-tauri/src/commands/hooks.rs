@@ -7,15 +7,17 @@
 //! - Test hook execution
 //! - Reorder hooks
 
-use crate::commands::{AppState, CommandResponse};
+use crate::commands::compartments::StorageCompartment;
+use crate::commands::CommandResponse;
 use crate::orchestrator::hooks::{Hook, HookAction, HookCondition, HookContext, HookTrigger};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 use uuid::Uuid;
+
+// Migrated to StorageCompartment (Workstream C).
 
 // ============================================================================
 // Request/Response Types
@@ -396,10 +398,12 @@ fn hook_to_response(
 /// * `Ok(CommandResponse)` - Success with list of HookResponse
 /// * `Err(String)` - Error message if hooks cannot be loaded
 #[tauri::command]
-pub async fn get_all_hooks(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn get_all_hooks(
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, String> {
     info!("Getting all hooks");
 
-    let pg_hooks = state.pg_db.list_hooks().await?;
+    let pg_hooks = state.pg_db().list_hooks().await?;
 
     let mut hooks: Vec<HookResponse> = Vec::new();
 
@@ -477,11 +481,11 @@ pub async fn get_all_hooks(state: State<'_, Arc<AppState>>) -> Result<CommandRes
 #[tauri::command]
 pub async fn get_hook(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting hook: {}", id);
 
-    match state.pg_db.get_hook(&id).await? {
+    match state.pg_db().get_hook(&id).await? {
         Some(hook_json) => {
             let hid = hook_json["id"].as_str().unwrap_or("").to_string();
             let name = hook_json["name"].as_str().unwrap_or("").to_string();
@@ -547,7 +551,7 @@ pub async fn get_hook(
 #[tauri::command]
 pub async fn create_hook(
     request: CreateHookRequest,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Creating hook: {}", request.name);
 
@@ -566,7 +570,7 @@ pub async fn create_hook(
         .map_err(|e| format!("Failed to serialize conditions: {}", e))?;
 
     state
-        .pg_db
+        .pg_db()
         .create_hook(
             &id,
             &request.name,
@@ -599,12 +603,12 @@ pub async fn create_hook(
 pub async fn update_hook(
     id: String,
     request: UpdateHookRequest,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Updating hook: {}", id);
 
     // Get current hook values from PG
-    let current = match state.pg_db.get_hook(&id).await? {
+    let current = match state.pg_db().get_hook(&id).await? {
         Some(v) => v,
         None => {
             return Ok(CommandResponse {
@@ -660,7 +664,7 @@ pub async fn update_hook(
     let _ = parse_action(&action_type, action_config)?;
 
     state
-        .pg_db
+        .pg_db()
         .update_hook(
             &id,
             &name,
@@ -690,11 +694,11 @@ pub async fn update_hook(
 #[tauri::command]
 pub async fn delete_hook(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Deleting hook: {}", id);
 
-    let deleted = state.pg_db.delete_hook(&id).await?;
+    let deleted = state.pg_db().delete_hook(&id).await?;
 
     if !deleted {
         return Ok(CommandResponse {
@@ -724,11 +728,11 @@ pub async fn delete_hook(
 pub async fn set_hook_enabled(
     id: String,
     enabled: bool,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Setting hook {} enabled={}", id, enabled);
 
-    let updated = state.pg_db.set_hook_enabled(&id, enabled).await?;
+    let updated = state.pg_db().set_hook_enabled(&id, enabled).await?;
 
     if !updated {
         return Ok(CommandResponse {
@@ -762,11 +766,11 @@ pub async fn set_hook_enabled(
 #[tauri::command]
 pub async fn reorder_hooks(
     request: ReorderHooksRequest,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Reordering {} hooks", request.hook_ids.len());
 
-    state.pg_db.reorder_hooks(&request.hook_ids).await?;
+    state.pg_db().reorder_hooks(&request.hook_ids).await?;
 
     Ok(CommandResponse {
         success: true,
@@ -786,12 +790,12 @@ pub async fn reorder_hooks(
 #[tauri::command]
 pub async fn test_hook(
     request: TestHookRequest,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Testing hook: {}", request.hook_id);
 
     // Get the hook from PG
-    let hook_json = match state.pg_db.get_hook(&request.hook_id).await? {
+    let hook_json = match state.pg_db().get_hook(&request.hook_id).await? {
         Some(v) => v,
         None => {
             return Ok(CommandResponse {
