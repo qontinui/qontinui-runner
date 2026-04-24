@@ -12,14 +12,14 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
-use super::{AppState, CommandResponse};
-use crate::executor::{is_default_bridge_running, with_default_bridge};
+use super::compartments::BridgeCompartment;
+use super::CommandResponse;
+use crate::executor::{is_default_bridge_running_compartment, with_default_bridge_compartment};
 
 /// Configuration for interaction recording
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,14 +57,14 @@ pub struct InteractionRecordingStatus {
 #[tauri::command]
 pub fn start_interaction_recording(
     config: InteractionRecordingConfig,
-    state: State<Arc<AppState>>,
+    bridge: State<BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Starting interaction recording: session_id={:?}, fps={:?}",
         config.session_id, config.fps
     );
 
-    if !is_default_bridge_running(&state) {
+    if !is_default_bridge_running_compartment(&bridge) {
         return Err("Python executor is not running. Please start the executor first.".to_string());
     }
 
@@ -74,7 +74,7 @@ pub fn start_interaction_recording(
         "output_dir": config.output_dir,
     });
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .send_command("start_interaction_recording", Some(params.clone()))
             .map_err(|e| {
@@ -101,14 +101,16 @@ pub fn start_interaction_recording(
 /// * `Ok(CommandResponse)` - Success with file paths and event count
 /// * `Err(String)` - Error if recording fails to stop
 #[tauri::command]
-pub fn stop_interaction_recording(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn stop_interaction_recording(
+    bridge: State<BridgeCompartment>,
+) -> Result<CommandResponse, String> {
     info!("Stopping interaction recording");
 
-    if !is_default_bridge_running(&state) {
+    if !is_default_bridge_running_compartment(&bridge) {
         return Err("Python executor is not running. Please start the executor first.".to_string());
     }
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .send_command("stop_interaction_recording", None)
             .map_err(|e| {
@@ -136,10 +138,10 @@ pub fn stop_interaction_recording(state: State<Arc<AppState>>) -> Result<Command
 /// * `Err(String)` - Error if status query fails
 #[tauri::command]
 pub fn get_interaction_recording_status(
-    state: State<Arc<AppState>>,
+    bridge: State<BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     // Return not recording if executor is not running
-    if !is_default_bridge_running(&state) {
+    if !is_default_bridge_running_compartment(&bridge) {
         return Ok(CommandResponse {
             success: true,
             message: None,
@@ -149,7 +151,7 @@ pub fn get_interaction_recording_status(
         });
     }
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .send_command("get_interaction_recording_status", None)
             .map_err(|e| {
