@@ -4,7 +4,14 @@
 //! - Getting and setting auth source settings
 //! - Managing custom variables for API execution
 //! - Resolving variable values from environment
+//!
+//! # Typed errors (Workstream D)
+//!
+//! Handlers keep `-> Result<T, String>` at the Tauri boundary and build
+//! errors via [`AppError`] internally, converting with
+//! `.map_err(String::from)`. See `commands/mod.rs` for the migration guide.
 
+use crate::error::AppError;
 use crate::settings::{
     self, AuthSource, CustomVariable, ExecutionVariablesSettings, VariableSource,
 };
@@ -45,51 +52,34 @@ pub struct ResolvedVariableStatus {
 // Tauri Commands
 // ============================================================================
 
-/// Get the current execution variables settings.
-///
-/// Returns the execution variables settings stored in the persistent settings file.
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success with execution variables settings data
-/// * `Err(String)` - Error message if settings cannot be loaded
-#[tauri::command]
-pub fn get_execution_variables_settings() -> Result<CommandResponse, String> {
+/// Internal implementation of [`get_execution_variables_settings`] returning [`AppError`].
+fn get_execution_variables_settings_impl() -> Result<CommandResponse, AppError> {
     info!("Getting execution variables settings");
 
     let settings = settings::get_execution_variables_settings();
+    let data = serde_json::to_value(&settings)?;
 
     Ok(CommandResponse {
         success: true,
         message: Some("Execution variables settings retrieved".to_string()),
-        data: Some(
-            serde_json::to_value(&settings)
-                .map_err(|e| format!("Failed to serialize settings: {}", e))?,
-        ),
+        data: Some(data),
     })
 }
 
-/// Save execution variables settings.
-///
-/// Updates the execution variables settings in the persistent settings file.
-///
-/// # Arguments
-/// * `auth_source` - Auth source ("captured", "manual", or "environment")
-/// * `auth_header_name` - Header name to use for auth (e.g., "Authorization")
-/// * `auth_token` - Manual auth token (when auth_source is "manual")
-/// * `auth_env_var` - Environment variable name (when auth_source is "environment")
-/// * `custom_variables` - Array of custom variables
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success
-/// * `Err(String)` - Error message if settings cannot be saved
+/// Get the current execution variables settings.
 #[tauri::command]
-pub fn save_execution_variables_settings(
+pub fn get_execution_variables_settings() -> Result<CommandResponse, String> {
+    get_execution_variables_settings_impl().map_err(String::from)
+}
+
+/// Internal implementation of [`save_execution_variables_settings`] returning [`AppError`].
+fn save_execution_variables_settings_impl(
     auth_source: String,
     auth_header_name: String,
     auth_token: Option<String>,
     auth_env_var: String,
     custom_variables: Vec<serde_json::Value>,
-) -> Result<CommandResponse, String> {
+) -> Result<CommandResponse, AppError> {
     info!(
         "Saving execution variables settings: auth_source={}, {} custom variables",
         auth_source,
@@ -100,17 +90,22 @@ pub fn save_execution_variables_settings(
         "captured" => AuthSource::Captured,
         "manual" => AuthSource::Manual,
         "environment" => AuthSource::Environment,
-        _ => return Err(format!("Invalid auth source: {}", auth_source)),
+        _ => {
+            return Err(AppError::ValidationError(format!(
+                "Invalid auth source: {}",
+                auth_source
+            )))
+        }
     };
 
     // Parse custom variables
-    let parsed_variables: Result<Vec<CustomVariable>, String> = custom_variables
+    let parsed_variables: Result<Vec<CustomVariable>, AppError> = custom_variables
         .into_iter()
         .map(|v| {
             let name = v
                 .get("name")
                 .and_then(|n| n.as_str())
-                .ok_or("Missing variable name")?
+                .ok_or_else(|| AppError::ValidationError("Missing variable name".to_string()))?
                 .to_string();
 
             let source_str = v.get("source").and_then(|s| s.as_str()).unwrap_or("manual");
@@ -155,7 +150,7 @@ pub fn save_execution_variables_settings(
     };
 
     settings::save_execution_variables_settings(execution_settings)
-        .map_err(|e| format!("Failed to save execution variables settings: {}", e))?;
+        .map_err(AppError::ConfigError)?;
 
     Ok(CommandResponse {
         success: true,
@@ -164,16 +159,27 @@ pub fn save_execution_variables_settings(
     })
 }
 
-/// Get resolved execution context.
-///
-/// Returns the current execution context with resolved variable values.
-/// For security, auth tokens are not returned - only their status.
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success with resolved context
-/// * `Err(String)` - Error message if resolution fails
+/// Save execution variables settings.
 #[tauri::command]
-pub fn get_resolved_execution_context() -> Result<CommandResponse, String> {
+pub fn save_execution_variables_settings(
+    auth_source: String,
+    auth_header_name: String,
+    auth_token: Option<String>,
+    auth_env_var: String,
+    custom_variables: Vec<serde_json::Value>,
+) -> Result<CommandResponse, String> {
+    save_execution_variables_settings_impl(
+        auth_source,
+        auth_header_name,
+        auth_token,
+        auth_env_var,
+        custom_variables,
+    )
+    .map_err(String::from)
+}
+
+/// Internal implementation of [`get_resolved_execution_context`] returning [`AppError`].
+fn get_resolved_execution_context_impl() -> Result<CommandResponse, AppError> {
     info!("Getting resolved execution context");
 
     let settings = settings::get_execution_variables_settings();
@@ -221,24 +227,22 @@ pub fn get_resolved_execution_context() -> Result<CommandResponse, String> {
         custom_variables: variable_status,
     };
 
+    let data = serde_json::to_value(&context)?;
+
     Ok(CommandResponse {
         success: true,
         message: Some("Execution context resolved".to_string()),
-        data: Some(
-            serde_json::to_value(&context)
-                .map_err(|e| format!("Failed to serialize context: {}", e))?,
-        ),
+        data: Some(data),
     })
 }
 
+/// Get resolved execution context.
+#[tauri::command]
+pub fn get_resolved_execution_context() -> Result<CommandResponse, String> {
+    get_resolved_execution_context_impl().map_err(String::from)
+}
+
 /// Test if an environment variable is set and has a value.
-///
-/// # Arguments
-/// * `env_var` - The environment variable name to check
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success with `exists` boolean in data
-/// * `Err(String)` - Error message if check fails
 #[tauri::command]
 pub fn test_env_var(env_var: String) -> Result<CommandResponse, String> {
     info!("Testing environment variable: {}", env_var);
