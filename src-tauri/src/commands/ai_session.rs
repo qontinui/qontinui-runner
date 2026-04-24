@@ -13,6 +13,10 @@ use tracing::{error, info, warn};
 use crate::claude_session::manager::SessionManager;
 use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
 use crate::claude_session::state::SessionState;
+// Migrated to StorageCompartment (Workstream C) — 5 handlers. `generate_workflow_from_session`
+// keeps `Arc<AppState>` because it needs raw `&AppState` for workflow_generation plus fields
+// across Storage + Health compartments.
+use crate::commands::compartments::StorageCompartment;
 use crate::commands::{AppState, CommandResponse};
 use crate::database::CreateTaskRunInput;
 use crate::execution_context::AiSessionContext;
@@ -69,10 +73,10 @@ pub fn emit_session_state_ex(
 /// enriched with `is_live` indicating whether a live CLI process exists.
 #[tauri::command]
 pub async fn list_ai_sessions(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, StorageCompartment>,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
 ) -> Result<CommandResponse, String> {
-    let result = app_state.pg_db.get_ai_sessions(50, None).await;
+    let result = app_state.pg_db().get_ai_sessions(50, None).await;
 
     match result {
         Ok(sessions) => {
@@ -302,7 +306,7 @@ pub async fn get_ai_session_state(
 pub async fn create_ai_session(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, StorageCompartment>,
     task_name: Option<String>,
 ) -> Result<CommandResponse, String> {
     let task_run_id = uuid::Uuid::new_v4().to_string();
@@ -317,7 +321,7 @@ pub async fn create_ai_session(
     let input = CreateTaskRunInput::new(task_run_id.clone(), name.clone())
         .with_prompt("AI session")
         .with_workflow_type("chat");
-    let create_ok = app_state.pg_db.create_task_run(&input).await.is_ok();
+    let create_ok = app_state.pg_db().create_task_run(&input).await.is_ok();
 
     if !create_ok {
         return Ok(CommandResponse {
@@ -409,7 +413,7 @@ pub async fn create_ai_session(
 pub async fn close_ai_session(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
     info!("close_ai_session: task_run_id={}", task_run_id);
@@ -421,7 +425,7 @@ pub async fn close_ai_session(
 
     // Update DB status
     let _ = app_state
-        .pg_db
+        .pg_db()
         .update_task_run_status(&task_run_id, "stopped")
         .await;
 
@@ -447,7 +451,7 @@ pub async fn close_ai_session(
 /// Updates the task_name for the task run in the database.
 #[tauri::command]
 pub async fn rename_ai_session(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, StorageCompartment>,
     task_run_id: String,
     name: String,
 ) -> Result<CommandResponse, String> {
@@ -456,7 +460,7 @@ pub async fn rename_ai_session(
         task_run_id, name
     );
 
-    let result: Result<(), String> = app_state.pg_db.update_task_name(&task_run_id, &name).await;
+    let result: Result<(), String> = app_state.pg_db().update_task_name(&task_run_id, &name).await;
 
     match result {
         Ok(()) => Ok(CommandResponse {
@@ -482,12 +486,12 @@ pub async fn rename_ai_session(
 /// been persisted yet (e.g., the current or most recent AI response).
 #[tauri::command]
 pub async fn get_ai_output(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, StorageCompartment>,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
     let db_output = app_state
-        .pg_db
+        .pg_db()
         .get_task_output(&task_run_id)
         .await
         .unwrap_or_default();
