@@ -7,11 +7,10 @@
 //! - Device information retrieval
 
 use crate::auth::AuthManager;
-use crate::commands::AppState;
+use crate::commands::compartments::HealthCompartment;
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tracing::{error, info, warn};
@@ -910,8 +909,8 @@ pub async fn send_device_heartbeat(
 /// The frontend calls this on mount to detect if the API server started
 /// before the event listener was set up (e.g., after a page refresh).
 #[tauri::command]
-pub fn is_api_ready(app_state: tauri::State<'_, Arc<AppState>>) -> bool {
-    app_state.api_ready.load(Ordering::Relaxed)
+pub fn is_api_ready(health: tauri::State<'_, HealthCompartment>) -> bool {
+    health.api_ready().load(Ordering::Relaxed)
 }
 
 /// Get the actual port the HTTP API server is listening on.
@@ -919,8 +918,8 @@ pub fn is_api_ready(app_state: tauri::State<'_, Arc<AppState>>) -> bool {
 /// Returns the port the server bound to (may differ from default 9876 if
 /// `QONTINUI_PORT` env var was set or if the primary port was occupied).
 #[tauri::command]
-pub fn get_api_port(app_state: tauri::State<'_, Arc<AppState>>) -> u16 {
-    app_state.api_port.load(Ordering::Relaxed)
+pub fn get_api_port(health: tauri::State<'_, HealthCompartment>) -> u16 {
+    health.api_port().load(Ordering::Relaxed)
 }
 
 /// Credentials for temp-runner auto-login, sourced from process env.
