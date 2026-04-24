@@ -13,77 +13,89 @@ use crate::meta_optimizer::types::{
 
 // ── Recommendations ────────────────────────────────────────────────────
 
+// These commands MUST be `async`. They were originally sync, which caused the
+// runner to hard-crash when the Cost Control page invoked them: Tauri executes
+// sync commands on a single-threaded WebView worker, and the
+// `tokio::task::block_in_place` + `Handle::current().block_on(...)` pattern in
+// the underlying helpers panics on a thread with no ambient multi-thread
+// runtime. That panic crosses the WebView2 FFI boundary and aborts the process
+// rather than unwinding. Async commands run on Tauri's tokio multi-thread
+// runtime, so we call `_async` helpers that `.await` PG calls directly.
 #[tauri::command]
-pub fn get_meta_optimizer_recommendations(
+pub async fn get_meta_optimizer_recommendations(
     app_state: State<'_, Arc<AppState>>,
     optimizer_type: Option<String>,
     status: Option<String>,
 ) -> Result<Vec<Recommendation>, String> {
-    crate::meta_optimizer::recommendations::list_recommendations(
+    crate::meta_optimizer::recommendations::list_recommendations_async(
         &app_state.pg_db,
         optimizer_type.as_deref(),
         status.as_deref(),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn apply_meta_optimizer_recommendation(
+pub async fn apply_meta_optimizer_recommendation(
     app_state: State<'_, Arc<AppState>>,
     recommendation_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::recommendations::apply_recommendation_with_side_effects(
+    crate::meta_optimizer::recommendations::apply_recommendation_with_side_effects_async(
         &app_state.pg_db,
         &recommendation_id,
     )
+    .await
 }
 
 #[tauri::command]
-pub fn reject_meta_optimizer_recommendation(
+pub async fn reject_meta_optimizer_recommendation(
     app_state: State<'_, Arc<AppState>>,
     recommendation_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::recommendations::reject_recommendation(
+    crate::meta_optimizer::recommendations::reject_recommendation_async(
         &app_state.pg_db,
         &recommendation_id,
     )
+    .await
 }
 
 #[tauri::command]
-pub fn rollback_meta_optimizer_recommendation(
+pub async fn rollback_meta_optimizer_recommendation(
     app_state: State<'_, Arc<AppState>>,
     recommendation_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::recommendations::rollback_recommendation(
+    crate::meta_optimizer::recommendations::rollback_recommendation_async(
         &app_state.pg_db,
         &recommendation_id,
     )
+    .await
 }
 
 // ── Prompt Registry ────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_prompt_variants(
+pub async fn get_prompt_variants(
     app_state: State<'_, Arc<AppState>>,
     agent_type: Option<String>,
 ) -> Result<Vec<PromptVariant>, String> {
-    crate::meta_optimizer::prompt_registry::list_variants(&app_state.pg_db, agent_type.as_deref())
+    app_state.pg_db.list_variants(agent_type.as_deref()).await
 }
 
 #[tauri::command]
-pub fn activate_prompt_variant(
+pub async fn activate_prompt_variant(
     app_state: State<'_, Arc<AppState>>,
     variant_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::prompt_registry::activate_variant(&app_state.pg_db, &variant_id)
+    app_state.pg_db.activate_variant(&variant_id).await
 }
 
 // ── Optimizer Runs ─────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_meta_optimizer_runs(
+pub async fn get_meta_optimizer_runs(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<MetaOptimizerRun>, String> {
-    crate::meta_optimizer::recommendations::list_optimizer_runs(&app_state.pg_db)
+    crate::meta_optimizer::recommendations::list_optimizer_runs_async(&app_state.pg_db).await
 }
 
 // ── Progress Tracking ─────────────────────────────────────────────────
@@ -135,17 +147,18 @@ pub async fn get_meta_optimizer_snapshots(
 // ── Agent Effectiveness ───────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_agent_effectiveness(
+pub async fn get_agent_effectiveness(
     app_state: State<'_, Arc<AppState>>,
     limit: Option<u32>,
 ) -> Result<Vec<crate::database::pipeline_traces::AgentTraceAggregate>, String> {
+    let _ = app_state;
     crate::database::pipeline_traces::get_agent_trace_aggregates(limit.unwrap_or(200))
 }
 
 // ── Failure Analysis ─────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_meta_optimizer_failure_analysis(
+pub async fn get_meta_optimizer_failure_analysis(
     app_state: State<'_, Arc<AppState>>,
     days: Option<u32>,
     category: Option<String>,
@@ -161,14 +174,15 @@ pub fn get_meta_optimizer_failure_analysis(
 // ── Recommendation Outcomes (Regression Detection) ───────────────────
 
 #[tauri::command]
-pub fn get_recommendation_outcomes(
+pub async fn get_recommendation_outcomes(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let recs = crate::meta_optimizer::recommendations::list_recommendations(
+    let recs = crate::meta_optimizer::recommendations::list_recommendations_async(
         &app_state.pg_db,
         None,
         Some("applied"),
-    )?;
+    )
+    .await?;
 
     let mut results = Vec::new();
     for rec in recs {
@@ -185,7 +199,7 @@ pub fn get_recommendation_outcomes(
 }
 
 #[tauri::command]
-pub fn reevaluate_recommendation_outcome(
+pub async fn reevaluate_recommendation_outcome(
     app_state: State<'_, Arc<AppState>>,
     recommendation_id: String,
 ) -> Result<serde_json::Value, String> {
@@ -199,11 +213,12 @@ pub fn reevaluate_recommendation_outcome(
 // ── Cost-Effectiveness ──────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_agent_cost_effectiveness(
+pub async fn get_agent_cost_effectiveness(
     app_state: State<'_, Arc<AppState>>,
     agent_type: Option<String>,
     days: Option<i64>,
 ) -> Result<Vec<crate::database::pipeline_traces::CostEffectivenessPoint>, String> {
+    let _ = app_state;
     crate::database::pipeline_traces::get_agent_cost_effectiveness(
         agent_type.as_deref(),
         days.unwrap_or(90),
@@ -213,25 +228,27 @@ pub fn get_agent_cost_effectiveness(
 // ── Cross-Agent Interaction ─────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_agent_interaction_matrix(
+pub async fn get_agent_interaction_matrix(
     app_state: State<'_, Arc<AppState>>,
     days: Option<i64>,
 ) -> Result<Vec<crate::database::pipeline_traces::AgentInteraction>, String> {
+    let _ = app_state;
     crate::database::pipeline_traces::get_agent_interaction_matrix(days.unwrap_or(30))
 }
 
 #[tauri::command]
-pub fn get_agent_cascade_effect(
+pub async fn get_agent_cascade_effect(
     app_state: State<'_, Arc<AppState>>,
     recommendation_id: String,
 ) -> Result<Vec<crate::database::pipeline_traces::CascadeEffect>, String> {
+    let _ = app_state;
     crate::database::pipeline_traces::get_agent_cascade_effect(&recommendation_id)
 }
 
 // ── Canary Rollout ──────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn start_canary_rollout(
+pub async fn start_canary_rollout(
     app_state: State<'_, Arc<AppState>>,
     recommendation_id: String,
     percentage: Option<i64>,
@@ -244,13 +261,17 @@ pub fn start_canary_rollout(
 }
 
 #[tauri::command]
-pub fn get_canary_rollouts(
+pub async fn get_canary_rollouts(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let rollouts = crate::meta_optimizer::canary::get_active_canaries(&app_state.pg_db)?;
-    let recs =
-        crate::meta_optimizer::recommendations::list_recommendations(&app_state.pg_db, None, None)
-            .unwrap_or_default();
+    let recs = crate::meta_optimizer::recommendations::list_recommendations_async(
+        &app_state.pg_db,
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_default();
 
     let values: Vec<serde_json::Value> = rollouts
         .into_iter()
@@ -268,7 +289,7 @@ pub fn get_canary_rollouts(
 }
 
 #[tauri::command]
-pub fn promote_canary_rollout(
+pub async fn promote_canary_rollout(
     app_state: State<'_, Arc<AppState>>,
     canary_id: String,
 ) -> Result<(), String> {
@@ -276,7 +297,7 @@ pub fn promote_canary_rollout(
 }
 
 #[tauri::command]
-pub fn rollback_canary_rollout(
+pub async fn rollback_canary_rollout(
     app_state: State<'_, Arc<AppState>>,
     canary_id: String,
 ) -> Result<(), String> {
@@ -326,7 +347,7 @@ pub async fn get_prompt_canary_status(
 // ── Manual Trigger ─────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn trigger_meta_optimizer(
+pub async fn trigger_meta_optimizer(
     app_state: State<'_, Arc<AppState>>,
     app_handle: tauri::AppHandle,
     optimizer_type: String,
@@ -357,7 +378,7 @@ pub fn trigger_meta_optimizer(
 // ── Eval Specs ────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_eval_specs(
+pub async fn get_eval_specs(
     app_state: State<'_, Arc<AppState>>,
     target_agent: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::eval_spec::EvalSpec>, String> {
@@ -365,7 +386,7 @@ pub fn get_eval_specs(
 }
 
 #[tauri::command]
-pub fn create_eval_spec(
+pub async fn create_eval_spec(
     app_state: State<'_, Arc<AppState>>,
     spec: crate::meta_optimizer::eval_spec::EvalSpec,
 ) -> Result<(), String> {
@@ -373,7 +394,7 @@ pub fn create_eval_spec(
 }
 
 #[tauri::command]
-pub fn delete_eval_spec(
+pub async fn delete_eval_spec(
     app_state: State<'_, Arc<AppState>>,
     spec_id: String,
 ) -> Result<(), String> {
@@ -381,7 +402,7 @@ pub fn delete_eval_spec(
 }
 
 #[tauri::command]
-pub fn get_eval_results(
+pub async fn get_eval_results(
     app_state: State<'_, Arc<AppState>>,
     spec_id: Option<String>,
     recommendation_id: Option<String>,
@@ -394,7 +415,7 @@ pub fn get_eval_results(
 }
 
 #[tauri::command]
-pub fn run_recommendation_eval(
+pub async fn run_recommendation_eval(
     app_state: State<'_, Arc<AppState>>,
     recommendation_id: String,
 ) -> Result<crate::meta_optimizer::eval_spec::EvalResult, String> {
@@ -405,7 +426,7 @@ pub fn run_recommendation_eval(
 }
 
 #[tauri::command]
-pub fn generate_default_eval_spec(
+pub async fn generate_default_eval_spec(
     app_state: State<'_, Arc<AppState>>,
     target_agent: String,
 ) -> Result<crate::meta_optimizer::eval_spec::EvalSpec, String> {
@@ -423,13 +444,14 @@ pub fn generate_default_eval_spec(
 /// metrics, this evaluates LLM judge assertions (hallucination, relevance, factuality,
 /// content safety) against concrete input/output pairs.
 #[tauri::command]
-pub fn evaluate_with_io(
+pub async fn evaluate_with_io(
     app_state: State<'_, Arc<AppState>>,
     eval_spec_json: String,
     input: String,
     output: String,
     context: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::eval_spec::AssertionResult>, String> {
+    let _ = app_state;
     let spec: crate::meta_optimizer::eval_spec::EvalSpec = serde_json::from_str(&eval_spec_json)
         .map_err(|e| format!("Failed to parse eval spec: {}", e))?;
 
@@ -494,7 +516,7 @@ fn default_aggregate_metrics() -> crate::meta_optimizer::eval_spec::EvalAggregat
 // ── Robustness Testing ────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn run_robustness_test(
+pub async fn run_robustness_test(
     app_state: State<'_, Arc<AppState>>,
     agent_type: String,
     prompt_variant_id: Option<String>,
@@ -509,7 +531,7 @@ pub fn run_robustness_test(
 }
 
 #[tauri::command]
-pub fn get_robustness_reports(
+pub async fn get_robustness_reports(
     app_state: State<'_, Arc<AppState>>,
     prompt_variant_id: Option<String>,
     recommendation_id: Option<String>,
@@ -524,7 +546,7 @@ pub fn get_robustness_reports(
 // ── Golden Datasets ───────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_golden_datasets(
+pub async fn get_golden_datasets(
     app_state: State<'_, Arc<AppState>>,
     agent_type: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::golden_dataset::GoldenDataset>, String> {
@@ -535,7 +557,7 @@ pub fn get_golden_datasets(
 }
 
 #[tauri::command]
-pub fn build_golden_dataset(
+pub async fn build_golden_dataset(
     app_state: State<'_, Arc<AppState>>,
     agent_type: String,
     max_entries: Option<usize>,
@@ -575,7 +597,7 @@ pub async fn get_model_recommendations(
 // ── Comparison Bridge ─────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn convert_comparison_to_recommendation(
+pub async fn convert_comparison_to_recommendation(
     app_state: State<'_, Arc<AppState>>,
     comparison_id: String,
 ) -> Result<Option<String>, String> {
@@ -588,7 +610,7 @@ pub fn convert_comparison_to_recommendation(
 // ── Prompt Optimization (Meta-Prompt Optimizer) ────────────────────────
 
 #[tauri::command]
-pub fn get_prompt_optimization_status(
+pub async fn get_prompt_optimization_status(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
     let pg_db = &app_state.pg_db;
@@ -615,7 +637,7 @@ pub fn get_prompt_optimization_status(
 }
 
 #[tauri::command]
-pub fn get_prompt_group_metrics(
+pub async fn get_prompt_group_metrics(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::meta_optimizer::prompt_extractor::PromptGroupMetrics>, String> {
     let samples =
@@ -629,7 +651,7 @@ pub fn get_prompt_group_metrics(
 }
 
 #[tauri::command]
-pub fn get_prompt_optimization_evidence(
+pub async fn get_prompt_optimization_evidence(
     app_state: State<'_, Arc<AppState>>,
     phase: String,
     max_failures: Option<usize>,
@@ -652,7 +674,7 @@ pub fn get_prompt_optimization_evidence(
 }
 
 #[tauri::command]
-pub fn get_prompt_evolution_history(
+pub async fn get_prompt_evolution_history(
     app_state: State<'_, Arc<AppState>>,
     agent_type: Option<String>,
     limit: Option<usize>,

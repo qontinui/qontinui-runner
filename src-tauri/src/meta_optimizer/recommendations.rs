@@ -151,6 +151,17 @@ pub fn list_recommendations(
     })
 }
 
+/// Async variant of [`list_recommendations`] for callers already on a tokio runtime
+/// (notably sync `#[tauri::command]` functions would panic in the sync wrapper above
+/// because Tauri's webview worker thread lacks an ambient multi-thread runtime).
+pub async fn list_recommendations_async(
+    pg_db: &Arc<PgDb>,
+    optimizer_type: Option<&str>,
+    status: Option<&str>,
+) -> Result<Vec<Recommendation>, String> {
+    pg_db.list_recommendations(optimizer_type, status).await
+}
+
 /// Apply a recommendation (updates status to 'applied').
 /// This is the simple status-only flip — prefer `apply_recommendation_with_side_effects`.
 pub fn apply_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
@@ -170,6 +181,198 @@ fn get_recommendation(
         Handle::current().block_on(pg_db.get_recommendation(recommendation_id))
     })?;
     result.ok_or_else(|| format!("Recommendation not found: {}", recommendation_id))
+}
+
+/// Async variant of [`apply_recommendation_with_side_effects`].
+///
+/// Safe to call from a sync `#[tauri::command]` that has been converted to
+/// `async fn`. Unlike the sync version, this never reaches
+/// `tokio::task::block_in_place` — every PG call is awaited directly.
+pub async fn apply_recommendation_with_side_effects_async(
+    pg_db: &Arc<PgDb>,
+    recommendation_id: &str,
+) -> Result<(), String> {
+    let id = recommendation_id.to_string();
+    let rec = pg_db
+        .get_recommendation(&id)
+        .await?
+        .ok_or_else(|| format!("Recommendation not found: {}", id))?;
+
+    if rec.status != "pending" && rec.status != "canary" {
+        return Err(format!(
+            "Recommendation {} is not pending or canary (status: {})",
+            rec.id, rec.status
+        ));
+    }
+
+    let recommended_value = rec
+        .recommended_value
+        .as_deref()
+        .ok_or_else(|| format!("Recommendation {} has no recommended_value", rec.id))?;
+
+    match rec.recommendation_type.as_str() {
+        "prompt_rewrite" => apply_prompt_rewrite_async(pg_db, &rec.id, recommended_value).await?,
+        "config_change" => apply_config_change_async(pg_db, recommended_value).await?,
+        "rule_create" => apply_rule_create_async(pg_db, &rec.id, recommended_value).await?,
+        "rule_update" => apply_rule_update_async(pg_db, recommended_value).await?,
+        other => {
+            warn!(
+                "Unknown recommendation_type '{}' for {}; applying status-only",
+                other, rec.id
+            );
+        }
+    }
+
+    // Side-effect succeeded — now flip the status via PG
+    pg_db.apply_recommendation_with_timestamp(&id).await?;
+
+    // Capture a snapshot to measure impact of this recommendation.
+    // `capture_post_apply` is a sync wrapper with its own `block_in_place`;
+    // from the async Tauri multi-thread runtime that's still safe. Defer the
+    // full conversion of snapshots/* — tracked as Phase B work.
+    if let Err(e) = super::snapshots::capture_post_apply(
+        pg_db,
+        recommendation_id,
+        super::types::WorkflowCategory::Main,
+    ) {
+        warn!("Failed to capture post-apply snapshot: {}", e);
+    }
+
+    // Evaluate outcome immediately (will likely be "insufficient_data" initially)
+    if let Err(e) = super::snapshots::evaluate_recommendation_outcome(pg_db, recommendation_id) {
+        warn!("Failed to evaluate recommendation outcome: {}", e);
+    }
+
+    Ok(())
+}
+
+/// Async variant of [`apply_prompt_rewrite`] — keeps the write path in a
+/// single await chain so sync Tauri commands converted to `async fn` never
+/// need to cross back into `block_in_place`.
+async fn apply_prompt_rewrite_async(
+    pg_db: &Arc<PgDb>,
+    recommendation_id: &str,
+    recommended_value: &str,
+) -> Result<(), String> {
+    let payload: PromptRewritePayload = serde_json::from_str(recommended_value)
+        .map_err(|e| format!("Invalid prompt_rewrite payload: {}", e))?;
+
+    let variant = pg_db
+        .create_prompt_variant(
+            &payload.agent_type,
+            &payload.variant_name,
+            &payload.prompt_content,
+            Some(recommendation_id),
+        )
+        .await?;
+
+    // Best-effort resource-version snapshot (same policy as the sync wrapper).
+    if let Err(e) = super::resource_versioning::create_version(
+        pg_db,
+        "prompt",
+        &payload.agent_type,
+        &payload.prompt_content,
+        Some(&format!(
+            r#"{{"variant_id":"{}","variant_name":"{}"}}"#,
+            variant.id, payload.variant_name
+        )),
+    )
+    .await
+    {
+        tracing::warn!(
+            "Failed to create resource version for prompt variant: {}",
+            e
+        );
+    }
+
+    pg_db.activate_variant(&variant.id).await?;
+
+    info!(
+        "Applied prompt_rewrite recommendation {}: created and activated variant {}",
+        recommendation_id, variant.id
+    );
+    Ok(())
+}
+
+async fn apply_config_change_async(
+    pg_db: &Arc<PgDb>,
+    recommended_value: &str,
+) -> Result<(), String> {
+    let payload: ConfigChangePayload = serde_json::from_str(recommended_value)
+        .map_err(|e| format!("Invalid config_change payload: {}", e))?;
+
+    pg_db.set_setting(&payload.key, &payload.value).await?;
+
+    info!(
+        "Applied config_change: set '{}' to {}",
+        payload.key, payload.value
+    );
+    Ok(())
+}
+
+async fn apply_rule_create_async(
+    pg_db: &Arc<PgDb>,
+    recommendation_id: &str,
+    recommended_value: &str,
+) -> Result<(), String> {
+    let payload: RulePayload = serde_json::from_str(recommended_value)
+        .map_err(|e| format!("Invalid rule_create payload: {}", e))?;
+
+    let rec_id = recommendation_id.to_string();
+
+    let rule_number = match payload.rule_number {
+        Some(n) => n,
+        None => pg_db.next_rule_number(&payload.agent, &payload.section).await?,
+    };
+
+    let input = crate::workflow_generation::rules::InsertRuleInput {
+        agent: payload.agent.clone(),
+        section: payload.section.clone(),
+        rule_number,
+        title: payload.title.clone(),
+        content: payload.content.clone(),
+        condition: payload.condition.clone(),
+        provenance: "meta_optimizer".to_string(),
+        source_fix_id: Some(rec_id.clone()),
+        severity: None,
+        examples_json: payload.examples_json.clone(),
+    };
+
+    let rule = pg_db.insert_rule(&input).await?;
+    info!(
+        "Applied rule_create recommendation {}: created rule {}",
+        rec_id, rule.id
+    );
+    Ok(())
+}
+
+async fn apply_rule_update_async(
+    pg_db: &Arc<PgDb>,
+    recommended_value: &str,
+) -> Result<(), String> {
+    let payload: RulePayload = serde_json::from_str(recommended_value)
+        .map_err(|e| format!("Invalid rule_update payload: {}", e))?;
+
+    let rule_id = payload
+        .rule_id
+        .ok_or_else(|| "rule_update payload missing 'rule_id'".to_string())?;
+
+    let input = crate::workflow_generation::rules::UpdateRuleInput {
+        title: Some(payload.title),
+        content: Some(payload.content),
+        condition: payload.condition,
+        status: payload.status,
+        rule_number: payload.rule_number,
+        severity: None,
+        examples_json: payload.examples_json,
+    };
+
+    let rule = pg_db.update_rule(&rule_id, &input).await?;
+    info!(
+        "Applied rule_update: updated rule {} ({})",
+        rule.id, rule.title
+    );
+    Ok(())
 }
 
 /// Apply a recommendation **and** perform the appropriate side-effect based on
@@ -350,6 +553,19 @@ pub fn reject_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Resu
     Ok(())
 }
 
+/// Async variant of [`reject_recommendation`] — safe to call from a sync
+/// `#[tauri::command]` that has been converted to `async fn`.
+pub async fn reject_recommendation_async(
+    pg_db: &Arc<PgDb>,
+    recommendation_id: &str,
+) -> Result<(), String> {
+    pg_db
+        .update_recommendation_status(recommendation_id, "rejected")
+        .await?;
+    info!("Rejected recommendation {}", recommendation_id);
+    Ok(())
+}
+
 /// Deduplicate pending recommendations by content hash.
 ///
 /// For each group of pending recs with the same content hash, keeps the oldest
@@ -400,6 +616,112 @@ pub fn dedup_pending_recommendations(pg_db: &Arc<PgDb>) -> usize {
 /// same targets. Rejecting them frees those slots while preserving history.
 pub fn auto_reject_stale_recommendations(pg_db: &Arc<PgDb>) -> usize {
     0
+}
+
+/// Async variant of [`rollback_recommendation`]. Safe to call from async
+/// Tauri commands — never reaches `block_in_place`.
+pub async fn rollback_recommendation_async(
+    pg_db: &Arc<PgDb>,
+    recommendation_id: &str,
+) -> Result<(), String> {
+    let rec = pg_db
+        .get_recommendation(recommendation_id)
+        .await?
+        .ok_or_else(|| format!("Recommendation not found: {}", recommendation_id))?;
+
+    if rec.status != "applied" {
+        return Err(format!(
+            "Recommendation {} is not applied (status: {})",
+            rec.id, rec.status
+        ));
+    }
+
+    if let Some(ref recommended_value) = rec.recommended_value {
+        match rec.recommendation_type.as_str() {
+            "rule_create" | "rule_update" => {
+                if let Err(e) = rollback_rule_async(pg_db, &rec.id, recommended_value).await {
+                    warn!("Failed to rollback rule side-effect for {}: {}", rec.id, e);
+                }
+            }
+            "config_change" => {
+                if let Some(ref current_value) = rec.current_value {
+                    if let Err(e) = rollback_config_change_async(pg_db, current_value).await {
+                        warn!(
+                            "Failed to rollback config side-effect for {}: {}",
+                            rec.id, e
+                        );
+                    }
+                }
+            }
+            "prompt_rewrite" => {
+                info!(
+                    "Prompt rollback for {} — variant left in registry, user can deactivate manually",
+                    rec.id
+                );
+            }
+            _ => {}
+        }
+    }
+
+    pg_db
+        .update_recommendation_status(recommendation_id, "rolled_back")
+        .await?;
+    info!("Rolled back recommendation {}", recommendation_id);
+    Ok(())
+}
+
+async fn rollback_rule_async(
+    pg_db: &Arc<PgDb>,
+    recommendation_id: &str,
+    recommended_value: &str,
+) -> Result<(), String> {
+    let rule_id_from_payload: Option<String> =
+        serde_json::from_str::<RulePayload>(recommended_value)
+            .ok()
+            .and_then(|p| p.rule_id);
+
+    let target_rule_id = if let Some(id) = rule_id_from_payload {
+        id
+    } else {
+        pg_db
+            .find_rule_by_source_fix_id(recommendation_id)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "Could not find rule created by recommendation {}",
+                    recommendation_id
+                )
+            })?
+    };
+
+    let input = crate::workflow_generation::rules::UpdateRuleInput {
+        title: None,
+        content: None,
+        condition: None,
+        status: Some("disabled".to_string()),
+        rule_number: None,
+        severity: None,
+        examples_json: None,
+    };
+
+    pg_db.update_rule(&target_rule_id, &input).await?;
+    info!("Rollback: disabled rule {}", target_rule_id);
+    Ok(())
+}
+
+async fn rollback_config_change_async(
+    pg_db: &Arc<PgDb>,
+    current_value: &str,
+) -> Result<(), String> {
+    let payload: ConfigChangePayload = serde_json::from_str(current_value)
+        .map_err(|e| format!("Invalid current_value payload for config rollback: {}", e))?;
+
+    pg_db.set_setting(&payload.key, &payload.value).await?;
+    info!(
+        "Rollback: restored config '{}' to {}",
+        payload.key, payload.value
+    );
+    Ok(())
 }
 
 /// Roll back an applied recommendation, undoing side-effects where possible.
@@ -550,6 +872,13 @@ pub fn complete_optimizer_run(
 /// List optimizer runs.
 pub fn list_optimizer_runs(pg_db: &Arc<PgDb>) -> Result<Vec<MetaOptimizerRun>, String> {
     tokio::task::block_in_place(|| Handle::current().block_on(pg_db.list_optimizer_runs()))
+}
+
+/// Async variant of [`list_optimizer_runs`].
+pub async fn list_optimizer_runs_async(
+    pg_db: &Arc<PgDb>,
+) -> Result<Vec<MetaOptimizerRun>, String> {
+    pg_db.list_optimizer_runs().await
 }
 
 /// Evaluate applied recommendations using composite agentic scores.
