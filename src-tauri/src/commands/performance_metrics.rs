@@ -10,10 +10,9 @@
 //! - config_statistics table (aggregated transition/template statistics)
 //! - task_run_automation table (run-level metrics)
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -219,7 +218,7 @@ pub struct PerformanceDashboardData {
 /// Get complete performance dashboard data.
 #[tauri::command]
 pub async fn get_performance_dashboard(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<PerformanceDashboardData>, String> {
@@ -235,7 +234,7 @@ pub async fn get_performance_dashboard(
     };
 
     match state
-        .pg_db
+        .pg_db()
         .get_performance_dashboard(&config_id, range_days)
         .await
     {
@@ -253,7 +252,7 @@ pub async fn get_performance_dashboard(
 /// Get action performance metrics only.
 #[tauri::command]
 pub async fn get_action_performance(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<Vec<ActionPerformanceMetrics>>, String> {
@@ -268,7 +267,7 @@ pub async fn get_action_performance(
     };
 
     match state
-        .pg_db
+        .pg_db()
         .get_action_performance(&config_id, range_days)
         .await
     {
@@ -286,10 +285,10 @@ pub async fn get_action_performance(
 /// Get transition metrics only.
 #[tauri::command]
 pub async fn get_transition_reliability(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     config_id: String,
 ) -> Result<PerformanceMetricsResponse<Vec<StateTransitionMetrics>>, String> {
-    match state.pg_db.get_transition_metrics(&config_id).await {
+    match state.pg_db().get_transition_metrics(&config_id).await {
         Ok(vals) => {
             let metrics: Vec<StateTransitionMetrics> = vals
                 .into_iter()
@@ -304,10 +303,10 @@ pub async fn get_transition_reliability(
 /// Get element resolution metrics only.
 #[tauri::command]
 pub async fn get_element_resolution_metrics(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     config_id: String,
 ) -> Result<PerformanceMetricsResponse<Vec<ElementResolutionMetrics>>, String> {
-    match state.pg_db.get_element_metrics(&config_id).await {
+    match state.pg_db().get_element_metrics(&config_id).await {
         Ok(vals) => {
             let metrics: Vec<ElementResolutionMetrics> = vals
                 .into_iter()
@@ -322,7 +321,7 @@ pub async fn get_element_resolution_metrics(
 /// Get success rate trend for time-series chart.
 #[tauri::command]
 pub async fn get_success_rate_trend(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<Vec<TimeSeriesDataPoint>>, String> {
@@ -337,7 +336,7 @@ pub async fn get_success_rate_trend(
     };
 
     match state
-        .pg_db
+        .pg_db()
         .get_success_rate_trend(&config_id, range_days)
         .await
     {
