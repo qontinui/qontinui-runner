@@ -477,8 +477,34 @@ pub async fn ui_bridge_execute_action_handler(
     Path(id): Path<String>,
     Query(query): Query<ActionQueryParams>,
     headers: HeaderMap,
-    Json(request): Json<UIBridgeActionRequest>,
+    body: Result<Json<UIBridgeActionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Custom body extraction so JSON-parse errors come back with an actionable
+    // hint instead of the raw serde_json message. The most common trip is a
+    // Windows path in `params.value` (e.g. `D:\foo\bar`) where a single
+    // backslash is an invalid JSON escape — agents keep hitting this and the
+    // serde message alone ("invalid escape at line 1 column 42") doesn't
+    // point at the fix.
+    let request = match body {
+        Ok(Json(req)) => req,
+        Err(rej) => {
+            let raw = format!("{}", rej);
+            let lower = raw.to_lowercase();
+            let hint = if lower.contains("invalid escape") || lower.contains("control character") {
+                format!(
+                    "{}. Hint: if a field value contains a Windows path, escape each backslash as `\\\\` in the JSON body — or send the body from a file with `curl --data-binary @file.json` to bypass shell re-escaping. Forward slashes also work: `D:/qontinui-root/...`.",
+                    raw
+                )
+            } else {
+                raw
+            };
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error(hint)),
+            ));
+        }
+    };
+
     info!(
         "UI Bridge API: Executing action {} on element {}",
         request.action, id
