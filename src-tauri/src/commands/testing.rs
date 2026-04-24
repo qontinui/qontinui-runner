@@ -12,6 +12,8 @@
 use super::CommandResponse;
 use crate::database::{CreateVerificationTestInput, TriggerPoint, VerificationTest};
 use crate::executor::{is_default_bridge_running, with_default_bridge};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use crate::test_executor::{
     execute_test, execute_test_suite, RepoTestConfig, TestCategory, TestDefinition,
     TestExecutionResult, TestStatus, TestSuiteSummary, TestType, VisionConfig,
@@ -1750,4 +1752,38 @@ mod tests {
         assert!(!result.success);
         assert!(result.message.unwrap().contains("repo_test_config"));
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_testing")
+        .invoke_handler(tauri::generate_handler![
+            execute_verification_test,
+            execute_verification_test_suite,
+            get_test_type_info,
+            validate_test_definition,
+            list_verification_tests,
+            get_verification_test,
+            create_verification_test,
+            update_verification_test,
+            delete_verification_test,
+            execute_test_by_id,
+            execute_tests_by_ids,
+            get_test_results,
+            get_task_run_test_results,
+            create_test_association,
+            get_config_test_associations,
+            delete_test_association,
+            export_tests_to_file,
+            export_all_tests_to_file,
+            import_tests_from_file,
+            analyze_page_playwright,
+            analyze_page_playwright_script,
+            analyze_page_vision,
+            generate_test_with_ai,
+            generate_test_metadata,
+            list_recent_task_runs,
+            get_workflow_run_context,
+        ])
+        .build()
 }
