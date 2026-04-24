@@ -1,6 +1,8 @@
 //! Tauri commands for managing runner instances (dev feature).
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -124,4 +126,18 @@ pub async fn get_runner_identity(
         "primary_port": primary_port,
         "port": own_port,
     }))
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_instances")
+        .invoke_handler(tauri::generate_handler![
+            get_runner_instances,
+            save_runner_instance,
+            delete_runner_instance,
+            launch_runner_instance,
+            stop_runner_instance,
+            get_runner_identity,
+        ])
+        .build()
 }
