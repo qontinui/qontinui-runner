@@ -13,6 +13,8 @@ use crate::executor::with_default_bridge;
 use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -963,4 +965,18 @@ pub fn build_provider_settings(ai_settings: &crate::settings::AiSettings) -> ser
             })
         }
     }
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_ai_generation")
+        .invoke_handler(tauri::generate_handler![
+            generate_context_with_ai,
+            generate_api_request_with_ai,
+            generate_task_prompt_with_ai,
+            suggest_exploration_strategy_with_ai,
+            generate_test_and_agentic_step,
+            explore_flow_step,
+            generate_element_ai_description,
+        ])
+        .build()
 }

@@ -510,6 +510,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::token_analytics::plugin())
         .plugin(commands::transcript::plugin())
         .plugin(commands::adaptive_learning::plugin())
+        .plugin(commands::ai_generation::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -910,14 +911,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::shell_commands::get_shell_command_categories,
             commands::shell_commands::set_shell_command_enabled,
             commands::shell_commands::generate_shell_command_with_ai,
-            // AI generation commands for builder tabs
-            commands::ai_generation::generate_context_with_ai,
-            commands::ai_generation::generate_api_request_with_ai,
-            commands::ai_generation::generate_task_prompt_with_ai,
-            commands::ai_generation::suggest_exploration_strategy_with_ai,
-            commands::ai_generation::generate_test_and_agentic_step,
-            commands::ai_generation::explore_flow_step,
-            commands::ai_generation::generate_element_ai_description,
+            // NOTE: ai_generation handlers moved to per-module plugin (see .plugin() calls above).
             // MCP client management commands
             commands::mcp::list_mcp_servers,
             commands::mcp::get_mcp_server,
