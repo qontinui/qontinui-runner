@@ -47,7 +47,14 @@
 //! execution_variables, mobile_settings, otel_settings, security_settings,
 //! ai_settings, accessibility, web_integration, activity_timeline,
 //! agentic_metrics, ai_data, cost_dashboard, learning, performance_metrics,
-//! recap, terminal_analysis, token_analytics, transcript (as of this commit).
+//! recap, terminal_analysis, token_analytics, transcript, adaptive_learning,
+//! ai_generation, ai_session, backup, checkpoint_browser, config, context,
+//! library_sync, logging, meta_optimizer, rag (as of this commit).
+//!
+//! Note: ai_session, meta_optimizer, and rag use a non-generic `plugin()
+//! -> TauriPlugin<tauri::Wry>` because they accept concrete `tauri::AppHandle`
+//! parameters in some commands. Modules without `AppHandle` parameters use
+//! the generic `plugin<R: Runtime>() -> TauriPlugin<R>` form.
 //!
 //! To migrate a module `foo.rs`:
 //! 1. Add `use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};` and
