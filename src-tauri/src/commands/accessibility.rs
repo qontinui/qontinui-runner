@@ -4,7 +4,14 @@
 //! - Getting and saving accessibility settings (Chrome path, CDP port)
 //! - Launching Chrome with remote debugging enabled
 //! - Native accessibility tree capture, querying, and interaction via AccessibilityManager
+//!
+//! # Typed errors (Workstream D)
+//!
+//! Handlers keep `-> Result<T, String>` at the Tauri boundary and build
+//! errors via [`AppError`] internally, converting with
+//! `.map_err(String::from)`. See `commands/mod.rs` for the migration guide.
 
+use crate::error::AppError;
 use crate::event_system::AppEvent;
 use crate::settings::{self, AccessibilitySettings};
 use qontinui_runner_lib::accessibility::model::UnifiedRole;
@@ -77,12 +84,6 @@ fn find_chrome_executable() -> Option<String> {
 // ============================================================================
 
 /// Get the current accessibility settings.
-///
-/// Returns the accessibility settings from the persistent settings file.
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success with accessibility settings data
-/// * `Err(String)` - Error message if settings cannot be loaded
 #[tauri::command]
 pub fn get_accessibility_settings() -> Result<CommandResponse, String> {
     info!("Getting accessibility settings");
@@ -108,24 +109,12 @@ pub fn get_accessibility_settings() -> Result<CommandResponse, String> {
     })
 }
 
-/// Save accessibility settings.
-///
-/// Updates the accessibility settings in the persistent settings file.
-///
-/// # Arguments
-/// * `chrome_path` - Optional path to Chrome/Chromium executable
-/// * `cdp_port` - CDP port for remote debugging
-/// * `use_rust_accessibility` - Whether to use Rust-native accessibility APIs
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success
-/// * `Err(String)` - Error message if settings cannot be saved
-#[tauri::command]
-pub fn save_accessibility_settings(
+/// Internal implementation of [`save_accessibility_settings`] returning [`AppError`].
+fn save_accessibility_settings_impl(
     chrome_path: Option<String>,
     cdp_port: u16,
     use_rust_accessibility: bool,
-) -> Result<CommandResponse, String> {
+) -> Result<CommandResponse, AppError> {
     info!(
         "Saving accessibility settings: chrome_path={:?}, cdp_port={}, use_rust_accessibility={}",
         chrome_path, cdp_port, use_rust_accessibility
@@ -137,8 +126,7 @@ pub fn save_accessibility_settings(
         use_rust_accessibility,
     };
 
-    settings::save_accessibility_settings(accessibility_settings)
-        .map_err(|e| format!("Failed to save accessibility settings: {}", e))?;
+    settings::save_accessibility_settings(accessibility_settings).map_err(AppError::ConfigError)?;
 
     Ok(CommandResponse {
         success: true,
@@ -147,23 +135,22 @@ pub fn save_accessibility_settings(
     })
 }
 
-/// Launch Chrome/Chromium with remote debugging enabled.
-///
-/// Uses the configured Chrome path or auto-detects the installation.
-/// Launches with `--remote-debugging-port` flag for CDP access.
-///
-/// # Arguments
-/// * `port` - Optional CDP port (defaults to settings or 9222)
-/// * `user_data_dir` - Optional separate user data directory for debugging session
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success with process info
-/// * `Err(String)` - Error message if Chrome cannot be launched
+/// Save accessibility settings.
 #[tauri::command]
-pub fn launch_chrome_debug(
+pub fn save_accessibility_settings(
+    chrome_path: Option<String>,
+    cdp_port: u16,
+    use_rust_accessibility: bool,
+) -> Result<CommandResponse, String> {
+    save_accessibility_settings_impl(chrome_path, cdp_port, use_rust_accessibility)
+        .map_err(String::from)
+}
+
+/// Internal implementation of [`launch_chrome_debug`] returning [`AppError`].
+fn launch_chrome_debug_impl(
     port: Option<u16>,
     user_data_dir: Option<String>,
-) -> Result<CommandResponse, String> {
+) -> Result<CommandResponse, AppError> {
     let accessibility_settings = settings::get_accessibility_settings();
 
     // Determine Chrome path
@@ -171,7 +158,10 @@ pub fn launch_chrome_debug(
         .chrome_path
         .or_else(find_chrome_executable)
         .ok_or_else(|| {
-            "Chrome not found. Please set the Chrome path in Settings > Accessibility.".to_string()
+            AppError::ConfigError(
+                "Chrome not found. Please set the Chrome path in Settings > Accessibility."
+                    .to_string(),
+            )
         })?;
 
     // Determine port
@@ -194,17 +184,16 @@ pub fn launch_chrome_debug(
         args.push(format!("--user-data-dir={}", temp_dir.display()));
     }
 
-    // Launch Chrome
+    // Launch Chrome. `?` lifts `std::io::Error` into `AppError::IoError` via
+    // the blanket `From<std::io::Error>` impl.
     let child = if cfg!(target_os = "windows") {
         crate::process_helpers::no_window(&chrome_path)
             .args(&args)
-            .spawn()
-            .map_err(|e| format!("Failed to launch Chrome: {}", e))?
+            .spawn()?
     } else {
         crate::process_helpers::no_window(&chrome_path)
             .args(&args)
-            .spawn()
-            .map_err(|e| format!("Failed to launch Chrome: {}", e))?
+            .spawn()?
     };
 
     let pid = child.id();
@@ -224,10 +213,16 @@ pub fn launch_chrome_debug(
     })
 }
 
+/// Launch Chrome/Chromium with remote debugging enabled.
+#[tauri::command]
+pub fn launch_chrome_debug(
+    port: Option<u16>,
+    user_data_dir: Option<String>,
+) -> Result<CommandResponse, String> {
+    launch_chrome_debug_impl(port, user_data_dir).map_err(String::from)
+}
+
 /// Check if Chrome is available (either configured or auto-detected).
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success with availability info
 #[tauri::command]
 pub fn check_chrome_available() -> Result<CommandResponse, String> {
     let accessibility_settings = settings::get_accessibility_settings();
@@ -253,22 +248,13 @@ pub fn check_chrome_available() -> Result<CommandResponse, String> {
 // Native Accessibility Manager Commands
 // ============================================================================
 
-/// Connect the accessibility manager to a target.
-///
-/// # Arguments
-/// * `target` - Connection target: "desktop", a window title, "cdp://host:port", or "pid:1234"
-/// * `backend` - Backend hint (currently unused; the manager auto-selects)
-///
-/// # Returns
-/// * `Ok(serde_json::Value)` - Connection result with backend info
-/// * `Err(String)` - Error message
-#[tauri::command]
-pub async fn a11y_connect<R: Runtime>(
+/// Internal implementation of [`a11y_connect`] returning [`AppError`].
+async fn a11y_connect_impl<R: Runtime>(
     target: String,
     backend: String,
     app: AppHandle<R>,
-    state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
-) -> Result<serde_json::Value, String> {
+    state: &TokioMutex<AccessibilityManager>,
+) -> Result<serde_json::Value, AppError> {
     info!("a11y_connect: target={}, backend={}", target, backend);
 
     let connection_target = parse_connection_target(&target, &backend)?;
@@ -276,7 +262,7 @@ pub async fn a11y_connect<R: Runtime>(
     let mut mgr = state.lock().await;
     mgr.connect(connection_target, 30_000)
         .await
-        .map_err(|e| format!("Failed to connect: {}", e))?;
+        .map_err(|e| AppError::CommunicationError(format!("Failed to connect: {}", e)))?;
 
     let backend_name = mgr.backend_name().to_string();
     drop(mgr);
@@ -293,22 +279,26 @@ pub async fn a11y_connect<R: Runtime>(
     }))
 }
 
-/// Capture the accessibility tree.
-///
-/// # Arguments
-/// * `include_hidden` - Whether to include hidden elements
-/// * `max_depth` - Optional maximum depth for the tree traversal
-///
-/// # Returns
-/// * `Ok(serde_json::Value)` - The captured snapshot serialized as JSON
-/// * `Err(String)` - Error message
+/// Connect the accessibility manager to a target.
 #[tauri::command]
-pub async fn a11y_capture<R: Runtime>(
-    include_hidden: bool,
-    max_depth: Option<u32>,
+pub async fn a11y_connect<R: Runtime>(
+    target: String,
+    backend: String,
     app: AppHandle<R>,
     state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
 ) -> Result<serde_json::Value, String> {
+    a11y_connect_impl(target, backend, app, &state)
+        .await
+        .map_err(String::from)
+}
+
+/// Internal implementation of [`a11y_capture`] returning [`AppError`].
+async fn a11y_capture_impl<R: Runtime>(
+    include_hidden: bool,
+    max_depth: Option<u32>,
+    app: AppHandle<R>,
+    state: &TokioMutex<AccessibilityManager>,
+) -> Result<serde_json::Value, AppError> {
     info!(
         "a11y_capture: include_hidden={}, max_depth={:?}",
         include_hidden, max_depth
@@ -320,7 +310,7 @@ pub async fn a11y_capture<R: Runtime>(
     let snapshot = mgr
         .capture(max_depth, include_hidden)
         .await
-        .map_err(|e| format!("Capture failed: {}", e))?;
+        .map_err(|e| AppError::CommunicationError(format!("Capture failed: {}", e)))?;
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let node_count = snapshot.total_nodes;
@@ -333,41 +323,43 @@ pub async fn a11y_capture<R: Runtime>(
         warn!("Event emission failed for {}: {}", event.event_name(), e);
     }
 
-    serde_json::to_value(&snapshot).map_err(|e| format!("Serialization failed: {}", e))
+    let value = serde_json::to_value(&snapshot)?;
+    Ok(value)
 }
 
-/// Query the cached accessibility tree by role, label, and interactivity.
-///
-/// # Arguments
-/// * `role` - Optional role filter (e.g., "button", "textbox")
-/// * `label` - Optional exact label match
-/// * `label_contains` - Optional substring label match
-/// * `interactive_only` - If true, only return interactive elements
-///
-/// # Returns
-/// * `Ok(serde_json::Value)` - Array of matching nodes
-/// * `Err(String)` - Error message
+/// Capture the accessibility tree.
 #[tauri::command]
-pub async fn a11y_query(
+pub async fn a11y_capture<R: Runtime>(
+    include_hidden: bool,
+    max_depth: Option<u32>,
+    app: AppHandle<R>,
+    state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
+) -> Result<serde_json::Value, String> {
+    a11y_capture_impl(include_hidden, max_depth, app, &state)
+        .await
+        .map_err(String::from)
+}
+
+/// Internal implementation of [`a11y_query`] returning [`AppError`].
+async fn a11y_query_impl(
     role: Option<String>,
     label: Option<String>,
     label_contains: Option<String>,
     interactive_only: bool,
-    state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
-) -> Result<serde_json::Value, String> {
+    state: &TokioMutex<AccessibilityManager>,
+) -> Result<serde_json::Value, AppError> {
     let mgr = state.lock().await;
 
-    let snapshot = mgr
-        .snapshot()
-        .await
-        .ok_or_else(|| "No accessibility tree captured yet".to_string())?;
+    let snapshot = mgr.snapshot().await.ok_or_else(|| {
+        AppError::StateError("No accessibility tree captured yet".to_string())
+    })?;
 
     let mut builder = mgr.query();
 
     if let Some(ref role_str) = role {
         let parsed_role: UnifiedRole =
             serde_json::from_value(serde_json::Value::String(role_str.clone()))
-                .map_err(|_| format!("Unknown role: {}", role_str))?;
+                .map_err(|_| AppError::ValidationError(format!("Unknown role: {}", role_str)))?;
         builder = builder.by_role(parsed_role);
     }
 
@@ -407,46 +399,52 @@ pub async fn a11y_query(
     }))
 }
 
-/// Click an element by its ref ID.
-///
-/// # Arguments
-/// * `ref_id` - The reference ID (e.g., "@e3")
-///
-/// # Returns
-/// * `Ok(serde_json::Value)` - Interaction result
-/// * `Err(String)` - Error message
+/// Query the cached accessibility tree by role, label, and interactivity.
 #[tauri::command]
-pub async fn a11y_click(
-    ref_id: String,
+pub async fn a11y_query(
+    role: Option<String>,
+    label: Option<String>,
+    label_contains: Option<String>,
+    interactive_only: bool,
     state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
 ) -> Result<serde_json::Value, String> {
+    a11y_query_impl(role, label, label_contains, interactive_only, &state)
+        .await
+        .map_err(String::from)
+}
+
+/// Internal implementation of [`a11y_click`] returning [`AppError`].
+async fn a11y_click_impl(
+    ref_id: String,
+    state: &TokioMutex<AccessibilityManager>,
+) -> Result<serde_json::Value, AppError> {
     info!("a11y_click: ref_id={}", ref_id);
     let mgr = state.lock().await;
     let result = mgr
         .click(&ref_id)
         .await
-        .map_err(|e| format!("Click failed: {}", e))?;
+        .map_err(|e| AppError::CommunicationError(format!("Click failed: {}", e)))?;
 
-    serde_json::to_value(&result).map_err(|e| format!("Serialization failed: {}", e))
+    let value = serde_json::to_value(&result)?;
+    Ok(value)
 }
 
-/// Type text into an element by its ref ID.
-///
-/// # Arguments
-/// * `ref_id` - The reference ID (e.g., "@e2")
-/// * `text` - Text to type
-/// * `clear_first` - If true, clear existing content before typing
-///
-/// # Returns
-/// * `Ok(serde_json::Value)` - Interaction result
-/// * `Err(String)` - Error message
+/// Click an element by its ref ID.
 #[tauri::command]
-pub async fn a11y_type_text(
+pub async fn a11y_click(
+    ref_id: String,
+    state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
+) -> Result<serde_json::Value, String> {
+    a11y_click_impl(ref_id, &state).await.map_err(String::from)
+}
+
+/// Internal implementation of [`a11y_type_text`] returning [`AppError`].
+async fn a11y_type_text_impl(
     ref_id: String,
     text: String,
     clear_first: bool,
-    state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
-) -> Result<serde_json::Value, String> {
+    state: &TokioMutex<AccessibilityManager>,
+) -> Result<serde_json::Value, AppError> {
     info!(
         "a11y_type_text: ref_id={}, clear_first={}",
         ref_id, clear_first
@@ -455,43 +453,51 @@ pub async fn a11y_type_text(
     let result = mgr
         .type_text(&ref_id, &text, clear_first)
         .await
-        .map_err(|e| format!("Type text failed: {}", e))?;
+        .map_err(|e| AppError::CommunicationError(format!("Type text failed: {}", e)))?;
 
-    serde_json::to_value(&result).map_err(|e| format!("Serialization failed: {}", e))
+    let value = serde_json::to_value(&result)?;
+    Ok(value)
 }
 
-/// Focus an element by its ref ID.
-///
-/// # Arguments
-/// * `ref_id` - The reference ID (e.g., "@e1")
-///
-/// # Returns
-/// * `Ok(serde_json::Value)` - Interaction result
-/// * `Err(String)` - Error message
+/// Type text into an element by its ref ID.
 #[tauri::command]
-pub async fn a11y_focus(
+pub async fn a11y_type_text(
     ref_id: String,
+    text: String,
+    clear_first: bool,
     state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
 ) -> Result<serde_json::Value, String> {
+    a11y_type_text_impl(ref_id, text, clear_first, &state)
+        .await
+        .map_err(String::from)
+}
+
+/// Internal implementation of [`a11y_focus`] returning [`AppError`].
+async fn a11y_focus_impl(
+    ref_id: String,
+    state: &TokioMutex<AccessibilityManager>,
+) -> Result<serde_json::Value, AppError> {
     info!("a11y_focus: ref_id={}", ref_id);
     let mgr = state.lock().await;
     let result = mgr
         .focus(&ref_id)
         .await
-        .map_err(|e| format!("Focus failed: {}", e))?;
+        .map_err(|e| AppError::CommunicationError(format!("Focus failed: {}", e)))?;
 
-    serde_json::to_value(&result).map_err(|e| format!("Serialization failed: {}", e))
+    let value = serde_json::to_value(&result)?;
+    Ok(value)
+}
+
+/// Focus an element by its ref ID.
+#[tauri::command]
+pub async fn a11y_focus(
+    ref_id: String,
+    state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
+) -> Result<serde_json::Value, String> {
+    a11y_focus_impl(ref_id, &state).await.map_err(String::from)
 }
 
 /// Generate an AI-friendly text representation of the current accessibility tree.
-///
-/// # Arguments
-/// * `max_elements` - Maximum number of elements to include (default 100)
-/// * `interactive_only` - If true, only include interactive elements
-///
-/// # Returns
-/// * `Ok(String)` - AI-friendly text representation
-/// * `Err(String)` - Error message
 #[tauri::command]
 pub async fn a11y_ai_context(
     max_elements: Option<usize>,
@@ -503,24 +509,27 @@ pub async fn a11y_ai_context(
     Ok(mgr.to_ai_context(max, interactive_only).await)
 }
 
-/// Disconnect from the current accessibility source.
-///
-/// # Returns
-/// * `Ok(serde_json::Value)` - Disconnection confirmation
-/// * `Err(String)` - Error message
-#[tauri::command]
-pub async fn a11y_disconnect(
-    state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
-) -> Result<serde_json::Value, String> {
+/// Internal implementation of [`a11y_disconnect`] returning [`AppError`].
+async fn a11y_disconnect_impl(
+    state: &TokioMutex<AccessibilityManager>,
+) -> Result<serde_json::Value, AppError> {
     info!("a11y_disconnect");
     let mut mgr = state.lock().await;
     mgr.disconnect()
         .await
-        .map_err(|e| format!("Disconnect failed: {}", e))?;
+        .map_err(|e| AppError::CommunicationError(format!("Disconnect failed: {}", e)))?;
 
     Ok(serde_json::json!({
         "connected": false,
     }))
+}
+
+/// Disconnect from the current accessibility source.
+#[tauri::command]
+pub async fn a11y_disconnect(
+    state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
+) -> Result<serde_json::Value, String> {
+    a11y_disconnect_impl(&state).await.map_err(String::from)
 }
 
 // ============================================================================
@@ -533,7 +542,7 @@ pub async fn a11y_disconnect(
 /// - `"desktop"` -> `ConnectionTarget::Desktop`
 /// - `"pid:1234"` -> `ConnectionTarget::ProcessId(1234)`
 /// - anything else -> `ConnectionTarget::WindowTitle(target)`
-fn parse_connection_target(target: &str, _backend: &str) -> Result<ConnectionTarget, String> {
+fn parse_connection_target(target: &str, _backend: &str) -> Result<ConnectionTarget, AppError> {
     let lower = target.to_lowercase();
 
     if lower == "desktop" {
@@ -544,7 +553,7 @@ fn parse_connection_target(target: &str, _backend: &str) -> Result<ConnectionTar
         let pid: u32 = pid_str
             .trim()
             .parse()
-            .map_err(|_| format!("Invalid PID: {}", pid_str))?;
+            .map_err(|_| AppError::ValidationError(format!("Invalid PID: {}", pid_str)))?;
         return Ok(ConnectionTarget::ProcessId(pid));
     }
 
