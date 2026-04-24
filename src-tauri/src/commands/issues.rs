@@ -10,6 +10,7 @@ use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
+use crate::error::AppError;
 
 /// Issue source information - where the AI found/detected the error
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,11 +131,10 @@ fn timestamp_to_iso(timestamp_ms: i64) -> String {
 /// - Not authenticated
 /// - Network request fails
 /// - Backend returns an error
-#[tauri::command]
-pub async fn sync_issues_to_backend(
+async fn sync_issues_to_backend_impl(
     issues: Vec<IssueSyncItem>,
     project_id: Option<String>,
-) -> Result<SyncIssuesResponse, String> {
+) -> Result<SyncIssuesResponse, AppError> {
     if issues.is_empty() {
         info!("No issues to sync");
         return Ok(SyncIssuesResponse {
@@ -155,13 +155,15 @@ pub async fn sync_issues_to_backend(
     // Check authentication
     if !auth_manager.has_tokens() {
         warn!("Cannot sync issues: not authenticated");
-        return Err("Not authenticated. Please log in to sync issues.".to_string());
+        return Err(AppError::StateError(
+            "Not authenticated. Please log in to sync issues.".to_string(),
+        ));
     }
 
     // Get access token
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::StateError(format!("Failed to get access token: {}", e))
     })?;
 
     // Convert issues to backend format
@@ -208,7 +210,7 @@ pub async fn sync_issues_to_backend(
         .await
         .map_err(|e| {
             error!("Failed to sync issues: {}", e);
-            format!("Network error: {}", e)
+            AppError::NetworkError(format!("Network error: {}", e))
         })?;
 
     if !response.status().is_success() {
@@ -218,12 +220,15 @@ pub async fn sync_issues_to_backend(
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
         error!("Issue sync failed with status {}: {}", status, error_text);
-        return Err(format!("Failed to sync issues: {}", error_text));
+        return Err(AppError::NetworkError(format!(
+            "Failed to sync issues: {}",
+            error_text
+        )));
     }
 
     let sync_response: SyncIssuesResponse = response.json().await.map_err(|e| {
         error!("Failed to parse sync response: {}", e);
-        format!("Invalid response from server: {}", e)
+        AppError::ParseError(format!("Invalid response from server: {}", e))
     })?;
 
     info!(
@@ -240,6 +245,16 @@ pub async fn sync_issues_to_backend(
     }
 
     Ok(sync_response)
+}
+
+#[tauri::command]
+pub async fn sync_issues_to_backend(
+    issues: Vec<IssueSyncItem>,
+    project_id: Option<String>,
+) -> Result<SyncIssuesResponse, String> {
+    sync_issues_to_backend_impl(issues, project_id)
+        .await
+        .map_err(String::from)
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.
