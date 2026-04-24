@@ -12,6 +12,8 @@ use crate::database::ImportResult;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -785,4 +787,15 @@ pub async fn import_all_data_impl(
         total_skipped,
         total_errors,
     })
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_backup")
+        .invoke_handler(tauri::generate_handler![
+            get_export_summary,
+            export_all_data,
+            get_import_preview,
+            import_all_data,
+        ])
+        .build()
 }

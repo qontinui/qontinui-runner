@@ -511,6 +511,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::transcript::plugin())
         .plugin(commands::adaptive_learning::plugin())
         .plugin(commands::ai_generation::plugin())
+        .plugin(commands::backup::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -896,10 +897,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::durable_execution::get_phase_results,
             // NOTE: database handlers moved to per-module plugin (see .plugin() calls above).
             // Comprehensive backup commands
-            commands::backup::get_export_summary,
-            commands::backup::export_all_data,
-            commands::backup::get_import_preview,
-            commands::backup::import_all_data,
+            // NOTE: backup handlers moved to per-module plugin (see .plugin() calls above).
             // Shell command management commands
             commands::shell_commands::create_shell_command,
             commands::shell_commands::get_shell_command,
