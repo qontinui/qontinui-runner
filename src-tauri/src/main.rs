@@ -553,6 +553,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::scripted_output_settings::plugin())
         .plugin(commands::watchers::plugin())
         .plugin(commands::durable_execution::plugin())
+        .plugin(commands::flow::plugin())
+        .plugin(commands::ui_bridge::plugin())
+        .plugin(commands::terminal::plugin())
+        .plugin(commands::instances::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -627,44 +631,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: adaptive_learning handlers moved to per-module plugin (see .plugin() calls above).
             // Agentic metric commands
             // NOTE: agentic_metrics handlers moved to per-module plugin (see .plugin() calls above).
-            // Flow designer commands
-            commands::flow::list_flows,
-            commands::flow::get_flow,
-            commands::flow::save_flow,
-            commands::flow::delete_flow,
-            commands::flow::validate_flow,
-            commands::flow::start_flow_execution,
-            commands::flow::step_flow_execution,
-            commands::flow::run_flow_execution,
-            commands::flow::provide_flow_input,
-            commands::flow::get_flow_execution,
-            commands::flow::list_flow_executions,
-            commands::flow::cancel_flow_execution,
-            commands::flow::pause_flow_execution,
-            commands::flow::resume_flow_execution,
-            commands::flow::step_into_flow,
-            commands::flow::create_sample_flow,
-            commands::flow::add_sample_flow,
-            // Enhanced flow queries (tag filtering, execution filtering, pagination)
-            commands::flow::get_flows_by_tag,
-            commands::flow::get_flow_executions_filtered,
-            commands::flow::get_flow_executions_paginated,
-            commands::flow::get_flow_executions_count,
-            // Flow version history commands
-            commands::flow::create_flow_version,
-            commands::flow::list_flow_versions,
-            commands::flow::get_flow_version,
-            commands::flow::restore_flow_version,
-            commands::flow::compare_flow_versions,
-            commands::flow::delete_flow_version,
-            commands::flow::get_latest_flow_version,
-            // Flow import/export commands
-            commands::flow::export_flow_json,
-            commands::flow::export_flow_yaml,
-            commands::flow::import_flow_json,
-            commands::flow::import_flow_yaml,
-            commands::flow::export_flows_bulk,
-            commands::flow::import_flows_bulk,
+            // NOTE: flow handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: checkpoint_browser handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: durable_execution handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: database handlers moved to per-module plugin (see .plugin() calls above).
@@ -677,22 +644,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: setup_wizard, saved_projects, test_orchestrator handlers moved to per-module plugins (see .plugin() calls above).
             // Performance Metrics Dashboard commands
             // NOTE: performance_metrics handlers moved to per-module plugin (see .plugin() calls above).
-            // UI Bridge commands (AI-driven UI automation)
-            commands::ui_bridge::ui_bridge_get_elements,
-            commands::ui_bridge::ui_bridge_get_element,
-            commands::ui_bridge::ui_bridge_execute_action,
-            commands::ui_bridge::ui_bridge_get_components,
-            commands::ui_bridge::ui_bridge_get_component,
-            commands::ui_bridge::ui_bridge_execute_component_action,
-            commands::ui_bridge::ui_bridge_discover,
-            commands::ui_bridge::ui_bridge_get_snapshot,
-            commands::ui_bridge::ui_bridge_discover_states_from_fingerprints,
-            commands::ui_bridge::ui_bridge_run_exploration,
-            commands::ui_bridge::ui_bridge_stop_exploration,
-            commands::ui_bridge::ui_bridge_reload_webview,
-            commands::ui_bridge::ui_bridge_run_exploration_native,
-            commands::ui_bridge::ui_bridge_stop_exploration_native,
-            commands::ui_bridge::ui_bridge_discover_states_native,
+            // NOTE: ui_bridge handlers moved to per-module plugin (see .plugin() calls above).
             // Error Monitor commands (application log error detection)
             // Note: Log source CRUD is now managed through global_log_sources commands
             error_monitor::commands::query_error_events,
@@ -750,25 +702,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             orchestration_loop::commands::get_multi_orchestration_loop_status,
             orchestration_loop::commands::signal_orchestration_restart_by_id,
             // NOTE: orchestration_loop_configs handlers moved to per-module plugin (see .plugin() calls above).
-            // Embedded terminal commands (PTY-backed shell sessions)
-            commands::terminal::terminal_create,
-            commands::terminal::terminal_write,
-            commands::terminal::terminal_resize,
-            commands::terminal::terminal_close,
-            commands::terminal::terminal_list,
-            commands::terminal::terminal_ack,
-            commands::terminal::terminal_get_buffer,
-            commands::terminal::terminal_save_scrollback,
-            commands::terminal::terminal_get_saved_scrollback,
-            commands::terminal::terminal_cleanup_scrollback,
-            commands::terminal::terminal_collect_session_metadata,
-            // Runner instance management commands (dev feature)
-            commands::instances::get_runner_instances,
-            commands::instances::save_runner_instance,
-            commands::instances::delete_runner_instance,
-            commands::instances::launch_runner_instance,
-            commands::instances::stop_runner_instance,
-            commands::instances::get_runner_identity,
+            // NOTE: terminal, instances handlers moved to per-module plugins (see .plugin() calls above).
             // Claude Code transcript import commands
             // NOTE: transcript handlers moved to per-module plugin (see .plugin() calls above).
             // Terminal session analysis commands

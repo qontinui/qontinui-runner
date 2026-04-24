@@ -14,6 +14,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info, warn};
@@ -1364,3 +1365,47 @@ pub async fn import_flows_bulk(
 
 // record_flow_learning removed — was checkpoint_db-dependent.
 // Flow learning recording should be migrated to PG in the future.
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// Non-generic because several handlers accept concrete `tauri::AppHandle`.
+pub fn plugin() -> TauriPlugin<tauri::Wry> {
+    PluginBuilder::<tauri::Wry>::new("qontinui_flow")
+        .invoke_handler(tauri::generate_handler![
+            list_flows,
+            get_flow,
+            save_flow,
+            delete_flow,
+            validate_flow,
+            start_flow_execution,
+            step_flow_execution,
+            run_flow_execution,
+            provide_flow_input,
+            get_flow_execution,
+            list_flow_executions,
+            cancel_flow_execution,
+            pause_flow_execution,
+            resume_flow_execution,
+            step_into_flow,
+            create_sample_flow,
+            add_sample_flow,
+            get_flows_by_tag,
+            get_flow_executions_filtered,
+            get_flow_executions_paginated,
+            get_flow_executions_count,
+            create_flow_version,
+            list_flow_versions,
+            get_flow_version,
+            restore_flow_version,
+            compare_flow_versions,
+            delete_flow_version,
+            get_latest_flow_version,
+            export_flow_json,
+            export_flow_yaml,
+            import_flow_json,
+            import_flow_yaml,
+            export_flows_bulk,
+            import_flows_bulk,
+        ])
+        .build()
+}
