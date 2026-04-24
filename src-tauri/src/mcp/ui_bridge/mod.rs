@@ -1419,8 +1419,6 @@ pub async fn ui_bridge_redo_handler(
     }
 }
 
-/// Get console errors captured by the UI Bridge ConsoleCapture.
-
 /// Get all loaded specs from the SpecStore.
 pub async fn ui_bridge_get_specs_handler(
     State(state): State<Arc<ApiState>>,
@@ -2481,8 +2479,6 @@ pub async fn ui_bridge_get_keyboard_shortcuts_handler(
 // ============================================================================
 // Idle Detection Handlers
 // ============================================================================
-
-/// Get composite idle status.
 
 /// Wait for an element to appear in the UI.
 ///
@@ -4475,8 +4471,6 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
     })))
 }
 
-/// Get individual idle signal status.
-
 /// Wait for a specific idle signal.
 pub async fn ui_bridge_wait_for_idle_signal_handler(
     State(state): State<Arc<ApiState>>,
@@ -5241,8 +5235,6 @@ pub async fn ui_bridge_append_render_log_handler(
         "count": log.len()
     }))))
 }
-
-/// Manually reset the UI Bridge circuit breaker to Closed state.
 
 /// Handle UI Bridge pong from frontend.
 pub async fn ui_bridge_pong_handler(
