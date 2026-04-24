@@ -11,10 +11,10 @@
 //! Valid component values: Markdown, Table, FileTree, Timeline, Checklist,
 //! FindingList, ProgressChart, KeyValue, Alert, ArchitectureGraph.
 
-use crate::commands::{AppState, CommandResponse};
+use crate::commands::compartments::HealthCompartment;
+use crate::commands::CommandResponse;
 use crate::doctor::DoctorHandle;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::SystemTime;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -104,7 +104,7 @@ fn run_analysis(
 /// Returns canvas panels: Markdown summary, Timeline of key events, Checklist of completed tasks, FileTree of changed files.
 #[tauri::command]
 pub async fn analyze_session_summary(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, HealthCompartment>,
     input: String,
 ) -> Result<CommandResponse, String> {
     info!("analyze_session_summary: input_len={}", input.len());
@@ -117,7 +117,7 @@ pub async fn analyze_session_summary(
         });
     }
 
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let doctor_handle = app_state.doctor_handle().lock().await.clone();
 
     let system_prompt = r#"You are analyzing a Claude Code (AI coding assistant) terminal session.
 Produce a clear, structured summary with these panels:
@@ -158,7 +158,7 @@ Focus on what matters for a developer to quickly understand what happened in thi
 /// Returns canvas panels: ArchitectureGraph (React Flow), KeyValue of component descriptions.
 #[tauri::command]
 pub async fn analyze_architecture(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, HealthCompartment>,
     input: String,
 ) -> Result<CommandResponse, String> {
     info!("analyze_architecture: input_len={}", input.len());
@@ -174,7 +174,7 @@ pub async fn analyze_architecture(
         });
     }
 
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let doctor_handle = app_state.doctor_handle().lock().await.clone();
 
     let system_prompt = r#"You are analyzing code, plans, or documentation to extract the software architecture.
 Produce these panels:
@@ -216,7 +216,7 @@ For the Qontinui project specifically: frontend=Next.js or Vite UI, backend=Fast
 /// Returns canvas panels: FileTree of changes, FindingList of risks/issues, Table of affected areas.
 #[tauri::command]
 pub async fn analyze_change_impact(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, HealthCompartment>,
     input: String,
 ) -> Result<CommandResponse, String> {
     info!("analyze_change_impact: input_len={}", input.len());
@@ -232,7 +232,7 @@ pub async fn analyze_change_impact(
         });
     }
 
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let doctor_handle = app_state.doctor_handle().lock().await.clone();
 
     let system_prompt = r#"You are analyzing code changes (git diff or file listings) to assess their impact.
 Produce these panels:
@@ -273,7 +273,7 @@ Be specific about what the changes do and what could break."#;
 /// Returns canvas panels: Checklist of plan items, ProgressChart, Markdown status summary.
 #[tauri::command]
 pub async fn analyze_plan_progress(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, HealthCompartment>,
     input: String,
 ) -> Result<CommandResponse, String> {
     info!("analyze_plan_progress: input_len={}", input.len());
@@ -286,7 +286,7 @@ pub async fn analyze_plan_progress(
         });
     }
 
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let doctor_handle = app_state.doctor_handle().lock().await.clone();
 
     let system_prompt = r#"You are analyzing an implementation plan alongside terminal session output to assess progress.
 The input may contain a plan (markdown headers, checklists, numbered items) followed by terminal activity.
@@ -327,7 +327,7 @@ Be realistic about completion — only mark something done if there's clear evid
 /// Returns canvas panels: one Markdown panel per tab, plus an overall Markdown summary.
 #[tauri::command]
 pub async fn analyze_cross_tab(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    app_state: tauri::State<'_, HealthCompartment>,
     input: String,
 ) -> Result<CommandResponse, String> {
     info!("analyze_cross_tab: input_len={}", input.len());
@@ -340,7 +340,7 @@ pub async fn analyze_cross_tab(
         });
     }
 
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let doctor_handle = app_state.doctor_handle().lock().await.clone();
 
     let system_prompt = r#"You are analyzing multiple Claude Code terminal sessions (tabs) simultaneously.
 The input has sections separated by "--- Tab: {name} ---" headers.
