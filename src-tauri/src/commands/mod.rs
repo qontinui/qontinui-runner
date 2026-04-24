@@ -103,6 +103,28 @@
 //!    near the module's `use` block so future sessions can audit progress.
 //! 6. The existing `.manage(shared_app_state)` stays — unmigrated modules
 //!    continue to use it until they migrate individually.
+//!
+//! # Typed errors (Workstream D)
+//!
+//! [`crate::error::AppError`] is the canonical error enum for command
+//! internals, with `impl From<AppError> for String` providing the Tauri ABI
+//! shim. Two patterns coexist during retrofit:
+//!
+//! (a) `-> Result<T, AppError>` directly — cleanest for internal helpers;
+//!     Tauri handlers using this form send AppError's structured `Serialize`
+//!     payload to the frontend (variant + message + error_code).
+//! (b) `-> Result<T, String>` at the Tauri boundary with an `*_impl` helper
+//!     returning `Result<T, AppError>` and `.map_err(String::from)` at the
+//!     call site — preserves the plain-string wire format frontends already
+//!     parse. See `commands/container_settings.rs` for the reference impl.
+//!
+//! Common variants: `ConfigError` (settings/persistence), `JsonError` (auto
+//! from `?` on `serde_json::Error`), `IoError` (auto from `?` on
+//! `std::io::Error`), `NetworkError` (auto from `reqwest::Error`),
+//! `DatabaseError`, `ValidationError`, `TimeoutError`, `StateError`. Full
+//! enum and all `From` impls live in `src/error.rs`; add a new variant
+//! there if no existing one fits, along with a matching `to_user_facing`
+//! arm so the frontend error-code mapping stays consistent.
 
 use crate::config::QontinuiConfig;
 use crate::container::isolated_executor::IsolatedExecutor;
