@@ -521,6 +521,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::ai_session::plugin())
         .plugin(commands::meta_optimizer::plugin())
         .plugin(commands::auth::plugin())
+        .plugin(commands::state_machine::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -564,14 +565,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution::system_ops::check_for_updates,
             commands::execution::system_ops::install_update,
             commands::execution::system_ops::open_folder,
-            // State machine commands
-            commands::state_machine::execute_transition,
-            commands::state_machine::navigate_to_state,
-            commands::state_machine::navigate_to_multiple_states,
-            commands::state_machine::get_active_states,
-            commands::state_machine::get_available_transitions,
-            commands::state_machine::get_action_log_view,
-            commands::state_machine::clear_action_log,
+            // NOTE: state_machine handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: debug handlers moved to per-module plugin (see .plugin() calls above).
             // WebSocket commands
             commands::websocket::configure_websocket,

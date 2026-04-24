@@ -10,6 +10,8 @@
 use crate::executor::{require_running_bridge, with_default_bridge};
 use crate::safe_eprintln;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -264,4 +266,19 @@ pub async fn clear_action_log(state: State<'_, Arc<AppState>>) -> Result<Command
         message: Some("Action log cleared".to_string()),
         data: None,
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_state_machine")
+        .invoke_handler(tauri::generate_handler![
+            execute_transition,
+            navigate_to_state,
+            navigate_to_multiple_states,
+            get_active_states,
+            get_available_transitions,
+            get_action_log_view,
+            clear_action_log,
+        ])
+        .build()
 }
