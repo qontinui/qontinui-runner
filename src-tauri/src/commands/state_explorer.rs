@@ -4,6 +4,8 @@
 //! enables AI-driven exploration of application states.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -385,4 +387,19 @@ pub async fn clear_exploration_history(
         message: Some(format!("Removed {} exploration reports", removed)),
         data: Some(serde_json::json!({ "removed": removed })),
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_state_explorer")
+        .invoke_handler(tauri::generate_handler![
+            start_exploration,
+            get_exploration_strategies,
+            preview_exploration_plan,
+            get_exploration_history,
+            get_exploration_report,
+            get_exploration_analysis_prompt,
+            clear_exploration_history,
+        ])
+        .build()
 }
