@@ -6,3 +6,4 @@
  */
 
 export { PerformanceOverlay, type PerformanceOverlayProps } from "./PerformanceOverlay";
+export { GiantSCCFixture } from "./GiantSCCFixture";

@@ -372,7 +372,13 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
         }
 
         case "page_evaluate": {
-          const { expression, unwrap } = payload;
+          // `allowNetworkRequests` is an EXPLICIT opt-in. It only relaxes the
+          // four network-related blocks (fetch / XMLHttpRequest / sendBeacon /
+          // WebSocket) so tests can hit runner APIs directly from an
+          // evaluated expression. Every structural code-injection block
+          // (import, require, eval, Function, __proto__, document.cookie,
+          // location mutation, crypto.subtle, …) stays in force regardless.
+          const { expression, unwrap, allowNetworkRequests } = payload;
           if (!expression) {
             await sendResponse({
               requestId,
@@ -398,17 +404,15 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             //   - globalThis / Reflect / Proxy (useful for deep inspection)
             // The remaining blocklist targets patterns with no legitimate
             // agent-testing use case.
-            const dangerousPatterns = [
+            // Structural patterns — always enforced. Code injection, prototype
+            // pollution, cookie exfiltration, redirects, crypto key access.
+            const structuralPatterns = [
               /\bimport\s*\(/, // dynamic import — can load arbitrary modules
               /\brequire\s*\(/, // require — same
               /\b__proto__\b/, // prototype pollution
               /\bconstructor\s*\[/, // constructor bracket access
               /\beval\s*\(/, // nested eval — full code execution
               /\bnew\s+Function\b/, // Function constructor — same
-              /\bfetch\s*\(/, // network requests — data exfiltration
-              /\bXMLHttpRequest\b/, // network requests — same
-              /\bnavigator\.sendBeacon\b/, // data exfiltration beacon
-              /\bWebSocket\b/, // persistent network channel
               /\bdocument\.cookie\b/, // cookie theft
               /\bwindow\.open\b/, // popup/phishing
               /\bwindow\.location\.(assign|replace)\b/, // redirect (reload allowed)
@@ -417,6 +421,18 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               /\blocation\s*=\s*["'`]/, // redirect via bare assignment
               /\bcrypto\.subtle\b/, // key material access
             ];
+            // Network patterns — disabled only when the caller explicitly
+            // sets `allowNetworkRequests: true`. Default is to block them
+            // as data-exfiltration / persistent-channel risks.
+            const networkPatterns = [
+              /\bfetch\s*\(/, // network requests — data exfiltration
+              /\bXMLHttpRequest\b/, // network requests — same
+              /\bnavigator\.sendBeacon\b/, // data exfiltration beacon
+              /\bWebSocket\b/, // persistent network channel
+            ];
+            const dangerousPatterns = allowNetworkRequests
+              ? structuralPatterns
+              : [...structuralPatterns, ...networkPatterns];
             const isDangerous = dangerousPatterns.some((p) => p.test(expression));
             if (isDangerous) {
               const matched = dangerousPatterns.find((p) => p.test(expression));
@@ -832,6 +848,20 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
         }
 
         case "get_routes": {
+          // The runner is a single-page Tauri app: every tab renders under
+          // the same `window.location.pathname` ("/") — tab switches are
+          // driven by internal React state (`ui-bridge-set-tab`), not by
+          // routing. As a result:
+          //   - `get_routes` surfaces exactly one synthetic "current page"
+          //     route (this handler), not the list of tabs.
+          //   - `control/snapshot?currentRouteOnly=true` is effectively a
+          //     no-op on the runner: the Rust filter in
+          //     `src-tauri/src/mcp/ui_bridge/elements.rs` matches all
+          //     elements because every element shares the same route.
+          //     Prefer `visibleOnly=true` or `tabId` + `tab_activate` when
+          //     you want to scope a snapshot to "what the user sees now".
+          // Expo Router / qontinui-web contexts, in contrast, register one
+          // route per screen and `currentRouteOnly` filters meaningfully.
           await sendResponse({
             requestId,
             type,
@@ -902,7 +932,14 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               success: true,
               data: {
                 activeTab,
-                tabs: TAB_LIST.map((entry) => ({ id: entry.id, label: entry.label })),
+                // Each entry keeps the existing {id, label} shape and adds
+                // `section` so agents can filter / group the 90+ tab catalog
+                // (sidebar nav vs. run-detail vs. settings sub-tabs, etc.).
+                tabs: TAB_LIST.map((entry) => ({
+                  id: entry.id,
+                  label: entry.label,
+                  section: entry.section,
+                })),
               },
               timestamp: Date.now(),
             });

@@ -306,10 +306,82 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   "project-explainer": "Project Explainer",
 };
 
-/** Ordered list of all tab ids with their human-readable labels. */
-export const TAB_LIST: ReadonlyArray<{ id: MainTabId; label: string }> = VALID_TAB_IDS.map(
-  (id) => ({ id, label: TAB_LABELS[id] }),
-);
+/**
+ * Logical section a tab belongs to — surfaces in `GET /control/tabs` so
+ * agents can navigate the 90+ tab catalog by grouping:
+ *   - "nav":      sidebar top-level navigation tabs
+ *   - "run":      run-detail sub-tabs (opened from a specific run)
+ *   - "monitor":  live-monitor sub-tabs
+ *   - "settings": settings panel sub-tabs
+ *   - "build":    workflow / spec / state-machine builders
+ *   - "config":   configuration tabs (log sources, findings, hooks, triggers, tasks)
+ *   - "system":   everything else (help, skills, analytics, debugging views, …)
+ */
+export type TabSection = "nav" | "run" | "monitor" | "settings" | "build" | "config" | "system";
+
+/**
+ * Sidebar top-level navigation tabs. Explicit override — these don't share a
+ * common prefix with each other, so we hand-list them rather than try to
+ * infer them. Everything not in this set falls through to the prefix rule.
+ */
+const NAV_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
+  "prompt-home",
+  "gui-automation",
+  "workflow-queue",
+  "active",
+  "runs",
+  "history",
+  "error-monitor",
+  "processes",
+  "terminal",
+]);
+
+/**
+ * Workflow / spec / state-machine building tabs. Explicit — these have
+ * mixed prefixes (state-*, spec*, capture, library, *-builder, …).
+ */
+const BUILD_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
+  "state-machine",
+  "specs",
+  "capture",
+  "library",
+  "step-builders",
+  "check-builder",
+  "check-group-builder",
+  "shell-command-builder",
+  "task-builder",
+  "context-builder",
+  "playwright-test-builder",
+  "unified-workflow-builder",
+  "dag-workflow-editor",
+]);
+
+/**
+ * Non-prefix-matching config tabs. The `config-*` family is picked up by
+ * the prefix rule below; these are misc config-ish tabs without the prefix.
+ */
+const CONFIG_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>(["triggers", "tasks"]);
+
+/**
+ * Derive the section for a tab id. Prefix rule covers the large families
+ * (run-*, monitor-*, settings-*, config-*); the explicit overrides above
+ * capture sidebar nav and build/config tabs that don't share a prefix.
+ * Unknown ids fall back to "system".
+ */
+export function deriveSection(id: MainTabId): TabSection {
+  if (NAV_TAB_IDS.has(id)) return "nav";
+  if (BUILD_TAB_IDS.has(id)) return "build";
+  if (CONFIG_TAB_IDS.has(id)) return "config";
+  if (id.startsWith("run-")) return "run";
+  if (id.startsWith("monitor-")) return "monitor";
+  if (id.startsWith("settings-") || id === "settings") return "settings";
+  if (id.startsWith("config-")) return "config";
+  return "system";
+}
+
+/** Ordered list of all tab ids with their human-readable labels and section. */
+export const TAB_LIST: ReadonlyArray<{ id: MainTabId; label: string; section: TabSection }> =
+  VALID_TAB_IDS.map((id) => ({ id, label: TAB_LABELS[id], section: deriveSection(id) }));
 
 /** Type guard. */
 export function isValidTabId(candidate: string): candidate is MainTabId {

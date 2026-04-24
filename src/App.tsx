@@ -62,7 +62,7 @@ import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
 import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
 import { ReorganizeDialog, type ReorganizePlan } from "./components/terminal/ReorganizeDialog";
-import { PerformanceOverlay } from "./components/dev";
+import { PerformanceOverlay, GiantSCCFixture } from "./components/dev";
 import { CommandPalette } from "./components/unified-search/CommandPalette";
 import { PromptExecutionProvider } from "./components/prompt-home/PromptExecutionContext";
 import { PromptAutomationOverlay } from "./components/prompt-home/PromptAutomationOverlay";
@@ -595,6 +595,7 @@ function AppContent() {
           <ApprovalDialog />
           <ToastContainer toasts={toasts} onDismiss={dismissToast} />
           <PerformanceOverlay position="bottom-right" />
+          <GiantSCCFixture />
           <CommandPalette />
         </div>
       </RenderLogWrapper>

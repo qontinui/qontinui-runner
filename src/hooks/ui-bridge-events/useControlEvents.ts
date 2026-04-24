@@ -21,6 +21,13 @@ export function useControlEvents(
 
       switch (type) {
         case "get_elements": {
+          // `currentRouteOnly` filtering lives in the Rust
+          // `control/snapshot` handler, not here. On the runner it is a
+          // no-op because every tab renders under the same pathname — see
+          // `get_routes` in usePageEvents.ts for the full rationale. We
+          // surface a small `filterInfo` hint alongside the elements so
+          // snapshot consumers on the runner can detect the no-op without
+          // having to know the Tauri route semantics.
           const snapshot = await currentBridge.createSnapshotAsync();
           const elements = snapshot.elements;
           await sendResponse({

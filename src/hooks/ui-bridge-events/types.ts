@@ -485,6 +485,15 @@ export interface UIBridgeRequestPayload {
    * the legacy conditional-wrapping shape is preserved for backward-compat.
    */
   unwrap?: boolean;
+  /**
+   * Explicit opt-in for page_evaluate expressions that perform network I/O
+   * (fetch / XMLHttpRequest / sendBeacon / WebSocket). Default (false)
+   * blocks those as data-exfiltration risks. Setting true relaxes ONLY the
+   * four network patterns — every structural code-injection block
+   * (import, require, eval, Function, __proto__, location mutation, …)
+   * remains in force.
+   */
+  allowNetworkRequests?: boolean;
   /** Element index for query_selector action targeting */
   index?: number;
   guide?: StyleGuideConfig;
