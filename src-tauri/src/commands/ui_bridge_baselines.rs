@@ -3,13 +3,12 @@
 //! Provides persistent baseline storage backed by PostgreSQL, replacing the
 //! in-memory `InMemoryBaselineStore` that loses data on reload.
 
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::database::pg::ui_bridge_baselines::{Baseline, BaselineMeta};
 
 // =============================================================================
@@ -64,7 +63,7 @@ pub async fn sm_save_baseline(
     fingerprint: Option<String>,
     metadata_json: Option<String>,
     ttl_days: Option<i32>,
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<BaselineResponse, String> {
     use base64::Engine;
 
@@ -72,8 +71,8 @@ pub async fn sm_save_baseline(
         .decode(&png_base64)
         .map_err(|e| format!("Failed to decode baseline base64: {}", e))?;
 
-    let baseline = app_state
-        .pg_db
+    let baseline = storage
+        .pg_db()
         .baseline_save(
             &id,
             &target_scope,
@@ -96,9 +95,9 @@ pub async fn sm_save_baseline(
 #[tauri::command]
 pub async fn sm_get_baseline(
     id: String,
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<Option<BaselineResponse>, String> {
-    let baseline = app_state.pg_db.baseline_get(&id).await?;
+    let baseline = storage.pg_db().baseline_get(&id).await?;
     Ok(baseline.map(BaselineResponse::from))
 }
 
@@ -107,18 +106,21 @@ pub async fn sm_get_baseline(
 #[tauri::command]
 pub async fn sm_list_baselines(
     target_scope: Option<String>,
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<Vec<BaselineMeta>, String> {
-    app_state.pg_db.baseline_list(target_scope.as_deref()).await
+    storage
+        .pg_db()
+        .baseline_list(target_scope.as_deref())
+        .await
 }
 
 /// Delete a baseline by ID.
 #[tauri::command]
 pub async fn sm_delete_baseline(
     id: String,
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<bool, String> {
-    let deleted = app_state.pg_db.baseline_delete(&id).await?;
+    let deleted = storage.pg_db().baseline_delete(&id).await?;
     if deleted {
         info!("Deleted baseline id={}", id);
     }
