@@ -6,14 +6,14 @@
 //! - Managing project association
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
-use super::{AppState, CommandResponse};
-use crate::executor::with_default_bridge;
+use super::compartments::{BridgeCompartment, HealthCompartment};
+use super::CommandResponse;
+use crate::executor::with_default_bridge_compartment;
 
 /// WebSocket configuration structure
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,7 +42,8 @@ pub struct WebSocketConfig {
 #[tauri::command]
 pub fn configure_websocket(
     config: WebSocketConfig,
-    state: State<Arc<AppState>>,
+    bridge: State<BridgeCompartment>,
+    health: State<HealthCompartment>,
 ) -> Result<CommandResponse, String> {
     let settings = crate::settings::load_settings();
     if settings.cloud_relay.enabled && settings.cloud_relay.auto_connect {
@@ -59,9 +60,9 @@ pub fn configure_websocket(
         config.enabled, config.url, config.runner_name
     );
 
-    let runner_port = state.api_port.load(std::sync::atomic::Ordering::Relaxed);
+    let runner_port = health.api_port().load(std::sync::atomic::Ordering::Relaxed);
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .configure_websocket(
                 config.enabled,
@@ -95,7 +96,7 @@ pub fn configure_websocket(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not running or connection fails
 #[tauri::command]
-pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn connect_websocket(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
     let settings = crate::settings::load_settings();
     if settings.cloud_relay.enabled && settings.cloud_relay.auto_connect {
         info!("Cloud relay handles backend connection, skipping Python WebSocket connect");
@@ -108,7 +109,7 @@ pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse,
 
     info!("Connecting WebSocket");
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge.connect_websocket().map_err(|e| {
             error!("Failed to connect WebSocket: {}", e);
             format!("Failed to connect WebSocket: {}", e)
@@ -133,7 +134,7 @@ pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse,
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not running or disconnection fails
 #[tauri::command]
-pub fn disconnect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn disconnect_websocket(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
     let settings = crate::settings::load_settings();
     if settings.cloud_relay.enabled && settings.cloud_relay.auto_connect {
         info!("Cloud relay handles backend connection, skipping Python WebSocket disconnect");
@@ -146,7 +147,7 @@ pub fn disconnect_websocket(state: State<Arc<AppState>>) -> Result<CommandRespon
 
     info!("Disconnecting WebSocket");
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge.disconnect_websocket().map_err(|e| {
             error!("Failed to disconnect WebSocket: {}", e);
             format!("Failed to disconnect WebSocket: {}", e)
