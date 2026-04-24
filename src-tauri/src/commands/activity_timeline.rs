@@ -3,13 +3,12 @@
 //! Provides full-text search, time-range queries, and statistics over captured
 //! screen text from UI Bridge snapshots, OCR, and accessibility trees.
 
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{debug, info};
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::database::types::*;
 use crate::recording::content_filter::ContentFilter;
 
@@ -27,9 +26,9 @@ fn get_content_filter() -> &'static ContentFilter {
 #[tauri::command]
 pub async fn insert_activity_entry(
     mut input: ActivityTimelineInput,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<i64, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
 
     // Content filtering: skip sensitive windows, scrub PII
     let filter = get_content_filter();
@@ -52,9 +51,9 @@ pub async fn insert_activity_entry(
 pub async fn search_activity_timeline(
     query: String,
     max_results: Option<i64>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<ActivityTimelineSearchResult>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
 
     pg.search_timeline(&query, max_results.unwrap_or(50)).await
 }
@@ -67,9 +66,9 @@ pub async fn search_activity_timeline_filtered(
     source_type: Option<String>,
     task_run_id: Option<String>,
     max_results: Option<i64>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<ActivityTimelineSearchResult>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
 
     pg.search_timeline_filtered(
         &query,
@@ -87,9 +86,9 @@ pub async fn get_activity_timeline_range(
     start_time: String,
     end_time: String,
     max_results: Option<i64>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<ActivityTimelineSearchResult>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
 
     let start = chrono::DateTime::parse_from_rfc3339(&start_time)
         .map_err(|e| format!("Invalid start_time: {}", e))?;
@@ -104,9 +103,9 @@ pub async fn get_activity_timeline_range(
 #[tauri::command]
 pub async fn get_activity_timeline_entry(
     id: i64,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Option<ActivityTimelineEntry>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
 
     pg.get_timeline_entry(id).await
 }
@@ -115,9 +114,9 @@ pub async fn get_activity_timeline_entry(
 #[tauri::command]
 pub async fn get_activity_timeline_for_task_run(
     task_run_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<ActivityTimelineSearchResult>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
 
     pg.get_timeline_by_task_run(&task_run_id).await
 }
@@ -126,9 +125,9 @@ pub async fn get_activity_timeline_for_task_run(
 #[tauri::command]
 pub async fn delete_activity_timeline_entry(
     id: i64,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<bool, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
 
     let deleted = pg.delete_timeline_entry(id).await?;
     if deleted {
@@ -140,9 +139,9 @@ pub async fn delete_activity_timeline_entry(
 /// Get capture statistics (counts by source_type and capture_mode).
 #[tauri::command]
 pub async fn get_activity_timeline_stats(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<ActivityTimelineStat>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
 
     pg.get_timeline_stats().await
 }
@@ -204,9 +203,9 @@ pub struct ScriptedOutputStats {
 #[tauri::command]
 pub async fn get_scripted_output_stats(
     task_run_id: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<ScriptedOutputStats, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     let rows = pg.get_scripted_output_rows(task_run_id.as_deref()).await?;
 
     let mut stats = ScriptedOutputStats {
