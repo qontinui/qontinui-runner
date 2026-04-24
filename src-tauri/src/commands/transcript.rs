@@ -6,6 +6,8 @@
 use crate::commands::{AppState, CommandResponse};
 use crate::terminal::transcript;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{info, warn};
 
 /// Collect workspace project paths for scanning (root + immediate child directories).
@@ -522,4 +524,17 @@ pub async fn generate_workflow_standalone(
             data: None,
         }),
     }
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_transcript")
+        .invoke_handler(tauri::generate_handler![
+            transcript_list_sessions,
+            transcript_read_session,
+            transcript_get_latest,
+            transcript_session_digests,
+            transcript_find_external_processes,
+            generate_workflow_standalone,
+        ])
+        .build()
 }

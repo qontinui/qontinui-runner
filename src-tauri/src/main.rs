@@ -508,6 +508,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::recap::plugin())
         .plugin(commands::terminal_analysis::plugin())
         .plugin(commands::token_analytics::plugin())
+        .plugin(commands::transcript::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -1095,12 +1096,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::instances::stop_runner_instance,
             commands::instances::get_runner_identity,
             // Claude Code transcript import commands
-            commands::transcript::transcript_list_sessions,
-            commands::transcript::transcript_read_session,
-            commands::transcript::transcript_get_latest,
-            commands::transcript::transcript_session_digests,
-            commands::transcript::transcript_find_external_processes,
-            commands::transcript::generate_workflow_standalone,
+            // NOTE: transcript handlers moved to per-module plugin (see .plugin() calls above).
             // Terminal session analysis commands
             // NOTE: terminal_analysis handlers moved to per-module plugin (see .plugin() calls above).
             // Meta-optimizer commands (recommendation review, prompt registry, manual trigger)
