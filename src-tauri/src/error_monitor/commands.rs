@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 use crate::commands::AppState;
@@ -499,6 +501,32 @@ pub async fn get_error_recurrence_history(
         .await?;
 
     Ok(rows)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_error_monitor_commands")
+        .invoke_handler(tauri::generate_handler![
+            query_error_events,
+            get_error_event,
+            get_unresolved_errors,
+            update_error_status,
+            acknowledge_error,
+            resolve_error,
+            ignore_error,
+            link_error_to_finding,
+            get_error_summary,
+            search_errors,
+            has_actionable_errors,
+            get_recent_errors,
+            acknowledge_all_errors,
+            get_debug_context,
+            get_debug_context_for_ai,
+            open_error_in_editor,
+            get_error_recurrence_history,
+            super::workflow::check_fixable_errors,
+        ])
+        .build()
 }
 
 /// Get all commands that should be registered with Tauri.

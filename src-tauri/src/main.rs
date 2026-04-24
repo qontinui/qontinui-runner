@@ -559,6 +559,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::instances::plugin())
         .plugin(commands::execution::plugin())
         .plugin(doctor::commands::plugin())
+        .plugin(error_monitor::commands::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -622,26 +623,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Performance Metrics Dashboard commands
             // NOTE: performance_metrics handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: ui_bridge handlers moved to per-module plugin (see .plugin() calls above).
-            // Error Monitor commands (application log error detection)
-            // Note: Log source CRUD is now managed through global_log_sources commands
-            error_monitor::commands::query_error_events,
-            error_monitor::commands::get_error_event,
-            error_monitor::commands::get_unresolved_errors,
-            error_monitor::commands::update_error_status,
-            error_monitor::commands::acknowledge_error,
-            error_monitor::commands::resolve_error,
-            error_monitor::commands::ignore_error,
-            error_monitor::commands::link_error_to_finding,
-            error_monitor::commands::get_error_summary,
-            error_monitor::commands::search_errors,
-            error_monitor::commands::has_actionable_errors,
-            error_monitor::commands::get_recent_errors,
-            error_monitor::commands::acknowledge_all_errors,
-            error_monitor::commands::get_debug_context,
-            error_monitor::commands::get_debug_context_for_ai,
-            error_monitor::commands::open_error_in_editor,
-            error_monitor::commands::get_error_recurrence_history,
-            error_monitor::workflow::check_fixable_errors,
+            // NOTE: error_monitor handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: doctor handlers moved to per-module plugin (see .plugin() calls above).
             // Cloud relay commands (remote mobile access via backend WebSocket)
             mcp::backend_relay::commands::start_cloud_relay,
