@@ -409,8 +409,9 @@ pub async fn ui_bridge_health_signals_handler(
 /// `ui_bridge_page_health_handler` are still registered in `mod.rs::routes()`
 /// because their private native-capture helpers have not moved yet.
 pub fn routes() -> axum::Router<Arc<ApiState>> {
+    use super::routing::add_dual;
     use axum::routing::{get, post};
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(
             "/ui-bridge/control/error-snapshots",
             get(ui_bridge_get_error_snapshots_handler),
@@ -453,21 +454,15 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             get(ui_bridge_readiness_handler),
         )
         .route(
-            "/ui-bridge/control/idle-status",
-            get(ui_bridge_get_idle_status_handler),
-        )
-        .route(
-            "/ui-bridge/ai/idle-status",
-            get(ui_bridge_get_idle_status_handler),
-        )
-        .route(
             "/ui-bridge/control/idle-status/{signal}",
             get(ui_bridge_get_idle_signal_handler),
         )
         .route(
             "/ui-bridge/control/health-signals",
             get(ui_bridge_health_signals_handler),
-        )
+        );
+    // idle-status: identical handler under /control + /ai.
+    add_dual!(router, get, "idle-status", ui_bridge_get_idle_status_handler)
 }
 
 /// Static (method, path) tuples matching every route registered by `routes()`.
