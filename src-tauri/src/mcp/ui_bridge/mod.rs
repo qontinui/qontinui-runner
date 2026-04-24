@@ -33,6 +33,7 @@ pub mod routing;
 pub mod screenshots;
 pub mod state_machine;
 pub mod stubs;
+pub mod toasts;
 pub mod types;
 
 // Re-export all public symbols so every currently-used path like
@@ -335,6 +336,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(screenshots::route_entries());
         all.extend_from_slice(state_machine::route_entries());
         all.extend_from_slice(stubs::route_entries());
+        all.extend_from_slice(toasts::route_entries());
         all
     })
 }
@@ -379,6 +381,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(screenshots::routes())
         .merge(state_machine::routes())
         .merge(stubs::routes())
+        .merge(toasts::routes())
         // Tier 2.1 — safelisted Tauri command proxy
         .merge(crate::mcp::tauri_proxy::routes())
         // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy (HTTP → Tauri invoke round-trip)
