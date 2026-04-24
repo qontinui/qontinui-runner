@@ -18,6 +18,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
@@ -333,4 +335,13 @@ pub async fn scan_spec_drift(project_root: String) -> Result<DriftReport, String
         report.orphans_in_spec.len()
     );
     Ok(report)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_spec_drift")
+        .invoke_handler(tauri::generate_handler![
+            scan_spec_drift,
+        ])
+        .build()
 }
