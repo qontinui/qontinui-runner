@@ -1,6 +1,8 @@
 //! Tauri commands for orchestration loop config CRUD operations.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -72,4 +74,18 @@ pub async fn ol_toggle_favorite(
         config_json: None,
     };
     app_state.pg_db.update_ol_config(&id, &req).await
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_orchestration_loop_configs")
+        .invoke_handler(tauri::generate_handler![
+            ol_list_configs,
+            ol_get_config,
+            ol_save_config,
+            ol_update_config,
+            ol_delete_config,
+            ol_toggle_favorite,
+        ])
+        .build()
 }
