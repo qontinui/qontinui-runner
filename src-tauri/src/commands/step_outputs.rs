@@ -9,6 +9,8 @@ use crate::commands::AppState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -931,4 +933,14 @@ fn parse_console_output(console_output: &Option<String>) -> Option<Vec<serde_jso
             Some(logs)
         }
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_step_outputs")
+        .invoke_handler(tauri::generate_handler![
+            collect_step_outputs,
+            get_step_outputs_for_test_builder,
+        ])
+        .build()
 }
