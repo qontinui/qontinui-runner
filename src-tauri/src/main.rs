@@ -506,6 +506,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::learning::plugin())
         .plugin(commands::performance_metrics::plugin())
         .plugin(commands::recap::plugin())
+        .plugin(commands::terminal_analysis::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -1100,13 +1101,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::transcript::transcript_find_external_processes,
             commands::transcript::generate_workflow_standalone,
             // Terminal session analysis commands
-            commands::terminal_analysis::analyze_session_summary,
-            commands::terminal_analysis::analyze_architecture,
-            commands::terminal_analysis::analyze_change_impact,
-            commands::terminal_analysis::analyze_plan_progress,
-            commands::terminal_analysis::analyze_cross_tab,
-            commands::terminal_analysis::analyze_page_architecture,
-            commands::terminal_analysis::get_latest_plan_content,
+            // NOTE: terminal_analysis handlers moved to per-module plugin (see .plugin() calls above).
             // Meta-optimizer commands (recommendation review, prompt registry, manual trigger)
             commands::meta_optimizer::get_meta_optimizer_recommendations,
             commands::meta_optimizer::apply_meta_optimizer_recommendation,

@@ -16,6 +16,8 @@ use crate::doctor::DoctorHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{info, warn};
 
 // ============================================================================
@@ -563,4 +565,18 @@ pub fn get_latest_plan_content() -> Result<CommandResponse, String> {
             "content": content,
         })),
     })
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_terminal_analysis")
+        .invoke_handler(tauri::generate_handler![
+            analyze_session_summary,
+            analyze_architecture,
+            analyze_change_impact,
+            analyze_plan_progress,
+            analyze_cross_tab,
+            analyze_page_architecture,
+            get_latest_plan_content,
+        ])
+        .build()
 }
