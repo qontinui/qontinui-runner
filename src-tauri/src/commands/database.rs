@@ -6,13 +6,16 @@
 //! - Running EXPLAIN QUERY PLAN for debugging
 
 use crate::database::DatabaseStats;
-use std::sync::Arc;
+use crate::error::AppError;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
-use super::{AppState, CommandResponse};
+use super::compartments::StorageCompartment;
+use super::CommandResponse;
+
+// Migrated to StorageCompartment (Workstream C).
 
 /// Optimize the database for better performance.
 ///
@@ -30,7 +33,7 @@ use super::{AppState, CommandResponse};
 #[tauri::command]
 pub fn optimize_database(
     run_integrity_check: Option<bool>,
-    state: State<Arc<AppState>>,
+    _state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Optimizing database (integrity_check={})",
@@ -66,13 +69,16 @@ pub fn optimize_database(
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with database statistics
 /// * `Err(String)` - Error message if statistics cannot be retrieved
-#[tauri::command]
-pub async fn get_database_stats(
-    state: State<'_, Arc<AppState>>,
-) -> Result<CommandResponse, String> {
+async fn get_database_stats_impl(
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!("Getting database statistics");
 
-    let stats: DatabaseStats = state.pg_db.get_database_stats().await?;
+    let stats: DatabaseStats = state
+        .pg_db()
+        .get_database_stats()
+        .await
+        .map_err(AppError::DatabaseError)?;
 
     let message = format!(
         "Database size: {:.2} MB, {} tables, {} total rows",
@@ -86,11 +92,15 @@ pub async fn get_database_stats(
     Ok(CommandResponse {
         success: true,
         message: Some(message),
-        data: Some(
-            serde_json::to_value(&stats)
-                .map_err(|e| format!("Failed to serialize database stats: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&stats)?),
     })
+}
+
+#[tauri::command]
+pub async fn get_database_stats(
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, String> {
+    get_database_stats_impl(&state).await.map_err(String::from)
 }
 
 /// Run EXPLAIN QUERY PLAN on a query for debugging.
@@ -105,14 +115,17 @@ pub async fn get_database_stats(
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with query plan
 /// * `Err(String)` - Error message if query plan cannot be generated
-#[tauri::command]
-pub async fn explain_query_plan(
+async fn explain_query_plan_impl(
     query: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<CommandResponse, String> {
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!("Running EXPLAIN QUERY PLAN for query: {}", query);
 
-    let plan = state.pg_db.explain_query_plan(&query).await?;
+    let plan = state
+        .pg_db()
+        .explain_query_plan(&query)
+        .await
+        .map_err(AppError::DatabaseError)?;
 
     Ok(CommandResponse {
         success: true,
@@ -122,6 +135,16 @@ pub async fn explain_query_plan(
             "plan": plan
         })),
     })
+}
+
+#[tauri::command]
+pub async fn explain_query_plan(
+    query: String,
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, String> {
+    explain_query_plan_impl(query, &state)
+        .await
+        .map_err(String::from)
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.
