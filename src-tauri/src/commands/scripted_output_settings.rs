@@ -14,6 +14,8 @@
 //! on the next call with no runner restart required.
 
 use crate::step_output::script_emitter::ScriptedOutputSettings;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 
 /// Return the current [`ScriptedOutputSettings`] from the persisted
 /// settings file. Used by the provider-selection UI to render the initial
@@ -36,4 +38,14 @@ pub fn save_scripted_output_settings(
 ) -> Result<ScriptedOutputSettings, String> {
     crate::config_facade::save_setting(settings.clone())?;
     Ok(settings)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_scripted_output_settings")
+        .invoke_handler(tauri::generate_handler![
+            get_scripted_output_settings,
+            save_scripted_output_settings,
+        ])
+        .build()
 }
