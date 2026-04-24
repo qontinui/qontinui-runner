@@ -4,15 +4,15 @@
 
 use crate::config::{ConfigLoader, ScreenshotCaptureSettings};
 use crate::executor::{
-    get_or_create_default_bridge, is_default_bridge_running, stop_default_bridge,
-    with_default_bridge,
+    get_or_create_default_bridge_compartment, is_default_bridge_running_compartment,
+    stop_default_bridge_compartment, with_default_bridge_compartment,
 };
 use crate::settings;
-use std::sync::Arc;
 use tauri::{Emitter, State};
 use tracing::{error, info, warn};
 
-use super::super::{AppState, CommandResponse};
+use super::super::compartments::{BridgeCompartment, ExecutionCompartment};
+use super::super::CommandResponse;
 
 /// Start the Python executor.
 ///
@@ -32,12 +32,13 @@ use super::super::{AppState, CommandResponse};
 #[tauri::command]
 pub fn start_python_executor(
     app_handle: tauri::AppHandle,
-    state: State<Arc<AppState>>,
+    bridge: State<BridgeCompartment>,
+    execution: State<ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Starting Python executor");
 
     // Check if already running
-    if is_default_bridge_running(&state) {
+    if is_default_bridge_running_compartment(&bridge) {
         info!("Python executor already running, checking if config needs to be reloaded");
 
         // When app restarts but Python is still running, we need to reload the config
@@ -61,7 +62,7 @@ pub fn start_python_executor(
                     });
 
                     // Store in app state
-                    match state.current_config.lock() {
+                    match execution.current_config().lock() {
                         Ok(mut guard) => *guard = Some(config),
                         Err(e) => warn!("Failed to store config (mutex poisoned): {}", e),
                     }
@@ -70,7 +71,7 @@ pub fn start_python_executor(
                     // Send debug settings and configuration via bridge manager
                     let debug_settings = settings::get_debug_settings();
                     let config_path_clone = config_path.clone();
-                    let reload_result = with_default_bridge(&state, |bridge| {
+                    let reload_result = with_default_bridge_compartment(&bridge, |bridge| {
                         // Send debug settings first
                         if let Err(e) = bridge.set_debug_settings(
                             debug_settings.enable_image_debug,
@@ -126,14 +127,14 @@ pub fn start_python_executor(
     }
 
     // Create and start new bridge via BridgeManager
-    get_or_create_default_bridge(&state).map_err(|e| {
+    get_or_create_default_bridge_compartment(&bridge).map_err(|e| {
         error!("Failed to start Python executor: {}", e);
         format!("Failed to start Python executor: {}", e)
     })?;
 
     // If a configuration was already loaded, send it to the Python executor
     let config_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
+        crate::safe_lock::safe_lock_or_recover(execution.current_config(), "current_config");
     let has_config = config_lock.is_some();
     drop(config_lock); // Release lock before calling bridge methods
 
@@ -147,7 +148,7 @@ pub fn start_python_executor(
 
             // Send debug settings and configuration via bridge manager
             let debug_settings = settings::get_debug_settings();
-            let send_result = with_default_bridge(&state, |bridge| {
+            let send_result = with_default_bridge_compartment(&bridge, |bridge| {
                 // Send debug settings first
                 if let Err(e) = bridge.set_debug_settings(
                     debug_settings.enable_image_debug,
@@ -204,10 +205,10 @@ pub fn start_python_executor(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor fails to stop
 #[tauri::command]
-pub fn stop_python_executor(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn stop_python_executor(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
     info!("Stopping Python executor");
 
-    stop_default_bridge(&state).map_err(|e| {
+    stop_default_bridge_compartment(&bridge).map_err(|e| {
         error!("Failed to stop Python executor: {}", e);
         format!("Failed to stop Python executor: {}", e)
     })?;
@@ -235,18 +236,18 @@ pub fn stop_python_executor(state: State<Arc<AppState>>) -> Result<CommandRespon
 #[tauri::command]
 pub fn update_capture_settings(
     settings: ScreenshotCaptureSettings,
-    state: State<Arc<AppState>>,
+    bridge: State<BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Updating screenshot capture settings: enabled={}",
         settings.enabled
     );
 
-    if !is_default_bridge_running(&state) {
+    if !is_default_bridge_running_compartment(&bridge) {
         return Err("Python executor is not running. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string());
     }
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge.update_capture_settings(settings.clone())
     })
     .map_err(|e| {
