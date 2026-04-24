@@ -3,13 +3,13 @@
 //! Provides access to learning data persisted in SQLite for displaying
 //! AI learning patterns, insights, and task outcome history.
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::orchestrator::learning::{
     AnalysisResult, Feedback, Insight, LearningSummary, LearningSystem, Pattern, TaskOutcome,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -31,11 +31,11 @@ pub struct LearningDashboardData {
 /// Get the learning summary statistics.
 #[tauri::command]
 pub async fn get_learning_summary(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<LearningSummary, String> {
     // Get outcomes from database
-    let outcomes = state.pg_db.get_learning_outcomes(Some(500)).await?;
-    let patterns = state.pg_db.get_learning_patterns().await?;
+    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
+    let patterns = state.pg_db().get_learning_patterns().await?;
 
     // Calculate summary from outcomes
     let total = outcomes.len();
@@ -77,9 +77,9 @@ pub async fn get_learning_summary(
 /// Get all identified patterns from the database.
 #[tauri::command]
 pub async fn get_learning_patterns(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<Pattern>, String> {
-    let patterns_json = state.pg_db.get_learning_patterns().await?;
+    let patterns_json = state.pg_db().get_learning_patterns().await?;
 
     let patterns: Vec<Pattern> = patterns_json
         .into_iter()
@@ -138,10 +138,10 @@ pub async fn get_learning_patterns(
 /// Get all generated insights (uses in-memory analysis).
 #[tauri::command]
 pub async fn get_learning_insights(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<Insight>, String> {
     // Load outcomes from database into the learning system
-    let outcomes = state.pg_db.get_learning_outcomes(Some(500)).await?;
+    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
     let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
 
     // Rebuild system from database outcomes
@@ -159,10 +159,10 @@ pub async fn get_learning_insights(
 /// Run full pattern analysis and return results.
 #[tauri::command]
 pub async fn analyze_learning_data(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<AnalysisResult, String> {
     // Load outcomes from database
-    let outcomes = state.pg_db.get_learning_outcomes(Some(500)).await?;
+    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
     let result = {
         let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
 
@@ -198,7 +198,7 @@ pub async fn analyze_learning_data(
         });
         let context_str = context.to_string();
         let _ = state
-            .pg_db
+            .pg_db()
             .save_learning_pattern(
                 &pattern.id,
                 pattern_type,
@@ -227,10 +227,10 @@ pub fn get_feedback_for_context(context: String) -> Result<Vec<Feedback>, String
 /// Get all learning dashboard data in one call.
 #[tauri::command]
 pub async fn get_learning_dashboard_data(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<LearningDashboardData, String> {
     // Load outcomes from database
-    let outcomes = state.pg_db.get_learning_outcomes(Some(500)).await?;
+    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
     let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
 
     // Rebuild system from database outcomes
@@ -253,7 +253,7 @@ pub async fn get_learning_dashboard_data(
 /// Record a task outcome for learning (saves to database).
 #[tauri::command]
 pub async fn record_task_outcome(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     outcome: TaskOutcome,
 ) -> Result<(), String> {
     // Record to in-memory system for immediate analysis
@@ -309,7 +309,7 @@ pub async fn record_task_outcome(
     };
 
     state
-        .pg_db
+        .pg_db()
         .record_learning_outcome(
             &id,
             &outcome.task_id,
@@ -341,9 +341,9 @@ pub async fn record_task_outcome(
 /// Get the best performing strategy.
 #[tauri::command]
 pub async fn get_best_strategy(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Option<(String, f64)>, String> {
-    let outcomes = state.pg_db.get_learning_outcomes(Some(500)).await?;
+    let outcomes = state.pg_db().get_learning_outcomes(Some(500)).await?;
 
     let mut strategy_stats: std::collections::HashMap<String, (u32, u32)> =
         std::collections::HashMap::new();
@@ -368,9 +368,9 @@ pub async fn get_best_strategy(
 
 /// Export learning data as JSON for backup.
 #[tauri::command]
-pub async fn export_learning_data(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let outcomes = state.pg_db.get_learning_outcomes(None).await?;
-    let patterns = state.pg_db.get_learning_patterns().await?;
+pub async fn export_learning_data(state: State<'_, StorageCompartment>) -> Result<String, String> {
+    let outcomes = state.pg_db().get_learning_outcomes(None).await?;
+    let patterns = state.pg_db().get_learning_patterns().await?;
 
     let export = serde_json::json!({
         "outcomes": outcomes,
@@ -400,7 +400,7 @@ pub fn clear_learning_data() -> Result<(), String> {
 
 /// Add sample learning data for demonstration/testing.
 #[tauri::command]
-pub async fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn add_sample_learning_data(state: State<'_, StorageCompartment>) -> Result<(), String> {
     // Add successful outcomes
     for i in 0..10 {
         let tools_json = serde_json::json!(["grep", "edit"]).to_string();
@@ -412,7 +412,7 @@ pub async fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result
 
         let id = uuid::Uuid::new_v4().to_string();
         state
-            .pg_db
+            .pg_db()
             .record_learning_outcome(
                 &id,
                 &format!("sample-task-{}", i),
@@ -445,7 +445,7 @@ pub async fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result
 
         let id = uuid::Uuid::new_v4().to_string();
         state
-            .pg_db
+            .pg_db()
             .record_learning_outcome(
                 &id,
                 &format!("sample-fail-{}", i),
@@ -500,11 +500,11 @@ pub struct PaginatedResult<T> {
 /// Get learning outcomes with optional filtering.
 #[tauri::command]
 pub async fn get_learning_outcomes_filtered(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     filter: LearningOutcomeFilter,
 ) -> Result<Vec<serde_json::Value>, String> {
     state
-        .pg_db
+        .pg_db()
         .get_learning_outcomes_filtered(
             filter.status.as_deref(),
             filter.strategy.as_deref(),
@@ -517,15 +517,15 @@ pub async fn get_learning_outcomes_filtered(
 /// Get learning outcomes with pagination.
 #[tauri::command]
 pub async fn get_learning_outcomes_paginated(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     offset: i64,
     limit: i64,
 ) -> Result<PaginatedResult<Vec<serde_json::Value>>, String> {
     let items = state
-        .pg_db
+        .pg_db()
         .get_learning_outcomes_paginated(offset, limit)
         .await?;
-    let total = state.pg_db.get_learning_outcomes_count().await?;
+    let total = state.pg_db().get_learning_outcomes_count().await?;
     Ok(PaginatedResult {
         items,
         total,
@@ -537,20 +537,20 @@ pub async fn get_learning_outcomes_paginated(
 /// Get learning statistics for a date range.
 #[tauri::command]
 pub async fn get_learning_stats_by_date_range(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     start: String,
     end: String,
 ) -> Result<serde_json::Value, String> {
     state
-        .pg_db
+        .pg_db()
         .get_learning_stats_by_date_range(&start, &end)
         .await
 }
 
 /// Get total count of learning outcomes.
 #[tauri::command]
-pub async fn get_learning_outcomes_count(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
-    state.pg_db.get_learning_outcomes_count().await
+pub async fn get_learning_outcomes_count(state: State<'_, StorageCompartment>) -> Result<i64, String> {
+    state.pg_db().get_learning_outcomes_count().await
 }
 
 // ============================================================================
@@ -561,20 +561,20 @@ pub async fn get_learning_outcomes_count(state: State<'_, Arc<AppState>>) -> Res
 /// This combines task run data with learning outcome data for the dashboard.
 #[tauri::command]
 pub async fn get_recent_tasks_with_outcomes(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(10);
-    state.pg_db.get_recent_task_runs_with_outcomes(limit).await
+    state.pg_db().get_recent_task_runs_with_outcomes(limit).await
 }
 
 /// Get the current running task (if any).
 /// Returns the most recently updated running task.
 #[tauri::command]
 pub async fn get_current_running_task(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let running_tasks = state.pg_db.get_running_task_runs(None).await?;
+    let running_tasks = state.pg_db().get_running_task_runs(None).await?;
 
     // Return the first (most recently updated) running task with basic info
     if let Some(task) = running_tasks.first() {
@@ -598,17 +598,17 @@ pub async fn get_current_running_task(
 /// Used for auto-selecting in the checkpoint browser.
 #[tauri::command]
 pub async fn get_most_recent_task_with_checkpoints(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Option<String>, String> {
-    state.pg_db.get_most_recent_task_with_checkpoints().await
+    state.pg_db().get_most_recent_task_with_checkpoints().await
 }
 
 /// Get learning statistics summary for dashboard display.
 #[tauri::command]
 pub async fn get_learning_stats_summary(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<serde_json::Value, String> {
-    state.pg_db.get_learning_stats_summary().await
+    state.pg_db().get_learning_stats_summary().await
 }
 
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
