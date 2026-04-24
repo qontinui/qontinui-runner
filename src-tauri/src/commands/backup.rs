@@ -6,16 +6,18 @@
 //! - Getting a summary of what will be exported
 //! - Preview of what will be imported
 
-use crate::commands::AppState;
 use crate::database::pg::PgDb;
 use crate::database::ImportResult;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
+
+use super::compartments::StorageCompartment;
+
+// Migrated to StorageCompartment (Workstream C).
 
 /// Export manifest with version information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,19 +142,19 @@ pub struct ImportPreview {
 /// Get a summary of all exportable data counts.
 #[tauri::command]
 pub async fn get_export_summary(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<serde_json::Value, String> {
     info!("Getting export summary");
-    state.pg_db.get_export_summary().await
+    state.pg_db().get_export_summary().await
 }
 
 /// Export all user data to a JSON structure.
 #[tauri::command]
 pub async fn export_all_data(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     options: Option<ExportOptions>,
 ) -> Result<ComprehensiveExport, String> {
-    export_all_data_impl(&state.pg_db, options).await
+    export_all_data_impl(state.pg_db(), options).await
 }
 
 /// Free-function implementation of comprehensive export, callable from any
@@ -318,11 +320,11 @@ pub fn get_import_preview(data: ComprehensiveExport) -> Result<ImportPreview, St
 /// Import all data from a comprehensive backup.
 #[tauri::command]
 pub async fn import_all_data(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     data: ComprehensiveExport,
     options: Option<ImportOptions>,
 ) -> Result<ComprehensiveImportResult, String> {
-    import_all_data_impl(&state.pg_db, data, options).await
+    import_all_data_impl(state.pg_db(), data, options).await
 }
 
 /// Free-function implementation of comprehensive import, callable from any
