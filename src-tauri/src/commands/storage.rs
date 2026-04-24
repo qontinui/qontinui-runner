@@ -10,13 +10,16 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json;
 use std::fs;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
-use super::{AppState, CommandResponse};
+use super::compartments::StorageCompartment;
+use super::CommandResponse;
+use crate::error::AppError;
+
+// Migrated to StorageCompartment (Workstream C).
 
 /// Save a screenshot to local disk storage.
 ///
@@ -37,8 +40,17 @@ pub fn save_screenshot_to_disk(
     session_id: String,
     screenshot_id: String,
     data: Vec<u8>,
-    state: State<Arc<AppState>>,
+    state: State<StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    save_screenshot_to_disk_impl(session_id, screenshot_id, data, &state).map_err(String::from)
+}
+
+fn save_screenshot_to_disk_impl(
+    session_id: String,
+    screenshot_id: String,
+    data: Vec<u8>,
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Saving screenshot to disk: session={}, id={}, size={} bytes",
         session_id,
@@ -46,12 +58,16 @@ pub fn save_screenshot_to_disk(
         data.len()
     );
 
-    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
+    let storage =
+        crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
     let path = storage
         .save_screenshot(&session_id, &screenshot_id, &data)
         .map_err(|e| {
             error!("Failed to save screenshot: {}", e);
-            format!("Failed to save screenshot: {}", e)
+            AppError::IoError(std::io::Error::other(format!(
+                "Failed to save screenshot: {}",
+                e
+            )))
         })?;
 
     info!("Screenshot saved successfully: {:?}", path);
@@ -82,7 +98,7 @@ pub fn save_screenshot_to_disk(
 pub fn save_video_to_disk(
     session_id: String,
     data: Vec<u8>,
-    state: State<Arc<AppState>>,
+    state: State<StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Saving video to disk: session={}, size={} bytes",
@@ -90,7 +106,8 @@ pub fn save_video_to_disk(
         data.len()
     );
 
-    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
+    let storage =
+        crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
     let path = storage.save_video(&session_id, &data).map_err(|e| {
         error!("Failed to save video: {}", e);
         format!("Failed to save video: {}", e)
@@ -119,10 +136,13 @@ pub fn save_video_to_disk(
 /// * `Ok(CommandResponse)` - Success with usage statistics
 /// * `Err(String)` - Error if usage query fails
 #[tauri::command]
-pub fn get_local_storage_usage(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn get_local_storage_usage(
+    state: State<StorageCompartment>,
+) -> Result<CommandResponse, String> {
     info!("Getting local storage usage");
 
-    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
+    let storage =
+        crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
     let usage = storage.get_storage_usage().map_err(|e| {
         error!("Failed to get storage usage: {}", e);
         format!("Failed to get storage usage: {}", e)
@@ -159,14 +179,15 @@ pub fn get_local_storage_usage(state: State<Arc<AppState>>) -> Result<CommandRes
 pub fn delete_old_sessions(
     storage_type: String,
     older_than_days: u32,
-    state: State<Arc<AppState>>,
+    state: State<StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Deleting old sessions: type={}, older_than_days={}",
         storage_type, older_than_days
     );
 
-    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
+    let storage =
+        crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
     storage
         .delete_old_sessions(&storage_type, older_than_days)
         .map_err(|e| {
@@ -197,10 +218,11 @@ pub fn delete_old_sessions(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if clear operation fails
 #[tauri::command]
-pub fn clear_all_storage(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn clear_all_storage(state: State<StorageCompartment>) -> Result<CommandResponse, String> {
     info!("Clearing all local storage");
 
-    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
+    let storage =
+        crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
     storage.clear_all_storage().map_err(|e| {
         error!("Failed to clear all storage: {}", e);
         format!("Failed to clear all storage: {}", e)
@@ -227,10 +249,11 @@ pub fn clear_all_storage(state: State<Arc<AppState>>) -> Result<CommandResponse,
 /// * `Ok(CommandResponse)` - Success with storage configuration
 /// * `Err(String)` - Error message if configuration cannot be retrieved
 #[tauri::command]
-pub fn get_storage_paths(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn get_storage_paths(state: State<StorageCompartment>) -> Result<CommandResponse, String> {
     info!("Getting storage paths");
 
-    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
+    let storage =
+        crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
     let config = &storage.config;
 
     Ok(CommandResponse {
