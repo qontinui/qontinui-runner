@@ -1140,28 +1140,21 @@ impl PgDb {
         // failures (idempotent intent preserved) and still apply the rest of
         // the schema. This mirrors `ensure_tables`'s warn-on-failure loop.
         //
-        // The split is a naive `;` split: safe here because schema.pg.sql is
-        // DDL only — no string literals containing semicolons, no PL/pgSQL
-        // functions. The checked-in `check_schema_drift` test would catch a
-        // future statement that needed DO/$$ blocks.
+        // Strip `--` line comments from the whole schema BEFORE splitting on
+        // `;`. Order matters: a `;` inside a comment would otherwise split a
+        // CREATE TABLE body in half, producing two malformed fragments.
+        // Observed symptom: PG 16 + pgvector sits "active" forever on the
+        // malformed DDL (no wait_event, statement_timeout doesn't fire), and
+        // every runner startup wedges in apply_canonical_schema.
+        let schema_no_comments: String = CANONICAL_SCHEMA
+            .lines()
+            .map(|l| if l.trim_start().starts_with("--") { "" } else { l })
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut applied = 0usize;
         let mut failed = 0usize;
-        for raw in CANONICAL_SCHEMA.split(';') {
-            // Strip line-leading `-- ` comments and blank lines so we don't
-            // send empty or comment-only statements to PG.
-            let stmt: String = raw
-                .lines()
-                .map(|l| {
-                    let t = l.trim_start();
-                    if t.starts_with("--") {
-                        ""
-                    } else {
-                        l
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let trimmed = stmt.trim();
+        for raw in schema_no_comments.split(';') {
+            let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
             }
