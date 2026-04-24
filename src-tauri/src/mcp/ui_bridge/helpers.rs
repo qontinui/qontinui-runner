@@ -203,7 +203,9 @@ pub(super) async fn direct_webview_evaluate_with_result(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Use the known API port — location.port is empty on tauri.localhost
+    // Use the known API base URL — location.port is empty on tauri.localhost,
+    // so the injected JS must address the runner's HTTP API explicitly. Reads
+    // the actually-bound port from AppState.api_port (set at server start).
     let api_port = state
         .app_state
         .api_port
@@ -217,6 +219,10 @@ pub(super) async fn direct_webview_evaluate_with_result(
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         return Err("API port not yet bound — direct eval unavailable".to_string());
     }
+    let ipc_url = format!(
+        "{}/ui-bridge/ipc-response",
+        crate::mcp::types::get_self_base_url(&state.app_state)
+    );
 
     // Encode the user's expression as a JS *string literal* so that any
     // characters that would break a raw splice (newlines inside a string
@@ -251,7 +257,7 @@ pub(super) async fn direct_webview_evaluate_with_result(
             try {{
                 var result = {};
                 var value = (result === undefined) ? null : result;
-                await fetch("http://127.0.0.1:{}/ui-bridge/ipc-response", {{
+                await fetch("{}", {{
                     method: "POST",
                     headers: {{ "Content-Type": "application/json" }},
                     body: JSON.stringify({{
@@ -262,7 +268,7 @@ pub(super) async fn direct_webview_evaluate_with_result(
                     }})
                 }});
             }} catch(e) {{
-                await fetch("http://127.0.0.1:{}/ui-bridge/ipc-response", {{
+                await fetch("{}", {{
                     method: "POST",
                     headers: {{ "Content-Type": "application/json" }},
                     body: JSON.stringify({{
@@ -274,7 +280,7 @@ pub(super) async fn direct_webview_evaluate_with_result(
                 }}).catch(function() {{}});
             }}
         }})()"#,
-        request_id, eval_inner, api_port, api_port
+        request_id, eval_inner, ipc_url, ipc_url
     );
 
     window

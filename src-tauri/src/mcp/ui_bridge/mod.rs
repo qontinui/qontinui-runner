@@ -407,9 +407,24 @@ mod manifest_drift_tests {
     #[test]
     fn manifest_matches_route_calls() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let src_path = PathBuf::from(manifest_dir).join("src/mcp/ui_bridge.rs");
-        let src = std::fs::read_to_string(&src_path)
-            .unwrap_or_else(|e| panic!("read {}: {}", src_path.display(), e));
+        let ui_bridge_dir = PathBuf::from(manifest_dir).join("src/mcp/ui_bridge");
+
+        // After the family split, routes live across ~20 submodule files.
+        // Concatenate every .rs file under src/mcp/ui_bridge/ before scanning
+        // so the drift test covers the full router composition, not just mod.rs.
+        let mut src = String::new();
+        let entries = std::fs::read_dir(&ui_bridge_dir).unwrap_or_else(|e| {
+            panic!("read_dir {}: {}", ui_bridge_dir.display(), e);
+        });
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let file = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+                src.push_str(&file);
+                src.push('\n');
+            }
+        }
 
         // For each route registration, extract every HTTP method present
         // (axum allows chaining like get(h).delete(h2) on the same route).
