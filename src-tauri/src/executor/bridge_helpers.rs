@@ -14,6 +14,7 @@
 
 use super::BridgeManager;
 use super::PythonBridge;
+use crate::commands::compartments::BridgeCompartment;
 use crate::commands::AppState;
 use std::sync::Arc;
 
@@ -183,6 +184,97 @@ pub fn require_running_bridge(state: &Arc<AppState>) -> Result<(), String> {
         return Err("Python executor not running".to_string());
     }
     Ok(())
+}
+
+// =============================================================================
+// Compartment-scoped variants
+// =============================================================================
+//
+// Each of the `*_compartment` helpers below is a thin delegator to the
+// corresponding `&Arc<AppState>` helper above, keyed off `BridgeCompartment.0`.
+// Their purpose is to let handlers migrated to `State<'_, BridgeCompartment>`
+// call into the bridge-helpers layer without reaching back through the full
+// AppState god-object — the Workstream-C goal of restricting each module to
+// only the fields in its domain. No behaviour change vs the pre-compartment
+// helpers.
+
+/// Compartment-scoped equivalent of [`get_bridge_manager`].
+pub fn get_bridge_manager_compartment(
+    compartment: &BridgeCompartment,
+) -> Result<Arc<BridgeManager>, String> {
+    get_bridge_manager(&compartment.0)
+}
+
+/// Compartment-scoped equivalent of [`with_default_bridge`].
+pub fn with_default_bridge_compartment<F, R>(
+    compartment: &BridgeCompartment,
+    f: F,
+) -> Result<R, String>
+where
+    F: FnOnce(&mut PythonBridge) -> R + Send,
+    R: Send,
+{
+    with_default_bridge(&compartment.0, f)
+}
+
+/// Compartment-scoped equivalent of [`with_default_bridge_async`].
+pub fn with_default_bridge_async_compartment<F, Fut, R>(
+    compartment: &BridgeCompartment,
+    f: F,
+) -> Result<R, String>
+where
+    F: FnOnce(&mut PythonBridge) -> Fut + Send,
+    Fut: std::future::Future<Output = R> + Send,
+    R: Send,
+{
+    with_default_bridge_async(&compartment.0, f)
+}
+
+/// Compartment-scoped equivalent of [`is_default_bridge_running`].
+pub fn is_default_bridge_running_compartment(compartment: &BridgeCompartment) -> bool {
+    is_default_bridge_running(&compartment.0)
+}
+
+/// Compartment-scoped equivalent of [`get_or_create_default_bridge`].
+pub fn get_or_create_default_bridge_compartment(
+    compartment: &BridgeCompartment,
+) -> Result<String, String> {
+    get_or_create_default_bridge(&compartment.0)
+}
+
+/// Compartment-scoped equivalent of [`start_default_bridge`].
+pub fn start_default_bridge_compartment(compartment: &BridgeCompartment) -> Result<bool, String> {
+    start_default_bridge(&compartment.0)
+}
+
+/// Compartment-scoped equivalent of [`stop_default_bridge`].
+pub fn stop_default_bridge_compartment(compartment: &BridgeCompartment) -> Result<(), String> {
+    stop_default_bridge(&compartment.0)
+}
+
+/// Compartment-scoped equivalent of [`get_default_bridge_state`].
+pub fn get_default_bridge_state_compartment(
+    compartment: &BridgeCompartment,
+) -> Option<super::ExecutorState> {
+    get_default_bridge_state(&compartment.0)
+}
+
+/// Compartment-scoped equivalent of [`with_bridge`].
+pub fn with_bridge_compartment<F, R>(
+    compartment: &BridgeCompartment,
+    bridge_id: &str,
+    f: F,
+) -> Result<R, String>
+where
+    F: FnOnce(&mut PythonBridge) -> R + Send,
+    R: Send,
+{
+    with_bridge(&compartment.0, bridge_id, f)
+}
+
+/// Compartment-scoped equivalent of [`require_running_bridge`].
+pub fn require_running_bridge_compartment(compartment: &BridgeCompartment) -> Result<(), String> {
+    require_running_bridge(&compartment.0)
 }
 
 /// Migrate helper: wraps the old pattern of getting a mutable bridge reference.
