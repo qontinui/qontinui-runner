@@ -10,6 +10,7 @@
 //!   - `wait-for-element-condition` (already `/ai/`-prefixed)
 //!   - `wait-for-element-state`
 //!   - `wait-for-route` (with `/ai/` alias)
+//!   - `wait-for-route-change` (with `/ai/` alias — forwards to SDK)
 
 use std::sync::Arc;
 
@@ -472,6 +473,58 @@ pub async fn ui_bridge_wait_for_route_handler(
     }
 }
 
+/// POST /ui-bridge/control/wait-for-route-change
+/// POST /ui-bridge/ai/wait-for-route-change
+///
+/// Forward to the SDK's `waitForRouteChange` handler on the frontend.
+/// The SDK subscribes to the ChangeTracker's route-change stream with
+/// optional `fromRoute` / `toRoute` filters and returns the first match,
+/// or a `{reason: 'timeout', ...}` payload on expiry.
+///
+/// Body shape: `{ fromRoute?, toRoute?, matchMode? ('exact'|'prefix'|'regex'), timeoutMs? }`.
+/// We bound `timeout_ms` to `[100, 60_000]` (default 5000) on the Rust side
+/// as a safety cap before forwarding. The SDK re-clamps inside the same
+/// window, so this bound is defensive: a runaway client can't park a
+/// listener indefinitely.
+pub async fn ui_bridge_wait_for_route_change_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut body = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // Clamp timeoutMs to [100, 60_000] (default 5000) before forwarding.
+    let raw_timeout = body
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5000);
+    let timeout_ms = raw_timeout.clamp(100, 60_000);
+    if let serde_json::Value::Object(ref mut map) = body {
+        map.insert(
+            "timeoutMs".to_string(),
+            serde_json::Value::from(timeout_ms),
+        );
+    }
+
+    info!(
+        "UI Bridge API: wait-for-route-change fromRoute={:?} toRoute={:?} matchMode={:?} timeoutMs={}",
+        body.get("fromRoute").and_then(|v| v.as_str()),
+        body.get("toRoute").and_then(|v| v.as_str()),
+        body.get("matchMode").and_then(|v| v.as_str()),
+        timeout_ms,
+    );
+
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "wait_for_route_change", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: wait-for-route-change failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 // ============================================================================
 // Routes + manifest
 // ============================================================================
@@ -516,6 +569,14 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_wait_for_route_handler),
         )
         .route(
+            "/ui-bridge/control/wait-for-route-change",
+            post(ui_bridge_wait_for_route_change_handler),
+        )
+        .route(
+            "/ui-bridge/ai/wait-for-route-change",
+            post(ui_bridge_wait_for_route_change_handler),
+        )
+        .route(
             "/ui-bridge/control/wait-for-idle/{signal}",
             post(ui_bridge_wait_for_idle_signal_handler),
         )
@@ -536,6 +597,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/wait-for-element-stable"),
         ("POST", "/ui-bridge/control/wait-for-route"),
         ("POST", "/ui-bridge/ai/wait-for-route"),
+        ("POST", "/ui-bridge/control/wait-for-route-change"),
+        ("POST", "/ui-bridge/ai/wait-for-route-change"),
         ("POST", "/ui-bridge/control/wait-for-idle/{signal}"),
         ("POST", "/ui-bridge/control/wait-for-targets"),
     ]

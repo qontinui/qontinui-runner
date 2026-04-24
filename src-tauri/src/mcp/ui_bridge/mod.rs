@@ -122,7 +122,8 @@ pub use intents::{
     ui_bridge_wait_for_element_condition_handler, ui_bridge_wait_for_element_stable_handler,
     ui_bridge_wait_for_element_state_handler, ui_bridge_wait_for_idle_handler,
     ui_bridge_wait_for_idle_signal_handler, ui_bridge_wait_for_navigation_handler,
-    ui_bridge_wait_for_route_handler, ui_bridge_wait_for_targets_handler,
+    ui_bridge_wait_for_route_change_handler, ui_bridge_wait_for_route_handler,
+    ui_bridge_wait_for_targets_handler,
 };
 pub use network::{
     ui_bridge_clear_console_errors_handler, ui_bridge_get_browser_events_handler,
