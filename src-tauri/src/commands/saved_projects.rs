@@ -24,6 +24,8 @@
 //! still want `remove_saved_project` to match.
 
 use serde::{Deserialize, Serialize};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::info;
 
 use crate::settings::{self, SavedProject};
@@ -229,4 +231,16 @@ mod tests {
         );
         assert_eq!(current[0].path, "/tmp/b");
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_saved_projects")
+        .invoke_handler(tauri::generate_handler![
+            list_saved_projects,
+            save_saved_projects,
+            add_saved_project,
+            remove_saved_project,
+        ])
+        .build()
 }
