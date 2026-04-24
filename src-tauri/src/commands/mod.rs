@@ -49,12 +49,28 @@
 //! agentic_metrics, ai_data, cost_dashboard, learning, performance_metrics,
 //! recap, terminal_analysis, token_analytics, transcript, adaptive_learning,
 //! ai_generation, ai_session, backup, checkpoint_browser, config, context,
-//! library_sync, logging, meta_optimizer, rag (as of this commit).
+//! library_sync, logging, meta_optimizer, rag, auth, state_machine,
+//! websocket, video, interaction, storage, extraction, screenshot,
+//! screenshots, script_emitter, verification, project_logs,
+//! global_log_sources, execution_reporting, workflow_events,
+//! state_machine_configs, spec_drift, ui_bridge_baselines, state_explorer,
+//! tiered_info, task_sync, step_outputs, testing, shell_commands, mcp,
+//! mobile, setup_wizard, saved_projects, test_orchestrator,
+//! orchestration_loop_configs, scripted_output_settings, watchers,
+//! durable_execution, flow, ui_bridge, terminal, instances, execution
+//! (as of this commit).
 //!
-//! Note: ai_session, meta_optimizer, and rag use a non-generic `plugin()
-//! -> TauriPlugin<tauri::Wry>` because they accept concrete `tauri::AppHandle`
-//! parameters in some commands. Modules without `AppHandle` parameters use
-//! the generic `plugin<R: Runtime>() -> TauriPlugin<R>` form.
+//! All `commands/*` modules are now migrated to the plugin pattern. The
+//! remaining entries in main.rs's central `tauri::generate_handler![...]`
+//! are modules living outside `commands/` (e.g. `error_monitor`, `doctor`,
+//! `mcp::backend_relay`, `process_capture`, `orchestration_loop`,
+//! `spec_experimentation`, `ui_error`, `crash_dumps`).
+//!
+//! Note: ai_session, meta_optimizer, rag, flow, ui_bridge, terminal, and
+//! execution use a non-generic `plugin() -> TauriPlugin<tauri::Wry>` because
+//! they accept concrete `tauri::AppHandle` parameters in some commands.
+//! Modules without `AppHandle` parameters use the generic
+//! `plugin<R: Runtime>() -> TauriPlugin<R>` form.
 //!
 //! To migrate a module `foo.rs`:
 //! 1. Add `use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};` and
