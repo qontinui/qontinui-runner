@@ -3,6 +3,8 @@
 use crate::commands::AppState;
 use crate::database::token_analytics::*;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 /// Get daily cost breakdown for the last N days (default: 7).
@@ -75,4 +77,18 @@ pub async fn get_token_usage_summary(
 ) -> Result<TokenUsageSummary, String> {
     let d = days.unwrap_or(7);
     state.pg_db.get_token_usage_summary(d).await
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_token_analytics")
+        .invoke_handler(tauri::generate_handler![
+            get_token_usage_summary,
+            get_daily_cost,
+            get_cost_by_model,
+            get_cost_by_phase,
+            get_provider_latency,
+            get_task_run_costs,
+            get_cost_by_target_app,
+        ])
+        .build()
 }

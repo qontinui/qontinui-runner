@@ -507,6 +507,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::performance_metrics::plugin())
         .plugin(commands::recap::plugin())
         .plugin(commands::terminal_analysis::plugin())
+        .plugin(commands::token_analytics::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -1176,13 +1177,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             spec_experimentation::commands::diff_spec_versions,
             spec_experimentation::commands::diff_spec_json,
             // Token analytics commands (LLM cost and usage tracking)
-            commands::token_analytics::get_token_usage_summary,
-            commands::token_analytics::get_daily_cost,
-            commands::token_analytics::get_cost_by_model,
-            commands::token_analytics::get_cost_by_phase,
-            commands::token_analytics::get_provider_latency,
-            commands::token_analytics::get_task_run_costs,
-            commands::token_analytics::get_cost_by_target_app,
+            // NOTE: token_analytics handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: activity_timeline handlers moved to per-module plugin (see .plugin() calls above).
             commands::scripted_output_settings::get_scripted_output_settings,
             commands::scripted_output_settings::save_scripted_output_settings,
