@@ -91,6 +91,12 @@ pub struct PageEvaluateRequest {
     /// When true, if the expression returns a Promise the runner awaits it.
     #[serde(default)]
     pub await_promise: bool,
+    /// When true, the frontend returns a consistent discriminated
+    /// `{value, type}` shape regardless of result type. When false/absent,
+    /// the legacy conditional-wrapping shape is preserved for backward
+    /// compatibility.
+    #[serde(default)]
+    pub unwrap: Option<bool>,
 }
 
 /// Request to evaluate multiple JS expressions in one round-trip.
@@ -615,6 +621,7 @@ async fn tagged_page_evaluate(
     expression: &str,
     await_promise: bool,
     timeout_ms: Option<u64>,
+    unwrap: bool,
 ) -> Result<serde_json::Value, String> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_PAGE_EVALUATE_TIMEOUT_MS);
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -630,6 +637,11 @@ async fn tagged_page_evaluate(
         "expression": expression,
         "await_promise": await_promise,
         "timeout_ms": timeout_ms,
+        // Forward unwrap so the frontend evaluate handler can emit the
+        // discriminated {value, type} shape when requested. When unwrap is
+        // true we skip the legacy conditional-wrap conversion below — the
+        // frontend already produced the final payload.
+        "unwrap": unwrap,
     });
 
     if let Err(e) = state
@@ -644,7 +656,11 @@ async fn tagged_page_evaluate(
         Ok(Ok(resp)) => {
             if resp.ok {
                 let result_value = resp.result.unwrap_or(serde_json::Value::Null);
-                let data = if result_value.is_object() {
+                let data = if unwrap {
+                    // Frontend already emitted the {value, type} shape —
+                    // pass it through verbatim.
+                    result_value
+                } else if result_value.is_object() {
                     result_value
                 } else {
                     serde_json::json!({
@@ -685,11 +701,13 @@ async fn page_evaluate_inner(
     expression: String,
     timeout_ms: Option<u64>,
     await_promise: bool,
+    unwrap: bool,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let preview: String = expression.chars().take(80).collect();
     info!("UI Bridge API: Page evaluate ({}...)", preview);
 
-    let ipc_result = tagged_page_evaluate(&state, &expression, await_promise, timeout_ms).await;
+    let ipc_result =
+        tagged_page_evaluate(&state, &expression, await_promise, timeout_ms, unwrap).await;
     match ipc_result {
         Ok(data) => {
             if let Some(false) = data.get("success").and_then(|v| v.as_bool()) {
@@ -719,10 +737,31 @@ async fn page_evaluate_inner(
             )
             .await
             {
-                Ok(result) => Ok(Json(ApiResponse::success(serde_json::json!({
-                    "result": { "value": result },
-                    "source": "direct_eval"
-                })))),
+                Ok(result) => {
+                    // Direct-eval fallback: when unwrap is requested, we
+                    // build the {value, type} shape ourselves since the
+                    // direct-eval path never reached the frontend handler
+                    // that would otherwise produce it. `result` is a JSON-
+                    // encoded string (direct_webview_evaluate_with_result
+                    // sends the serialised value back over HTTP) — parse it
+                    // before classifying so null/objects/arrays get the
+                    // correct discriminator.
+                    let data = if unwrap {
+                        let parsed: serde_json::Value = serde_json::from_str(&result)
+                            .unwrap_or_else(|_| serde_json::Value::String(result.clone()));
+                        let (value, type_name) = classify_direct_eval_value(parsed);
+                        serde_json::json!({
+                            "value": value,
+                            "type": type_name,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "result": { "value": result },
+                            "source": "direct_eval"
+                        })
+                    };
+                    Ok(Json(ApiResponse::success(data)))
+                }
                 Err(direct_err) => {
                     error!(
                         "UI Bridge API: Both IPC and direct eval failed. IPC: {}, Direct: {}",
@@ -741,13 +780,33 @@ async fn page_evaluate_inner(
     }
 }
 
+/// Map a direct-eval JSON value to the unwrap discriminator the frontend
+/// would have produced via `typeof`. Functions are unreachable here because
+/// the direct-eval path serialises through JSON — they'd have surfaced as
+/// `Null`.
+fn classify_direct_eval_value(result: serde_json::Value) -> (serde_json::Value, &'static str) {
+    match &result {
+        serde_json::Value::Null => (serde_json::Value::Null, "null"),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => (result, "object"),
+        _ => (result, "scalar"),
+    }
+}
+
 /// Evaluate a JavaScript expression in the webview.
 pub async fn ui_bridge_page_evaluate_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let timeout = request.timeout_ms.map(|ms| ms.clamp(1000, 600_000));
-    page_evaluate_inner(state, request.expression, timeout, request.await_promise).await
+    let unwrap = request.unwrap.unwrap_or(false);
+    page_evaluate_inner(
+        state,
+        request.expression,
+        timeout,
+        request.await_promise,
+        unwrap,
+    )
+    .await
 }
 
 /// `POST /ui-bridge/control/page/evaluate-raw`
@@ -761,7 +820,7 @@ pub async fn ui_bridge_page_evaluate_raw_handler(
             Json(api_error("page/evaluate-raw: body is empty".to_string())),
         ));
     }
-    page_evaluate_inner(state, body, None, false).await
+    page_evaluate_inner(state, body, None, false, false).await
 }
 
 /// POST /ui-bridge/control/page/evaluate-safe

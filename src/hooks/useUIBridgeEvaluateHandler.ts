@@ -51,6 +51,12 @@ interface EvaluateRequestPayload {
   expression: string;
   await_promise?: boolean;
   timeout_ms?: number;
+  /**
+   * When true, emit the discriminated `{value, type}` shape instead of
+   * the legacy `{success, result}` envelope. Matches the sibling unwrap
+   * branch in usePageEvents.ts::page_evaluate.
+   */
+  unwrap?: boolean;
 }
 
 interface EvaluateResponsePayload {
@@ -144,7 +150,7 @@ export function useUIBridgeEvaluateHandler(): void {
               return;
             }
 
-            const { request_id, expression } = event.payload;
+            const { request_id, expression, unwrap } = event.payload;
             log.debug(`Received evaluate request`, request_id);
 
             let response: EvaluateResponsePayload;
@@ -168,18 +174,52 @@ export function useUIBridgeEvaluateHandler(): void {
               try {
                 rejectIfDangerous(expression);
                 const resolved = await evaluateExpression(expression);
-                // Match the legacy IPC page_evaluate shape so the Rust
-                // `tagged_page_evaluate` helper can pass the `data` field
-                // through unchanged: `{ result: object | { value: primitive } }`.
-                const resultField =
-                  typeof resolved === "object" && resolved !== null
-                    ? resolved
-                    : { value: resolved };
-                response = {
-                  request_id,
-                  ok: true,
-                  result: { success: true, result: resultField },
-                };
+                if (unwrap === true) {
+                  // Opt-in consistent shape: always `{ value, type }`.
+                  // Mirrors the sibling unwrap branch in
+                  // usePageEvents.ts::page_evaluate. Rust passes this
+                  // shape through verbatim when unwrap=true so the HTTP
+                  // caller sees `{success: true, data: {value, type}}`.
+                  let valueType: "scalar" | "object" | "undefined" | "function" | "null";
+                  let normalizedValue: unknown;
+                  if (resolved === null) {
+                    valueType = "null";
+                    normalizedValue = null;
+                  } else if (resolved === undefined) {
+                    valueType = "undefined";
+                    normalizedValue = undefined;
+                  } else if (typeof resolved === "function") {
+                    valueType = "function";
+                    // Functions aren't structured-clone-safe. Surface the
+                    // name (or `<anonymous>`) so the caller gets something
+                    // useful.
+                    normalizedValue = (resolved as { name?: string }).name || "<anonymous>";
+                  } else if (typeof resolved === "object") {
+                    valueType = "object";
+                    normalizedValue = resolved;
+                  } else {
+                    valueType = "scalar";
+                    normalizedValue = resolved;
+                  }
+                  response = {
+                    request_id,
+                    ok: true,
+                    result: { value: normalizedValue, type: valueType },
+                  };
+                } else {
+                  // Match the legacy IPC page_evaluate shape so the Rust
+                  // `tagged_page_evaluate` helper can pass the `data` field
+                  // through unchanged: `{ result: object | { value: primitive } }`.
+                  const resultField =
+                    typeof resolved === "object" && resolved !== null
+                      ? resolved
+                      : { value: resolved };
+                  response = {
+                    request_id,
+                    ok: true,
+                    result: { success: true, result: resultField },
+                  };
+                }
               } catch (err) {
                 const message = getErrorMessage(err);
                 log.debug(`evaluate(${request_id}) threw:`, message);
