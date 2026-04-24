@@ -13,6 +13,7 @@ import { buildPageSpecPrompt } from "@/lib/page-analysis-prompt-builder";
 import { getApiBase } from "@/lib/runner-api";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
 import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
+import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compilation";
 import type { LoadedSpec } from "@/pages/specs/types";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 
@@ -357,28 +358,40 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
       return updated ?? (s.config as SpecConfig);
     });
     try {
-      const { stateMachine, stats } = compileStateMachineFromSpecs(allSpecs);
+      const result = compileStateMachineFromSpecs(allSpecs);
 
-      // Load into engine
-      const bridge = (window as unknown as Record<string, unknown>).__UI_BRIDGE__ as
-        | Record<string, unknown>
-        | undefined;
-      if (bridge?.loadStateMachine) {
-        const json = JSON.stringify(stateMachine);
-        (bridge.loadStateMachine as (json: string) => unknown)(json);
+      if (!result.compiled) {
+        // Quarantined — surface to the user via warnings and persist the
+        // record offline. Do NOT load a partial machine into the engine.
+        warningsRef.current.push(...result.stats.warnings);
+        void persistQuarantinedCompilation(result.quarantine);
+        console.warn(
+          `[SpecSync] Compilation quarantined: ${result.quarantine.conflicts.length} element conflicts; engine not updated (see quarantine record ${result.quarantine.id})`,
+        );
+      } else {
+        const { stateMachine, stats } = result;
+
+        // Load into engine
+        const bridge = (window as unknown as Record<string, unknown>).__UI_BRIDGE__ as
+          | Record<string, unknown>
+          | undefined;
+        if (bridge?.loadStateMachine) {
+          const json = JSON.stringify(stateMachine);
+          (bridge.loadStateMachine as (json: string) => unknown)(json);
+        }
+
+        // Best-effort: also persist to the backend DB so the compiled machine is
+        // available via the HTTP API (and survives runner restarts).
+        void persistCompiledStateMachine(stateMachine);
+
+        if (stats.warnings.length > 0) {
+          warningsRef.current.push(...stats.warnings);
+        }
+
+        console.warn(
+          `[SpecSync] Compiled: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions from ${stats.specsProcessed} specs`,
+        );
       }
-
-      // Best-effort: also persist to the backend DB so the compiled machine is
-      // available via the HTTP API (and survives runner restarts).
-      void persistCompiledStateMachine(stateMachine);
-
-      if (stats.warnings.length > 0) {
-        warningsRef.current.push(...stats.warnings);
-      }
-
-      console.warn(
-        `[SpecSync] Compiled: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions from ${stats.specsProcessed} specs`,
-      );
     } catch (err) {
       warningsRef.current.push(`Compilation error: ${err}`);
     }

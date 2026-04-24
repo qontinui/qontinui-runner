@@ -38,6 +38,7 @@ import { ContractBuilder } from "./ContractBuilder";
 import type { LoadedSpec } from "./types";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
 import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
+import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compilation";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import { useSpecSync } from "@/hooks/useSpecSync";
 
@@ -538,7 +539,19 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   // Compile all specs' stateMachine sections into a runtime state machine
   const handleCompileStateMachine = useCallback(() => {
     const allSpecs = state.specs.map((s) => s.config as SpecConfig);
-    const { stateMachine, stats } = compileStateMachineFromSpecs(allSpecs);
+    const compilation = compileStateMachineFromSpecs(allSpecs);
+
+    if (!compilation.compiled) {
+      // Quarantined — persist the record and refuse to load into the engine.
+      void persistQuarantinedCompilation(compilation.quarantine);
+      console.warn(
+        `[Specs] State machine compilation quarantined: ${compilation.quarantine.conflicts.length} element conflicts (record ${compilation.quarantine.id})`,
+        compilation.quarantine.conflicts,
+      );
+      return;
+    }
+
+    const { stateMachine, stats } = compilation;
 
     // Load into the engine via the bridge
     const bridge = (window as unknown as Record<string, unknown>).__UI_BRIDGE__ as

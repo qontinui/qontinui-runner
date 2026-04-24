@@ -117,16 +117,62 @@ export type PersistedStateMachineWithProvenance = Omit<PersistedStateMachine, "s
 // Public API
 // ---------------------------------------------------------------------------
 
-export interface CompilationResult {
-  stateMachine: PersistedStateMachineWithProvenance;
-  stats: {
-    specsProcessed: number;
-    statesCompiled: number;
-    transitionsCompiled: number;
-    warnings: string[];
-    provenanceCounts: Record<StateProvenance, number>;
-  };
+/** A single cross-state element collision. */
+export interface ElementCollisionConflict {
+  /** Stable element-query key (same shape as `elementQueryKey`). */
+  elementKey: string;
+  /** State IDs that all claim this element, with their provenance. */
+  states: Array<{ stateId: string; provenance: StateProvenance }>;
 }
+
+/**
+ * Metadata written to the quarantine store when compilation is rejected.
+ * Callers persist this via `persistQuarantinedCompilation`.
+ */
+export interface QuarantineRecord {
+  /** Synthetic identifier for this quarantined compilation (for filename). */
+  id: string;
+  /** Why the compilation was quarantined. */
+  reason: "duplicate-elements";
+  /** ISO-8601 timestamp of detection. */
+  detectedAt: string;
+  /** All cross-state collisions found during compilation. */
+  conflicts: ElementCollisionConflict[];
+  /** Original spec-set fed into the compiler, for offline inspection. */
+  specs: SpecConfig[];
+}
+
+/**
+ * Shared stats bundle, included on both success and quarantine outcomes so
+ * consumers can still surface provenance counts / specs-processed etc.
+ */
+export interface CompilationStats {
+  specsProcessed: number;
+  statesCompiled: number;
+  transitionsCompiled: number;
+  warnings: string[];
+  provenanceCounts: Record<StateProvenance, number>;
+}
+
+/**
+ * Discriminated union. When `compiled === false` the compilation was
+ * rejected (quarantined) and the caller MUST NOT load the partial output.
+ * Historically this was a plain object with `stateMachine` always present;
+ * consumers that destructured `{ stateMachine, stats }` now need to check
+ * `compiled` first. See `proj_ui_bridge_sm_element_uniqueness.md`.
+ */
+export type CompilationResult =
+  | {
+      compiled: true;
+      stateMachine: PersistedStateMachineWithProvenance;
+      stats: CompilationStats;
+    }
+  | {
+      compiled: false;
+      reason: "quarantined";
+      quarantine: QuarantineRecord;
+      stats: CompilationStats;
+    };
 
 /**
  * Compile all spec stateMachine sections into a single runtime state machine.
@@ -209,15 +255,54 @@ export function compileStateMachineFromSpecs(
     }
   }
 
-  // Cross-state element uniqueness: throw on collisions between
-  // observed/ai-fallback states (those are claimed to be authoritative or
-  // recently-authoritative); warn only on ai-generated collisions
-  // (sketches — violations are expected and will be resolved by the
-  // promotion step once observations accumulate).
-  enforceElementUniqueness(allStates, warnings);
+  // Cross-state element uniqueness. Observed/ai-fallback collisions still
+  // throw (authoritative claims that disagree = hard bug). Any remaining
+  // cross-state duplicates — even the ai-generated ones that used to only
+  // log a warning-per-duplicate — now quarantine the whole compilation.
+  //
+  // Rationale: per-duplicate warnings were drowned out (48+ per snapshot
+  // in testing) and downstream consumers still trusted the partial output.
+  // VGA training + runtime state inference both require the
+  // one-state-per-element invariant, so producing any result at all
+  // when the invariant is violated is worse than producing nothing.
+  const conflicts = collectElementCollisions(allStates);
+
+  const stats: CompilationStats = {
+    specsProcessed,
+    statesCompiled: allStates.length,
+    transitionsCompiled: allTransitions.length,
+    warnings,
+    provenanceCounts,
+  };
+
+  if (conflicts.length > 0) {
+    const quarantine: QuarantineRecord = {
+      id: makeQuarantineId(),
+      reason: "duplicate-elements",
+      detectedAt: new Date().toISOString(),
+      conflicts,
+      specs,
+    };
+    const duplicatedElementCount = conflicts.length;
+    const affectedStateCount = new Set(conflicts.flatMap((c) => c.states.map((s) => s.stateId)))
+      .size;
+    // One aggregate log line instead of one per duplicate. Callers who want
+    // the full list can read `quarantine.conflicts` from the returned record
+    // or the persisted file.
+    console.warn(
+      `[compile-state-machine] quarantined compilation ${quarantine.id}: ` +
+        `${duplicatedElementCount} duplicated element(s) across ${affectedStateCount} state(s); ` +
+        `downstream consumers will skip this result`,
+    );
+    stats.warnings.push(
+      `quarantined: ${duplicatedElementCount} duplicated element(s) across ${affectedStateCount} state(s) — see quarantine record ${quarantine.id}`,
+    );
+    return { compiled: false, reason: "quarantined", quarantine, stats };
+  }
 
   const now = Date.now();
   return {
+    compiled: true,
     stateMachine: {
       version: "1.0.0",
       createdAt: now,
@@ -225,14 +310,18 @@ export function compileStateMachineFromSpecs(
       states: allStates,
       transitions: allTransitions,
     },
-    stats: {
-      specsProcessed,
-      statesCompiled: allStates.length,
-      transitionsCompiled: allTransitions.length,
-      warnings,
-      provenanceCounts,
-    },
+    stats,
   };
+}
+
+/**
+ * Generate a short quarantine ID. Not cryptographically strong — just
+ * unique enough to identify a record in the quarantine directory.
+ */
+function makeQuarantineId(): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `quarantine-${ts}-${rand}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -490,14 +579,14 @@ function artifactElementsToQueries(elements: string[]): ElementQuery[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Enforce the one-state-per-element invariant. Collisions between
- * observed/ai-fallback states throw; collisions involving only
- * ai-generated states warn.
+ * Collect every cross-state element collision. Observed/ai-fallback
+ * double-claims throw immediately (authoritative sources disagreeing is a
+ * hard bug); every other duplicate is returned as a conflict. The caller
+ * uses the returned list to decide whether to quarantine the compilation.
  */
-function enforceElementUniqueness(
+function collectElementCollisions(
   states: StateDefinitionWithProvenance[],
-  warnings: string[],
-): void {
+): ElementCollisionConflict[] {
   // Map element-key → array of {stateId, provenance}.
   const seen = new Map<string, Array<{ stateId: string; provenance: StateProvenance }>>();
   for (const state of states) {
@@ -510,6 +599,7 @@ function enforceElementUniqueness(
     }
   }
 
+  const conflicts: ElementCollisionConflict[] = [];
   for (const [key, bucket] of seen.entries()) {
     if (bucket.length < 2) continue;
     // Deduplicate by stateId — multiple copies of the same element
@@ -530,13 +620,12 @@ function enforceElementUniqueness(
           `element "${key}" is claimed by multiple observed/ai-fallback states: ${stateList}`,
       );
     }
-    const stateList = [...byState.entries()].map(([id, p]) => `${id} (${p})`).join(", ");
-    const msg =
-      `Element "${key}" appears in multiple states (${stateList}); ` +
-      `ai-generated sketches only — will resolve on promotion.`;
-    warnings.push(msg);
-    console.warn(`[compile-state-machine] ${msg}`);
+    conflicts.push({
+      elementKey: key,
+      states: [...byState.entries()].map(([stateId, provenance]) => ({ stateId, provenance })),
+    });
   }
+  return conflicts;
 }
 
 /**

@@ -1043,6 +1043,174 @@ pub async fn save_compiled_state_machine(
     })))
 }
 
+// ============================================================================
+// Quarantined compilations
+// ============================================================================
+
+/// Return the on-disk directory for state-machine quarantine records.
+/// Mirrors the `~/.qontinui/...` convention used throughout the runner
+/// (see `mcp::extraction::get_extraction_screenshot`). Falls back to the
+/// current working directory when `dirs::home_dir()` is unavailable.
+fn quarantine_dir() -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".qontinui").join("state-machine-quarantine")
+}
+
+/// POST body for `/state-machine/quarantine`. Matches the frontend's
+/// `QuarantineRecord` shape — it's stored verbatim on disk.
+#[derive(Debug, Deserialize, serde::Serialize)]
+pub struct QuarantineRecord {
+    pub id: String,
+    pub reason: String,
+    #[serde(rename = "detectedAt")]
+    pub detected_at: String,
+    pub conflicts: serde_json::Value,
+    pub specs: serde_json::Value,
+}
+
+/// Metadata summary (no body) returned by GET /state-machine/quarantine.
+/// Matches the "items" entry shape specified by the feature plan.
+#[derive(Debug, serde::Serialize)]
+pub struct QuarantineSummary {
+    #[serde(rename = "specId")]
+    pub spec_id: String,
+    pub reason: String,
+    #[serde(rename = "detectedAt")]
+    pub detected_at: String,
+    pub conflicts: serde_json::Value,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct QuarantineList {
+    pub items: Vec<QuarantineSummary>,
+}
+
+/// POST /state-machine/quarantine — Store a quarantined compilation record.
+///
+/// Writes the full record (spec set + conflicts) to
+/// `~/.qontinui/state-machine-quarantine/<id>.json` so operators can inspect
+/// the conflicting specs offline. This endpoint is best-effort — callers
+/// typically fire-and-forget via `void persistQuarantinedCompilation(...)`.
+pub async fn save_quarantined_compilation(
+    Json(record): Json<QuarantineRecord>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let dir = quarantine_dir();
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        error!(
+            "State Machine API: failed to create quarantine dir {:?}: {}",
+            dir, e
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("create quarantine dir: {}", e))),
+        ));
+    }
+
+    // Sanitise the id to avoid path traversal — strip any slashes or dots
+    // beyond a basic alnum/dash/underscore alphabet.
+    let safe_id: String = record
+        .id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("quarantine id is empty or invalid".to_string())),
+        ));
+    }
+
+    let path = dir.join(format!("{}.json", safe_id));
+    let body = match serde_json::to_vec_pretty(&record) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("serialize quarantine record: {}", e))),
+            ));
+        }
+    };
+    if let Err(e) = tokio::fs::write(&path, &body).await {
+        error!(
+            "State Machine API: failed to write quarantine record {:?}: {}",
+            path, e
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("write quarantine record: {}", e))),
+        ));
+    }
+
+    info!(
+        "State Machine API: wrote quarantine record {} ({} bytes) to {:?}",
+        safe_id,
+        body.len(),
+        path
+    );
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "id": safe_id,
+        "path": path.to_string_lossy(),
+    }))))
+}
+
+/// GET /state-machine/quarantine — List quarantined compilations.
+///
+/// Returns metadata only (no `specs` payload) so clients can page the
+/// summary without loading every spec set. Invalid/unreadable files are
+/// silently skipped (logged at debug) — the endpoint never fails wholesale
+/// just because one file is corrupt.
+pub async fn list_quarantined_compilations(
+) -> Result<Json<ApiResponse<QuarantineList>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let dir = quarantine_dir();
+    let mut items: Vec<QuarantineSummary> = Vec::new();
+
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No quarantine dir yet — treat as empty list.
+            return Ok(Json(ApiResponse::success(QuarantineList { items })));
+        }
+        Err(e) => {
+            error!(
+                "State Machine API: failed to read quarantine dir {:?}: {}",
+                dir, e
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("read quarantine dir: {}", e))),
+            ));
+        }
+    };
+
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let record: QuarantineRecord = match serde_json::from_slice(&bytes) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        items.push(QuarantineSummary {
+            spec_id: record.id,
+            reason: record.reason,
+            detected_at: record.detected_at,
+            conflicts: record.conflicts,
+        });
+    }
+
+    // Newest first (lexicographic sort works because quarantine IDs embed
+    // an ISO-8601 timestamp).
+    items.sort_by(|a, b| b.detected_at.cmp(&a.detected_at));
+
+    Ok(Json(ApiResponse::success(QuarantineList { items })))
+}
+
 /// GET /state-machine/current — Return the most recently updated state machine config
 ///
 /// Returns the full config (with states and transitions) that was most recently
@@ -1103,6 +1271,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(save_compiled_state_machine),
         )
         .route("/state-machine/current", get(get_current_state_machine))
+        // Quarantined compilations (rejected specs with duplicate elements)
+        .route(
+            "/state-machine/quarantine",
+            post(save_quarantined_compilation).get(list_quarantined_compilations),
+        )
         // CRUD operations for state machine configs (SQLite)
         .route("/state-machine/configs", get(list_configs))
         .route("/state-machine/configs", post(create_config))
