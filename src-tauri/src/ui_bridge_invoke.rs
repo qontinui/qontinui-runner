@@ -264,6 +264,40 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // clear the very crash dump we just surfaced to the user.
         probe_with_empty_args: false,
     },
+    // Saved-projects registry (user-curated project list populated by the
+    // setup wizard and surfaced in the UI Bridge Integration panel).
+    ProxyableCommand {
+        name: "list_saved_projects",
+        description: "Return the user-curated list of projects persisted in settings.json (populated by the setup wizard's project picker; consumed by the UI Bridge Integration panel dropdown). Empty array on first run.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"array","items":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}"#,
+        probe_with_empty_args: true,
+    },
+    ProxyableCommand {
+        name: "save_saved_projects",
+        description: "Atomically replace the entire saved-projects list. Used by the setup wizard on commit.",
+        args_schema: r#"{"type":"object","required":["projects"],"properties":{"projects":{"type":"array","items":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}}}"#,
+        response_schema: r#"{"type":"null"}"#,
+        // Destructive (replaces the entire list). Probing with empty args
+        // would wipe the user's saved projects every startup.
+        probe_with_empty_args: false,
+    },
+    ProxyableCommand {
+        name: "add_saved_project",
+        description: "Append a project to the saved list. Idempotent by normalized path.",
+        args_schema: r#"{"type":"object","required":["project"],"properties":{"project":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}}"#,
+        response_schema: r#"{"type":"null"}"#,
+        // Required `project` arg; empty-args probe would error.
+        probe_with_empty_args: false,
+    },
+    ProxyableCommand {
+        name: "remove_saved_project",
+        description: "Remove a saved project by path. No-op if the path isn't in the list.",
+        args_schema: r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}"#,
+        response_schema: r#"{"type":"null"}"#,
+        // Required `path` arg; empty-args probe would error.
+        probe_with_empty_args: false,
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.
