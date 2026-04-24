@@ -4,12 +4,12 @@
 //! including initial states resolution and screen requirements analysis.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use tauri::State;
 use tracing::{debug, info};
 
-use super::super::{AppState, CommandResponse};
-use crate::executor::{require_running_bridge, with_default_bridge};
+use super::super::compartments::{BridgeCompartment, ExecutionCompartment};
+use super::super::CommandResponse;
+use crate::executor::{require_running_bridge_compartment, with_default_bridge_compartment};
 
 /// Start workflow execution.
 ///
@@ -39,10 +39,11 @@ pub fn start_execution(
     monitor_indices: Option<Vec<i32>>,
     monitor_index: Option<i32>, // Legacy single monitor support
     initial_state_ids: Option<Vec<String>>, // Override for initial active states
-    state: State<Arc<AppState>>,
+    bridge: State<BridgeCompartment>,
+    execution: State<ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     // Check if executor is running first
-    require_running_bridge(&state)?;
+    require_running_bridge_compartment(&bridge)?;
 
     // Build params
     let mut params = serde_json::Map::new();
@@ -73,7 +74,7 @@ pub fn start_execution(
     // Resolve and add initial_state_ids
     // Priority: override param > workflow.initialStateIds > states with is_initial=true
     let config_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
+        crate::safe_lock::safe_lock_or_recover(execution.current_config(), "current_config");
     let resolved_initial_states =
         resolve_initial_states(config_lock.as_ref(), &workflow_id, initial_state_ids);
     drop(config_lock);
@@ -86,7 +87,7 @@ pub fn start_execution(
         debug!("Using initial state IDs: {:?}", resolved_initial_states);
     }
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .start_execution_with_params(Some(serde_json::Value::Object(params)))
             .map_err(|e| format!("Failed to start execution: {}", e))
@@ -110,8 +111,8 @@ pub fn start_execution(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not initialized or stop fails
 #[tauri::command]
-pub fn stop_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    with_default_bridge(&state, |bridge| {
+pub fn stop_execution(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .stop_execution()
             .map_err(|e| format!("Failed to stop execution: {}", e))
@@ -135,8 +136,8 @@ pub fn stop_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, St
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not initialized or pause fails
 #[tauri::command]
-pub fn pause_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    with_default_bridge(&state, |bridge| {
+pub fn pause_execution(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .pause_execution()
             .map_err(|e| format!("Failed to pause execution: {}", e))
@@ -160,8 +161,8 @@ pub fn pause_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, S
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not initialized or resume fails
 #[tauri::command]
-pub fn resume_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    with_default_bridge(&state, |bridge| {
+pub fn resume_execution(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .resume_execution()
             .map_err(|e| format!("Failed to resume execution: {}", e))
@@ -312,7 +313,7 @@ fn get_initial_states_source(
 #[tauri::command]
 pub fn get_resolved_initial_states(
     workflow_id: String,
-    state: State<Arc<AppState>>,
+    execution: State<ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     debug!(
         "Getting resolved initial states for workflow: {}",
@@ -320,7 +321,7 @@ pub fn get_resolved_initial_states(
     );
 
     let config_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
+        crate::safe_lock::safe_lock_or_recover(execution.current_config(), "current_config");
     let config = config_lock.as_ref();
 
     // Get resolved states (without override, since this is for display)
@@ -381,13 +382,13 @@ pub fn get_resolved_initial_states(
 #[tauri::command]
 pub fn get_workflow_required_screens(
     workflow_id: String,
-    state: State<Arc<AppState>>,
+    execution: State<ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting required screens for workflow: {}", workflow_id);
 
     // Get the current config from state
     let config_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
+        crate::safe_lock::safe_lock_or_recover(execution.current_config(), "current_config");
     let config = match config_lock.as_ref() {
         Some(c) => c,
         None => {
