@@ -4,6 +4,8 @@
 //! timeline on a schedule, reasons with AI, and triggers an action.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
@@ -83,4 +85,18 @@ pub async fn set_watcher_enabled(
         info!("Set watcher {} enabled={}", id, enabled);
     }
     Ok(updated)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_watchers")
+        .invoke_handler(tauri::generate_handler![
+            create_watcher,
+            get_watcher,
+            list_watchers,
+            update_watcher,
+            delete_watcher,
+            set_watcher_enabled,
+        ])
+        .build()
 }
