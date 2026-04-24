@@ -7,15 +7,18 @@
 //! - Managing screenshots
 //! - Creating extraction sessions in qontinui-web
 
-use super::{AppState, CommandResponse};
+use super::compartments::BridgeCompartment;
+use super::CommandResponse;
 use crate::auth::AuthManager;
+use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
+
+// Migrated to BridgeCompartment (Workstream C).
 
 /// Configuration for vision extraction
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,21 +72,25 @@ pub struct WebExtractionConfig {
 /// GUI automation workflows.
 #[tauri::command]
 pub fn start_web_extraction(
-    state: State<Arc<AppState>>,
+    state: State<BridgeCompartment>,
     config: WebExtractionConfig,
 ) -> Result<CommandResponse, String> {
+    start_web_extraction_impl(&state, config).map_err(String::from)
+}
+
+fn start_web_extraction_impl(
+    state: &BridgeCompartment,
+    config: WebExtractionConfig,
+) -> Result<CommandResponse, AppError> {
     info!("Starting web extraction for URLs: {:?}", config.urls);
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = state.extraction_executor().lock()?;
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
         executor.ensure_started().map_err(|e| {
             error!("Failed to start extraction executor: {}", e);
-            e
+            AppError::ExecutorError(e)
         })?;
 
         let params = json!({
@@ -101,7 +108,7 @@ pub fn start_web_extraction(
 
         executor
             .send_command("start_web_extraction", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| AppError::ExecutorError(e.to_string()))?;
 
         Ok(CommandResponse {
             success: true,
@@ -109,7 +116,9 @@ pub fn start_web_extraction(
             data: None,
         })
     } else {
-        Err("Extraction executor not initialized".to_string())
+        Err(AppError::ExecutorError(
+            "Extraction executor not initialized".to_string(),
+        ))
     }
 }
 
@@ -119,21 +128,25 @@ pub fn start_web_extraction(
 /// edge detection, SAM3 segmentation, and OCR.
 #[tauri::command]
 pub fn start_vision_extraction(
-    state: State<Arc<AppState>>,
+    state: State<BridgeCompartment>,
     config: VisionExtractionConfig,
 ) -> Result<CommandResponse, String> {
+    start_vision_extraction_impl(&state, config).map_err(String::from)
+}
+
+fn start_vision_extraction_impl(
+    state: &BridgeCompartment,
+    config: VisionExtractionConfig,
+) -> Result<CommandResponse, AppError> {
     info!("Starting vision extraction");
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = state.extraction_executor().lock()?;
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
         executor.ensure_started().map_err(|e| {
             error!("Failed to start extraction executor: {}", e);
-            e
+            AppError::ExecutorError(e)
         })?;
 
         let params = json!({
@@ -155,7 +168,7 @@ pub fn start_vision_extraction(
 
         executor
             .send_command("run_vision_extraction", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(AppError::ExecutorError)?;
 
         Ok(CommandResponse {
             success: true,
@@ -163,28 +176,33 @@ pub fn start_vision_extraction(
             data: None,
         })
     } else {
-        Err("Extraction executor not initialized".to_string())
+        Err(AppError::ExecutorError(
+            "Extraction executor not initialized".to_string(),
+        ))
     }
 }
 
 /// Stop the current web extraction process
 #[tauri::command]
-pub fn stop_web_extraction(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn stop_web_extraction(state: State<BridgeCompartment>) -> Result<CommandResponse, String> {
+    stop_web_extraction_impl(&state).map_err(String::from)
+}
+
+fn stop_web_extraction_impl(state: &BridgeCompartment) -> Result<CommandResponse, AppError> {
     info!("Stopping web extraction");
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = state.extraction_executor().lock()?;
 
     if let Some(ref mut executor) = *executor_lock {
         if !executor.is_running() {
-            return Err("Extraction executor not running".to_string());
+            return Err(AppError::ExecutorError(
+                "Extraction executor not running".to_string(),
+            ));
         }
 
         executor
             .send_command("stop_web_extraction", None)
-            .map_err(|e| e.to_string())?;
+            .map_err(AppError::ExecutorError)?;
 
         Ok(CommandResponse {
             success: true,
@@ -192,19 +210,22 @@ pub fn stop_web_extraction(state: State<Arc<AppState>>) -> Result<CommandRespons
             data: None,
         })
     } else {
-        Err("Extraction executor not initialized".to_string())
+        Err(AppError::ExecutorError(
+            "Extraction executor not initialized".to_string(),
+        ))
     }
 }
 
 /// Get the current extraction status
 #[tauri::command]
-pub fn get_extraction_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn get_extraction_status(state: State<BridgeCompartment>) -> Result<CommandResponse, String> {
+    get_extraction_status_impl(&state).map_err(String::from)
+}
+
+fn get_extraction_status_impl(state: &BridgeCompartment) -> Result<CommandResponse, AppError> {
     info!("Getting extraction status");
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = state.extraction_executor().lock()?;
 
     if let Some(ref mut executor) = *executor_lock {
         if !executor.is_running() {
@@ -218,7 +239,7 @@ pub fn get_extraction_status(state: State<Arc<AppState>>) -> Result<CommandRespo
 
         executor
             .send_command("get_extraction_status", None)
-            .map_err(|e| e.to_string())?;
+            .map_err(AppError::ExecutorError)?;
 
         Ok(CommandResponse {
             success: true,
@@ -226,7 +247,9 @@ pub fn get_extraction_status(state: State<Arc<AppState>>) -> Result<CommandRespo
             data: None,
         })
     } else {
-        Err("Extraction executor not initialized".to_string())
+        Err(AppError::ExecutorError(
+            "Extraction executor not initialized".to_string(),
+        ))
     }
 }
 
@@ -239,24 +262,28 @@ pub struct ScreenshotRequest {
 
 #[tauri::command]
 pub fn request_extraction_screenshot(
-    state: State<Arc<AppState>>,
+    state: State<BridgeCompartment>,
     request: ScreenshotRequest,
 ) -> Result<CommandResponse, String> {
+    request_extraction_screenshot_impl(&state, request).map_err(String::from)
+}
+
+fn request_extraction_screenshot_impl(
+    state: &BridgeCompartment,
+    request: ScreenshotRequest,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Requesting screenshot {} at {} resolution",
         request.screenshot_id, request.resolution
     );
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = state.extraction_executor().lock()?;
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
         executor.ensure_started().map_err(|e| {
             error!("Failed to start extraction executor: {}", e);
-            e
+            AppError::ExecutorError(e)
         })?;
 
         let params = json!({
@@ -266,7 +293,7 @@ pub fn request_extraction_screenshot(
 
         executor
             .send_command("get_extraction_screenshot", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(AppError::ExecutorError)?;
 
         Ok(CommandResponse {
             success: true,
@@ -274,7 +301,9 @@ pub fn request_extraction_screenshot(
             data: None,
         })
     } else {
-        Err("Extraction executor not initialized".to_string())
+        Err(AppError::ExecutorError(
+            "Extraction executor not initialized".to_string(),
+        ))
     }
 }
 
@@ -291,24 +320,28 @@ pub struct TrainingDataExportConfig {
 /// Export extraction results as training data
 #[tauri::command]
 pub fn export_training_data(
-    state: State<Arc<AppState>>,
+    state: State<BridgeCompartment>,
     config: TrainingDataExportConfig,
 ) -> Result<CommandResponse, String> {
+    export_training_data_impl(&state, config).map_err(String::from)
+}
+
+fn export_training_data_impl(
+    state: &BridgeCompartment,
+    config: TrainingDataExportConfig,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Exporting training data for extraction {} as {} to {}",
         config.extraction_id, config.format, config.output_path
     );
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = state.extraction_executor().lock()?;
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
         executor.ensure_started().map_err(|e| {
             error!("Failed to start extraction executor: {}", e);
-            e
+            AppError::ExecutorError(e)
         })?;
 
         let params = json!({
@@ -321,7 +354,7 @@ pub fn export_training_data(
 
         executor
             .send_command("export_training_data", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(AppError::ExecutorError)?;
 
         Ok(CommandResponse {
             success: true,
@@ -329,7 +362,9 @@ pub fn export_training_data(
             data: None,
         })
     } else {
-        Err("Extraction executor not initialized".to_string())
+        Err(AppError::ExecutorError(
+            "Extraction executor not initialized".to_string(),
+        ))
     }
 }
 
@@ -343,24 +378,28 @@ pub struct StateStructureExportConfig {
 
 #[tauri::command]
 pub fn export_state_structure(
-    state: State<Arc<AppState>>,
+    state: State<BridgeCompartment>,
     config: StateStructureExportConfig,
 ) -> Result<CommandResponse, String> {
+    export_state_structure_impl(&state, config).map_err(String::from)
+}
+
+fn export_state_structure_impl(
+    state: &BridgeCompartment,
+    config: StateStructureExportConfig,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Exporting state structure for extraction {} to {}",
         config.extraction_id, config.output_path
     );
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = state.extraction_executor().lock()?;
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
         executor.ensure_started().map_err(|e| {
             error!("Failed to start extraction executor: {}", e);
-            e
+            AppError::ExecutorError(e)
         })?;
 
         let params = json!({
@@ -371,7 +410,7 @@ pub fn export_state_structure(
 
         executor
             .send_command("export_state_structure", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(AppError::ExecutorError)?;
 
         Ok(CommandResponse {
             success: true,
@@ -379,30 +418,33 @@ pub fn export_state_structure(
             data: None,
         })
     } else {
-        Err("Extraction executor not initialized".to_string())
+        Err(AppError::ExecutorError(
+            "Extraction executor not initialized".to_string(),
+        ))
     }
 }
 
 /// Get list of available extractions
 #[tauri::command]
-pub fn list_extractions(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn list_extractions(state: State<BridgeCompartment>) -> Result<CommandResponse, String> {
+    list_extractions_impl(&state).map_err(String::from)
+}
+
+fn list_extractions_impl(state: &BridgeCompartment) -> Result<CommandResponse, AppError> {
     info!("Listing available extractions");
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = state.extraction_executor().lock()?;
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
         executor.ensure_started().map_err(|e| {
             error!("Failed to start extraction executor: {}", e);
-            e
+            AppError::ExecutorError(e)
         })?;
 
         executor
             .send_command("list_extractions", None)
-            .map_err(|e| e.to_string())?;
+            .map_err(AppError::ExecutorError)?;
 
         Ok(CommandResponse {
             success: true,
@@ -410,7 +452,9 @@ pub fn list_extractions(state: State<Arc<AppState>>) -> Result<CommandResponse, 
             data: None,
         })
     } else {
-        Err("Extraction executor not initialized".to_string())
+        Err(AppError::ExecutorError(
+            "Extraction executor not initialized".to_string(),
+        ))
     }
 }
 
