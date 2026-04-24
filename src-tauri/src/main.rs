@@ -500,6 +500,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::accessibility::plugin())
         .plugin(commands::web_integration::plugin())
         .plugin(commands::activity_timeline::plugin())
+        .plugin(commands::agentic_metrics::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -868,12 +869,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::learning::get_most_recent_task_with_checkpoints,
             commands::learning::get_learning_stats_summary,
             // Agentic metric commands
-            commands::agentic_metrics::get_agentic_scores,
-            commands::agentic_metrics::get_agentic_metric_aggregates,
-            commands::agentic_metrics::get_composite_score_trend,
-            commands::agentic_metrics::recompute_agentic_baselines,
-            commands::agentic_metrics::push_agentic_scores_to_backend,
-            commands::agentic_metrics::push_latest_agentic_scores,
+            // NOTE: agentic_metrics handlers moved to per-module plugin (see .plugin() calls above).
             // Flow designer commands
             commands::flow::list_flows,
             commands::flow::get_flow,

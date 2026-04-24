@@ -4,6 +4,8 @@ use crate::auth::AuthManager;
 use crate::commands::AppState;
 use serde::Serialize;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info, warn};
 
@@ -181,4 +183,17 @@ pub async fn push_latest_agentic_scores(
     info!("Most recent task_run_id with scores: {}", task_run_id);
 
     push_agentic_scores_to_backend(state, task_run_id, target_id, target_type).await
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_agentic_metrics")
+        .invoke_handler(tauri::generate_handler![
+            get_agentic_scores,
+            get_agentic_metric_aggregates,
+            get_composite_score_trend,
+            recompute_agentic_baselines,
+            push_agentic_scores_to_backend,
+            push_latest_agentic_scores,
+        ])
+        .build()
 }
