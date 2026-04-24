@@ -18,9 +18,8 @@ use crate::check_executor::{
 use crate::database::{
     Check, CreateCheckGroupInput, CreateCheckInput, UpdateCheckGroupInput, UpdateCheckInput,
 };
-use crate::AppState;
+use crate::commands::compartments::StorageCompartment;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -118,11 +117,11 @@ pub fn execute_code_check_suite(request: ExecuteCheckSuiteRequest) -> ExecuteChe
 pub async fn execute_check_by_id(
     check_id: String,
     task_run_id: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Executing check by ID: {}", check_id);
 
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     // Get the check from database
     let check = match db.get_check(&check_id).await {
@@ -202,9 +201,9 @@ pub async fn list_checks(
     enabled_only: Option<bool>,
     check_type: Option<String>,
     tool: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     match db.list_checks().await {
         Ok(checks) => {
@@ -247,9 +246,9 @@ pub async fn list_checks(
 #[tauri::command]
 pub async fn get_check(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     match db.get_check(&id).await {
         Ok(Some(check)) => Ok(CommandResponse {
@@ -274,9 +273,9 @@ pub async fn get_check(
 #[tauri::command]
 pub async fn create_check(
     input: CreateCheckInput,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!(
         "Creating check: {} (type: {})",
@@ -305,9 +304,9 @@ pub async fn create_check(
 pub async fn update_check(
     id: String,
     input: UpdateCheckInput,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!("Updating check: {}", id);
 
@@ -332,9 +331,9 @@ pub async fn update_check(
 #[tauri::command]
 pub async fn delete_check(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!("Deleting check: {}", id);
 
@@ -419,11 +418,11 @@ pub fn get_check_tool_info() -> CommandResponse {
 pub async fn get_check_results(
     check_id: String,
     limit: Option<u32>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     let limit = limit.unwrap_or(10);
 
-    match state.pg_db.get_check_results(&check_id, limit).await {
+    match state.pg_db().get_check_results(&check_id, limit).await {
         Ok(results) => Ok(CommandResponse {
             success: true,
             message: Some(format!("Found {} results", results.len())),
@@ -469,9 +468,9 @@ fn check_to_definition(check: &Check) -> CheckDefinition {
 #[tauri::command]
 pub async fn list_check_groups(
     enabled_only: Option<bool>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     match db.list_check_groups(enabled_only.unwrap_or(false)).await {
         Ok(groups) => Ok(CommandResponse {
@@ -491,9 +490,9 @@ pub async fn list_check_groups(
 #[tauri::command]
 pub async fn get_check_group(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     match db.get_check_group(&id).await {
         Ok(Some(group)) => Ok(CommandResponse {
@@ -518,9 +517,9 @@ pub async fn get_check_group(
 #[tauri::command]
 pub async fn create_check_group(
     input: CreateCheckGroupInput,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!("Creating check group: {}", input.name);
 
@@ -546,9 +545,9 @@ pub async fn create_check_group(
 pub async fn update_check_group(
     id: String,
     input: UpdateCheckGroupInput,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!("Updating check group: {}", id);
 
@@ -573,9 +572,9 @@ pub async fn update_check_group(
 #[tauri::command]
 pub async fn delete_check_group(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!("Deleting check group: {}", id);
 
@@ -605,9 +604,9 @@ pub async fn delete_check_group(
 #[tauri::command]
 pub async fn get_checks_in_group(
     group_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     match db.get_checks_in_group(&group_id).await {
         Ok(checks) => Ok(CommandResponse {
@@ -628,9 +627,9 @@ pub async fn get_checks_in_group(
 pub async fn set_checks_in_group(
     group_id: String,
     check_ids: Vec<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!("Setting {} checks in group: {}", check_ids.len(), group_id);
 
@@ -656,9 +655,9 @@ pub async fn set_checks_in_group(
 pub async fn execute_check_group(
     group_id: String,
     task_run_id: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!("Executing check group: {}", group_id);
 
@@ -786,9 +785,9 @@ pub async fn execute_check_group(
 /// This command finds checks that match groups by this pattern and ensures they are linked.
 #[tauri::command]
 pub async fn repair_check_group_associations(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     info!("Repairing check-group associations based on naming convention");
 
