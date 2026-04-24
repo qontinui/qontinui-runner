@@ -26,6 +26,7 @@ pub mod network;
 pub mod page;
 pub mod request;
 pub mod screenshots;
+pub mod state_machine;
 pub mod stubs;
 pub mod types;
 
@@ -361,45 +362,18 @@ macro_rules! ipc_handler_path_post {
     };
 }
 
-// State machine
-ipc_handler_get!(ui_bridge_get_states_handler, "get_states");
-ipc_handler_get!(ui_bridge_get_active_states_handler, "get_active_states");
-ipc_handler_get!(ui_bridge_get_state_snapshot_handler, "get_state_snapshot");
-ipc_handler_path_get!(ui_bridge_get_state_handler, "get_state", "stateId");
-ipc_handler_path_post!(
-    ui_bridge_activate_state_handler,
-    "activate_state",
-    "stateId"
-);
-ipc_handler_path_post!(
-    ui_bridge_deactivate_state_handler,
-    "deactivate_state",
-    "stateId"
-);
-ipc_handler_get!(ui_bridge_get_state_groups_handler, "get_state_groups");
-ipc_handler_path_post!(
-    ui_bridge_activate_state_group_handler,
-    "activate_state_group",
-    "groupId"
-);
-ipc_handler_path_post!(
-    ui_bridge_deactivate_state_group_handler,
-    "deactivate_state_group",
-    "groupId"
-);
-ipc_handler_get!(ui_bridge_get_transitions_handler, "get_transitions");
-ipc_handler_path_get!(
-    ui_bridge_can_execute_transition_handler,
-    "can_execute_transition",
-    "transitionId"
-);
-ipc_handler_path_post!(
-    ui_bridge_execute_transition_handler,
-    "execute_transition",
-    "transitionId"
-);
-ipc_handler_post!(ui_bridge_find_state_path_handler, "find_state_path");
-ipc_handler_post!(ui_bridge_navigate_to_state_handler, "navigate_to_state");
+// Re-export macros so per-family submodules can import them via
+// `use super::{ipc_handler_get, ipc_handler_post, ...};`. The macros expand
+// to code referencing `State`, `Arc<ApiState>`, `Json`, `StatusCode`,
+// `ApiResponse`, `api_error`, and `ui_bridge_request_sync` — callers must
+// have those symbols in scope at the call site.
+pub(crate) use ipc_handler_get;
+pub(crate) use ipc_handler_path_get;
+pub(crate) use ipc_handler_path_post;
+pub(crate) use ipc_handler_post;
+
+// State machine handlers (states/, state/, state-groups/, transitions/)
+// live in `state_machine::routes()` — see `state_machine.rs`.
 
 // Runner-specific: tab navigation and storage management
 ipc_handler_post!(ui_bridge_navigate_tab_handler, "navigate_tab");
@@ -527,6 +501,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
         all.extend_from_slice(screenshots::route_entries());
+        all.extend_from_slice(state_machine::route_entries());
         all.extend_from_slice(stubs::route_entries());
         all
     })
@@ -539,20 +514,6 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
     &[
         ("GET", "/ui-bridge/control/specs"),
         ("GET", "/ui-bridge/control/spec/{id}"),
-        ("GET", "/ui-bridge/control/states"),
-        ("GET", "/ui-bridge/control/states/active"),
-        ("GET", "/ui-bridge/control/states/snapshot"),
-        ("POST", "/ui-bridge/control/states/find-path"),
-        ("POST", "/ui-bridge/control/states/navigate"),
-        ("GET", "/ui-bridge/control/state/{id}"),
-        ("POST", "/ui-bridge/control/state/{id}/activate"),
-        ("POST", "/ui-bridge/control/state/{id}/deactivate"),
-        ("GET", "/ui-bridge/control/state-groups"),
-        ("POST", "/ui-bridge/control/state-group/{id}/activate"),
-        ("POST", "/ui-bridge/control/state-group/{id}/deactivate"),
-        ("GET", "/ui-bridge/control/transitions"),
-        ("GET", "/ui-bridge/control/transition/{id}/can-execute"),
-        ("POST", "/ui-bridge/control/transition/{id}/execute"),
         ("POST", "/ui-bridge/ai/semantic-search"),
         ("GET", "/ui-bridge/ai/diff"),
         ("GET", "/ui-bridge/control/intents"),
@@ -672,63 +633,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // Phase 4: Idle sub-signal wait (get moved to errors::routes(),
         // post moved to intents::routes()).
         // Annotations CRUD and media routes live in `screenshots::routes()`.
-        // State machine routes
-        .route(
-            "/ui-bridge/control/states",
-            get(ui_bridge_get_states_handler),
-        )
-        .route(
-            "/ui-bridge/control/states/active",
-            get(ui_bridge_get_active_states_handler),
-        )
-        .route(
-            "/ui-bridge/control/states/snapshot",
-            get(ui_bridge_get_state_snapshot_handler),
-        )
-        .route(
-            "/ui-bridge/control/states/find-path",
-            post(ui_bridge_find_state_path_handler),
-        )
-        .route(
-            "/ui-bridge/control/states/navigate",
-            post(ui_bridge_navigate_to_state_handler),
-        )
-        .route(
-            "/ui-bridge/control/state/{id}",
-            get(ui_bridge_get_state_handler),
-        )
-        .route(
-            "/ui-bridge/control/state/{id}/activate",
-            post(ui_bridge_activate_state_handler),
-        )
-        .route(
-            "/ui-bridge/control/state/{id}/deactivate",
-            post(ui_bridge_deactivate_state_handler),
-        )
-        .route(
-            "/ui-bridge/control/state-groups",
-            get(ui_bridge_get_state_groups_handler),
-        )
-        .route(
-            "/ui-bridge/control/state-group/{id}/activate",
-            post(ui_bridge_activate_state_group_handler),
-        )
-        .route(
-            "/ui-bridge/control/state-group/{id}/deactivate",
-            post(ui_bridge_deactivate_state_group_handler),
-        )
-        .route(
-            "/ui-bridge/control/transitions",
-            get(ui_bridge_get_transitions_handler),
-        )
-        .route(
-            "/ui-bridge/control/transition/{id}/can-execute",
-            get(ui_bridge_can_execute_transition_handler),
-        )
-        .route(
-            "/ui-bridge/control/transition/{id}/execute",
-            post(ui_bridge_execute_transition_handler),
-        )
+        // State machine routes (extracted to state_machine.rs) merged below.
         // AI semantic search & diff
         .route(
             "/ui-bridge/ai/semantic-search",
@@ -930,6 +835,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(network::routes())
         // F2 — Network stub registry (extracted to stubs.rs)
         .merge(stubs::routes())
+        // State machine handlers (extracted to state_machine.rs)
+        .merge(state_machine::routes())
         // UI Bridge exploration + window listing (extracted to exploration.rs)
         .merge(exploration::routes())
         // Page navigation / evaluation / tab switching (extracted to page.rs)
