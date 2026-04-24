@@ -7,6 +7,8 @@
 //! exceeds the 8 KB scripted-output threshold.
 
 use serde::Serialize;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 
 use crate::step_output::script_emitter::{self, EmitError, EmitResult};
 
@@ -83,4 +85,14 @@ pub async fn emit_scripted_output_event(
 ) -> Result<(), String> {
     let metadata = metadata.unwrap_or_else(|| serde_json::json!({}));
     script_emitter::emit_ts_originated_event(&name, metadata, task_run_id)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_script_emitter")
+        .invoke_handler(tauri::generate_handler![
+            emit_extraction_script,
+            emit_scripted_output_event,
+        ])
+        .build()
 }
