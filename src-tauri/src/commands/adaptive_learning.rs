@@ -2,11 +2,10 @@
 //!
 //! Provides access to playbook entries, curated examples, template performance,
 //! GEPA optimization history, and learning statistics.
-//! All queries go through PostgreSQL via `state.pg_db`.
+//! All queries go through PostgreSQL via `state.pg_db()`.
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -76,9 +75,9 @@ pub struct GepaRunResponse {
 /// Get adaptive learning statistics overview.
 #[tauri::command]
 pub async fn get_adaptive_learning_stats(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<AdaptiveLearningStats, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     let stats = pg.get_adaptive_learning_stats().await?;
 
     Ok(AdaptiveLearningStats {
@@ -96,12 +95,12 @@ pub async fn get_adaptive_learning_stats(
 /// Get playbook entries, optionally filtered by domain and status.
 #[tauri::command]
 pub async fn get_playbook_entries(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     domain: Option<String>,
     status: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<PlaybookEntryResponse>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     let limit = limit.unwrap_or(100) as i64;
 
     let rows = pg
@@ -131,11 +130,11 @@ pub async fn get_playbook_entries(
 /// Get curated few-shot examples for a domain.
 #[tauri::command]
 pub async fn get_curated_examples(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     domain: String,
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     let limit = limit.unwrap_or(20) as i64;
     pg.get_curated_examples_by_domain(&domain, limit).await
 }
@@ -143,9 +142,9 @@ pub async fn get_curated_examples(
 /// Get template performance data.
 #[tauri::command]
 pub async fn get_template_performance(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<TemplatePerformanceResponse>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     let rows = pg.get_all_template_performance().await?;
 
     let templates = rows
@@ -168,10 +167,10 @@ pub async fn get_template_performance(
 /// Get GEPA optimization run history.
 #[tauri::command]
 pub async fn get_gepa_runs(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     limit: Option<u32>,
 ) -> Result<Vec<GepaRunResponse>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     let limit = limit.unwrap_or(50) as i64;
     let rows = pg.get_recent_gepa_runs(limit).await?;
 
@@ -194,10 +193,10 @@ pub async fn get_gepa_runs(
 /// Get template lifecycle event history for a specific template.
 #[tauri::command]
 pub async fn get_template_lifecycle_history(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     template_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     pg.get_template_lifecycle_events(&template_id).await
 }
 
@@ -208,7 +207,7 @@ pub async fn get_template_lifecycle_history(
 /// Update a playbook entry's status (activate, retire, stage).
 #[tauri::command]
 pub async fn update_playbook_entry_status(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     id: String,
     new_status: String,
 ) -> Result<(), String> {
@@ -220,57 +219,57 @@ pub async fn update_playbook_entry_status(
         ));
     }
 
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     pg.update_playbook_status(&id, &new_status).await
 }
 
 /// Delete a playbook entry.
 #[tauri::command]
 pub async fn delete_playbook_entry(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     id: String,
 ) -> Result<(), String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     pg.delete_playbook_entry(&id).await
 }
 
 /// Delete a curated example.
 #[tauri::command]
 pub async fn delete_curated_example(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     id: String,
 ) -> Result<(), String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     pg.delete_curated_example(&id).await
 }
 
 /// Get full detail for a GEPA optimization run (including before/after prompts).
 #[tauri::command]
 pub async fn get_gepa_run_detail(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     id: String,
 ) -> Result<serde_json::Value, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     pg.get_gepa_run_detail(&id).await
 }
 
 /// Get playbook entry detail with source run context.
 #[tauri::command]
 pub async fn get_playbook_entry_detail(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     id: String,
 ) -> Result<serde_json::Value, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     pg.get_playbook_entry_detail(&id).await
 }
 
 /// Get learning trend data (entries created per day, rolling counts).
 #[tauri::command]
 pub async fn get_learning_trends(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     days: Option<u32>,
 ) -> Result<serde_json::Value, String> {
-    let pg = &state.pg_db;
+    let pg = state.pg_db();
     let days = days.unwrap_or(30) as i64;
     pg.get_learning_trends(days).await
 }
