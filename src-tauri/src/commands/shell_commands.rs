@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
@@ -882,4 +884,22 @@ pub async fn generate_shell_command_with_ai(
     .map_err(|e| format!("spawn_blocking error: {}", e))?;
 
     Ok(result)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_shell_commands")
+        .invoke_handler(tauri::generate_handler![
+            create_shell_command,
+            get_shell_command,
+            list_shell_commands,
+            update_shell_command,
+            delete_shell_command,
+            execute_shell_command,
+            get_shell_command_results,
+            get_shell_command_categories,
+            set_shell_command_enabled,
+            generate_shell_command_with_ai,
+        ])
+        .build()
 }

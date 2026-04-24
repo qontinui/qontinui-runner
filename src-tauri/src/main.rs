@@ -543,6 +543,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::task_sync::plugin())
         .plugin(commands::step_outputs::plugin())
         .plugin(commands::testing::plugin())
+        .plugin(commands::shell_commands::plugin())
+        .plugin(commands::mcp::plugin())
+        .plugin(commands::mobile::plugin())
+        .plugin(commands::setup_wizard::plugin())
+        .plugin(commands::saved_projects::plugin())
+        .plugin(commands::test_orchestrator::plugin())
+        .plugin(commands::orchestration_loop_configs::plugin())
+        .plugin(commands::scripted_output_settings::plugin())
+        .plugin(commands::watchers::plugin())
+        .plugin(commands::durable_execution::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -656,80 +666,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::flow::export_flows_bulk,
             commands::flow::import_flows_bulk,
             // NOTE: checkpoint_browser handlers moved to per-module plugin (see .plugin() calls above).
-            // Durable execution commands (Conductor-inspired replay/rollback)
-            commands::durable_execution::list_replay_points,
-            commands::durable_execution::replay_workflow,
-            commands::durable_execution::rollback_workflow_to_iteration,
-            commands::durable_execution::get_iteration_diffs,
-            commands::durable_execution::get_iteration_commits,
-            commands::durable_execution::get_phase_results,
+            // NOTE: durable_execution handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: database handlers moved to per-module plugin (see .plugin() calls above).
             // Comprehensive backup commands
             // NOTE: backup handlers moved to per-module plugin (see .plugin() calls above).
-            // Shell command management commands
-            commands::shell_commands::create_shell_command,
-            commands::shell_commands::get_shell_command,
-            commands::shell_commands::list_shell_commands,
-            commands::shell_commands::update_shell_command,
-            commands::shell_commands::delete_shell_command,
-            commands::shell_commands::execute_shell_command,
-            commands::shell_commands::get_shell_command_results,
-            commands::shell_commands::get_shell_command_categories,
-            commands::shell_commands::set_shell_command_enabled,
-            commands::shell_commands::generate_shell_command_with_ai,
+            // NOTE: shell_commands handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: ai_generation handlers moved to per-module plugin (see .plugin() calls above).
-            // MCP client management commands
-            commands::mcp::list_mcp_servers,
-            commands::mcp::get_mcp_server,
-            commands::mcp::create_mcp_server,
-            commands::mcp::update_mcp_server,
-            commands::mcp::delete_mcp_server,
-            commands::mcp::connect_mcp_server,
-            commands::mcp::disconnect_mcp_server,
-            commands::mcp::get_mcp_servers_status,
-            commands::mcp::get_mcp_server_status,
-            commands::mcp::list_mcp_server_tools,
-            commands::mcp::call_mcp_tool,
-            commands::mcp::get_task_run_mcp_calls,
-            // Mobile development feedback commands
-            commands::mobile::list_mobile_devices,
-            commands::mobile::capture_mobile_screenshot,
-            commands::mobile::capture_mobile_logcat,
-            commands::mobile::get_mobile_states,
-            commands::mobile::get_latest_mobile_state,
-            commands::mobile::create_mobile_state,
-            commands::mobile::get_mobile_logs,
-            commands::mobile::get_mobile_errors,
-            commands::mobile::create_mobile_log,
-            commands::mobile::capture_mobile_feedback,
-            commands::mobile::delete_mobile_data,
+            // NOTE: mcp, mobile handlers moved to per-module plugins (see .plugin() calls above).
             // NOTE: global_log_sources handlers consolidated above.
-            // Setup wizard commands (first-launch setup)
-            commands::setup_wizard::check_setup_completed,
-            commands::setup_wizard::complete_setup,
-            commands::setup_wizard::scan_workspace_for_setup,
-            commands::setup_wizard::detect_project_framework_for_setup,
-            commands::setup_wizard::suggest_log_sources_for_setup,
-            commands::setup_wizard::suggest_workspace_sources_for_setup,
-            commands::setup_wizard::save_log_sources_from_setup,
-            commands::setup_wizard::save_ai_provider_from_setup,
-            commands::setup_wizard::suggest_process_configs_for_setup,
-            commands::setup_wizard::suggest_dev_services_for_setup,
-            commands::setup_wizard::save_dev_services_from_setup,
-            commands::setup_wizard::discover_claude_config_dirs,
-            // Saved projects registry (user-curated, populated by setup wizard)
-            commands::saved_projects::list_saved_projects,
-            commands::saved_projects::save_saved_projects,
-            commands::saved_projects::add_saved_project,
-            commands::saved_projects::remove_saved_project,
-            // Test Orchestrator commands (AI-driven multi-step API test creation)
-            commands::test_orchestrator::plan_test_orchestration,
-            commands::test_orchestrator::execute_test_orchestration,
-            commands::test_orchestrator::generate_test_from_orchestration,
-            commands::test_orchestrator::get_saved_requests_for_orchestration,
-            commands::test_orchestrator::save_orchestration_plan,
-            commands::test_orchestrator::list_orchestration_plans,
-            commands::test_orchestrator::delete_orchestration_plan,
+            // NOTE: setup_wizard, saved_projects, test_orchestrator handlers moved to per-module plugins (see .plugin() calls above).
             // Performance Metrics Dashboard commands
             // NOTE: performance_metrics handlers moved to per-module plugin (see .plugin() calls above).
             // UI Bridge commands (AI-driven UI automation)
@@ -804,13 +749,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             orchestration_loop::commands::stop_all_orchestration_loops,
             orchestration_loop::commands::get_multi_orchestration_loop_status,
             orchestration_loop::commands::signal_orchestration_restart_by_id,
-            // Orchestration loop saved config CRUD
-            commands::orchestration_loop_configs::ol_list_configs,
-            commands::orchestration_loop_configs::ol_get_config,
-            commands::orchestration_loop_configs::ol_save_config,
-            commands::orchestration_loop_configs::ol_update_config,
-            commands::orchestration_loop_configs::ol_delete_config,
-            commands::orchestration_loop_configs::ol_toggle_favorite,
+            // NOTE: orchestration_loop_configs handlers moved to per-module plugin (see .plugin() calls above).
             // Embedded terminal commands (PTY-backed shell sessions)
             commands::terminal::terminal_create,
             commands::terminal::terminal_write,
@@ -856,16 +795,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Token analytics commands (LLM cost and usage tracking)
             // NOTE: token_analytics handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: activity_timeline handlers moved to per-module plugin (see .plugin() calls above).
-            commands::scripted_output_settings::get_scripted_output_settings,
-            commands::scripted_output_settings::save_scripted_output_settings,
+            // NOTE: scripted_output_settings handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: event_search handlers moved to per-module plugin (see .plugin() calls above).
-            // Watcher commands (screenpipe-inspired reactive AI agents)
-            commands::watchers::create_watcher,
-            commands::watchers::get_watcher,
-            commands::watchers::list_watchers,
-            commands::watchers::update_watcher,
-            commands::watchers::delete_watcher,
-            commands::watchers::set_watcher_enabled,
+            // NOTE: watchers handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: container_settings handlers moved to per-module plugin (see .plugin() calls above).
             // Cost dashboard commands (unified token/cache/budget overview)
             // NOTE: cost_dashboard handlers moved to per-module plugin (see .plugin() calls above).
