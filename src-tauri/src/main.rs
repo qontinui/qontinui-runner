@@ -520,6 +520,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::rag::plugin())
         .plugin(commands::ai_session::plugin())
         .plugin(commands::meta_optimizer::plugin())
+        .plugin(commands::auth::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -531,19 +532,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .invoke_handler(tauri::generate_handler![
             // Interactive AI session commands (send messages, interrupt, query state)
             // NOTE: ai_session handlers moved to per-module plugin (see .plugin() calls above).
-            // Authentication commands
-            commands::auth::login,
-            commands::auth::logout,
-            commands::auth::check_auth_status,
-            commands::auth::get_device_info,
-            commands::auth::get_connection_info,
-            commands::auth::get_user_projects,
-            commands::auth::refresh_token,
-            commands::auth::get_access_token_for_websocket,
-            commands::auth::send_device_heartbeat,
-            commands::auth::is_api_ready,
-            commands::auth::get_api_port,
-            commands::auth::get_test_auto_login,
+            // NOTE: auth handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: clipboard, dev_findings, and file_browser handlers moved to
             // per-module plugins (see .plugin() calls above).
             // Configuration commands

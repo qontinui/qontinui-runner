@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
@@ -948,4 +950,26 @@ pub fn get_test_auto_login() -> Option<TestAutoLoginCreds> {
         return None;
     }
     Some(TestAutoLoginCreds { email, password })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_auth")
+        .invoke_handler(tauri::generate_handler![
+            login,
+            logout,
+            check_auth_status,
+            get_device_info,
+            get_connection_info,
+            get_user_projects,
+            refresh_token,
+            get_access_token_for_websocket,
+            send_device_heartbeat,
+            is_api_ready,
+            get_api_port,
+            get_test_auto_login,
+        ])
+        .build()
 }
