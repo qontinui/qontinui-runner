@@ -1,7 +1,8 @@
 //! Tauri commands for Conductor-inspired durable execution features:
 //! replay from arbitrary checkpoint, manual rollback, and iteration inspection.
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
+use crate::database::pg::PgDb;
 use crate::unified_workflow_executor::compensation::CompensationManager;
 use crate::unified_workflow_executor::replay::{ReplayManager, ReplayTarget};
 use crate::unified_workflow_executor::types::ReplayPoint;
@@ -13,9 +14,9 @@ use tauri::State;
 /// Resolve the working directory for a task run by checking:
 /// 1. Active worktree associated with the task run
 /// 2. Fallback: current working directory
-fn resolve_working_dir(app_state: &AppState, execution_id: &str) -> Result<String, String> {
+fn resolve_working_dir(pg_db: &Arc<PgDb>, execution_id: &str) -> Result<String, String> {
     // Check for a worktree associated with this task run (PG-primary via block_in_place)
-    let pg = app_state.pg_db.clone();
+    let pg = pg_db.clone();
     let worktrees_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokio::task::block_in_place(|| {
@@ -52,10 +53,10 @@ fn resolve_working_dir(app_state: &AppState, execution_id: &str) -> Result<Strin
 /// and timestamp. Used by the UI to show a timeline of iteration states.
 #[tauri::command]
 pub async fn list_replay_points(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     execution_id: String,
 ) -> Result<Vec<ReplayPoint>, String> {
-    let replay_manager = ReplayManager::new(app_state.pg_db.clone());
+    let replay_manager = ReplayManager::new(storage.pg_db().clone());
     replay_manager.list_replay_points(&execution_id)
 }
 
@@ -70,17 +71,18 @@ pub async fn list_replay_points(
 /// `working_dir` is optional — if omitted, resolved from the task's worktree.
 #[tauri::command]
 pub async fn replay_workflow(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     execution_id: String,
     target_iteration: u32,
     working_dir: Option<String>,
     target_phase: Option<String>,
 ) -> Result<String, String> {
-    let replay_manager = ReplayManager::new(app_state.pg_db.clone());
+    let pg_db = storage.pg_db();
+    let replay_manager = ReplayManager::new(pg_db.clone());
 
     let resolved_dir = match working_dir {
         Some(ref d) if !d.is_empty() && d != "." => d.clone(),
-        _ => resolve_working_dir(&app_state, &execution_id)?,
+        _ => resolve_working_dir(pg_db, &execution_id)?,
     };
 
     let target = match target_phase.as_deref() {
@@ -112,17 +114,18 @@ pub async fn replay_workflow(
 /// `working_dir` is optional — if omitted, resolved from the task's worktree.
 #[tauri::command]
 pub async fn rollback_workflow_to_iteration(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     execution_id: String,
     target_iteration: u32,
     working_dir: Option<String>,
 ) -> Result<String, String> {
+    let pg_db = storage.pg_db();
     let resolved_dir = match working_dir {
         Some(ref d) if !d.is_empty() && d != "." => d.clone(),
-        _ => resolve_working_dir(&app_state, &execution_id)?,
+        _ => resolve_working_dir(pg_db, &execution_id)?,
     };
 
-    let compensation_manager = CompensationManager::new(app_state.pg_db.clone());
+    let compensation_manager = CompensationManager::new(pg_db.clone());
 
     let commit = compensation_manager
         .rollback_to_iteration(
@@ -145,10 +148,10 @@ pub async fn rollback_workflow_to_iteration(
 /// in each iteration (files modified, insertions, deletions, commit hashes).
 #[tauri::command]
 pub async fn get_iteration_diffs(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     execution_id: String,
 ) -> Result<Vec<crate::unified_workflow_executor::types::IterationDiff>, String> {
-    app_state.pg_db.get_iteration_diffs(&execution_id).await
+    storage.pg_db().get_iteration_diffs(&execution_id).await
 }
 
 /// Get the commit checkpoints for a workflow execution.
@@ -157,10 +160,10 @@ pub async fn get_iteration_diffs(
 /// to its git commit hash.
 #[tauri::command]
 pub async fn get_iteration_commits(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     execution_id: String,
 ) -> Result<Vec<crate::unified_workflow_executor::types::IterationCommit>, String> {
-    app_state.pg_db.get_iteration_commits(&execution_id).await
+    storage.pg_db().get_iteration_commits(&execution_id).await
 }
 
 /// Get the structured phase-level results for a workflow execution.
@@ -175,11 +178,11 @@ pub async fn get_iteration_commits(
 /// than returning an empty list.
 #[tauri::command]
 pub async fn get_phase_results(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     execution_id: String,
 ) -> Result<Vec<crate::unified_workflow_executor::types::PhaseResult>, String> {
     let parent_id = crate::unified_workflow_executor::types::get_parent_task_id(&execution_id);
-    app_state.pg_db.get_phase_results(&parent_id).await
+    storage.pg_db().get_phase_results(&parent_id).await
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.
