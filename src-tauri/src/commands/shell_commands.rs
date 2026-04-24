@@ -10,7 +10,9 @@
 //! - Category and tag-based organization
 //! - Integration with task runs for audit logging
 
+use crate::commands::compartments::{ExecutionCompartment, StorageCompartment};
 use crate::commands::{AppState, CommandResponse};
+use crate::error::AppError;
 use crate::executor::with_default_bridge;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,9 @@ use tauri::Runtime;
 use tauri::State;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
+
+// Migrated to StorageCompartment + ExecutionCompartment (Workstream C).
+// generate_shell_command_with_ai retains Arc<AppState> for with_default_bridge.
 
 // ============================================================================
 // Request/Response Types
@@ -151,8 +156,17 @@ fn default_fail_on_error() -> bool {
 #[tauri::command]
 pub async fn create_shell_command(
     input: CreateShellCommandInput,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    create_shell_command_impl(input, &state)
+        .await
+        .map_err(String::from)
+}
+
+async fn create_shell_command_impl(
+    input: CreateShellCommandInput,
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!("Creating shell command: {}", input.name);
 
     let timeout_seconds = input
@@ -172,7 +186,11 @@ pub async fn create_shell_command(
         enabled: true,
     };
 
-    let pg_cmd = state.pg_db.create_shell_command(&pg_input).await?;
+    let pg_cmd = state
+        .pg_db()
+        .create_shell_command(&pg_input)
+        .await
+        .map_err(AppError::DatabaseError)?;
 
     info!("Created shell command: {} ({})", pg_cmd.name, pg_cmd.id);
 
@@ -181,10 +199,7 @@ pub async fn create_shell_command(
     Ok(CommandResponse {
         success: true,
         message: Some("Shell command found".to_string()),
-        data: Some(
-            serde_json::to_value(&shell_command)
-                .map_err(|e| format!("Failed to serialize shell command: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&shell_command)?),
     })
 }
 
@@ -199,21 +214,30 @@ pub async fn create_shell_command(
 #[tauri::command]
 pub async fn get_shell_command(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    get_shell_command_impl(id, &state).await.map_err(String::from)
+}
+
+async fn get_shell_command_impl(
+    id: String,
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!("Getting shell command: {}", id);
 
-    match state.pg_db.get_shell_command(&id).await? {
+    match state
+        .pg_db()
+        .get_shell_command(&id)
+        .await
+        .map_err(AppError::DatabaseError)?
+    {
         Some(pg_cmd) => {
             let shell_command = pg_shell_command_to_local(&pg_cmd);
 
             Ok(CommandResponse {
                 success: true,
                 message: Some("Shell command found".to_string()),
-                data: Some(
-                    serde_json::to_value(&shell_command)
-                        .map_err(|e| format!("Failed to serialize shell command: {}", e))?,
-                ),
+                data: Some(serde_json::to_value(&shell_command)?),
             })
         }
         None => Ok(CommandResponse {
@@ -237,7 +261,7 @@ pub async fn get_shell_command(
 pub async fn list_shell_commands(
     enabled_only: Option<bool>,
     category: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Listing shell commands (enabled_only: {:?}, category: {:?})",
@@ -245,7 +269,7 @@ pub async fn list_shell_commands(
     );
 
     let pg_cmds = state
-        .pg_db
+        .pg_db()
         .list_shell_commands_filtered(enabled_only.unwrap_or(false), category.as_deref())
         .await?;
 
@@ -300,12 +324,12 @@ pub async fn list_shell_commands(
 pub async fn update_shell_command(
     id: String,
     input: UpdateShellCommandInput,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Updating shell command: {}", id);
 
     // Get current values from PG
-    let current = match state.pg_db.get_shell_command(&id).await? {
+    let current = match state.pg_db().get_shell_command(&id).await? {
         Some(v) => v,
         None => {
             return Ok(CommandResponse {
@@ -335,7 +359,7 @@ pub async fn update_shell_command(
     let enabled = input.enabled.unwrap_or(current.enabled);
 
     state
-        .pg_db
+        .pg_db()
         .update_shell_command_full(
             &id,
             &name,
@@ -366,11 +390,11 @@ pub async fn update_shell_command(
 #[tauri::command]
 pub async fn delete_shell_command(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Deleting shell command: {}", id);
 
-    let deleted = state.pg_db.delete_shell_command(&id).await?;
+    let deleted = state.pg_db().delete_shell_command(&id).await?;
 
     if !deleted {
         return Ok(CommandResponse {
@@ -406,12 +430,13 @@ pub async fn delete_shell_command(
 pub async fn execute_shell_command(
     id: String,
     task_run_id: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
+    execution: State<'_, ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Executing shell command: {}", id);
 
     // Get the shell command from PG
-    let pg_cmd = match state.pg_db.get_shell_command(&id).await? {
+    let pg_cmd = match storage.pg_db().get_shell_command(&id).await? {
         Some(cmd) => cmd,
         None => {
             return Ok(CommandResponse {
@@ -462,7 +487,7 @@ pub async fn execute_shell_command(
         crate::security::build_container_security_env(&security_policy, &security_settings);
 
     let container_result = {
-        let executor_guard = state.container_executor.lock().await;
+        let executor_guard = execution.container_executor().lock().await;
         if let Some(ref executor) = *executor_guard {
             debug!(
                 "Container executor present, attempting container execution for '{}'",
@@ -576,8 +601,8 @@ pub async fn execute_shell_command(
     let status_str = if success { "success" } else { "failed" };
     let started_at_str = Utc::now().to_rfc3339();
 
-    if let Err(e) = state
-        .pg_db
+    if let Err(e) = storage
+        .pg_db()
         .save_shell_command_result(
             &cmd_id,
             status_str,
@@ -641,13 +666,13 @@ pub async fn execute_shell_command(
 pub async fn get_shell_command_results(
     shell_command_id: String,
     limit: Option<u32>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting results for shell command: {}", shell_command_id);
 
     let limit = limit.unwrap_or(10);
     let pg_results = state
-        .pg_db
+        .pg_db()
         .get_shell_command_results(&shell_command_id, limit)
         .await?;
 
@@ -668,11 +693,11 @@ pub async fn get_shell_command_results(
 /// * `Err(String)` - Error message if query fails
 #[tauri::command]
 pub async fn get_shell_command_categories(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting shell command categories");
 
-    let categories = state.pg_db.get_shell_command_categories().await?;
+    let categories = state.pg_db().get_shell_command_categories().await?;
 
     Ok(CommandResponse {
         success: true,
@@ -697,11 +722,14 @@ pub async fn get_shell_command_categories(
 pub async fn set_shell_command_enabled(
     id: String,
     enabled: bool,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Setting shell command {} enabled={}", id, enabled);
 
-    let updated = state.pg_db.set_shell_command_enabled(&id, enabled).await?;
+    let updated = state
+        .pg_db()
+        .set_shell_command_enabled(&id, enabled)
+        .await?;
 
     if !updated {
         return Ok(CommandResponse {
