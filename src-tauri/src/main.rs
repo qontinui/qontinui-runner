@@ -561,6 +561,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(doctor::commands::plugin())
         .plugin(error_monitor::commands::plugin())
         .plugin(process_capture::commands::plugin())
+        .plugin(orchestration_loop::commands::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -633,17 +634,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             mcp::backend_relay::commands::save_cloud_relay_settings,
             mcp::backend_relay::commands::get_cloud_relay_settings,
             // NOTE: process_capture handlers moved to per-module plugin (see .plugin() calls above).
-            // Orchestration loop commands (runner-side workflow loop)
-            orchestration_loop::commands::start_orchestration_loop,
-            orchestration_loop::commands::stop_orchestration_loop,
-            orchestration_loop::commands::get_orchestration_loop_status,
-            orchestration_loop::commands::signal_orchestration_restart,
-            // Multi-loop orchestration commands
-            orchestration_loop::commands::start_multi_orchestration_loop,
-            orchestration_loop::commands::stop_orchestration_loop_by_id,
-            orchestration_loop::commands::stop_all_orchestration_loops,
-            orchestration_loop::commands::get_multi_orchestration_loop_status,
-            orchestration_loop::commands::signal_orchestration_restart_by_id,
+            // NOTE: orchestration_loop handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: orchestration_loop_configs handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: terminal, instances handlers moved to per-module plugins (see .plugin() calls above).
             // Claude Code transcript import commands

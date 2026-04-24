@@ -1,6 +1,8 @@
 //! Tauri IPC commands for the orchestration loop.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 use crate::commands::AppState;
@@ -80,4 +82,21 @@ pub async fn signal_orchestration_restart_by_id(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     loop_engine::signal_restart_by_id(state.orchestration_loops.clone(), &loop_id).await
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_orchestration_loop_commands")
+        .invoke_handler(tauri::generate_handler![
+            start_orchestration_loop,
+            stop_orchestration_loop,
+            get_orchestration_loop_status,
+            signal_orchestration_restart,
+            start_multi_orchestration_loop,
+            stop_orchestration_loop_by_id,
+            stop_all_orchestration_loops,
+            get_multi_orchestration_loop_status,
+            signal_orchestration_restart_by_id,
+        ])
+        .build()
 }
