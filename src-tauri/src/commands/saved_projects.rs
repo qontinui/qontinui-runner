@@ -56,7 +56,7 @@ struct SavedProjectMirror {
 ///   so `d:/foo/` and `D:\foo` compare equal.
 /// - Leaves the rest of the path alone (no canonicalize; path need not exist).
 fn normalize_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches(|c| c == '\\' || c == '/');
+    let trimmed = path.trim_end_matches(['\\', '/']);
 
     #[cfg(windows)]
     {

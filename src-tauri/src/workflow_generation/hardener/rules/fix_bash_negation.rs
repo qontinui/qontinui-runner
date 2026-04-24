@@ -33,7 +33,7 @@ impl HardenRule for FixBashNegation {
         // may have mutated it.
         let current = step
             .raw()
-            .get(&cmd_key as &str)
+            .get(cmd_key)
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();

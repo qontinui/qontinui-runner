@@ -82,8 +82,8 @@ pub fn get_supervisor_socket_addr() -> String {
     let url = get_supervisor_url();
     // Strip scheme and any path.
     let after_scheme = url
-        .splitn(2, "://")
-        .nth(1)
+        .split_once("://")
+        .map(|x| x.1)
         .unwrap_or(url.as_str());
     let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
     if host_port.contains(':') {

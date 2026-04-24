@@ -37,7 +37,7 @@ impl HardenRule for EnsureCommandMode {
             .map(|s| !s.is_empty())
             .unwrap_or(false);
 
-        if !(is_command_step && !has_mode) {
+        if !is_command_step || has_mode {
             return;
         }
 
