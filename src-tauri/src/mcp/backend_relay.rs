@@ -1208,6 +1208,8 @@ pub mod commands {
     use super::*;
     use crate::settings;
     use std::sync::OnceLock;
+    use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+    use tauri::Runtime;
 
     /// Global relay state (managed outside Tauri state for simplicity)
     static RELAY_STATE: OnceLock<tokio::sync::Mutex<Option<Arc<BackendRelayState>>>> =
@@ -1414,5 +1416,18 @@ pub mod commands {
             "backend_url": settings.cloud_relay.backend_url,
             "auto_connect": settings.cloud_relay.auto_connect
         }))
+    }
+
+    /// Build the Tauri plugin that registers this module's command handlers.
+    pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+        PluginBuilder::new("qontinui_backend_relay_commands")
+            .invoke_handler(tauri::generate_handler![
+                start_cloud_relay,
+                stop_cloud_relay,
+                get_cloud_relay_status,
+                save_cloud_relay_settings,
+                get_cloud_relay_settings,
+            ])
+            .build()
     }
 }

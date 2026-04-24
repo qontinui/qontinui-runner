@@ -575,6 +575,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(process_capture::commands::plugin())
         .plugin(orchestration_loop::commands::plugin())
         .plugin(spec_experimentation::commands::plugin())
+        .plugin(mcp::backend_relay::commands::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -640,12 +641,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: ui_bridge handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: error_monitor handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: doctor handlers moved to per-module plugin (see .plugin() calls above).
-            // Cloud relay commands (remote mobile access via backend WebSocket)
-            mcp::backend_relay::commands::start_cloud_relay,
-            mcp::backend_relay::commands::stop_cloud_relay,
-            mcp::backend_relay::commands::get_cloud_relay_status,
-            mcp::backend_relay::commands::save_cloud_relay_settings,
-            mcp::backend_relay::commands::get_cloud_relay_settings,
+            // NOTE: mcp::backend_relay handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: process_capture handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: orchestration_loop handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: orchestration_loop_configs handlers moved to per-module plugin (see .plugin() calls above).
