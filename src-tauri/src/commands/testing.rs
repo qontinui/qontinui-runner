@@ -9,6 +9,7 @@
 //!
 //! Also provides CRUD operations for managing tests in the database.
 
+use super::compartments::StorageCompartment;
 use super::CommandResponse;
 use crate::database::{CreateVerificationTestInput, TriggerPoint, VerificationTest};
 use crate::executor::{is_default_bridge_running, with_default_bridge};
@@ -373,14 +374,14 @@ pub async fn list_verification_tests(
     enabled_only: Option<bool>,
     test_type: Option<String>,
     category: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     let filter = crate::database::pg::verification_tests::VerificationTestFilter {
         enabled_only: enabled_only.unwrap_or(false),
         test_type,
         category,
     };
-    match state.pg_db.list_verification_tests(filter).await {
+    match state.pg_db().list_verification_tests(filter).await {
         Ok(tests) => Ok(CommandResponse {
             success: true,
             message: Some(format!("Found {} verification tests", tests.len())),
@@ -398,9 +399,9 @@ pub async fn list_verification_tests(
 #[tauri::command]
 pub async fn get_verification_test(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    match state.pg_db.get_verification_test(&id).await {
+    match state.pg_db().get_verification_test(&id).await {
         Ok(Some(test)) => {
             return Ok(CommandResponse {
                 success: true,
@@ -429,13 +430,13 @@ pub async fn get_verification_test(
 #[tauri::command]
 pub async fn create_verification_test(
     input: CreateVerificationTestInput,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Creating verification test: {} (type: {:?})",
         input.name, input.test_type
     );
-    match state.pg_db.create_verification_test(&input).await {
+    match state.pg_db().create_verification_test(&input).await {
         Ok(test) => Ok(CommandResponse {
             success: true,
             message: Some(format!("Created test: {}", test.id)),
@@ -454,10 +455,10 @@ pub async fn create_verification_test(
 pub async fn update_verification_test(
     id: String,
     input: CreateVerificationTestInput,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Updating verification test: {} ({})", input.name, id);
-    match state.pg_db.update_verification_test(&id, &input).await {
+    match state.pg_db().update_verification_test(&id, &input).await {
         Ok(test) => Ok(CommandResponse {
             success: true,
             message: Some(format!("Updated test: {}", test.id)),
@@ -475,10 +476,10 @@ pub async fn update_verification_test(
 #[tauri::command]
 pub async fn delete_verification_test(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Deleting verification test: {}", id);
-    match state.pg_db.delete_verification_test(&id).await {
+    match state.pg_db().delete_verification_test(&id).await {
         Ok(true) => Ok(CommandResponse {
             success: true,
             message: Some(format!("Deleted test: {}", id)),
@@ -506,9 +507,9 @@ pub async fn delete_verification_test(
 pub async fn execute_test_by_id(
     test_id: String,
     task_run_id: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
 
     // Get the test from database
     let test = match db.get_verification_test(&test_id).await {
@@ -569,9 +570,9 @@ pub async fn execute_tests_by_ids(
     test_ids: Vec<String>,
     task_run_id: Option<String>,
     stop_on_failure: Option<bool>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.pg_db;
+    let db = state.pg_db();
     let stop_on_failure = stop_on_failure.unwrap_or(false);
 
     let mut results: Vec<serde_json::Value> = Vec::new();
@@ -654,10 +655,10 @@ pub async fn execute_tests_by_ids(
 pub async fn get_test_results(
     test_id: String,
     limit: Option<u32>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     match state
-        .pg_db
+        .pg_db()
         .list_test_results(Some(&test_id), None, None, limit)
         .await
     {
@@ -678,10 +679,10 @@ pub async fn get_test_results(
 #[tauri::command]
 pub async fn get_task_run_test_results(
     task_run_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     match state
-        .pg_db
+        .pg_db()
         .list_test_results(None, Some(&task_run_id), None, None)
         .await
     {
