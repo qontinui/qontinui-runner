@@ -15,6 +15,8 @@ use crate::database::TaskRun;
 use crate::findings::types::{Finding, FindingStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
@@ -1096,4 +1098,20 @@ pub async fn sync_all_pending_ai_tasks(
 
     info!("Synced {} tasks to backend", synced_count);
     Ok(synced_count)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_task_sync")
+        .invoke_handler(tauri::generate_handler![
+            sync_ai_task_created,
+            sync_ai_session_started,
+            sync_ai_session_ended,
+            sync_ai_findings,
+            sync_deferred_questions,
+            sync_ai_task_completed,
+            full_sync_ai_task,
+            sync_all_pending_ai_tasks,
+        ])
+        .build()
 }
