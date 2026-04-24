@@ -4,6 +4,8 @@
 //! per-phase breakdowns, and budget utilization.
 
 use serde::Serialize;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 
 /// Unified cost dashboard summary.
 #[derive(Debug, Clone, Serialize)]
@@ -153,4 +155,13 @@ pub async fn get_active_budget_status(
     } else {
         Ok(None)
     }
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_cost_dashboard")
+        .invoke_handler(tauri::generate_handler![
+            get_cost_dashboard,
+            get_active_budget_status,
+        ])
+        .build()
 }

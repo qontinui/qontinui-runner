@@ -502,6 +502,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::activity_timeline::plugin())
         .plugin(commands::agentic_metrics::plugin())
         .plugin(commands::ai_data::plugin())
+        .plugin(commands::cost_dashboard::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -1224,8 +1225,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::watchers::set_watcher_enabled,
             // NOTE: container_settings handlers moved to per-module plugin (see .plugin() calls above).
             // Cost dashboard commands (unified token/cache/budget overview)
-            commands::cost_dashboard::get_cost_dashboard,
-            commands::cost_dashboard::get_active_budget_status,
+            // NOTE: cost_dashboard handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: window_manager handlers moved to per-module plugin (see .plugin() calls above).
             // Runner UI error reporting (Phase 3J.1/3J.2)
             ui_error::report_ui_error,
