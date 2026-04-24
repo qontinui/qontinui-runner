@@ -1,10 +1,17 @@
 //! Tauri commands for security settings management.
+//!
+//! # Typed errors (Workstream D)
+//!
+//! Handlers keep `-> Result<T, String>` at the Tauri boundary and build
+//! errors via [`AppError`] internally, converting with
+//! `.map_err(String::from)`. See `commands/mod.rs` for the migration guide.
 
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
+use crate::error::AppError;
 use crate::security::engine::SecuritySettings;
 use crate::security::profiles::{self, ProfileSummary};
 
@@ -15,9 +22,10 @@ pub async fn get_security_settings() -> Result<SecuritySettings, String> {
     Ok(settings)
 }
 
-/// Update security settings.
-#[tauri::command]
-pub async fn update_security_settings(config: SecuritySettings) -> Result<CommandResponse, String> {
+/// Internal implementation of [`update_security_settings`] returning [`AppError`].
+async fn update_security_settings_impl(
+    config: SecuritySettings,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Updating security settings: profile={}, audit={}, cred_proxy={}, net_proxy={}",
         config.default_profile,
@@ -29,18 +37,22 @@ pub async fn update_security_settings(config: SecuritySettings) -> Result<Comman
     // Validate profile name
     let valid_profiles = ["permissive", "standard", "strict", "custom"];
     if !valid_profiles.contains(&config.default_profile.as_str()) {
-        return Err(format!(
+        return Err(AppError::ValidationError(format!(
             "Invalid security profile '{}'. Valid profiles: {:?}",
             config.default_profile, valid_profiles
-        ));
+        )));
     }
 
     // If custom profile selected, ensure custom policy exists
     if config.default_profile == "custom" && config.custom_policy.is_none() {
-        return Err("Custom profile selected but no custom policy provided".to_string());
+        return Err(AppError::ValidationError(
+            "Custom profile selected but no custom policy provided".to_string(),
+        ));
     }
 
-    crate::settings::save_security_settings(config.clone())?;
+    crate::settings::save_security_settings(config.clone()).map_err(AppError::ConfigError)?;
+
+    let data = serde_json::to_value(&config)?;
 
     Ok(CommandResponse {
         success: true,
@@ -48,10 +60,16 @@ pub async fn update_security_settings(config: SecuritySettings) -> Result<Comman
             "Security settings updated (profile: {})",
             config.default_profile
         )),
-        data: Some(
-            serde_json::to_value(&config).map_err(|e| format!("Failed to serialize: {}", e))?,
-        ),
+        data: Some(data),
     })
+}
+
+/// Update security settings.
+#[tauri::command]
+pub async fn update_security_settings(config: SecuritySettings) -> Result<CommandResponse, String> {
+    update_security_settings_impl(config)
+        .await
+        .map_err(String::from)
 }
 
 /// Get the list of available security profiles.
