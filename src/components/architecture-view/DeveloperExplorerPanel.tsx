@@ -240,6 +240,7 @@ export function DeveloperExplorerPanel({ project }: Props) {
         <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
         <input
           type="text"
+          aria-label="Search features, patterns, tech, directories, constraints"
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           placeholder="Search features, patterns, tech, directories, constraints..."

@@ -162,6 +162,7 @@ function SearchTab() {
             <ModeIcon className="absolute left-2.5 top-2.5 w-4 h-4 text-muted-foreground" />
             <input
               type="text"
+              aria-label="Search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={handleKeyDown}

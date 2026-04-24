@@ -327,6 +327,7 @@ export function PromptSnippetBuilderTab({
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <input
               type="text"
+              aria-label="Search prompt snippets"
               placeholder="Search prompt snippets..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
@@ -495,6 +496,7 @@ export function PromptSnippetBuilderTab({
                   <label className="block text-sm font-medium mb-1.5">Name *</label>
                   <input
                     type="text"
+                    aria-label="Name"
                     value={formName}
                     onChange={(e) => setFormName(e.target.value)}
                     placeholder="Prompt snippet name"
@@ -509,6 +511,7 @@ export function PromptSnippetBuilderTab({
                     Content *
                   </label>
                   <textarea
+                    aria-label="Content"
                     value={formContent}
                     onChange={(e) => setFormContent(e.target.value)}
                     placeholder="Enter the reusable text snippet content..."
@@ -529,6 +532,7 @@ export function PromptSnippetBuilderTab({
                     </label>
                     <input
                       type="text"
+                      aria-label="Category"
                       value={formCategory}
                       onChange={(e) => setFormCategory(e.target.value)}
                       placeholder="e.g., Login, Navigation, Forms"
@@ -542,6 +546,7 @@ export function PromptSnippetBuilderTab({
                     </label>
                     <input
                       type="text"
+                      aria-label="Tags"
                       value={formTags}
                       onChange={(e) => setFormTags(e.target.value)}
                       placeholder="comma, separated, tags"

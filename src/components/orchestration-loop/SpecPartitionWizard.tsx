@@ -236,6 +236,7 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
             <div>
               <label className={labelCls}>Partition Strategy</label>
               <select
+                aria-label="Partition Strategy"
                 value={strategy}
                 onChange={(e) => setStrategy(e.target.value as PartitionStrategy)}
                 className={cn(inputCls, "w-full mt-0.5")}
@@ -250,6 +251,7 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
               <label className={labelCls}>Loop Max Iterations</label>
               <input
                 type="number"
+                aria-label="Loop Max Iterations"
                 min={1}
                 max={50}
                 value={maxIter}
@@ -261,6 +263,7 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
               <label className={labelCls}>Spec Workflow Iterations</label>
               <input
                 type="number"
+                aria-label="Spec Workflow Iterations"
                 min={1}
                 max={10}
                 value={specMaxIter}
@@ -271,6 +274,7 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
             <div>
               <label className={labelCls}>Between Iterations</label>
               <select
+                aria-label="Between Iterations"
                 value={between}
                 onChange={(e) => setBetween(e.target.value)}
                 className={cn(inputCls, "w-full mt-0.5")}

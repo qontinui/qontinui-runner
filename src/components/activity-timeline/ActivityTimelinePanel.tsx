@@ -201,6 +201,7 @@ export function ActivityTimelinePanel() {
           <input
             ref={searchInputRef}
             type="text"
+            aria-label="Search activity timeline"
             placeholder="Search activity timeline... (e.g., 'login button disabled')"
             className="w-full pl-9 pr-3 py-2 rounded-md border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-ring"
             value={query}
@@ -239,6 +240,7 @@ export function ActivityTimelinePanel() {
           <input
             ref={appFilterRef}
             type="text"
+            aria-label="App name filter"
             placeholder="App name filter"
             className="flex-1 px-3 py-1.5 rounded-md border border-border bg-background text-sm"
             value={appFilter}

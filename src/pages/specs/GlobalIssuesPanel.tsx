@@ -94,6 +94,7 @@ function IssueCard({
       <div className="flex items-start gap-2">
         <input
           type="checkbox"
+          aria-label="Select issue"
           checked={selected}
           onChange={onToggleSelect}
           className="mt-1 accent-primary"
@@ -278,6 +279,7 @@ function CreateIssueForm({
 
       <input
         type="text"
+        aria-label="Issue title"
         placeholder="Issue title"
         value={title}
         onChange={(e) => setTitle(e.target.value)}
@@ -286,6 +288,7 @@ function CreateIssueForm({
       />
 
       <textarea
+        aria-label="Issue description"
         placeholder="Describe the issue -- what you observed, what is wrong"
         value={description}
         onChange={(e) => setDescription(e.target.value)}
@@ -299,6 +302,7 @@ function CreateIssueForm({
             Category
           </label>
           <select
+            aria-label="Category"
             value={category}
             onChange={(e) => setCategory(e.target.value as IssueCategory)}
             className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
@@ -315,6 +319,7 @@ function CreateIssueForm({
             Severity
           </label>
           <select
+            aria-label="Severity"
             value={severity}
             onChange={(e) => setSeverity(e.target.value as KnownIssueSeverity)}
             className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
@@ -331,6 +336,7 @@ function CreateIssueForm({
             Scope
           </label>
           <select
+            aria-label="Scope"
             value={scopeType}
             onChange={(e) =>
               setScopeType(e.target.value as "global" | "spec" | "url" | "component" | "feature")
@@ -348,6 +354,7 @@ function CreateIssueForm({
 
       {scopeType !== "global" && scopeType === "spec" ? (
         <select
+          aria-label="Spec scope value"
           value={scopeValue}
           onChange={(e) => setScopeValue(e.target.value)}
           className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
@@ -365,6 +372,7 @@ function CreateIssueForm({
       ) : scopeType !== "global" ? (
         <input
           type="text"
+          aria-label="Scope identifier"
           placeholder={`${scopeType} identifier`}
           value={scopeValue}
           onChange={(e) => setScopeValue(e.target.value)}
@@ -378,6 +386,7 @@ function CreateIssueForm({
         </label>
         <input
           type="text"
+          aria-label="Verification Hint (optional)"
           placeholder="How to check for this issue"
           value={verificationHint}
           onChange={(e) => setVerificationHint(e.target.value)}
@@ -391,6 +400,7 @@ function CreateIssueForm({
         </label>
         <input
           type="text"
+          aria-label="Reproduction Context (optional)"
           placeholder="When does this happen?"
           value={reproductionContext}
           onChange={(e) => setReproductionContext(e.target.value)}
@@ -730,6 +740,7 @@ export function GlobalIssuesPanel() {
           </div>
 
           <select
+            aria-label="Filter by category"
             value={categoryFilter}
             onChange={(e) => setCategoryFilter(e.target.value)}
             className="px-2 py-1 text-xs bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
@@ -743,6 +754,7 @@ export function GlobalIssuesPanel() {
           </select>
 
           <select
+            aria-label="Filter by severity"
             value={severityFilter}
             onChange={(e) => setSeverityFilter(e.target.value)}
             className="px-2 py-1 text-xs bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
@@ -759,6 +771,7 @@ export function GlobalIssuesPanel() {
             <Search className="w-3.5 h-3.5 text-muted-foreground" />
             <input
               type="text"
+              aria-label="Search issues"
               placeholder="Search..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}

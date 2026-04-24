@@ -270,6 +270,7 @@ export function WatcherManagementPanel() {
               <input
                 ref={nameInputRef}
                 type="text"
+                aria-label="Watcher name"
                 placeholder="e.g., Error Toast Watcher"
                 className="w-full px-3 py-1.5 mt-1 rounded-md border border-border bg-background text-sm"
                 value={form.name}
@@ -283,6 +284,7 @@ export function WatcherManagementPanel() {
               <input
                 ref={queryInputRef}
                 type="text"
+                aria-label="Timeline Query (FTS)"
                 placeholder="e.g., error toast failed"
                 className="w-full px-3 py-1.5 mt-1 rounded-md border border-border bg-background text-sm"
                 value={form.timelineQuery}
@@ -295,6 +297,7 @@ export function WatcherManagementPanel() {
               <label className="text-xs font-medium text-muted-foreground">Schedule Interval</label>
               <select
                 ref={scheduleSelectRef}
+                aria-label="Schedule Interval"
                 className="w-full px-3 py-1.5 mt-1 rounded-md border border-border bg-background text-sm"
                 value={form.scheduleInterval}
                 onChange={(e) => setForm({ ...form, scheduleInterval: e.target.value })}
@@ -310,6 +313,7 @@ export function WatcherManagementPanel() {
               <label className="text-xs font-medium text-muted-foreground">Lookback Window</label>
               <select
                 ref={lookbackSelectRef}
+                aria-label="Lookback Window"
                 className="w-full px-3 py-1.5 mt-1 rounded-md border border-border bg-background text-sm"
                 value={form.lookbackWindow}
                 onChange={(e) => setForm({ ...form, lookbackWindow: e.target.value })}
@@ -326,6 +330,7 @@ export function WatcherManagementPanel() {
               <label className="text-xs font-medium text-muted-foreground">Action</label>
               <select
                 ref={actionSelectRef}
+                aria-label="Action"
                 className="w-full px-3 py-1.5 mt-1 rounded-md border border-border bg-background text-sm"
                 value={form.actionType}
                 onChange={(e) => setForm({ ...form, actionType: e.target.value })}
@@ -344,6 +349,7 @@ export function WatcherManagementPanel() {
               <input
                 ref={appFilterInputRef}
                 type="text"
+                aria-label="App Filter (optional)"
                 placeholder="e.g., Chrome"
                 className="w-full px-3 py-1.5 mt-1 rounded-md border border-border bg-background text-sm"
                 value={form.appNameFilter}
@@ -356,6 +362,7 @@ export function WatcherManagementPanel() {
               </label>
               <select
                 ref={sourceFilterSelectRef}
+                aria-label="Source Filter (optional)"
                 className="w-full px-3 py-1.5 mt-1 rounded-md border border-border bg-background text-sm"
                 value={form.sourceTypeFilter}
                 onChange={(e) => setForm({ ...form, sourceTypeFilter: e.target.value })}
@@ -371,6 +378,7 @@ export function WatcherManagementPanel() {
             <label className="text-xs font-medium text-muted-foreground">AI Reasoning Prompt</label>
             <textarea
               ref={promptTextareaRef}
+              aria-label="AI Reasoning Prompt"
               className="w-full px-3 py-2 mt-1 rounded-md border border-border bg-background text-sm font-mono resize-y"
               rows={4}
               value={form.reasoningPrompt}

@@ -619,6 +619,7 @@ export function ErrorMonitorTab({
             <Search className="w-4 h-4 text-muted-foreground" />
             <input
               type="text"
+              aria-label="Search errors"
               value={searchText}
               onChange={(e) => setSearchText(e.target.value)}
               placeholder="Search errors..."

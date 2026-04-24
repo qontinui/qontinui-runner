@@ -76,6 +76,7 @@ export function LibraryBuilderLayout<T extends { id: string; name: string }>({
               <input
                 type="text"
                 placeholder="Search..."
+                aria-label="Search"
                 value={builder.searchQuery}
                 onChange={(e) => builder.setSearchQuery(e.target.value)}
                 className="w-full pl-9 pr-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md

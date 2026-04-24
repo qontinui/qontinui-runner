@@ -276,6 +276,7 @@ export function FeatureHealthPanel({
 
         <div className="ml-auto flex items-center gap-1">
           <select
+            aria-label="Filter by status"
             className="text-xs bg-muted rounded px-1.5 py-1 border-0"
             value={filter}
             onChange={(e) => setFilter(e.target.value as FeatureHealth["status"] | "all")}

@@ -148,6 +148,7 @@ export default function LiveEvaluationPanel({
 
           {specMode === "saved" ? (
             <select
+              aria-label="Select eval spec"
               className="w-full rounded-md bg-background border border-border px-3 py-1.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
               value={selectedSpecId}
               onChange={(e) => setSelectedSpecId(e.target.value)}
@@ -167,6 +168,7 @@ export default function LiveEvaluationPanel({
             <div className="relative">
               <FileJson className="absolute top-2 left-2 w-3.5 h-3.5 text-muted-foreground" />
               <textarea
+                aria-label="Inline JSON spec"
                 className="w-full rounded-md bg-background border border-border pl-8 pr-3 py-2 text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-primary resize-y min-h-[80px]"
                 placeholder='{"id":"...","name":"...","test_cases":[...],"thresholds":{...}}'
                 value={inlineSpec}
@@ -183,6 +185,7 @@ export default function LiveEvaluationPanel({
             Input (prompt / question)
           </label>
           <textarea
+            aria-label="Input (prompt / question)"
             className="w-full rounded-md bg-background border border-border px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary resize-y min-h-[60px]"
             placeholder="Enter the prompt or question that was sent to the LLM..."
             value={input}
@@ -195,6 +198,7 @@ export default function LiveEvaluationPanel({
         <div className="space-y-1">
           <label className="text-xs font-medium text-muted-foreground">Output (LLM response)</label>
           <textarea
+            aria-label="Output (LLM response)"
             className="w-full rounded-md bg-background border border-border px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary resize-y min-h-[60px]"
             placeholder="Enter the LLM response to evaluate..."
             value={output}
@@ -209,6 +213,7 @@ export default function LiveEvaluationPanel({
             Context <span className="text-muted-foreground/60">(optional, for RAG)</span>
           </label>
           <textarea
+            aria-label="Context (optional, for RAG)"
             className="w-full rounded-md bg-background border border-border px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary resize-y min-h-[40px]"
             placeholder="Provide grounding context if evaluating RAG responses..."
             value={context}

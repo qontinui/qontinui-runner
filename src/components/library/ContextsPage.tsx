@@ -201,6 +201,7 @@ function ContextEditor({
           <label className="block text-xs font-medium text-muted-foreground">Name</label>
           <input
             type="text"
+            aria-label="Name"
             value={formState.name ?? ""}
             onChange={(e) => updateField("name", e.target.value)}
             placeholder="Context name..."
@@ -217,6 +218,7 @@ function ContextEditor({
         <div className="space-y-1.5">
           <label className="block text-xs font-medium text-muted-foreground">Context scope</label>
           <select
+            aria-label="Context scope"
             value={formState.scope ?? "global"}
             onChange={(e) => updateField("scope", e.target.value as ContextItem["scope"])}
             className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
@@ -241,6 +243,7 @@ function ContextEditor({
         <div className="space-y-1.5">
           <label className="block text-xs font-medium text-muted-foreground">Context content</label>
           <textarea
+            aria-label="Context content"
             value={formState.content ?? ""}
             onChange={(e) => updateField("content", e.target.value)}
             placeholder="Enter the context content that will be provided to AI sessions..."
@@ -280,6 +283,7 @@ function ContextEditor({
             </label>
             <input
               type="number"
+              aria-label="Priority (0-100)"
               min={0}
               max={100}
               value={formState.priority ?? 50}

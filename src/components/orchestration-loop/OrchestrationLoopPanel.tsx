@@ -803,6 +803,7 @@ export function OrchestrationLoopPanel() {
                   <div className="flex items-center gap-1.5">
                     <span className={labelCls}>Between</span>
                     <select
+                      aria-label="Between iterations"
                       value={between}
                       onChange={(e) => setBetween(e.target.value)}
                       className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
@@ -820,6 +821,7 @@ export function OrchestrationLoopPanel() {
                     <span className={labelCls}>Max</span>
                     <input
                       type="number"
+                      aria-label="Max iterations"
                       value={maxIter ?? ""}
                       onChange={(e) => {
                         const raw = e.target.value.trim();
@@ -840,6 +842,7 @@ export function OrchestrationLoopPanel() {
                   <div className="flex items-center gap-1.5">
                     <span className={labelCls}>Target</span>
                     <select
+                      aria-label="Target runner"
                       value={targetRunner}
                       onChange={(e) => handleTargetRunnerChange(e.target.value)}
                       className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
@@ -903,6 +906,7 @@ export function OrchestrationLoopPanel() {
                       <span className={labelCls}>Workflow</span>
                       <input
                         type="text"
+                        aria-label="Workflow ID"
                         value={workflowId}
                         onChange={(e) => setWorkflowId(e.target.value)}
                         placeholder="workflow-id"
@@ -912,6 +916,7 @@ export function OrchestrationLoopPanel() {
                     <div className="flex items-center gap-1.5">
                       <span className={labelCls}>Exit</span>
                       <select
+                        aria-label="Exit strategy"
                         value={exitStrategy}
                         onChange={(e) => setExitStrategy(e.target.value)}
                         className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
@@ -1059,6 +1064,7 @@ export function OrchestrationLoopPanel() {
                             <span className={labelCls}>Max chars</span>
                             <input
                               type="number"
+                              aria-label="Max chars"
                               value={diagnoseSnapshotMaxChars}
                               onChange={(e) => setDiagnoseSnapshotMaxChars(Number(e.target.value))}
                               min={1000}
@@ -1074,6 +1080,7 @@ export function OrchestrationLoopPanel() {
                             <span className={labelCls}>Model override</span>
                             <input
                               type="text"
+                              aria-label="Model override"
                               value={diagnoseModelOverride}
                               onChange={(e) => setDiagnoseModelOverride(e.target.value)}
                               placeholder="(default)"

@@ -278,6 +278,7 @@ export function DatasetDetail({
             Paste JSON array of items
           </label>
           <textarea
+            aria-label="Paste JSON array of items"
             className="w-full h-32 rounded-md bg-background border border-border px-3 py-2 text-xs font-mono resize-y focus:outline-hidden focus:ring-2 focus:ring-primary"
             placeholder={PLACEHOLDER_JSON}
             value={jsonInput}

@@ -357,6 +357,7 @@ export function AutomationToolkitSidebar({
                 <div className="space-y-2">
                   <label className="text-xs text-muted-foreground">Target Image</label>
                   <select
+                    aria-label="Target Image"
                     value={selectedImageId}
                     onChange={(e) => setSelectedImageId(e.target.value)}
                     className="w-full px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-hidden focus:ring-1 focus:ring-primary [&>option]:text-black [&>option]:bg-white"
@@ -399,6 +400,7 @@ export function AutomationToolkitSidebar({
                   <div className="flex gap-2">
                     <input
                       type="text"
+                      aria-label="Type Text"
                       value={typeText}
                       onChange={(e) => setTypeText(e.target.value)}
                       placeholder="Enter text to type..."
@@ -437,6 +439,7 @@ export function AutomationToolkitSidebar({
                   <div className="flex gap-2">
                     <input
                       type="text"
+                      aria-label="Hotkey"
                       value={hotkeyText}
                       onChange={(e) => setHotkeyText(e.target.value)}
                       placeholder="e.g., ctrl+c, alt+tab"
@@ -474,6 +477,7 @@ export function AutomationToolkitSidebar({
                   </div>
                   <div className="flex gap-2">
                     <select
+                      aria-label="Go To State"
                       value={selectedStateId}
                       onChange={(e) => setSelectedStateId(e.target.value)}
                       className="flex-1 px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-hidden focus:ring-1 focus:ring-primary [&>option]:text-black [&>option]:bg-white"

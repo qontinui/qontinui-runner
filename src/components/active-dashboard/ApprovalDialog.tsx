@@ -399,6 +399,7 @@ export function ApprovalDialog({ taskRunId, onResolved }: ApprovalDialogProps) {
               Comment (optional)
             </label>
             <textarea
+              aria-label="Comment (optional)"
               ref={commentRef}
               className="w-full px-3 py-2 text-sm bg-gray-800 border border-gray-600 rounded text-white placeholder-gray-500 focus:border-blue-500 focus:outline-hidden"
               value={comment}

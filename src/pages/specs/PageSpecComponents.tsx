@@ -218,6 +218,7 @@ function AddAssertionForm({
   return (
     <div className="px-3 py-2 rounded border border-dashed border-green-500/30 bg-green-500/5 space-y-2">
       <textarea
+        aria-label="Assertion description"
         value={description}
         onChange={(e) => setF("description", e.target.value)}
         placeholder="Assertion description..."
@@ -234,6 +235,7 @@ function AddAssertionForm({
       />
       <div className="flex items-center gap-2 flex-wrap">
         <select
+          aria-label="Assertion type"
           value={assertionType}
           onChange={(e) => setF("assertionType", e.target.value)}
           className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground"
@@ -273,6 +275,7 @@ function AddAssertionForm({
           </optgroup>
         </select>
         <select
+          aria-label="Severity"
           value={severity}
           onChange={(e) => setF("severity", e.target.value)}
           className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground"
@@ -282,6 +285,7 @@ function AddAssertionForm({
           <option value="info">info</option>
         </select>
         <select
+          aria-label="Category"
           value={category}
           onChange={(e) => setF("category", e.target.value)}
           className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground"
@@ -299,6 +303,7 @@ function AddAssertionForm({
       </div>
       <input
         type="text"
+        aria-label="Target element text"
         value={targetText}
         onChange={(e) => setF("targetText", e.target.value)}
         placeholder="Target element text..."
@@ -309,6 +314,7 @@ function AddAssertionForm({
       {isSpatial && (
         <input
           type="text"
+          aria-label="Related target element text"
           value={relatedTargetText}
           onChange={(e) => setF("relatedTargetText", e.target.value)}
           placeholder="Related target element text..."
@@ -503,6 +509,7 @@ function SetupActionsEditor({
           {editMode && showAddForm && (
             <div className="px-2 py-2 rounded border border-dashed border-cyan-500/30 bg-cyan-500/5 space-y-2">
               <select
+                aria-label="Setup action type"
                 value={newType}
                 onChange={(e) => setEd("newType", e.target.value)}
                 className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground w-full"
@@ -517,6 +524,7 @@ function SetupActionsEditor({
               {needsTarget && (
                 <input
                   type="text"
+                  aria-label="Target element text"
                   value={newTargetText}
                   onChange={(e) => setEd("newTargetText", e.target.value)}
                   placeholder="Target element text..."
@@ -529,6 +537,7 @@ function SetupActionsEditor({
               {newType === "type" && (
                 <input
                   type="text"
+                  aria-label="Text to type"
                   value={newValue}
                   onChange={(e) => setEd("newValue", e.target.value)}
                   placeholder="Text to type..."
@@ -541,6 +550,7 @@ function SetupActionsEditor({
               {newType === "navigate" && (
                 <input
                   type="text"
+                  aria-label="Navigation URL"
                   value={newUrl}
                   onChange={(e) => setEd("newUrl", e.target.value)}
                   placeholder="http://localhost:3001/..."
@@ -723,6 +733,7 @@ function AddGroupForm({
   return (
     <div className="px-3 py-2 rounded border border-dashed border-green-500/30 bg-green-500/5 space-y-2">
       <input
+        aria-label="Group name"
         value={name}
         onChange={(e) => setName(e.target.value)}
         placeholder="Group name..."
@@ -738,6 +749,7 @@ function AddGroupForm({
       />
       <div className="flex items-center gap-2">
         <select
+          aria-label="Group category"
           value={category}
           onChange={(e) => setCategory(e.target.value)}
           className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground"
@@ -752,6 +764,7 @@ function AddGroupForm({
           <option value="custom">custom</option>
         </select>
         <input
+          aria-label="Group description (optional)"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           placeholder="Description (optional)"

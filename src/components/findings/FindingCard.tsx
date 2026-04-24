@@ -453,6 +453,7 @@ export function FindingCard({
             <div className="flex gap-2">
               <input
                 type="text"
+                aria-label="Enter your response"
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
                 placeholder="Enter your response..."

@@ -1053,6 +1053,7 @@ export function AiTab({
                       <Calendar className="w-4 h-4 text-muted-foreground shrink-0" />
                       <input
                         type="date"
+                        aria-label="Select runs before this date"
                         value={deleteBeforeDate}
                         onChange={(e) => handleSelectBeforeDate(e.target.value)}
                         onClick={(e) => e.stopPropagation()}

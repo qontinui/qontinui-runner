@@ -247,6 +247,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
         <div className="px-4 py-3 border-b border-border space-y-2 bg-muted/30">
           <input
             type="text"
+            aria-label="Observation title"
             value={createTitle}
             onChange={(e) => setCreateTitle(e.target.value)}
             placeholder="Observation title..."
@@ -254,6 +255,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
             data-ui-element="create-observation-title"
           />
           <textarea
+            aria-label="Observation content"
             value={createContent}
             onChange={(e) => setCreateContent(e.target.value)}
             placeholder="Content (markdown supported)..."
@@ -263,6 +265,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
           />
           <div className="flex items-center gap-2">
             <select
+              aria-label="Observation type"
               value={createType}
               onChange={(e) => setCreateType(e.target.value)}
               className="px-2 py-1 text-xs bg-background border border-border rounded-md"
@@ -324,6 +327,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
           <Search className="w-4 h-4 text-muted-foreground shrink-0" />
           <input
             type="text"
+            aria-label="Search observations"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSearch()}

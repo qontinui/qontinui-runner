@@ -155,6 +155,7 @@ export function DetailsPanel({
           <div className="flex items-center gap-1.5">
             <input
               type="text"
+              aria-label="Text to type"
               value={typeText}
               onChange={(e) => onTypeTextChange(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && onTypeAction()}

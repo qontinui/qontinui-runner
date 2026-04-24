@@ -198,6 +198,7 @@ function TaskEditor({
             <label className="text-xs font-medium text-muted-foreground">Name</label>
             <input
               type="text"
+              aria-label="Name"
               value={formState.name ?? ""}
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Task name..."
@@ -211,6 +212,7 @@ function TaskEditor({
             <label className="text-xs font-medium text-muted-foreground">Category</label>
             <input
               type="text"
+              aria-label="Category"
               value={formState.category ?? ""}
               onChange={(e) => updateField("category", e.target.value)}
               placeholder="e.g., code-review, bug-fix, feature"
@@ -232,6 +234,7 @@ function TaskEditor({
         <div className="space-y-1.5">
           <label className="text-xs font-medium text-muted-foreground">Task Prompt</label>
           <textarea
+            aria-label="Task Prompt"
             value={formState.content ?? ""}
             onChange={(e) => updateField("content", e.target.value)}
             placeholder="Enter the task/prompt content..."
@@ -257,6 +260,7 @@ function TaskEditor({
           <div className="flex items-center gap-2">
             <input
               type="text"
+              aria-label="Add a tag"
               value={tagInput}
               onChange={(e) => setTagInput(e.target.value)}
               onKeyDown={handleTagKeyDown}

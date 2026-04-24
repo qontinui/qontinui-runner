@@ -165,6 +165,7 @@ export function PlaybookPanel() {
         <h3 style={{ margin: 0 }}>Playbook Lessons</h3>
         <div style={{ display: "flex", gap: "8px" }}>
           <select
+            aria-label="Filter by domain"
             value={domainFilter}
             onChange={(e) => setDomainFilter(e.target.value)}
             style={{
@@ -184,6 +185,7 @@ export function PlaybookPanel() {
             <option value="general">General</option>
           </select>
           <select
+            aria-label="Filter by status"
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
             style={{

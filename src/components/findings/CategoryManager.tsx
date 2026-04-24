@@ -602,6 +602,7 @@ function CategoryForm({
           </label>
           <input
             type="text"
+            aria-label="Category ID"
             value={formId}
             onChange={(e) => setFormId(e.target.value)}
             disabled={!isNew}
@@ -613,6 +614,7 @@ function CategoryForm({
           <label className="block text-sm font-medium mb-1">Name</label>
           <input
             type="text"
+            aria-label="Name"
             value={formName}
             onChange={(e) => handleNameChange(e.target.value)}
             placeholder="Category Name"
@@ -626,6 +628,7 @@ function CategoryForm({
         <label className="block text-sm font-medium mb-1">Description</label>
         <input
           type="text"
+          aria-label="Description"
           value={formDescription}
           onChange={(e) => setFormDescription(e.target.value)}
           placeholder="Brief description of what this category is for"

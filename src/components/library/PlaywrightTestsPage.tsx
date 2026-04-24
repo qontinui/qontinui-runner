@@ -195,6 +195,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
             <label className="text-xs font-medium text-muted-foreground">Name</label>
             <input
               type="text"
+              aria-label="Name"
               value={formState.name ?? ""}
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Test name..."
@@ -208,6 +209,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
             <label className="text-xs font-medium text-muted-foreground">Category</label>
             <input
               type="text"
+              aria-label="Category"
               value={formState.category ?? ""}
               onChange={(e) => updateField("category", e.target.value)}
               placeholder="e.g., smoke, regression, e2e..."
@@ -230,6 +232,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
           <label className="text-xs font-medium text-muted-foreground">Target URL</label>
           <input
             type="text"
+            aria-label="Target URL"
             value={formState.target_url ?? ""}
             onChange={(e) => updateField("target_url", e.target.value)}
             placeholder="https://localhost:3001"
@@ -255,6 +258,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
             Playwright Test (TypeScript)
           </label>
           <textarea
+            aria-label="Playwright Test (TypeScript)"
             value={formState.code ?? ""}
             onChange={(e) => updateField("code", e.target.value)}
             placeholder={DEFAULT_TEST_CODE}
@@ -282,6 +286,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
         <div className="flex items-center gap-2">
           <input
             type="text"
+            aria-label="Add a tag"
             value={tagInput}
             onChange={(e) => setTagInput(e.target.value)}
             onKeyDown={handleTagKeyDown}

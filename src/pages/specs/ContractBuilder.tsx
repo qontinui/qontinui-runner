@@ -206,6 +206,7 @@ function CheckTypeEditor({
       <div className="grid grid-cols-[1fr_auto_auto] gap-2">
         <input
           type="text"
+          aria-label="API endpoint URL"
           value={check.endpoint}
           onChange={(e) => onChange({ ...check, endpoint: e.target.value })}
           placeholder="https://api.example.com/health"
@@ -213,6 +214,7 @@ function CheckTypeEditor({
             placeholder:text-muted-foreground/50 focus:outline-hidden focus:border-cyan-500/50"
         />
         <select
+          aria-label="HTTP method"
           value={check.method}
           onChange={(e) =>
             onChange({ ...check, method: e.target.value as "GET" | "POST" | "PUT" | "DELETE" })
@@ -226,6 +228,7 @@ function CheckTypeEditor({
         </select>
         <input
           type="number"
+          aria-label="Expected HTTP status"
           value={check.expectedStatus}
           onChange={(e) => onChange({ ...check, expectedStatus: parseInt(e.target.value) || 200 })}
           className="w-20 px-2 py-1 text-xs rounded bg-white/5 border border-white/10 text-foreground
@@ -242,6 +245,7 @@ function CheckTypeEditor({
     <div className="space-y-2">
       <input
         type="text"
+        aria-label="Assertion description"
         value={assertion.description || ""}
         onChange={(e) =>
           onChange({
@@ -255,6 +259,7 @@ function CheckTypeEditor({
       />
       <div className="grid grid-cols-2 gap-2">
         <select
+          aria-label="Assertion type"
           value={assertion.assertionType || "exists"}
           onChange={(e) =>
             onChange({
@@ -274,6 +279,7 @@ function CheckTypeEditor({
           <option value="checked">checked</option>
         </select>
         <select
+          aria-label="Severity"
           value={assertion.severity || "warning"}
           onChange={(e) =>
             onChange({
@@ -308,6 +314,7 @@ function ConditionEditor({
       <div className="flex items-center gap-2">
         <input
           type="text"
+          aria-label="Condition ID"
           value={condition.id}
           onChange={(e) => onChange({ ...condition, id: e.target.value })}
           className="w-24 px-2 py-1 text-[10px] font-mono rounded bg-white/5 border border-white/10
@@ -316,6 +323,7 @@ function ConditionEditor({
         />
         <input
           type="text"
+          aria-label="Condition description"
           value={condition.description}
           onChange={(e) => onChange({ ...condition, description: e.target.value })}
           placeholder="Condition description"
@@ -333,6 +341,7 @@ function ConditionEditor({
       <div className="flex items-center gap-2">
         <label className="text-[10px] text-muted-foreground shrink-0">Check:</label>
         <select
+          aria-label="Check type"
           value={checkType}
           onChange={(e) => {
             const newType = e.target.value as "assertion" | "api";
@@ -369,6 +378,7 @@ function ConditionEditor({
 
         <label className="text-[10px] text-muted-foreground shrink-0 ml-2">On Failure:</label>
         <select
+          aria-label="On Failure"
           value={condition.onFailure}
           onChange={(e) =>
             onChange({ ...condition, onFailure: e.target.value as "skip" | "fail" | "warn" })
@@ -430,6 +440,7 @@ function VerificationEditor({
           <div>
             <label className="text-[10px] text-muted-foreground block mb-1">Spec ID</label>
             <select
+              aria-label="Spec ID"
               value={verification.specId}
               onChange={(e) => {
                 const specId = e.target.value;
@@ -448,6 +459,7 @@ function VerificationEditor({
           <div>
             <label className="text-[10px] text-muted-foreground block mb-1">Group ID</label>
             <select
+              aria-label="Group ID"
               value={verification.groupId}
               onChange={(e) => onChange({ ...verification, groupId: e.target.value })}
               className="w-full px-2 py-1 text-xs rounded bg-white/5 border border-white/10 text-foreground"
@@ -475,6 +487,7 @@ function VerificationEditor({
               <div className="flex items-center gap-2">
                 <input
                   type="text"
+                  aria-label="Assertion description"
                   value={assertion.description}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                     const assertions = [...verification.assertions];
@@ -849,6 +862,7 @@ export function ContractBuilder() {
                   </label>
                   <input
                     type="text"
+                    aria-label="Contract Name"
                     value={activeContract.name}
                     onChange={(e) =>
                       updateActiveContract({ ...activeContract, name: e.target.value })
@@ -863,6 +877,7 @@ export function ContractBuilder() {
                     Description
                   </label>
                   <textarea
+                    aria-label="Description"
                     value={activeContract.description}
                     onChange={(e) =>
                       updateActiveContract({ ...activeContract, description: e.target.value })

@@ -65,6 +65,7 @@ export function ScriptListPanel({
           <input
             id="script-search"
             type="text"
+            aria-label="Search scripts"
             placeholder="Search scripts..."
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}

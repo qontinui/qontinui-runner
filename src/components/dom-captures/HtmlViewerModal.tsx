@@ -146,6 +146,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
               <input
                 id="html-search"
                 type="text"
+                aria-label="Search HTML content"
                 placeholder="Search (Ctrl+F)"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}

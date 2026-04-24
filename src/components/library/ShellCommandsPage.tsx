@@ -125,6 +125,7 @@ function TagInput({ tags, onChange }: TagInputProps) {
       <div className="flex items-center gap-2">
         <input
           type="text"
+          aria-label="Add a tag"
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -243,6 +244,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
             <label className="text-xs font-medium text-muted-foreground">Name</label>
             <input
               type="text"
+              aria-label="Name"
               value={formState.name ?? ""}
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Command name..."
@@ -256,6 +258,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
             <label className="text-xs font-medium text-muted-foreground">Category</label>
             <input
               type="text"
+              aria-label="Category"
               value={formState.category ?? ""}
               onChange={(e) => updateField("category", e.target.value)}
               placeholder="e.g., build, deploy, test..."
@@ -278,6 +281,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">Shell Command</label>
             <textarea
+              aria-label="Shell Command"
               value={formState.command ?? ""}
               onChange={(e) => updateField("command", e.target.value)}
               placeholder="Enter shell command..."
@@ -295,6 +299,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
             </label>
             <input
               type="text"
+              aria-label="Working Directory"
               value={formState.working_directory ?? ""}
               onChange={(e) => updateField("working_directory", e.target.value)}
               placeholder="/path/to/directory (optional)"
@@ -317,6 +322,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">Platform</label>
             <select
+              aria-label="Platform"
               value={formState.platform ?? "any"}
               onChange={(e) =>
                 updateField("platform", e.target.value as ShellCommandItem["platform"])
@@ -339,6 +345,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
             </label>
             <input
               type="number"
+              aria-label="Timeout (seconds)"
               value={formState.timeout ?? 30}
               onChange={(e) => updateField("timeout", parseInt(e.target.value, 10) || 30)}
               min={1}

@@ -189,6 +189,7 @@ export function DecisionTrailPage() {
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
               <input
                 type="text"
+                aria-label="Search decisions and concepts"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search decisions and concepts..."
@@ -197,6 +198,7 @@ export function DecisionTrailPage() {
             </div>
 
             <select
+              aria-label="Category filter"
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value)}
               className="px-2 py-1.5 text-xs rounded-md border border-border bg-background text-foreground"

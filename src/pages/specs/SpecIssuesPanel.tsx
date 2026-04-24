@@ -154,6 +154,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
       {/* Title */}
       <input
         type="text"
+        aria-label="Issue title"
         placeholder="Issue title"
         value={title}
         onChange={(e) => setTitle(e.target.value)}
@@ -163,6 +164,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
 
       {/* Description */}
       <textarea
+        aria-label="Issue description"
         placeholder="Describe the issue — what you observed, what's wrong"
         value={description}
         onChange={(e) => setDescription(e.target.value)}
@@ -177,6 +179,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
             Category
           </label>
           <select
+            aria-label="Category"
             value={category}
             onChange={(e) => setCategory(e.target.value as IssueCategory)}
             className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
@@ -193,6 +196,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
             Severity
           </label>
           <select
+            aria-label="Severity"
             value={severity}
             onChange={(e) => setSeverity(e.target.value as KnownIssueSeverity)}
             className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
@@ -213,6 +217,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
         </label>
         <input
           type="text"
+          aria-label="Verification Hint (optional)"
           placeholder="How to check for this issue"
           value={verificationHint}
           onChange={(e) => setVerificationHint(e.target.value)}
@@ -227,6 +232,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
         </label>
         <input
           type="text"
+          aria-label="Reproduction Context (optional)"
           placeholder="When does this happen?"
           value={reproductionContext}
           onChange={(e) => setReproductionContext(e.target.value)}

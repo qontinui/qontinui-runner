@@ -94,6 +94,7 @@ export function DeveloperArchitecturePanel({
       {specs.length > 1 && (
         <div className="shrink-0">
           <select
+            aria-label="Select project"
             value={clampedIndex}
             onChange={(e) => setSelectedProjectIndex(Number(e.target.value))}
             className="px-3 py-1.5 text-sm bg-muted border border-border rounded-md"

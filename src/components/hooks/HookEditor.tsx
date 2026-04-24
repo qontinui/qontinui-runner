@@ -182,6 +182,7 @@ export function HookEditor({ hook, onSave, onCancel, loading }: HookEditorProps)
               <label className="block text-sm font-medium text-muted-foreground mb-1">Name *</label>
               <input
                 type="text"
+                aria-label="Name"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="My Hook"
@@ -197,6 +198,7 @@ export function HookEditor({ hook, onSave, onCancel, loading }: HookEditorProps)
                 Description
               </label>
               <textarea
+                aria-label="Description"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="What this hook does..."

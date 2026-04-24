@@ -532,6 +532,7 @@ export function MultiLoopPanel() {
                     <span className="text-muted-foreground">:{a.port}</span>
                   </span>
                   <select
+                    aria-label="Select workflow"
                     value={a.workflowId}
                     onChange={(e) => updateAssignment(idx, "workflowId", e.target.value)}
                     className={cn(inputCls, "flex-1")}
@@ -545,6 +546,7 @@ export function MultiLoopPanel() {
                   </select>
                   <input
                     type="text"
+                    aria-label="Loop label"
                     value={a.label}
                     onChange={(e) => updateAssignment(idx, "label", e.target.value)}
                     className={cn(inputCls, "w-[100px]")}
@@ -561,6 +563,7 @@ export function MultiLoopPanel() {
               {availableRunners.length > 0 && (
                 <div className="flex items-center gap-2">
                   <select
+                    aria-label="Add runner"
                     value=""
                     onChange={(e) => {
                       const runner = runnerInstances.find((r) => r.id === e.target.value);
@@ -593,6 +596,7 @@ export function MultiLoopPanel() {
               </label>
               <input
                 type="number"
+                aria-label="Max Iterations"
                 min={1}
                 max={50}
                 value={maxIter ?? ""}
@@ -613,6 +617,7 @@ export function MultiLoopPanel() {
               <label className={labelCls}>Supervisor Port</label>
               <input
                 type="text"
+                aria-label="Supervisor Port"
                 value={supervisorPort}
                 onChange={(e) => setSupervisorPort(e.target.value)}
                 className={cn(inputCls, "w-full mt-0.5")}
@@ -621,6 +626,7 @@ export function MultiLoopPanel() {
             <div>
               <label className={labelCls}>Exit Strategy</label>
               <select
+                aria-label="Exit Strategy"
                 value={exitStrategy}
                 onChange={(e) => setExitStrategy(e.target.value)}
                 className={cn(inputCls, "w-full mt-0.5")}
@@ -633,6 +639,7 @@ export function MultiLoopPanel() {
             <div>
               <label className={labelCls}>Between Iterations</label>
               <select
+                aria-label="Between Iterations"
                 value={between}
                 onChange={(e) => setBetween(e.target.value)}
                 className={cn(inputCls, "w-full mt-0.5")}

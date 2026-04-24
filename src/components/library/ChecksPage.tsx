@@ -324,6 +324,7 @@ function TagInput({ tags, onChange }: TagInputProps) {
       <div className="flex items-center gap-2">
         <input
           type="text"
+          aria-label="Add a tag"
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -526,6 +527,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
             <label className="text-xs font-medium text-muted-foreground">Name</label>
             <input
               type="text"
+              aria-label="Name"
               value={formState.name ?? ""}
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Check name..."
@@ -539,6 +541,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
             <label className="text-xs font-medium text-muted-foreground">Description</label>
             <input
               type="text"
+              aria-label="Description"
               value={formState.description ?? ""}
               onChange={(e) => updateField("description", e.target.value)}
               placeholder="Brief description (optional)..."
@@ -552,6 +555,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-muted-foreground">Check Type</label>
               <select
+                aria-label="Check Type"
                 value={formState.check_type ?? "linter"}
                 onChange={(e) => handleCheckTypeChange(e.target.value)}
                 className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
@@ -571,6 +575,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
                 Tool
               </label>
               <select
+                aria-label="Tool"
                 value={formState.tool ?? "custom"}
                 onChange={(e) => handleToolChange(e.target.value)}
                 className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
@@ -598,6 +603,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">Command</label>
             <textarea
+              aria-label="Command"
               value={formState.command ?? ""}
               onChange={(e) => updateField("command", e.target.value)}
               placeholder="Shell command to execute..."
@@ -615,6 +621,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
             </label>
             <input
               type="text"
+              aria-label="Working Directory"
               value={formState.working_directory ?? ""}
               onChange={(e) => updateField("working_directory", e.target.value)}
               placeholder="/path/to/project (optional)"
@@ -629,6 +636,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
               <label className="text-xs font-medium text-muted-foreground">Config Path</label>
               <input
                 type="text"
+                aria-label="Config Path"
                 value={formState.config_path ?? ""}
                 onChange={(e) => updateField("config_path", e.target.value)}
                 placeholder=".eslintrc.json (optional)"
@@ -645,6 +653,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
               </label>
               <input
                 type="number"
+                aria-label="Timeout (seconds)"
                 value={formState.timeout_seconds ?? 300}
                 onChange={(e) =>
                   updateField("timeout_seconds", parseInt(e.target.value, 10) || 300)

@@ -198,6 +198,7 @@ export function ExternalLogsTab({
 
           {autoRefresh && (
             <select
+              aria-label="Auto-refresh interval"
               value={autoRefreshInterval}
               onChange={(e) => setAutoRefreshInterval(Number(e.target.value))}
               className="text-xs bg-muted border border-border rounded px-2 py-1"

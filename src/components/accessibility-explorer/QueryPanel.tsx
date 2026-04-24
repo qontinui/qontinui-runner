@@ -79,6 +79,7 @@ export function QueryPanel({
     <div className="space-y-2">
       <div className="flex items-center gap-2">
         <select
+          aria-label="Role filter"
           value={queryRole}
           onChange={(e) => onRoleChange(e.target.value)}
           className="px-2 py-1 text-xs rounded bg-muted/30 border border-border text-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
@@ -91,6 +92,7 @@ export function QueryPanel({
         </select>
         <input
           type="text"
+          aria-label="Label filter"
           value={queryLabel}
           onChange={(e) => onLabelChange(e.target.value)}
           placeholder="Label contains..."

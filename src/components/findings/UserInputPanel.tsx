@@ -108,6 +108,7 @@ function InputControl({
       return (
         <div className="space-y-2">
           <textarea
+            aria-label="Enter code"
             value={value}
             onChange={(e) => onChange(e.target.value)}
             placeholder="Enter code..."
@@ -132,6 +133,7 @@ function InputControl({
         <div className="flex gap-2">
           <input
             type="text"
+            aria-label="Enter your response"
             value={value}
             onChange={(e) => onChange(e.target.value)}
             placeholder={request.defaultValue || "Enter your response..."}

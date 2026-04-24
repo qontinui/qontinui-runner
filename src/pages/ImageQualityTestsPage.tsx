@@ -212,6 +212,7 @@ function ImageCard({
                 Category
               </label>
               <select
+                aria-label="Category"
                 className={inputClass}
                 value={editCategory}
                 onChange={(e) => setEditCategory(e.target.value)}
@@ -228,6 +229,7 @@ function ImageCard({
                 Label
               </label>
               <input
+                aria-label="Label"
                 className={inputClass}
                 value={editLabel}
                 onChange={(e) => setEditLabel(e.target.value)}
@@ -239,6 +241,7 @@ function ImageCard({
                 Expected Text
               </label>
               <input
+                aria-label="Expected Text"
                 className={inputClass}
                 value={editExpectedText}
                 onChange={(e) => setEditExpectedText(e.target.value)}
@@ -250,6 +253,7 @@ function ImageCard({
                 Issue
               </label>
               <input
+                aria-label="Issue"
                 className={inputClass}
                 value={editIssue}
                 onChange={(e) => setEditIssue(e.target.value)}
@@ -261,6 +265,7 @@ function ImageCard({
                 Element Type
               </label>
               <input
+                aria-label="Element Type"
                 className={inputClass}
                 value={editElementType}
                 onChange={(e) => setEditElementType(e.target.value)}
@@ -272,6 +277,7 @@ function ImageCard({
                 Description
               </label>
               <textarea
+                aria-label="Description"
                 className={`${inputClass} resize-none`}
                 rows={2}
                 value={editDescription}
@@ -478,6 +484,7 @@ function UploadPanel({ onUploadComplete }: { onUploadComplete: () => void }) {
                 Category
               </label>
               <select
+                aria-label="Category"
                 value={category}
                 onChange={(e) => setCategory(e.target.value as Category)}
                 className="w-full px-2 py-1.5 text-xs bg-muted/30 border border-border rounded-md text-foreground"
@@ -495,6 +502,7 @@ function UploadPanel({ onUploadComplete }: { onUploadComplete: () => void }) {
               </label>
               <input
                 type="text"
+                aria-label="Expected Label"
                 value={expectedLabel}
                 onChange={(e) => setExpectedLabel(e.target.value)}
                 placeholder="e.g. BETA"
@@ -507,6 +515,7 @@ function UploadPanel({ onUploadComplete }: { onUploadComplete: () => void }) {
               </label>
               <input
                 type="text"
+                aria-label="Issue Type"
                 value={issue}
                 onChange={(e) => setIssue(e.target.value)}
                 placeholder="e.g. text_clipped_bottom"
@@ -519,6 +528,7 @@ function UploadPanel({ onUploadComplete }: { onUploadComplete: () => void }) {
               </label>
               <input
                 type="text"
+                aria-label="Element Type"
                 value={elementType}
                 onChange={(e) => setElementType(e.target.value)}
                 placeholder="e.g. badge, button"
@@ -531,6 +541,7 @@ function UploadPanel({ onUploadComplete }: { onUploadComplete: () => void }) {
               </label>
               <input
                 type="text"
+                aria-label="Description"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="What's shown / what's wrong"

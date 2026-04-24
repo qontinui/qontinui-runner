@@ -298,6 +298,7 @@ export function EventHistoryPage() {
           <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
           <input
             type="text"
+            aria-label="Filter by event name or source"
             placeholder="Filter by event name or source..."
             value={filter}
             onChange={(e) => setFilter(e.target.value)}

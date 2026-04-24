@@ -176,6 +176,7 @@ export function AiApiRequestGenerator({
               </label>
               <input
                 type="text"
+                aria-label="Base URL (optional)"
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
                 placeholder="https://api.example.com"
@@ -189,6 +190,7 @@ export function AiApiRequestGenerator({
                 Describe the API request you need
               </label>
               <textarea
+                aria-label="Describe the API request you need"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Example: POST request to create a new user with name, email, and password fields, including proper Content-Type header"

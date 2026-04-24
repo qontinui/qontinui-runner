@@ -158,6 +158,7 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
                 Describe the topic for the knowledge base entry
               </label>
               <textarea
+                aria-label="Describe the topic for the knowledge base entry"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Example: Best practices for handling network timeouts in Playwright tests, including retry strategies and timeout configuration"

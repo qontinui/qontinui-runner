@@ -287,6 +287,7 @@ export function ContextEditor({
             </label>
             <input
               type="text"
+              aria-label="Name"
               value={name}
               onChange={(e) => setName(e.target.value)}
               disabled={isReadOnly}
@@ -308,6 +309,7 @@ export function ContextEditor({
                 Category
               </label>
               <select
+                aria-label="Category"
                 value={category}
                 onChange={(e) => {
                   setCategory(e.target.value);
@@ -328,6 +330,7 @@ export function ContextEditor({
               <label className="block text-sm font-medium mb-1">Or create new category</label>
               <input
                 type="text"
+                aria-label="Or create new category"
                 value={newCategory}
                 onChange={(e) => {
                   setNewCategory(e.target.value);
@@ -368,6 +371,7 @@ export function ContextEditor({
               <div className="flex gap-2">
                 <input
                   type="text"
+                  aria-label="Add tag"
                   value={tagInput}
                   onChange={(e) => setTagInput(e.target.value)}
                   onKeyDown={(e) => {
@@ -417,6 +421,7 @@ export function ContextEditor({
               </div>
             ) : (
               <textarea
+                aria-label="Content"
                 value={content}
                 onChange={(e) => setContent(e.target.value)}
                 disabled={isReadOnly}
@@ -480,6 +485,7 @@ export function ContextEditor({
                 <div className="flex gap-2">
                   <input
                     type="text"
+                    aria-label="Task mentions"
                     value={taskMentionInput}
                     onChange={(e) => setTaskMentionInput(e.target.value)}
                     onKeyDown={(e) => {
@@ -558,6 +564,7 @@ export function ContextEditor({
                 <div className="flex gap-2">
                   <input
                     type="text"
+                    aria-label="Error patterns"
                     value={errorPatternInput}
                     onChange={(e) => setErrorPatternInput(e.target.value)}
                     onKeyDown={(e) => {
@@ -614,6 +621,7 @@ export function ContextEditor({
                 <div className="flex gap-2">
                   <input
                     type="text"
+                    aria-label="File patterns"
                     value={filePatternInput}
                     onChange={(e) => setFilePatternInput(e.target.value)}
                     onKeyDown={(e) => {

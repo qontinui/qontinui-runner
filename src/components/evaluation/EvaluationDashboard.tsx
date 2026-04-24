@@ -169,6 +169,7 @@ export default function EvaluationDashboard() {
           <div className="flex-1 space-y-1">
             <label className="text-xs font-medium text-muted-foreground">Dataset Name</label>
             <input
+              aria-label="Dataset Name"
               className="w-full rounded-md bg-background border border-border px-3 py-1.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
               placeholder="e.g. Customer Support QA"
               value={newDatasetName}
@@ -184,6 +185,7 @@ export default function EvaluationDashboard() {
               Description (optional)
             </label>
             <input
+              aria-label="Description (optional)"
               className="w-full rounded-md bg-background border border-border px-3 py-1.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
               placeholder="Brief description..."
               value={newDatasetDescription}

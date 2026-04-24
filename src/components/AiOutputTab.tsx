@@ -413,6 +413,7 @@ export function AiOutputTab({
         <div className="mt-3 flex gap-2">
           <textarea
             ref={textareaRef}
+            aria-label="Start a conversation with AI"
             value={promptInput}
             onChange={(e) => setPromptInput(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -554,6 +555,7 @@ export function AiOutputTab({
       <div className="shrink-0 mt-3 flex gap-2">
         <textarea
           ref={textareaRef}
+          aria-label="AI conversation input"
           value={promptInput}
           onChange={(e) => {
             setPromptInput(e.target.value);

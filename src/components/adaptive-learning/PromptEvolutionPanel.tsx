@@ -138,6 +138,7 @@ export function PromptEvolutionPanel() {
         <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
           {/* Domain filter */}
           <select
+            aria-label="Filter by domain"
             value={domainFilter}
             onChange={(e) => setDomainFilter(e.target.value)}
             style={{

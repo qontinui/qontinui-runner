@@ -66,6 +66,7 @@ export function HookConditionBuilder({ conditions, onChange }: HookConditionBuil
             >
               {/* Variable selector */}
               <select
+                aria-label="Condition variable"
                 value={condition.variable}
                 onChange={(e) => updateCondition(index, { variable: e.target.value })}
                 className="px-2 py-1.5 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
@@ -79,6 +80,7 @@ export function HookConditionBuilder({ conditions, onChange }: HookConditionBuil
 
               {/* Operator selector */}
               <select
+                aria-label="Condition operator"
                 value={condition.operator}
                 onChange={(e) =>
                   updateCondition(index, {
@@ -99,6 +101,7 @@ export function HookConditionBuilder({ conditions, onChange }: HookConditionBuil
               {/* Value input */}
               <input
                 type="text"
+                aria-label="Condition value"
                 value={
                   typeof condition.value === "string"
                     ? condition.value

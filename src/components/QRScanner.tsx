@@ -172,6 +172,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
         <div className="space-y-2">
           <label className="block text-sm font-medium text-foreground">Select Camera</label>
           <select
+            aria-label="Select Camera"
             value={selectedCamera}
             onChange={(e) => handleCameraChange(e.target.value)}
             className="w-full px-3 py-2 bg-input border border-border/50 rounded-md text-foreground"

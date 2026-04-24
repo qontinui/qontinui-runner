@@ -299,6 +299,7 @@ export function PromptSnippetSelector({
                 <input
                   ref={searchInputRef}
                   type="text"
+                  aria-label="Search prompt snippets"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Search prompt snippets..."
@@ -308,6 +309,7 @@ export function PromptSnippetSelector({
 
               {categories.length > 0 && (
                 <select
+                  aria-label="Filter by category"
                   value={selectedCategory}
                   onChange={(e) => setSelectedCategory(e.target.value)}
                   className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-primary"
@@ -358,6 +360,7 @@ export function PromptSnippetSelector({
           <input
             ref={searchInputRef}
             type="text"
+            aria-label="Search prompt snippets"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="Search..."

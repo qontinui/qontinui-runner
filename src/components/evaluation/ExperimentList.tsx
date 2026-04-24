@@ -85,6 +85,7 @@ export function ExperimentList({
       {showCreate && (
         <div className="px-4 py-3 border-b border-border/50 bg-muted/20 space-y-2">
           <input
+            aria-label="Experiment name"
             className="w-full rounded-md bg-background border border-border px-3 py-1.5 text-xs focus:outline-hidden focus:ring-2 focus:ring-primary"
             placeholder="Experiment name"
             value={name}
@@ -94,12 +95,14 @@ export function ExperimentList({
             }}
           />
           <input
+            aria-label="Description (optional)"
             className="w-full rounded-md bg-background border border-border px-3 py-1.5 text-xs focus:outline-hidden focus:ring-2 focus:ring-primary"
             placeholder="Description (optional)"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
           />
           <input
+            aria-label="Prompt Variant ID (optional)"
             className="w-full rounded-md bg-background border border-border px-3 py-1.5 text-xs focus:outline-hidden focus:ring-2 focus:ring-primary"
             placeholder="Prompt Variant ID (optional)"
             value={promptVariantId}

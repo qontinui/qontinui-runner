@@ -251,6 +251,7 @@ export function DagWorkflowEditor() {
           <GitBranch className="w-4 h-4 text-indigo-400" />
           <input
             type="text"
+            aria-label="Workflow name"
             value={workflowName}
             onChange={(e) => setWorkflowName(e.target.value)}
             className="text-sm font-semibold bg-transparent border-none outline-none text-foreground placeholder:text-muted-foreground w-48 focus:bg-muted/30 rounded px-1 -mx-1 transition-colors"

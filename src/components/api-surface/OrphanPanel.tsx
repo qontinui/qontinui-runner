@@ -58,6 +58,7 @@ export function OrphanPanel({ orphans, onSelect }: Props) {
           <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-500" />
           <input
             type="text"
+            aria-label="Filter orphans"
             placeholder="Filter orphans..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}

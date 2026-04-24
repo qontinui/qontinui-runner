@@ -238,6 +238,7 @@ export default function AccessibilityExplorer() {
         <div className="flex items-center gap-2">
           <input
             type="text"
+            aria-label="Target window"
             value={target}
             onChange={(e) => setTarget(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleConnect()}

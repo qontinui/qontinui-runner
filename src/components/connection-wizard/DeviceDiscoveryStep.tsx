@@ -279,6 +279,7 @@ function LanBranch({ api }: { api: WizardApi }) {
         <div className="flex gap-2">
           <input
             type="text"
+            aria-label="Manual IP (host:port)"
             value={manualIp}
             onChange={(e) => setManualIp(e.target.value)}
             placeholder="192.168.1.42:8087"
@@ -344,6 +345,7 @@ function RemoteBranch({ api }: { api: WizardApi }) {
         <label className="text-xs text-muted-foreground block">Server address</label>
         <input
           type="text"
+          aria-label="Server address"
           value={serverAddr}
           onChange={(e) => setServerAddr(e.target.value)}
           placeholder="relay.example.com:2333"
@@ -355,6 +357,7 @@ function RemoteBranch({ api }: { api: WizardApi }) {
         <label className="text-xs text-muted-foreground block">Shared token</label>
         <input
           type="password"
+          aria-label="Shared token"
           value={token}
           onChange={(e) => setToken(e.target.value)}
           placeholder="Shared secret with the server"

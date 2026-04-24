@@ -136,6 +136,7 @@ function TagInput({ tags, onChange }: TagInputProps) {
       <div className="flex items-center gap-2">
         <input
           type="text"
+          aria-label="Add a tag"
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -379,6 +380,7 @@ function CheckGroupEditor({ builder }: CheckGroupEditorProps) {
             <label className="text-xs font-medium text-muted-foreground">Name</label>
             <input
               type="text"
+              aria-label="Name"
               value={formState.name ?? ""}
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Group name..."
@@ -391,6 +393,7 @@ function CheckGroupEditor({ builder }: CheckGroupEditorProps) {
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">Description</label>
             <textarea
+              aria-label="Description"
               value={formState.description ?? ""}
               onChange={(e) => updateField("description", e.target.value)}
               placeholder="What does this group of checks verify?"
@@ -414,6 +417,7 @@ function CheckGroupEditor({ builder }: CheckGroupEditorProps) {
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">Run Mode</label>
             <select
+              aria-label="Run Mode"
               value={formState.run_in_parallel ? "parallel" : "sequential"}
               onChange={(e) => updateField("run_in_parallel", e.target.value === "parallel")}
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md

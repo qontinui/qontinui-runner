@@ -45,6 +45,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
       <div>
         <label className="block text-sm font-medium text-muted-foreground mb-1">Command *</label>
         <textarea
+          aria-label="Command"
           value={config.command}
           onChange={(e) => onChange(actionType, { ...config, command: e.target.value })}
           placeholder="echo 'Hello World'"
@@ -62,6 +63,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
         </label>
         <input
           type="text"
+          aria-label="Working Directory"
           value={config.working_dir || ""}
           onChange={(e) =>
             onChange(actionType, {
@@ -80,6 +82,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
         </label>
         <input
           type="number"
+          aria-label="Timeout (seconds)"
           value={config.timeout_seconds}
           onChange={(e) =>
             onChange(actionType, {
@@ -131,6 +134,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
           <div className="flex items-center gap-2">
             <input
               type="text"
+              aria-label="Environment variable key"
               value={newEnvKey}
               onChange={(e) => setNewEnvKey(e.target.value)}
               placeholder="KEY"
@@ -138,6 +142,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
             />
             <input
               type="text"
+              aria-label="Environment variable value"
               value={newEnvValue}
               onChange={(e) => setNewEnvValue(e.target.value)}
               placeholder="value"
@@ -182,6 +187,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
         <div className="w-32">
           <label className="block text-sm font-medium text-muted-foreground mb-1">Method</label>
           <select
+            aria-label="Method"
             value={config.method}
             onChange={(e) => onChange(actionType, { ...config, method: e.target.value })}
             className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
@@ -197,6 +203,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
           <label className="block text-sm font-medium text-muted-foreground mb-1">URL *</label>
           <input
             type="url"
+            aria-label="URL"
             value={config.url}
             onChange={(e) => onChange(actionType, { ...config, url: e.target.value })}
             placeholder="https://api.example.com/webhook"
@@ -241,6 +248,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
           <div className="flex items-center gap-2">
             <input
               type="text"
+              aria-label="Header name"
               value={newHeaderKey}
               onChange={(e) => setNewHeaderKey(e.target.value)}
               placeholder="Header-Name"
@@ -248,6 +256,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
             />
             <input
               type="text"
+              aria-label="Header value"
               value={newHeaderValue}
               onChange={(e) => setNewHeaderValue(e.target.value)}
               placeholder="value"
@@ -275,6 +284,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
       <div>
         <label className="block text-sm font-medium text-muted-foreground mb-1">Request Body</label>
         <textarea
+          aria-label="Request Body"
           value={config.body || ""}
           onChange={(e) =>
             onChange(actionType, {
@@ -297,6 +307,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
         </label>
         <input
           type="number"
+          aria-label="Timeout (seconds)"
           value={config.timeout_seconds}
           onChange={(e) =>
             onChange(actionType, {
@@ -328,6 +339,7 @@ function LogConfig({
       <div>
         <label className="block text-sm font-medium text-muted-foreground mb-1">Log Level</label>
         <select
+          aria-label="Log Level"
           value={config.level}
           onChange={(e) => onChange(actionType, { ...config, level: e.target.value })}
           className="w-40 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
@@ -343,6 +355,7 @@ function LogConfig({
       <div>
         <label className="block text-sm font-medium text-muted-foreground mb-1">Message *</label>
         <textarea
+          aria-label="Message"
           value={config.message}
           onChange={(e) => onChange(actionType, { ...config, message: e.target.value })}
           placeholder="Task {{task_name}} completed with status: {{status}}"
@@ -374,6 +387,7 @@ function NotificationConfig({
         <label className="block text-sm font-medium text-muted-foreground mb-1">Title *</label>
         <input
           type="text"
+          aria-label="Title"
           value={config.title}
           onChange={(e) => onChange(actionType, { ...config, title: e.target.value })}
           placeholder="Task {{task_name}} Complete"
@@ -384,6 +398,7 @@ function NotificationConfig({
       <div>
         <label className="block text-sm font-medium text-muted-foreground mb-1">Body *</label>
         <textarea
+          aria-label="Body"
           value={config.body}
           onChange={(e) => onChange(actionType, { ...config, body: e.target.value })}
           placeholder="Completed after {{iteration}} iterations with status: {{status}}"

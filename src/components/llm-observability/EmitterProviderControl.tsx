@@ -254,6 +254,7 @@ export function EmitterProviderControl() {
           <div className="text-xs text-muted-foreground mb-1">Provider</div>
           <select
             ref={providerSelectRef}
+            aria-label="Provider"
             value={dirty.provider}
             onChange={(e) => setDirty({ ...dirty, provider: e.target.value as ProviderMode })}
             className="w-full px-3 py-2 rounded-md border border-border bg-background text-sm"
@@ -280,6 +281,7 @@ export function EmitterProviderControl() {
               <input
                 ref={gemmaEndpointInputRef}
                 type="text"
+                aria-label="Endpoint"
                 value={dirty.gemma_local_endpoint}
                 onChange={(e) => setDirty({ ...dirty, gemma_local_endpoint: e.target.value })}
                 placeholder="http://localhost:8200"

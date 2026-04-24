@@ -71,6 +71,7 @@ export function ContextFilters({
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <input
             type="text"
+            aria-label="Search contexts"
             placeholder="Search contexts by name, content, or tags..."
             value={filters.searchQuery || ""}
             onChange={(e) => updateFilter("searchQuery", e.target.value)}
@@ -88,6 +89,7 @@ export function ContextFilters({
 
         {/* Scope Filter */}
         <select
+          aria-label="Scope filter"
           value={filters.scope || "all"}
           onChange={(e) => updateFilter("scope", e.target.value as ContextScope | "all")}
           className="px-3 py-2 bg-card border border-border rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
@@ -101,6 +103,7 @@ export function ContextFilters({
 
         {/* Category Filter */}
         <select
+          aria-label="Category filter"
           value={filters.category || "all"}
           onChange={(e) => updateFilter("category", e.target.value)}
           className="px-3 py-2 bg-card border border-border rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
@@ -121,6 +124,7 @@ export function ContextFilters({
           <div className="flex items-center gap-2">
             <SlidersHorizontal className="w-4 h-4 text-muted-foreground" />
             <select
+              aria-label="Sort by"
               value={filters.sortBy || "modifiedAt"}
               onChange={(e) =>
                 updateFilter("sortBy", e.target.value as ContextFilterOptions["sortBy"])
