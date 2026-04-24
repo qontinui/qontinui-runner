@@ -6,6 +6,10 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tracing::{debug, info, warn};
 
+// Migrated to BridgeCompartment (Workstream C) — 2 of 3 state handlers.
+// `get_executor_status` keeps `Arc<AppState>` (reads bridge_manager +
+// current_config, which span BridgeCompartment + ExecutionCompartment).
+use super::super::compartments::BridgeCompartment;
 use super::super::{AppState, CommandResponse};
 // Note: BridgeManager methods (is_default_bridge_running, with_default_bridge, etc.)
 // are synchronous and can be called directly after acquiring the manager lock.
@@ -191,11 +195,11 @@ pub fn get_monitors(app_handle: AppHandle) -> Result<CommandResponse, String> {
 #[tauri::command]
 pub async fn set_input_capture_enabled(
     enabled: bool,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Setting input capture enabled: {}", enabled);
 
-    let manager_guard = state.bridge_manager.lock().await;
+    let manager_guard = state.bridge_manager().lock().await;
     let manager = manager_guard
         .as_ref()
         .ok_or("Bridge manager not initialized")?;
@@ -241,9 +245,9 @@ pub async fn set_input_capture_enabled(
 /// * `Err(String)` - Error if executor not running
 #[tauri::command]
 pub async fn get_input_validation_status(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
-    let manager_guard = state.bridge_manager.lock().await;
+    let manager_guard = state.bridge_manager().lock().await;
     // Use async check to avoid nested runtime panic
     let is_running = if let Some(ref manager) = *manager_guard {
         manager.is_default_bridge_running_async().await
