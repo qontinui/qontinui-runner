@@ -505,6 +505,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::cost_dashboard::plugin())
         .plugin(commands::learning::plugin())
         .plugin(commands::performance_metrics::plugin())
+        .plugin(commands::recap::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -754,8 +755,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::context::get_builtin_contexts_cmd,
             commands::context::evaluate_auto_include,
             // NOTE: ai_data handlers moved to per-module plugin (see .plugin() calls above).
-            // Recap commands (Session overview)
-            commands::recap::get_task_run_recap,
+            // NOTE: recap handlers moved to per-module plugin (see .plugin() calls above).
             // Task Sync commands (sync to qontinui-web)
             commands::task_sync::sync_ai_task_created,
             commands::task_sync::sync_ai_session_started,

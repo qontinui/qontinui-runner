@@ -19,6 +19,8 @@ mod utils;
 
 use crate::commands::AppState;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{info, warn};
 
@@ -173,4 +175,10 @@ pub async fn get_task_run_recap(
     };
 
     Ok(RecapResponse::ok(recap))
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_recap")
+        .invoke_handler(tauri::generate_handler![get_task_run_recap])
+        .build()
 }
