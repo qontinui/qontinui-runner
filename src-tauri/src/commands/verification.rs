@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use super::CommandResponse;
@@ -253,4 +255,16 @@ pub fn update_verification_status(status: String) -> CommandResponse {
         message: Some(format!("Status updated to: {}", status)),
         data: None,
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_verification")
+        .invoke_handler(tauri::generate_handler![
+            save_pending_verification,
+            load_pending_verification,
+            clear_pending_verification,
+            update_verification_status,
+        ])
+        .build()
 }
