@@ -5,15 +5,18 @@
 //! - Querying recording status
 //! - Managing recording sessions
 
+use crate::error::AppError;
 use crate::video_recorder::VideoRecordingConfig;
 use serde_json;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
-use super::{AppState, CommandResponse};
+use super::compartments::StorageCompartment;
+use super::CommandResponse;
+
+// Migrated to StorageCompartment (Workstream C).
 
 /// Start video recording for the current automation session.
 ///
@@ -31,15 +34,23 @@ use super::{AppState, CommandResponse};
 pub fn start_video_recording(
     session_id: String,
     config: VideoRecordingConfig,
-    state: State<Arc<AppState>>,
+    state: State<StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    start_video_recording_impl(session_id, config, &state).map_err(String::from)
+}
+
+fn start_video_recording_impl(
+    session_id: String,
+    config: VideoRecordingConfig,
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!("Starting video recording for session: {}", session_id);
 
-    let recorder = state.video_recorder.lock().map_err(|e| e.to_string())?;
+    let recorder = state.video_recorder().lock()?;
 
     recorder.start_recording(&session_id, config).map_err(|e| {
         error!("Failed to start video recording: {}", e);
-        format!("Failed to start video recording: {}", e)
+        AppError::ExecutorError(format!("Failed to start video recording: {}", e))
     })?;
 
     Ok(CommandResponse {
@@ -60,14 +71,20 @@ pub fn start_video_recording(
 /// * `Ok(CommandResponse)` - Success with saved video path
 /// * `Err(String)` - Error if recording fails to stop
 #[tauri::command]
-pub fn stop_video_recording(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn stop_video_recording(
+    state: State<StorageCompartment>,
+) -> Result<CommandResponse, String> {
+    stop_video_recording_impl(&state).map_err(String::from)
+}
+
+fn stop_video_recording_impl(state: &StorageCompartment) -> Result<CommandResponse, AppError> {
     info!("Stopping video recording");
 
-    let recorder = state.video_recorder.lock().map_err(|e| e.to_string())?;
+    let recorder = state.video_recorder().lock()?;
 
     let video_path = recorder.stop_recording().map_err(|e| {
         error!("Failed to stop video recording: {}", e);
-        format!("Failed to stop video recording: {}", e)
+        AppError::ExecutorError(format!("Failed to stop video recording: {}", e))
     })?;
 
     Ok(CommandResponse {
@@ -90,18 +107,26 @@ pub fn stop_video_recording(state: State<Arc<AppState>>) -> Result<CommandRespon
 /// * `Ok(CommandResponse)` - Success with status data
 /// * `Err(String)` - Error if status query fails
 #[tauri::command]
-pub fn get_video_recording_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    let recorder = state.video_recorder.lock().map_err(|e| e.to_string())?;
+pub fn get_video_recording_status(
+    state: State<StorageCompartment>,
+) -> Result<CommandResponse, String> {
+    get_video_recording_status_impl(&state).map_err(String::from)
+}
+
+fn get_video_recording_status_impl(
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
+    let recorder = state.video_recorder().lock()?;
 
     let status = recorder.get_status().map_err(|e| {
         error!("Failed to get video recording status: {}", e);
-        format!("Failed to get video recording status: {}", e)
+        AppError::ExecutorError(format!("Failed to get video recording status: {}", e))
     })?;
 
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::to_value(status).map_err(|e| e.to_string())?),
+        data: Some(serde_json::to_value(status)?),
     })
 }
 
