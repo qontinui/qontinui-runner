@@ -6,7 +6,7 @@
 //! Uses PostgreSQL for persistence with in-memory CheckpointManager for
 //! real-time operations like replay.
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::database::CreateTaskRunInput;
 use crate::orchestrator::checkpoint::{
     Checkpoint, CheckpointDiff, CheckpointManager, CheckpointSummary, CheckpointTrigger,
@@ -16,7 +16,7 @@ use crate::orchestrator::checkpoint::{
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -32,11 +32,11 @@ static REPLAY_MANAGER: Lazy<Mutex<ReplayManager>> = Lazy::new(|| Mutex::new(Repl
 /// List all checkpoints, optionally filtered by task ID.
 #[tauri::command]
 pub async fn list_orchestrator_checkpoints(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_id: Option<String>,
 ) -> Result<Vec<CheckpointSummary>, String> {
     let checkpoints_json = state
-        .pg_db
+        .pg_db()
         .get_orchestrator_checkpoints(task_id.as_deref())
         .await?;
 
@@ -67,10 +67,10 @@ pub async fn list_orchestrator_checkpoints(
 /// Get a checkpoint by ID.
 #[tauri::command]
 pub async fn get_orchestrator_checkpoint(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     id: String,
 ) -> Result<Option<Checkpoint>, String> {
-    let checkpoint_json = state.pg_db.get_orchestrator_checkpoint(&id).await?;
+    let checkpoint_json = state.pg_db().get_orchestrator_checkpoint(&id).await?;
 
     if let Some(cp) = checkpoint_json {
         // Deserialize the state snapshot from JSON
@@ -117,7 +117,7 @@ pub async fn get_orchestrator_checkpoint(
 /// Create a manual checkpoint for a task.
 #[tauri::command]
 pub async fn create_orchestrator_checkpoint(
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
     task_id: String,
     name: Option<String>,
     description: Option<String>,
@@ -158,7 +158,7 @@ pub async fn create_orchestrator_checkpoint(
     // Persist to database
     let state_json = serde_json::to_value(&snapshot).unwrap_or(serde_json::json!(state));
     app_state
-        .pg_db
+        .pg_db()
         .save_orchestrator_checkpoint(
             &id,
             &task_id,
@@ -175,7 +175,7 @@ pub async fn create_orchestrator_checkpoint(
 /// Delete a checkpoint by ID.
 #[tauri::command]
 pub async fn delete_orchestrator_checkpoint(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     id: String,
 ) -> Result<bool, String> {
     // Delete from in-memory manager
@@ -185,7 +185,7 @@ pub async fn delete_orchestrator_checkpoint(
     } // MutexGuard dropped before .await
 
     // Delete from database
-    state.pg_db.delete_orchestrator_checkpoint(&id).await
+    state.pg_db().delete_orchestrator_checkpoint(&id).await
 }
 
 /// Find checkpoints by tag.
@@ -234,17 +234,17 @@ pub fn start_replay_session(checkpoint_id: String) -> Result<ReplaySession, Stri
 
 /// Get total checkpoint count.
 #[tauri::command]
-pub async fn get_checkpoint_count(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
-    let checkpoints = state.pg_db.get_orchestrator_checkpoints(None).await?;
+pub async fn get_checkpoint_count(state: State<'_, StorageCompartment>) -> Result<usize, String> {
+    let checkpoints = state.pg_db().get_orchestrator_checkpoints(None).await?;
     Ok(checkpoints.len())
 }
 
 /// Get unique task IDs that have checkpoints.
 #[tauri::command]
 pub async fn get_checkpoint_task_ids(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<String>, String> {
-    state.pg_db.get_checkpoint_task_ids().await
+    state.pg_db().get_checkpoint_task_ids().await
 }
 
 /// Clear all checkpoints (for testing/reset).
@@ -257,7 +257,7 @@ pub fn clear_all_checkpoints() -> Result<(), String> {
 
 /// Add sample checkpoints for demonstration.
 #[tauri::command]
-pub async fn add_sample_checkpoints(app_state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn add_sample_checkpoints(app_state: State<'_, StorageCompartment>) -> Result<(), String> {
     let task_id = "sample-task-001";
 
     // Collect items to save to PG after releasing the mutex
@@ -358,7 +358,7 @@ pub async fn add_sample_checkpoints(app_state: State<'_, Arc<AppState>>) -> Resu
     // Now persist to PG (async, no mutex held)
     for (id, i, trigger_str, state_json, name) in &pg_saves {
         let _ = app_state
-            .pg_db
+            .pg_db()
             .save_orchestrator_checkpoint(id, task_id, *i, trigger_str, state_json, *name)
             .await;
     }
@@ -377,10 +377,10 @@ pub struct CheckpointStats {
 /// Get checkpoint statistics.
 #[tauri::command]
 pub async fn get_checkpoint_stats(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<CheckpointStats, String> {
-    let checkpoints = state.pg_db.get_orchestrator_checkpoints(None).await?;
-    let task_ids = state.pg_db.get_checkpoint_task_ids().await?;
+    let checkpoints = state.pg_db().get_orchestrator_checkpoints(None).await?;
+    let task_ids = state.pg_db().get_checkpoint_task_ids().await?;
 
     let mut by_trigger: HashMap<String, usize> = HashMap::new();
     for cp in &checkpoints {
@@ -424,7 +424,7 @@ pub struct ReplayFromCheckpointResponse {
 /// A ReplayFromCheckpointResponse containing the session, lineage, and restoration info.
 #[tauri::command]
 pub async fn replay_from_checkpoint(
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
     checkpoint_id: String,
 ) -> Result<ReplayFromCheckpointResponse, String> {
     // Get the checkpoint from in-memory manager
@@ -452,7 +452,7 @@ pub async fn replay_from_checkpoint(
 
     // Create a new task run in the database (branched from checkpoint)
     let original_prompt = app_state
-        .pg_db
+        .pg_db()
         .get_task_run(&checkpoint.task_id)
         .await
         .ok()
@@ -475,7 +475,7 @@ pub async fn replay_from_checkpoint(
     let input = CreateTaskRunInput::new(&new_task_run_id, &replay_task_name)
         .with_prompt(&replay_prompt)
         .with_auto_continue(true);
-    app_state.pg_db.create_task_run(&input).await?;
+    app_state.pg_db().create_task_run(&input).await?;
 
     // Save replay lineage to database
     let _lineage_json = serde_json::to_string(&replay_result.lineage)
@@ -490,7 +490,7 @@ pub async fn replay_from_checkpoint(
     })
     .to_string();
     app_state
-        .pg_db
+        .pg_db()
         .update_task_run_runtime_context(&new_task_run_id, &runtime_ctx)
         .await?;
 
@@ -616,11 +616,11 @@ pub struct PaginatedCheckpointResult {
 /// Get checkpoints with optional filtering.
 #[tauri::command]
 pub async fn get_checkpoints_filtered(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     filter: CheckpointFilter,
 ) -> Result<Vec<CheckpointSummary>, String> {
     let checkpoints_json = state
-        .pg_db
+        .pg_db()
         .get_checkpoints_filtered(
             filter.task_id.as_deref(),
             filter.trigger.as_deref(),
@@ -655,13 +655,13 @@ pub async fn get_checkpoints_filtered(
 /// Get checkpoints with pagination.
 #[tauri::command]
 pub async fn get_checkpoints_paginated(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_id: Option<String>,
     offset: i64,
     limit: i64,
 ) -> Result<PaginatedCheckpointResult, String> {
     let checkpoints_json = state
-        .pg_db
+        .pg_db()
         .get_checkpoints_paginated(task_id.as_deref(), offset, limit)
         .await?;
 
@@ -687,7 +687,7 @@ pub async fn get_checkpoints_paginated(
         .collect();
 
     let total = state
-        .pg_db
+        .pg_db()
         .get_checkpoints_count(task_id.as_deref())
         .await?;
 
@@ -702,10 +702,10 @@ pub async fn get_checkpoints_paginated(
 /// Get total count of checkpoints.
 #[tauri::command]
 pub async fn get_checkpoints_count(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_id: Option<String>,
 ) -> Result<i64, String> {
-    state.pg_db.get_checkpoints_count(task_id.as_deref()).await
+    state.pg_db().get_checkpoints_count(task_id.as_deref()).await
 }
 
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
