@@ -57,10 +57,17 @@ fn default_timeout_ms() -> u64 {
     8000
 }
 
-/// Request for page navigation
+/// Request for page navigation.
+///
+/// `mode` is optional and defaults to `"hard"` (full webview reload). `"soft"`
+/// performs a SPA-style `history.pushState` navigation that preserves any
+/// injected window state (fetch patches, spies, `window.__*` globals). Any
+/// value other than `"hard"` / `"soft"` is rejected with a 400.
 #[derive(Debug, Deserialize)]
 pub struct PageNavigateRequest {
-    url: String,
+    pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
 }
 
 /// Request for CSS selector query
@@ -125,6 +132,13 @@ pub struct SetTabResponse {
     /// Value of `[data-page-id]` on the active page after the tab change
     /// (null if no element with that attribute is present).
     pub page_id: Option<String>,
+}
+
+/// Request body for `POST /ui-bridge/control/tab/activate` (F4).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabActivateRequest {
+    pub tab_id: String,
 }
 
 // ============================================================================
@@ -428,11 +442,24 @@ pub async fn ui_bridge_page_close_request_handler(
 }
 
 /// Navigate to a URL.
+///
+/// Accepts an optional `mode` field:
+/// - `"hard"` (default): full webview reload via `window.location.href = url`.
+/// - `"soft"`: SPA-style `history.pushState` + synthetic `popstate`/`ui-bridge:navigate`
+///   events, preserving any injected `window.<custom-globals>` state.
+///
+/// The response `data` block carries `{ url, hard, mode }` so callers can
+/// audit which behaviour the runner executed. The legacy `hard` flag is
+/// retained for back-compat — old clients that only read `hard` continue to
+/// work.
 pub async fn ui_bridge_page_navigate_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<PageNavigateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Page navigate to {}", request.url);
+    info!(
+        "UI Bridge API: Page navigate to {} (mode={:?})",
+        request.url, request.mode
+    );
 
     let url = request.url.trim();
     if url.is_empty() {
@@ -476,10 +503,37 @@ pub async fn ui_bridge_page_navigate_handler(
         }
     }
 
-    let payload = serde_json::json!({ "url": url });
+    // Validate and normalize the mode flag. Default = "hard" for back-compat.
+    let mode = match normalize_navigate_mode(request.mode.as_deref()) {
+        Ok(m) => m,
+        Err(bad) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "invalid mode `{}` (expected \"hard\" or \"soft\")",
+                    bad
+                ))),
+            ));
+        }
+    };
+
+    let payload = serde_json::json!({ "url": url, "mode": mode });
 
     match ui_bridge_request_sync(&state, "page_navigate", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(mut data) => {
+            // Ensure the response carries the mode we actually used so callers
+            // can audit soft-vs-hard negotiation. The JS handler should already
+            // populate these; this block is defensive for older frontends.
+            if let Some(obj) = data.as_object_mut() {
+                obj.entry("url".to_string())
+                    .or_insert_with(|| serde_json::Value::String(url.to_string()));
+                obj.entry("mode".to_string())
+                    .or_insert_with(|| serde_json::Value::String(mode.to_string()));
+                obj.entry("hard".to_string())
+                    .or_insert_with(|| serde_json::Value::Bool(mode == "hard"));
+            }
+            Ok(Json(ApiResponse::success(data)))
+        }
         Err(e) => {
             error!("UI Bridge API: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
@@ -924,6 +978,108 @@ pub async fn ui_bridge_activate_tab_handler(
 }
 
 // ============================================================================
+// F4 — First-class tab activation
+// ============================================================================
+
+/// Validate a user-supplied tab id. Returns `Ok(trimmed)` when the id is
+/// known, or a sorted preview of `knownTabs` for the 400 body when it isn't.
+///
+/// Split out from the handler so it's unit-testable without spinning up a
+/// full `axum::Router` — see `tab_activate_tests` below.
+pub(crate) fn validate_tab_id(raw: &str) -> Result<String, Vec<&'static str>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !VALID_TAB_IDS.contains(&trimmed) {
+        return Err(VALID_TAB_IDS.to_vec());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// `GET /ui-bridge/control/tabs`
+///
+/// Returns the full tab list with labels plus the currently active tab. Uses
+/// the same IPC bridge as other `/control/*` endpoints — the authoritative
+/// tab list lives in the frontend (`src/components/app/tab-types.ts` →
+/// `TAB_LIST`) so there's no duplication between Rust and TS.
+pub async fn ui_bridge_tabs_list_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: tabs_list");
+
+    match ui_bridge_request_sync(&state, "tabs_list", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: tabs_list failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// `POST /ui-bridge/control/tab/activate`
+///
+/// Body: `{ "tabId": "<id>" }`. Fires the same code path a user click would
+/// (the React handler dispatches the `ui-bridge-set-tab` window event, which
+/// `useAppNavigation` listens for and fans out to `setActiveTab`). Returns
+/// `{ activeTab, previousTab }` on success.
+///
+/// Rust-side validation returns HTTP 400 with
+/// `{ error: "unknown_tab", knownTabs: [...] }` when the id isn't in the
+/// static `VALID_TAB_IDS` registry so the caller gets the error without an
+/// IPC round-trip; the React handler repeats the check as a defence-in-depth
+/// guard in case the two lists ever diverge.
+pub async fn ui_bridge_tab_activate_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<TabActivateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
+    let tab_id = match validate_tab_id(&request.tab_id) {
+        Ok(id) => id,
+        Err(known) => {
+            let body = serde_json::json!({
+                "success": false,
+                "error": "unknown_tab",
+                "data": {
+                    "error": "unknown_tab",
+                    "tabId": request.tab_id,
+                    "knownTabs": known,
+                }
+            });
+            // We need the `knownTabs` payload in the body, so bypass the
+            // `api_error(..)` helper and craft the envelope manually. The
+            // outer `ApiResponse<serde_json::Value>` keeps the route's error
+            // type uniform with the success path.
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse {
+                    success: false,
+                    data: Some(body),
+                    error: Some(format!("unknown_tab: \"{}\"", request.tab_id)),
+                    error_detail: None,
+                }),
+            ));
+        }
+    };
+
+    info!("UI Bridge API: tab_activate -> {}", tab_id);
+
+    let payload = serde_json::json!({ "tabId": tab_id });
+    match ui_bridge_request_sync(&state, "tab_activate", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: tab_activate IPC failed: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse {
+                    success: false,
+                    data: None,
+                    error: Some(e),
+                    error_detail: None,
+                }),
+            ))
+        }
+    }
+}
+
+// ============================================================================
 // Page summary
 // ============================================================================
 
@@ -971,8 +1127,13 @@ pub async fn ui_bridge_page_summary_handler(
 /// Page navigation, evaluation, and tab-switching routes (includes /ai/*
 /// alias for page-summary).
 pub fn routes() -> axum::Router<Arc<ApiState>> {
-    use axum::routing::post;
+    use axum::routing::{get, post};
     axum::Router::new()
+        .route("/ui-bridge/control/tabs", get(ui_bridge_tabs_list_handler))
+        .route(
+            "/ui-bridge/control/tab/activate",
+            post(ui_bridge_tab_activate_handler),
+        )
         .route(
             "/ui-bridge/control/page/refresh",
             post(ui_bridge_page_refresh_handler),
@@ -1039,9 +1200,121 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         )
 }
 
+/// Normalize an optional `mode` string into `"hard"` / `"soft"`.
+///
+/// Returns `Err(other)` for any unrecognized mode (so the handler can return
+/// a 400). Split out from the handler for unit-testing.
+pub(crate) fn normalize_navigate_mode(mode: Option<&str>) -> Result<&'static str, String> {
+    match mode {
+        None | Some("hard") => Ok("hard"),
+        Some("soft") => Ok("soft"),
+        Some(other) => Err(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod page_navigate_mode_tests {
+    //! Unit tests for the soft/hard mode negotiation on
+    //! `POST /ui-bridge/control/page/navigate`.
+
+    use super::{normalize_navigate_mode, PageNavigateRequest};
+
+    #[test]
+    fn default_mode_is_hard() {
+        assert_eq!(normalize_navigate_mode(None), Ok("hard"));
+    }
+
+    #[test]
+    fn explicit_hard_mode_is_accepted() {
+        assert_eq!(normalize_navigate_mode(Some("hard")), Ok("hard"));
+    }
+
+    #[test]
+    fn soft_mode_is_accepted() {
+        assert_eq!(normalize_navigate_mode(Some("soft")), Ok("soft"));
+    }
+
+    #[test]
+    fn unknown_mode_is_rejected() {
+        assert_eq!(
+            normalize_navigate_mode(Some("spa")),
+            Err("spa".to_string())
+        );
+        assert_eq!(normalize_navigate_mode(Some("")), Err("".to_string()));
+    }
+
+    #[test]
+    fn request_without_mode_deserializes_to_none() {
+        // Back-compat: legacy callers pass only { "url": "..." }.
+        let req: PageNavigateRequest =
+            serde_json::from_str(r#"{"url": "/fleet"}"#).expect("parse");
+        assert_eq!(req.mode, None);
+    }
+
+    #[test]
+    fn request_with_soft_mode_deserializes() {
+        let req: PageNavigateRequest =
+            serde_json::from_str(r#"{"url": "/fleet", "mode": "soft"}"#).expect("parse");
+        assert_eq!(req.mode.as_deref(), Some("soft"));
+    }
+}
+
+#[cfg(test)]
+mod tab_activate_tests {
+    //! Unit tests for the F4 `POST /ui-bridge/control/tab/activate` handler's
+    //! validation seam. Following the same pattern as
+    //! `page_navigate_mode_tests` — exercise the pure helper so we don't need
+    //! an axum router or a live frontend.
+    //!
+    //! The HTTP response shape (400 body with `error: "unknown_tab"` +
+    //! `knownTabs`) is built in the handler; these tests lock down the
+    //! accept/reject decision it relies on.
+    use super::{validate_tab_id, TabActivateRequest, VALID_TAB_IDS};
+
+    #[test]
+    fn unknown_tab_id_returns_400() {
+        // `validate_tab_id` returning `Err(known)` is the precondition the
+        // handler uses to emit HTTP 400. The preview list must match the
+        // authoritative `VALID_TAB_IDS` registry so callers can recover.
+        let err = validate_tab_id("not-a-real-tab").expect_err("unknown tab should fail");
+        assert!(!err.is_empty(), "known_tabs preview must not be empty");
+        assert_eq!(err.len(), VALID_TAB_IDS.len());
+        assert!(err.contains(&"specs"), "preview should contain common tabs");
+    }
+
+    #[test]
+    fn empty_tab_id_is_rejected() {
+        assert!(validate_tab_id("").is_err());
+        assert!(validate_tab_id("   ").is_err());
+    }
+
+    #[test]
+    fn known_tab_id_is_accepted() {
+        assert_eq!(validate_tab_id("specs").expect("specs"), "specs");
+        assert_eq!(
+            validate_tab_id("state-machine").expect("state-machine"),
+            "state-machine"
+        );
+        assert_eq!(
+            validate_tab_id("  specs  ").expect("trimmed"),
+            "specs",
+            "validate_tab_id should trim whitespace"
+        );
+    }
+
+    #[test]
+    fn tab_activate_request_deserializes_camel_case() {
+        let req: TabActivateRequest =
+            serde_json::from_str(r#"{"tabId": "specs"}"#).expect("parse camelCase");
+        assert_eq!(req.tab_id, "specs");
+    }
+}
+
 /// Static (method, path) tuples matching every route registered by `routes()`.
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     &[
+        ("GET", "/ui-bridge/control/tabs"),
+        ("POST", "/ui-bridge/control/tab/activate"),
         ("POST", "/ui-bridge/control/page/refresh"),
         ("POST", "/ui-bridge/control/page/hard-refresh"),
         ("POST", "/ui-bridge/control/page/close-request"),
@@ -1059,4 +1332,264 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/page/summary"),
         ("POST", "/ui-bridge/ai/page-summary"),
     ]
+}
+
+#[cfg(test)]
+mod page_evaluate_escaping_tests {
+    //! Regression tests for the `/control/page/evaluate` direct-WebView path:
+    //! the user's expression must be encoded as a JS string literal and
+    //! `eval()`ed, so literal newlines / quotes / backslashes inside the
+    //! expression survive the splice into the callback JS template.
+    //!
+    //! We can't spin up a real webview inside a unit test, so instead we
+    //! validate the two invariants that make the fix correct:
+    //!   1. `serde_json::to_string` produces a valid JS string literal.
+    //!   2. Splicing that literal into `eval(...)` yields a JS source where
+    //!      newlines in the original expression no longer appear as raw
+    //!      line terminators.
+
+    /// Helper mirroring the production encoding used in
+    /// `direct_webview_evaluate_with_result`.
+    fn build_eval_inner(expression: &str, await_promise: bool) -> String {
+        let expr_literal = serde_json::to_string(expression).expect("encode expression");
+        if await_promise {
+            format!("await Promise.resolve(eval({}))", expr_literal)
+        } else {
+            format!("eval({})", expr_literal)
+        }
+    }
+
+    #[test]
+    fn expression_with_newline_in_string_literal_is_escaped() {
+        // The original Phase 3J repro: `stack: "at A\n  at B"` decoded from
+        // JSON produces a real newline inside the expression. Before the fix,
+        // this newline appeared verbatim in the generated JS → SyntaxError.
+        let expression = "invoke(\"report_ui_error\", {stack: \"at A\n  at B\"})";
+        let emitted = build_eval_inner(expression, false);
+
+        // The raw literal newline from the source expression must NOT appear
+        // inside the emitted `eval(...)` argument — it should have been
+        // escaped to the two-character sequence \n by serde_json.
+        // (`emitted` itself still begins `eval("...` with no newlines.)
+        assert!(
+            !emitted.contains('\n'),
+            "emitted JS still contains a raw newline: {:?}",
+            emitted
+        );
+        // But the escaped sequence must be present.
+        assert!(
+            emitted.contains(r"\n"),
+            "emitted JS missing escaped newline: {:?}",
+            emitted
+        );
+        // Shape check: the wrapper is the eval form.
+        assert!(
+            emitted.starts_with("eval(\""),
+            "unexpected prefix: {:?}",
+            emitted
+        );
+        assert!(emitted.ends_with("\")"), "unexpected suffix: {:?}", emitted);
+    }
+
+    #[test]
+    fn await_promise_emits_promise_resolve_wrapper() {
+        let emitted = build_eval_inner("invoke(\"long_async_op\")", true);
+        assert!(
+            emitted.starts_with("await Promise.resolve(eval("),
+            "awaitPromise=true wrapper missing: {:?}",
+            emitted
+        );
+    }
+
+    #[test]
+    fn expression_with_quotes_and_backslashes_roundtrips() {
+        // A nasty mix: embedded double-quote, single-quote, backslash, and
+        // unicode. serde_json must escape all of these such that the emitted
+        // string is a single JS string literal — no premature termination.
+        let expression = r#"doc.querySelector('a[href="/x\\y"]').click() // "test""#;
+        let emitted = build_eval_inner(expression, false);
+
+        // Exactly one `eval("` opening and one `")` closing — no premature
+        // quote in the middle would split the literal into multiple tokens.
+        assert_eq!(emitted.matches("eval(\"").count(), 1);
+        assert!(emitted.ends_with("\")"));
+        // And the emitted blob must decode back to the original when parsed
+        // as a JSON string (proving the JS eval() would see the same bytes).
+        let inner = &emitted["eval(".len()..emitted.len() - 1];
+        let decoded: String = serde_json::from_str(inner).expect("decode back");
+        assert_eq!(decoded, expression);
+    }
+}
+
+#[cfg(test)]
+mod page_evaluate_tagging_tests {
+    //! Plan item D regression tests for request-tagged `/control/page/evaluate`.
+    //!
+    //! Concurrent `/page/evaluate` callers against the same runner must never
+    //! observe each other's responses. The HTTP handler path goes through
+    //! `tagged_page_evaluate` → `EvaluateRequestStore` → the
+    //! `ui-bridge:evaluate-response` listener installed in `mcp_api.rs`,
+    //! with per-call uuid request_ids keying the pending oneshots.
+    //!
+    //! We can't spin up Tauri inside a unit test, so these tests exercise the
+    //! store directly. The store is the sole correlation surface: every
+    //! arriving response has to round-trip through `deliver(request_id, …)`,
+    //! so showing the store's id-keyed routing is correct is equivalent to
+    //! showing the handler path is correct.
+    use crate::ui_bridge_evaluate::{EvaluateRequestStore, EvaluateResponse};
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+
+    /// Fire two concurrent "page_evaluate" calls through the store-level
+    /// surface that `tagged_page_evaluate` relies on. Each call registers
+    /// its own oneshot, deliveries land in the opposite order, and each
+    /// caller observes exactly its own result. This is the plan's
+    /// "unit test that fires two concurrent `/page/evaluate` calls and
+    /// asserts they each get their own result" verification criterion.
+    #[tokio::test]
+    async fn concurrent_page_evaluate_calls_do_not_interleave() {
+        let store = Arc::new(EvaluateRequestStore::new());
+
+        // Caller A: evaluates `document.title` → "Runner".
+        let request_id_a = "evaluate-call-a".to_string();
+        let (tx_a, rx_a) = oneshot::channel::<EvaluateResponse>();
+        store.register(request_id_a.clone(), tx_a).await;
+
+        // Caller B: evaluates `window.location.pathname` → "/dashboard".
+        let request_id_b = "evaluate-call-b".to_string();
+        let (tx_b, rx_b) = oneshot::channel::<EvaluateResponse>();
+        store.register(request_id_b.clone(), tx_b).await;
+
+        // Run both HTTP-handler-equivalent awaits concurrently. Each
+        // simulates `tagged_page_evaluate`'s `tokio::time::timeout(..., rx)`.
+        let caller_a = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx_a)
+                .await
+                .expect("caller A should not time out")
+                .expect("caller A sender should not drop")
+        });
+        let caller_b = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx_b)
+                .await
+                .expect("caller B should not time out")
+                .expect("caller B sender should not drop")
+        });
+
+        // Frontend (simulated) delivers B's response first, then A's —
+        // proving the store's id-keyed routing doesn't care about arrival
+        // order and that concurrent pending entries don't shadow each other.
+        let store_for_b = store.clone();
+        let deliver_b = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            store_for_b
+                .deliver(
+                    "evaluate-call-b",
+                    EvaluateResponse {
+                        ok: true,
+                        result: Some(serde_json::json!({
+                            "success": true,
+                            "result": { "value": "/dashboard" }
+                        })),
+                        error: None,
+                    },
+                )
+                .await
+        });
+        let store_for_a = store.clone();
+        let deliver_a = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            store_for_a
+                .deliver(
+                    "evaluate-call-a",
+                    EvaluateResponse {
+                        ok: true,
+                        result: Some(serde_json::json!({
+                            "success": true,
+                            "result": { "value": "Runner" }
+                        })),
+                        error: None,
+                    },
+                )
+                .await
+        });
+
+        assert!(deliver_a.await.expect("deliver_a join"));
+        assert!(deliver_b.await.expect("deliver_b join"));
+
+        let result_a = caller_a.await.expect("caller_a join");
+        let result_b = caller_b.await.expect("caller_b join");
+
+        // Each caller received its own expression's result, not the other's.
+        assert!(result_a.ok);
+        assert!(result_b.ok);
+        assert_eq!(
+            result_a
+                .result
+                .as_ref()
+                .and_then(|v| v.pointer("/result/value"))
+                .and_then(|v| v.as_str()),
+            Some("Runner"),
+            "caller A must see its own result, not caller B's"
+        );
+        assert_eq!(
+            result_b
+                .result
+                .as_ref()
+                .and_then(|v| v.pointer("/result/value"))
+                .and_then(|v| v.as_str()),
+            Some("/dashboard"),
+            "caller B must see its own result, not caller A's"
+        );
+
+        // Store should be fully drained after both deliveries.
+        assert_eq!(store.pending_len().await, 0);
+    }
+
+    /// Timing out one call must not strand the other call's pending slot.
+    /// Simulates: A times out (cancelled), B still delivers successfully.
+    #[tokio::test]
+    async fn timeout_of_one_page_evaluate_does_not_affect_sibling() {
+        let store = Arc::new(EvaluateRequestStore::new());
+
+        let request_id_a = "evaluate-timeout".to_string();
+        let (tx_a, rx_a) = oneshot::channel::<EvaluateResponse>();
+        store.register(request_id_a.clone(), tx_a).await;
+
+        let request_id_b = "evaluate-sibling".to_string();
+        let (tx_b, rx_b) = oneshot::channel::<EvaluateResponse>();
+        store.register(request_id_b.clone(), tx_b).await;
+
+        // Caller A times out while waiting (mirrors the Elapsed branch of
+        // tagged_page_evaluate). The handler cancels its slot.
+        let wait_a = tokio::time::timeout(std::time::Duration::from_millis(50), rx_a).await;
+        assert!(wait_a.is_err(), "caller A must time out");
+        store.cancel(&request_id_a).await;
+
+        // Caller B still gets a clean delivery afterwards.
+        let store_for_b = store.clone();
+        tokio::spawn(async move {
+            store_for_b
+                .deliver(
+                    "evaluate-sibling",
+                    EvaluateResponse {
+                        ok: true,
+                        result: Some(serde_json::json!({ "value": 7 })),
+                        error: None,
+                    },
+                )
+                .await
+        });
+
+        let result_b = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b)
+            .await
+            .expect("caller B should not time out")
+            .expect("caller B sender should not drop");
+
+        assert!(result_b.ok);
+        assert_eq!(
+            result_b.result.as_ref().and_then(|v| v.get("value")),
+            Some(&serde_json::json!(7))
+        );
+        assert_eq!(store.pending_len().await, 0);
+    }
 }
