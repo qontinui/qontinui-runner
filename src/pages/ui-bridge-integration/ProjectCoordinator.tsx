@@ -60,6 +60,32 @@ import type {
 const MANUAL_PATH_VALUE = "::manual";
 const BROWSE_VALUE = "::browse";
 
+/**
+ * localStorage key for the last project path the user picked from the
+ * dropdown. Sticky across runner restarts so users don't have to re-select
+ * the same project every session.
+ */
+const LAST_SELECTED_PROJECT_KEY = "qontinui:ui-bridge-integration:last-selected-project";
+
+function readLastSelectedProject(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const v = window.localStorage.getItem(LAST_SELECTED_PROJECT_KEY);
+    return v && v.length > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLastSelectedProject(path: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(LAST_SELECTED_PROJECT_KEY, path);
+  } catch {
+    /* localStorage quota/permission — non-fatal */
+  }
+}
+
 type CoordinatorPhase =
   | "idle"
   | "analyzing"
@@ -109,9 +135,23 @@ export function ProjectCoordinator({
   const [manualModeOverride, setManualMode] = useState<boolean | null>(null);
   const defaultManualMode = !projectsLoading && projects.length === 0;
   const manualMode = manualModeOverride ?? defaultManualMode;
-  const [projectPath, setProjectPath] = useState<string>(initialProjectPath ?? "");
+  // On mount, read the previously-selected project path from localStorage so
+  // returning users land on the last project they worked with. The effect
+  // below validates it against the loaded `projects` list and falls back to
+  // the first saved project if the remembered one is no longer saved.
+  //
+  // `readLastSelectedProject` is pure (wraps a localStorage.getItem with
+  // SSR / exception guards) so calling it twice from the lazy init of two
+  // useState slots is equivalent to reading once. Avoids a useRef which
+  // would trip react-hooks/refs for being accessed during render.
+  const [projectPath, setProjectPath] = useState<string>(
+    () => initialProjectPath ?? readLastSelectedProject() ?? "",
+  );
   const [dropdownValue, setDropdownValue] = useState<string>(
-    initialProjectPath ?? (defaultManualMode ? MANUAL_PATH_VALUE : ""),
+    () =>
+      initialProjectPath ??
+      readLastSelectedProject() ??
+      (defaultManualMode ? MANUAL_PATH_VALUE : ""),
   );
   const [editListOpen, setEditListOpen] = useState(false);
 
@@ -142,6 +182,79 @@ export function ProjectCoordinator({
   }, [initialProjectPath]);
 
   // (Empty-list manual-mode default is derived above — no effect needed.)
+
+  // Reconcile the initial selection once the async `projects` list loads.
+  // The first render happens with `projects = []` and `projectsLoading = true`,
+  // so the useState default lands on the sentinel "" (or manual, if the
+  // load had already completed). This effect:
+  //
+  //   - picks up the remembered-last-project from localStorage if it's still
+  //     present in the saved list (sticky across runner restarts);
+  //   - falls back to the first saved project if the remembered one is gone;
+  //   - does nothing if the user has already made an explicit choice
+  //     (`manualModeOverride` set, or a real path already in `projectPath`).
+  //
+  // This is a legitimate one-time setState-in-effect: the `autoSelectDoneRef`
+  // guard means the body runs exactly once per mount (the same invariant
+  // the lint rule is protecting), and the initialization depends on an
+  // async-loaded value that the useState lazy-initializer can't see.
+  const autoSelectDoneRef = useRef(false);
+  useEffect(() => {
+    if (autoSelectDoneRef.current) return;
+    if (projectsLoading) return;
+    if (projects.length === 0) {
+      // No saved projects — leave the default-manual-mode path unchanged.
+      autoSelectDoneRef.current = true;
+      return;
+    }
+    // Respect explicit user choices and external pre-fills.
+    if (initialProjectPath) {
+      autoSelectDoneRef.current = true;
+      return;
+    }
+    if (manualModeOverride !== null) {
+      autoSelectDoneRef.current = true;
+      return;
+    }
+    if (projectPath && projectPath !== "") {
+      // Already initialized from localStorage during useState; verify the
+      // remembered path is still in the list, otherwise fall back to the
+      // first saved project.
+      const stillPresent = projects.some((p) => p.path === projectPath);
+      if (!stillPresent) {
+        const first = projects[0].path;
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time post-load reconcile guarded by autoSelectDoneRef
+        setProjectPath(first);
+
+        setDropdownValue(first);
+      } else {
+        // Keep current selection and make sure the dropdown mirrors it.
+
+        setDropdownValue(projectPath);
+      }
+      autoSelectDoneRef.current = true;
+      return;
+    }
+    // No selection yet — pick the first saved project so the user doesn't
+    // have to click anything to reach a usable state. This also prevents the
+    // dropdown from defaulting to the Manual sentinel when real projects
+    // exist (the previous behavior users flagged as surprising).
+    const first = projects[0].path;
+
+    setProjectPath(first);
+
+    setDropdownValue(first);
+    autoSelectDoneRef.current = true;
+  }, [projectsLoading, projects, initialProjectPath, manualModeOverride, projectPath]);
+
+  // Persist the user's choice so the next runner session lands on the same
+  // project. Only write real paths — sentinels and empty strings aren't
+  // meaningful across sessions.
+  useEffect(() => {
+    if (projectPath && !projectPath.startsWith("::")) {
+      writeLastSelectedProject(projectPath);
+    }
+  }, [projectPath]);
 
   // Notify parent of path changes so Advanced panels stay in sync.
   useEffect(() => {
