@@ -773,7 +773,7 @@ impl Default for LibrarySyncService {
 /// macros, and prompt snippets from local storage and POSTs them to the backend.
 #[tauri::command]
 pub async fn sync_library_to_backend(
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    app_state: tauri::State<'_, crate::commands::compartments::StorageCompartment>,
 ) -> Result<FullLibrarySyncResult, String> {
     let service = LibrarySyncService::new();
 
@@ -781,43 +781,43 @@ pub async fn sync_library_to_backend(
         return Err("Not authenticated. Please log in to sync library items.".to_string());
     }
 
-    Ok(service.full_sync(&app_state.pg_db).await)
+    Ok(service.full_sync(app_state.pg_db()).await)
 }
 
 /// Sync only checks to the backend.
 #[tauri::command]
 pub async fn sync_checks_to_backend(
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    app_state: tauri::State<'_, crate::commands::compartments::StorageCompartment>,
 ) -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
-    Ok(service.sync_checks(&app_state.pg_db).await)
+    Ok(service.sync_checks(app_state.pg_db()).await)
 }
 
 /// Sync only check groups to the backend.
 #[tauri::command]
 pub async fn sync_check_groups_to_backend(
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    app_state: tauri::State<'_, crate::commands::compartments::StorageCompartment>,
 ) -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
-    Ok(service.sync_check_groups(&app_state.pg_db).await)
+    Ok(service.sync_check_groups(app_state.pg_db()).await)
 }
 
 /// Sync only shell commands to the backend.
 #[tauri::command]
 pub async fn sync_shell_commands_to_backend(
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    app_state: tauri::State<'_, crate::commands::compartments::StorageCompartment>,
 ) -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
-    Ok(service.sync_shell_commands(&app_state.pg_db).await)
+    Ok(service.sync_shell_commands(app_state.pg_db()).await)
 }
 
 /// Sync only saved API requests to the backend.
 #[tauri::command]
 pub async fn sync_api_requests_to_backend(
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    app_state: tauri::State<'_, crate::commands::compartments::StorageCompartment>,
 ) -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
-    Ok(service.sync_saved_api_requests(&app_state.pg_db).await)
+    Ok(service.sync_saved_api_requests(app_state.pg_db()).await)
 }
 
 /// Sync only contexts to the backend.
