@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{Emitter, Manager};
 use tracing::{error, info, warn};
 
@@ -1347,4 +1348,20 @@ Each `.spec.uibridge.json` file follows this structure:
 {existing_specs}
 "#
     )
+}
+
+pub fn plugin() -> TauriPlugin<tauri::Wry> {
+    PluginBuilder::<tauri::Wry>::new("qontinui_ai_session")
+        .invoke_handler(tauri::generate_handler![
+            list_ai_sessions,
+            send_user_message,
+            interrupt_ai_session,
+            get_ai_session_state,
+            create_ai_session,
+            close_ai_session,
+            rename_ai_session,
+            get_ai_output,
+            generate_workflow_from_session,
+        ])
+        .build()
 }

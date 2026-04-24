@@ -518,6 +518,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::library_sync::plugin())
         .plugin(commands::logging::plugin())
         .plugin(commands::rag::plugin())
+        .plugin(commands::ai_session::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -528,15 +529,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         )) // Native cross-platform accessibility API
         .invoke_handler(tauri::generate_handler![
             // Interactive AI session commands (send messages, interrupt, query state)
-            commands::ai_session::list_ai_sessions,
-            commands::ai_session::send_user_message,
-            commands::ai_session::interrupt_ai_session,
-            commands::ai_session::get_ai_session_state,
-            commands::ai_session::create_ai_session,
-            commands::ai_session::close_ai_session,
-            commands::ai_session::rename_ai_session,
-            commands::ai_session::get_ai_output,
-            commands::ai_session::generate_workflow_from_session,
+            // NOTE: ai_session handlers moved to per-module plugin (see .plugin() calls above).
             // Authentication commands
             commands::auth::login,
             commands::auth::logout,
