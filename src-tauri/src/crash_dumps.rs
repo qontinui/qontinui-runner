@@ -39,6 +39,8 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -278,6 +280,13 @@ pub async fn dismiss_recent_crash(
 ) -> Result<(), String> {
     app_state.crash_dumps.dismiss().await;
     Ok(())
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_crash_dumps")
+        .invoke_handler(tauri::generate_handler![dismiss_recent_crash])
+        .build()
 }
 
 // ---------------------------------------------------------------------------

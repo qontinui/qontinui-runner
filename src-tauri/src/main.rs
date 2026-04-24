@@ -481,9 +481,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(ui_bridge_plugin::init())
-        // Per-module plugins (Phase 1 of commands/ → plugin migration).
-        // See commands/<module>.rs's plugin() fn for the handler list. Modules
-        // not yet migrated remain in generate_handler! below.
+        // Per-module plugins. Every Tauri command in this binary is now
+        // registered via its owning module's `plugin()` fn — see
+        // `commands/<module>.rs` and the subsystem `commands.rs` files below
+        // (doctor, error_monitor, process_capture, orchestration_loop,
+        // spec_experimentation, mcp::backend_relay), plus `ui_error.rs` and
+        // `crash_dumps.rs`. No central `generate_handler!` remains.
         .plugin(commands::clipboard::plugin())
         .plugin(commands::debug::plugin())
         .plugin(commands::dev_findings::plugin())
@@ -576,6 +579,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(orchestration_loop::commands::plugin())
         .plugin(spec_experimentation::commands::plugin())
         .plugin(mcp::backend_relay::commands::plugin())
+        .plugin(ui_error::plugin())
+        .plugin(crash_dumps::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -584,93 +589,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(tokio::sync::Mutex::new(
             qontinui_runner_lib::accessibility::AccessibilityManager::default(),
         )) // Native cross-platform accessibility API
-        .invoke_handler(tauri::generate_handler![
-            // Interactive AI session commands (send messages, interrupt, query state)
-            // NOTE: ai_session handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: auth handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: clipboard, dev_findings, and file_browser handlers moved to
-            // per-module plugins (see .plugin() calls above).
-            // Configuration commands
-            // NOTE: config handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: dataset handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: execution handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: state_machine handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: debug handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: websocket, video, interaction, storage handlers moved to per-module plugins (see .plugin() calls above).
-            // NOTE: extraction handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: screenshot handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: script_emitter handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: logging handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: verification handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: rag handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: project_logs handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: global_log_sources handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: issues handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: execution_reporting, workflow_events handlers moved to per-module plugins (see .plugin() calls above).
-            // NOTE: dag_workflows, checkpoints, findings, known_issues handlers moved to
-            // per-module plugins (see .plugin() calls above).
-            // NOTE: state_machine_configs, spec_drift, ui_bridge_baselines, state_explorer, tiered_info handlers moved to per-module plugins (see .plugin() calls above).
-            // NOTE: discoveries handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: context handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: ai_data handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: recap handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: task_sync handlers moved to per-module plugin (see .plugin() calls above).
-            // Library Sync commands (sync library items to qontinui-web)
-            // NOTE: library_sync handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: testing, step_outputs handlers moved to per-module plugins (see .plugin() calls above).
-            // NOTE: checks handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: screenshots handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: hooks handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: learning handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: adaptive_learning handlers moved to per-module plugin (see .plugin() calls above).
-            // Agentic metric commands
-            // NOTE: agentic_metrics handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: flow handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: checkpoint_browser handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: durable_execution handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: database handlers moved to per-module plugin (see .plugin() calls above).
-            // Comprehensive backup commands
-            // NOTE: backup handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: shell_commands handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: ai_generation handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: mcp, mobile handlers moved to per-module plugins (see .plugin() calls above).
-            // NOTE: global_log_sources handlers consolidated above.
-            // NOTE: setup_wizard, saved_projects, test_orchestrator handlers moved to per-module plugins (see .plugin() calls above).
-            // Performance Metrics Dashboard commands
-            // NOTE: performance_metrics handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: ui_bridge handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: error_monitor handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: doctor handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: mcp::backend_relay handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: process_capture handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: orchestration_loop handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: orchestration_loop_configs handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: terminal, instances handlers moved to per-module plugins (see .plugin() calls above).
-            // Claude Code transcript import commands
-            // NOTE: transcript handlers moved to per-module plugin (see .plugin() calls above).
-            // Terminal session analysis commands
-            // NOTE: terminal_analysis handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: meta_optimizer handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: comparison handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: spec_experimentation handlers moved to per-module plugin (see .plugin() calls above).
-            // Token analytics commands (LLM cost and usage tracking)
-            // NOTE: token_analytics handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: activity_timeline handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: scripted_output_settings handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: event_search handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: watchers handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: container_settings handlers moved to per-module plugin (see .plugin() calls above).
-            // Cost dashboard commands (unified token/cache/budget overview)
-            // NOTE: cost_dashboard handlers moved to per-module plugin (see .plugin() calls above).
-            // NOTE: window_manager handlers moved to per-module plugin (see .plugin() calls above).
-            // Runner UI error reporting (Phase 3J.1/3J.2)
-            ui_error::report_ui_error,
-            ui_error::clear_ui_error,
-            ui_error::get_ui_error,
-            // Startup crash-dump surface (post-3J follow-up): ack a panic
-            // the previous process aborted on, clearing /health.derived_status.
-            crash_dumps::dismiss_recent_crash,
-        ])
+        // All Tauri command handlers are registered via per-module plugins
+        // (see the `.plugin(...)` chain above). The previous central
+        // `generate_handler![...]` has been fully dismantled — each subsystem
+        // owns its own plugin, keeping registrations local to the module
+        // that defines the commands.
         .setup(|app| {
             info!("Tauri application setup starting");
 

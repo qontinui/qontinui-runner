@@ -60,11 +60,13 @@
 //! durable_execution, flow, ui_bridge, terminal, instances, execution
 //! (as of this commit).
 //!
-//! All `commands/*` modules are now migrated to the plugin pattern. The
-//! remaining entries in main.rs's central `tauri::generate_handler![...]`
-//! are modules living outside `commands/` (e.g. `error_monitor`, `doctor`,
-//! `mcp::backend_relay`, `process_capture`, `orchestration_loop`,
-//! `spec_experimentation`, `ui_error`, `crash_dumps`).
+//! All `commands/*` modules are now migrated to the plugin pattern. So are
+//! the subsystem command modules living outside `commands/`: `error_monitor`,
+//! `doctor`, `mcp::backend_relay`, `process_capture`, `orchestration_loop`,
+//! `spec_experimentation`, plus the module-level handlers in `ui_error.rs`
+//! and `crash_dumps.rs`. main.rs no longer holds a central
+//! `tauri::generate_handler![...]` — every command self-registers through
+//! its owning module's `plugin()` fn.
 //!
 //! Note: ai_session, meta_optimizer, rag, flow, ui_bridge, terminal, and
 //! execution use a non-generic `plugin() -> TauriPlugin<tauri::Wry>` because
