@@ -2,16 +2,17 @@
 //!
 //! These commands expose discovery functionality to the frontend and MCP API.
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::discoveries::{
     self, sync_discoveries_batch, DiscoveryPayload, DiscoveryToSync, PendingDiscovery, SyncStatus,
 };
 use serde::Serialize;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::info;
+
+// Migrated to StorageCompartment (Workstream C).
 
 /// Response type for discovery commands.
 #[derive(Debug, Serialize)]
@@ -86,9 +87,9 @@ impl From<&PendingDiscovery> for DiscoveryPreview {
 /// Get all pending discoveries awaiting sync.
 #[tauri::command]
 pub async fn get_pending_discoveries_cmd(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<DiscoveryResponse<Vec<PendingDiscovery>>, String> {
-    match state.pg_db.get_pending_discoveries().await {
+    match state.pg_db().get_pending_discoveries().await {
         Ok(vals) => {
             let discoveries: Vec<PendingDiscovery> = vals
                 .into_iter()
@@ -103,9 +104,9 @@ pub async fn get_pending_discoveries_cmd(
 /// Get a summary of pending discoveries for the UI dashboard.
 #[tauri::command]
 pub async fn get_discovery_summary(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<DiscoveryResponse<DiscoverySummary>, String> {
-    match state.pg_db.get_discovery_summary().await {
+    match state.pg_db().get_discovery_summary().await {
         Ok(val) => {
             let pending_count = val["pending_count"].as_u64().unwrap_or(0) as u32;
             let ready = val["ready_for_sync"].as_u64().unwrap_or(0) as u32;
@@ -135,12 +136,12 @@ pub struct SyncResultResponse {
 /// Trigger sync of pending discoveries to qontinui-web.
 #[tauri::command]
 pub async fn sync_discoveries(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<DiscoveryResponse<SyncResultResponse>, String> {
     info!("Manual sync of pending discoveries triggered");
 
     let to_sync_pairs = state
-        .pg_db
+        .pg_db()
         .extract_discoveries_for_sync()
         .await
         .map_err(|e| format!("Failed to extract discoveries: {}", e))?;
@@ -174,16 +175,16 @@ pub async fn sync_discoveries(
     let mut errors = Vec::new();
     for sr in &sync_results {
         if sr.success {
-            let _ = state.pg_db.mark_discovery_synced(&sr.id).await;
+            let _ = state.pg_db().mark_discovery_synced(&sr.id).await;
             sent += 1;
         } else {
             let err_msg = sr.error.as_deref().unwrap_or("unknown");
-            let _ = state.pg_db.mark_discovery_failed(&sr.id, err_msg).await;
+            let _ = state.pg_db().mark_discovery_failed(&sr.id, err_msg).await;
             failed += 1;
             errors.push(format!("{}: {}", sr.id, err_msg));
         }
     }
-    let remaining_status = state.pg_db.get_sync_status().await.unwrap_or_default();
+    let remaining_status = state.pg_db().get_sync_status().await.unwrap_or_default();
     let remaining = remaining_status["pending_count"].as_u64().unwrap_or(0) as u32;
 
     let response = SyncResultResponse {
@@ -204,12 +205,12 @@ pub async fn sync_discoveries(
 /// Clear a specific discovery from the pending queue.
 #[tauri::command]
 pub async fn clear_discovery(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     id: String,
 ) -> Result<DiscoveryResponse<bool>, String> {
     info!("Clearing discovery {} from queue", id);
 
-    match state.pg_db.delete_discovery(&id).await {
+    match state.pg_db().delete_discovery(&id).await {
         Ok(deleted) => Ok(DiscoveryResponse::ok(deleted)),
         Err(e) => Ok(DiscoveryResponse::err(e)),
     }
@@ -218,11 +219,11 @@ pub async fn clear_discovery(
 /// Clear all failed discoveries (exceeded retry limit).
 #[tauri::command]
 pub async fn clear_failed_discoveries(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<DiscoveryResponse<u32>, String> {
     info!("Clearing failed discoveries");
 
-    match state.pg_db.cleanup_failed_discoveries().await {
+    match state.pg_db().cleanup_failed_discoveries().await {
         Ok(count) => {
             info!("Cleared {} failed discoveries", count);
             Ok(DiscoveryResponse::ok(count))
@@ -234,9 +235,9 @@ pub async fn clear_failed_discoveries(
 /// Get the current sync status.
 #[tauri::command]
 pub async fn get_discovery_sync_status(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<DiscoveryResponse<SyncStatus>, String> {
-    match state.pg_db.get_sync_status().await {
+    match state.pg_db().get_sync_status().await {
         Ok(val) => {
             let status = SyncStatus {
                 pending_count: val["pending_count"].as_u64().unwrap_or(0) as u32,
