@@ -10,6 +10,8 @@
 
 use crate::context::{self, Context, ContextAutoInclude, ContextScope, ContextWithMetadata};
 use serde::{Deserialize, Serialize};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -518,4 +520,22 @@ pub fn evaluate_auto_include(
                 .map_err(|e| format!("Failed to serialize results: {}", e))?,
         ),
     })
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_context")
+        .invoke_handler(tauri::generate_handler![
+            get_all_contexts,
+            get_context,
+            create_context,
+            update_context,
+            delete_context,
+            search_contexts,
+            get_context_categories,
+            set_context_enabled,
+            record_context_usage,
+            get_builtin_contexts_cmd,
+            evaluate_auto_include,
+        ])
+        .build()
 }

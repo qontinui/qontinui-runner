@@ -25,6 +25,7 @@ pub mod helpers;
 pub mod history;
 pub mod intents;
 pub mod intents_registry;
+pub mod misc;
 pub mod network;
 pub mod page;
 pub mod request;
@@ -200,81 +201,9 @@ use helpers::{
 /// it (callers can decide what to do based on `age_ms`).
 const LAST_DISCOVERED_FRESH_SECS: u64 = 60;
 
-/// Get undo/redo state from the UI Bridge.
-pub async fn ui_bridge_get_undo_state_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting undo state");
-
-    match ui_bridge_request_sync(&state, "get_undo_state", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Execute undo via the UI Bridge.
-pub async fn ui_bridge_undo_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Undo");
-
-    match ui_bridge_request_sync(&state, "undo", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Undo failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Execute redo via the UI Bridge.
-pub async fn ui_bridge_redo_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Redo");
-
-    match ui_bridge_request_sync(&state, "redo", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Redo failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Get all loaded specs from the SpecStore.
-pub async fn ui_bridge_get_specs_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting all specs");
-
-    match ui_bridge_request_sync(&state, "get_specs", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// Get a specific spec by ID from the SpecStore.
-pub async fn ui_bridge_get_spec_handler(
-    State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting spec {}", id);
-
-    match ui_bridge_request_sync(&state, "get_spec", serde_json::json!({ "specId": id })).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
+// Undo/redo, specs, component-state, scroll, performance-entries,
+// annotations-import, debug element-tree/highlight, navigate-tab, and
+// clear-storage handlers live in `misc::routes()` — see `misc.rs`.
 
 // ============================================================================
 // Page Navigation Handlers
@@ -375,58 +304,14 @@ pub(crate) use ipc_handler_path_get;
 pub(crate) use ipc_handler_path_post;
 pub(crate) use ipc_handler_post;
 
-// State machine handlers (states/, state/, state-groups/, transitions/)
-// live in `state_machine::routes()` — see `state_machine.rs`.
-
-// Runner-specific: tab navigation and storage management
-ipc_handler_post!(ui_bridge_navigate_tab_handler, "navigate_tab");
-ipc_handler_post!(ui_bridge_clear_storage_handler, "clear_storage");
-
-// AI semantic search & diff, AI analysis, media compare, and image-diff
-// handlers live in `ai_analyze::routes()` — see `ai_analyze.rs`.
-
-// Intent registry handlers (list/register/find/execute/execute-from-query)
-// live in `intents_registry::routes()` — see `intents_registry.rs`.
-
-// Component state
-ipc_handler_path_get!(
-    ui_bridge_get_component_state_handler,
-    "get_component_state",
-    "componentId"
-);
-
-// Page scroll
-ipc_handler_post!(ui_bridge_scroll_page_handler, "scroll_page");
-
-// Performance entries
-ipc_handler_get!(
-    ui_bridge_get_performance_entries_handler,
-    "get_performance_entries"
-);
-ipc_handler_get!(
-    ui_bridge_clear_performance_entries_handler,
-    "clear_performance_entries"
-);
-
-// Design evaluation handlers live in `design_eval::routes()` —
-// see `design_eval.rs`.
-
-// Annotations import
-ipc_handler_post!(ui_bridge_annotations_import_handler, "annotations_import");
-
-// Debug
-ipc_handler_get!(ui_bridge_get_element_tree_handler, "get_element_tree");
-ipc_handler_path_get!(
-    ui_bridge_highlight_element_handler,
-    "highlight_element",
-    "elementId"
-);
-
-/// Get render log entries.
-
-
-
-// Create routes for this module.
+// Per-family submodules host the rest of the macro-generated handlers:
+//   - state_machine.rs   (states/, state/, state-groups/, transitions/)
+//   - ai_analyze.rs      (ai/analyze/*, ai/semantic-search, ai/diff, media-compare, image-diff)
+//   - design_eval.rs     (control/design/evaluate/*)
+//   - intents_registry.rs (control/intents/*)
+//   - misc.rs            (undo/redo, specs, component-state, scroll,
+//                         performance-entries, annotations-import, debug,
+//                         navigate-tab, clear-storage)
 
 // =========================================================================
 // Convenience endpoints — app-agnostic DOM interaction helpers
@@ -462,6 +347,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(forms::route_entries());
         all.extend_from_slice(intents::route_entries());
         all.extend_from_slice(intents_registry::route_entries());
+        all.extend_from_slice(misc::route_entries());
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
         all.extend_from_slice(screenshots::route_entries());
@@ -476,19 +362,12 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
 /// `route_manifest()` above; do not list those entries here.
 fn local_route_entries() -> &'static [(&'static str, &'static str)] {
     &[
-        ("GET", "/ui-bridge/control/specs"),
-        ("GET", "/ui-bridge/control/spec/{id}"),
-        ("GET", "/ui-bridge/control/component/{id}/state"),
-        ("POST", "/ui-bridge/control/page/scroll"),
-        ("GET", "/ui-bridge/control/performance-entries"),
-        ("POST", "/ui-bridge/control/performance-entries/clear"),
-        ("POST", "/ui-bridge/control/annotations/import"),
-        ("GET", "/ui-bridge/debug/element-tree"),
-        ("POST", "/ui-bridge/debug/highlight/{id}"),
+        // Persisted interaction history (cross-run analysis)
         ("GET", "/ui-bridge/history/elements"),
         ("GET", "/ui-bridge/history/element/{id}"),
         ("GET", "/ui-bridge/history/flaky"),
         ("GET", "/ui-bridge/graph/element-reliability"),
+        // Analytics
         ("GET", "/ui-bridge/analytics/decay-curve"),
         ("GET", "/ui-bridge/analytics/action-baselines"),
         ("GET", "/ui-bridge/analytics/failure-taxonomy"),
@@ -500,11 +379,6 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/analytics/annotation-gaps"),
         ("GET", "/ui-bridge/analytics/health-score"),
         ("GET", "/ui-bridge/analytics/recommendations"),
-        ("POST", "/ui-bridge/control/navigate-tab"),
-        ("POST", "/ui-bridge/control/clear-storage"),
-        ("POST", "/ui-bridge/control/undo"),
-        ("POST", "/ui-bridge/control/redo"),
-        ("GET", "/ui-bridge/control/undo-state"),
         // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy
         ("GET", "/ui-bridge/commands"),
         ("POST", "/ui-bridge/invoke/{command_name}"),
@@ -524,23 +398,12 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // `/control/batch` (step-level diff batch) lives in
         // `capabilities::routes()`.
         // `/control/annotated-screenshot` lives in `screenshots::routes()`.
-        // Undo/Redo awareness
-        .route(
-            "/ui-bridge/control/undo-state",
-            get(ui_bridge_get_undo_state_handler),
-        )
-        .route("/ui-bridge/control/undo", post(ui_bridge_undo_handler))
-        .route("/ui-bridge/control/redo", post(ui_bridge_redo_handler))
+        // Undo/redo + specs handlers (extracted to misc.rs) merged below.
         // Form state awareness, /ai/* form aliases, and clipboard live in
         // `forms::routes()` — see `forms.rs`.
         // /ai/design-audit lives in `design::routes()` — see `design.rs`.
         // Network request monitoring, console errors, browser events, and
         // timeline live in `network::routes()` — see `network.rs`.
-        .route("/ui-bridge/control/specs", get(ui_bridge_get_specs_handler))
-        .route(
-            "/ui-bridge/control/spec/{id}",
-            get(ui_bridge_get_spec_handler),
-        )
         // Page navigation, evaluation, tab switching, navigate-and-wait, and
         // page summary live in `page::routes()` — see `page.rs`.
         // Convenience DOM interaction endpoints (find-by-text / click-by-text /
@@ -582,41 +445,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // AI semantic search / diff / analyze / recovery / media-compare /
         // image-diff handlers (extracted to ai_analyze.rs) merged below.
         // Intent registry handlers (extracted to intents_registry.rs) merged below.
-        // Component state
-        .route(
-            "/ui-bridge/control/component/{id}/state",
-            get(ui_bridge_get_component_state_handler),
-        )
-        // Page scroll
-        .route(
-            "/ui-bridge/control/page/scroll",
-            post(ui_bridge_scroll_page_handler),
-        )
-        // Performance entries
-        .route(
-            "/ui-bridge/control/performance-entries",
-            get(ui_bridge_get_performance_entries_handler),
-        )
-        .route(
-            "/ui-bridge/control/performance-entries/clear",
-            post(ui_bridge_clear_performance_entries_handler),
-        )
         // Design evaluation handlers (extracted to design_eval.rs) merged below.
         // Element-screenshot routes live in `screenshots::routes()`.
-        // Annotations import
-        .route(
-            "/ui-bridge/control/annotations/import",
-            post(ui_bridge_annotations_import_handler),
-        )
-        // Debug
-        .route(
-            "/ui-bridge/debug/element-tree",
-            get(ui_bridge_get_element_tree_handler),
-        )
-        .route(
-            "/ui-bridge/debug/highlight/{id}",
-            post(ui_bridge_highlight_element_handler),
-        )
+        // Component state, page scroll, performance entries, annotations
+        // import, and debug routes (extracted to misc.rs) merged below.
         // Persisted interaction history (cross-run analysis)
         .route(
             "/ui-bridge/history/elements",
@@ -679,15 +511,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/analytics/recommendations",
             get(analytics_recommendations_handler),
         )
-        // Runner-specific: tab navigation and storage management
-        .route(
-            "/ui-bridge/control/navigate-tab",
-            post(ui_bridge_navigate_tab_handler),
-        )
-        .route(
-            "/ui-bridge/control/clear-storage",
-            post(ui_bridge_clear_storage_handler),
-        )
+        // Runner-specific navigate-tab + clear-storage (extracted to misc.rs).
         // Bookmark, change-tracking and with-diff handlers (extracted to bookmarks.rs)
         .merge(bookmarks::routes())
         // Design Review handlers (extracted to design.rs)
@@ -716,6 +540,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(design_eval::routes())
         // Intent registry handlers (extracted to intents_registry.rs)
         .merge(intents_registry::routes())
+        // Undo/redo, specs, component-state, scroll, performance-entries,
+        // annotations-import, debug, navigate-tab, clear-storage
+        // (extracted to misc.rs)
+        .merge(misc::routes())
         // UI Bridge exploration + window listing (extracted to exploration.rs)
         .merge(exploration::routes())
         // Page navigation / evaluation / tab switching (extracted to page.rs)
