@@ -17,25 +17,27 @@ mod step_builder;
 pub mod types;
 mod utils;
 
-use crate::commands::AppState;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{info, warn};
+
+use crate::commands::compartments::StorageCompartment;
+
+// Migrated to StorageCompartment (Workstream C).
 
 pub use types::{RecapData, RecapResponse};
 
 /// Get recap data for a specific task run.
 #[tauri::command]
 pub async fn get_task_run_recap(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<RecapResponse<RecapData>, String> {
     info!("Getting recap for task run: {}", task_run_id);
 
     // Get the task run
-    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
+    let task_run_result = state.pg_db().get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -52,7 +54,7 @@ pub async fn get_task_run_recap(
 
     // Get automation records
     let automations = state
-        .pg_db
+        .pg_db()
         .get_task_run_automations(&task_run_id)
         .await
         .unwrap_or_else(|e| {
@@ -62,7 +64,7 @@ pub async fn get_task_run_recap(
 
     // Get events (limited for performance)
     let events = state
-        .pg_db
+        .pg_db()
         .get_task_run_events(&task_run_id, None, Some(500))
         .await
         .unwrap_or_else(|e| {
@@ -79,7 +81,7 @@ pub async fn get_task_run_recap(
 
     // Get orchestrator verification results for this task run (criterion-based)
     let verification_results = state
-        .pg_db
+        .pg_db()
         .get_latest_verification_results(&task_run_id)
         .await
         .unwrap_or_else(|e| {
@@ -92,7 +94,7 @@ pub async fn get_task_run_recap(
 
     // Get workflow verification phase results (step-based, from execute_verification_steps)
     let workflow_verification_results = state
-        .pg_db
+        .pg_db()
         .get_all_verification_phase_results(&task_run_id)
         .await
         .unwrap_or_else(|e| {
@@ -105,7 +107,7 @@ pub async fn get_task_run_recap(
 
     // Get workflow step checkpoints (from unified workflow executor)
     let step_checkpoints = state
-        .pg_db
+        .pg_db()
         .get_all_workflow_step_checkpoints(&task_run_id)
         .await
         .unwrap_or_else(|e| {
