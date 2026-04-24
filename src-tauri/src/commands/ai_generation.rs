@@ -10,18 +10,17 @@
 //!
 //! Errors are wrapped in [`AppError`] variants inline at the Tauri boundary
 //! (`spawn_blocking` failures map to `ProcessError`, `serde_json` failures
-//! lift via the blanket `From` impl). Compartment retrofit is N/A here
-//! because each handler needs the full `Arc<AppState>` to pass to
-//! `with_default_bridge`, which no compartment exposes.
+//! lift via the blanket `From` impl). Handlers use `BridgeCompartment` to
+//! access `with_default_bridge_compartment` for Python-bridge IPC.
 
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
-use crate::commands::{AppState, CommandResponse};
+use crate::commands::compartments::BridgeCompartment;
+use crate::commands::CommandResponse;
 use crate::error::AppError;
-use crate::executor::with_default_bridge;
+use crate::executor::with_default_bridge_compartment;
 use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -43,7 +42,7 @@ pub struct GenerateContextInput {
 #[tauri::command]
 pub async fn generate_context_with_ai(
     input: GenerateContextInput,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
 
@@ -67,7 +66,7 @@ pub async fn generate_context_with_ai(
     let provider_settings = build_provider_settings(&ai_settings);
 
     // Clone state for use in spawn_blocking
-    let app_state = state.inner().clone();
+    let bridge_compartment = bridge.inner().clone();
     let user_prompt = input.user_prompt;
 
     // Execute via spawn_blocking since PythonBridge uses block_on internally
@@ -78,7 +77,7 @@ pub async fn generate_context_with_ai(
             "ai_settings": provider_settings,
         });
 
-        let bridge_result = with_default_bridge(&app_state, |bridge| {
+        let bridge_result = with_default_bridge_compartment(&bridge_compartment, |bridge| {
             bridge.send_command_and_wait(
                 "generate_context_with_ai",
                 Some(params),
@@ -141,7 +140,7 @@ pub struct GenerateApiRequestInput {
 #[tauri::command]
 pub async fn generate_api_request_with_ai(
     input: GenerateApiRequestInput,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
 
@@ -159,7 +158,7 @@ pub async fn generate_api_request_with_ai(
     };
 
     let provider_settings = build_provider_settings(&ai_settings);
-    let app_state = state.inner().clone();
+    let bridge_compartment = bridge.inner().clone();
     let user_prompt = input.user_prompt;
     let base_url = input.base_url;
 
@@ -171,7 +170,7 @@ pub async fn generate_api_request_with_ai(
             "ai_settings": provider_settings,
         });
 
-        let bridge_result = with_default_bridge(&app_state, |bridge| {
+        let bridge_result = with_default_bridge_compartment(&bridge_compartment, |bridge| {
             bridge.send_command_and_wait(
                 "generate_api_request_with_ai",
                 Some(params),
@@ -234,7 +233,7 @@ pub struct GenerateTaskPromptInput {
 #[tauri::command]
 pub async fn generate_task_prompt_with_ai(
     input: GenerateTaskPromptInput,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
 
@@ -253,7 +252,7 @@ pub async fn generate_task_prompt_with_ai(
     };
 
     let provider_settings = build_provider_settings(&ai_settings);
-    let app_state = state.inner().clone();
+    let bridge_compartment = bridge.inner().clone();
     let user_prompt = input.user_prompt;
     let mode = input.mode;
 
@@ -265,7 +264,7 @@ pub async fn generate_task_prompt_with_ai(
             "ai_settings": provider_settings,
         });
 
-        let bridge_result = with_default_bridge(&app_state, |bridge| {
+        let bridge_result = with_default_bridge_compartment(&bridge_compartment, |bridge| {
             bridge.send_command_and_wait(
                 "generate_task_prompt_with_ai",
                 Some(params),
@@ -348,7 +347,7 @@ pub struct SuggestExplorationInput {
 #[tauri::command]
 pub async fn suggest_exploration_strategy_with_ai(
     input: SuggestExplorationInput,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
 
@@ -366,7 +365,7 @@ pub async fn suggest_exploration_strategy_with_ai(
     };
 
     let provider_settings = build_provider_settings(&ai_settings);
-    let app_state = state.inner().clone();
+    let bridge_compartment = bridge.inner().clone();
     let user_goal = input.user_goal;
     let available_states = input.available_states;
     let available_transitions = input.available_transitions;
@@ -380,7 +379,7 @@ pub async fn suggest_exploration_strategy_with_ai(
             "ai_settings": provider_settings,
         });
 
-        let bridge_result = with_default_bridge(&app_state, |bridge| {
+        let bridge_result = with_default_bridge_compartment(&bridge_compartment, |bridge| {
             bridge.send_command_and_wait(
                 "suggest_exploration_strategy_with_ai",
                 Some(params),
@@ -481,7 +480,7 @@ pub struct GenerateTestAndAgenticInput {
 #[tauri::command]
 pub async fn generate_test_and_agentic_step(
     input: GenerateTestAndAgenticInput,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
 
@@ -499,7 +498,7 @@ pub async fn generate_test_and_agentic_step(
     };
 
     let provider_settings = build_provider_settings(&ai_settings);
-    let app_state = state.inner().clone();
+    let bridge_compartment = bridge.inner().clone();
     let user_prompt = input.user_prompt;
     let page_context = input.page_context;
     let context_ids = input.context_ids;
@@ -513,7 +512,7 @@ pub async fn generate_test_and_agentic_step(
             "ai_settings": provider_settings,
         });
 
-        let bridge_result = with_default_bridge(&app_state, |bridge| {
+        let bridge_result = with_default_bridge_compartment(&bridge_compartment, |bridge| {
             bridge.send_command_and_wait(
                 "generate_test_and_agentic_step",
                 Some(params),
@@ -595,7 +594,7 @@ pub struct ExploreFlowStepInput {
 #[tauri::command]
 pub async fn explore_flow_step(
     input: ExploreFlowStepInput,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
 
@@ -614,7 +613,7 @@ pub async fn explore_flow_step(
     };
 
     let provider_settings = build_provider_settings(&ai_settings);
-    let app_state = state.inner().clone();
+    let bridge_compartment = bridge.inner().clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let params = serde_json::json!({
@@ -628,7 +627,7 @@ pub async fn explore_flow_step(
             "ai_settings": provider_settings,
         });
 
-        let bridge_result = with_default_bridge(&app_state, |bridge| {
+        let bridge_result = with_default_bridge_compartment(&bridge_compartment, |bridge| {
             bridge.send_command_and_wait(
                 "explore_flow_step",
                 Some(params),
