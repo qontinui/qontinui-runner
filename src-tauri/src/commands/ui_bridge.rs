@@ -32,15 +32,12 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tracing::{error, info};
 
-// Migrated to BridgeCompartment (Workstream C) — 2 of 5 AppState handlers.
-// The remaining 3 keep `Arc<AppState>`: `ui_bridge_run_exploration` and
-// `ui_bridge_stop_exploration` need `state.inner()` for extraction_executor
-// (bridge helper footgun), and `ui_bridge_run_exploration_native` spans
-// Integration (sdk_connection) + Bridge (exploration_cancel).
+// Fully migrated to compartment state (Workstream C).
+// `ui_bridge_run_exploration_native` uses multi-State (Bridge + Integration).
+// `ui_bridge_run_exploration` uses multi-State (Bridge + Health).
 use super::compartments::BridgeCompartment;
 use super::CommandResponse;
 
@@ -482,18 +479,24 @@ pub struct UIBridgeExplorationResult {
 /// Exploration result with discovered states and statistics
 #[tauri::command]
 pub async fn ui_bridge_run_exploration(
-    state: State<'_, Arc<super::AppState>>,
+    state: State<'_, BridgeCompartment>,
+    health: State<'_, super::compartments::HealthCompartment>,
     runner_url: Option<String>,
     config: Option<UIBridgeExplorationConfig>,
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Running automatic exploration");
 
-    let app_state = state.inner().clone();
-    let self_url = crate::mcp::types::get_self_base_url(&state);
+    let bridge_compartment = state.inner().clone();
+    let self_url = {
+        let port = health
+            .api_port()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        format!("http://localhost:{}", port)
+    };
 
     tokio::task::spawn_blocking(move || -> Result<CommandResponse, String> {
         let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
-            &app_state.extraction_executor,
+            bridge_compartment.extraction_executor(),
             "extraction_executor",
         );
 
@@ -555,16 +558,16 @@ pub async fn ui_bridge_run_exploration(
 /// * `Err(String)` - Error if stop could not be initiated
 #[tauri::command]
 pub async fn ui_bridge_stop_exploration(
-    state: State<'_, Arc<super::AppState>>,
+    state: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Stopping exploration");
 
-    let app_state = state.inner().clone();
+    let bridge_compartment = state.inner().clone();
 
     let response_result = tokio::task::spawn_blocking(
         move || -> Result<crate::executor::lifecycle::CommandResponseResult, String> {
             let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
-                &app_state.extraction_executor,
+                bridge_compartment.extraction_executor(),
                 "extraction_executor",
             );
 
@@ -616,19 +619,20 @@ pub async fn ui_bridge_stop_exploration(
 /// and survives page navigation in the runner's webview.
 #[tauri::command]
 pub async fn ui_bridge_run_exploration_native(
-    state: State<'_, Arc<super::AppState>>,
+    bridge: State<'_, BridgeCompartment>,
+    integration: State<'_, super::compartments::IntegrationCompartment>,
     config: Option<crate::exploration::ExplorationConfig>,
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Starting native Rust exploration");
 
-    let sdk_conn = state.sdk_connection.clone();
+    let sdk_conn = integration.sdk_connection().clone();
     let config = config.unwrap_or_default();
 
     let mut engine = crate::exploration::ExplorationEngine::new();
 
     // Store cancel token so it can be cancelled from another command
     {
-        let mut cancel_guard = state.exploration_cancel.lock().await;
+        let mut cancel_guard = bridge.exploration_cancel().lock().await;
         *cancel_guard = Some(engine.cancel_token());
     }
 
@@ -636,7 +640,7 @@ pub async fn ui_bridge_run_exploration_native(
 
     // Clear cancel token
     {
-        let mut cancel_guard = state.exploration_cancel.lock().await;
+        let mut cancel_guard = bridge.exploration_cancel().lock().await;
         *cancel_guard = None;
     }
 
