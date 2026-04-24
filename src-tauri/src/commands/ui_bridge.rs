@@ -36,6 +36,12 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tracing::{error, info};
 
+// Migrated to BridgeCompartment (Workstream C) — 2 of 5 AppState handlers.
+// The remaining 3 keep `Arc<AppState>`: `ui_bridge_run_exploration` and
+// `ui_bridge_stop_exploration` need `state.inner()` for extraction_executor
+// (bridge helper footgun), and `ui_bridge_run_exploration_native` spans
+// Integration (sdk_connection) + Bridge (exploration_cancel).
+use super::compartments::BridgeCompartment;
 use super::CommandResponse;
 
 // Re-export wire-format DTOs from qontinui-types (canonical source of truth).
@@ -338,7 +344,7 @@ pub struct FingerprintDiscoveryResult {
 /// * `Err(String)` - Error message if discovery fails
 #[tauri::command]
 pub async fn ui_bridge_discover_states_from_fingerprints(
-    _state: State<'_, Arc<super::AppState>>,
+    _state: State<'_, BridgeCompartment>,
     cooccurrence_export: serde_json::Value,
     config: Option<FingerprintDiscoveryConfig>,
 ) -> Result<CommandResponse, String> {
@@ -652,11 +658,11 @@ pub async fn ui_bridge_run_exploration_native(
 /// Stop a running native exploration.
 #[tauri::command]
 pub async fn ui_bridge_stop_exploration_native(
-    state: State<'_, Arc<super::AppState>>,
+    state: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Stopping native exploration");
 
-    let cancel_guard = state.exploration_cancel.lock().await;
+    let cancel_guard = state.exploration_cancel().lock().await;
     if let Some(ref token) = *cancel_guard {
         token.cancel();
         Ok(CommandResponse {
