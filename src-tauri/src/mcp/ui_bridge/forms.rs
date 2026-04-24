@@ -147,10 +147,13 @@ pub async fn ui_bridge_diff_forms_handler(
 /// Form state + fill + snapshot/diff routes (control + ai aliases) plus
 /// the clipboard read/write pair.
 pub fn routes() -> axum::Router<Arc<ApiState>> {
+    use super::routing::add_dual;
     use axum::routing::{get, post};
-    axum::Router::new()
+    let router = axum::Router::new();
+    // forms: identical handler under /control + /ai.
+    let router = add_dual!(router, get, "forms", ui_bridge_get_forms_handler);
+    router
         // Form state awareness
-        .route("/ui-bridge/control/forms", get(ui_bridge_get_forms_handler))
         .route("/ui-bridge/control/fill", post(ui_bridge_fill_form_handler))
         .route(
             "/ui-bridge/control/forms/snapshot",
@@ -160,8 +163,8 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/forms/diff",
             post(ui_bridge_diff_forms_handler),
         )
-        // /ai/* aliases for forms
-        .route("/ui-bridge/ai/forms", get(ui_bridge_get_forms_handler))
+        // /ai/* alias with a DIFFERENT tail (fill-form vs fill) — not a true
+        // alias pair, keep as a second /ai/ registration.
         .route("/ui-bridge/ai/fill-form", post(ui_bridge_fill_form_handler))
         // Clipboard
         .route(
