@@ -516,6 +516,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::config::plugin())
         .plugin(commands::context::plugin())
         .plugin(commands::library_sync::plugin())
+        .plugin(commands::logging::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -633,19 +634,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Scripted-output emitter (think-in-code extraction script)
             commands::script_emitter::emit_extraction_script,
             commands::script_emitter::emit_scripted_output_event,
-            // Logging commands
-            commands::logging::append_ai_output_log,
-            commands::logging::clear_ai_output_log,
-            commands::logging::get_ai_output_log_path_cmd,
-            commands::logging::load_ai_output_log,
-            commands::logging::list_session_checkpoints,
-            commands::logging::delete_session_checkpoints,
-            commands::logging::clear_all_run_history,
-            // Render logging commands (for UI testing)
-            commands::logging::append_render_log,
-            commands::logging::clear_render_log,
-            commands::logging::load_render_log,
-            commands::logging::get_render_log_path_cmd,
+            // NOTE: logging handlers moved to per-module plugin (see .plugin() calls above).
             // Verification commands (AI self-healing)
             commands::verification::save_pending_verification,
             commands::verification::load_pending_verification,

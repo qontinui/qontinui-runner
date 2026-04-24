@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use super::CommandResponse;
@@ -715,4 +717,22 @@ pub fn get_render_log_path_cmd() -> CommandResponse {
             "path": log_path.to_string_lossy()
         })),
     }
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_logging")
+        .invoke_handler(tauri::generate_handler![
+            append_ai_output_log,
+            clear_ai_output_log,
+            get_ai_output_log_path_cmd,
+            load_ai_output_log,
+            list_session_checkpoints,
+            delete_session_checkpoints,
+            clear_all_run_history,
+            append_render_log,
+            clear_render_log,
+            load_render_log,
+            get_render_log_path_cmd,
+        ])
+        .build()
 }
