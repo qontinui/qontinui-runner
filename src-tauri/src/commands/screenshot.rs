@@ -7,13 +7,13 @@
 //!
 //! All screenshot capture uses IPC to the Python bridge (qontinui library).
 
-use super::{AppState, CommandResponse};
+use super::compartments::BridgeCompartment;
+use super::CommandResponse;
 use crate::auth::AuthManager;
-use crate::executor::with_default_bridge;
+use crate::executor::with_default_bridge_compartment;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
 use std::time::Duration;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -84,14 +84,14 @@ pub struct ScreenshotUploadResult {
 /// `get_monitors` for workflow execution monitor selection.
 #[tauri::command]
 pub async fn get_screenshot_monitors(
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting available monitors for screenshot capture via IPC");
 
-    let app_state = state.inner().clone();
+    let bridge_clone = bridge.inner().clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        with_default_bridge(&app_state, |bridge| {
+        with_default_bridge_compartment(&bridge_clone, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -136,7 +136,7 @@ pub async fn get_screenshot_monitors(
 /// This is the core implementation used by both the Tauri command and other
 /// functions that need to capture screenshots.
 async fn capture_screenshot_internal(
-    app_state: Arc<AppState>,
+    bridge_compartment: BridgeCompartment,
     monitor: Option<i32>,
     delay_seconds: Option<f64>,
 ) -> Result<ScreenshotCaptureResult, String> {
@@ -155,7 +155,7 @@ async fn capture_screenshot_internal(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        with_default_bridge(&app_state, |bridge| {
+        with_default_bridge_compartment(&bridge_compartment, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -241,14 +241,14 @@ async fn capture_screenshot_internal(
 pub async fn capture_screenshot(
     monitor: Option<i32>,
     delay_seconds: Option<f64>,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<ScreenshotCaptureResult, String> {
     info!(
         "Capturing screenshot from monitor: {:?}, delay: {:?}s via IPC",
         monitor, delay_seconds
     );
 
-    capture_screenshot_internal(state.inner().clone(), monitor, delay_seconds).await
+    capture_screenshot_internal(bridge.inner().clone(), monitor, delay_seconds).await
 }
 
 /// Capture a screenshot and upload it directly to a qontinui-web project.
@@ -262,7 +262,7 @@ pub async fn capture_screenshot(
 #[tauri::command]
 pub async fn capture_and_upload_screenshot(
     config: ScreenshotUploadConfig,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<ScreenshotUploadResult, String> {
     info!(
         "Capturing and uploading screenshot to project: {}",
@@ -271,7 +271,7 @@ pub async fn capture_and_upload_screenshot(
 
     // 1. Capture the screenshot via IPC (no delay for upload workflow)
     let capture_result =
-        capture_screenshot_internal(state.inner().clone(), config.monitor, None).await?;
+        capture_screenshot_internal(bridge.inner().clone(), config.monitor, None).await?;
 
     if !capture_result.success || capture_result.screenshot_base64.is_none() {
         return Ok(ScreenshotUploadResult {
@@ -409,16 +409,16 @@ pub async fn capture_and_upload_screenshot(
 #[tauri::command]
 pub fn capture_screenshot_via_python(
     monitor: Option<i32>,
-    state: State<Arc<AppState>>,
+    bridge: State<BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Capturing screenshot via Python bridge for monitor: {:?}",
         monitor
     );
 
-    let app_state = state.inner().clone();
+    let bridge_clone = bridge.inner().clone();
 
-    with_default_bridge(&app_state, |bridge| {
+    with_default_bridge_compartment(&bridge_clone, |bridge| {
         if !bridge.is_running() {
             return Err("Python executor not running".to_string());
         }
