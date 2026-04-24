@@ -7,16 +7,15 @@
 //! - Getting available transitions
 //! - Action log viewing and management
 
-use crate::commands::compartments::StorageCompartment;
-use crate::executor::{require_running_bridge, with_default_bridge};
+use crate::commands::compartments::{BridgeCompartment, StorageCompartment};
+use crate::executor::{require_running_bridge_compartment, with_default_bridge_compartment};
 use crate::safe_eprintln;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
-use super::{AppState, CommandResponse};
+use super::CommandResponse;
 
 /// Execute a specific transition in the state machine.
 ///
@@ -33,18 +32,18 @@ use super::{AppState, CommandResponse};
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
 pub async fn execute_transition(
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
     transition_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Executing transition: {}", transition_id);
 
-    require_running_bridge(&state)?;
+    require_running_bridge_compartment(&bridge)?;
 
     let params = serde_json::json!({
         "transition_id": transition_id
     });
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .send_command("execute_transition", Some(params))
             .map_err(|e| e.to_string())
@@ -74,18 +73,18 @@ pub async fn execute_transition(
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
 pub async fn navigate_to_state(
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
     state_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to state: {}", state_id);
 
-    require_running_bridge(&state)?;
+    require_running_bridge_compartment(&bridge)?;
 
     let params = serde_json::json!({
         "state_id": state_id
     });
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .send_command("navigate_to_state", Some(params))
             .map_err(|e| e.to_string())
@@ -113,19 +112,19 @@ pub async fn navigate_to_state(
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
 pub async fn navigate_to_multiple_states(
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
     state_ids: Vec<String>,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to multiple states: {:?}", state_ids);
 
-    require_running_bridge(&state)?;
+    require_running_bridge_compartment(&bridge)?;
 
     let state_ids_len = state_ids.len();
     let params = serde_json::json!({
         "state_ids": state_ids
     });
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .send_command("navigate_to_multiple_states", Some(params))
             .map_err(|e| e.to_string())
@@ -150,14 +149,16 @@ pub async fn navigate_to_multiple_states(
 /// * `Ok(CommandResponse)` - Success, active states will be sent via event
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
-pub async fn get_active_states(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn get_active_states(
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
     info!("Getting active states");
 
-    require_running_bridge(&state)?;
+    require_running_bridge_compartment(&bridge)?;
 
     let params = serde_json::json!({});
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .send_command("get_active_states", Some(params))
             .map_err(|e| e.to_string())
@@ -184,15 +185,15 @@ pub async fn get_active_states(state: State<'_, Arc<AppState>>) -> Result<Comman
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
 pub async fn get_available_transitions(
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting available transitions");
 
-    require_running_bridge(&state)?;
+    require_running_bridge_compartment(&bridge)?;
 
     let params = serde_json::json!({});
 
-    with_default_bridge(&state, |bridge| {
+    with_default_bridge_compartment(&bridge, |bridge| {
         bridge
             .send_command("get_available_transitions", Some(params))
             .map_err(|e| e.to_string())
