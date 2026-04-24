@@ -7,6 +7,11 @@
 //! Uses PostgreSQL for persistence with in-memory storage for active
 //! executions.
 
+// Migrated to StorageCompartment (Workstream C) — ~28 of 32 handlers.
+// step/run/resume/step_into flow-execution handlers keep `Arc<AppState>`
+// because they read `doctor_handle` (HealthCompartment) alongside pg_db
+// and no single compartment covers both.
+use crate::commands::compartments::StorageCompartment;
 use crate::commands::AppState;
 use crate::orchestrator::flow::{Condition, Flow, FlowState, FlowStatus, FlowStep};
 use crate::orchestrator::flow_executor::{FlowEvent, FlowExecutor};
@@ -52,8 +57,8 @@ pub struct FlowSummary {
 
 /// List all saved flows.
 #[tauri::command]
-pub async fn list_flows(state: State<'_, Arc<AppState>>) -> Result<Vec<FlowSummary>, String> {
-    let flows_json = state.pg_db.list_flows().await?;
+pub async fn list_flows(state: State<'_, StorageCompartment>) -> Result<Vec<FlowSummary>, String> {
+    let flows_json = state.pg_db().list_flows().await?;
 
     let summaries = flows_json
         .into_iter()
@@ -79,8 +84,8 @@ pub async fn list_flows(state: State<'_, Arc<AppState>>) -> Result<Vec<FlowSumma
 
 /// Get a flow by ID.
 #[tauri::command]
-pub async fn get_flow(state: State<'_, Arc<AppState>>, id: String) -> Result<Option<Flow>, String> {
-    let flow_json = state.pg_db.get_flow(&id).await?;
+pub async fn get_flow(state: State<'_, StorageCompartment>, id: String) -> Result<Option<Flow>, String> {
+    let flow_json = state.pg_db().get_flow(&id).await?;
 
     if let Some(f) = flow_json {
         // Try to deserialize the flow
@@ -99,16 +104,16 @@ pub async fn get_flow(state: State<'_, Arc<AppState>>, id: String) -> Result<Opt
 
 /// Save a flow (create or update).
 #[tauri::command]
-pub async fn save_flow(state: State<'_, Arc<AppState>>, flow: Flow) -> Result<String, String> {
+pub async fn save_flow(state: State<'_, StorageCompartment>, flow: Flow) -> Result<String, String> {
     let flow_json =
         serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.pg_db.save_flow(&flow_json).await
+    state.pg_db().save_flow(&flow_json).await
 }
 
 /// Delete a flow by ID.
 #[tauri::command]
-pub async fn delete_flow(state: State<'_, Arc<AppState>>, id: String) -> Result<bool, String> {
-    state.pg_db.delete_flow(&id).await
+pub async fn delete_flow(state: State<'_, StorageCompartment>, id: String) -> Result<bool, String> {
+    state.pg_db().delete_flow(&id).await
 }
 
 /// Validate a flow definition.
@@ -127,14 +132,14 @@ pub fn validate_flow(flow: Flow) -> Result<Vec<String>, String> {
 /// using `run_flow_execution`.
 #[tauri::command]
 pub async fn start_flow_execution(
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
     app_handle: AppHandle,
     flow_id: String,
     inputs: HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
     // Get flow from database
     let flow_json = app_state
-        .pg_db
+        .pg_db()
         .get_flow(&flow_id)
         .await?
         .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
@@ -163,7 +168,7 @@ pub async fn start_flow_execution(
     // Persist to database
     let state_json = serde_json::to_value(&state)
         .map_err(|e| format!("Failed to serialize flow execution: {}", e))?;
-    app_state.pg_db.save_flow_execution(&state_json).await?;
+    app_state.pg_db().save_flow_execution(&state_json).await?;
 
     // Emit flow started event
     emit_flow_event(
@@ -363,7 +368,7 @@ pub async fn run_flow_execution(
 /// Provide human input to a flow waiting for input.
 #[tauri::command]
 pub async fn provide_flow_input(
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
     _app_handle: AppHandle,
     instance_id: String,
     step_id: String,
@@ -395,7 +400,7 @@ pub async fn provide_flow_input(
 
     // Persist updated state
     if let Ok(state_json) = serde_json::to_value(&*state) {
-        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
+        let _ = app_state.pg_db().save_flow_execution(&state_json).await;
     }
 
     Ok(true)
@@ -404,7 +409,7 @@ pub async fn provide_flow_input(
 /// Get the current state of a flow execution.
 #[tauri::command]
 pub async fn get_flow_execution(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     instance_id: String,
 ) -> Result<Option<FlowState>, String> {
     // Try in-memory first for active executions
@@ -416,7 +421,7 @@ pub async fn get_flow_execution(
     }
 
     // Fall back to database for completed executions
-    let exec_json = state.pg_db.get_flow_execution(&instance_id).await?;
+    let exec_json = state.pg_db().get_flow_execution(&instance_id).await?;
     if let Some(e) = exec_json {
         match serde_json::from_value::<FlowState>(e) {
             Ok(exec) => Ok(Some(exec)),
@@ -430,9 +435,9 @@ pub async fn get_flow_execution(
 /// List all flow executions.
 #[tauri::command]
 pub async fn list_flow_executions(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<Vec<FlowExecutionSummary>, String> {
-    let executions_json = state.pg_db.list_flow_executions().await?;
+    let executions_json = state.pg_db().list_flow_executions().await?;
 
     let summaries = executions_json
         .into_iter()
@@ -485,7 +490,7 @@ pub struct FlowExecutionResult {
 /// Cancel a flow execution.
 #[tauri::command]
 pub async fn cancel_flow_execution(
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
     app_handle: AppHandle,
     instance_id: String,
 ) -> Result<bool, String> {
@@ -514,7 +519,7 @@ pub async fn cancel_flow_execution(
 
         // Update database
         if let Ok(state_json) = serde_json::to_value(&*state) {
-            let _ = app_state.pg_db.save_flow_execution(&state_json).await;
+            let _ = app_state.pg_db().save_flow_execution(&state_json).await;
         }
 
         info!(instance_id = %instance_id, "Flow execution cancelled");
@@ -580,11 +585,11 @@ pub fn create_sample_flow() -> Result<Flow, String> {
 
 /// Add the sample flow to storage.
 #[tauri::command]
-pub async fn add_sample_flow(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+pub async fn add_sample_flow(state: State<'_, StorageCompartment>) -> Result<String, String> {
     let flow = create_sample_flow()?;
     let flow_json =
         serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.pg_db.save_flow(&flow_json).await
+    state.pg_db().save_flow(&flow_json).await
 }
 
 // ============================================================================
@@ -610,10 +615,10 @@ pub struct PaginatedFlowExecutionResult {
 /// Get flows filtered by tag.
 #[tauri::command]
 pub async fn get_flows_by_tag(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     tag: String,
 ) -> Result<Vec<FlowSummary>, String> {
-    let flows_json = state.pg_db.get_flows_by_tag(&tag).await?;
+    let flows_json = state.pg_db().get_flows_by_tag(&tag).await?;
 
     let summaries = flows_json
         .into_iter()
@@ -640,11 +645,11 @@ pub async fn get_flows_by_tag(
 /// Get flow executions with optional filtering.
 #[tauri::command]
 pub async fn get_flow_executions_filtered(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     filter: FlowExecutionFilter,
 ) -> Result<Vec<FlowExecutionSummary>, String> {
     let executions_json = state
-        .pg_db
+        .pg_db()
         .get_flow_executions_filtered(filter.flow_id.as_deref(), filter.status.as_deref())
         .await?;
 
@@ -666,13 +671,13 @@ pub async fn get_flow_executions_filtered(
 /// Get flow executions with pagination.
 #[tauri::command]
 pub async fn get_flow_executions_paginated(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: Option<String>,
     offset: i64,
     limit: i64,
 ) -> Result<PaginatedFlowExecutionResult, String> {
     let executions_json = state
-        .pg_db
+        .pg_db()
         .get_flow_executions_paginated(flow_id.as_deref(), offset, limit)
         .await?;
 
@@ -689,7 +694,7 @@ pub async fn get_flow_executions_paginated(
         .collect();
 
     let total = state
-        .pg_db
+        .pg_db()
         .get_flow_executions_count(flow_id.as_deref())
         .await?;
 
@@ -704,11 +709,11 @@ pub async fn get_flow_executions_paginated(
 /// Get total count of flow executions.
 #[tauri::command]
 pub async fn get_flow_executions_count(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: Option<String>,
 ) -> Result<i64, String> {
     state
-        .pg_db
+        .pg_db()
         .get_flow_executions_count(flow_id.as_deref())
         .await
 }
@@ -741,7 +746,7 @@ fn emit_flow_event(app_handle: &AppHandle, event: FlowEvent) {
 /// The flow can be resumed with resume_flow_execution.
 #[tauri::command]
 pub async fn pause_flow_execution(
-    app_state: State<'_, Arc<AppState>>,
+    app_state: State<'_, StorageCompartment>,
     app_handle: AppHandle,
     instance_id: String,
 ) -> Result<bool, String> {
@@ -764,7 +769,7 @@ pub async fn pause_flow_execution(
 
         // Persist updated state
         if let Ok(state_json) = serde_json::to_value(&*state) {
-            let _ = app_state.pg_db.save_flow_execution(&state_json).await;
+            let _ = app_state.pg_db().save_flow_execution(&state_json).await;
         }
 
         // Emit pause event (using flow_id captured before mutable borrow)
@@ -1000,21 +1005,21 @@ pub struct FlowVersionDetail {
 /// restored later. Version numbers are automatically incremented.
 #[tauri::command]
 pub async fn create_flow_version(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: String,
     message: Option<String>,
     created_by: Option<String>,
 ) -> Result<FlowVersionSummary, String> {
     // Get current flow definition
     let flow_json = state
-        .pg_db
+        .pg_db()
         .get_flow(&flow_id)
         .await?
         .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
 
     // Create version
     let version = state
-        .pg_db
+        .pg_db()
         .create_flow_version(
             &flow_id,
             &flow_json,
@@ -1038,10 +1043,10 @@ pub async fn create_flow_version(
 /// Returns version summaries (without full definitions) in descending order.
 #[tauri::command]
 pub async fn list_flow_versions(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: String,
 ) -> Result<Vec<FlowVersionSummary>, String> {
-    let versions_json = state.pg_db.list_flow_versions(&flow_id).await?;
+    let versions_json = state.pg_db().list_flow_versions(&flow_id).await?;
 
     let summaries = versions_json
         .into_iter()
@@ -1063,11 +1068,11 @@ pub async fn list_flow_versions(
 /// Returns the full version data including the flow definition.
 #[tauri::command]
 pub async fn get_flow_version(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: String,
     version: i32,
 ) -> Result<Option<FlowVersion>, String> {
-    let version_json = state.pg_db.get_flow_version(&flow_id, version).await?;
+    let version_json = state.pg_db().get_flow_version(&flow_id, version).await?;
 
     Ok(version_json.map(|v| FlowVersion {
         id: v["id"].as_str().unwrap_or("").to_string(),
@@ -1086,13 +1091,13 @@ pub async fn get_flow_version(
 /// to the specified version. Returns the new version number created.
 #[tauri::command]
 pub async fn restore_flow_version(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: String,
     version: i32,
     created_by: Option<String>,
 ) -> Result<serde_json::Value, String> {
     state
-        .pg_db
+        .pg_db()
         .restore_flow_version(&flow_id, version, created_by.as_deref())
         .await
 }
@@ -1102,13 +1107,13 @@ pub async fn restore_flow_version(
 /// Returns the full definitions of both versions for client-side comparison.
 #[tauri::command]
 pub async fn compare_flow_versions(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: String,
     version1: i32,
     version2: i32,
 ) -> Result<FlowVersionComparison, String> {
     let comparison = state
-        .pg_db
+        .pg_db()
         .compare_flow_versions(&flow_id, version1, version2)
         .await?;
 
@@ -1148,20 +1153,20 @@ pub async fn compare_flow_versions(
 /// Delete a specific version of a flow.
 #[tauri::command]
 pub async fn delete_flow_version(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: String,
     version: i32,
 ) -> Result<bool, String> {
-    state.pg_db.delete_flow_version(&flow_id, version).await
+    state.pg_db().delete_flow_version(&flow_id, version).await
 }
 
 /// Get the latest version number of a flow.
 #[tauri::command]
 pub async fn get_latest_flow_version(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: String,
 ) -> Result<Option<i32>, String> {
-    state.pg_db.get_latest_flow_version(&flow_id).await
+    state.pg_db().get_latest_flow_version(&flow_id).await
 }
 
 // ============================================================================
@@ -1184,11 +1189,11 @@ pub struct FlowExport {
 /// Returns a JSON string that can be saved to a file.
 #[tauri::command]
 pub async fn export_flow_json(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: String,
 ) -> Result<String, String> {
     let flow_json = state
-        .pg_db
+        .pg_db()
         .get_flow(&flow_id)
         .await?
         .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
@@ -1207,11 +1212,11 @@ pub async fn export_flow_json(
 /// Returns a YAML string that can be saved to a file.
 #[tauri::command]
 pub async fn export_flow_yaml(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_id: String,
 ) -> Result<String, String> {
     let flow_json = state
-        .pg_db
+        .pg_db()
         .get_flow(&flow_id)
         .await?
         .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
@@ -1230,7 +1235,7 @@ pub async fn export_flow_yaml(
 /// Returns the ID of the imported flow.
 #[tauri::command]
 pub async fn import_flow_json(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     content: String,
     generate_new_id: bool,
 ) -> Result<Flow, String> {
@@ -1255,7 +1260,7 @@ pub async fn import_flow_json(
     // Save to database
     let flow_json =
         serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.pg_db.save_flow(&flow_json).await?;
+    state.pg_db().save_flow(&flow_json).await?;
 
     Ok(flow)
 }
@@ -1265,7 +1270,7 @@ pub async fn import_flow_json(
 /// Returns the imported flow.
 #[tauri::command]
 pub async fn import_flow_yaml(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     content: String,
     generate_new_id: bool,
 ) -> Result<Flow, String> {
@@ -1293,7 +1298,7 @@ pub async fn import_flow_yaml(
     // Save to database
     let flow_json =
         serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.pg_db.save_flow(&flow_json).await?;
+    state.pg_db().save_flow(&flow_json).await?;
 
     Ok(flow)
 }
@@ -1301,13 +1306,13 @@ pub async fn import_flow_yaml(
 /// Export multiple flows to a single JSON file.
 #[tauri::command]
 pub async fn export_flows_bulk(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     flow_ids: Vec<String>,
 ) -> Result<String, String> {
     let mut flows = Vec::new();
 
     for flow_id in flow_ids {
-        if let Some(flow_json) = state.pg_db.get_flow(&flow_id).await? {
+        if let Some(flow_json) = state.pg_db().get_flow(&flow_id).await? {
             flows.push(flow_json);
         }
     }
@@ -1324,7 +1329,7 @@ pub async fn export_flows_bulk(
 /// Import multiple flows from a bulk export.
 #[tauri::command]
 pub async fn import_flows_bulk(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     content: String,
     generate_new_ids: bool,
 ) -> Result<Vec<Flow>, String> {
@@ -1351,7 +1356,7 @@ pub async fn import_flows_bulk(
 
         let flow_json =
             serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-        state.pg_db.save_flow(&flow_json).await?;
+        state.pg_db().save_flow(&flow_json).await?;
 
         imported_flows.push(flow);
     }
