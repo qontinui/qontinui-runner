@@ -3,12 +3,11 @@
 //! These commands expose the data that is available to AI via MCP,
 //! allowing the frontend to display it in the same format.
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::database::TaskRun;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -45,12 +44,12 @@ impl<T> AiDataResponse<T> {
 /// Get task runs for the AI Data Viewer.
 #[tauri::command]
 pub async fn get_task_runs_for_viewer(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     limit: Option<u32>,
 ) -> Result<AiDataResponse<Vec<TaskRun>>, String> {
     let limit = limit.unwrap_or(20);
 
-    let result = state.pg_db.get_recent_task_runs(limit, None).await;
+    let result = state.pg_db().get_recent_task_runs(limit, None).await;
     match result {
         Ok(runs) => Ok(AiDataResponse::ok(runs)),
         Err(e) => Ok(AiDataResponse::err(e)),
@@ -60,10 +59,10 @@ pub async fn get_task_runs_for_viewer(
 /// Get a specific task run with full output.
 #[tauri::command]
 pub async fn get_task_run_for_viewer(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_id: String,
 ) -> Result<AiDataResponse<TaskRun>, String> {
-    let result = state.pg_db.get_task_run(&task_id).await;
+    let result = state.pg_db().get_task_run(&task_id).await;
     match result {
         Ok(Some(run)) => Ok(AiDataResponse::ok(run)),
         Ok(None) => Ok(AiDataResponse::err(format!(
@@ -252,12 +251,12 @@ fn read_jsonl_file_in_time_range(
 /// Read JSONL logs filtered by task run time range.
 #[tauri::command]
 pub async fn read_jsonl_logs_for_task_run(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     log_type: String,
     task_run_id: String,
 ) -> Result<AiDataResponse<JsonlLogsResult>, String> {
     // Get the task run to get time range
-    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
+    let task_run_result = state.pg_db().get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -354,11 +353,11 @@ pub struct ConsolidatedAiOutputResult {
 /// Groups consecutive entries by source into readable chunks.
 #[tauri::command]
 pub async fn get_consolidated_ai_output(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<AiDataResponse<ConsolidatedAiOutputResult>, String> {
     // Get the task run to get time range
-    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
+    let task_run_result = state.pg_db().get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -553,7 +552,7 @@ pub async fn get_jsonl_logs_summary() -> Result<AiDataResponse<JsonlLogsSummary>
 /// This allows continuing a task that didn't achieve its goal.
 #[tauri::command]
 pub async fn reopen_task_run(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_id: String,
     additional_sessions: u32,
 ) -> Result<AiDataResponse<TaskRun>, String> {
@@ -695,12 +694,12 @@ fn get_log_filename(log_type: &str) -> Option<&'static str> {
 /// Read text logs for a specific task run.
 #[tauri::command]
 pub async fn read_text_logs_for_viewer(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     log_type: String,
     task_run_id: String,
 ) -> Result<AiDataResponse<TextLogsResult>, String> {
     // Get the task run to get time range
-    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
+    let task_run_result = state.pg_db().get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -760,11 +759,11 @@ pub async fn read_text_logs_for_viewer(
 /// Get summary of all text log files for a task run.
 #[tauri::command]
 pub async fn get_text_logs_summary(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<AiDataResponse<TextLogsSummary>, String> {
     // Get the task run to get time range
-    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
+    let task_run_result = state.pg_db().get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -1013,11 +1012,11 @@ pub struct AiPromptsResult {
 /// Get AI prompts for a task run
 #[tauri::command]
 pub async fn get_ai_prompts_for_viewer(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<AiDataResponse<AiPromptsResult>, String> {
     // Get the task run to find associated prompt files
-    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
+    let task_run_result = state.pg_db().get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -1190,7 +1189,7 @@ pub struct TaskRunEventsResult {
 /// This replaces JSONL file reading for historical analysis.
 #[tauri::command]
 pub async fn get_task_run_events_from_db(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
     event_type: Option<String>,
     limit: Option<u32>,
@@ -1198,7 +1197,7 @@ pub async fn get_task_run_events_from_db(
     let limit = limit.unwrap_or(1000);
 
     match state
-        .pg_db
+        .pg_db()
         .get_task_run_events(&task_run_id, event_type.as_deref(), Some(limit))
         .await
     {
@@ -1226,12 +1225,12 @@ pub struct TaskRunScreenshotsResult {
 /// Get task run screenshots from PG database.
 #[tauri::command]
 pub async fn get_task_run_screenshots_from_db(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
     screenshot_type: Option<String>,
 ) -> Result<AiDataResponse<TaskRunScreenshotsResult>, String> {
     match state
-        .pg_db
+        .pg_db()
         .get_task_run_screenshots(&task_run_id, screenshot_type.as_deref())
         .await
     {
@@ -1261,7 +1260,7 @@ pub struct TaskRunPlaywrightResultsResult {
 /// Get Playwright test results from PG database with SQL-level pagination.
 #[tauri::command]
 pub async fn get_task_run_playwright_results_from_db(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
     limit: Option<usize>,
     offset: Option<usize>,
@@ -1270,13 +1269,13 @@ pub async fn get_task_run_playwright_results_from_db(
     let off = offset.unwrap_or(0) as i64;
 
     let total_count = state
-        .pg_db
+        .pg_db()
         .count_task_run_table("task_run_playwright_results", &task_run_id)
         .await
         .unwrap_or(0) as usize;
 
     match state
-        .pg_db
+        .pg_db()
         .get_task_run_playwright_results_paginated(&task_run_id, lim, off)
         .await
     {
@@ -1311,12 +1310,12 @@ pub struct TaskRunMigratedLogsSummary {
 /// Get summary of migrated logs for a task run.
 #[tauri::command]
 pub async fn get_task_run_migrated_logs_summary(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<AiDataResponse<TaskRunMigratedLogsSummary>, String> {
     // Get events
     let events = state
-        .pg_db
+        .pg_db()
         .get_task_run_events(&task_run_id, None, None)
         .await
         .unwrap_or_default();
@@ -1329,14 +1328,14 @@ pub async fn get_task_run_migrated_logs_summary(
 
     // Get screenshots
     let screenshots = state
-        .pg_db
+        .pg_db()
         .get_task_run_screenshots(&task_run_id, None)
         .await
         .unwrap_or_default();
 
     // Get Playwright results
     let playwright_results = state
-        .pg_db
+        .pg_db()
         .get_task_run_playwright_results(&task_run_id)
         .await
         .unwrap_or_default();
@@ -1365,7 +1364,7 @@ pub struct TaskRunApiRequestsResult {
 /// Get API requests for a task run from PG database with SQL-level pagination.
 #[tauri::command]
 pub async fn get_task_run_api_requests_from_db(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
     success_filter: Option<bool>,
     limit: Option<usize>,
@@ -1377,13 +1376,13 @@ pub async fn get_task_run_api_requests_from_db(
     // When no filter, use SQL-level LIMIT/OFFSET (avoids loading all rows into Rust memory)
     if success_filter.is_none() {
         let total_count = state
-            .pg_db
+            .pg_db()
             .count_task_run_table("task_run_api_requests", &task_run_id)
             .await
             .unwrap_or(0) as usize;
 
         match state
-            .pg_db
+            .pg_db()
             .get_task_run_api_requests_paginated(&task_run_id, lim as i64, off as i64)
             .await
         {
@@ -1406,7 +1405,7 @@ pub async fn get_task_run_api_requests_from_db(
         }
     } else {
         // With success_filter, must fetch all then filter in memory
-        match state.pg_db.get_task_run_api_requests(&task_run_id).await {
+        match state.pg_db().get_task_run_api_requests(&task_run_id).await {
             Ok(all_requests) => {
                 let filter = success_filter.unwrap();
                 let filtered: Vec<_> = all_requests
@@ -1449,7 +1448,7 @@ pub struct TaskRunAwasStepsResult {
 /// Get AWAS steps for a task run from database with SQL-level pagination.
 #[tauri::command]
 pub async fn get_task_run_awas_steps_from_db(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
     step_type: Option<String>,
     limit: Option<usize>,
@@ -1461,13 +1460,13 @@ pub async fn get_task_run_awas_steps_from_db(
     // When no filter, use SQL-level LIMIT/OFFSET
     if step_type.is_none() {
         let total_count = state
-            .pg_db
+            .pg_db()
             .count_task_run_table("task_run_awas_steps", &task_run_id)
             .await
             .unwrap_or(0) as usize;
 
         match state
-            .pg_db
+            .pg_db()
             .get_task_run_awas_steps_paginated(&task_run_id, lim as i64, off as i64)
             .await
         {
@@ -1490,7 +1489,7 @@ pub async fn get_task_run_awas_steps_from_db(
         }
     } else {
         // With step_type filter, must fetch all then filter in memory
-        match state.pg_db.get_task_run_awas_steps(&task_run_id).await {
+        match state.pg_db().get_task_run_awas_steps(&task_run_id).await {
             Ok(all_steps) => {
                 let filter_type = step_type.unwrap();
                 let filtered: Vec<_> = all_steps
@@ -1541,7 +1540,7 @@ pub struct TaskRunVerificationResultsDbResult {
 /// step results (tests, checks, etc.) from the unified workflow's verification phase.
 #[tauri::command]
 pub async fn get_task_run_verification_results_from_db(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<AiDataResponse<TaskRunVerificationResultsDbResult>, String> {
     // checkpoint_db removed — verification phase results was SQLite-only
@@ -1577,7 +1576,7 @@ pub struct RuntimeContextVariable {
 /// the stored variables into a flat list for the Context Tab.
 #[tauri::command]
 pub async fn get_task_run_context(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<AiDataResponse<RuntimeContextResult>, String> {
     // checkpoint_db removed — runtime context was SQLite-only
