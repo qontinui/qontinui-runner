@@ -3,24 +3,21 @@
 //! CRUD operations for watcher definitions. Each watcher queries the activity
 //! timeline on a schedule, reasons with AI, and triggers an action.
 
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::database::types::*;
 
 /// Create a new watcher. Returns the watcher ID.
 #[tauri::command]
 pub async fn create_watcher(
     input: CreateWatcherInput,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<String, String> {
-    let pg = &state.pg_db;
-
-    let id = pg.create_watcher(&input).await?;
+    let id = storage.pg_db().create_watcher(&input).await?;
     info!("Created watcher '{}' ({})", input.name, id);
     Ok(id)
 }
@@ -29,30 +26,26 @@ pub async fn create_watcher(
 #[tauri::command]
 pub async fn get_watcher(
     id: String,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<Option<Watcher>, String> {
-    let pg = &state.pg_db;
-
-    pg.get_watcher(&id).await
+    storage.pg_db().get_watcher(&id).await
 }
 
 /// List all watchers.
 #[tauri::command]
-pub async fn list_watchers(state: State<'_, Arc<AppState>>) -> Result<Vec<Watcher>, String> {
-    let pg = &state.pg_db;
-
-    pg.list_watchers().await
+pub async fn list_watchers(
+    storage: State<'_, StorageCompartment>,
+) -> Result<Vec<Watcher>, String> {
+    storage.pg_db().list_watchers().await
 }
 
 /// Update a watcher's fields.
 #[tauri::command]
 pub async fn update_watcher(
     input: UpdateWatcherInput,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<Option<String>, String> {
-    let pg = &state.pg_db;
-
-    let result = pg.update_watcher(&input).await?;
+    let result = storage.pg_db().update_watcher(&input).await?;
     if result.is_some() {
         info!("Updated watcher {}", input.id);
     }
@@ -61,10 +54,11 @@ pub async fn update_watcher(
 
 /// Delete a watcher permanently.
 #[tauri::command]
-pub async fn delete_watcher(id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
-    let pg = &state.pg_db;
-
-    let deleted = pg.delete_watcher(&id).await?;
+pub async fn delete_watcher(
+    id: String,
+    storage: State<'_, StorageCompartment>,
+) -> Result<bool, String> {
+    let deleted = storage.pg_db().delete_watcher(&id).await?;
     if deleted {
         info!("Deleted watcher {}", id);
     }
@@ -76,11 +70,9 @@ pub async fn delete_watcher(id: String, state: State<'_, Arc<AppState>>) -> Resu
 pub async fn set_watcher_enabled(
     id: String,
     enabled: bool,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<bool, String> {
-    let pg = &state.pg_db;
-
-    let updated = pg.set_watcher_enabled(&id, enabled).await?;
+    let updated = storage.pg_db().set_watcher_enabled(&id, enabled).await?;
     if updated {
         info!("Set watcher {} enabled={}", id, enabled);
     }
