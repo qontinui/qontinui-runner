@@ -2,15 +2,14 @@
 //!
 //! Commands for querying executor status, detecting monitors, and managing input capture.
 
-use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tracing::{debug, info, warn};
 
-// Migrated to BridgeCompartment (Workstream C) — 2 of 3 state handlers.
-// `get_executor_status` keeps `Arc<AppState>` (reads bridge_manager +
-// current_config, which span BridgeCompartment + ExecutionCompartment).
-use super::super::compartments::BridgeCompartment;
-use super::super::{AppState, CommandResponse};
+// Fully migrated to compartment state (Workstream C).
+// `get_executor_status` uses multi-State (Bridge + Execution) since it reads
+// both the bridge manager and `current_config`.
+use super::super::compartments::{BridgeCompartment, ExecutionCompartment};
+use super::super::CommandResponse;
 // Note: BridgeManager methods (is_default_bridge_running, with_default_bridge, etc.)
 // are synchronous and can be called directly after acquiring the manager lock.
 
@@ -26,13 +25,14 @@ use super::super::{AppState, CommandResponse};
 /// * `Err(String)` - Error if status query fails
 #[tauri::command]
 pub async fn get_executor_status(
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
+    execution: State<'_, ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     debug!("[GET_EXECUTOR_STATUS] Called - checking bridge state...");
 
     // Use bridge manager directly - use async methods to avoid nested runtime panic
     let (is_running, state_name) = {
-        let manager_guard = state.bridge_manager.lock().await;
+        let manager_guard = bridge.bridge_manager().lock().await;
         if let Some(ref manager) = *manager_guard {
             // Use async version to avoid nested runtime panic when called from async context
             let running = manager.is_default_bridge_running_async().await;
@@ -55,8 +55,8 @@ pub async fn get_executor_status(
     debug!("[GET_EXECUTOR_STATUS] is_running() = {}", is_running);
     debug!("[GET_EXECUTOR_STATUS] Current state: {}", state_name);
 
-    let config_loaded = state
-        .current_config
+    let config_loaded = execution
+        .current_config()
         .lock()
         .unwrap_or_else(|poisoned| {
             warn!("[GET_EXECUTOR_STATUS] current_config mutex was poisoned, recovering");
