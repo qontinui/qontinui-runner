@@ -1,9 +1,8 @@
 //! Tauri commands for agentic metric scores and trends.
 
 use crate::auth::AuthManager;
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use serde::Serialize;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -12,38 +11,38 @@ use tracing::{error, info, warn};
 /// Get all agentic metric scores for a specific task run.
 #[tauri::command]
 pub async fn get_agentic_scores(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<Vec<crate::database::agentic_metrics_ops::AgenticMetricScoreRow>, String> {
-    state.pg_db.get_agentic_scores_for_run(&task_run_id).await
+    state.pg_db().get_agentic_scores_for_run(&task_run_id).await
 }
 
 /// Get aggregate agentic metric stats over a time period.
 #[tauri::command]
 pub async fn get_agentic_metric_aggregates(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     days: Option<i64>,
 ) -> Result<Vec<crate::database::agentic_metrics_ops::AgenticMetricAggregate>, String> {
     let interval = format!("{} days", days.unwrap_or(30));
-    state.pg_db.get_agentic_metric_aggregates(&interval).await
+    state.pg_db().get_agentic_metric_aggregates(&interval).await
 }
 
 /// Get composite agentic score trend over time, grouped by date.
 #[tauri::command]
 pub async fn get_composite_score_trend(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     days: Option<i64>,
 ) -> Result<Vec<crate::database::agentic_metrics_ops::CompositeScoreTrendPoint>, String> {
     state
-        .pg_db
+        .pg_db()
         .get_composite_score_trend(days.unwrap_or(30))
         .await
 }
 
 /// Manually trigger baseline recomputation.
 #[tauri::command]
-pub async fn recompute_agentic_baselines(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
-    state.pg_db.recompute_agentic_baselines().await
+pub async fn recompute_agentic_baselines(state: State<'_, StorageCompartment>) -> Result<u32, String> {
+    state.pg_db().recompute_agentic_baselines().await
 }
 
 // ============================================================================
@@ -66,7 +65,7 @@ pub struct PushScoresResult {
 /// POSTs them as a single batch to `/api/v1/feedback-scores/batch` with bearer auth.
 #[tauri::command]
 pub async fn push_agentic_scores_to_backend(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     task_run_id: String,
     target_id: String,
     target_type: String,
@@ -76,7 +75,7 @@ pub async fn push_agentic_scores_to_backend(
         task_run_id, target_type, target_id
     );
 
-    let scores = state.pg_db.get_agentic_scores_for_run(&task_run_id).await?;
+    let scores = state.pg_db().get_agentic_scores_for_run(&task_run_id).await?;
 
     if scores.is_empty() {
         info!("No agentic scores found for task_run_id={}", task_run_id);
@@ -168,14 +167,14 @@ pub async fn push_agentic_scores_to_backend(
 /// delegates to `push_agentic_scores_to_backend`.
 #[tauri::command]
 pub async fn push_latest_agentic_scores(
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
     target_id: String,
     target_type: String,
 ) -> Result<PushScoresResult, String> {
     info!("Finding most recent task run with agentic scores...");
 
     let task_run_id: String = state
-        .pg_db
+        .pg_db()
         .get_latest_scored_task_run_id()
         .await?
         .ok_or_else(|| "No agentic scores found".to_string())?;
