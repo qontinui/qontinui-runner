@@ -10,6 +10,7 @@
 //! The "AI" prefix was removed since task runs can now be pure automation or mixed.
 
 use crate::auth::AuthManager;
+use crate::commands::compartments::StorageCompartment;
 use crate::database::pg::PgDb;
 use crate::database::TaskRun;
 use crate::findings::types::{Finding, FindingStatus};
@@ -943,10 +944,10 @@ impl Default for AITaskSyncService {
 pub async fn sync_ai_task_created(
     task_id: String,
     project_id: Option<String>,
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    storage: tauri::State<'_, StorageCompartment>,
 ) -> Result<AITaskResponse, String> {
-    let task = app_state
-        .pg_db
+    let task = storage
+        .pg_db()
         .get_task_run(&task_id)
         .await?
         .ok_or_else(|| format!("Task {} not found", task_id))?;
@@ -990,9 +991,9 @@ pub async fn sync_ai_session_ended(
 #[tauri::command]
 pub async fn sync_ai_findings(
     task_id: String,
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    storage: tauri::State<'_, StorageCompartment>,
 ) -> Result<Vec<AITaskFindingSyncResponse>, String> {
-    let findings = app_state.pg_db.get_findings_for_task(&task_id).await?;
+    let findings = storage.pg_db().get_findings_for_task(&task_id).await?;
 
     if findings.is_empty() {
         return Ok(vec![]);
@@ -1006,10 +1007,10 @@ pub async fn sync_ai_findings(
 #[tauri::command]
 pub async fn sync_deferred_questions(
     task_id: String,
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    storage: tauri::State<'_, StorageCompartment>,
 ) -> Result<(), String> {
-    let questions = app_state
-        .pg_db
+    let questions = storage
+        .pg_db()
         .get_deferred_questions_for_task_run(&task_id)
         .await?;
 
@@ -1032,10 +1033,10 @@ pub async fn sync_deferred_questions(
 #[tauri::command]
 pub async fn sync_ai_task_completed(
     task_id: String,
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    storage: tauri::State<'_, StorageCompartment>,
 ) -> Result<AITaskResponse, String> {
-    let task = app_state
-        .pg_db
+    let task = storage
+        .pg_db()
         .get_task_run(&task_id)
         .await?
         .ok_or_else(|| format!("Task {} not found", task_id))?;
@@ -1051,11 +1052,11 @@ pub async fn sync_ai_task_completed(
 pub async fn full_sync_ai_task(
     task_id: String,
     project_id: Option<String>,
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    storage: tauri::State<'_, StorageCompartment>,
 ) -> Result<(), String> {
     let service = AITaskSyncService::new();
     service
-        .full_sync_task(&app_state.pg_db, &task_id, project_id.as_deref())
+        .full_sync_task(storage.pg_db(), &task_id, project_id.as_deref())
         .await
 }
 
@@ -1066,7 +1067,7 @@ pub async fn full_sync_ai_task(
 #[tauri::command]
 pub async fn sync_all_pending_ai_tasks(
     project_id: Option<String>,
-    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+    storage: tauri::State<'_, StorageCompartment>,
 ) -> Result<u32, String> {
     let service = AITaskSyncService::new();
 
@@ -1076,13 +1077,13 @@ pub async fn sync_all_pending_ai_tasks(
     }
 
     // Get recent task runs (limit to last 50)
-    let tasks = app_state.pg_db.get_recent_task_runs(50, None).await?;
+    let tasks = storage.pg_db().get_recent_task_runs(50, None).await?;
 
     let mut synced_count = 0u32;
 
     for task in tasks {
         match service
-            .full_sync_task(&app_state.pg_db, &task.id, project_id.as_deref())
+            .full_sync_task(storage.pg_db(), &task.id, project_id.as_deref())
             .await
         {
             Ok(_) => {
