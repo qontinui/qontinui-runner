@@ -14,6 +14,8 @@ use crate::commands::AppState;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 // =============================================================================
@@ -375,6 +377,18 @@ fn calculate_percentiles(durations: &[u64]) -> (u64, u64, u64) {
     let p99 = sorted[p99_idx.min(len - 1)];
 
     (p50, p95, p99)
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_performance_metrics")
+        .invoke_handler(tauri::generate_handler![
+            get_performance_dashboard,
+            get_action_performance,
+            get_transition_reliability,
+            get_element_resolution_metrics,
+            get_success_rate_trend,
+        ])
+        .build()
 }
 
 #[cfg(test)]

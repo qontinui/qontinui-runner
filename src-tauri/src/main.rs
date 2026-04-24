@@ -504,6 +504,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::ai_data::plugin())
         .plugin(commands::cost_dashboard::plugin())
         .plugin(commands::learning::plugin())
+        .plugin(commands::performance_metrics::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -992,11 +993,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::test_orchestrator::list_orchestration_plans,
             commands::test_orchestrator::delete_orchestration_plan,
             // Performance Metrics Dashboard commands
-            commands::performance_metrics::get_performance_dashboard,
-            commands::performance_metrics::get_action_performance,
-            commands::performance_metrics::get_transition_reliability,
-            commands::performance_metrics::get_element_resolution_metrics,
-            commands::performance_metrics::get_success_rate_trend,
+            // NOTE: performance_metrics handlers moved to per-module plugin (see .plugin() calls above).
             // UI Bridge commands (AI-driven UI automation)
             commands::ui_bridge::ui_bridge_get_elements,
             commands::ui_bridge::ui_bridge_get_element,
