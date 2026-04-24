@@ -1563,13 +1563,13 @@ pub async fn test_wsv_connection(endpoint: String) -> Result<WsvConnectionTestRe
 /// `wsv_disagreements::normalize_limit`.
 #[tauri::command]
 pub async fn list_wsv_disagreements(
-    state: tauri::State<'_, std::sync::Arc<crate::commands::AppState>>,
+    storage: tauri::State<'_, crate::commands::compartments::StorageCompartment>,
     task_run_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<crate::database::pg::wsv_disagreements::WsvDisagreementRow>, String> {
     let limit = crate::database::pg::wsv_disagreements::normalize_limit(limit);
-    state
-        .pg_db
+    storage
+        .pg_db()
         .list_wsv_disagreements(task_run_id.as_deref(), limit)
         .await
 }
