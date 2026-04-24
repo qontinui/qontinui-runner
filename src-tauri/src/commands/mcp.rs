@@ -10,13 +10,12 @@
 //! - Call tools with arguments
 //! - Query MCP call history for task runs
 
-use crate::commands::AppState;
+use crate::commands::compartments::{IntegrationCompartment, StorageCompartment};
 use crate::mcp_client::{
     CreateMcpServerInput, McpCallsResult, McpServerConfig, McpServerStatus, McpToolCallResult,
     McpToolInfo, UpdateMcpServerInput,
 };
 use serde::Serialize;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -59,9 +58,9 @@ impl<T> McpResponse<T> {
 /// List all configured MCP servers
 #[tauri::command]
 pub async fn list_mcp_servers(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<McpResponse<Vec<McpServerConfig>>, String> {
-    let result = state.pg_db.list_mcp_servers().await;
+    let result = storage.pg_db().list_mcp_servers().await;
     match result {
         Ok(servers) => Ok(McpResponse::ok(servers)),
         Err(e) => {
@@ -74,10 +73,10 @@ pub async fn list_mcp_servers(
 /// Get a specific MCP server by ID
 #[tauri::command]
 pub async fn get_mcp_server(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     server_id: String,
 ) -> Result<McpResponse<McpServerConfig>, String> {
-    let result = state.pg_db.get_mcp_server(&server_id).await;
+    let result = storage.pg_db().get_mcp_server(&server_id).await;
     match result {
         Ok(Some(server)) => Ok(McpResponse::ok(server)),
         Ok(None) => Ok(McpResponse::err(format!(
@@ -94,12 +93,12 @@ pub async fn get_mcp_server(
 /// Create a new MCP server configuration
 #[tauri::command]
 pub async fn create_mcp_server(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     input: CreateMcpServerInput,
 ) -> Result<McpResponse<McpServerConfig>, String> {
     info!("Creating MCP server: {}", input.name);
 
-    let result = state.pg_db.create_mcp_server(input).await;
+    let result = storage.pg_db().create_mcp_server(input).await;
     match result {
         Ok(server) => {
             info!("Created MCP server: {} ({})", server.name, server.id);
@@ -118,13 +117,13 @@ pub async fn create_mcp_server(
 /// subprocess is killed before updating the configuration.
 #[tauri::command]
 pub async fn update_mcp_server(
-    state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
     server_id: String,
     input: UpdateMcpServerInput,
 ) -> Result<McpResponse<McpServerConfig>, String> {
     info!("Updating MCP server: {}", server_id);
 
-    let mcp_manager = state.mcp_client_manager.lock().await;
+    let mcp_manager = integration.mcp_client_manager().lock().await;
 
     match mcp_manager.update_server(&server_id, input).await {
         Ok(server) => {
@@ -144,12 +143,12 @@ pub async fn update_mcp_server(
 /// subprocess is killed before deleting the configuration.
 #[tauri::command]
 pub async fn delete_mcp_server(
-    state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
     server_id: String,
 ) -> Result<McpResponse<()>, String> {
     info!("Deleting MCP server: {}", server_id);
 
-    let mcp_manager = state.mcp_client_manager.lock().await;
+    let mcp_manager = integration.mcp_client_manager().lock().await;
 
     match mcp_manager.delete_server(&server_id).await {
         Ok(()) => {
@@ -170,13 +169,13 @@ pub async fn delete_mcp_server(
 /// Connect to an MCP server and list its tools
 #[tauri::command]
 pub async fn connect_mcp_server(
-    state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
     server_id: String,
 ) -> Result<McpResponse<Vec<McpToolInfo>>, String> {
     info!("Connecting to MCP server: {}", server_id);
 
     // Get the MCP client manager from state
-    let mcp_manager = state.mcp_client_manager.lock().await;
+    let mcp_manager = integration.mcp_client_manager().lock().await;
 
     match mcp_manager.connect(&server_id).await {
         Ok(tools) => {
@@ -197,12 +196,12 @@ pub async fn connect_mcp_server(
 /// Disconnect from an MCP server
 #[tauri::command]
 pub async fn disconnect_mcp_server(
-    state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
     server_id: String,
 ) -> Result<McpResponse<()>, String> {
     info!("Disconnecting from MCP server: {}", server_id);
 
-    let mcp_manager = state.mcp_client_manager.lock().await;
+    let mcp_manager = integration.mcp_client_manager().lock().await;
 
     match mcp_manager.disconnect(&server_id).await {
         Ok(()) => {
@@ -219,9 +218,9 @@ pub async fn disconnect_mcp_server(
 /// Get the status of all MCP servers
 #[tauri::command]
 pub async fn get_mcp_servers_status(
-    state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
 ) -> Result<McpResponse<Vec<McpServerStatus>>, String> {
-    let mcp_manager = state.mcp_client_manager.lock().await;
+    let mcp_manager = integration.mcp_client_manager().lock().await;
     let status = mcp_manager.get_all_status().await;
     Ok(McpResponse::ok(status))
 }
@@ -229,10 +228,10 @@ pub async fn get_mcp_servers_status(
 /// Get the status of a specific MCP server
 #[tauri::command]
 pub async fn get_mcp_server_status(
-    state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
     server_id: String,
 ) -> Result<McpResponse<McpServerStatus>, String> {
-    let mcp_manager = state.mcp_client_manager.lock().await;
+    let mcp_manager = integration.mcp_client_manager().lock().await;
 
     match mcp_manager.get_server_status(&server_id).await {
         Ok(status) => Ok(McpResponse::ok(status)),
@@ -246,10 +245,10 @@ pub async fn get_mcp_server_status(
 /// List tools available on a connected MCP server
 #[tauri::command]
 pub async fn list_mcp_server_tools(
-    state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
     server_id: String,
 ) -> Result<McpResponse<Vec<McpToolInfo>>, String> {
-    let mcp_manager = state.mcp_client_manager.lock().await;
+    let mcp_manager = integration.mcp_client_manager().lock().await;
 
     match mcp_manager.list_tools(&server_id).await {
         Ok(tools) => Ok(McpResponse::ok(tools)),
@@ -267,14 +266,14 @@ pub async fn list_mcp_server_tools(
 /// Call a tool on an MCP server
 #[tauri::command]
 pub async fn call_mcp_tool(
-    state: State<'_, Arc<AppState>>,
+    integration: State<'_, IntegrationCompartment>,
     server_id: String,
     tool_name: String,
     arguments: serde_json::Value,
 ) -> Result<McpResponse<McpToolCallResult>, String> {
     info!("Calling MCP tool: {}.{}", server_id, tool_name);
 
-    let mcp_manager = state.mcp_client_manager.lock().await;
+    let mcp_manager = integration.mcp_client_manager().lock().await;
 
     match mcp_manager
         .call_tool(&server_id, &tool_name, arguments)
@@ -308,14 +307,14 @@ pub async fn call_mcp_tool(
 /// Get MCP calls for a task run
 #[tauri::command]
 pub async fn get_task_run_mcp_calls(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     task_run_id: String,
     success_filter: Option<bool>,
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<McpResponse<McpCallsResult>, String> {
-    match state
-        .pg_db
+    match storage
+        .pg_db()
         .get_task_run_mcp_calls(&task_run_id, success_filter)
         .await
     {
