@@ -6,7 +6,7 @@
 //! for state machine configs, states, and transitions stored in PostgreSQL.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -1271,10 +1271,20 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(save_compiled_state_machine),
         )
         .route("/state-machine/current", get(get_current_state_machine))
-        // Quarantined compilations (rejected specs with duplicate elements)
+        // Quarantined compilations (rejected specs with duplicate elements).
+        //
+        // Bump the body limit for this route from axum's default 2 MB to
+        // 16 MB — a single state-machine spec JSON can exceed the default
+        // when it carries per-element screenshots, accessibility trees, or
+        // verbose test-expectation metadata. The limit applies to the whole
+        // MethodRouter (covers both POST persist and GET list, but only the
+        // POST actually reads a request body) and is local to this route so
+        // it doesn't relax body limits on unrelated endpoints.
         .route(
             "/state-machine/quarantine",
-            post(save_quarantined_compilation).get(list_quarantined_compilations),
+            post(save_quarantined_compilation)
+                .get(list_quarantined_compilations)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         // CRUD operations for state machine configs (SQLite)
         .route("/state-machine/configs", get(list_configs))
