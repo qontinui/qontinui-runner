@@ -3,6 +3,7 @@
 //! Provides commands to list, read, and extract Claude Code session transcripts,
 //! plus a standalone workflow generation command that doesn't require an existing task_run_id.
 
+use crate::commands::compartments::ExecutionCompartment;
 use crate::commands::{AppState, CommandResponse};
 use crate::terminal::transcript;
 use std::sync::Arc;
@@ -238,11 +239,11 @@ pub async fn transcript_session_digests(
 /// that are NOT managed by this Runner's PTY or session system.
 #[tauri::command]
 pub async fn transcript_find_external_processes(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    execution: tauri::State<'_, ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     // Collect PIDs managed by this runner
-    let managed_pids = app_state
-        .ai_pid_tracker
+    let managed_pids = execution
+        .ai_pid_tracker()
         .lock()
         .map_err(|e| format!("Failed to lock ai_pid_tracker: {e}"))?
         .clone();
