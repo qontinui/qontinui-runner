@@ -104,6 +104,11 @@ mod security;
 mod semantic_conventions;
 mod server_mode;
 mod settings;
+// `startup_panic` is a minimal, dep-free panic-hook installer called from
+// the very top of `main()` so early-init crashes (DB connect, Tauri builder,
+// axum router construction) write a `runner-panic.log` the supervisor can
+// pick up. Must come before any module that panics during static init.
+mod startup_panic;
 mod skills;
 mod slash_commands;
 mod spec_experimentation;
@@ -172,6 +177,13 @@ use video_recorder::VideoRecordingService;
 fn main() {
     // Enable backtraces in crash dumps for better diagnostics
     std::env::set_var("RUST_BACKTRACE", "1");
+
+    // Install the startup-panic hook FIRST, before any other setup. Panics
+    // during early init (database connection, Tauri builder, axum router
+    // construction) would otherwise vanish — the process exits with code 1
+    // and the supervisor sees only that. This hook writes a one-file-per-boot
+    // `runner-panic.log` the supervisor reads after a non-zero exit.
+    startup_panic::install_startup_panic_hook();
 
     // Initialize lifecycle debugging BEFORE anything else
     debug_lifecycle::init_lifecycle_debug();
@@ -562,6 +574,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(error_monitor::commands::plugin())
         .plugin(process_capture::commands::plugin())
         .plugin(orchestration_loop::commands::plugin())
+        .plugin(spec_experimentation::commands::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -643,23 +656,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: terminal_analysis handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: meta_optimizer handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: comparison handlers moved to per-module plugin (see .plugin() calls above).
-            // Spec experimentation commands
-            spec_experimentation::commands::get_spec_compliance_history,
-            spec_experimentation::commands::get_spec_compliance_summary,
-            spec_experimentation::commands::extract_spec_compliance,
-            spec_experimentation::commands::analyze_spec_element_coverage,
-            spec_experimentation::commands::analyze_cross_page_consistency,
-            spec_experimentation::commands::run_spec_mutation_test,
-            spec_experimentation::commands::analyze_spec_freshness,
-            spec_experimentation::commands::get_spec_accuracy_results,
-            // Spec attention & broken assertion commands
-            spec_experimentation::commands::detect_broken_spec_assertions,
-            spec_experimentation::commands::get_specs_needing_attention,
-            // Spec versioning commands
-            spec_experimentation::commands::snapshot_current_spec,
-            spec_experimentation::commands::get_spec_version_history,
-            spec_experimentation::commands::diff_spec_versions,
-            spec_experimentation::commands::diff_spec_json,
+            // NOTE: spec_experimentation handlers moved to per-module plugin (see .plugin() calls above).
             // Token analytics commands (LLM cost and usage tracking)
             // NOTE: token_analytics handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: activity_timeline handlers moved to per-module plugin (see .plugin() calls above).

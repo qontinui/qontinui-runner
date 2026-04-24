@@ -1,6 +1,8 @@
 //! Tauri commands for the spec experimentation system.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 use super::accuracy;
@@ -193,4 +195,26 @@ pub async fn diff_spec_versions(
 #[tauri::command]
 pub fn diff_spec_json(old_json: String, new_json: String) -> Result<versioning::SpecDiff, String> {
     versioning::diff_specs(&old_json, &new_json)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_spec_experimentation_commands")
+        .invoke_handler(tauri::generate_handler![
+            get_spec_compliance_history,
+            get_spec_compliance_summary,
+            extract_spec_compliance,
+            analyze_spec_element_coverage,
+            analyze_cross_page_consistency,
+            run_spec_mutation_test,
+            analyze_spec_freshness,
+            get_spec_accuracy_results,
+            detect_broken_spec_assertions,
+            get_specs_needing_attention,
+            snapshot_current_spec,
+            get_spec_version_history,
+            diff_spec_versions,
+            diff_spec_json,
+        ])
+        .build()
 }
