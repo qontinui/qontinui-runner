@@ -211,8 +211,240 @@ export type UIBridgeRequestType =
   | "list_network_stubs"
   | "delete_network_stub"
   | "clear_network_stubs"
+  // Non-consuming stub verification (N3)
+  | "verify_network_stub"
   // Toast ring buffer (GET /control/toasts)
   | "get_toast_buffer";
+
+// ============================================================
+// N1 — Compile-time exhaustiveness registry for the chained
+// sub-hook dispatcher in useUIBridgeEventHandler.
+//
+// Each sub-hook declares the UIBridgeRequestType variants it
+// handles. The `AllHandledTypes` union is the compile-time sum
+// of those declarations. The two `AssertEqual<>` asserts below
+// fail to compile if:
+//   (a) a sub-hook's declared variants drift from the variants it
+//       actually `case`s in its switch, OR
+//   (b) a new variant is added to UIBridgeRequestType without being
+//       claimed by some sub-hook.
+//
+// This catches the F2-style ship where commands are added to the
+// union but the runner dispatcher forgets its case (producing
+// "Unknown request type: <name>" at runtime). The per-hook
+// `never` checks in each switch default then guarantee the
+// claimed variants are actually `case`d.
+// ============================================================
+
+export type ControlEventTypes =
+  | "get_elements"
+  | "get_element"
+  | "execute_action"
+  | "get_components"
+  | "get_component"
+  | "execute_component_action"
+  | "navigate_tab"
+  | "assert_element"
+  | "resolve_stable_ref"
+  | "clear_storage";
+
+export type DiscoveryEventTypes =
+  | "discover"
+  | "find"
+  | "get_snapshot"
+  | "get_component_state"
+  | "get_states"
+  | "get_active_states"
+  | "get_state_snapshot"
+  | "get_state"
+  | "activate_state"
+  | "deactivate_state"
+  | "get_state_groups"
+  | "activate_state_group"
+  | "deactivate_state_group"
+  | "get_transitions"
+  | "can_execute_transition"
+  | "execute_transition"
+  | "find_state_path"
+  | "navigate_to_state";
+
+export type PageEventTypes =
+  | "page_refresh"
+  | "page_navigate"
+  | "page_go_back"
+  | "page_go_forward"
+  | "scroll_page"
+  | "query_selector"
+  | "page_evaluate"
+  | "click_by_text"
+  | "click_by_selector"
+  | "type_into"
+  | "read_value"
+  | "find_by_text"
+  | "get_diagnostics"
+  | "get_routes"
+  | "navigate_by_adapter"
+  | "tabs_list"
+  | "tab_activate"
+  | "register_network_stub"
+  | "list_network_stubs"
+  | "delete_network_stub"
+  | "clear_network_stubs"
+  | "verify_network_stub";
+
+export type DesignEventTypes =
+  | "design_get_snapshot"
+  | "design_get_element_styles"
+  | "design_get_state_styles"
+  | "design_get_responsive"
+  | "design_run_audit"
+  | "design_load_style_guide"
+  | "design_get_style_guide"
+  | "design_clear_style_guide"
+  | "design_evaluate"
+  | "design_evaluate_baseline"
+  | "design_evaluate_contexts"
+  | "design_evaluate_diff";
+
+export type ChangeTrackingEventTypes =
+  | "wait_for_route_change"
+  | "save_bookmark"
+  | "get_bookmark"
+  | "delete_bookmark"
+  | "list_bookmarks"
+  | "diff_from_bookmark"
+  | "execute_with_diff"
+  | "execute_batch_with_diff"
+  | "wait_for_change"
+  | "categorize_last_diff"
+  | "scoped_diff"
+  | "summarize_diff"
+  | "structured_changes"
+  | "enable_change_buffer"
+  | "disable_change_buffer"
+  | "drain_change_buffer"
+  | "get_change_buffer_size";
+
+export type DebugInspectEventTypes =
+  | "get_console_errors"
+  | "clear_console_errors"
+  | "get_specs"
+  | "get_spec"
+  | "get_undo_state"
+  | "undo"
+  | "redo"
+  | "get_element_state"
+  | "get_forms"
+  | "fill_form"
+  | "snapshot_forms"
+  | "get_browser_events"
+  | "get_timeline"
+  | "get_health_report"
+  | "get_network_chains"
+  | "get_error_snapshots"
+  | "start_error_session"
+  | "end_error_session"
+  | "get_error_sessions"
+  | "capture_error_baseline"
+  | "compare_error_baseline"
+  | "get_error_report"
+  | "get_action_history"
+  | "get_interaction_metrics"
+  | "get_performance_entries"
+  | "clear_performance_entries"
+  | "get_element_tree"
+  | "highlight_element"
+  | "get_toast_buffer";
+
+export type NetworkIdleEventTypes =
+  | "get_network_requests"
+  | "get_network_requests_in_flight"
+  | "get_idle_status"
+  | "wait_for_idle"
+  | "get_idle_signal"
+  | "wait_for_idle_signal"
+  | "wait_for_targets"
+  | "wait_for_navigation_complete"
+  | "wait_for_element_stable"
+  | "diagnose_stuck_screen"
+  | "get_keyboard_shortcuts";
+
+export type AISearchEventTypes =
+  | "ai_search"
+  | "ai_find"
+  | "wait_for_element_registered"
+  | "wait_for_element_by_condition"
+  | "ai_execute"
+  | "ai_assert"
+  | "ai_assert_batch"
+  | "ai_snapshot"
+  | "ai_summary"
+  | "ai_semantic_search"
+  | "ai_diff"
+  | "ai_analyze_data"
+  | "ai_analyze_regions"
+  | "ai_analyze_structured_data"
+  | "ai_analyze_cross_app"
+  | "ai_recovery_attempt"
+  | "get_intents"
+  | "register_intent"
+  | "find_intent"
+  | "execute_intent"
+  | "execute_intent_from_query";
+
+export type WorkflowEventTypes = "get_workflows" | "run_workflow" | "get_workflow_status";
+
+export type MediaEventTypes =
+  | "find_media"
+  | "media_audit"
+  | "capture_media_snapshot"
+  | "analyze_media"
+  | "capture_element_images"
+  | "get_element_images"
+  | "capture_single_element"
+  | "image_diff"
+  | "media_compare";
+
+export type AnnotationEventTypes =
+  | "annotations_list"
+  | "annotations_create"
+  | "annotations_get"
+  | "annotations_update"
+  | "annotations_delete"
+  | "annotations_coverage"
+  | "annotations_export"
+  | "annotations_import";
+
+/** Union of every variant claimed by a sub-hook. */
+export type AllHandledTypes =
+  | ControlEventTypes
+  | DiscoveryEventTypes
+  | PageEventTypes
+  | DesignEventTypes
+  | ChangeTrackingEventTypes
+  | DebugInspectEventTypes
+  | NetworkIdleEventTypes
+  | AISearchEventTypes
+  | WorkflowEventTypes
+  | MediaEventTypes
+  | AnnotationEventTypes;
+
+/**
+ * Type-level assertion helper. `AssertEqual<X, Y>` is the literal type
+ * `true` iff `X` and `Y` are mutually assignable, otherwise it's a
+ * compile error where used.
+ */
+type AssertEqual<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : never;
+
+// Forces a compile error if AllHandledTypes drifts from UIBridgeRequestType
+// in either direction. Either:
+//   - A new variant was added to UIBridgeRequestType but no sub-hook claimed
+//     it (the fix: add it to the appropriate *EventTypes union above), OR
+//   - A *EventTypes union claims a variant that isn't in UIBridgeRequestType
+//     (the fix: remove the stale claim).
+const _handledCoversUnion: AssertEqual<AllHandledTypes, UIBridgeRequestType> = true;
+void _handledCoversUnion;
 
 /**
  * Payload structure for UI Bridge requests from Rust

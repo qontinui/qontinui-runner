@@ -1,6 +1,6 @@
 import { useCallback } from "react";
 import { getApiPort } from "@/lib/runner-api";
-import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
+import type { UIBridgeRequestPayload, UIBridgeEventContext, PageEventTypes } from "./types";
 import { createLogger } from "@/lib/logger";
 import {
   TAB_LIST,
@@ -9,8 +9,47 @@ import {
   type MainTabId,
 } from "@/components/app/tab-types";
 import { instanceStorage } from "@/lib/instance-storage";
+import {
+  getGlobalStubRegistry,
+  installStubFetchInterceptor,
+  validateStubRequest,
+} from "@qontinui/ui-bridge";
 
 const logger = createLogger("UIBridgePageEvents");
+
+// Runtime set of UIBridgeRequestTypes handled by this hook. Kept in sync
+// with the switch below. The type annotation forces every entry to be a
+// valid PageEventTypes, and TypeScript's control-flow narrowing uses this
+// predicate to narrow `type` inside the switch so the default branch can
+// assert exhaustiveness via `never`.
+const PAGE_EVENT_TYPES: ReadonlySet<PageEventTypes> = new Set<PageEventTypes>([
+  "page_refresh",
+  "page_navigate",
+  "page_go_back",
+  "page_go_forward",
+  "scroll_page",
+  "query_selector",
+  "page_evaluate",
+  "click_by_text",
+  "click_by_selector",
+  "type_into",
+  "read_value",
+  "find_by_text",
+  "get_diagnostics",
+  "get_routes",
+  "navigate_by_adapter",
+  "tabs_list",
+  "tab_activate",
+  "register_network_stub",
+  "list_network_stubs",
+  "delete_network_stub",
+  "clear_network_stubs",
+  "verify_network_stub",
+]);
+
+function isPageEventType(type: string): type is PageEventTypes {
+  return PAGE_EVENT_TYPES.has(type as PageEventTypes);
+}
 
 /**
  * Handles: page_refresh, page_navigate, page_go_back, page_go_forward, query_selector, page_evaluate
@@ -21,6 +60,17 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
   return useCallback(
     async (payload: UIBridgeRequestPayload): Promise<boolean> => {
       const { requestId, type } = payload;
+
+      // Fast-path bail for variants this hook does not handle. Narrowing
+      // `type` to `PageEventTypes` here lets the `never` check in the
+      // default branch catch drift inside the page-events scope (i.e. a
+      // new entry added to `PageEventTypes`/`PAGE_EVENT_TYPES` without a
+      // matching `case`, or vice versa). Cross-hook drift at the level of
+      // the full `UIBridgeRequestType` union is caught statically by the
+      // `AllHandledTypes` vs `UIBridgeRequestType` assertion in `./types`.
+      if (!isPageEventType(type)) {
+        return false;
+      }
 
       switch (type) {
         case "page_refresh": {
@@ -940,12 +990,18 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "register_network_stub": {
           // F2 — install a fetch stub. Lazily installs the SDK's stub-fetch
-          // interceptor on first call so the runner can short-circuit
-          // matching requests without also enabling the full network-request
-          // tracker (which is installed separately via NetworkRequestTracker).
+          // interceptor so the runner can short-circuit matching requests
+          // without also enabling the full network-request tracker (which
+          // is installed separately via NetworkRequestTracker).
+          //
+          // IMPORTANT: install the interceptor AFTER sendResponse. The
+          // bridge's sendResponse posts over HTTP via window.fetch, and
+          // wrapping fetch before that POST causes the response to loop
+          // through the stub matcher — harmless in theory but in practice
+          // stalls the call. Register the stub first (so its effect is
+          // visible to subsequent fetches), reply via the un-wrapped fetch,
+          // then wrap fetch for future calls.
           try {
-            const { getGlobalStubRegistry, installStubFetchInterceptor, validateStubRequest } =
-              await import("@qontinui/ui-bridge");
             const spec =
               (payload.params as unknown as Record<string, unknown>) ??
               (payload as unknown as Record<string, unknown>);
@@ -961,7 +1017,6 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               });
               return true;
             }
-            installStubFetchInterceptor();
             const registry = getGlobalStubRegistry();
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const id = registry.register(spec as any);
@@ -972,6 +1027,10 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               data: { id },
               timestamp: Date.now(),
             });
+            // Wrap fetch AFTER responding — httpSendResponse uses window.fetch,
+            // and wrapping before sendResponse causes the response POST to
+            // recurse through the matcher.
+            installStubFetchInterceptor();
           } catch (e) {
             await sendResponse({
               requestId,
@@ -986,7 +1045,6 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "list_network_stubs": {
           try {
-            const { getGlobalStubRegistry } = await import("@qontinui/ui-bridge");
             const registry = getGlobalStubRegistry();
             await sendResponse({
               requestId,
@@ -1009,7 +1067,6 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "delete_network_stub": {
           try {
-            const { getGlobalStubRegistry } = await import("@qontinui/ui-bridge");
             const id =
               (payload as { id?: unknown }).id ??
               (payload.params as { id?: unknown } | undefined)?.id;
@@ -1056,7 +1113,6 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "clear_network_stubs": {
           try {
-            const { getGlobalStubRegistry } = await import("@qontinui/ui-bridge");
             const cleared = getGlobalStubRegistry().clear();
             await sendResponse({
               requestId,
@@ -1077,8 +1133,91 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
           return true;
         }
 
-        default:
+        case "verify_network_stub": {
+          // N3 — non-consuming stub probe. Uses the SDK registry's `peek()`
+          // + `peekEntry()` so `times: 1` stubs stay armed across verifies.
+          try {
+            const params =
+              (payload.params as unknown as Record<string, unknown>) ??
+              (payload as unknown as Record<string, unknown>);
+            const urlPattern = params.urlPattern;
+            const methodRaw = params.method;
+            if (typeof urlPattern !== "string" || urlPattern.length === 0) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "urlPattern is required (non-empty string)",
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            const methodStr =
+              typeof methodRaw === "string" && methodRaw.length > 0 ? methodRaw.toUpperCase() : "*";
+
+            const registry = getGlobalStubRegistry();
+            const hit = registry.peek(urlPattern, methodStr);
+            if (!hit) {
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: {
+                  matched: false,
+                  stubId: null,
+                  response: null,
+                  stubEntry: null,
+                },
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            const entry = registry.peekEntry(urlPattern, methodStr);
+            const resp = hit.buildResponse();
+            const headers: Record<string, string> = {};
+            resp.headers.forEach((v: string, k: string) => {
+              headers[k] = v;
+            });
+            const body = await resp.text();
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                matched: true,
+                stubId: hit.id,
+                response: {
+                  status: resp.status,
+                  headers,
+                  body,
+                },
+                stubEntry: entry,
+              },
+              timestamp: Date.now(),
+            });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: String(e),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        default: {
+          // Exhaustiveness check — if TypeScript errors here with
+          // "Type 'X' is not assignable to type 'never'", add a case for the
+          // new UIBridgeRequestType variant above. This prevents the F2-style
+          // ship where commands are added to the union but the runner
+          // dispatcher forgets its case (producing "Unknown request type" at
+          // runtime).
+          const _exhaustive: never = type;
+          void _exhaustive;
           return false;
+        }
       }
     },
     [sendResponse],

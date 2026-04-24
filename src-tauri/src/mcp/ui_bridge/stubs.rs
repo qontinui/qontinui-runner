@@ -225,6 +225,82 @@ pub async fn ui_bridge_clear_network_stubs_handler(
 }
 
 // ============================================================================
+// N3 — Non-consuming stub verification
+// ============================================================================
+//
+// Separate request type from `StubRequest` — this endpoint does NOT register
+// anything, it just probes the existing registry. The wire payload is a
+// trimmed `{urlPattern, method?}` pair with the same camelCase convention as
+// the register side.
+
+/// Request body for `POST /control/network/verify-stub`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyStubRequest {
+    pub url_pattern: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+}
+
+impl VerifyStubRequest {
+    /// Validate. Mirrors `StubRequest::validate` but is much narrower — the
+    /// response shape doesn't exist on verify and `times` doesn't apply.
+    pub fn validate(&self) -> Result<(), String> {
+        let pattern = self
+            .url_pattern
+            .as_deref()
+            .ok_or("urlPattern is required")?;
+        if pattern.is_empty() {
+            return Err("urlPattern must be non-empty".into());
+        }
+        if let Some(m) = self.method.as_deref() {
+            if !is_valid_method(m) {
+                return Err(format!(
+                    "method must be one of GET|POST|PUT|DELETE|PATCH|*, got \"{}\"",
+                    m
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// POST /control/network/verify-stub — non-consuming probe.
+///
+/// Asks the SDK registry "would this URL+method get stubbed right now?"
+/// WITHOUT decrementing `times: 1` entries or bumping `hitCount`. Returns
+/// the hypothetical response (status/headers/body) + the matched stub's
+/// registry entry snapshot on hit; on miss returns `{matched: false, ...}`
+/// with null fields.
+pub async fn ui_bridge_verify_network_stub_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Verify network stub");
+
+    let req: VerifyStubRequest = match serde_json::from_value(body.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("invalid verify-stub body: {}", e))),
+            ));
+        }
+    };
+    if let Err(msg) = req.validate() {
+        return Err((StatusCode::BAD_REQUEST, Json(api_error(msg))));
+    }
+
+    match ui_bridge_request_sync(&state, "verify_network_stub", body).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
 // Route registration
 // ============================================================================
 
@@ -241,6 +317,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/network/stubs/{id}",
             delete(ui_bridge_delete_network_stub_handler),
         )
+        .route(
+            "/ui-bridge/control/network/verify-stub",
+            post(ui_bridge_verify_network_stub_handler),
+        )
 }
 
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
@@ -249,6 +329,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/network/stubs"),
         ("DELETE", "/ui-bridge/control/network/stubs"),
         ("DELETE", "/ui-bridge/control/network/stubs/{id}"),
+        ("POST", "/ui-bridge/control/network/verify-stub"),
     ]
 }
 
@@ -366,5 +447,62 @@ mod stub_request_tests {
         let headers = req.response.unwrap().headers.unwrap();
         assert_eq!(headers.get("x-a").unwrap().as_str(), Some("1"));
         assert_eq!(headers.get("x-b").unwrap().as_str(), Some("2"));
+    }
+}
+
+#[cfg(test)]
+mod verify_stub_request_tests {
+    //! N3: serde + validation tests for `VerifyStubRequest`.
+
+    use super::VerifyStubRequest;
+
+    fn parse(body: &str) -> VerifyStubRequest {
+        serde_json::from_str(body).expect("VerifyStubRequest must deserialize")
+    }
+
+    #[test]
+    fn minimal_valid_body() {
+        let req = parse(r#"{"urlPattern":"/foo"}"#);
+        req.validate().expect("valid");
+        assert_eq!(req.url_pattern.as_deref(), Some("/foo"));
+        assert!(req.method.is_none());
+    }
+
+    #[test]
+    fn camel_case_wire_key() {
+        // `url_pattern` in Rust is `urlPattern` on the wire.
+        let req = parse(r#"{"urlPattern":"/foo","method":"POST"}"#);
+        assert_eq!(req.url_pattern.as_deref(), Some("/foo"));
+        assert_eq!(req.method.as_deref(), Some("POST"));
+    }
+
+    #[test]
+    fn missing_url_pattern_is_rejected() {
+        let req = parse(r#"{"method":"GET"}"#);
+        assert!(req.validate().unwrap_err().contains("urlPattern"));
+    }
+
+    #[test]
+    fn empty_url_pattern_is_rejected() {
+        let req = parse(r#"{"urlPattern":""}"#);
+        assert!(req.validate().unwrap_err().contains("non-empty"));
+    }
+
+    #[test]
+    fn unknown_method_is_rejected() {
+        let req = parse(r#"{"urlPattern":"/f","method":"HEAD"}"#);
+        assert!(req.validate().unwrap_err().contains("method"));
+    }
+
+    #[test]
+    fn wildcard_method_is_accepted() {
+        let req = parse(r#"{"urlPattern":"/f","method":"*"}"#);
+        req.validate().expect("wildcard valid");
+    }
+
+    #[test]
+    fn absent_method_is_accepted() {
+        let req = parse(r#"{"urlPattern":"/f"}"#);
+        req.validate().expect("absent method valid");
     }
 }
