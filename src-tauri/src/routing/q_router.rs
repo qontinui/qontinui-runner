@@ -654,6 +654,11 @@ pub async fn load_overrides_pg(
     pg.load_q_overrides().await
 }
 
+/// Deterministic small offset for convergence test (no randomness in tests).
+fn rand_offset() -> f64 {
+    0.0 // Keep tests deterministic
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1117,9 +1122,4 @@ mod tests {
         let eps = router.effective_epsilon(&state);
         assert!(eps < 0.06, "Epsilon should be near minimum: {}", eps);
     }
-}
-
-/// Deterministic small offset for convergence test (no randomness in tests).
-fn rand_offset() -> f64 {
-    0.0 // Keep tests deterministic
 }

@@ -1169,7 +1169,7 @@ mod tests {
         let params = extract_params_from_step(&step, skill);
         // lint-project template has {{working_directory}} as the only placeholder
         assert_eq!(params.get("working_directory").unwrap(), "./frontend");
-        assert!(params.get("command").is_none()); // no command placeholder in lint-project
+        assert!(!params.contains_key("command")); // no command placeholder in lint-project
     }
 
     #[test]

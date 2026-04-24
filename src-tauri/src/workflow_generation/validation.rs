@@ -1509,10 +1509,8 @@ mod tests {
 
     #[test]
     fn test_validate_step_references_valid() {
-        let steps = vec![
-            json!({"id": "step-1", "name": "First", "type": "command", "phase": "setup"}),
-            json!({"id": "step-2", "name": "Second", "type": "command", "phase": "setup", "depends_on": ["step-1"]}),
-        ];
+        let steps = [json!({"id": "step-1", "name": "First", "type": "command", "phase": "setup"}),
+            json!({"id": "step-2", "name": "Second", "type": "command", "phase": "setup", "depends_on": ["step-1"]})];
         let step_refs: Vec<&Value> = steps.iter().collect();
         let mut errors = Vec::new();
         validate_step_references(&step_refs, &mut errors);
@@ -1525,10 +1523,8 @@ mod tests {
 
     #[test]
     fn test_validate_step_references_invalid_depends_on() {
-        let steps = vec![
-            json!({"id": "step-1", "name": "First", "type": "command", "phase": "setup"}),
-            json!({"id": "step-2", "name": "Second", "type": "command", "phase": "setup", "depends_on": ["nonexistent"]}),
-        ];
+        let steps = [json!({"id": "step-1", "name": "First", "type": "command", "phase": "setup"}),
+            json!({"id": "step-2", "name": "Second", "type": "command", "phase": "setup", "depends_on": ["nonexistent"]})];
         let step_refs: Vec<&Value> = steps.iter().collect();
         let mut errors = Vec::new();
         validate_step_references(&step_refs, &mut errors);
@@ -1537,10 +1533,8 @@ mod tests {
 
     #[test]
     fn test_validate_step_references_invalid_inputs() {
-        let steps = vec![
-            json!({"id": "step-1", "name": "First", "type": "command", "phase": "setup"}),
-            json!({"id": "step-2", "name": "Second", "type": "command", "phase": "setup", "inputs": {"token": "${bad-id.token}"}}),
-        ];
+        let steps = [json!({"id": "step-1", "name": "First", "type": "command", "phase": "setup"}),
+            json!({"id": "step-2", "name": "Second", "type": "command", "phase": "setup", "inputs": {"token": "${bad-id.token}"}})];
         let step_refs: Vec<&Value> = steps.iter().collect();
         let mut errors = Vec::new();
         validate_step_references(&step_refs, &mut errors);

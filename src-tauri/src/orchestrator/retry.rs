@@ -735,8 +735,10 @@ mod tests {
 
     #[test]
     fn test_calculate_delay_exponential() {
-        let mut config = RetryConfig::default();
-        config.jitter = false; // Disable jitter for predictable testing
+        let config = RetryConfig {
+            jitter: false, // Disable jitter for predictable testing
+            ..RetryConfig::default()
+        };
         let service = RetryService::new(config);
 
         // base_delay * 2^attempt
@@ -748,9 +750,11 @@ mod tests {
 
     #[test]
     fn test_calculate_delay_capped() {
-        let mut config = RetryConfig::default();
-        config.jitter = false;
-        config.max_delay_ms = 5000; // Cap at 5 seconds
+        let config = RetryConfig {
+            jitter: false,
+            max_delay_ms: 5000, // Cap at 5 seconds
+            ..RetryConfig::default()
+        };
         let service = RetryService::new(config);
 
         // Should be capped at max_delay
@@ -759,8 +763,10 @@ mod tests {
 
     #[test]
     fn test_should_retry_disabled() {
-        let mut config = RetryConfig::default();
-        config.enabled = false;
+        let config = RetryConfig {
+            enabled: false,
+            ..RetryConfig::default()
+        };
         let service = RetryService::new(config);
         let state = RetryState::new();
 

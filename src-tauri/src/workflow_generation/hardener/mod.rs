@@ -2863,10 +2863,10 @@ mod tests {
     }
 
     #[test]
-    fn test_curl_sfL_becomes_sL() {
+    fn test_curl_sf_l_becomes_s_l() {
         let cmd = "curl -sfL http://example.com | python -c 'print(1)'";
         let fixed = fix_curl_sf_in_piped_commands(cmd);
-        assert_eq!(fixed.contains("-sL"), true, "Should become -sL: {}", fixed);
+        assert!(fixed.contains("-sL"), "Should become -sL: {}", fixed);
         assert!(!fixed.contains('f'), "Should not contain f: {}", fixed);
     }
 

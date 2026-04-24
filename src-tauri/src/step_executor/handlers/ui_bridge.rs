@@ -2131,6 +2131,26 @@ impl UiBridgeHandler {
     }
 }
 
+/// Extract domain and protocol from a URL string.
+fn extract_domain_from_url(url: &str) -> (String, String) {
+    let (protocol, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https".to_string(), rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        ("http".to_string(), rest)
+    } else {
+        ("http".to_string(), url)
+    };
+    let domain = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    (domain, protocol)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests (#10)
 // ---------------------------------------------------------------------------
@@ -2477,24 +2497,4 @@ mod tests {
         assert_eq!(w, 9.0);
         assert_eq!(h, 9.0);
     }
-}
-
-/// Extract domain and protocol from a URL string.
-fn extract_domain_from_url(url: &str) -> (String, String) {
-    let (protocol, rest) = if let Some(rest) = url.strip_prefix("https://") {
-        ("https".to_string(), rest)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        ("http".to_string(), rest)
-    } else {
-        ("http".to_string(), url)
-    };
-    let domain = rest
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    (domain, protocol)
 }

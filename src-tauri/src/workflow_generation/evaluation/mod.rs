@@ -929,6 +929,35 @@ fn run_quality_gate(
     }
 }
 
+/// Generate a fix suggestion based on the weakest dimension.
+fn generate_fix_suggestion(score: &DimensionScore) -> String {
+    match score.dimension {
+        EvaluationDimension::Determinism => {
+            "Convert prompt step to command with specific output check".into()
+        }
+        EvaluationDimension::Entailment => {
+            let gaps = if score.evidence.is_empty() {
+                "unknown gaps".to_string()
+            } else {
+                score.evidence.join(", ")
+            };
+            format!("Step doesn't test criterion. Gaps: {}", gaps)
+        }
+        EvaluationDimension::Specificity => {
+            "Add more specific pattern matching to avoid false positives".into()
+        }
+        EvaluationDimension::Executability => {
+            "Fix placeholder paths/commands to use real project values".into()
+        }
+        EvaluationDimension::Coverage => {
+            "Add additional checks to cover all aspects of the criterion".into()
+        }
+        EvaluationDimension::Robustness => {
+            "Add retry_count: 3 and timeout_seconds: 30 for reliability".into()
+        }
+    }
+}
+
 #[cfg(test)]
 mod url_invariant_tests {
     use super::*;
@@ -1096,34 +1125,5 @@ mod url_invariant_tests {
             "Sdk mode should have no violations: {:?}",
             v_sdk
         );
-    }
-}
-
-/// Generate a fix suggestion based on the weakest dimension.
-fn generate_fix_suggestion(score: &DimensionScore) -> String {
-    match score.dimension {
-        EvaluationDimension::Determinism => {
-            "Convert prompt step to command with specific output check".into()
-        }
-        EvaluationDimension::Entailment => {
-            let gaps = if score.evidence.is_empty() {
-                "unknown gaps".to_string()
-            } else {
-                score.evidence.join(", ")
-            };
-            format!("Step doesn't test criterion. Gaps: {}", gaps)
-        }
-        EvaluationDimension::Specificity => {
-            "Add more specific pattern matching to avoid false positives".into()
-        }
-        EvaluationDimension::Executability => {
-            "Fix placeholder paths/commands to use real project values".into()
-        }
-        EvaluationDimension::Coverage => {
-            "Add additional checks to cover all aspects of the criterion".into()
-        }
-        EvaluationDimension::Robustness => {
-            "Add retry_count: 3 and timeout_seconds: 30 for reliability".into()
-        }
     }
 }

@@ -1268,8 +1268,8 @@ function helperFn() {}
         };
         parse_typescript(content, "src/data.ts", &mut graph, false);
 
-        assert!(graph.functions.len() >= 1, "Should find fetchData function");
-        assert!(graph.classes.len() >= 1, "Should find DataService class");
+        assert!(!graph.functions.is_empty(), "Should find fetchData function");
+        assert!(!graph.classes.is_empty(), "Should find DataService class");
         assert!(
             graph.imports.len() >= 2,
             "Should find react and axios imports"
@@ -1312,7 +1312,7 @@ def _private_helper():
             graph.functions.len() >= 2,
             "Should find process_data and _private_helper"
         );
-        assert!(graph.classes.len() >= 1, "Should find DataProcessor class");
+        assert!(!graph.classes.is_empty(), "Should find DataProcessor class");
         assert!(graph.imports.len() >= 2, "Should find os and json imports");
 
         // _private_helper should not be exported
@@ -1391,11 +1391,11 @@ export class App extends React.Component {
         parse_typescript(content, "src/App.tsx", &mut graph, true);
 
         assert!(
-            graph.functions.len() >= 1,
+            !graph.functions.is_empty(),
             "Should find MyComponent function in TSX"
         );
-        assert!(graph.classes.len() >= 1, "Should find App class in TSX");
-        assert!(graph.imports.len() >= 1, "Should find React import in TSX");
+        assert!(!graph.classes.is_empty(), "Should find App class in TSX");
+        assert!(!graph.imports.is_empty(), "Should find React import in TSX");
     }
 
     #[test]
@@ -1537,7 +1537,7 @@ impl MyService {
         };
         parse_rust(content, "src/service.rs", &mut graph);
 
-        assert!(graph.classes.len() >= 1, "Should find MyService struct");
+        assert!(!graph.classes.is_empty(), "Should find MyService struct");
         let cls = graph.classes.iter().find(|c| c.name == "MyService");
         assert!(cls.is_some());
         let methods = &cls.unwrap().methods;

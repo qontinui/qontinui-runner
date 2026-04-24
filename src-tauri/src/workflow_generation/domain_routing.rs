@@ -701,25 +701,25 @@ mod tests {
         assert!(
             result
                 .get(&VerificationDomain::Compilation)
-                .map_or(false, |v| v.contains(&"c1".to_string())),
+                .is_some_and(|v| v.contains(&"c1".to_string())),
             "c1 should be in Compilation"
         );
         assert!(
             result
                 .get(&VerificationDomain::ApiEndpoint)
-                .map_or(false, |v| v.contains(&"a1".to_string())),
+                .is_some_and(|v| v.contains(&"a1".to_string())),
             "a1 should be in ApiEndpoint"
         );
         assert!(
             result
                 .get(&VerificationDomain::UiContent)
-                .map_or(false, |v| v.contains(&"u1".to_string())),
+                .is_some_and(|v| v.contains(&"u1".to_string())),
             "u1 should be in UiContent"
         );
         assert!(
             result
                 .get(&VerificationDomain::General)
-                .map_or(false, |v| v.contains(&"g1".to_string())),
+                .is_some_and(|v| v.contains(&"g1".to_string())),
             "g1 should be in General"
         );
     }

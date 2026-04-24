@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_verifier_output_all_pass() {
-        let output = VerifierOutput::from_pipeline_data(&[], &vec!["c1".into()]);
+        let output = VerifierOutput::from_pipeline_data(&[], &["c1".into()]);
         assert!(output.overall_pass);
         assert_eq!(output.pass_count, 1);
         assert_eq!(output.fail_count, 0);

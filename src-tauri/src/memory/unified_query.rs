@@ -1282,7 +1282,7 @@ mod tests {
 
         // Apply the same temporal filter that query_memory uses
         let from = Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap();
-        fused.retain(|r| r.timestamp.map_or(true, |t| t >= from));
+        fused.retain(|r| r.timestamp.is_none_or(|t| t >= from));
 
         let ids: Vec<&str> = fused.iter().map(|r| r.id.as_str()).collect();
         assert!(
@@ -1331,7 +1331,7 @@ mod tests {
 
         // Apply the same temporal filter that query_memory uses
         let to = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
-        fused.retain(|r| r.timestamp.map_or(true, |t| t <= to));
+        fused.retain(|r| r.timestamp.is_none_or(|t| t <= to));
 
         let ids: Vec<&str> = fused.iter().map(|r| r.id.as_str()).collect();
         assert!(
@@ -1356,7 +1356,7 @@ mod tests {
     fn test_source_filter_restricts() {
         // Replicate the source_enabled helper from query_memory
         fn source_enabled(sources: &Option<Vec<MemorySource>>, s: MemorySource) -> bool {
-            sources.as_ref().map_or(true, |list| list.contains(&s))
+            sources.as_ref().is_none_or(|list| list.contains(&s))
         }
 
         // No filter — all sources enabled

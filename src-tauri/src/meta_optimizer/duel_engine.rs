@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(pool.beta_posteriors.len(), 4);
 
         // All posteriors should be (1.0, 1.0)
-        for (_, (a, b)) in &pool.beta_posteriors {
+        for (a, b) in pool.beta_posteriors.values() {
             assert!((a - 1.0).abs() < 1e-9);
             assert!((b - 1.0).abs() < 1e-9);
         }

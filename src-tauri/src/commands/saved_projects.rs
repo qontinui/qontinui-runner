@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn add_is_idempotent_on_same_path() {
         // Pure in-memory logic: mimic add_saved_project's dedupe check.
-        let existing = vec![sample("/tmp/proj")];
+        let existing = [sample("/tmp/proj")];
         let incoming = normalize_project(sample("/tmp/proj/"));
         let already_present = existing
             .iter()

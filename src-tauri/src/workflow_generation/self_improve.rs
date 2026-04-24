@@ -181,118 +181,6 @@ pub fn format_builder_insights(context: &SelfImprovementContext) -> String {
     output
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_specification_insights_empty() {
-        let ctx = SelfImprovementContext::default();
-        let result = format_specification_insights(&ctx);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_format_specification_insights_with_data() {
-        let ctx = SelfImprovementContext {
-            specification_insights: vec!["insight 1".into(), "insight 2".into()],
-            ..Default::default()
-        };
-        let result = format_specification_insights(&ctx);
-        assert!(result.contains("Lessons from Past Generations"));
-        assert!(result.contains("insight 1"));
-        assert!(result.contains("insight 2"));
-    }
-
-    #[test]
-    fn test_format_verification_insights_empty() {
-        let ctx = SelfImprovementContext::default();
-        let result = format_verification_insights(&ctx);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_format_verification_insights_with_data() {
-        let ctx = SelfImprovementContext {
-            verification_blind_spots: vec!["blind spot 1".into()],
-            ..Default::default()
-        };
-        let result = format_verification_insights(&ctx);
-        assert!(result.contains("Known Blind Spots"));
-        assert!(result.contains("blind spot 1"));
-    }
-
-    #[test]
-    fn test_format_hardener_insights_empty() {
-        let ctx = SelfImprovementContext::default();
-        let result = format_hardener_insights(&ctx);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_format_hardener_insights_with_data() {
-        let ctx = SelfImprovementContext {
-            hardener_patterns: vec!["pattern 1".into()],
-            ..Default::default()
-        };
-        let result = format_hardener_insights(&ctx);
-        assert!(result.contains("Patterns from Past Conversions"));
-        assert!(result.contains("pattern 1"));
-    }
-
-    #[test]
-    fn test_format_builder_insights_empty() {
-        let ctx = SelfImprovementContext::default();
-        let result = format_builder_insights(&ctx);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_format_builder_insights_with_data() {
-        let ctx = SelfImprovementContext {
-            builder_insights: vec!["lesson 1".into(), "lesson 2".into()],
-            ..Default::default()
-        };
-        let result = format_builder_insights(&ctx);
-        assert!(result.contains("Lessons for Workflow Construction"));
-        assert!(result.contains("lesson 1"));
-        assert!(result.contains("lesson 2"));
-    }
-
-    #[test]
-    fn test_is_empty_default() {
-        let ctx = SelfImprovementContext::default();
-        assert!(ctx.is_empty());
-    }
-
-    #[test]
-    fn test_is_empty_with_builder_insights() {
-        let ctx = SelfImprovementContext {
-            builder_insights: vec!["x".to_string()],
-            ..Default::default()
-        };
-        assert!(!ctx.is_empty());
-    }
-
-    #[test]
-    fn test_format_improvement_context_empty() {
-        let ctx = SelfImprovementContext::default();
-        let result = format_improvement_context(&ctx);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_format_improvement_context_with_data() {
-        let ctx = SelfImprovementContext {
-            common_verifier_issues: vec![("issue".into(), 5)],
-            ..Default::default()
-        };
-        let result = format_improvement_context(&ctx);
-        assert!(result.contains("Historical Generation Patterns"));
-        assert!(result.contains("issue"));
-    }
-}
-
 // ============================================================================
 // PG-based analysis (async, called from sync context via block_on)
 // ============================================================================
@@ -474,4 +362,116 @@ pub async fn analyze_generation_patterns_pg(
     );
 
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_specification_insights_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_specification_insights(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_specification_insights_with_data() {
+        let ctx = SelfImprovementContext {
+            specification_insights: vec!["insight 1".into(), "insight 2".into()],
+            ..Default::default()
+        };
+        let result = format_specification_insights(&ctx);
+        assert!(result.contains("Lessons from Past Generations"));
+        assert!(result.contains("insight 1"));
+        assert!(result.contains("insight 2"));
+    }
+
+    #[test]
+    fn test_format_verification_insights_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_verification_insights(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_verification_insights_with_data() {
+        let ctx = SelfImprovementContext {
+            verification_blind_spots: vec!["blind spot 1".into()],
+            ..Default::default()
+        };
+        let result = format_verification_insights(&ctx);
+        assert!(result.contains("Known Blind Spots"));
+        assert!(result.contains("blind spot 1"));
+    }
+
+    #[test]
+    fn test_format_hardener_insights_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_hardener_insights(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_hardener_insights_with_data() {
+        let ctx = SelfImprovementContext {
+            hardener_patterns: vec!["pattern 1".into()],
+            ..Default::default()
+        };
+        let result = format_hardener_insights(&ctx);
+        assert!(result.contains("Patterns from Past Conversions"));
+        assert!(result.contains("pattern 1"));
+    }
+
+    #[test]
+    fn test_format_builder_insights_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_builder_insights(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_builder_insights_with_data() {
+        let ctx = SelfImprovementContext {
+            builder_insights: vec!["lesson 1".into(), "lesson 2".into()],
+            ..Default::default()
+        };
+        let result = format_builder_insights(&ctx);
+        assert!(result.contains("Lessons for Workflow Construction"));
+        assert!(result.contains("lesson 1"));
+        assert!(result.contains("lesson 2"));
+    }
+
+    #[test]
+    fn test_is_empty_default() {
+        let ctx = SelfImprovementContext::default();
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn test_is_empty_with_builder_insights() {
+        let ctx = SelfImprovementContext {
+            builder_insights: vec!["x".to_string()],
+            ..Default::default()
+        };
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn test_format_improvement_context_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_improvement_context(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_improvement_context_with_data() {
+        let ctx = SelfImprovementContext {
+            common_verifier_issues: vec![("issue".into(), 5)],
+            ..Default::default()
+        };
+        let result = format_improvement_context(&ctx);
+        assert!(result.contains("Historical Generation Patterns"));
+        assert!(result.contains("issue"));
+    }
 }

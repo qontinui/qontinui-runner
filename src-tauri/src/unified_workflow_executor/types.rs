@@ -1134,7 +1134,7 @@ mod tests {
         // indices rewritten to sequential
         assert_eq!(pr.step_results[0].step_index, 0);
         assert_eq!(pr.step_results[1].step_index, 1);
-        assert_eq!(pr.step_results[1].success, false);
+        assert!(!pr.step_results[1].success);
         assert_eq!(pr.step_results[1].error.as_deref(), Some("compile error"));
         assert_eq!(
             pr.step_results[0].step_name.as_deref(),
@@ -1193,7 +1193,7 @@ mod tests {
         assert!(!pr.all_passed);
         assert_eq!(pr.step_results.len(), 2);
         assert_eq!(pr.step_results[0].step_name.as_deref(), Some("lint"));
-        assert_eq!(pr.step_results[1].success, false);
+        assert!(!pr.step_results[1].success);
         assert_eq!(pr.duration_ms, 500);
         assert_eq!(
             pr.failure_context.as_deref(),

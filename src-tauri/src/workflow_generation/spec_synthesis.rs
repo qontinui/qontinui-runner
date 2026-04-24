@@ -1164,7 +1164,7 @@ mod tests {
         let result = synthesize_verification_steps(&criteria, "");
         let step = &result.steps[0];
         assert_eq!(step["type"].as_str().unwrap(), "ui_bridge");
-        assert_eq!(step["snapshot_assert"].as_bool().unwrap(), true);
+        assert!(step["snapshot_assert"].as_bool().unwrap());
     }
 
     #[test]
@@ -1406,8 +1406,8 @@ mod tests {
         assert_eq!(assertion["severity"].as_str().unwrap(), "critical");
         assert_eq!(assertion["assertionType"].as_str().unwrap(), "exists");
         assert_eq!(assertion["source"].as_str().unwrap(), "ai-generated");
-        assert_eq!(assertion["reviewed"].as_bool().unwrap(), false);
-        assert_eq!(assertion["enabled"].as_bool().unwrap(), true);
+        assert!(!assertion["reviewed"].as_bool().unwrap());
+        assert!(assertion["enabled"].as_bool().unwrap());
         assert!(assertion.get("target").is_some());
     }
 
