@@ -655,6 +655,7 @@ pub async fn load_overrides_pg(
 }
 
 /// Deterministic small offset for convergence test (no randomness in tests).
+#[cfg(test)]
 fn rand_offset() -> f64 {
     0.0 // Keep tests deterministic
 }
