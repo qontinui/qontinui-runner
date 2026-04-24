@@ -2030,20 +2030,20 @@ pub async fn ui_bridge_type_into_handler(
 /// and the DOM-convenience family (find / find-by-text / click-by-text /
 /// click-by-selector / read-value / type-into).
 pub fn routes() -> axum::Router<Arc<ApiState>> {
+    use super::routing::add_dual;
     use axum::routing::{get, post};
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(
             "/ui-bridge/control/elements",
             get(ui_bridge_get_elements_handler),
-        )
-        .route(
-            "/ui-bridge/control/elements/last-discovered",
-            get(ui_bridge_get_last_discovered_handler),
-        )
-        .route(
-            "/ui-bridge/ai/elements/last-discovered",
-            get(ui_bridge_get_last_discovered_handler),
-        )
+        );
+    let router = add_dual!(
+        router,
+        get,
+        "elements/last-discovered",
+        ui_bridge_get_last_discovered_handler
+    );
+    let router = router
         .route(
             "/ui-bridge/control/element/{id}",
             get(ui_bridge_get_element_handler),
@@ -2079,16 +2079,15 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/control/snapshot",
             get(ui_bridge_get_snapshot_handler),
-        )
-        // Wait-for-element (control + ai aliases)
-        .route(
-            "/ui-bridge/control/wait-for-element",
-            post(ui_bridge_wait_for_element_handler),
-        )
-        .route(
-            "/ui-bridge/ai/wait-for-element",
-            post(ui_bridge_wait_for_element_handler),
-        )
+        );
+    // Wait-for-element: identical handler under /control + /ai.
+    let router = add_dual!(
+        router,
+        post,
+        "wait-for-element",
+        ui_bridge_wait_for_element_handler
+    );
+    router
         .route("/ui-bridge/control/find", post(ui_bridge_find_handler))
         // DOM convenience helpers
         .route(
