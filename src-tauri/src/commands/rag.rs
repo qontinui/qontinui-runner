@@ -13,6 +13,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, State};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
@@ -862,4 +863,20 @@ pub async fn start_rag_processing(
         )),
         data: None,
     })
+}
+
+pub fn plugin() -> TauriPlugin<tauri::Wry> {
+    PluginBuilder::<tauri::Wry>::new("qontinui_rag")
+        .invoke_handler(tauri::generate_handler![
+            import_rag_config,
+            get_rag_embedding_status,
+            search_rag_elements,
+            search_rag_elements_semantic,
+            list_rag_configs,
+            delete_rag_config,
+            get_rag_config,
+            get_rag_storage_usage,
+            start_rag_processing,
+        ])
+        .build()
 }

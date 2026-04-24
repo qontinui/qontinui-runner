@@ -517,6 +517,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::context::plugin())
         .plugin(commands::library_sync::plugin())
         .plugin(commands::logging::plugin())
+        .plugin(commands::rag::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -640,16 +641,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::verification::load_pending_verification,
             commands::verification::clear_pending_verification,
             commands::verification::update_verification_status,
-            // RAG commands
-            commands::rag::list_rag_configs,
-            commands::rag::get_rag_config,
-            commands::rag::delete_rag_config,
-            commands::rag::import_rag_config,
-            commands::rag::search_rag_elements,
-            commands::rag::search_rag_elements_semantic,
-            commands::rag::get_rag_embedding_status,
-            commands::rag::get_rag_storage_usage,
-            commands::rag::start_rag_processing,
+            // NOTE: rag handlers moved to per-module plugin (see .plugin() calls above).
             // Project logs commands
             commands::project_logs::get_project_log_config,
             commands::project_logs::save_project_log_config,
