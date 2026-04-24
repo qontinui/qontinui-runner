@@ -1827,8 +1827,9 @@ pub async fn ui_bridge_media_analyze_handler(
 // ============================================================================
 
 pub fn routes() -> axum::Router<Arc<ApiState>> {
+    use super::routing::add_dual;
     use axum::routing::{get, post};
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(
             "/ui-bridge/control/annotated-screenshot",
             get(ui_bridge_annotated_screenshot_handler),
@@ -1840,15 +1841,15 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/control/page-health",
             post(ui_bridge_page_health_handler),
-        )
-        .route(
-            "/ui-bridge/control/element-screenshot",
-            get(ui_bridge_element_screenshot_handler),
-        )
-        .route(
-            "/ui-bridge/ai/element-screenshot",
-            get(ui_bridge_element_screenshot_handler),
-        )
+        );
+    // element-screenshot: identical handler under /control + /ai.
+    let router = add_dual!(
+        router,
+        get,
+        "element-screenshot",
+        ui_bridge_element_screenshot_handler
+    );
+    router
         .route(
             "/ui-bridge/control/capture-element-images",
             post(ui_bridge_capture_element_images_handler),
