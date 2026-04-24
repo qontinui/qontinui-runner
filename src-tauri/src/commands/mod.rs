@@ -122,6 +122,7 @@ pub mod checkpoint_browser; // Orchestrator checkpoint browser (time-travel debu
 pub mod checkpoints;
 pub mod checks; // Code quality checks (linting, formatting, type checking)
 pub mod clipboard; // Clipboard sync: share text to mobile via backend relay
+pub mod compartments; // Workstream C: scoped wrappers around Arc<AppState> for gradual migration
 pub mod comparison; // Side-by-side architecture comparison runs
 pub mod config;
 pub mod container_settings;

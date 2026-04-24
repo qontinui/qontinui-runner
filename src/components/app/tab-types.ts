@@ -199,6 +199,126 @@ const VALID_TAB_IDS: MainTabId[] = [
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
 
+/**
+ * Human-readable labels for every `MainTabId`. Authoritative source for the
+ * UI Bridge `GET /control/tabs` endpoint and any other consumer that needs
+ * to present a tab by a display name rather than its raw id.
+ *
+ * Keep in sync with `VALID_TAB_IDS` above: every id in `VALID_TAB_IDS` must
+ * have an entry here (the runtime test in `page.rs::tabs_list` asserts this).
+ */
+export const TAB_LABELS: Record<MainTabId, string> = {
+  "prompt-home": "Home",
+  "gui-automation": "Execute",
+  "workflow-queue": "Workflow Queue",
+  active: "Active Dashboard",
+  runs: "History",
+  history: "History",
+  "error-monitor": "Error Monitor",
+  processes: "Process Manager",
+  reflection: "Reflection",
+  observations: "Observations",
+  architecture: "Architecture",
+  "generator-eval": "Generator Eval",
+  "meta-optimizer": "Meta-Optimizer",
+  "run-recap": "Run Recap",
+  "run-actions": "Run Actions",
+  "run-image": "Image Recognition",
+  "run-findings": "Findings",
+  "run-state-explorer": "State Explorer",
+  "run-tests": "Test Results",
+  "run-ai-output": "AI Output",
+  "run-statistics": "Statistics",
+  "run-ai-data": "AI Data Viewer",
+  "run-traces": "Traces",
+  ai: "AI Output",
+  logs: "Logs",
+  "run-summary": "Run Summary",
+  "monitor-summary": "Monitor Summary",
+  "monitor-findings": "Monitor Findings",
+  "monitor-issues": "Monitor Issues",
+  "monitor-learnings": "Monitor Learnings",
+  "monitor-state-explorer": "Monitor State Explorer",
+  "monitor-statistics": "Monitor Statistics",
+  "monitor-discoveries": "Monitor Discoveries",
+  library: "Library",
+  "step-builders": "Step Builders",
+  "check-builder": "Check Builder",
+  "check-group-builder": "Check Group Builder",
+  "shell-command-builder": "Shell Command Builder",
+  "task-builder": "Task Builder",
+  "context-builder": "Context Builder",
+  "playwright-test-builder": "Playwright Test Builder",
+  "unified-workflow-builder": "Workflow Builder",
+  "state-machine": "State Machines",
+  specs: "Specs",
+  capture: "Capture",
+  "config-log-sources": "Log Sources",
+  "config-findings": "Findings Config",
+  "config-hooks": "Hooks",
+  "config-ui-bridge": "UI Bridge",
+  triggers: "Triggers",
+  tasks: "Scheduler",
+  settings: "Settings",
+  "settings-account": "Account Settings",
+  "settings-ai": "AI Settings",
+  "settings-agentic": "Agentic Settings",
+  "settings-self-healing": "Self-Healing Settings",
+  "settings-world-state-verifier": "World State Verifier Settings",
+  "settings-playwright": "Playwright Settings",
+  "settings-mobile": "Mobile Settings",
+  "settings-cloud-relay": "Cloud Relay Settings",
+  "settings-discovery": "Discovery Settings",
+  "settings-web-integration": "Web Integration Settings",
+  "settings-mcp": "MCP Settings",
+  "settings-log-sources": "Log Sources Settings",
+  "settings-execution-variables": "Execution Variables",
+  "settings-general": "General Settings",
+  "settings-storage": "Storage Settings",
+  "settings-backup": "Backup Settings",
+  "settings-instances": "Instances Settings",
+  "settings-debug": "Debug Settings",
+  "settings-security": "Security Settings",
+  "accessibility-explorer": "Accessibility Explorer",
+  "settings-updates": "Updates Settings",
+  "orchestration-loop": "Orchestration Loop",
+  "image-quality-tests": "Image Quality Tests",
+  terminal: "Terminal",
+  "llm-analytics": "LLM Analytics",
+  "cost-control": "Cost Control",
+  evaluation: "Evaluation",
+  skills: "Skills",
+  help: "Help",
+  "automation-health": "Automation Health",
+  "activity-timeline": "Activity Timeline",
+  watchers: "Watchers",
+  "knowledge-explorer": "Knowledge Explorer",
+  "event-history": "Event History",
+  "development-intelligence": "Development Intelligence",
+  "demo-video": "Demo Video",
+  "product-tours": "Product Tours",
+  "session-recap": "Session Recap",
+  "api-surface": "API Surface",
+  "decision-trail": "Decision Trail",
+  "memory-search": "Memory Search",
+  "online-learning": "Online Learning",
+  "dag-workflow-editor": "DAG Workflow Editor",
+  "project-explainer": "Project Explainer",
+};
+
+/** Ordered list of all tab ids with their human-readable labels. */
+export const TAB_LIST: ReadonlyArray<{ id: MainTabId; label: string }> = VALID_TAB_IDS.map(
+  (id) => ({ id, label: TAB_LABELS[id] }),
+);
+
+/** Type guard. */
+export function isValidTabId(candidate: string): candidate is MainTabId {
+  return VALID_TAB_IDS.includes(candidate as MainTabId);
+}
+
+/** Read the runner's last-persisted active tab from instance-scoped storage. */
+export const ACTIVE_TAB_STORAGE_KEY = "qontinui-main-active-tab";
+
 export function migrateTabId(stored: string | null): MainTabId {
   if (!stored) return "prompt-home";
 

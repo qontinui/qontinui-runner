@@ -53,6 +53,7 @@ export type UIBridgeRequestType =
   | "disable_change_buffer"
   | "drain_change_buffer"
   | "get_change_buffer_size"
+  | "wait_for_route_change"
   // Undo/Redo
   | "get_undo_state"
   | "undo"
@@ -200,7 +201,17 @@ export type UIBridgeRequestType =
   | "assert_element"
   // Runner-specific
   | "navigate_tab"
-  | "clear_storage";
+  | "clear_storage"
+  // Tab control (F4 — first-class tab activation)
+  | "tabs_list"
+  | "tab_activate"
+  // Network stubs (F2)
+  | "register_network_stub"
+  | "list_network_stubs"
+  | "delete_network_stub"
+  | "clear_network_stubs"
+  // Toast ring buffer (GET /control/toasts)
+  | "get_toast_buffer";
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -224,6 +235,12 @@ export interface UIBridgeRequestPayload {
   };
   specId?: string;
   url?: string;
+  /**
+   * Optional navigation mode for `page_navigate`. `"hard"` (default, back-compat)
+   * does a full reload; `"soft"` uses `history.pushState` + synthetic events
+   * so SPA routers pick up the change without losing injected window state.
+   */
+  mode?: "hard" | "soft";
   params?: Record<string, unknown>;
   /** CSS selector for query_selector requests */
   selector?: string;
@@ -255,6 +272,8 @@ export interface UIBridgeRequestPayload {
   };
   /** Maximum token budget for AI snapshot pruning (0 = unlimited) */
   maxTokens?: number;
+  /** Target tab id for `tab_activate`. */
+  tabId?: string;
 }
 
 /**

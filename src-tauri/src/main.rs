@@ -441,6 +441,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let heartbeat_app_state = shared_app_state.clone();
     let crash_dump_app_state = shared_app_state.clone();
 
+    // Workstream C (Move 2B): compartment wrappers around Arc<AppState> so
+    // per-module plugins can migrate from `State<Arc<AppState>>` to a scoped
+    // `State<<Compartment>>`. Both forms coexist during the gradual migration.
+    let bridge_compartment =
+        commands::compartments::BridgeCompartment(shared_app_state.clone());
+    let execution_compartment =
+        commands::compartments::ExecutionCompartment(shared_app_state.clone());
+    let integration_compartment =
+        commands::compartments::IntegrationCompartment(shared_app_state.clone());
+    let health_compartment =
+        commands::compartments::HealthCompartment(shared_app_state.clone());
+    let storage_compartment =
+        commands::compartments::StorageCompartment(shared_app_state.clone());
+
     // Create error monitor config for later initialization
     let error_monitor_pg = shared_app_state.pg_db.clone();
 
@@ -582,6 +596,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(ui_error::plugin())
         .plugin(crash_dumps::plugin())
         .manage(shared_app_state)
+        .manage(bridge_compartment)
+        .manage(execution_compartment)
+        .manage(integration_compartment)
+        .manage(health_compartment)
+        .manage(storage_compartment)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
         .manage(session_manager) // For interactive AI session commands

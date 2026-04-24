@@ -2,6 +2,13 @@ import { useCallback } from "react";
 import { getApiPort } from "@/lib/runner-api";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { createLogger } from "@/lib/logger";
+import {
+  TAB_LIST,
+  ACTIVE_TAB_STORAGE_KEY,
+  isValidTabId,
+  type MainTabId,
+} from "@/components/app/tab-types";
+import { instanceStorage } from "@/lib/instance-storage";
 
 const logger = createLogger("UIBridgePageEvents");
 
@@ -33,6 +40,23 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "page_navigate": {
           const { url } = payload;
+          // `mode` is optional; defaults to "hard" for back-compat with the
+          // pre-F1 envelope `{ url }`. F1 adds "soft", which preserves injected
+          // window state (fetch patches, `window.__*` globals) and drives the
+          // SPA router via `pushState` + a synthetic `popstate` event.
+          const rawMode = (payload as { mode?: unknown }).mode;
+          const modeStr = typeof rawMode === "string" ? rawMode : undefined;
+          if (modeStr !== undefined && modeStr !== "hard" && modeStr !== "soft") {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `invalid mode: "${modeStr}" (expected "hard" or "soft")`,
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const mode: "hard" | "soft" = modeStr ?? "hard";
           if (!url) {
             await sendResponse({
               requestId,
@@ -49,17 +73,44 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             // React re-renders — the SPA never switches tabs/pages.
             const previousPath = window.location.pathname;
             if (url.startsWith("/")) {
-              // Convert URL path to tab ID: strip leading slash, then
-              // replace remaining slashes with hyphens so
-              // "/settings/world-state-verifier" becomes
-              // "settings-world-state-verifier" — matching the PAGE_TO_TAB
-              // keys in useAppNavigation.ts.
-              const page = url.replace(/^\/+/, "").replace(/\//g, "-") || "gui-automation";
-              window.dispatchEvent(
-                new CustomEvent("ui-bridge-navigate", { detail: { page, url } }),
-              );
-              // Also update the URL bar for consistency
-              window.history.pushState({}, "", url);
+              if (mode === "soft") {
+                // Soft mode: pure client-side navigation. React Router v6
+                // listens to `popstate`, so fire a synthetic PopStateEvent
+                // after pushState. Also emit ui-bridge:navigate for any
+                // non-router listeners that want to observe navigation.
+                window.history.pushState(null, "", url);
+                try {
+                  window.dispatchEvent(new PopStateEvent("popstate"));
+                } catch {
+                  // Fallback for very old engines: dispatch a generic Event.
+                  window.dispatchEvent(new Event("popstate"));
+                }
+                window.dispatchEvent(
+                  new CustomEvent("ui-bridge:navigate", {
+                    detail: { url, mode: "soft" },
+                  }),
+                );
+                // Also notify the runner's tab system so its internal state
+                // tracks the URL change — soft navigation still wants the
+                // active tab to flip.
+                const page = url.replace(/^\/+/, "").replace(/\//g, "-") || "gui-automation";
+                window.dispatchEvent(
+                  new CustomEvent("ui-bridge-navigate", { detail: { page, url } }),
+                );
+              } else {
+                // Hard mode (default / legacy): preserve existing behaviour.
+                // Convert URL path to tab ID: strip leading slash, then
+                // replace remaining slashes with hyphens so
+                // "/settings/world-state-verifier" becomes
+                // "settings-world-state-verifier" — matching the PAGE_TO_TAB
+                // keys in useAppNavigation.ts.
+                const page = url.replace(/^\/+/, "").replace(/\//g, "-") || "gui-automation";
+                window.dispatchEvent(
+                  new CustomEvent("ui-bridge-navigate", { detail: { page, url } }),
+                );
+                // Also update the URL bar for consistency
+                window.history.pushState({}, "", url);
+              }
             } else {
               console.warn(
                 `[UIBridge] page_navigate: ignoring absolute URL navigation in runner: ${url}`,
@@ -69,7 +120,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               requestId,
               type,
               success: true,
-              data: { success: true, url },
+              data: { success: true, url, hard: mode === "hard", mode },
               timestamp: Date.now(),
             });
 
@@ -82,6 +133,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
                   timestamp: Date.now(),
                   from: previousPath,
                   to: url,
+                  mode,
                 }),
               }).catch(() => {});
             } catch {
@@ -781,6 +833,244 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               type,
               success: false,
               error: String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        // ============================================================
+        // F4 — First-class tab activation
+        // ============================================================
+
+        case "tabs_list": {
+          try {
+            const activeTab = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                activeTab,
+                tabs: TAB_LIST.map((entry) => ({ id: entry.id, label: entry.label })),
+              },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "tab_activate": {
+          try {
+            const tabId =
+              (payload as { tabId?: unknown }).tabId ??
+              (payload.params as { tabId?: unknown } | undefined)?.tabId;
+            if (typeof tabId !== "string" || tabId.length === 0) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "tabId is required (non-empty string)",
+                data: {
+                  error: "missing_tab_id",
+                  knownTabs: TAB_LIST.map((t) => t.id),
+                },
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            if (!isValidTabId(tabId)) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `unknown tabId: "${tabId}"`,
+                data: {
+                  error: "unknown_tab",
+                  knownTabs: TAB_LIST.map((t) => t.id),
+                },
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            const previousTab = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
+            // Fire the same event the runner's `useAppNavigation` hook already
+            // listens for. This is the exact code path a user click traverses
+            // (via the sidebar's `setActiveTab(tab)` -> `ui-bridge-set-tab`),
+            // so lazy-mounts, `url-state-sync`, the `activeTab`-keyed effects
+            // in `useAppNavigation`, etc. all fire as usual.
+            window.dispatchEvent(
+              new CustomEvent<{ tab: MainTabId }>("ui-bridge-set-tab", {
+                detail: { tab: tabId as MainTabId },
+              }),
+            );
+            // Persist immediately so that `tabs_list` polled right after sees
+            // the new value (the React effect in `useAppNavigation` would also
+            // persist on the next render, but agents may read back before that).
+            instanceStorage.setItem(ACTIVE_TAB_STORAGE_KEY, tabId);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                activeTab: tabId,
+                previousTab,
+              },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "register_network_stub": {
+          // F2 — install a fetch stub. Lazily installs the SDK's stub-fetch
+          // interceptor on first call so the runner can short-circuit
+          // matching requests without also enabling the full network-request
+          // tracker (which is installed separately via NetworkRequestTracker).
+          try {
+            const { getGlobalStubRegistry, installStubFetchInterceptor, validateStubRequest } =
+              await import("@qontinui/ui-bridge");
+            const spec =
+              (payload.params as unknown as Record<string, unknown>) ??
+              (payload as unknown as Record<string, unknown>);
+            const err = validateStubRequest(spec);
+            if (err) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: err.message,
+                data: { error: "invalid_stub", field: err.field },
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            installStubFetchInterceptor();
+            const registry = getGlobalStubRegistry();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const id = registry.register(spec as any);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { id },
+              timestamp: Date.now(),
+            });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: String(e),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "list_network_stubs": {
+          try {
+            const { getGlobalStubRegistry } = await import("@qontinui/ui-bridge");
+            const registry = getGlobalStubRegistry();
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { stubs: registry.list() },
+              timestamp: Date.now(),
+            });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: String(e),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "delete_network_stub": {
+          try {
+            const { getGlobalStubRegistry } = await import("@qontinui/ui-bridge");
+            const id =
+              (payload as { id?: unknown }).id ??
+              (payload.params as { id?: unknown } | undefined)?.id;
+            if (typeof id !== "string" || id.length === 0) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "id is required (non-empty string)",
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            const removed = getGlobalStubRegistry().delete(id);
+            if (!removed) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `stub not found: ${id}`,
+                data: { error: "not_found", id },
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { id, deleted: true },
+              timestamp: Date.now(),
+            });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: String(e),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "clear_network_stubs": {
+          try {
+            const { getGlobalStubRegistry } = await import("@qontinui/ui-bridge");
+            const cleared = getGlobalStubRegistry().clear();
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { cleared },
+              timestamp: Date.now(),
+            });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: String(e),
               timestamp: Date.now(),
             });
           }
