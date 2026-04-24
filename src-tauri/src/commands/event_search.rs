@@ -5,15 +5,16 @@
 //! the frontend. See queries/event_search.sql for the underlying query and
 //! database/pg/event_search.rs for the PgDb wrapper.
 
-use std::sync::Arc;
-
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
+use crate::error::AppError;
+
+// Migrated to StorageCompartment (Workstream C).
 
 /// Presentation-layer row returned to the frontend.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -36,29 +37,31 @@ pub struct SearchEventResult {
 /// - `query`: required, non-empty plainto_tsquery input.
 /// - `since_iso`: optional RFC 3339 timestamp. Defaults to now - 7 days.
 /// - `limit`: optional, defaults to 100, capped at 500.
-#[tauri::command]
-pub async fn search_events(
-    state: State<'_, Arc<AppState>>,
+async fn search_events_impl(
+    state: &StorageCompartment,
     query: String,
     since_iso: Option<String>,
     limit: Option<i64>,
-) -> Result<Vec<SearchEventResult>, String> {
+) -> Result<Vec<SearchEventResult>, AppError> {
     if query.trim().is_empty() {
-        return Err("query must be non-empty".to_string());
+        return Err(AppError::ValidationError(
+            "query must be non-empty".to_string(),
+        ));
     }
 
     let since_ts = match since_iso {
         Some(s) => chrono::DateTime::parse_from_rfc3339(&s)
-            .map_err(|e| format!("Invalid since_iso: {}", e))?,
+            .map_err(|e| AppError::ValidationError(format!("Invalid since_iso: {}", e)))?,
         None => (Utc::now() - Duration::days(7)).into(),
     };
 
     let max_results = limit.unwrap_or(100).clamp(1, 500);
 
     let rows = state
-        .pg_db
+        .pg_db()
         .search_events(&query, since_ts, max_results)
-        .await?;
+        .await
+        .map_err(AppError::DatabaseError)?;
 
     Ok(rows
         .into_iter()
@@ -70,6 +73,18 @@ pub async fn search_events(
             score: r.score as f64,
         })
         .collect())
+}
+
+#[tauri::command]
+pub async fn search_events(
+    state: State<'_, StorageCompartment>,
+    query: String,
+    since_iso: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<SearchEventResult>, String> {
+    search_events_impl(&state, query, since_iso, limit)
+        .await
+        .map_err(String::from)
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.
