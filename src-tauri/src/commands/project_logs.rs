@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::settings::{self, GlobalLogSource};
@@ -710,4 +712,20 @@ pub fn append_project_log(
         message: None,
         data: None,
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_project_logs")
+        .invoke_handler(tauri::generate_handler![
+            get_project_log_config,
+            save_project_log_config,
+            list_project_configs,
+            delete_project_config,
+            read_log_source,
+            read_project_logs,
+            get_project_directories,
+            append_project_log,
+        ])
+        .build()
 }
