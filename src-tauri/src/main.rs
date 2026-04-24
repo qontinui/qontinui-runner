@@ -509,6 +509,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::terminal_analysis::plugin())
         .plugin(commands::token_analytics::plugin())
         .plugin(commands::transcript::plugin())
+        .plugin(commands::adaptive_learning::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -818,19 +819,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::screenshots::list_screenshots,
             // NOTE: hooks handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: learning handlers moved to per-module plugin (see .plugin() calls above).
-            // Adaptive learning (Plan 15)
-            commands::adaptive_learning::get_adaptive_learning_stats,
-            commands::adaptive_learning::get_playbook_entries,
-            commands::adaptive_learning::get_curated_examples,
-            commands::adaptive_learning::get_template_performance,
-            commands::adaptive_learning::get_gepa_runs,
-            commands::adaptive_learning::get_template_lifecycle_history,
-            commands::adaptive_learning::update_playbook_entry_status,
-            commands::adaptive_learning::delete_playbook_entry,
-            commands::adaptive_learning::delete_curated_example,
-            commands::adaptive_learning::get_gepa_run_detail,
-            commands::adaptive_learning::get_playbook_entry_detail,
-            commands::adaptive_learning::get_learning_trends,
+            // NOTE: adaptive_learning handlers moved to per-module plugin (see .plugin() calls above).
             // Agentic metric commands
             // NOTE: agentic_metrics handlers moved to per-module plugin (see .plugin() calls above).
             // Flow designer commands
