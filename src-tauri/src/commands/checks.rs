@@ -160,7 +160,7 @@ pub async fn execute_check_by_id(
             .map(|o| serde_json::to_string(o).unwrap_or_default());
 
         if let Err(e) = state
-            .pg_db
+            .pg_db()
             .save_check_result(
                 &result.check_id,
                 &status_str,
@@ -730,7 +730,7 @@ pub async fn execute_check_group(
                 .map(|o| serde_json::to_string(o).unwrap_or_default());
 
             if let Err(e) = state
-                .pg_db
+                .pg_db()
                 .save_check_result(
                     &result.check_id,
                     &status_str,
