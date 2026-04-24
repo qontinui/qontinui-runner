@@ -170,8 +170,6 @@ mod tests {
 /// Build the Tauri plugin that registers this module's command handlers.
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_screenshots")
-        .invoke_handler(tauri::generate_handler![
-            list_screenshots,
-        ])
+        .invoke_handler(tauri::generate_handler![list_screenshots,])
         .build()
 }

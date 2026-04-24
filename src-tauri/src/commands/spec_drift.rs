@@ -340,8 +340,6 @@ pub async fn scan_spec_drift(project_root: String) -> Result<DriftReport, String
 /// Build the Tauri plugin that registers this module's command handlers.
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_spec_drift")
-        .invoke_handler(tauri::generate_handler![
-            scan_spec_drift,
-        ])
+        .invoke_handler(tauri::generate_handler![scan_spec_drift,])
         .build()
 }

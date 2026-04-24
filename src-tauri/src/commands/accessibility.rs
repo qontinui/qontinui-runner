@@ -328,8 +328,7 @@ pub async fn a11y_capture<R: Runtime>(
     drop(mgr);
 
     // Emit tauri event so UI Bridge observers can surface capture completion.
-    let event =
-        AppEvent::accessibility_capture_complete(&backend_name, node_count, duration_ms);
+    let event = AppEvent::accessibility_capture_complete(&backend_name, node_count, duration_ms);
     if let Err(e) = app.emit(event.event_name(), &event) {
         warn!("Event emission failed for {}: {}", event.event_name(), e);
     }

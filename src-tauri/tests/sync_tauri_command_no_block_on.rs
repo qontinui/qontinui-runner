@@ -251,9 +251,7 @@ fn no_sync_tauri_command_directly_calls_block_on_or_block_in_place() {
                         "{}::{}  contains `{}` — convert the command to `pub async fn` and \
                          `.await` the underlying async call (or call an `_async` helper). See \
                          tests/sync_tauri_command_no_block_on.rs for the full rationale.",
-                        file.strip_prefix(crate_root())
-                            .unwrap_or(&file)
-                            .display(),
+                        file.strip_prefix(crate_root()).unwrap_or(&file).display(),
                         name,
                         token,
                     ));
@@ -299,7 +297,11 @@ fn extractor_recognizes_sync_vs_async_commands() {
 
     let sync = extract_sync_tauri_commands(source);
     let names: Vec<&str> = sync.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(names.contains(&"sync_ok"), "missed sync_ok: got {:?}", names);
+    assert!(
+        names.contains(&"sync_ok"),
+        "missed sync_ok: got {:?}",
+        names
+    );
     assert!(
         names.contains(&"sync_with_extra_attr"),
         "missed sync_with_extra_attr: got {:?}",
@@ -317,6 +319,9 @@ fn extractor_recognizes_sync_vs_async_commands() {
     );
 
     // And the forbidden-token check finds block_in_place in sync_with_extra_attr.
-    let (_, body) = sync.iter().find(|(n, _)| n == "sync_with_extra_attr").unwrap();
+    let (_, body) = sync
+        .iter()
+        .find(|(n, _)| n == "sync_with_extra_attr")
+        .unwrap();
     assert!(body.contains("block_in_place"));
 }

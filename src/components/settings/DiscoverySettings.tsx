@@ -159,6 +159,8 @@ export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
               .map((port) => (
                 <li
                   key={port}
+                  data-ui-bridge-content={`custom-port:${port}`}
+                  data-ui-bridge-role="listitem"
                   className="flex items-center justify-between rounded-md bg-muted/40 px-3 py-1.5"
                 >
                   <code className="text-sm font-mono">{port}</code>
@@ -191,12 +193,14 @@ export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
               }
             }}
             placeholder="e.g. 7000"
+            data-ui-bridge-test-id="discovery-port-input"
             className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
           />
           <button
             type="button"
             onClick={handleAddPort}
             disabled={!newPortInput.trim()}
+            data-ui-bridge-test-id="discovery-add-port"
             className="flex items-center gap-1 px-3 py-1.5 rounded-md text-sm font-medium bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             <Plus className="w-3.5 h-3.5" />
@@ -223,6 +227,8 @@ export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
               {HARDCODED_DESKTOP_DEFAULTS.map((p) => (
                 <code
                   key={p}
+                  data-ui-bridge-content={`hardcoded-port:${p}`}
+                  data-ui-bridge-role="badge"
                   className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground"
                 >
                   {p}
@@ -236,6 +242,8 @@ export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
               {HARDCODED_WEB_DEFAULTS.map((p) => (
                 <code
                   key={p}
+                  data-ui-bridge-content={`hardcoded-port:${p}`}
+                  data-ui-bridge-role="badge"
                   className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground"
                 >
                   {p}
@@ -252,6 +260,7 @@ export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
           type="button"
           onClick={handleSave}
           disabled={!hasChanges || saving || loading}
+          data-ui-bridge-test-id="discovery-save-settings"
           className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
             hasChanges && !saving && !loading
               ? "bg-primary text-primary-foreground hover:bg-primary/90"

@@ -30,6 +30,7 @@ import {
   type DiscoveredApp as RegisteredDiscoveredApp,
   type RegisterAppPayload,
 } from "@/hooks/useAppDiscovery";
+import { emitToast } from "@qontinui/ui-bridge";
 
 // =============================================================================
 // ProcessConfig type (from process manager)
@@ -237,6 +238,7 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
             <div className="grid gap-2">
               {showRunner && (
                 <ProjectCard
+                  projectId="runner"
                   name="Qontinui Runner"
                   projectPath={runnerPath}
                   category="runner"
@@ -247,6 +249,7 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
               {unscannedProjects.map((cfg) => (
                 <ProjectCard
                   key={cfg.id}
+                  projectId={cfg.id}
                   name={cfg.name}
                   projectPath={cfg.cwd}
                   category={cfg.category}
@@ -349,12 +352,14 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
 // =============================================================================
 
 function ProjectCard({
+  projectId,
   name,
   projectPath,
   category,
   port,
   onSelect,
 }: {
+  projectId: string;
   name: string;
   projectPath: string;
   category: string;
@@ -369,6 +374,8 @@ function ProjectCard({
       }
       role={onSelect ? "button" : undefined}
       tabIndex={onSelect ? 0 : undefined}
+      data-ui-bridge-content={`project:${projectId}`}
+      data-ui-bridge-role="article"
       className={`flex items-center gap-3 p-3 rounded-lg border border-border bg-card/50${
         onSelect
           ? " cursor-pointer hover:border-cyan-500/40 hover:bg-cyan-500/5 transition-colors"
@@ -621,6 +628,7 @@ function RegisteredAppsSection({
         <button
           onClick={handleRefresh}
           disabled={refreshing}
+          data-ui-bridge-test-id="registered-apps-refresh"
           className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded
                      bg-white/5 text-muted-foreground border border-border
                      hover:bg-white/10 hover:text-foreground disabled:opacity-50 transition-colors"
@@ -698,6 +706,8 @@ function RegisteredAppCard({
       }
       role={clickable ? "button" : undefined}
       tabIndex={clickable ? 0 : undefined}
+      data-ui-bridge-content={`registered-app:${app.appId}`}
+      data-ui-bridge-role="article"
       className={`flex items-center gap-3 p-3 rounded-lg border border-border bg-card/50${
         clickable
           ? " cursor-pointer hover:border-cyan-500/40 hover:bg-cyan-500/5 transition-colors"
@@ -790,6 +800,22 @@ function AddApplicationForm({
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<{ kind: "success" | "error"; message: string } | null>(null);
 
+  /**
+   * Wraps setStatus so every status banner is also mirrored into the
+   * UI Bridge toast ring buffer. Lets tests assert on the transient message
+   * via `GET /ui-bridge/control/toasts` even after the banner has
+   * unmounted. Maps "error" → "error" toast kind; "success" → "success".
+   */
+  const setStatusAndEmit = useCallback(
+    (next: { kind: "success" | "error"; message: string } | null) => {
+      setStatus(next);
+      if (next) {
+        emitToast({ kind: next.kind, message: next.message });
+      }
+    },
+    [],
+  );
+
   const buildBaseUrl = useCallback((rawUrl: string, rawBasePath: string): string => {
     const trimmedBase = rawBasePath.trim().replace(/\/+$/, "");
     const trimmedUrl = rawUrl.trim().replace(/\/+$/, "");
@@ -802,7 +828,7 @@ function AddApplicationForm({
   const handleProbeAndAdd = useCallback(async () => {
     setStatus(null);
     if (!url.trim()) {
-      setStatus({ kind: "error", message: "URL is required" });
+      setStatusAndEmit({ kind: "error", message: "URL is required" });
       return;
     }
     setBusy(true);
@@ -842,7 +868,7 @@ function AddApplicationForm({
           version: meta.version,
         };
       } catch (err) {
-        setStatus({
+        setStatusAndEmit({
           kind: "error",
           message: `Probe failed (${(err as Error).message}). Try "Add without probing".`,
         });
@@ -850,7 +876,7 @@ function AddApplicationForm({
       }
 
       if (!probed.appId || !probed.appName || !probed.appType) {
-        setStatus({
+        setStatusAndEmit({
           kind: "error",
           message: "Probe succeeded but response is missing uiBridge metadata",
         });
@@ -868,21 +894,24 @@ function AddApplicationForm({
       };
       const registered = await onRegister(payload);
       if (registered) {
-        setStatus({ kind: "success", message: `Registered "${registered.appName}"` });
+        setStatusAndEmit({ kind: "success", message: `Registered "${registered.appName}"` });
         setUrl("");
         setAppId("");
       } else {
-        setStatus({ kind: "error", message: "Registration failed — see console for details" });
+        setStatusAndEmit({
+          kind: "error",
+          message: "Registration failed — see console for details",
+        });
       }
     } finally {
       setBusy(false);
     }
-  }, [url, appId, basePath, buildBaseUrl, onRegister]);
+  }, [url, appId, basePath, buildBaseUrl, onRegister, setStatusAndEmit]);
 
   const handleAddWithoutProbing = useCallback(async () => {
     setStatus(null);
     if (!url.trim()) {
-      setStatus({ kind: "error", message: "URL is required" });
+      setStatusAndEmit({ kind: "error", message: "URL is required" });
       return;
     }
     setBusy(true);
@@ -902,7 +931,7 @@ function AddApplicationForm({
       // extra reconciliation code is needed on either side.
       const registered = await onRegister(payload);
       if (registered) {
-        setStatus({
+        setStatusAndEmit({
           kind: "success",
           message:
             "Added as a placeholder. If the SDK is installed in this app, it should update this entry shortly by phoning home.",
@@ -910,12 +939,15 @@ function AddApplicationForm({
         setUrl("");
         setAppId("");
       } else {
-        setStatus({ kind: "error", message: "Registration failed — see console for details" });
+        setStatusAndEmit({
+          kind: "error",
+          message: "Registration failed — see console for details",
+        });
       }
     } finally {
       setBusy(false);
     }
-  }, [url, appId, basePath, buildBaseUrl, onRegister]);
+  }, [url, appId, basePath, buildBaseUrl, onRegister, setStatusAndEmit]);
 
   return (
     <div className="rounded-lg border border-border bg-card/30">
@@ -994,6 +1026,7 @@ function AddApplicationForm({
             <button
               onClick={handleProbeAndAdd}
               disabled={busy || !url.trim()}
+              data-ui-bridge-test-id="add-app-probe"
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded
                          bg-cyan-500/10 text-cyan-400 border border-cyan-500/20
                          hover:bg-cyan-500/20 disabled:opacity-50 transition-colors"
@@ -1008,6 +1041,7 @@ function AddApplicationForm({
             <button
               onClick={handleAddWithoutProbing}
               disabled={busy || !url.trim()}
+              data-ui-bridge-test-id="add-app-manual"
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded
                          bg-white/5 text-muted-foreground border border-border
                          hover:bg-white/10 hover:text-foreground disabled:opacity-50 transition-colors"

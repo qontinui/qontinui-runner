@@ -114,6 +114,7 @@ import {
   isGroupExpanded,
   serializeState,
   deserializeState,
+  useNavigationItem,
 } from "qontinui-navigation";
 import { useProductMode, type ProductMode } from "@/contexts/ProductModeContext";
 
@@ -367,6 +368,12 @@ function NavItem({
   const Icon = item.icon;
   const showActiveState = isActive || isParentActive;
 
+  // Register this item with the UI Bridge as `nav:<item.id>` so
+  // discovery/control endpoints can see every sidebar entry regardless of
+  // group collapse state or scroll position. Clicking the bridge-registered
+  // element triggers the same handler the user's click would.
+  useNavigationItem(item, onClick);
+
   const button = (
     <button
       data-nav-item={dataNavItem}
@@ -433,6 +440,10 @@ interface FlyoutItemProps {
 
 function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
   const Icon = item.icon;
+
+  // Flyout items are secondary-nav children — same treatment as NavItem so
+  // bridge clients can reach them via `nav:<id>`.
+  useNavigationItem(item, onClick);
 
   return (
     <button

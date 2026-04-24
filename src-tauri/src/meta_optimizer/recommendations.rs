@@ -322,7 +322,11 @@ async fn apply_rule_create_async(
 
     let rule_number = match payload.rule_number {
         Some(n) => n,
-        None => pg_db.next_rule_number(&payload.agent, &payload.section).await?,
+        None => {
+            pg_db
+                .next_rule_number(&payload.agent, &payload.section)
+                .await?
+        }
     };
 
     let input = crate::workflow_generation::rules::InsertRuleInput {
@@ -346,10 +350,7 @@ async fn apply_rule_create_async(
     Ok(())
 }
 
-async fn apply_rule_update_async(
-    pg_db: &Arc<PgDb>,
-    recommended_value: &str,
-) -> Result<(), String> {
+async fn apply_rule_update_async(pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(), String> {
     let payload: RulePayload = serde_json::from_str(recommended_value)
         .map_err(|e| format!("Invalid rule_update payload: {}", e))?;
 
@@ -875,9 +876,7 @@ pub fn list_optimizer_runs(pg_db: &Arc<PgDb>) -> Result<Vec<MetaOptimizerRun>, S
 }
 
 /// Async variant of [`list_optimizer_runs`].
-pub async fn list_optimizer_runs_async(
-    pg_db: &Arc<PgDb>,
-) -> Result<Vec<MetaOptimizerRun>, String> {
+pub async fn list_optimizer_runs_async(pg_db: &Arc<PgDb>) -> Result<Vec<MetaOptimizerRun>, String> {
     pg_db.list_optimizer_runs().await
 }
 

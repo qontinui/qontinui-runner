@@ -108,11 +108,11 @@ mod settings;
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
 // axum router construction) write a `runner-panic.log` the supervisor can
 // pick up. Must come before any module that panics during static init.
-mod startup_panic;
 mod skills;
 mod slash_commands;
 mod spec_experimentation;
 mod spec_utils;
+mod startup_panic;
 mod state_discovery;
 mod state_explorer;
 mod state_machine_configs;

@@ -18,9 +18,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
-use std::sync::Arc;
 use tauri::State;
 
 use tracing::{debug, info, warn};

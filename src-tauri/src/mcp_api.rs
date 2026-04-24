@@ -1342,6 +1342,8 @@ pub fn create_router(
         .merge(crate::mcp::canvas::routes())
         .merge(crate::mcp::cascade::routes())
         .merge(crate::mcp::ai_generation::routes())
+        .merge(crate::mcp::ai_network_probe::routes())
+        .merge(crate::mcp::ai_wait_for::routes())
         .merge(crate::mcp::api_requests::routes())
         .merge(crate::mcp::app_discovery::routes())
         .merge(crate::mcp::physical_device_api::routes())

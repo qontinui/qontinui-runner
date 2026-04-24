@@ -12,8 +12,6 @@
 use super::CommandResponse;
 use crate::database::{CreateVerificationTestInput, TriggerPoint, VerificationTest};
 use crate::executor::{is_default_bridge_running, with_default_bridge};
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use crate::test_executor::{
     execute_test, execute_test_suite, RepoTestConfig, TestCategory, TestDefinition,
     TestExecutionResult, TestStatus, TestSuiteSummary, TestType, VisionConfig,
@@ -21,6 +19,8 @@ use crate::test_executor::{
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::info;
 

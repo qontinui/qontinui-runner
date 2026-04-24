@@ -14,11 +14,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-};
+use axum::{extract::State, http::StatusCode, response::Json};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 

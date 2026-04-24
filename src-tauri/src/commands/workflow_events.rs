@@ -323,8 +323,6 @@ fn truncate(s: &str, max_len: usize) -> &str {
 /// Build the Tauri plugin that registers this module's command handlers.
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_workflow_events")
-        .invoke_handler(tauri::generate_handler![
-            emit_workflow_event,
-        ])
+        .invoke_handler(tauri::generate_handler![emit_workflow_event,])
         .build()
 }
