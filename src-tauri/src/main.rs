@@ -501,6 +501,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::web_integration::plugin())
         .plugin(commands::activity_timeline::plugin())
         .plugin(commands::agentic_metrics::plugin())
+        .plugin(commands::ai_data::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -749,29 +750,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::context::record_context_usage,
             commands::context::get_builtin_contexts_cmd,
             commands::context::evaluate_auto_include,
-            // AI Data Viewer commands
-            commands::ai_data::get_task_runs_for_viewer,
-            commands::ai_data::get_task_run_for_viewer,
-            commands::ai_data::read_jsonl_logs_for_viewer,
-            commands::ai_data::read_jsonl_logs_for_task_run,
-            commands::ai_data::get_consolidated_ai_output,
-            commands::ai_data::get_jsonl_logs_summary,
-            commands::ai_data::reopen_task_run,
-            commands::ai_data::read_text_logs_for_viewer,
-            commands::ai_data::get_text_logs_summary,
-            commands::ai_data::get_screenshots_for_viewer,
-            commands::ai_data::get_loaded_config_for_viewer,
-            commands::ai_data::get_ai_prompts_for_viewer,
-            commands::ai_data::get_contexts_for_viewer,
-            // AI Data Viewer - SQLite queries (migrated logs)
-            commands::ai_data::get_task_run_events_from_db,
-            commands::ai_data::get_task_run_screenshots_from_db,
-            commands::ai_data::get_task_run_playwright_results_from_db,
-            commands::ai_data::get_task_run_migrated_logs_summary,
-            commands::ai_data::get_task_run_api_requests_from_db,
-            commands::ai_data::get_task_run_awas_steps_from_db,
-            commands::ai_data::get_task_run_verification_results_from_db,
-            commands::ai_data::get_task_run_context,
+            // NOTE: ai_data handlers moved to per-module plugin (see .plugin() calls above).
             // Recap commands (Session overview)
             commands::recap::get_task_run_recap,
             // Task Sync commands (sync to qontinui-web)

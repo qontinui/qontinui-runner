@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::warn;
 
@@ -1658,4 +1660,32 @@ pub async fn get_task_run_context(
         task_run_id,
         variables,
     }))
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_ai_data")
+        .invoke_handler(tauri::generate_handler![
+            get_task_runs_for_viewer,
+            get_task_run_for_viewer,
+            read_jsonl_logs_for_viewer,
+            read_jsonl_logs_for_task_run,
+            get_consolidated_ai_output,
+            get_jsonl_logs_summary,
+            reopen_task_run,
+            read_text_logs_for_viewer,
+            get_text_logs_summary,
+            get_screenshots_for_viewer,
+            get_loaded_config_for_viewer,
+            get_ai_prompts_for_viewer,
+            get_contexts_for_viewer,
+            get_task_run_events_from_db,
+            get_task_run_screenshots_from_db,
+            get_task_run_playwright_results_from_db,
+            get_task_run_migrated_logs_summary,
+            get_task_run_api_requests_from_db,
+            get_task_run_awas_steps_from_db,
+            get_task_run_verification_results_from_db,
+            get_task_run_context,
+        ])
+        .build()
 }
