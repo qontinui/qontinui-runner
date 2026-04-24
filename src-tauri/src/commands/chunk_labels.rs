@@ -5,33 +5,32 @@
 //! of a chunk's sorted state ids (see `chunkStateMachine` in
 //! `@qontinui/workflow-utils`), so labels survive input re-orderings.
 
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::database::pg::chunk_labels::ChunkLabel;
 
 /// List all user-chosen chunk labels for the given config.
 #[tauri::command]
 pub async fn list_chunk_labels(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
 ) -> Result<Vec<ChunkLabel>, String> {
-    app_state.pg_db.list_chunk_labels(&config_id).await
+    storage.pg_db().list_chunk_labels(&config_id).await
 }
 
 /// Upsert a chunk label for (config_id, chunk_id).
 #[tauri::command]
 pub async fn upsert_chunk_label(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     chunk_id: String,
     label: String,
 ) -> Result<(), String> {
-    app_state
-        .pg_db
+    storage
+        .pg_db()
         .upsert_chunk_label(&config_id, &chunk_id, &label)
         .await
 }
@@ -39,12 +38,12 @@ pub async fn upsert_chunk_label(
 /// Delete a chunk label (revert to the auto-derived name).
 #[tauri::command]
 pub async fn delete_chunk_label(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     chunk_id: String,
 ) -> Result<(), String> {
-    app_state
-        .pg_db
+    storage
+        .pg_db()
         .delete_chunk_label(&config_id, &chunk_id)
         .await
 }
