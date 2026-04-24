@@ -18,6 +18,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use std::sync::Arc;
 use tauri::State;
 
@@ -919,4 +921,23 @@ pub async fn delete_mobile_data(
             "deleted": true,
         })),
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_mobile")
+        .invoke_handler(tauri::generate_handler![
+            list_mobile_devices,
+            capture_mobile_screenshot,
+            capture_mobile_logcat,
+            get_mobile_states,
+            get_latest_mobile_state,
+            create_mobile_state,
+            get_mobile_logs,
+            get_mobile_errors,
+            create_mobile_log,
+            capture_mobile_feedback,
+            delete_mobile_data,
+        ])
+        .build()
 }
