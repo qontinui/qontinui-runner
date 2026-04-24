@@ -11,6 +11,8 @@ use crate::error::AppError;
 use crate::executor::file_logger;
 use crate::settings;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info, warn};
 
@@ -516,4 +518,26 @@ pub fn save_claude_account_launch_commands(
         message: Some(format!("Saved {} account launch commands", commands.len())),
         data: Some(serde_json::json!({ "commands": commands })),
     })
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_config")
+        .invoke_handler(tauri::generate_handler![
+            load_configuration,
+            get_current_configuration,
+            get_last_config_path,
+            save_last_workflow_id,
+            save_last_monitor_index,
+            save_last_monitor_indices,
+            get_auto_load_last_config,
+            save_auto_load_last_config,
+            get_include_summary_step_by_default,
+            save_include_summary_step_by_default,
+            get_workspace_paths,
+            get_claude_config_dirs,
+            save_claude_config_dirs,
+            get_claude_account_launch_commands,
+            save_claude_account_launch_commands,
+        ])
+        .build()
 }

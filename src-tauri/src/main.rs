@@ -513,6 +513,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::ai_generation::plugin())
         .plugin(commands::backup::plugin())
         .plugin(commands::checkpoint_browser::plugin())
+        .plugin(commands::config::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -548,21 +549,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: clipboard, dev_findings, and file_browser handlers moved to
             // per-module plugins (see .plugin() calls above).
             // Configuration commands
-            commands::config::load_configuration,
-            commands::config::get_current_configuration,
-            commands::config::get_last_config_path,
-            commands::config::save_last_workflow_id,
-            commands::config::save_last_monitor_index,
-            commands::config::save_last_monitor_indices,
-            commands::config::get_auto_load_last_config,
-            commands::config::save_auto_load_last_config,
-            commands::config::get_include_summary_step_by_default,
-            commands::config::save_include_summary_step_by_default,
-            commands::config::get_workspace_paths,
-            commands::config::get_claude_config_dirs,
-            commands::config::save_claude_config_dirs,
-            commands::config::get_claude_account_launch_commands,
-            commands::config::save_claude_account_launch_commands,
+            // NOTE: config handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: dataset handlers moved to per-module plugin (see .plugin() calls above).
             // Execution commands - python_executor
             commands::execution::python_executor::start_python_executor,
