@@ -29,7 +29,7 @@ describe("generateConstraintToml (runner import)", () => {
         enabled: true,
       },
     ];
-    const limits: ResourceLimits = { max_wall_time_secs: 300 };
+    const limits: ResourceLimits = { maxWallTimeSecs: 300 };
 
     const result = generateConstraintToml(constraints, limits);
 
