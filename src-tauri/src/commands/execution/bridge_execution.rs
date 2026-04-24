@@ -4,9 +4,9 @@
 //! These commands enable multi-bridge scenarios where workflows need to run on
 //! different bridges, and GUI lock ownership may need to be transferred.
 
-use crate::commands::{AppState, CommandResponse};
-use crate::executor::bridge_helpers::get_bridge_manager;
-use std::sync::Arc;
+use crate::commands::compartments::BridgeCompartment;
+use crate::commands::CommandResponse;
+use crate::executor::bridge_helpers::get_bridge_manager_compartment;
 use tauri::State;
 use tracing::{debug, info, warn};
 
@@ -30,14 +30,14 @@ pub async fn run_workflow_on_bridge(
     bridge_id: String,
     workflow_id: String,
     params: Option<serde_json::Value>,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Running workflow '{}' on bridge '{}'",
         workflow_id, bridge_id
     );
 
-    let manager = get_bridge_manager(&state)?;
+    let manager = get_bridge_manager_compartment(&bridge)?;
 
     // Verify the bridge exists and get its info
     let bridge_info = manager
@@ -127,14 +127,14 @@ pub async fn run_workflow_on_bridge(
 pub async fn transfer_gui_lock(
     from_bridge_id: String,
     to_bridge_id: String,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Transferring GUI lock from '{}' to '{}'",
         from_bridge_id, to_bridge_id
     );
 
-    let manager = get_bridge_manager(&state)?;
+    let manager = get_bridge_manager_compartment(&bridge)?;
 
     // Verify both bridges exist
     if !manager.has_bridge(&from_bridge_id) {
@@ -179,10 +179,12 @@ pub async fn transfer_gui_lock(
 /// * `Ok(CommandResponse)` - Success with list of bridge info
 /// * `Err(String)` - Error if bridge manager not initialized
 #[tauri::command]
-pub async fn list_bridges(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn list_bridges(
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
     debug!("Listing all bridges");
 
-    let manager = get_bridge_manager(&state)?;
+    let manager = get_bridge_manager_compartment(&bridge)?;
     let bridges = manager.list_bridges().await;
 
     Ok(CommandResponse {
@@ -207,11 +209,11 @@ pub async fn list_bridges(state: State<'_, Arc<AppState>>) -> Result<CommandResp
 #[tauri::command]
 pub async fn get_bridge_info(
     bridge_id: String,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     debug!("Getting info for bridge '{}'", bridge_id);
 
-    let manager = get_bridge_manager(&state)?;
+    let manager = get_bridge_manager_compartment(&bridge)?;
 
     match manager.get_bridge_info(&bridge_id).await {
         Some(info) => Ok(CommandResponse {
