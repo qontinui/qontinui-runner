@@ -4,8 +4,15 @@
 //! - Getting and setting Playwright test credentials
 //! - Configuring test environment variables
 //! - Secure password storage in OS keychain
+//!
+//! # Typed errors (Workstream D)
+//!
+//! Handlers keep `-> Result<T, String>` at the Tauri boundary and build
+//! errors via [`AppError`] internally, converting with
+//! `.map_err(String::from)`. See `commands/mod.rs` for the migration guide.
 
 use crate::config_facade::{keychain_keys, playwright_keychain};
+use crate::error::AppError;
 use crate::settings::{self, PlaywrightSettings};
 use anyhow::Result;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -42,24 +49,15 @@ fn has_playwright_password() -> Result<bool> {
 // Tauri Commands
 // ============================================================================
 
-/// Get the current Playwright settings.
-///
-/// Returns the Playwright settings stored in the persistent settings file.
-/// Note: The password field in the response indicates whether a password is set,
-/// but the actual password is stored securely in the OS keychain.
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success with Playwright settings data
-/// * `Err(String)` - Error message if settings cannot be loaded
-#[tauri::command]
-pub fn get_playwright_settings() -> Result<CommandResponse, String> {
+/// Internal implementation of [`get_playwright_settings`] returning [`AppError`].
+fn get_playwright_settings_impl() -> Result<CommandResponse, AppError> {
     info!("Getting Playwright settings");
 
     let playwright_settings = settings::get_playwright_settings();
 
     // Check if password exists in keychain (for backward compatibility, also check settings)
     let has_password = has_playwright_password()
-        .map_err(|e| format!("Failed to check keychain: {}", e))?
+        .map_err(|e| AppError::ConfigError(format!("Failed to check keychain: {}", e)))?
         || playwright_settings.test_password.is_some();
 
     // Build response - include a placeholder if password is set (don't expose actual password)
@@ -78,41 +76,35 @@ pub fn get_playwright_settings() -> Result<CommandResponse, String> {
     })
 }
 
-/// Save Playwright settings.
-///
-/// Persists the provided Playwright settings to the settings file.
-/// The password is stored securely in the OS keychain, not in the settings file.
-///
-/// # Arguments
-/// * `test_username` - Username or email for test authentication (optional)
-/// * `test_password` - Password for test authentication (optional). If provided, stored in keychain.
-/// * `base_url` - Base URL for Playwright tests (optional)
-/// * `skip_web_server` - Whether to skip starting web server
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success message
-/// * `Err(String)` - Error message if settings cannot be saved
+/// Get the current Playwright settings.
 #[tauri::command]
-pub fn save_playwright_settings(
+pub fn get_playwright_settings() -> Result<CommandResponse, String> {
+    get_playwright_settings_impl().map_err(String::from)
+}
+
+/// Internal implementation of [`save_playwright_settings`] returning [`AppError`].
+fn save_playwright_settings_impl(
     test_username: Option<String>,
     test_password: Option<String>,
     base_url: Option<String>,
     skip_web_server: bool,
-) -> Result<CommandResponse, String> {
+) -> Result<CommandResponse, AppError> {
     info!("Saving Playwright settings");
 
     // Handle password storage in keychain
     if let Some(ref password) = test_password {
         if !password.is_empty() && password != "********" {
             // Only store if it's a real password (not the placeholder)
-            store_playwright_password(password)
-                .map_err(|e| format!("Failed to store password in keychain: {}", e))?;
+            store_playwright_password(password).map_err(|e| {
+                AppError::ConfigError(format!("Failed to store password in keychain: {}", e))
+            })?;
             info!("Playwright test password stored in keychain");
         }
     } else {
         // If password is None, delete from keychain
-        delete_playwright_password()
-            .map_err(|e| format!("Failed to delete password from keychain: {}", e))?;
+        delete_playwright_password().map_err(|e| {
+            AppError::ConfigError(format!("Failed to delete password from keychain: {}", e))
+        })?;
     }
 
     // Save settings without password (password is in keychain)
@@ -123,8 +115,7 @@ pub fn save_playwright_settings(
         skip_web_server,
     };
 
-    settings::save_playwright_settings(playwright_settings)
-        .map_err(|e| format!("Failed to save Playwright settings: {}", e))?;
+    settings::save_playwright_settings(playwright_settings).map_err(AppError::ConfigError)?;
 
     Ok(CommandResponse {
         success: true,
@@ -133,18 +124,26 @@ pub fn save_playwright_settings(
     })
 }
 
+/// Save Playwright settings.
+#[tauri::command]
+pub fn save_playwright_settings(
+    test_username: Option<String>,
+    test_password: Option<String>,
+    base_url: Option<String>,
+    skip_web_server: bool,
+) -> Result<CommandResponse, String> {
+    save_playwright_settings_impl(test_username, test_password, base_url, skip_web_server)
+        .map_err(String::from)
+}
+
 /// Check if a Playwright test password is configured.
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success with `has_password` boolean in data
-/// * `Err(String)` - Error message if check fails
 #[tauri::command]
 pub fn has_playwright_test_password() -> Result<CommandResponse, String> {
     info!("Checking if Playwright test password exists");
 
     // Check keychain first, then fall back to settings for backward compatibility
-    let keychain_has =
-        has_playwright_password().map_err(|e| format!("Failed to check keychain: {}", e))?;
+    let keychain_has = has_playwright_password()
+        .map_err(|e| String::from(AppError::ConfigError(format!("Failed to check keychain: {}", e))))?;
     let settings_has = settings::get_playwright_settings().test_password.is_some();
 
     Ok(CommandResponse {
@@ -154,24 +153,21 @@ pub fn has_playwright_test_password() -> Result<CommandResponse, String> {
     })
 }
 
-/// Delete the Playwright test password from the keychain.
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success
-/// * `Err(String)` - Error message if deletion fails
-#[tauri::command]
-pub fn delete_playwright_test_password() -> Result<CommandResponse, String> {
+/// Internal implementation of [`delete_playwright_test_password`] returning [`AppError`].
+fn delete_playwright_test_password_impl() -> Result<CommandResponse, AppError> {
     info!("Deleting Playwright test password");
 
-    delete_playwright_password()
-        .map_err(|e| format!("Failed to delete password from keychain: {}", e))?;
+    delete_playwright_password().map_err(|e| {
+        AppError::ConfigError(format!("Failed to delete password from keychain: {}", e))
+    })?;
 
     // Also clear from settings if present (backward compatibility)
     let mut playwright_settings = settings::get_playwright_settings();
     if playwright_settings.test_password.is_some() {
         playwright_settings.test_password = None;
-        settings::save_playwright_settings(playwright_settings)
-            .map_err(|e| format!("Failed to clear password from settings: {}", e))?;
+        settings::save_playwright_settings(playwright_settings).map_err(|e| {
+            AppError::ConfigError(format!("Failed to clear password from settings: {}", e))
+        })?;
     }
 
     Ok(CommandResponse {
@@ -179,6 +175,12 @@ pub fn delete_playwright_test_password() -> Result<CommandResponse, String> {
         message: Some("Playwright test password deleted".to_string()),
         data: None,
     })
+}
+
+/// Delete the Playwright test password from the keychain.
+#[tauri::command]
+pub fn delete_playwright_test_password() -> Result<CommandResponse, String> {
+    delete_playwright_test_password_impl().map_err(String::from)
 }
 
 /// Get the actual Playwright test password for use in test execution.
