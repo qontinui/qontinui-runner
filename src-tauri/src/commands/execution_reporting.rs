@@ -8,6 +8,8 @@
 
 use crate::auth::AuthManager;
 use serde::{Deserialize, Serialize};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
@@ -934,4 +936,17 @@ pub async fn complete_execution_run(
     }
 
     Ok(result)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_execution_reporting")
+        .invoke_handler(tauri::generate_handler![
+            create_execution_run,
+            report_action_executions,
+            upload_execution_screenshot,
+            report_execution_issues,
+            complete_execution_run,
+        ])
+        .build()
 }
