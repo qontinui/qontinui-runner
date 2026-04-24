@@ -6,17 +6,17 @@
 //! - Persisting configuration paths and workflow IDs
 //! - Auto-load settings
 
+use crate::commands::compartments::{BridgeCompartment, ExecutionCompartment};
 use crate::config::{ConfigLoader, QontinuiConfig};
 use crate::error::AppError;
 use crate::executor::file_logger;
 use crate::settings;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info, warn};
 
-use super::{AppState, CommandResponse};
+use super::CommandResponse;
 
 /// Load a configuration file from the specified path.
 ///
@@ -37,7 +37,8 @@ use super::{AppState, CommandResponse};
 #[tauri::command]
 pub async fn load_configuration(
     path: String,
-    state: State<'_, Arc<AppState>>,
+    execution: State<'_, ExecutionCompartment>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Loading configuration from: {}", path);
 
@@ -72,7 +73,7 @@ pub async fn load_configuration(
 
     // Set config context on run recording handler
     {
-        let handler = state.run_recording_handler.clone();
+        let handler = execution.run_recording_handler().clone();
         let config_id_clone = config_id.clone();
         let project_id_clone = project_id.clone();
         tauri::async_runtime::spawn(async move {
@@ -81,7 +82,8 @@ pub async fn load_configuration(
     }
 
     // Store the configuration
-    *crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config") = Some(config);
+    *crate::safe_lock::safe_lock_or_recover(execution.current_config(), "current_config") =
+        Some(config);
     info!(
         "Configuration loaded successfully: {} (config_id: {}, project_id: {:?})",
         summary, config_id, project_id
@@ -97,7 +99,7 @@ pub async fn load_configuration(
 
     // If Python bridge is running, send the configuration and debug settings
     // NOTE: We use spawn_blocking because PythonBridge methods use block_on internally
-    let manager_guard = state.bridge_manager.lock().await;
+    let manager_guard = bridge.bridge_manager().lock().await;
     if let Some(ref manager) = *manager_guard {
         // Use async check to avoid nested runtime panic
         if manager.is_default_bridge_running_async().await {
@@ -150,9 +152,11 @@ pub async fn load_configuration(
 /// * `Ok(QontinuiConfig)` - The current configuration
 /// * `Err(String)` - Error if no configuration is loaded
 #[tauri::command]
-pub fn get_current_configuration(state: State<Arc<AppState>>) -> Result<QontinuiConfig, String> {
-    state
-        .current_config
+pub fn get_current_configuration(
+    execution: State<'_, ExecutionCompartment>,
+) -> Result<QontinuiConfig, String> {
+    execution
+        .current_config()
         .lock()
         .unwrap()
         .clone()
