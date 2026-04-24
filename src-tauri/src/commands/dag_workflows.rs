@@ -1,12 +1,13 @@
 //! Tauri commands for DAG workflow operations.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 
-use super::AppState;
+use super::compartments::StorageCompartment;
+
+// Migrated to StorageCompartment (Workstream C).
 
 /// Validate a YAML DAG workflow definition without executing it.
 ///
@@ -14,7 +15,7 @@ use super::AppState;
 #[tauri::command]
 pub async fn validate_dag_workflow(
     yaml_content: String,
-    _state: State<'_, Arc<AppState>>,
+    _state: State<'_, StorageCompartment>,
 ) -> Result<serde_json::Value, String> {
     use crate::workflow::dag_parser::parse_dag_workflow;
 
@@ -36,7 +37,7 @@ pub async fn validate_dag_workflow(
 #[tauri::command]
 pub async fn import_dag_workflow(
     file_path: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<serde_json::Value, String> {
     use crate::workflow::dag_sync::import_workflow_file;
 
@@ -45,7 +46,7 @@ pub async fn import_dag_workflow(
         return Err(format!("File not found: {}", file_path));
     }
 
-    let result = import_workflow_file(&path, &state.pg_db).await;
+    let result = import_workflow_file(&path, state.pg_db()).await;
 
     if let Some(ref error) = result.error {
         Err(error.clone())
@@ -62,7 +63,7 @@ pub async fn import_dag_workflow(
 #[tauri::command]
 pub async fn import_dag_workflows_from_project(
     project_path: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<serde_json::Value, String> {
     use crate::workflow::dag_sync::{import_workflows_from_directory, workflow_directory};
 
@@ -75,7 +76,7 @@ pub async fn import_dag_workflows_from_project(
         }));
     }
 
-    let results = import_workflows_from_directory(&dir, &state.pg_db).await;
+    let results = import_workflows_from_directory(&dir, state.pg_db()).await;
     let imported = results.iter().filter(|r| r.error.is_none()).count();
     let failed = results.iter().filter(|r| r.error.is_some()).count();
 
@@ -96,10 +97,10 @@ pub async fn import_dag_workflows_from_project(
 #[tauri::command]
 pub async fn export_dag_workflow(
     workflow_id: String,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, StorageCompartment>,
 ) -> Result<String, String> {
     use crate::workflow::dag_sync::export_workflow_as_yaml;
-    export_workflow_as_yaml(&workflow_id, &state.pg_db).await
+    export_workflow_as_yaml(&workflow_id, state.pg_db()).await
 }
 
 /// Respond to a pending DAG approval gate.
@@ -111,7 +112,7 @@ pub async fn export_dag_workflow(
 pub async fn respond_dag_approval(
     approval_id: String,
     approved: bool,
-    _state: State<'_, Arc<AppState>>,
+    _state: State<'_, StorageCompartment>,
 ) -> Result<(), String> {
     crate::step_executor::handlers::dag_nodes::resolve_approval(&approval_id, approved)
 }
