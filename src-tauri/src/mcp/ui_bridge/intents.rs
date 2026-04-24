@@ -530,24 +530,39 @@ pub async fn ui_bridge_wait_for_route_change_handler(
 // ============================================================================
 
 pub fn routes() -> axum::Router<Arc<ApiState>> {
+    use super::routing::add_dual;
     use axum::routing::post;
-    axum::Router::new()
-        .route(
-            "/ui-bridge/control/wait-for-navigation",
-            post(ui_bridge_wait_for_navigation_handler),
-        )
-        .route(
-            "/ui-bridge/ai/wait-for-navigation",
-            post(ui_bridge_wait_for_navigation_handler),
-        )
-        .route(
-            "/ui-bridge/control/wait-for-idle",
-            post(ui_bridge_wait_for_idle_handler),
-        )
-        .route(
-            "/ui-bridge/ai/wait-for-idle",
-            post(ui_bridge_wait_for_idle_handler),
-        )
+    let router = axum::Router::new();
+    // Four wait-for-* endpoints are reachable under both /control/ and /ai/
+    // with the same handler. /ai/wait-for-element-condition has no /control/
+    // twin, and wait-for-element-state / wait-for-element-stable /
+    // wait-for-idle/{signal} / wait-for-targets are /control/-only —
+    // those stay as plain .route() calls below.
+    let router = add_dual!(
+        router,
+        post,
+        "wait-for-navigation",
+        ui_bridge_wait_for_navigation_handler
+    );
+    let router = add_dual!(
+        router,
+        post,
+        "wait-for-idle",
+        ui_bridge_wait_for_idle_handler
+    );
+    let router = add_dual!(
+        router,
+        post,
+        "wait-for-route",
+        ui_bridge_wait_for_route_handler
+    );
+    let router = add_dual!(
+        router,
+        post,
+        "wait-for-route-change",
+        ui_bridge_wait_for_route_change_handler
+    );
+    router
         .route(
             "/ui-bridge/ai/wait-for-element-condition",
             post(ui_bridge_wait_for_element_condition_handler),
@@ -559,22 +574,6 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/control/wait-for-element-stable",
             post(ui_bridge_wait_for_element_stable_handler),
-        )
-        .route(
-            "/ui-bridge/control/wait-for-route",
-            post(ui_bridge_wait_for_route_handler),
-        )
-        .route(
-            "/ui-bridge/ai/wait-for-route",
-            post(ui_bridge_wait_for_route_handler),
-        )
-        .route(
-            "/ui-bridge/control/wait-for-route-change",
-            post(ui_bridge_wait_for_route_change_handler),
-        )
-        .route(
-            "/ui-bridge/ai/wait-for-route-change",
-            post(ui_bridge_wait_for_route_change_handler),
         )
         .route(
             "/ui-bridge/control/wait-for-idle/{signal}",
