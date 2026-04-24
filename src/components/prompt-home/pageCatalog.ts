@@ -53,23 +53,23 @@ function formatSpec(specId: string, cfg: SpecConfig): string {
   return lines.join("\n");
 }
 
-/**
- * Read every spec from the global SpecStore and produce a compact catalog
- * suitable for injection into the planner's system prompt. Returns an empty
- * string if no specs are loaded (caller should treat as "no catalog").
- */
+/** Build a compact catalog of the runner's own UI labels, prefixed with a disclaimer warning the planner not to use these labels for external-project prompts. */
 export function buildPageCatalog(): string {
   const store = getGlobalSpecStore();
   const all = store.getAll();
   if (all.size === 0) return "";
 
+  const disclaimer =
+    "NOTE: These labels describe the Qontinui Runner's own UI. If the user's prompt is about integrating, analyzing, or generating for a DIFFERENT project (e.g. qontinui-mobile, qontinui-web, or any external path), DO NOT use these labels as element names — the runner's buttons are not present on that external project's pages. Use these labels ONLY when the user is clearly asking to do something within the runner itself.";
+
+  const budget = MAX_CATALOG_CHARS - disclaimer.length - 2;
   const sections: string[] = [];
   let total = 0;
   for (const [specId, cfg] of all) {
     const section = formatSpec(specId, cfg);
-    if (total + section.length > MAX_CATALOG_CHARS) break;
+    if (total + section.length > budget) break;
     sections.push(section);
     total += section.length + 2;
   }
-  return sections.join("\n\n");
+  return [disclaimer, ...sections].join("\n\n");
 }
