@@ -1149,7 +1149,7 @@ export function useDebugInspectEvents(
                 ? Number(limitRaw)
                 : undefined;
 
-          let toasts: unknown[] = [];
+          let toasts: unknown[];
           try {
             const { toastBuffer } = await import("@qontinui/ui-bridge");
             toasts = toastBuffer.getSince(sinceMs, limit);
