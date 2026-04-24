@@ -229,6 +229,12 @@ export interface UIBridgeRequestPayload {
   selector?: string;
   /** JavaScript expression for page_evaluate requests */
   expression?: string;
+  /**
+   * When true, page_evaluate returns a consistent discriminated
+   * `{ value, type }` shape regardless of result type. When false/omitted,
+   * the legacy conditional-wrapping shape is preserved for backward-compat.
+   */
+  unwrap?: boolean;
   /** Element index for query_selector action targeting */
   index?: number;
   guide?: StyleGuideConfig;

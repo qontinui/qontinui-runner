@@ -270,7 +270,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
         }
 
         case "page_evaluate": {
-          const { expression } = payload;
+          const { expression, unwrap } = payload;
           if (!expression) {
             await sendResponse({
               requestId,
@@ -338,16 +338,47 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               }
             }
             const resolvedResult = await Promise.resolve(result);
-            await sendResponse({
-              requestId,
-              type,
-              success: true,
-              data: {
-                result:
-                  typeof resolvedResult === "object" ? resolvedResult : { value: resolvedResult },
-              },
-              timestamp: Date.now(),
-            });
+            if (unwrap) {
+              // Opt-in consistent shape: always `{ value, type }`.
+              let valueType: "scalar" | "object" | "undefined" | "function" | "null";
+              let normalizedValue: unknown;
+              if (resolvedResult === null) {
+                valueType = "null";
+                normalizedValue = null;
+              } else if (resolvedResult === undefined) {
+                valueType = "undefined";
+                normalizedValue = undefined;
+              } else if (typeof resolvedResult === "function") {
+                valueType = "function";
+                // Functions aren't structured-clone-safe. Surface the name
+                // (or `<anonymous>`) so the caller gets something useful.
+                normalizedValue = (resolvedResult as { name?: string }).name || "<anonymous>";
+              } else if (typeof resolvedResult === "object") {
+                valueType = "object";
+                normalizedValue = resolvedResult;
+              } else {
+                valueType = "scalar";
+                normalizedValue = resolvedResult;
+              }
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: { value: normalizedValue, type: valueType },
+                timestamp: Date.now(),
+              });
+            } else {
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: {
+                  result:
+                    typeof resolvedResult === "object" ? resolvedResult : { value: resolvedResult },
+                },
+                timestamp: Date.now(),
+              });
+            }
           } catch (err) {
             await sendResponse({
               requestId,
