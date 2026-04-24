@@ -11,6 +11,8 @@ use crate::tiered_info::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{debug, info, warn};
 
@@ -587,4 +589,26 @@ pub async fn delete_ai_session(
             Ok(TieredInfoResponse::err(e))
         }
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_tiered_info")
+        .invoke_handler(tauri::generate_handler![
+            get_config_statistics,
+            get_flaky_transitions,
+            get_flaky_templates,
+            get_debugging_context,
+            get_debugging_context_prompt,
+            get_run_details,
+            get_recent_runs,
+            get_failed_runs,
+            record_run,
+            cleanup_old_runs,
+            get_execution_options,
+            get_flakiness_summary,
+            get_ai_session_history,
+            delete_ai_session,
+        ])
+        .build()
 }
