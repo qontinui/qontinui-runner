@@ -522,6 +522,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::meta_optimizer::plugin())
         .plugin(commands::auth::plugin())
         .plugin(commands::state_machine::plugin())
+        .plugin(commands::websocket::plugin())
+        .plugin(commands::video::plugin())
+        .plugin(commands::interaction::plugin())
+        .plugin(commands::storage::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -567,28 +571,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution::system_ops::open_folder,
             // NOTE: state_machine handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: debug handlers moved to per-module plugin (see .plugin() calls above).
-            // WebSocket commands
-            commands::websocket::configure_websocket,
-            commands::websocket::connect_websocket,
-            commands::websocket::disconnect_websocket,
-            // Video commands
-            commands::video::start_video_recording,
-            commands::video::stop_video_recording,
-            commands::video::get_video_recording_status,
-            // Interaction recording commands (video + input capture for State Machine creation)
-            commands::interaction::start_interaction_recording,
-            commands::interaction::stop_interaction_recording,
-            commands::interaction::get_interaction_recording_status,
-            // Storage commands
-            commands::storage::save_screenshot_to_disk,
-            commands::storage::save_video_to_disk,
-            commands::storage::get_local_storage_usage,
-            commands::storage::delete_old_sessions,
-            commands::storage::clear_all_storage,
-            commands::storage::get_storage_paths,
-            commands::storage::read_image_as_base64,
-            commands::storage::save_findings_data,
-            commands::storage::load_findings_data,
+            // NOTE: websocket, video, interaction, storage handlers moved to per-module plugins (see .plugin() calls above).
             // Web extraction commands
             commands::extraction::start_web_extraction,
             commands::extraction::start_vision_extraction,

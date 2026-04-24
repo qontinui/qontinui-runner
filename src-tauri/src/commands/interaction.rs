@@ -13,6 +13,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -163,4 +165,15 @@ pub fn get_interaction_recording_status(
             "is_recording": false,
         })),
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_interaction")
+        .invoke_handler(tauri::generate_handler![
+            start_interaction_recording,
+            stop_interaction_recording,
+            get_interaction_recording_status,
+        ])
+        .build()
 }

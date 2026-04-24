@@ -8,6 +8,8 @@
 use crate::video_recorder::VideoRecordingConfig;
 use serde_json;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -101,4 +103,15 @@ pub fn get_video_recording_status(state: State<Arc<AppState>>) -> Result<Command
         message: None,
         data: Some(serde_json::to_value(status).map_err(|e| e.to_string())?),
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_video")
+        .invoke_handler(tauri::generate_handler![
+            start_video_recording,
+            stop_video_recording,
+            get_video_recording_status,
+        ])
+        .build()
 }

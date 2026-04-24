@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -156,4 +158,15 @@ pub fn disconnect_websocket(state: State<Arc<AppState>>) -> Result<CommandRespon
         message: Some("WebSocket disconnection initiated".to_string()),
         data: None,
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_websocket")
+        .invoke_handler(tauri::generate_handler![
+            configure_websocket,
+            connect_websocket,
+            disconnect_websocket,
+        ])
+        .build()
 }
