@@ -499,6 +499,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::ai_settings::plugin())
         .plugin(commands::accessibility::plugin())
         .plugin(commands::web_integration::plugin())
+        .plugin(commands::activity_timeline::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -1235,16 +1236,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::token_analytics::get_provider_latency,
             commands::token_analytics::get_task_run_costs,
             commands::token_analytics::get_cost_by_target_app,
-            // Activity timeline commands (screenpipe-inspired capture history)
-            commands::activity_timeline::insert_activity_entry,
-            commands::activity_timeline::search_activity_timeline,
-            commands::activity_timeline::search_activity_timeline_filtered,
-            commands::activity_timeline::get_activity_timeline_range,
-            commands::activity_timeline::get_activity_timeline_entry,
-            commands::activity_timeline::get_activity_timeline_for_task_run,
-            commands::activity_timeline::delete_activity_timeline_entry,
-            commands::activity_timeline::get_activity_timeline_stats,
-            commands::activity_timeline::get_scripted_output_stats,
+            // NOTE: activity_timeline handlers moved to per-module plugin (see .plugin() calls above).
             commands::scripted_output_settings::get_scripted_output_settings,
             commands::scripted_output_settings::save_scripted_output_settings,
             // NOTE: event_search handlers moved to per-module plugin (see .plugin() calls above).

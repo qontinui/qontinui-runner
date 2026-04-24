@@ -4,6 +4,8 @@
 //! screen text from UI Bridge snapshots, OCR, and accessibility trees.
 
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{debug, info};
 
@@ -280,4 +282,20 @@ pub async fn get_scripted_output_stats(
 fn read_bytes_avoided(meta: &serde_json::Value) -> Option<u64> {
     meta.get("bytes_avoided")
         .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_activity_timeline")
+        .invoke_handler(tauri::generate_handler![
+            insert_activity_entry,
+            search_activity_timeline,
+            search_activity_timeline_filtered,
+            get_activity_timeline_range,
+            get_activity_timeline_entry,
+            get_activity_timeline_for_task_run,
+            delete_activity_timeline_entry,
+            get_activity_timeline_stats,
+            get_scripted_output_stats,
+        ])
+        .build()
 }
