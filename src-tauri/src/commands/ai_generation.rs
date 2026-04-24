@@ -5,10 +5,19 @@
 //!
 //! Also includes AI-powered generation for lightweight tasks like element
 //! descriptions, routed through the provider system (ai_provider).
+//!
+//! # Typed errors (Workstream D)
+//!
+//! Errors are wrapped in [`AppError`] variants inline at the Tauri boundary
+//! (`spawn_blocking` failures map to `ProcessError`, `serde_json` failures
+//! lift via the blanket `From` impl). Compartment retrofit is N/A here
+//! because each handler needs the full `Arc<AppState>` to pass to
+//! `with_default_bridge`, which no compartment exposes.
 
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::commands::{AppState, CommandResponse};
+use crate::error::AppError;
 use crate::executor::with_default_bridge;
 use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
@@ -110,7 +119,7 @@ pub async fn generate_context_with_ai(
         }
     })
     .await
-    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
 
     result
 }
@@ -203,7 +212,7 @@ pub async fn generate_api_request_with_ai(
         }
     })
     .await
-    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
 
     result
 }
@@ -297,7 +306,7 @@ pub async fn generate_task_prompt_with_ai(
         }
     })
     .await
-    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
 
     result
 }
@@ -412,7 +421,7 @@ pub async fn suggest_exploration_strategy_with_ai(
         }
     })
     .await
-    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
 
     result
 }
@@ -545,7 +554,7 @@ pub async fn generate_test_and_agentic_step(
         }
     })
     .await
-    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
 
     result
 }
@@ -660,7 +669,7 @@ pub async fn explore_flow_step(
         }
     })
     .await
-    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
 
     result
 }
@@ -748,7 +757,7 @@ pub async fn generate_element_ai_description(
         ai_provider::run_prompt_with_routing(&prompt, &context, None)
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?;
 
     if !ai_response.success {
         let error = ai_response
@@ -766,7 +775,10 @@ pub async fn generate_element_ai_description(
         Ok(description) => Ok(CommandResponse {
             success: true,
             message: Some("AI description generated successfully".to_string()),
-            data: Some(serde_json::to_value(&description).map_err(|e| e.to_string())?),
+            data: Some(
+                serde_json::to_value(&description)
+                    .map_err(|e| String::from(AppError::from(e)))?,
+            ),
         }),
         Err(e) => {
             error!("Failed to parse AI description: {}", e);
