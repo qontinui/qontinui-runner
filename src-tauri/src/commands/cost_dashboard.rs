@@ -3,6 +3,7 @@
 //! Provides a unified cost overview including token usage, cache efficiency,
 //! per-phase breakdowns, and budget utilization.
 
+use crate::commands::compartments::{ExecutionCompartment, StorageCompartment};
 use serde::Serialize;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -35,11 +36,12 @@ pub struct PhaseCostBreakdown {
 /// breakdowns. Returns a unified view suitable for the frontend dashboard.
 #[tauri::command]
 pub async fn get_cost_dashboard(
-    state: tauri::State<'_, std::sync::Arc<crate::commands::AppState>>,
+    storage: tauri::State<'_, StorageCompartment>,
+    execution: tauri::State<'_, ExecutionCompartment>,
     days: Option<u32>,
 ) -> Result<CostDashboard, String> {
     let d = days.unwrap_or(30);
-    let pg_db = state.pg_db.clone();
+    let pg_db = storage.pg_db().clone();
 
     let rows = pg_db.get_phase_cost_with_cache(d).await?;
 
@@ -99,7 +101,7 @@ pub async fn get_cost_dashboard(
         per_phase_breakdown: per_phase,
         // Get budget utilization from any active run
         budget_utilization: {
-            let trackers = state.run_cost_trackers.lock().await;
+            let trackers = execution.run_cost_trackers().lock().await;
             trackers
                 .values()
                 .next()
@@ -128,9 +130,9 @@ pub struct ActiveBudgetStatus {
 /// stats for any currently active run. Returns None if no run is active.
 #[tauri::command]
 pub async fn get_active_budget_status(
-    state: tauri::State<'_, std::sync::Arc<crate::commands::AppState>>,
+    execution: tauri::State<'_, ExecutionCompartment>,
 ) -> Result<Option<ActiveBudgetStatus>, String> {
-    let trackers = state.run_cost_trackers.lock().await;
+    let trackers = execution.run_cost_trackers().lock().await;
 
     // Return the first active run's status (most common case: single run)
     if let Some((execution_id, t)) = trackers.iter().next() {
