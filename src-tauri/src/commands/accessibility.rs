@@ -5,15 +5,16 @@
 //! - Launching Chrome with remote debugging enabled
 //! - Native accessibility tree capture, querying, and interaction via AccessibilityManager
 
-use crate::event_system::EventEmitter;
+use crate::event_system::AppEvent;
 use crate::settings::{self, AccessibilitySettings};
 use qontinui_runner_lib::accessibility::model::UnifiedRole;
 use qontinui_runner_lib::accessibility::traits::ConnectionTarget;
 use qontinui_runner_lib::accessibility::AccessibilityManager;
 
-use tauri::AppHandle;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::CommandResponse;
 
@@ -262,10 +263,10 @@ pub fn check_chrome_available() -> Result<CommandResponse, String> {
 /// * `Ok(serde_json::Value)` - Connection result with backend info
 /// * `Err(String)` - Error message
 #[tauri::command]
-pub async fn a11y_connect(
+pub async fn a11y_connect<R: Runtime>(
     target: String,
     backend: String,
-    app: AppHandle,
+    app: AppHandle<R>,
     state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
 ) -> Result<serde_json::Value, String> {
     info!("a11y_connect: target={}, backend={}", target, backend);
@@ -281,8 +282,10 @@ pub async fn a11y_connect(
     drop(mgr);
 
     // Emit tauri event so UI Bridge observers (e.g., Accessibility Explorer) can react.
-    let emitter = EventEmitter::new(app);
-    emitter.accessibility_connected(&backend_name, Some(&target));
+    let event = AppEvent::accessibility_connected(&backend_name, Some(target.clone()));
+    if let Err(e) = app.emit(event.event_name(), &event) {
+        warn!("Event emission failed for {}: {}", event.event_name(), e);
+    }
 
     Ok(serde_json::json!({
         "connected": true,
@@ -300,10 +303,10 @@ pub async fn a11y_connect(
 /// * `Ok(serde_json::Value)` - The captured snapshot serialized as JSON
 /// * `Err(String)` - Error message
 #[tauri::command]
-pub async fn a11y_capture(
+pub async fn a11y_capture<R: Runtime>(
     include_hidden: bool,
     max_depth: Option<u32>,
-    app: AppHandle,
+    app: AppHandle<R>,
     state: tauri::State<'_, TokioMutex<AccessibilityManager>>,
 ) -> Result<serde_json::Value, String> {
     info!(
@@ -325,8 +328,11 @@ pub async fn a11y_capture(
     drop(mgr);
 
     // Emit tauri event so UI Bridge observers can surface capture completion.
-    let emitter = EventEmitter::new(app);
-    emitter.accessibility_capture_complete(&backend_name, node_count, duration_ms);
+    let event =
+        AppEvent::accessibility_capture_complete(&backend_name, node_count, duration_ms);
+    if let Err(e) = app.emit(event.event_name(), &event) {
+        warn!("Event emission failed for {}: {}", event.event_name(), e);
+    }
 
     serde_json::to_value(&snapshot).map_err(|e| format!("Serialization failed: {}", e))
 }
@@ -545,4 +551,24 @@ fn parse_connection_target(target: &str, _backend: &str) -> Result<ConnectionTar
 
     // Default: treat as window title
     Ok(ConnectionTarget::WindowTitle(target.to_string()))
+}
+
+/// Tauri plugin exposing all accessibility commands.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_accessibility")
+        .invoke_handler(tauri::generate_handler![
+            get_accessibility_settings,
+            save_accessibility_settings,
+            launch_chrome_debug,
+            check_chrome_available,
+            a11y_connect,
+            a11y_capture,
+            a11y_query,
+            a11y_click,
+            a11y_type_text,
+            a11y_focus,
+            a11y_ai_context,
+            a11y_disconnect,
+        ])
+        .build()
 }

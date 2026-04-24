@@ -7,6 +7,8 @@
 use crate::config_facade::self_healing_keychain;
 use crate::settings::{self, SelfHealingApiProvider, SelfHealingLlmMode, SelfHealingSettings};
 use anyhow::Result;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -196,4 +198,17 @@ pub fn has_self_healing_api_key(provider: String) -> Result<CommandResponse, Str
 #[allow(dead_code)]
 pub fn get_provider_api_key(provider: &str) -> Result<Option<String>, String> {
     get_self_healing_api_key(provider).map_err(|e| format!("Failed to get API key: {}", e))
+}
+
+/// Tauri plugin exposing all self-healing settings commands.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_self_healing_settings")
+        .invoke_handler(tauri::generate_handler![
+            get_self_healing_settings,
+            save_self_healing_settings,
+            save_self_healing_api_key,
+            delete_self_healing_api_key,
+            has_self_healing_api_key,
+        ])
+        .build()
 }

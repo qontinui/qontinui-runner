@@ -14,6 +14,8 @@ use crate::settings::{
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -1570,4 +1572,32 @@ pub async fn list_wsv_disagreements(
         .pg_db
         .list_wsv_disagreements(task_run_id.as_deref(), limit)
         .await
+}
+
+/// Tauri plugin exposing all AI-settings commands.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_ai_settings")
+        .invoke_handler(tauri::generate_handler![
+            get_ai_settings,
+            save_ai_settings,
+            save_gemini_settings,
+            save_ai_api_key_command,
+            delete_ai_api_key_command,
+            has_ai_api_key,
+            test_ai_connection,
+            check_claude_cli_auth,
+            check_accounts_usage,
+            get_claude_accounts,
+            switch_claude_account,
+            refresh_claude_cli_auth,
+            get_agentic_settings,
+            save_agentic_settings,
+            get_wsv_settings,
+            save_wsv_settings,
+            test_wsv_connection,
+            list_wsv_disagreements,
+            get_provider_circuit_states,
+            reset_provider_circuit,
+        ])
+        .build()
 }

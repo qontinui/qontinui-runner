@@ -6,6 +6,8 @@
 //! - Logcat capture settings
 
 use crate::settings::{self, MobileSettings};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -82,4 +84,14 @@ pub fn save_mobile_settings(
         message: Some("Mobile settings saved".to_string()),
         data: None,
     })
+}
+
+/// Tauri plugin exposing all mobile settings commands.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_mobile_settings")
+        .invoke_handler(tauri::generate_handler![
+            get_mobile_settings,
+            save_mobile_settings,
+        ])
+        .build()
 }

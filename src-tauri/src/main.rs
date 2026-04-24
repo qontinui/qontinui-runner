@@ -490,6 +490,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::hooks::plugin())
         .plugin(commands::issues::plugin())
         .plugin(commands::known_issues::plugin())
+        .plugin(commands::playwright_settings::plugin())
+        .plugin(commands::self_healing_settings::plugin())
+        .plugin(commands::execution_variables::plugin())
+        .plugin(commands::mobile_settings::plugin())
+        .plugin(commands::otel_settings::plugin())
+        .plugin(commands::security_settings::plugin())
+        .plugin(commands::ai_settings::plugin())
+        .plugin(commands::accessibility::plugin())
+        .plugin(commands::web_integration::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -660,59 +669,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::project_logs::append_project_log,
             // AI log source discovery (global)
             commands::global_log_sources::find_log_sources_with_ai,
-            // AI settings commands
-            commands::ai_settings::get_ai_settings,
-            commands::ai_settings::save_ai_settings,
-            commands::ai_settings::save_gemini_settings,
-            commands::ai_settings::save_ai_api_key_command,
-            commands::ai_settings::delete_ai_api_key_command,
-            commands::ai_settings::has_ai_api_key,
-            commands::ai_settings::test_ai_connection,
-            commands::ai_settings::check_claude_cli_auth,
-            commands::ai_settings::check_accounts_usage,
-            commands::ai_settings::get_claude_accounts,
-            commands::ai_settings::switch_claude_account,
-            commands::ai_settings::refresh_claude_cli_auth,
-            commands::ai_settings::get_agentic_settings,
-            commands::ai_settings::save_agentic_settings,
-            // World State Verifier settings commands
-            commands::ai_settings::get_wsv_settings,
-            commands::ai_settings::save_wsv_settings,
-            commands::ai_settings::test_wsv_connection,
-            commands::ai_settings::list_wsv_disagreements,
-            // AI provider circuit breaker commands
-            commands::ai_settings::get_provider_circuit_states,
-            commands::ai_settings::reset_provider_circuit,
-            // Accessibility commands
-            commands::accessibility::get_accessibility_settings,
-            commands::accessibility::save_accessibility_settings,
-            commands::accessibility::launch_chrome_debug,
-            commands::accessibility::check_chrome_available,
-            // Native accessibility API commands
-            commands::accessibility::a11y_connect,
-            commands::accessibility::a11y_capture,
-            commands::accessibility::a11y_query,
-            commands::accessibility::a11y_click,
-            commands::accessibility::a11y_type_text,
-            commands::accessibility::a11y_focus,
-            commands::accessibility::a11y_ai_context,
-            commands::accessibility::a11y_disconnect,
-            // Playwright settings commands
-            commands::playwright_settings::get_playwright_settings,
-            commands::playwright_settings::save_playwright_settings,
-            commands::playwright_settings::has_playwright_test_password,
-            commands::playwright_settings::delete_playwright_test_password,
-            // Self-healing settings commands
-            commands::self_healing_settings::get_self_healing_settings,
-            commands::self_healing_settings::save_self_healing_settings,
-            commands::self_healing_settings::save_self_healing_api_key,
-            commands::self_healing_settings::delete_self_healing_api_key,
-            commands::self_healing_settings::has_self_healing_api_key,
-            // Execution variables settings commands
-            commands::execution_variables::get_execution_variables_settings,
-            commands::execution_variables::save_execution_variables_settings,
-            commands::execution_variables::get_resolved_execution_context,
-            commands::execution_variables::test_env_var,
             // NOTE: issues handlers moved to per-module plugin (see .plugin() calls above).
             // Unified execution reporting commands
             commands::execution_reporting::create_execution_run,
@@ -1038,12 +994,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::mobile::create_mobile_log,
             commands::mobile::capture_mobile_feedback,
             commands::mobile::delete_mobile_data,
-            // Mobile settings commands
-            commands::mobile_settings::get_mobile_settings,
-            commands::mobile_settings::save_mobile_settings,
-            // OpenTelemetry settings commands
-            commands::otel_settings::get_otel_settings,
-            commands::otel_settings::update_otel_settings,
             // Global log source management commands
             commands::global_log_sources::get_global_log_sources,
             commands::global_log_sources::save_global_log_sources,
@@ -1306,20 +1256,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::watchers::delete_watcher,
             commands::watchers::set_watcher_enabled,
             // NOTE: container_settings handlers moved to per-module plugin (see .plugin() calls above).
-            // Security settings commands (sandbox policies, profiles)
-            commands::security_settings::get_security_settings,
-            commands::security_settings::update_security_settings,
-            commands::security_settings::get_security_profiles,
             // Cost dashboard commands (unified token/cache/budget overview)
             commands::cost_dashboard::get_cost_dashboard,
             commands::cost_dashboard::get_active_budget_status,
             // NOTE: window_manager handlers moved to per-module plugin (see .plugin() calls above).
-            // Web-integration settings commands (Phase 3G: runner↔web toggle)
-            commands::web_integration::get_web_integration_status,
-            commands::web_integration::save_web_integration_settings,
-            commands::web_integration::test_web_integration_connection,
-            // Browser-login one-click token flow (Phase 3G-web-polish)
-            commands::web_integration::start_web_token_flow,
             // Runner UI error reporting (Phase 3J.1/3J.2)
             ui_error::report_ui_error,
             ui_error::clear_ui_error,

@@ -1,5 +1,7 @@
 //! Tauri commands for security settings management.
 
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -56,4 +58,15 @@ pub async fn update_security_settings(config: SecuritySettings) -> Result<Comman
 #[tauri::command]
 pub async fn get_security_profiles() -> Result<Vec<ProfileSummary>, String> {
     Ok(profiles::list_profiles())
+}
+
+/// Tauri plugin exposing all security-settings commands.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_security_settings")
+        .invoke_handler(tauri::generate_handler![
+            get_security_settings,
+            update_security_settings,
+            get_security_profiles,
+        ])
+        .build()
 }

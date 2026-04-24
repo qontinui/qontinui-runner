@@ -6,6 +6,8 @@
 
 use crate::otel::OtelConfig;
 use crate::settings;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -70,4 +72,14 @@ pub fn update_otel_settings(config: OtelConfig) -> Result<CommandResponse, Strin
                 .map_err(|e| format!("Failed to serialize OTel settings: {}", e))?,
         ),
     })
+}
+
+/// Tauri plugin exposing all OpenTelemetry settings commands.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_otel_settings")
+        .invoke_handler(tauri::generate_handler![
+            get_otel_settings,
+            update_otel_settings,
+        ])
+        .build()
 }

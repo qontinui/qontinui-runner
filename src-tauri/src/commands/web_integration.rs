@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::{AppHandle, Emitter, Runtime, State};
 use tracing::{info, warn};
 
 use crate::commands::AppState;
@@ -153,9 +154,9 @@ pub async fn get_web_integration_status(
 ///
 /// Safe to call with `settings` equal to the currently-persisted values:
 /// the no-op short-circuit preserves idempotency.
-pub async fn apply_web_integration_settings(
+pub async fn apply_web_integration_settings<R: Runtime>(
     app_state: &AppState,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
     settings: WebIntegrationSettings,
 ) -> Result<(), String> {
     let normalized = normalize_for_compare(&settings);
@@ -253,9 +254,9 @@ pub async fn apply_web_integration_settings(
 /// Emits [`WEB_INTEGRATION_CHANGED_EVENT`] on success so live status views
 /// can refresh.
 #[tauri::command]
-pub async fn save_web_integration_settings(
+pub async fn save_web_integration_settings<R: Runtime>(
     app_state: State<'_, Arc<AppState>>,
-    app_handle: AppHandle,
+    app_handle: AppHandle<R>,
     enabled: bool,
     backend_url: String,
     runner_token: String,
@@ -493,9 +494,9 @@ fn get_hostname_for_browser() -> String {
 /// - `backend_url` is empty and no backend is persisted in settings.
 /// - `open::that` fails to launch the browser (e.g. no default handler).
 #[tauri::command]
-pub async fn start_web_token_flow(
+pub async fn start_web_token_flow<R: Runtime>(
     app_state: State<'_, Arc<AppState>>,
-    app_handle: AppHandle,
+    app_handle: AppHandle<R>,
     backend_url: Option<String>,
 ) -> Result<(), String> {
     // Resolve effective backend URL.
@@ -595,6 +596,18 @@ pub async fn start_web_token_flow(
     open::that(&web_url).map_err(|e| format!("failed to open browser: {}", e))?;
 
     Ok(())
+}
+
+/// Tauri plugin exposing all web-integration commands.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_web_integration")
+        .invoke_handler(tauri::generate_handler![
+            get_web_integration_status,
+            save_web_integration_settings,
+            test_web_integration_connection,
+            start_web_token_flow,
+        ])
+        .build()
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,8 @@ use crate::settings::{
     self, AuthSource, CustomVariable, ExecutionVariablesSettings, VariableSource,
 };
 use serde::{Deserialize, Serialize};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::info;
 
 use super::CommandResponse;
@@ -251,4 +253,16 @@ pub fn test_env_var(env_var: String) -> Result<CommandResponse, String> {
             "exists": exists
         })),
     })
+}
+
+/// Tauri plugin exposing all execution-variables commands.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_execution_variables")
+        .invoke_handler(tauri::generate_handler![
+            get_execution_variables_settings,
+            save_execution_variables_settings,
+            get_resolved_execution_context,
+            test_env_var,
+        ])
+        .build()
 }
