@@ -6,7 +6,6 @@
 
 #![allow(dead_code)]
 
-use crate::commands::AppState;
 use crate::settings::{
     self, GlobalLogSource, GlobalLogSourceProfile, GlobalLogSourceSettings,
     LogSourceAiSelectionMode, LogSourceCategory,
@@ -15,14 +14,18 @@ use chrono::Utc;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::compartments::HealthCompartment;
 use super::CommandResponse;
+
+// Migrated to HealthCompartment (Workstream C).
+// Only find_log_sources_with_ai consumes AppState (doctor_handle); all other
+// handlers are State-free.
 
 // ============================================================================
 // Source Management Commands
@@ -1101,7 +1104,7 @@ pub struct AiSuggestedLogSource {
 pub async fn find_log_sources_with_ai(
     application_name: String,
     project_directory: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    state: State<'_, HealthCompartment>,
 ) -> Result<CommandResponse, String> {
     use crate::ai_provider;
     use std::path::Path;
@@ -1213,7 +1216,7 @@ pub async fn find_log_sources_with_ai(
         os_info
     );
 
-    let doctor_handle = state.doctor_handle.lock().await.clone();
+    let doctor_handle = state.doctor_handle().lock().await.clone();
     let response = ai_provider::run_prompt_sync(&prompt, doctor_handle.as_ref());
 
     if !response.success {

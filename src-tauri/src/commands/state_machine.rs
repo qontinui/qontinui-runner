@@ -7,6 +7,7 @@
 //! - Getting available transitions
 //! - Action log viewing and management
 
+use crate::commands::compartments::StorageCompartment;
 use crate::executor::{require_running_bridge, with_default_bridge};
 use crate::safe_eprintln;
 use std::sync::Arc;
@@ -217,13 +218,13 @@ pub async fn get_available_transitions(
 /// * `Err(String)` - Error message if view cannot be retrieved
 #[tauri::command]
 pub async fn get_action_log_view(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     safe_eprintln!("[DEBUG] get_action_log_view called");
     info!("Getting action log view");
 
     safe_eprintln!("[DEBUG] Acquiring display_processor lock...");
-    let processor = state.display_processor.lock().await;
+    let processor = storage.display_processor().lock().await;
     safe_eprintln!("[DEBUG] Got display_processor lock");
 
     safe_eprintln!("[DEBUG] Calling processor.get_view(\"action_log\")...");
@@ -254,10 +255,12 @@ pub async fn get_action_log_view(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error message if clear fails
 #[tauri::command]
-pub async fn clear_action_log(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn clear_action_log(
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, String> {
     info!("Clearing action log");
 
-    let mut processor = state.display_processor.lock().await;
+    let mut processor = storage.display_processor().lock().await;
     processor.clear_events();
 
     info!("Action log cleared successfully");
