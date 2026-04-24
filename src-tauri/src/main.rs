@@ -514,6 +514,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::backup::plugin())
         .plugin(commands::checkpoint_browser::plugin())
         .plugin(commands::config::plugin())
+        .plugin(commands::context::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -736,18 +737,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::tiered_info::get_ai_session_history,
             commands::tiered_info::delete_ai_session,
             // NOTE: discoveries handlers moved to per-module plugin (see .plugin() calls above).
-            // Context commands (AI knowledge snippets)
-            commands::context::get_all_contexts,
-            commands::context::get_context,
-            commands::context::create_context,
-            commands::context::update_context,
-            commands::context::delete_context,
-            commands::context::search_contexts,
-            commands::context::get_context_categories,
-            commands::context::set_context_enabled,
-            commands::context::record_context_usage,
-            commands::context::get_builtin_contexts_cmd,
-            commands::context::evaluate_auto_include,
+            // NOTE: context handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: ai_data handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: recap handlers moved to per-module plugin (see .plugin() calls above).
             // Task Sync commands (sync to qontinui-web)
