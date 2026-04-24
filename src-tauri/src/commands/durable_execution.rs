@@ -6,6 +6,8 @@ use crate::unified_workflow_executor::compensation::CompensationManager;
 use crate::unified_workflow_executor::replay::{ReplayManager, ReplayTarget};
 use crate::unified_workflow_executor::types::ReplayPoint;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 /// Resolve the working directory for a task run by checking:
@@ -178,4 +180,18 @@ pub async fn get_phase_results(
 ) -> Result<Vec<crate::unified_workflow_executor::types::PhaseResult>, String> {
     let parent_id = crate::unified_workflow_executor::types::get_parent_task_id(&execution_id);
     app_state.pg_db.get_phase_results(&parent_id).await
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_durable_execution")
+        .invoke_handler(tauri::generate_handler![
+            list_replay_points,
+            replay_workflow,
+            rollback_workflow_to_iteration,
+            get_iteration_diffs,
+            get_iteration_commits,
+            get_phase_results,
+        ])
+        .build()
 }
