@@ -29,6 +29,7 @@ pub mod misc;
 pub mod network;
 pub mod page;
 pub mod request;
+pub mod routing;
 pub mod screenshots;
 pub mod state_machine;
 pub mod stubs;
@@ -454,6 +455,22 @@ mod manifest_drift_tests {
             for m in method_re.captures_iter(scan) {
                 source_routes.insert((m[1].to_uppercase(), path.clone()));
             }
+        }
+
+        // `add_dual!(router, <method>, "<tail>", <handler>)` registers the
+        // same handler at both `/ui-bridge/control/<tail>` and
+        // `/ui-bridge/ai/<tail>`. Synthesise those two source routes here
+        // so the drift test sees them even though the literal strings
+        // never appear in the source.
+        let add_dual_re = regex::Regex::new(
+            r#"add_dual!\s*\(\s*[^,]+,\s*(get|post|put|delete|patch)\s*,\s*"([^"]+)""#,
+        )
+        .unwrap();
+        for cap in add_dual_re.captures_iter(&src) {
+            let method = cap[1].to_uppercase();
+            let tail = &cap[2];
+            source_routes.insert((method.clone(), format!("/ui-bridge/control/{}", tail)));
+            source_routes.insert((method, format!("/ui-bridge/ai/{}", tail)));
         }
 
         let manifest_routes: HashSet<(String, String)> = route_manifest()
