@@ -2,20 +2,21 @@
 //!
 //! Thin wrappers that delegate to the HTTP API comparison_api module's
 //! database operations, providing frontend access via `invoke()`.
-
-use std::sync::Arc;
+//!
+//! Migrated to StorageCompartment + HealthCompartment (Workstream C).
 
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 
-use crate::commands::AppState;
+use crate::commands::compartments::{HealthCompartment, StorageCompartment};
 use crate::mcp::comparison_api::ComparisonEntryJson;
 
 /// Start a comparison run. Returns the comparison_id.
 #[tauri::command]
 pub async fn start_comparison(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
+    health: State<'_, HealthCompartment>,
     workflow_id: String,
     variation_type: String,
     use_worktree: Option<bool>,
@@ -78,15 +79,15 @@ pub async fn start_comparison(
     let ejs = entries_json.clone();
     let now_c = now.clone();
 
-    app_state
-        .pg_db
+    storage
+        .pg_db()
         .insert_comparison(&cid, &wid, &vtype, &ejs)
         .await?;
 
     // Launch runs via local HTTP API in background
-    let pg_db_for_spawn = app_state.pg_db.clone();
-    let api_port = app_state
-        .api_port
+    let pg_db_for_spawn = storage.pg_db().clone();
+    let api_port = health
+        .api_port()
         .load(std::sync::atomic::Ordering::Relaxed);
     let comp_id = comparison_id.clone();
 
@@ -146,11 +147,11 @@ pub async fn start_comparison(
 /// Get status of a comparison run, enriching entries with live task_run data.
 #[tauri::command]
 pub async fn get_comparison_status(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     comparison_id: String,
 ) -> Result<serde_json::Value, String> {
-    let cmp_json = app_state
-        .pg_db
+    let cmp_json = storage
+        .pg_db()
         .get_comparison(&comparison_id)
         .await?
         .ok_or_else(|| format!("Comparison not found: {}", comparison_id))?;
@@ -177,7 +178,7 @@ pub async fn get_comparison_status(
     let mut all_done = true;
     for entry in entries.iter_mut() {
         if let Some(ref trid) = entry.task_run_id {
-            if let Ok(Some(task_run)) = app_state.pg_db.get_task_run(trid).await {
+            if let Ok(Some(task_run)) = storage.pg_db().get_task_run(trid).await {
                 match task_run.status.as_str() {
                     "complete" => {
                         entry.status = "completed".to_string();
@@ -219,7 +220,7 @@ pub async fn get_comparison_status(
     // Auto-complete if all done
     let final_status = if all_done && status == "running" {
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = app_state.pg_db.complete_comparison(&id, &entries_str).await;
+        let _ = storage.pg_db().complete_comparison(&id, &entries_str).await;
         "completed".to_string()
     } else {
         status
@@ -240,9 +241,9 @@ pub async fn get_comparison_status(
 /// List recent comparison runs.
 #[tauri::command]
 pub async fn list_comparisons(
-    app_state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    app_state.pg_db.list_comparisons().await
+    storage.pg_db().list_comparisons().await
 }
 
 fn calculate_duration(created_at: &str, completed_at: Option<&str>) -> u64 {
