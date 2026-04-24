@@ -10,14 +10,13 @@
 //! - Category and tag-based organization
 //! - Integration with task runs for audit logging
 
-use crate::commands::compartments::{ExecutionCompartment, StorageCompartment};
-use crate::commands::{AppState, CommandResponse};
+use crate::commands::compartments::{BridgeCompartment, ExecutionCompartment, StorageCompartment};
+use crate::commands::CommandResponse;
 use crate::error::AppError;
-use crate::executor::with_default_bridge;
+use crate::executor::with_default_bridge_compartment;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Instant;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -25,8 +24,8 @@ use tauri::State;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
-// Migrated to StorageCompartment + ExecutionCompartment (Workstream C).
-// generate_shell_command_with_ai retains Arc<AppState> for with_default_bridge.
+// Fully migrated to compartment state (Workstream C):
+// Storage + Execution + Bridge compartments as needed per handler.
 
 // ============================================================================
 // Request/Response Types
@@ -780,7 +779,7 @@ pub struct GenerateShellCommandResponse {
 #[tauri::command]
 pub async fn generate_shell_command_with_ai(
     input: GenerateShellCommandInput,
-    state: State<'_, Arc<AppState>>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
 
@@ -853,7 +852,7 @@ pub async fn generate_shell_command_with_ai(
     };
 
     // Clone state for use in spawn_blocking
-    let app_state = state.inner().clone();
+    let bridge_compartment = bridge.inner().clone();
 
     let target_os = input.target_os.unwrap_or_else(|| "windows".to_string());
     let category = input.category.unwrap_or_else(|| "general".to_string());
@@ -861,7 +860,7 @@ pub async fn generate_shell_command_with_ai(
 
     // Execute via spawn_blocking since with_default_bridge uses block_on internally
     let result = tokio::task::spawn_blocking(move || {
-        with_default_bridge(&app_state, |bridge| {
+        with_default_bridge_compartment(&bridge_compartment, |bridge| {
             let params = serde_json::json!({
                 "user_prompt": user_prompt,
                 "target_os": target_os,
