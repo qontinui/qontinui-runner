@@ -165,41 +165,19 @@ pub use types::{
     UiBridgeError, UiBridgeErrorCode,
 };
 
+// Imports kept in scope for the `ipc_handler_*!` macro expansions declared
+// below. Each macro invocation in a submodule imports the macro via
+// `use super::ipc_handler_*;`, and the expanded code references these
+// names at the call site — but the macros are also defined here so the
+// names must resolve at *definition* scope for rustc to parse them.
 use axum::{
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::State,
+    http::StatusCode,
     response::Json,
 };
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Instant;
-use tracing::{debug, error, info, warn};
 
-use tauri::Emitter;
-
-use crate::executor::with_default_bridge;
-use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
-use crate::screen;
-
-// Internal re-imports for inline handlers that still live in this file.
-// `request::get_ui_bridge_timeout_ms` and `request::wrap_ipc_result` are
-// `pub(super)` helpers the inline handlers depend on.
-use request::{gather_readiness_diagnostics, get_ui_bridge_timeout_ms, wrap_ipc_result};
-
-// Shared helpers (JS evaluation, snapshot diffing, response extractors)
-// live in `helpers.rs` so per-family handler extractions can pull them in
-// without dragging the rest of `mod.rs` along.
-use helpers::{
-    compute_snapshot_diff, count_elements_in_discover_payload, direct_webview_evaluate_with_result,
-    evaluate_js_expression, extract_ai_find_match, extract_first_element_id,
-    extract_get_element_match, filter_element_fields, glob_match, safe_evaluate,
-    snapshot_signature,
-};
-
-/// Maximum age of the last-discovered cache served to callers, in seconds.
-/// Past this age the endpoint reports the entry as stale but still returns
-/// it (callers can decide what to do based on `age_ms`).
-const LAST_DISCOVERED_FRESH_SECS: u64 = 60;
+use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // Undo/redo, specs, component-state, scroll, performance-entries,
 // annotations-import, debug element-tree/highlight, navigate-tab, and
@@ -337,6 +315,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(local_route_entries());
         all.extend_from_slice(ai::route_entries());
         all.extend_from_slice(ai_analyze::route_entries());
+        all.extend_from_slice(analytics::route_entries());
         all.extend_from_slice(bookmarks::route_entries());
         all.extend_from_slice(capabilities::route_entries());
         all.extend_from_slice(design::route_entries());
@@ -345,6 +324,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(errors::route_entries());
         all.extend_from_slice(exploration::route_entries());
         all.extend_from_slice(forms::route_entries());
+        all.extend_from_slice(history::route_entries());
         all.extend_from_slice(intents::route_entries());
         all.extend_from_slice(intents_registry::route_entries());
         all.extend_from_slice(misc::route_entries());
@@ -362,23 +342,6 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
 /// `route_manifest()` above; do not list those entries here.
 fn local_route_entries() -> &'static [(&'static str, &'static str)] {
     &[
-        // Persisted interaction history (cross-run analysis)
-        ("GET", "/ui-bridge/history/elements"),
-        ("GET", "/ui-bridge/history/element/{id}"),
-        ("GET", "/ui-bridge/history/flaky"),
-        ("GET", "/ui-bridge/graph/element-reliability"),
-        // Analytics
-        ("GET", "/ui-bridge/analytics/decay-curve"),
-        ("GET", "/ui-bridge/analytics/action-baselines"),
-        ("GET", "/ui-bridge/analytics/failure-taxonomy"),
-        ("GET", "/ui-bridge/analytics/fragility-heatmap"),
-        ("GET", "/ui-bridge/analytics/regressions"),
-        ("GET", "/ui-bridge/analytics/stall-frequency"),
-        ("GET", "/ui-bridge/analytics/intervention-effectiveness"),
-        ("GET", "/ui-bridge/analytics/state-coverage"),
-        ("GET", "/ui-bridge/analytics/annotation-gaps"),
-        ("GET", "/ui-bridge/analytics/health-score"),
-        ("GET", "/ui-bridge/analytics/recommendations"),
         // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy
         ("GET", "/ui-bridge/commands"),
         ("POST", "/ui-bridge/invoke/{command_name}"),
@@ -449,68 +412,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // Element-screenshot routes live in `screenshots::routes()`.
         // Component state, page scroll, performance entries, annotations
         // import, and debug routes (extracted to misc.rs) merged below.
-        // Persisted interaction history (cross-run analysis)
-        .route(
-            "/ui-bridge/history/elements",
-            get(ui_bridge_history_elements_handler),
-        )
-        .route(
-            "/ui-bridge/history/element/{id}",
-            get(ui_bridge_history_element_handler),
-        )
-        .route(
-            "/ui-bridge/history/flaky",
-            get(ui_bridge_history_flaky_handler),
-        )
-        .route(
-            "/ui-bridge/graph/element-reliability",
-            get(ui_bridge_element_reliability_handler),
-        )
-        // Analytics endpoints (Phase 1 + 2)
-        .route(
-            "/ui-bridge/analytics/decay-curve",
-            get(analytics_decay_curve_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/action-baselines",
-            get(analytics_action_baselines_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/failure-taxonomy",
-            get(analytics_failure_taxonomy_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/fragility-heatmap",
-            get(analytics_fragility_heatmap_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/regressions",
-            get(analytics_regressions_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/stall-frequency",
-            get(analytics_stall_frequency_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/intervention-effectiveness",
-            get(analytics_intervention_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/state-coverage",
-            get(analytics_state_coverage_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/annotation-gaps",
-            get(analytics_annotation_gaps_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/health-score",
-            get(analytics_health_score_handler),
-        )
-        .route(
-            "/ui-bridge/analytics/recommendations",
-            get(analytics_recommendations_handler),
-        )
+        // Persisted interaction history + analytics (extracted to
+        // history.rs / analytics.rs) merged below.
         // Runner-specific navigate-tab + clear-storage (extracted to misc.rs).
         // Bookmark, change-tracking and with-diff handlers (extracted to bookmarks.rs)
         .merge(bookmarks::routes())
@@ -544,6 +447,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // annotations-import, debug, navigate-tab, clear-storage
         // (extracted to misc.rs)
         .merge(misc::routes())
+        // Persisted interaction history (cross-run analysis) — history.rs
+        .merge(history::routes())
+        // Analytics endpoints — analytics.rs
+        .merge(analytics::routes())
         // UI Bridge exploration + window listing (extracted to exploration.rs)
         .merge(exploration::routes())
         // Page navigation / evaluation / tab switching (extracted to page.rs)

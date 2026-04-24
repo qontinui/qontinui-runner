@@ -282,3 +282,68 @@ pub async fn analytics_recommendations_handler(
         .collect();
     Ok(Json(ApiResponse::success(typed)))
 }
+
+pub fn routes() -> axum::Router<Arc<ApiState>> {
+    use axum::routing::get;
+    axum::Router::new()
+        .route(
+            "/ui-bridge/analytics/decay-curve",
+            get(analytics_decay_curve_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/action-baselines",
+            get(analytics_action_baselines_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/failure-taxonomy",
+            get(analytics_failure_taxonomy_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/fragility-heatmap",
+            get(analytics_fragility_heatmap_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/regressions",
+            get(analytics_regressions_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/stall-frequency",
+            get(analytics_stall_frequency_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/intervention-effectiveness",
+            get(analytics_intervention_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/state-coverage",
+            get(analytics_state_coverage_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/annotation-gaps",
+            get(analytics_annotation_gaps_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/health-score",
+            get(analytics_health_score_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/recommendations",
+            get(analytics_recommendations_handler),
+        )
+}
+
+pub fn route_entries() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("GET", "/ui-bridge/analytics/decay-curve"),
+        ("GET", "/ui-bridge/analytics/action-baselines"),
+        ("GET", "/ui-bridge/analytics/failure-taxonomy"),
+        ("GET", "/ui-bridge/analytics/fragility-heatmap"),
+        ("GET", "/ui-bridge/analytics/regressions"),
+        ("GET", "/ui-bridge/analytics/stall-frequency"),
+        ("GET", "/ui-bridge/analytics/intervention-effectiveness"),
+        ("GET", "/ui-bridge/analytics/state-coverage"),
+        ("GET", "/ui-bridge/analytics/annotation-gaps"),
+        ("GET", "/ui-bridge/analytics/health-score"),
+        ("GET", "/ui-bridge/analytics/recommendations"),
+    ]
+}

@@ -142,3 +142,33 @@ pub async fn ui_bridge_element_reliability_handler(
         }
     }
 }
+
+pub fn routes() -> axum::Router<Arc<ApiState>> {
+    use axum::routing::get;
+    axum::Router::new()
+        .route(
+            "/ui-bridge/history/elements",
+            get(ui_bridge_history_elements_handler),
+        )
+        .route(
+            "/ui-bridge/history/element/{id}",
+            get(ui_bridge_history_element_handler),
+        )
+        .route(
+            "/ui-bridge/history/flaky",
+            get(ui_bridge_history_flaky_handler),
+        )
+        .route(
+            "/ui-bridge/graph/element-reliability",
+            get(ui_bridge_element_reliability_handler),
+        )
+}
+
+pub fn route_entries() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("GET", "/ui-bridge/history/elements"),
+        ("GET", "/ui-bridge/history/element/{id}"),
+        ("GET", "/ui-bridge/history/flaky"),
+        ("GET", "/ui-bridge/graph/element-reliability"),
+    ]
+}
