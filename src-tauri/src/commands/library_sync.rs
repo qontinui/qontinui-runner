@@ -14,6 +14,8 @@ use crate::prompt_snippets;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
@@ -837,4 +839,19 @@ pub async fn sync_macros_to_backend() -> Result<LibrarySyncResult, String> {
 pub async fn sync_prompt_snippets_to_backend() -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
     Ok(service.sync_prompt_snippets().await)
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_library_sync")
+        .invoke_handler(tauri::generate_handler![
+            sync_library_to_backend,
+            sync_checks_to_backend,
+            sync_check_groups_to_backend,
+            sync_shell_commands_to_backend,
+            sync_api_requests_to_backend,
+            sync_contexts_to_backend,
+            sync_macros_to_backend,
+            sync_prompt_snippets_to_backend,
+        ])
+        .build()
 }

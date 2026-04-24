@@ -515,6 +515,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::checkpoint_browser::plugin())
         .plugin(commands::config::plugin())
         .plugin(commands::context::plugin())
+        .plugin(commands::library_sync::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -750,14 +751,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::task_sync::full_sync_ai_task,
             commands::task_sync::sync_all_pending_ai_tasks,
             // Library Sync commands (sync library items to qontinui-web)
-            commands::library_sync::sync_library_to_backend,
-            commands::library_sync::sync_checks_to_backend,
-            commands::library_sync::sync_check_groups_to_backend,
-            commands::library_sync::sync_shell_commands_to_backend,
-            commands::library_sync::sync_api_requests_to_backend,
-            commands::library_sync::sync_contexts_to_backend,
-            commands::library_sync::sync_macros_to_backend,
-            commands::library_sync::sync_prompt_snippets_to_backend,
+            // NOTE: library_sync handlers moved to per-module plugin (see .plugin() calls above).
             // Verification testing commands
             commands::testing::execute_verification_test,
             commands::testing::execute_verification_test_suite,
