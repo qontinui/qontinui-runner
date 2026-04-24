@@ -9,6 +9,8 @@ use crate::test_orchestrator::{
     TestOrchestrator,
 };
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -283,4 +285,19 @@ pub async fn delete_orchestration_plan(
         message: Some("Orchestration plan deleted".to_string()),
         data: None,
     })
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_test_orchestrator")
+        .invoke_handler(tauri::generate_handler![
+            plan_test_orchestration,
+            execute_test_orchestration,
+            generate_test_from_orchestration,
+            get_saved_requests_for_orchestration,
+            save_orchestration_plan,
+            list_orchestration_plans,
+            delete_orchestration_plan,
+        ])
+        .build()
 }
