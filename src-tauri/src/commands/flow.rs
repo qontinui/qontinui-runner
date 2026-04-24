@@ -7,18 +7,15 @@
 //! Uses PostgreSQL for persistence with in-memory storage for active
 //! executions.
 
-// Migrated to StorageCompartment (Workstream C) — ~28 of 32 handlers.
-// step/run/resume/step_into flow-execution handlers keep `Arc<AppState>`
-// because they read `doctor_handle` (HealthCompartment) alongside pg_db
-// and no single compartment covers both.
-use crate::commands::compartments::StorageCompartment;
-use crate::commands::AppState;
+// Fully migrated to compartment state (Workstream C).
+// step/run/resume/step_into flow-execution handlers use multi-State
+// (Storage + Health) since they read both pg_db and doctor_handle.
+use crate::commands::compartments::{HealthCompartment, StorageCompartment};
 use crate::orchestrator::flow::{Condition, Flow, FlowState, FlowStatus, FlowStep};
 use crate::orchestrator::flow_executor::{FlowEvent, FlowExecutor};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex as TokioMutex;
@@ -195,7 +192,8 @@ pub async fn start_flow_execution(
 /// before moving to the next one.
 #[tauri::command]
 pub async fn step_flow_execution(
-    app_state: State<'_, Arc<AppState>>,
+    storage_state: State<'_, StorageCompartment>,
+    health: State<'_, HealthCompartment>,
     app_handle: AppHandle,
     instance_id: String,
 ) -> Result<StepExecutionResult, String> {
@@ -226,7 +224,7 @@ pub async fn step_flow_execution(
     }
 
     // Extract doctor handle for health monitoring
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let doctor_handle = health.doctor_handle().lock().await.clone();
 
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
@@ -241,7 +239,7 @@ pub async fn step_flow_execution(
 
     // Persist updated state
     if let Ok(state_json) = serde_json::to_value(&*state) {
-        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
+        let _ = storage_state.pg_db().save_flow_execution(&state_json).await;
     }
 
     match result {
@@ -263,7 +261,8 @@ pub async fn step_flow_execution(
 /// a human input step is reached.
 #[tauri::command]
 pub async fn run_flow_execution(
-    app_state: State<'_, Arc<AppState>>,
+    storage_state: State<'_, StorageCompartment>,
+    health: State<'_, HealthCompartment>,
     app_handle: AppHandle,
     instance_id: String,
 ) -> Result<FlowExecutionResult, String> {
@@ -298,7 +297,7 @@ pub async fn run_flow_execution(
     }
 
     // Extract doctor handle for health monitoring
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let doctor_handle = health.doctor_handle().lock().await.clone();
 
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
@@ -321,7 +320,7 @@ pub async fn run_flow_execution(
 
     // Persist final state
     if let Ok(state_json) = serde_json::to_value(&state) {
-        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
+        let _ = storage_state.pg_db().save_flow_execution(&state_json).await;
     }
 
     // Record learning outcome + agentic metrics for this flow execution
@@ -797,7 +796,8 @@ pub async fn pause_flow_execution(
 /// Continues execution from where it was paused.
 #[tauri::command]
 pub async fn resume_flow_execution(
-    app_state: State<'_, Arc<AppState>>,
+    storage_state: State<'_, StorageCompartment>,
+    health: State<'_, HealthCompartment>,
     app_handle: AppHandle,
     instance_id: String,
 ) -> Result<bool, String> {
@@ -840,7 +840,7 @@ pub async fn resume_flow_execution(
     );
 
     // Extract doctor handle for health monitoring
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let doctor_handle = health.doctor_handle().lock().await.clone();
 
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
@@ -863,7 +863,7 @@ pub async fn resume_flow_execution(
 
     // Persist final state
     if let Ok(state_json) = serde_json::to_value(&state) {
-        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
+        let _ = storage_state.pg_db().save_flow_execution(&state_json).await;
     }
 
     match result {
@@ -888,7 +888,8 @@ pub async fn resume_flow_execution(
 /// Step into a paused flow (execute one step and pause again).
 #[tauri::command]
 pub async fn step_into_flow(
-    app_state: State<'_, Arc<AppState>>,
+    storage_state: State<'_, StorageCompartment>,
+    health: State<'_, HealthCompartment>,
     app_handle: AppHandle,
     instance_id: String,
 ) -> Result<StepExecutionResult, String> {
@@ -918,7 +919,7 @@ pub async fn step_into_flow(
     state.status = FlowStatus::Running;
 
     // Extract doctor handle for health monitoring
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let doctor_handle = health.doctor_handle().lock().await.clone();
 
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
@@ -938,7 +939,7 @@ pub async fn step_into_flow(
 
     // Persist updated state
     if let Ok(state_json) = serde_json::to_value(&*state) {
-        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
+        let _ = storage_state.pg_db().save_flow_execution(&state_json).await;
     }
 
     match result {
