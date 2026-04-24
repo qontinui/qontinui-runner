@@ -6,6 +6,8 @@
 
 use crate::auth::AuthManager;
 use serde::{Deserialize, Serialize};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tracing::{info, warn};
 
 use crate::api_config::get_api_base_url;
@@ -316,4 +318,13 @@ fn truncate(s: &str, max_len: usize) -> &str {
         }
         &s[..end]
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_workflow_events")
+        .invoke_handler(tauri::generate_handler![
+            emit_workflow_event,
+        ])
+        .build()
 }
