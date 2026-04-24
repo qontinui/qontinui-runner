@@ -11,14 +11,14 @@
 //! - Mobile state persistence in SQLite
 //! - Integration with task runs for AI context
 
-use crate::commands::{AppState, CommandResponse};
+use crate::commands::compartments::StorageCompartment;
+use crate::commands::CommandResponse;
 use crate::database::{CreateMobileLogInput, CreateMobileStateInput};
 use crate::settings;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -213,7 +213,7 @@ async fn run_adb_command(args: &[&str]) -> Result<String, String> {
 /// Returns a list of connected devices with their IDs, types, and states.
 #[tauri::command]
 pub async fn list_mobile_devices(
-    _state: State<'_, Arc<AppState>>,
+    _storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Listing connected mobile devices");
 
@@ -290,7 +290,7 @@ pub async fn capture_mobile_screenshot(
     task_run_id: Option<String>,
     device_id: Option<String>,
     output_dir: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Capturing mobile screenshot (task_run_id: {:?}, device_id: {:?})",
@@ -367,7 +367,7 @@ pub async fn capture_mobile_screenshot(
             error_summary: None,
         };
 
-        if let Err(e) = state.pg_db.create_mobile_state(&input).await {
+        if let Err(e) = storage.pg_db().create_mobile_state(&input).await {
             warn!("Failed to save mobile state to PG: {}", e);
         }
     }
@@ -408,7 +408,7 @@ pub async fn capture_mobile_logcat(
     lines: Option<u32>,
     filter_app: Option<bool>,
     output_dir: Option<String>,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Capturing mobile logcat (task_run_id: {:?}, device_id: {:?}, lines: {:?})",
@@ -492,7 +492,7 @@ pub async fn capture_mobile_logcat(
                         device_timestamp: None,
                     };
 
-                    if let Err(e) = state.pg_db.create_mobile_log(&input).await {
+                    if let Err(e) = storage.pg_db().create_mobile_log(&input).await {
                         debug!("Failed to save mobile log to PG: {}", e);
                     }
                 }
@@ -561,12 +561,12 @@ fn parse_logcat_line(line: &str) -> Option<(String, String, String)> {
 pub async fn get_mobile_states(
     task_run_id: String,
     limit: Option<u32>,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting mobile states for task run: {}", task_run_id);
 
-    let states = state
-        .pg_db
+    let states = storage
+        .pg_db()
         .get_mobile_states(&task_run_id, limit)
         .await
         .map_err(|e| format!("Failed to get mobile states: {}", e))?;
@@ -588,12 +588,12 @@ pub async fn get_mobile_states(
 #[tauri::command]
 pub async fn get_latest_mobile_state(
     task_run_id: String,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting latest mobile state for task run: {}", task_run_id);
 
-    let mobile_state = state
-        .pg_db
+    let mobile_state = storage
+        .pg_db()
         .get_latest_mobile_state(&task_run_id)
         .await
         .map_err(|e| format!("Failed to get mobile state: {}", e))?;
@@ -618,7 +618,7 @@ pub async fn get_latest_mobile_state(
 #[tauri::command]
 pub async fn create_mobile_state(
     input: CreateMobileStateRequest,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Creating mobile state for task run: {}", input.task_run_id);
 
@@ -640,8 +640,8 @@ pub async fn create_mobile_state(
         error_summary: input.error_summary,
     };
 
-    let mobile_state = state
-        .pg_db
+    let mobile_state = storage
+        .pg_db()
         .create_mobile_state(&db_input)
         .await
         .map_err(|e| format!("Failed to create mobile state: {}", e))?;
@@ -673,15 +673,15 @@ pub async fn get_mobile_logs(
     log_source: Option<String>,
     errors_only: Option<bool>,
     limit: Option<u32>,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Getting mobile logs for task run: {} (source: {:?}, errors_only: {:?})",
         task_run_id, log_source, errors_only
     );
 
-    let logs = state
-        .pg_db
+    let logs = storage
+        .pg_db()
         .get_mobile_logs(
             &task_run_id,
             log_source.as_deref(),
@@ -709,12 +709,12 @@ pub async fn get_mobile_logs(
 pub async fn get_mobile_errors(
     task_run_id: String,
     limit: Option<u32>,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Getting mobile errors for task run: {}", task_run_id);
 
-    let errors = state
-        .pg_db
+    let errors = storage
+        .pg_db()
         .get_mobile_errors(&task_run_id, limit)
         .await
         .map_err(|e| format!("Failed to get mobile errors: {}", e))?;
@@ -736,7 +736,7 @@ pub async fn get_mobile_errors(
 #[tauri::command]
 pub async fn create_mobile_log(
     input: CreateMobileLogRequest,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Creating mobile log for task run: {} (source: {})",
@@ -761,8 +761,8 @@ pub async fn create_mobile_log(
         device_timestamp: input.device_timestamp,
     };
 
-    let log = state
-        .pg_db
+    let log = storage
+        .pg_db()
         .create_mobile_log(&db_input)
         .await
         .map_err(|e| format!("Failed to create mobile log: {}", e))?;
@@ -794,7 +794,7 @@ pub async fn capture_mobile_feedback(
     task_run_id: String,
     device_id: Option<String>,
     logcat_lines: Option<u32>,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Capturing mobile feedback for task run: {} (device: {:?})",
@@ -814,7 +814,7 @@ pub async fn capture_mobile_feedback(
         Some(task_run_id.clone()),
         Some(device.clone()),
         None,
-        state.clone(),
+        storage.clone(),
     )
     .await;
 
@@ -825,7 +825,7 @@ pub async fn capture_mobile_feedback(
         logcat_lines,
         Some(true), // Filter to app logs
         None,
-        state.clone(),
+        storage.clone(),
     )
     .await;
 
@@ -878,8 +878,8 @@ pub async fn capture_mobile_feedback(
         },
     };
 
-    let mobile_state = state
-        .pg_db
+    let mobile_state = storage
+        .pg_db()
         .create_mobile_state(&input)
         .await
         .map_err(|e| format!("Failed to create mobile state: {}", e))?;
@@ -904,12 +904,12 @@ pub async fn capture_mobile_feedback(
 #[tauri::command]
 pub async fn delete_mobile_data(
     task_run_id: String,
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
     info!("Deleting mobile data for task run: {}", task_run_id);
 
-    state
-        .pg_db
+    storage
+        .pg_db()
         .delete_mobile_data_for_task(&task_run_id)
         .await
         .map_err(|e| format!("Failed to delete mobile data: {}", e))?;
