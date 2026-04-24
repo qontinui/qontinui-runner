@@ -557,6 +557,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::ui_bridge::plugin())
         .plugin(commands::terminal::plugin())
         .plugin(commands::instances::plugin())
+        .plugin(commands::execution::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -574,32 +575,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Configuration commands
             // NOTE: config handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: dataset handlers moved to per-module plugin (see .plugin() calls above).
-            // Execution commands - python_executor
-            commands::execution::python_executor::start_python_executor,
-            commands::execution::python_executor::stop_python_executor,
-            commands::execution::python_executor::update_capture_settings,
-            // Execution commands - workflow_execution
-            commands::execution::workflow_execution::start_execution,
-            commands::execution::workflow_execution::stop_execution,
-            commands::execution::workflow_execution::pause_execution,
-            commands::execution::workflow_execution::resume_execution,
-            commands::execution::workflow_execution::get_resolved_initial_states,
-            commands::execution::workflow_execution::get_workflow_required_screens,
-            // Execution commands - bridge_execution
-            commands::execution::bridge_execution::run_workflow_on_bridge,
-            commands::execution::bridge_execution::transfer_gui_lock,
-            commands::execution::bridge_execution::list_bridges,
-            commands::execution::bridge_execution::get_bridge_info,
-            // Execution commands - executor_status
-            commands::execution::executor_status::get_executor_status,
-            commands::execution::executor_status::get_monitors,
-            commands::execution::executor_status::set_input_capture_enabled,
-            commands::execution::executor_status::get_input_validation_status,
-            // Execution commands - system_ops
-            commands::execution::system_ops::handle_error,
-            commands::execution::system_ops::check_for_updates,
-            commands::execution::system_ops::install_update,
-            commands::execution::system_ops::open_folder,
+            // NOTE: execution handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: state_machine handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: debug handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: websocket, video, interaction, storage handlers moved to per-module plugins (see .plugin() calls above).
