@@ -535,6 +535,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::global_log_sources::plugin())
         .plugin(commands::execution_reporting::plugin())
         .plugin(commands::workflow_events::plugin())
+        .plugin(commands::state_machine_configs::plugin())
+        .plugin(commands::spec_drift::plugin())
+        .plugin(commands::ui_bridge_baselines::plugin())
+        .plugin(commands::state_explorer::plugin())
+        .plugin(commands::tiered_info::plugin())
+        .plugin(commands::task_sync::plugin())
+        .plugin(commands::step_outputs::plugin())
+        .plugin(commands::testing::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -593,111 +601,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: execution_reporting, workflow_events handlers moved to per-module plugins (see .plugin() calls above).
             // NOTE: dag_workflows, checkpoints, findings, known_issues handlers moved to
             // per-module plugins (see .plugin() calls above).
-            // State Machine Config Builder commands (CRUD for configs, states, transitions)
-            commands::state_machine_configs::sm_list_configs,
-            commands::state_machine_configs::sm_get_config,
-            commands::state_machine_configs::sm_create_config,
-            commands::state_machine_configs::sm_update_config,
-            commands::state_machine_configs::sm_delete_config,
-            commands::state_machine_configs::sm_create_state,
-            commands::state_machine_configs::sm_update_state,
-            commands::state_machine_configs::sm_delete_state,
-            commands::state_machine_configs::sm_create_transition,
-            commands::state_machine_configs::sm_update_transition,
-            commands::state_machine_configs::sm_delete_transition,
-            commands::state_machine_configs::sm_import_config,
-            commands::state_machine_configs::sm_save_thumbnails,
-            commands::state_machine_configs::sm_get_thumbnails,
-            commands::state_machine_configs::sm_save_capture_screenshots,
-            commands::state_machine_configs::sm_get_capture_screenshots,
-            commands::state_machine_configs::sm_get_capture_screenshot_image,
-            commands::state_machine_configs::sm_move_pending_screenshots,
-            commands::state_machine_configs::sm_delete_capture_screenshots,
-            commands::state_machine_configs::sm_backfill_capture_screenshot_dimensions,
-            commands::state_machine_configs::sm_audit_capture_screenshot_bounds,
-            commands::state_machine_configs::sm_generate_static,
-            // Spec drift detection
-            commands::spec_drift::scan_spec_drift,
-            // UI Bridge Baseline commands (visual regression persistent store)
-            commands::ui_bridge_baselines::sm_save_baseline,
-            commands::ui_bridge_baselines::sm_get_baseline,
-            commands::ui_bridge_baselines::sm_list_baselines,
-            commands::ui_bridge_baselines::sm_delete_baseline,
-            // State Explorer commands
-            commands::state_explorer::start_exploration,
-            commands::state_explorer::get_exploration_strategies,
-            commands::state_explorer::preview_exploration_plan,
-            commands::state_explorer::get_exploration_history,
-            commands::state_explorer::get_exploration_report,
-            commands::state_explorer::get_exploration_analysis_prompt,
-            commands::state_explorer::clear_exploration_history,
-            // Tiered Information Model commands
-            commands::tiered_info::get_config_statistics,
-            commands::tiered_info::get_flaky_transitions,
-            commands::tiered_info::get_flaky_templates,
-            commands::tiered_info::get_debugging_context,
-            commands::tiered_info::get_debugging_context_prompt,
-            commands::tiered_info::get_run_details,
-            commands::tiered_info::get_recent_runs,
-            commands::tiered_info::get_failed_runs,
-            commands::tiered_info::record_run,
-            commands::tiered_info::cleanup_old_runs,
-            commands::tiered_info::get_execution_options,
-            commands::tiered_info::get_flakiness_summary,
-            // AI Session History commands (for Runs page)
-            commands::tiered_info::get_ai_session_history,
-            commands::tiered_info::delete_ai_session,
+            // NOTE: state_machine_configs, spec_drift, ui_bridge_baselines, state_explorer, tiered_info handlers moved to per-module plugins (see .plugin() calls above).
             // NOTE: discoveries handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: context handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: ai_data handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: recap handlers moved to per-module plugin (see .plugin() calls above).
-            // Task Sync commands (sync to qontinui-web)
-            commands::task_sync::sync_ai_task_created,
-            commands::task_sync::sync_ai_session_started,
-            commands::task_sync::sync_ai_session_ended,
-            commands::task_sync::sync_ai_findings,
-            commands::task_sync::sync_deferred_questions,
-            commands::task_sync::sync_ai_task_completed,
-            commands::task_sync::full_sync_ai_task,
-            commands::task_sync::sync_all_pending_ai_tasks,
+            // NOTE: task_sync handlers moved to per-module plugin (see .plugin() calls above).
             // Library Sync commands (sync library items to qontinui-web)
             // NOTE: library_sync handlers moved to per-module plugin (see .plugin() calls above).
-            // Verification testing commands
-            commands::testing::execute_verification_test,
-            commands::testing::execute_verification_test_suite,
-            commands::testing::get_test_type_info,
-            commands::testing::validate_test_definition,
-            // Verification test database CRUD commands
-            commands::testing::list_verification_tests,
-            commands::testing::get_verification_test,
-            commands::testing::create_verification_test,
-            commands::testing::update_verification_test,
-            commands::testing::delete_verification_test,
-            // Verification test execution with database integration
-            commands::testing::execute_test_by_id,
-            commands::testing::execute_tests_by_ids,
-            // Test result commands
-            commands::testing::get_test_results,
-            commands::testing::get_task_run_test_results,
-            // Test association commands
-            commands::testing::create_test_association,
-            commands::testing::get_config_test_associations,
-            commands::testing::delete_test_association,
-            // Test import/export commands
-            commands::testing::export_tests_to_file,
-            commands::testing::export_all_tests_to_file,
-            commands::testing::import_tests_from_file,
-            // Page analysis commands for AI test generation
-            commands::testing::analyze_page_playwright,
-            commands::testing::analyze_page_playwright_script,
-            commands::testing::analyze_page_vision,
-            // Step output collection commands (for test builder auto-population)
-            commands::step_outputs::collect_step_outputs,
-            commands::step_outputs::get_step_outputs_for_test_builder,
-            commands::testing::generate_test_with_ai,
-            commands::testing::generate_test_metadata,
-            commands::testing::list_recent_task_runs,
-            commands::testing::get_workflow_run_context,
+            // NOTE: testing, step_outputs handlers moved to per-module plugins (see .plugin() calls above).
             // NOTE: checks handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: screenshots handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: hooks handlers moved to per-module plugin (see .plugin() calls above).
