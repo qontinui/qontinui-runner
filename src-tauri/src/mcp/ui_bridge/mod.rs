@@ -26,6 +26,7 @@ pub mod network;
 pub mod page;
 pub mod request;
 pub mod screenshots;
+pub mod stubs;
 pub mod types;
 
 // Re-export all public symbols so every currently-used path like
@@ -279,99 +280,6 @@ pub async fn ui_bridge_get_spec_handler(
 // ============================================================================
 // Direct tab navigation moved to `page::routes()` — see `page.rs`.
 // ============================================================================
-#[cfg(any())]
-const _REMOVED_TAB_LIST: &[&str] = &[
-    // Superseded block below (kept inside cfg(any()) so it never compiles).
-    "error-monitor",
-    "processes",
-    "reflection",
-    "observations",
-    "architecture",
-    "generator-eval",
-    "meta-optimizer",
-    "run-recap",
-    "run-actions",
-    "run-image",
-    "run-findings",
-    "run-state-explorer",
-    "run-tests",
-    "run-ai-output",
-    "run-statistics",
-    "run-ai-data",
-    "run-traces",
-    "ai",
-    "logs",
-    "run-summary",
-    "monitor-summary",
-    "monitor-findings",
-    "monitor-issues",
-    "monitor-learnings",
-    "monitor-state-explorer",
-    "monitor-statistics",
-    "monitor-discoveries",
-    "library",
-    "step-builders",
-    "check-builder",
-    "check-group-builder",
-    "shell-command-builder",
-    "task-builder",
-    "context-builder",
-    "playwright-test-builder",
-    "unified-workflow-builder",
-    "state-machine",
-    "specs",
-    "capture",
-    "config-log-sources",
-    "config-findings",
-    "config-hooks",
-    "config-ui-bridge",
-    "triggers",
-    "tasks",
-    "settings",
-    "settings-account",
-    "settings-ai",
-    "settings-agentic",
-    "settings-self-healing",
-    "settings-world-state-verifier",
-    "settings-playwright",
-    "settings-mobile",
-    "settings-cloud-relay",
-    "settings-web-integration",
-    "settings-mcp",
-    "settings-log-sources",
-    "settings-execution-variables",
-    "settings-general",
-    "settings-storage",
-    "settings-backup",
-    "settings-instances",
-    "settings-debug",
-    "settings-security",
-    "accessibility-explorer",
-    "settings-updates",
-    "orchestration-loop",
-    "image-quality-tests",
-    "terminal",
-    "llm-analytics",
-    "cost-control",
-    "evaluation",
-    "skills",
-    "help",
-    "automation-health",
-    "activity-timeline",
-    "watchers",
-    "knowledge-explorer",
-    "event-history",
-    "development-intelligence",
-    "demo-video",
-    "product-tours",
-    "session-recap",
-    "api-surface",
-    "decision-trail",
-    "memory-search",
-    "online-learning",
-    "dag-workflow-editor",
-    "project-explainer",
-];
 
 
 // ============================================================================
@@ -619,6 +527,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
         all.extend_from_slice(screenshots::route_entries());
+        all.extend_from_slice(stubs::route_entries());
         all
     })
 }
@@ -1019,6 +928,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // Console errors, browser events, timeline, network requests
         // (extracted to network.rs)
         .merge(network::routes())
+        // F2 — Network stub registry (extracted to stubs.rs)
+        .merge(stubs::routes())
         // UI Bridge exploration + window listing (extracted to exploration.rs)
         .merge(exploration::routes())
         // Page navigation / evaluation / tab switching (extracted to page.rs)
