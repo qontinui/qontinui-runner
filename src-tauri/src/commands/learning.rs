@@ -10,6 +10,8 @@ use crate::orchestrator::learning::{
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 
 /// Global learning system instance for in-memory analysis.
@@ -607,4 +609,31 @@ pub async fn get_learning_stats_summary(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
     state.pg_db.get_learning_stats_summary().await
+}
+
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_learning")
+        .invoke_handler(tauri::generate_handler![
+            get_learning_summary,
+            get_learning_patterns,
+            get_learning_insights,
+            analyze_learning_data,
+            get_feedback_for_context,
+            get_learning_dashboard_data,
+            record_task_outcome,
+            get_best_strategy,
+            export_learning_data,
+            import_learning_data,
+            clear_learning_data,
+            add_sample_learning_data,
+            get_learning_outcomes_filtered,
+            get_learning_outcomes_paginated,
+            get_learning_stats_by_date_range,
+            get_learning_outcomes_count,
+            get_recent_tasks_with_outcomes,
+            get_current_running_task,
+            get_most_recent_task_with_checkpoints,
+            get_learning_stats_summary,
+        ])
+        .build()
 }

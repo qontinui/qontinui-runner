@@ -503,6 +503,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::agentic_metrics::plugin())
         .plugin(commands::ai_data::plugin())
         .plugin(commands::cost_dashboard::plugin())
+        .plugin(commands::learning::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -812,10 +813,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Screenshot listing commands
             commands::screenshots::list_screenshots,
             // NOTE: hooks handlers moved to per-module plugin (see .plugin() calls above).
-            // Learning insights dashboard commands
-            commands::learning::get_learning_summary,
-            commands::learning::get_learning_patterns,
-            commands::learning::get_learning_insights,
+            // NOTE: learning handlers moved to per-module plugin (see .plugin() calls above).
             // Adaptive learning (Plan 15)
             commands::adaptive_learning::get_adaptive_learning_stats,
             commands::adaptive_learning::get_playbook_entries,
@@ -829,25 +827,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::adaptive_learning::get_gepa_run_detail,
             commands::adaptive_learning::get_playbook_entry_detail,
             commands::adaptive_learning::get_learning_trends,
-            commands::learning::analyze_learning_data,
-            commands::learning::get_feedback_for_context,
-            commands::learning::get_learning_dashboard_data,
-            commands::learning::record_task_outcome,
-            commands::learning::get_best_strategy,
-            commands::learning::export_learning_data,
-            commands::learning::import_learning_data,
-            commands::learning::clear_learning_data,
-            commands::learning::add_sample_learning_data,
-            // Enhanced learning queries (filtering, pagination, date ranges)
-            commands::learning::get_learning_outcomes_filtered,
-            commands::learning::get_learning_outcomes_paginated,
-            commands::learning::get_learning_stats_by_date_range,
-            commands::learning::get_learning_outcomes_count,
-            // Task run integration (recent tasks with learning outcomes)
-            commands::learning::get_recent_tasks_with_outcomes,
-            commands::learning::get_current_running_task,
-            commands::learning::get_most_recent_task_with_checkpoints,
-            commands::learning::get_learning_stats_summary,
             // Agentic metric commands
             // NOTE: agentic_metrics handlers moved to per-module plugin (see .plugin() calls above).
             // Flow designer commands
