@@ -519,6 +519,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::logging::plugin())
         .plugin(commands::rag::plugin())
         .plugin(commands::ai_session::plugin())
+        .plugin(commands::meta_optimizer::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -1001,61 +1002,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: transcript handlers moved to per-module plugin (see .plugin() calls above).
             // Terminal session analysis commands
             // NOTE: terminal_analysis handlers moved to per-module plugin (see .plugin() calls above).
-            // Meta-optimizer commands (recommendation review, prompt registry, manual trigger)
-            commands::meta_optimizer::get_meta_optimizer_recommendations,
-            commands::meta_optimizer::apply_meta_optimizer_recommendation,
-            commands::meta_optimizer::reject_meta_optimizer_recommendation,
-            commands::meta_optimizer::rollback_meta_optimizer_recommendation,
-            commands::meta_optimizer::get_prompt_variants,
-            commands::meta_optimizer::activate_prompt_variant,
-            commands::meta_optimizer::get_meta_optimizer_runs,
-            commands::meta_optimizer::trigger_meta_optimizer,
-            commands::meta_optimizer::get_meta_optimizer_progress,
-            commands::meta_optimizer::capture_meta_optimizer_baseline,
-            commands::meta_optimizer::get_meta_optimizer_snapshots,
-            commands::meta_optimizer::get_agent_effectiveness,
-            commands::meta_optimizer::get_meta_optimizer_failure_analysis,
-            // Regression detection
-            commands::meta_optimizer::get_recommendation_outcomes,
-            commands::meta_optimizer::reevaluate_recommendation_outcome,
-            // Cost-effectiveness
-            commands::meta_optimizer::get_agent_cost_effectiveness,
-            // Cross-agent interaction
-            commands::meta_optimizer::get_agent_interaction_matrix,
-            commands::meta_optimizer::get_agent_cascade_effect,
-            // Canary rollout
-            commands::meta_optimizer::start_canary_rollout,
-            commands::meta_optimizer::get_canary_rollouts,
-            commands::meta_optimizer::promote_canary_rollout,
-            commands::meta_optimizer::rollback_canary_rollout,
-            // Prompt template A/B testing
-            commands::meta_optimizer::create_prompt_canary,
-            commands::meta_optimizer::get_prompt_canary_status,
-            // Eval spec commands (promptfoo-inspired declarative evaluation)
-            commands::meta_optimizer::get_eval_specs,
-            commands::meta_optimizer::create_eval_spec,
-            commands::meta_optimizer::delete_eval_spec,
-            commands::meta_optimizer::get_eval_results,
-            commands::meta_optimizer::run_recommendation_eval,
-            commands::meta_optimizer::generate_default_eval_spec,
-            commands::meta_optimizer::evaluate_with_io,
-            // Robustness testing and golden datasets
-            commands::meta_optimizer::run_robustness_test,
-            commands::meta_optimizer::get_robustness_reports,
-            commands::meta_optimizer::get_golden_datasets,
-            commands::meta_optimizer::build_golden_dataset,
-            // Model profiles and comparison bridge
-            commands::meta_optimizer::get_model_profiles,
-            commands::meta_optimizer::refresh_model_profiles,
-            commands::meta_optimizer::get_model_recommendations,
-            commands::meta_optimizer::convert_comparison_to_recommendation,
-            // Prompt optimization (meta-prompt optimizer)
-            commands::meta_optimizer::get_prompt_optimization_status,
-            commands::meta_optimizer::get_prompt_group_metrics,
-            commands::meta_optimizer::get_prompt_optimization_evidence,
-            commands::meta_optimizer::get_prompt_evolution_history,
-            commands::meta_optimizer::get_prompt_variant_content,
-            commands::meta_optimizer::get_prompt_evolution_diff,
+            // NOTE: meta_optimizer handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: comparison handlers moved to per-module plugin (see .plugin() calls above).
             // Spec experimentation commands
             spec_experimentation::commands::get_spec_compliance_history,
