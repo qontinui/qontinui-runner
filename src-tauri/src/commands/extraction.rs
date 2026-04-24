@@ -12,6 +12,8 @@ use crate::auth::AuthManager;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
@@ -867,4 +869,25 @@ pub async fn get_project_extractions(
 
     info!("Retrieved {} extractions", sessions.len());
     Ok(sessions)
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_extraction")
+        .invoke_handler(tauri::generate_handler![
+            start_web_extraction,
+            start_vision_extraction,
+            stop_web_extraction,
+            get_extraction_status,
+            request_extraction_screenshot,
+            export_training_data,
+            export_state_structure,
+            list_extractions,
+            create_extraction_session,
+            update_extraction_session,
+            upload_extraction_annotations,
+            upload_state_structure,
+            get_project_extractions,
+        ])
+        .build()
 }

@@ -526,6 +526,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::video::plugin())
         .plugin(commands::interaction::plugin())
         .plugin(commands::storage::plugin())
+        .plugin(commands::extraction::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -572,21 +573,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: state_machine handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: debug handlers moved to per-module plugin (see .plugin() calls above).
             // NOTE: websocket, video, interaction, storage handlers moved to per-module plugins (see .plugin() calls above).
-            // Web extraction commands
-            commands::extraction::start_web_extraction,
-            commands::extraction::start_vision_extraction,
-            commands::extraction::stop_web_extraction,
-            commands::extraction::get_extraction_status,
-            commands::extraction::request_extraction_screenshot,
-            commands::extraction::export_training_data,
-            commands::extraction::export_state_structure,
-            commands::extraction::list_extractions,
-            // Web extraction backend integration commands
-            commands::extraction::create_extraction_session,
-            commands::extraction::update_extraction_session,
-            commands::extraction::upload_extraction_annotations,
-            commands::extraction::upload_state_structure,
-            commands::extraction::get_project_extractions,
+            // NOTE: extraction handlers moved to per-module plugin (see .plugin() calls above).
             // Screenshot capture commands
             commands::screenshot::get_screenshot_monitors,
             commands::screenshot::capture_screenshot,
