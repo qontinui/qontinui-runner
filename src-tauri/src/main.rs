@@ -558,6 +558,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(commands::terminal::plugin())
         .plugin(commands::instances::plugin())
         .plugin(commands::execution::plugin())
+        .plugin(doctor::commands::plugin())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -641,9 +642,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             error_monitor::commands::open_error_in_editor,
             error_monitor::commands::get_error_recurrence_history,
             error_monitor::workflow::check_fixable_errors,
-            // Doctor health monitoring commands
-            doctor::commands::doctor_get_status,
-            doctor::commands::stop_process_by_pid,
+            // NOTE: doctor handlers moved to per-module plugin (see .plugin() calls above).
             // Cloud relay commands (remote mobile access via backend WebSocket)
             mcp::backend_relay::commands::start_cloud_relay,
             mcp::backend_relay::commands::stop_cloud_relay,

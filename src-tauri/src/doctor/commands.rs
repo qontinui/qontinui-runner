@@ -5,6 +5,8 @@
 use std::sync::Arc;
 
 use serde::Serialize;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
+use tauri::Runtime;
 
 use crate::commands::AppState;
 use crate::doctor::service::ProcessStatus;
@@ -62,4 +64,14 @@ pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
             Err(format!("Failed to kill process {}", pid))
         }
     }
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_doctor_commands")
+        .invoke_handler(tauri::generate_handler![
+            doctor_get_status,
+            stop_process_by_pid,
+        ])
+        .build()
 }
