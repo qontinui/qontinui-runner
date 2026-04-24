@@ -5,10 +5,9 @@
 //!
 //! The step output types match the TypeScript definitions in `src/types/step-output.ts`.
 
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -321,7 +320,7 @@ pub struct CollectStepOutputsResponse {
 /// Step outputs in a format compatible with TypeScript StepOutput types.
 #[tauri::command]
 pub async fn collect_step_outputs(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     input: CollectStepOutputsInput,
 ) -> Result<CollectStepOutputsResponse, String> {
     info!("Collecting step outputs: {:?}", input);
@@ -331,8 +330,8 @@ pub async fn collect_step_outputs(
         id
     } else {
         // Get the most recent task run
-        let running_tasks = state
-            .pg_db
+        let running_tasks = storage
+            .pg_db()
             .get_running_task_runs(None)
             .await
             .map_err(|e| format!("Failed to get running tasks: {}", e))?;
@@ -341,8 +340,8 @@ pub async fn collect_step_outputs(
             task.id.clone()
         } else {
             // Try to get the most recent completed task
-            let recent_tasks = state
-                .pg_db
+            let recent_tasks = storage
+                .pg_db()
                 .get_recent_task_runs(1, None)
                 .await
                 .map_err(|e| format!("Failed to list task runs: {}", e))?;
@@ -362,8 +361,8 @@ pub async fn collect_step_outputs(
     };
 
     // Get events for this task run
-    let events = state
-        .pg_db
+    let events = storage
+        .pg_db()
         .get_task_run_events(&task_run_id, None, input.limit)
         .await
         .map_err(|e| format!("Failed to get task run events: {}", e))?;
@@ -407,8 +406,8 @@ pub async fn collect_step_outputs(
     }
 
     // Also check for Playwright results
-    let playwright_results = state
-        .pg_db
+    let playwright_results = storage
+        .pg_db()
         .get_task_run_playwright_results(&task_run_id)
         .await
         .unwrap_or_default();
@@ -463,7 +462,7 @@ pub async fn collect_step_outputs(
 /// optimized for the test builder's auto-population feature.
 #[tauri::command]
 pub async fn get_step_outputs_for_test_builder(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     task_run_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let input = CollectStepOutputsInput {
@@ -472,7 +471,7 @@ pub async fn get_step_outputs_for_test_builder(
         limit: Some(50), // Reasonable limit for test builder
     };
 
-    let result = collect_step_outputs(state, input).await?;
+    let result = collect_step_outputs(storage, input).await?;
 
     // Transform outputs for test builder consumption
     let transformed: Vec<serde_json::Value> = result
