@@ -202,18 +202,22 @@ export function ProjectCoordinator({
   useEffect(() => {
     if (autoSelectDoneRef.current) return;
     if (projectsLoading) return;
-    if (projects.length === 0) {
-      // No saved projects — leave the default-manual-mode path unchanged.
-      autoSelectDoneRef.current = true;
-      return;
-    }
-    // Respect explicit user choices and external pre-fills.
+    // Respect explicit user choices and external pre-fills before any
+    // length-based branches so we don't race against user intent if projects
+    // arrive after the user has already picked something.
     if (initialProjectPath) {
       autoSelectDoneRef.current = true;
       return;
     }
     if (manualModeOverride !== null) {
       autoSelectDoneRef.current = true;
+      return;
+    }
+    if (projects.length === 0) {
+      // No saved projects *yet*. Don't mark done — the list may populate
+      // later if the user adds a project via Browse or another tab
+      // refreshes the store. The effect re-runs on every projects change;
+      // the early-returns above cost ~microseconds per render.
       return;
     }
     if (projectPath && projectPath !== "") {

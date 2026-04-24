@@ -66,7 +66,12 @@ function isTauriAvailable(): boolean {
  */
 export function useSavedProjects(): UseSavedProjectsResult {
   const [projects, setProjects] = useState<SavedProject[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
+  // Start as `loading: true` so mount-time consumers don't misinterpret the
+  // initial `projects = []` as "definitively empty" before the async
+  // `list_saved_projects` call has had a chance to fire. The mount-effect
+  // below calls `refresh()` which sets loading = false once the invoke
+  // resolves (or earlier when Tauri isn't available).
+  const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -74,6 +79,10 @@ export function useSavedProjects(): UseSavedProjectsResult {
       log.warn("Tauri runtime not available; returning empty saved projects list");
       setProjects([]);
       setError(null);
+      // Flip the mount-time `loading: true` default off so consumers aren't
+      // stuck waiting forever in non-Tauri environments (SSR, unit tests,
+      // plain-browser dev).
+      setLoading(false);
       return;
     }
     setLoading(true);
