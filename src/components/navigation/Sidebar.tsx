@@ -370,6 +370,15 @@ function NavItem({
   const button = (
     <button
       data-nav-item={dataNavItem}
+      // Keep this nav item in the UI Bridge registry for the whole time
+      // it's mounted, even when the enclosing NavGroup is collapsed
+      // (opacity:0 / max-height:0) or the sidebar scroll container hides
+      // it below the fold. Without this, `/control/discover` returns
+      // only the nav items currently on-screen, so agent-driven testing
+      // can't reach tabs under collapsed groups (Settings, BUILD,
+      // CONFIGURE, SCHEDULE). Consumed by useAutoRegister via its
+      // UI_BRIDGE_PERSIST_ATTR opt-in.
+      data-ui-bridge-persist="true"
       onClick={onClick}
       onKeyDown={onKeyDown}
       tabIndex={tabIndex}
@@ -428,6 +437,10 @@ function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
   return (
     <button
       onClick={onClick}
+      // Flyout items render inside a sidebar secondary panel that animates
+      // in/out. Same rationale as NavItem: keep them discoverable by UI
+      // Bridge clients regardless of animation/visibility state.
+      data-ui-bridge-persist="true"
       className={`
         w-full p-3 rounded-lg flex items-start gap-3 transition-all duration-200 text-left group
         animate-in fade-in slide-in-from-left-2
@@ -565,6 +578,11 @@ function NavGroup({
     <div className="space-y-1">
       <button
         onClick={onToggle}
+        // Group-header toggles (BUILD, CONFIGURE, SCHEDULE, SYSTEM) live in
+        // the scrollable sidebar container. Same persist rationale as the
+        // leaf NavItems — clients need to be able to expand a collapsed
+        // group via the bridge even when it's scrolled off-screen.
+        data-ui-bridge-persist="true"
         className="w-full flex items-center justify-between px-2 py-1.5 text-xs
                    font-semibold text-muted-foreground/70 hover:text-muted-foreground
                    transition-colors uppercase tracking-wider outline-hidden
