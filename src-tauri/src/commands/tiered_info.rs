@@ -4,13 +4,12 @@
 //! and external APIs for debugging context.
 
 use crate::auth::AuthManager;
-use crate::commands::AppState;
+use crate::commands::compartments::StorageCompartment;
 use crate::executor::flakiness::{ExecutionOptions, FlakinessCache};
 use crate::tiered_info::{
     self, ConfigStatistics, DebuggingContext, FlakyItem, RunDetails, RunStatus,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
@@ -50,10 +49,10 @@ impl<T> TieredInfoResponse<T> {
 /// tightly coupled to the tiered_info module's internal data model.
 #[tauri::command]
 pub async fn get_config_statistics(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
 ) -> Result<TieredInfoResponse<ConfigStatistics>, String> {
-    match state.pg_db.get_config_statistics(&config_id).await {
+    match storage.pg_db().get_config_statistics(&config_id).await {
         Ok(Some(stats_val)) => match serde_json::from_value(stats_val) {
             Ok(stats) => Ok(TieredInfoResponse::ok(stats)),
             Err(e) => Ok(TieredInfoResponse::err(format!(
@@ -72,13 +71,13 @@ pub async fn get_config_statistics(
 /// Get flaky transitions for a config.
 #[tauri::command]
 pub async fn get_flaky_transitions(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
     let threshold = threshold.unwrap_or(0.2);
-    match state
-        .pg_db
+    match storage
+        .pg_db()
         .get_flaky_transitions(&config_id, threshold)
         .await
     {
@@ -96,12 +95,12 @@ pub async fn get_flaky_transitions(
 /// Get flaky templates for a config.
 #[tauri::command]
 pub async fn get_flaky_templates(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
     let threshold = threshold.unwrap_or(0.2);
-    match state.pg_db.get_flaky_templates(&config_id, threshold).await {
+    match storage.pg_db().get_flaky_templates(&config_id, threshold).await {
         Ok(items) => {
             let typed: Vec<FlakyItem> = items
                 .into_iter()
@@ -116,12 +115,12 @@ pub async fn get_flaky_templates(
 /// Get debugging context for AI prompts.
 #[tauri::command]
 pub async fn get_debugging_context(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<DebuggingContext>, String> {
-    match state
-        .pg_db
+    match storage
+        .pg_db()
         .get_debugging_context(&config_id, config_name)
         .await
     {
@@ -139,12 +138,12 @@ pub async fn get_debugging_context(
 /// Get debugging context formatted as markdown for AI prompts.
 #[tauri::command]
 pub async fn get_debugging_context_prompt(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<String>, String> {
-    match state
-        .pg_db
+    match storage
+        .pg_db()
         .get_debugging_context(&config_id, config_name)
         .await
     {
@@ -160,11 +159,11 @@ pub async fn get_debugging_context_prompt(
 /// Get automation run details from task_run_automation table.
 #[tauri::command]
 pub async fn get_run_details(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     run_id: String,
 ) -> Result<TieredInfoResponse<RunDetails>, String> {
     // Query from task_run_automation table (run_details table removed)
-    match state.pg_db.get_task_run_automation_by_id(&run_id).await {
+    match storage.pg_db().get_task_run_automation_by_id(&run_id).await {
         Ok(Some(automation)) => {
             // Convert TaskRunAutomation to RunDetails for backward compatibility
             let run = RunDetails {
@@ -213,13 +212,13 @@ pub async fn get_run_details(
 /// Get recent runs, optionally filtered by config.
 #[tauri::command]
 pub async fn get_recent_runs(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
     let limit = limit.unwrap_or(10);
-    match state
-        .pg_db
+    match storage
+        .pg_db()
         .get_recent_runs(config_id.as_deref(), limit)
         .await
     {
@@ -237,12 +236,12 @@ pub async fn get_recent_runs(
 /// Get failed runs for a config (for debugging).
 #[tauri::command]
 pub async fn get_failed_runs(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
     let limit = limit.unwrap_or(5);
-    match state.pg_db.get_failed_runs(&config_id, limit).await {
+    match storage.pg_db().get_failed_runs(&config_id, limit).await {
         Ok(vals) => {
             let runs: Vec<RunDetails> = vals
                 .into_iter()
@@ -280,7 +279,7 @@ pub struct RecordRunInput {
 /// After recording, analyzes for discoveries and queues them for sync.
 #[tauri::command]
 pub async fn record_run(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     input: RecordRunInput,
 ) -> Result<TieredInfoResponse<String>, String> {
     // Parse status
@@ -348,8 +347,8 @@ pub async fn record_run(
 
     let success = run.success.unwrap_or(false);
     let duration = run.duration_ms;
-    if let Err(e) = state
-        .pg_db
+    if let Err(e) = storage
+        .pg_db()
         .update_statistics_after_run(&input.config_id, success, duration)
         .await
     {
@@ -366,13 +365,13 @@ pub async fn record_run(
 /// Note: This only cleans up task_run_automation records, not the parent task_runs.
 #[tauri::command]
 pub async fn cleanup_old_runs(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     keep_count: Option<u32>,
 ) -> Result<TieredInfoResponse<u32>, String> {
     let keep_count = keep_count.unwrap_or(100);
 
-    match state.pg_db.cleanup_old_runs(&config_id, keep_count).await {
+    match storage.pg_db().cleanup_old_runs(&config_id, keep_count).await {
         Ok(deleted) => {
             info!(
                 "Cleaned up {} old automation records for config {}",
@@ -401,13 +400,13 @@ pub async fn cleanup_old_runs(
 /// If neither is provided, returns default execution options.
 #[tauri::command]
 pub async fn get_execution_options(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     transition_id: Option<String>,
     template_id: Option<String>,
 ) -> Result<TieredInfoResponse<ExecutionOptions>, String> {
-    match state
-        .pg_db
+    match storage
+        .pg_db()
         .get_execution_options(
             &config_id,
             transition_id.as_deref(),
@@ -448,14 +447,14 @@ pub struct FlakinessSummary {
 /// before starting execution.
 #[tauri::command]
 pub async fn get_flakiness_summary(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<FlakinessSummary>, String> {
     let threshold = threshold.unwrap_or(0.2);
 
-    match state
-        .pg_db
+    match storage
+        .pg_db()
         .get_flakiness_summary(&config_id, threshold)
         .await
     {
@@ -508,14 +507,14 @@ pub struct AiSessionRun {
 /// * `limit` - Maximum number of runs to return (default: 50)
 #[tauri::command]
 pub async fn get_ai_session_history(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     config_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<AiSessionRun>>, String> {
     let limit = limit.unwrap_or(50);
 
-    let pg_rows = state
-        .pg_db
+    let pg_rows = storage
+        .pg_db()
         .get_ai_session_history(config_id.as_deref(), limit)
         .await?;
 
@@ -568,10 +567,10 @@ fn map_status_to_frontend(status: &str) -> String {
 /// - orchestrator_verification_results
 #[tauri::command]
 pub async fn delete_ai_session(
-    state: State<'_, Arc<AppState>>,
+    storage: State<'_, StorageCompartment>,
     session_id: String,
 ) -> Result<TieredInfoResponse<bool>, String> {
-    match state.pg_db.delete_task_run(&session_id).await {
+    match storage.pg_db().delete_task_run(&session_id).await {
         Ok(deleted) => {
             if deleted {
                 info!("Deleted AI session: {}", session_id);
