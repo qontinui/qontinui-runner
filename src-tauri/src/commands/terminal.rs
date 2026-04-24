@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Manager;
 use tracing::{info, warn};
 
@@ -387,4 +388,25 @@ fn strip_ansi(text: &str) -> String {
         }
     }
     result
+}
+
+/// Build the Tauri plugin that registers this module's command handlers.
+///
+/// Non-generic because handlers accept concrete `tauri::AppHandle`.
+pub fn plugin() -> TauriPlugin<tauri::Wry> {
+    PluginBuilder::<tauri::Wry>::new("qontinui_terminal")
+        .invoke_handler(tauri::generate_handler![
+            terminal_create,
+            terminal_write,
+            terminal_resize,
+            terminal_close,
+            terminal_list,
+            terminal_ack,
+            terminal_get_buffer,
+            terminal_save_scrollback,
+            terminal_get_saved_scrollback,
+            terminal_cleanup_scrollback,
+            terminal_collect_session_metadata,
+        ])
+        .build()
 }
