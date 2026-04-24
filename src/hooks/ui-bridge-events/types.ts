@@ -76,6 +76,7 @@ export type UIBridgeRequestType =
   | "ai_find"
   | "find"
   | "wait_for_element_by_condition"
+  | "wait_for_element_registered"
   | "get_workflows"
   | "get_element_state"
   // Workflow execution

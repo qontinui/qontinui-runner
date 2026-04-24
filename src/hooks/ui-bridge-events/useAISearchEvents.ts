@@ -92,6 +92,232 @@ export function useAISearchEvents(
           return true;
         }
 
+        case "wait_for_element_registered": {
+          // SDK-shape wait-for-element: body carries a `predicate` object
+          // (id, label, testId, selector) plus optional `requirement` and
+          // polling knobs. Rust forwards the params; we implement the
+          // matching loop inline using the live registry to avoid pulling
+          // `@qontinui/ui-bridge/server/handlers` at runtime (the server
+          // subpath isn't published in the runtime bundle).
+          const p = (payload.params ?? payload.body ?? {}) as {
+            predicate?: {
+              id?: string;
+              label?: string;
+              testId?: string;
+              selector?: string;
+            };
+            requirement?: "registered" | "visible" | "has-layout";
+            pollMs?: number;
+            timeoutMs?: number;
+          };
+          const predicate = p.predicate ?? {};
+          const requirement = p.requirement ?? "registered";
+          const pollMs = Math.min(
+            Math.max(typeof p.pollMs === "number" ? p.pollMs : 100, 50),
+            1000,
+          );
+          const timeoutMs = Math.min(
+            Math.max(typeof p.timeoutMs === "number" ? p.timeoutMs : 5000, 100),
+            60_000,
+          );
+          const labelNeedle =
+            typeof predicate.label === "string" && predicate.label.length > 0
+              ? predicate.label.toLowerCase()
+              : null;
+
+          const predicateMatches = (
+            el: Record<string, unknown>,
+            domEl: HTMLElement | null,
+          ): boolean => {
+            if (typeof predicate.id === "string" && predicate.id.length > 0) {
+              if (el.id !== predicate.id) return false;
+            }
+            if (labelNeedle) {
+              const label = typeof el.label === "string" ? el.label.toLowerCase() : "";
+              const ariaLabel =
+                typeof el.ariaLabel === "string" ? (el.ariaLabel as string).toLowerCase() : "";
+              if (!label.includes(labelNeedle) && !ariaLabel.includes(labelNeedle)) {
+                return false;
+              }
+            }
+            if (typeof predicate.testId === "string" && predicate.testId.length > 0) {
+              const testId = domEl?.getAttribute?.("data-testid");
+              if (testId !== predicate.testId) return false;
+            }
+            return true;
+          };
+
+          const requirementMet = (
+            el: Record<string, unknown>,
+            domEl: HTMLElement | null,
+          ): boolean => {
+            if (requirement === "registered") return true;
+            const state = el.state as
+              | { visible?: boolean; rect?: { width?: number; height?: number } }
+              | undefined;
+            if (requirement === "visible") {
+              if (state && typeof state.visible === "boolean") return state.visible;
+              if (!domEl) return false;
+              if (domEl.offsetParent === null) return false;
+              const rect = domEl.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            }
+            if (requirement === "has-layout") {
+              const w = state?.rect?.width ?? 0;
+              const h = state?.rect?.height ?? 0;
+              if (w > 0 && h > 0) return true;
+              if (domEl) {
+                const rect = domEl.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              }
+              return false;
+            }
+            return true;
+          };
+
+          const started = Date.now();
+
+          const attempt = (): {
+            element: Record<string, unknown>;
+            domEl: HTMLElement | null;
+          } | null => {
+            const registry = (
+              currentBridge as unknown as {
+                registry?: {
+                  getAllElements?: () => Array<{
+                    id: string;
+                    element?: HTMLElement;
+                    type?: unknown;
+                    label?: string;
+                  }>;
+                } | null;
+              }
+            ).registry;
+            const rows = registry?.getAllElements?.() ?? [];
+            for (const row of rows) {
+              const domEl = (row.element as HTMLElement | null) ?? null;
+              const materialized: Record<string, unknown> = {
+                id: row.id,
+                type: row.type,
+                label: row.label,
+                ariaLabel: domEl?.getAttribute?.("aria-label") ?? undefined,
+                state: undefined,
+              };
+              if (!predicateMatches(materialized, domEl)) continue;
+              if (!requirementMet(materialized, domEl)) continue;
+              return { element: materialized, domEl };
+            }
+            // DOM-selector fallback when the registry can't satisfy the predicate.
+            if (typeof predicate.selector === "string" && predicate.selector.length > 0) {
+              try {
+                const domEl = document.querySelector(predicate.selector) as HTMLElement | null;
+                if (domEl) {
+                  const syntheticEl: Record<string, unknown> = {
+                    id: domEl.id || `dom-${predicate.selector}`,
+                    label:
+                      domEl.getAttribute("aria-label") ?? domEl.textContent?.trim() ?? undefined,
+                    type: domEl.tagName?.toLowerCase?.(),
+                    ariaLabel: domEl.getAttribute("aria-label") ?? undefined,
+                  };
+                  if (!requirementMet(syntheticEl, domEl)) return null;
+                  return { element: syntheticEl, domEl };
+                }
+              } catch {
+                // Invalid selector — treat as no match.
+              }
+            }
+            return null;
+          };
+
+          const fast = attempt();
+          if (fast) {
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                element: fast.element,
+                elapsedMs: Date.now() - started,
+              },
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const data = await new Promise<Record<string, unknown>>((resolve) => {
+            let done = false;
+            let lastPartial: Record<string, unknown> | undefined;
+            const tick = () => {
+              if (done) return;
+              const hit = attempt();
+              if (hit) {
+                done = true;
+                resolve({
+                  element: hit.element,
+                  elapsedMs: Date.now() - started,
+                });
+                return;
+              }
+              if (requirement !== "registered") {
+                // Track a "closest match" — an element that matched the
+                // predicate but failed the requirement (visibility/layout).
+                // Helps callers debug why their wait timed out.
+                try {
+                  const registry = (
+                    currentBridge as unknown as {
+                      registry?: {
+                        getAllElements?: () => Array<{
+                          id: string;
+                          element?: HTMLElement;
+                          type?: unknown;
+                          label?: string;
+                        }>;
+                      } | null;
+                    }
+                  ).registry;
+                  const rows = registry?.getAllElements?.() ?? [];
+                  for (const row of rows) {
+                    const domEl = (row.element as HTMLElement | null) ?? null;
+                    const materialized: Record<string, unknown> = {
+                      id: row.id,
+                      type: row.type,
+                      label: row.label,
+                      ariaLabel: domEl?.getAttribute?.("aria-label") ?? undefined,
+                    };
+                    if (predicateMatches(materialized, domEl)) {
+                      lastPartial = materialized;
+                      break;
+                    }
+                  }
+                } catch {
+                  /* ignore */
+                }
+              }
+              if (Date.now() - started >= timeoutMs) {
+                done = true;
+                const timeout: Record<string, unknown> = {
+                  reason: "timeout",
+                  elapsedMs: Date.now() - started,
+                };
+                if (lastPartial) timeout.closestMatch = lastPartial;
+                resolve(timeout);
+                return;
+              }
+              setTimeout(tick, pollMs);
+            };
+            setTimeout(tick, pollMs);
+          });
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "wait_for_element_by_condition": {
           // Tier 3.1 companion to the Rust forwarder
           // (qontinui-runner/src-tauri/src/mcp/ui_bridge.rs::ui_bridge_wait_for_element_condition_handler).

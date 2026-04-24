@@ -405,10 +405,7 @@ pub async fn ui_bridge_execute_action_handler(
             } else {
                 raw
             };
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::error(hint)),
-            ));
+            return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(hint))));
         }
     };
 
@@ -1343,6 +1340,16 @@ pub async fn ui_bridge_wait_for_element_handler(
         .map(|Json(v)| v)
         .unwrap_or_else(|| serde_json::json!({}));
 
+    // Body-shape routing: the SDK's `waitForElementRegistered` uses the new
+    // `predicate: {id?, label?, testId?, selector?}` shape, while the legacy
+    // handler below expects `query` / `elementId`. If `predicate` is present
+    // we forward to the SDK handler and return its payload verbatim. This
+    // avoids a route collision without requiring a URL rename (callers keep
+    // using `/ai/wait-for-element`).
+    if body.get("predicate").is_some() {
+        return ui_bridge_wait_for_element_registered_forward(state, body).await;
+    }
+
     let query = body.get("query").and_then(|v| v.as_str()).map(String::from);
     let element_id = body
         .get("elementId")
@@ -1509,6 +1516,48 @@ pub async fn ui_bridge_wait_for_element_handler(
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+    }
+}
+
+/// Forward a `predicate`-shaped wait-for-element body to the SDK's
+/// `waitForElementRegistered` dispatcher. We stamp a defensive timeout
+/// clamp before forwarding so a runaway client can't park the webview
+/// listener indefinitely, mirroring Phase 1's /wait-for-route-change
+/// behaviour. The SDK itself re-clamps to the same window.
+async fn ui_bridge_wait_for_element_registered_forward(
+    state: Arc<ApiState>,
+    mut body: serde_json::Value,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Clamp timeoutMs to [100, 60_000] (default 5000) before forwarding.
+    let raw_timeout = body
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5000);
+    let timeout_ms = raw_timeout.clamp(100, 60_000);
+    if let serde_json::Value::Object(ref mut map) = body {
+        map.insert(
+            "timeoutMs".to_string(),
+            serde_json::Value::from(timeout_ms),
+        );
+    }
+
+    info!(
+        "UI Bridge API: wait-for-element (predicate shape) predicate={:?} requirement={:?} timeoutMs={}",
+        body.get("predicate"),
+        body.get("requirement").and_then(|v| v.as_str()),
+        timeout_ms,
+    );
+
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "wait_for_element_registered", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!(
+                "UI Bridge API: wait-for-element (predicate shape) failed: {}",
+                e
+            );
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
     }
 }
 
