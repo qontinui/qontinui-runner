@@ -468,14 +468,16 @@ impl AITaskSyncService {
     }
 
     /// Check if authenticated and can sync
-    fn check_auth(&self) -> Result<String, String> {
+    fn check_auth(&self) -> Result<String, AppError> {
         if !self.auth_manager.has_tokens() {
-            return Err("Not authenticated. Please log in to sync AI tasks.".to_string());
+            return Err(AppError::AuthError(
+                "Not authenticated. Please log in to sync AI tasks.".to_string(),
+            ));
         }
 
         self.auth_manager.get_access_token().map_err(|e| {
             error!("Failed to get access token: {}", e);
-            format!("Failed to get access token: {}", e)
+            AppError::AuthError(format!("Failed to get access token: {}", e))
         })
     }
 
@@ -485,6 +487,16 @@ impl AITaskSyncService {
         task: &TaskRun,
         project_id: Option<&str>,
     ) -> Result<AITaskResponse, String> {
+        self.sync_task_created_impl(task, project_id)
+            .await
+            .map_err(String::from)
+    }
+
+    async fn sync_task_created_impl(
+        &self,
+        task: &TaskRun,
+        project_id: Option<&str>,
+    ) -> Result<AITaskResponse, AppError> {
         info!("Syncing new AI task to backend: {}", task.id);
 
         let access_token = self.check_auth()?;
@@ -498,29 +510,16 @@ impl AITaskSyncService {
             .bearer_auth(&access_token)
             .json(&request)
             .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to sync task creation: {}", e);
-                format!("Network error: {}", e)
-            })?;
+            .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            error!(
-                "Sync task creation failed with status {}: {}",
-                status, error_text
-            );
-            return Err(format!("Failed to sync task: {}", error_text));
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            error!("Sync task creation failed with status {}: {}", status, body);
+            return Err(AppError::HttpStatusError { status, body });
         }
 
-        let result: AITaskResponse = response.json().await.map_err(|e| {
-            error!("Failed to parse task response: {}", e);
-            format!("Invalid response from server: {}", e)
-        })?;
+        let result: AITaskResponse = response.json().await?;
 
         info!("AI task synced successfully: {}", result.id);
         Ok(result)
@@ -532,6 +531,16 @@ impl AITaskSyncService {
         task_id: &str,
         session_number: u32,
     ) -> Result<AITaskSessionResponse, String> {
+        self.sync_session_started_impl(task_id, session_number)
+            .await
+            .map_err(String::from)
+    }
+
+    async fn sync_session_started_impl(
+        &self,
+        task_id: &str,
+        session_number: u32,
+    ) -> Result<AITaskSessionResponse, AppError> {
         info!(
             "Syncing session start for task {}, session {}",
             task_id, session_number
@@ -551,29 +560,16 @@ impl AITaskSyncService {
             .bearer_auth(&access_token)
             .json(&request)
             .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to sync session start: {}", e);
-                format!("Network error: {}", e)
-            })?;
+            .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            error!(
-                "Sync session start failed with status {}: {}",
-                status, error_text
-            );
-            return Err(format!("Failed to sync session: {}", error_text));
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            error!("Sync session start failed with status {}: {}", status, body);
+            return Err(AppError::HttpStatusError { status, body });
         }
 
-        let result: AITaskSessionResponse = response.json().await.map_err(|e| {
-            error!("Failed to parse session response: {}", e);
-            format!("Invalid response from server: {}", e)
-        })?;
+        let result: AITaskSessionResponse = response.json().await?;
 
         info!("Session synced successfully: {}", result.id);
         Ok(result)
@@ -587,6 +583,18 @@ impl AITaskSyncService {
         duration_seconds: i64,
         output_summary: Option<&str>,
     ) -> Result<AITaskSessionResponse, String> {
+        self.sync_session_ended_impl(task_id, session_number, duration_seconds, output_summary)
+            .await
+            .map_err(String::from)
+    }
+
+    async fn sync_session_ended_impl(
+        &self,
+        task_id: &str,
+        session_number: u32,
+        duration_seconds: i64,
+        output_summary: Option<&str>,
+    ) -> Result<AITaskSessionResponse, AppError> {
         info!(
             "Syncing session end for task {}, session {} ({}s)",
             task_id, session_number, duration_seconds
@@ -612,29 +620,16 @@ impl AITaskSyncService {
             .bearer_auth(&access_token)
             .json(&request)
             .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to sync session end: {}", e);
-                format!("Network error: {}", e)
-            })?;
+            .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            error!(
-                "Sync session end failed with status {}: {}",
-                status, error_text
-            );
-            return Err(format!("Failed to sync session: {}", error_text));
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            error!("Sync session end failed with status {}: {}", status, body);
+            return Err(AppError::HttpStatusError { status, body });
         }
 
-        let result: AITaskSessionResponse = response.json().await.map_err(|e| {
-            error!("Failed to parse session response: {}", e);
-            format!("Invalid response from server: {}", e)
-        })?;
+        let result: AITaskSessionResponse = response.json().await?;
 
         info!("Session end synced successfully");
         Ok(result)
@@ -646,6 +641,16 @@ impl AITaskSyncService {
         task_id: &str,
         findings: &[Finding],
     ) -> Result<Vec<AITaskFindingSyncResponse>, String> {
+        self.sync_findings_impl(task_id, findings)
+            .await
+            .map_err(String::from)
+    }
+
+    async fn sync_findings_impl(
+        &self,
+        task_id: &str,
+        findings: &[Finding],
+    ) -> Result<Vec<AITaskFindingSyncResponse>, AppError> {
         if findings.is_empty() {
             return Ok(vec![]);
         }
@@ -671,29 +676,16 @@ impl AITaskSyncService {
             .bearer_auth(&access_token)
             .json(&request)
             .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to sync findings: {}", e);
-                format!("Network error: {}", e)
-            })?;
+            .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            error!(
-                "Sync findings failed with status {}: {}",
-                status, error_text
-            );
-            return Err(format!("Failed to sync findings: {}", error_text));
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            error!("Sync findings failed with status {}: {}", status, body);
+            return Err(AppError::HttpStatusError { status, body });
         }
 
-        let result: Vec<AITaskFindingSyncResponse> = response.json().await.map_err(|e| {
-            error!("Failed to parse findings response: {}", e);
-            format!("Invalid response from server: {}", e)
-        })?;
+        let result: Vec<AITaskFindingSyncResponse> = response.json().await?;
 
         info!("Synced {} findings successfully", result.len());
         Ok(result)
@@ -705,6 +697,16 @@ impl AITaskSyncService {
         task_id: &str,
         questions: Vec<DeferredQuestionSyncRequest>,
     ) -> Result<(), String> {
+        self.sync_deferred_questions_impl(task_id, questions)
+            .await
+            .map_err(String::from)
+    }
+
+    async fn sync_deferred_questions_impl(
+        &self,
+        task_id: &str,
+        questions: Vec<DeferredQuestionSyncRequest>,
+    ) -> Result<(), AppError> {
         if questions.is_empty() {
             return Ok(());
         }
@@ -729,23 +731,16 @@ impl AITaskSyncService {
             .bearer_auth(&access_token)
             .json(&batch)
             .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to sync deferred questions: {}", e);
-                format!("Network error: {}", e)
-            })?;
+            .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
             error!(
                 "Sync deferred questions failed with status {}: {}",
-                status, error_text
+                status, body
             );
-            return Err(format!("Failed to sync deferred questions: {}", error_text));
+            return Err(AppError::HttpStatusError { status, body });
         }
 
         info!(
@@ -762,6 +757,17 @@ impl AITaskSyncService {
         iteration: u32,
         result_json: &serde_json::Value,
     ) -> Result<(), String> {
+        self.sync_verification_result_impl(task_id, iteration, result_json)
+            .await
+            .map_err(String::from)
+    }
+
+    async fn sync_verification_result_impl(
+        &self,
+        task_id: &str,
+        iteration: u32,
+        result_json: &serde_json::Value,
+    ) -> Result<(), AppError> {
         info!(
             "Syncing verification result for task {}, iteration {}",
             task_id, iteration
@@ -786,26 +792,16 @@ impl AITaskSyncService {
             .bearer_auth(&access_token)
             .json(&request)
             .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to sync verification result: {}", e);
-                format!("Network error: {}", e)
-            })?;
+            .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
             error!(
                 "Sync verification result failed with status {}: {}",
-                status, error_text
+                status, body
             );
-            return Err(format!(
-                "Failed to sync verification result: {}",
-                error_text
-            ));
+            return Err(AppError::HttpStatusError { status, body });
         }
 
         info!(
@@ -817,6 +813,15 @@ impl AITaskSyncService {
 
     /// Sync task completion to the backend.
     pub async fn sync_task_completed(&self, task: &TaskRun) -> Result<AITaskResponse, String> {
+        self.sync_task_completed_impl(task)
+            .await
+            .map_err(String::from)
+    }
+
+    async fn sync_task_completed_impl(
+        &self,
+        task: &TaskRun,
+    ) -> Result<AITaskResponse, AppError> {
         info!("Syncing task completion: {}", task.id);
 
         let access_token = self.check_auth()?;
@@ -850,29 +855,19 @@ impl AITaskSyncService {
             .bearer_auth(&access_token)
             .json(&request)
             .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to sync task completion: {}", e);
-                format!("Network error: {}", e)
-            })?;
+            .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
             error!(
                 "Sync task completion failed with status {}: {}",
-                status, error_text
+                status, body
             );
-            return Err(format!("Failed to sync task completion: {}", error_text));
+            return Err(AppError::HttpStatusError { status, body });
         }
 
-        let result: AITaskResponse = response.json().await.map_err(|e| {
-            error!("Failed to parse task response: {}", e);
-            format!("Invalid response from server: {}", e)
-        })?;
+        let result: AITaskResponse = response.json().await?;
 
         info!("Task completion synced successfully: {}", result.id);
         Ok(result)
