@@ -4,6 +4,7 @@
 //! RAG configs contain pattern screenshots and element annotations for visual automation.
 
 use crate::auth::AuthManager;
+use crate::error::AppError;
 use crate::event_system::EventEmitter;
 use crate::rag::{
     EmbeddingGenerator, EmbeddingStatus, ImportResult, QontinuiConfig, RAGStorage, SearchFilters,
@@ -25,33 +26,36 @@ use crate::api_config::get_api_base_url;
 /// This function reads the embeddings.json file and sends the results
 /// to the web backend for storage.
 pub async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
+    send_embeddings_to_web_impl(project_id)
+        .await
+        .map_err(String::from)
+}
+
+async fn send_embeddings_to_web_impl(project_id: &str) -> Result<(), AppError> {
     // Get the project directory
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| AppError::Raw("Could not determine home directory".to_string()))?;
     let project_dir = home.join(".qontinui").join("rag").join(project_id);
 
     let embeddings_path = project_dir.join("embeddings").join("embeddings.json");
     let config_path = project_dir.join("config.json");
 
     if !embeddings_path.exists() {
-        return Err(format!(
+        return Err(AppError::Raw(format!(
             "Embeddings file not found: {}",
             embeddings_path.display()
-        ));
+        )));
     }
 
     // Read embeddings file
-    let embeddings_content = std::fs::read_to_string(&embeddings_path)
-        .map_err(|e| format!("Failed to read embeddings file: {}", e))?;
+    let embeddings_content = std::fs::read_to_string(&embeddings_path)?;
 
-    let embeddings_data: Value = serde_json::from_str(&embeddings_content)
-        .map_err(|e| format!("Failed to parse embeddings JSON: {}", e))?;
+    let embeddings_data: Value = serde_json::from_str(&embeddings_content)?;
 
     // Read config file to get pattern -> stateImage mapping
-    let config_content = std::fs::read_to_string(&config_path)
-        .map_err(|e| format!("Failed to read config file: {}", e))?;
+    let config_content = std::fs::read_to_string(&config_path)?;
 
-    let config_data: Value = serde_json::from_str(&config_content)
-        .map_err(|e| format!("Failed to parse config JSON: {}", e))?;
+    let config_data: Value = serde_json::from_str(&config_content)?;
 
     // Build pattern_id -> state_image_id mapping from config
     let mut pattern_to_state_image: HashMap<String, String> = HashMap::new();
@@ -85,7 +89,7 @@ pub async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
     let elements = embeddings_data
         .get("elements")
         .and_then(|e| e.as_array())
-        .ok_or("No elements found in embeddings")?;
+        .ok_or_else(|| AppError::Raw("No elements found in embeddings".to_string()))?;
 
     // Group embeddings by state_image_id (web stores embeddings per stateImage)
     let mut state_image_embeddings: HashMap<String, Value> = HashMap::new();
@@ -138,9 +142,7 @@ pub async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
 
     // Get auth token
     let auth_manager = AuthManager::new();
-    let access_token = auth_manager
-        .get_access_token()
-        .map_err(|e| format!("Failed to get access token: {}", e))?;
+    let access_token = auth_manager.get_access_token()?;
 
     // Build request payload
     let request_body = serde_json::json!({
@@ -167,14 +169,10 @@ pub async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
-        .await
-        .map_err(|e| format!("Failed to send embeddings to web: {}", e))?;
+        .await?;
 
     if response.status().is_success() {
-        let response_body: Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        let response_body: Value = response.json().await?;
 
         info!(
             "Successfully sent embeddings to web backend: {:?}",
@@ -182,12 +180,10 @@ pub async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
         );
         Ok(())
     } else {
-        let status = response.status();
-        let error_body = response.text().await.unwrap_or_default();
-        Err(format!(
-            "Web backend returned error {}: {}",
-            status, error_body
-        ))
+        Err(AppError::HttpStatusError {
+            status: response.status().as_u16(),
+            body: response.text().await.unwrap_or_default(),
+        })
     }
 }
 
@@ -202,12 +198,13 @@ pub struct RAGState {
 
 impl RAGState {
     pub fn new() -> Result<Self, String> {
-        let storage =
-            RAGStorage::new().map_err(|e| format!("Failed to initialize RAG storage: {}", e))?;
-        let embedding_generator = EmbeddingGenerator::new()
-            .map_err(|e| format!("Failed to initialize embedding generator: {}", e))?;
-        let semantic_search = SemanticSearch::new()
-            .map_err(|e| format!("Failed to initialize semantic search: {}", e))?;
+        Self::new_impl().map_err(String::from)
+    }
+
+    fn new_impl() -> Result<Self, AppError> {
+        let storage = RAGStorage::new()?;
+        let embedding_generator = EmbeddingGenerator::new()?;
+        let semantic_search = SemanticSearch::new()?;
 
         Ok(Self {
             storage: Arc::new(TokioMutex::new(storage)),
@@ -252,6 +249,16 @@ pub async fn import_rag_config(
     config: QontinuiConfig,
     state: State<'_, Arc<RAGState>>,
 ) -> Result<CommandResponse, String> {
+    import_rag_config_impl(project_id, config, state)
+        .await
+        .map_err(String::from)
+}
+
+async fn import_rag_config_impl(
+    project_id: String,
+    config: QontinuiConfig,
+    state: State<'_, Arc<RAGState>>,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Importing RAG config: project_id={}, images={}, states={}",
         project_id,
@@ -261,7 +268,9 @@ pub async fn import_rag_config(
 
     // Validate configuration
     if project_id.is_empty() {
-        return Err("Project ID cannot be empty".to_string());
+        return Err(AppError::ValidationError(
+            "Project ID cannot be empty".to_string(),
+        ));
     }
 
     let image_count = config.images.len();
@@ -269,15 +278,12 @@ pub async fn import_rag_config(
 
     // Save configuration
     let storage = state.storage.lock().await;
-    let storage_path = storage
-        .save_qontinui_config(&project_id, &config)
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+    let storage_path = storage.save_qontinui_config(&project_id, &config)?;
 
     // Save images from config
     let referenced_ids = config.referenced_image_ids();
-    let saved_count = storage
-        .save_images_from_config(&project_id, &config.images, &referenced_ids)
-        .map_err(|e| format!("Failed to save images: {}", e))?;
+    let saved_count =
+        storage.save_images_from_config(&project_id, &config.images, &referenced_ids)?;
 
     let storage_path_str = storage_path.to_string_lossy().to_string();
     drop(storage); // Release lock before starting async task
@@ -432,7 +438,7 @@ pub async fn search_rag_elements(
     // Load config
     let config = storage
         .load_qontinui_config(&project_id)
-        .map_err(|e| format!("Failed to load config: {}", e))?;
+        .map_err(|e: crate::rag::storage::RAGStorageError| String::from(AppError::from(e)))?;
 
     // Simple name-based search through states and patterns
     let mut results = Vec::new();
@@ -578,12 +584,16 @@ pub async fn search_rag_elements_semantic(
 /// * `Err(String)` - Error message if listing fails
 #[tauri::command]
 pub async fn list_rag_configs(state: State<'_, Arc<RAGState>>) -> Result<CommandResponse, String> {
+    list_rag_configs_impl(state).await.map_err(String::from)
+}
+
+async fn list_rag_configs_impl(
+    state: State<'_, Arc<RAGState>>,
+) -> Result<CommandResponse, AppError> {
     info!("Listing RAG configurations");
 
     let storage = state.storage.lock().await;
-    let summaries = storage
-        .list_configs()
-        .map_err(|e| format!("Failed to list configs: {}", e))?;
+    let summaries = storage.list_configs()?;
 
     info!("Found {} RAG configurations", summaries.len());
 
@@ -608,12 +618,19 @@ pub async fn delete_rag_config(
     project_id: String,
     state: State<'_, Arc<RAGState>>,
 ) -> Result<CommandResponse, String> {
+    delete_rag_config_impl(project_id, state)
+        .await
+        .map_err(String::from)
+}
+
+async fn delete_rag_config_impl(
+    project_id: String,
+    state: State<'_, Arc<RAGState>>,
+) -> Result<CommandResponse, AppError> {
     info!("Deleting RAG config: project_id={}", project_id);
 
     let storage = state.storage.lock().await;
-    storage
-        .delete_config(&project_id)
-        .map_err(|e| format!("Failed to delete config: {}", e))?;
+    storage.delete_config(&project_id)?;
 
     info!("Successfully deleted RAG config: project_id={}", project_id);
 
@@ -638,12 +655,19 @@ pub async fn get_rag_config(
     project_id: String,
     state: State<'_, Arc<RAGState>>,
 ) -> Result<CommandResponse, String> {
+    get_rag_config_impl(project_id, state)
+        .await
+        .map_err(String::from)
+}
+
+async fn get_rag_config_impl(
+    project_id: String,
+    state: State<'_, Arc<RAGState>>,
+) -> Result<CommandResponse, AppError> {
     info!("Getting RAG config: project_id={}", project_id);
 
     let storage = state.storage.lock().await;
-    let config = storage
-        .load_qontinui_config(&project_id)
-        .map_err(|e| format!("Failed to load config: {}", e))?;
+    let config = storage.load_qontinui_config(&project_id)?;
 
     Ok(CommandResponse {
         success: true,
@@ -666,12 +690,19 @@ pub async fn get_rag_storage_usage(
     project_id: String,
     state: State<'_, Arc<RAGState>>,
 ) -> Result<CommandResponse, String> {
+    get_rag_storage_usage_impl(project_id, state)
+        .await
+        .map_err(String::from)
+}
+
+async fn get_rag_storage_usage_impl(
+    project_id: String,
+    state: State<'_, Arc<RAGState>>,
+) -> Result<CommandResponse, AppError> {
     info!("Getting storage usage for project_id={}", project_id);
 
     let storage = state.storage.lock().await;
-    let usage = storage
-        .get_storage_usage(&project_id)
-        .map_err(|e| format!("Failed to get storage usage: {}", e))?;
+    let usage = storage.get_storage_usage(&project_id)?;
 
     Ok(CommandResponse {
         success: true,
@@ -714,6 +745,17 @@ pub async fn start_rag_processing(
     app_handle: AppHandle,
     state: State<'_, Arc<RAGState>>,
 ) -> Result<CommandResponse, String> {
+    start_rag_processing_impl(project_id, config, app_handle, state)
+        .await
+        .map_err(String::from)
+}
+
+async fn start_rag_processing_impl(
+    project_id: String,
+    config: Option<QontinuiConfig>,
+    app_handle: AppHandle,
+    state: State<'_, Arc<RAGState>>,
+) -> Result<CommandResponse, AppError> {
     info!("Starting RAG processing for project_id={}", project_id);
 
     // Check if config exists, if not and config is provided, save it
@@ -728,14 +770,11 @@ pub async fn start_rag_processing(
             );
 
             // Save the config
-            storage
-                .save_qontinui_config(&project_id, cfg)
-                .map_err(|e| format!("Failed to save config: {}", e))?;
+            storage.save_qontinui_config(&project_id, cfg)?;
 
             // Also save images to disk for embedding generation
             let images_path = storage.get_images_path(&project_id);
-            std::fs::create_dir_all(&images_path)
-                .map_err(|e| format!("Failed to create images directory: {}", e))?;
+            std::fs::create_dir_all(&images_path)?;
 
             for image in &cfg.images {
                 let image_path = images_path.join(format!("{}.png", image.id));
@@ -751,7 +790,7 @@ pub async fn start_rag_processing(
             }
         } else {
             drop(storage);
-            return Err(format!("Project not found: {}", project_id));
+            return Err(AppError::Raw(format!("Project not found: {}", project_id)));
         }
     }
     drop(storage);
