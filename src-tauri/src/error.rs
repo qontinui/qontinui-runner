@@ -71,6 +71,18 @@ pub enum AppError {
     #[error("Network error: {0}")]
     NetworkError(String),
 
+    /// Authentication / authorization failure (token missing, expired, denied
+    /// access). Distinct from generic `ConfigError` so the frontend can show
+    /// a sign-in CTA without substring-matching on the message text.
+    #[error("Authentication error: {0}")]
+    AuthError(String),
+
+    /// HTTP request that completed but returned a non-success status code.
+    /// Carries the status code and response body so callers can distinguish
+    /// retryable (5xx, 429) from definitive (4xx) failures without parsing.
+    #[error("HTTP {status}: {body}")]
+    HttpStatusError { status: u16, body: String },
+
     /// Pass-through variant that preserves the inner string verbatim — no
     /// "Variant: " prefix is added by `Display`. Use this when migrating a
     /// handler from `Result<T, String>` to `Result<T, AppError>` and the
@@ -115,6 +127,8 @@ impl Serialize for AppError {
             AppError::EncodingError(_) => "EncodingError",
             AppError::TauriError(_) => "TauriError",
             AppError::NetworkError(_) => "NetworkError",
+            AppError::AuthError(_) => "AuthError",
+            AppError::HttpStatusError { .. } => "HttpStatusError",
             AppError::Raw(_) => "Raw",
         };
 
@@ -369,6 +383,31 @@ impl AppError {
                 suggested_action: Some("Check your network connection and try again.".to_string()),
             },
 
+            AppError::AuthError(msg) => UserFacingError {
+                title: "Authentication Error".to_string(),
+                message: "You are not signed in or your session has expired."
+                    .to_string(),
+                details: Some(msg.clone()),
+                error_code: "AUTH_001".to_string(),
+                severity: ErrorSeverity::Warning,
+                recoverable: true,
+                suggested_action: Some("Sign in again to continue.".to_string()),
+            },
+
+            AppError::HttpStatusError { status, body } => UserFacingError {
+                title: "HTTP Error".to_string(),
+                message: format!("Server returned HTTP {}.", status),
+                details: Some(body.clone()),
+                error_code: format!("HTTP_{}", status),
+                severity: if (500..600).contains(status) {
+                    ErrorSeverity::Error
+                } else {
+                    ErrorSeverity::Warning
+                },
+                recoverable: matches!(status, 408 | 425 | 429 | 500..=504),
+                suggested_action: None,
+            },
+
             AppError::Raw(msg) => UserFacingError {
                 title: "Error".to_string(),
                 message: msg.clone(),
@@ -379,6 +418,23 @@ impl AppError {
                 suggested_action: None,
             },
         }
+    }
+}
+
+// =============================================================================
+// From<anyhow::Error> for AppError
+// =============================================================================
+//
+// Auth manager and several other helpers return `anyhow::Result`. Letting `?`
+// flow through into `Result<T, AppError>` removes a class of repetitive
+// `.map_err(|e| AppError::Raw(format!("...: {}", e)))?` boilerplate from
+// command handlers. Maps to `UnexpectedError` since by definition `anyhow`
+// wraps any error type; callers that want a more specific variant should
+// `.map_err(...)` explicitly before the `?`.
+
+impl From<anyhow::Error> for AppError {
+    fn from(err: anyhow::Error) -> Self {
+        AppError::UnexpectedError(format!("{:#}", err))
     }
 }
 
