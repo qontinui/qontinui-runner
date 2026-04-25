@@ -1,13 +1,16 @@
-//! UI Bridge handlers for MCP API
+//! UI Bridge handlers for MCP API.
 //!
-//! Provides HTTP handlers for UI Bridge control (React UI automation)
-//! and UI Bridge exploration (qontinui library via Python bridge).
+//! Provides HTTP handlers for UI Bridge control (React UI automation) and
+//! UI Bridge exploration (qontinui library via Python bridge).
 //!
-//! This module was extracted from a single 12.7kLOC file. Foundation
-//! pieces (request types, error taxonomy, circuit breaker, core IPC
-//! request machinery) live in dedicated submodules; the per-endpoint
-//! HTTP handlers and `routes()` composer are still inline in this file
-//! and will be extracted in subsequent passes.
+//! Originally a single 12.7kLOC file; now decomposed across ~25 thematic
+//! submodules. Each submodule exposes `pub fn routes() -> Router` and
+//! `pub fn route_entries() -> &'static [(&'static str, &'static str)]`.
+//! `mod.rs` contains only the `routes()` composer (which `.merge()`s every
+//! submodule's router), the `route_manifest()` cache (concatenates
+//! submodule entries for the `/_help` and `/_routes` endpoints), the
+//! shared `ipc_handler_*` macro definitions, and a small drift-test
+//! module. All per-endpoint handlers live in their family submodules.
 
 pub mod ai;
 pub mod ai_analyze;

@@ -1343,11 +1343,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(tokio::sync::Mutex::new(
             qontinui_runner_lib::accessibility::AccessibilityManager::default(),
         )) // Native cross-platform accessibility API
-        // All Tauri command handlers are registered via per-module plugins
-        // (see the `.plugin(...)` chain above). The previous central
-        // `generate_handler![...]` has been fully dismantled — each subsystem
-        // owns its own plugin, keeping registrations local to the module
-        // that defines the commands.
+        // Tauri command handlers are registered via the central
+        // `tauri::generate_handler![...]` block above. Each command module
+        // (`commands/*.rs` and a few subsystem `commands.rs` files) ALSO
+        // exposes a `pub fn plugin<R: Runtime>() -> TauriPlugin<R>` for
+        // future plugin-based registration, but those are not currently
+        // wired — Tauri 2's plugin path requires `plugin:<name>|<cmd>`
+        // invoke prefixes and the frontend invokes commands bare, so the
+        // plugin form was rolled back to the central handler at commit
+        // `1f1d807f6`. The `plugin()` fns are kept as ready-to-go scaffolding
+        // for any future migration that updates the frontend invoke sites.
         .setup(|app| {
             info!("Tauri application setup starting");
 
