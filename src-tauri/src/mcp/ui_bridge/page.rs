@@ -97,6 +97,12 @@ pub struct PageEvaluateRequest {
     /// compatibility.
     #[serde(default)]
     pub unwrap: Option<bool>,
+    /// EXPLICIT opt-in. When true, the frontend evaluate handler relaxes
+    /// only the four network-related blocks (fetch / XMLHttpRequest /
+    /// sendBeacon / WebSocket) so test assertions can hit runner APIs
+    /// directly. Structural code-injection blocks stay in force regardless.
+    #[serde(default)]
+    pub allow_network_requests: Option<bool>,
 }
 
 /// Request to evaluate multiple JS expressions in one round-trip.
@@ -622,6 +628,7 @@ async fn tagged_page_evaluate(
     await_promise: bool,
     timeout_ms: Option<u64>,
     unwrap: bool,
+    allow_network_requests: bool,
 ) -> Result<serde_json::Value, String> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_PAGE_EVALUATE_TIMEOUT_MS);
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -642,6 +649,10 @@ async fn tagged_page_evaluate(
         // true we skip the legacy conditional-wrap conversion below — the
         // frontend already produced the final payload.
         "unwrap": unwrap,
+        // Forward the explicit network-request opt-in to the frontend
+        // blocklist gate. snake_case to match the rest of this IPC payload's
+        // convention (await_promise / timeout_ms / request_id).
+        "allow_network_requests": allow_network_requests,
     });
 
     if let Err(e) = state
@@ -702,12 +713,20 @@ async fn page_evaluate_inner(
     timeout_ms: Option<u64>,
     await_promise: bool,
     unwrap: bool,
+    allow_network_requests: bool,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let preview: String = expression.chars().take(80).collect();
     info!("UI Bridge API: Page evaluate ({}...)", preview);
 
-    let ipc_result =
-        tagged_page_evaluate(&state, &expression, await_promise, timeout_ms, unwrap).await;
+    let ipc_result = tagged_page_evaluate(
+        &state,
+        &expression,
+        await_promise,
+        timeout_ms,
+        unwrap,
+        allow_network_requests,
+    )
+    .await;
     match ipc_result {
         Ok(data) => {
             if let Some(false) = data.get("success").and_then(|v| v.as_bool()) {
@@ -799,12 +818,14 @@ pub async fn ui_bridge_page_evaluate_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let timeout = request.timeout_ms.map(|ms| ms.clamp(1000, 600_000));
     let unwrap = request.unwrap.unwrap_or(false);
+    let allow_network_requests = request.allow_network_requests.unwrap_or(false);
     page_evaluate_inner(
         state,
         request.expression,
         timeout,
         request.await_promise,
         unwrap,
+        allow_network_requests,
     )
     .await
 }
@@ -820,7 +841,7 @@ pub async fn ui_bridge_page_evaluate_raw_handler(
             Json(api_error("page/evaluate-raw: body is empty".to_string())),
         ));
     }
-    page_evaluate_inner(state, body, None, false, false).await
+    page_evaluate_inner(state, body, None, false, false, false).await
 }
 
 /// POST /ui-bridge/control/page/evaluate-safe

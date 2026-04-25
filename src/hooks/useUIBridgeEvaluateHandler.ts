@@ -57,6 +57,14 @@ interface EvaluateRequestPayload {
    * branch in usePageEvents.ts::page_evaluate.
    */
   unwrap?: boolean;
+  /**
+   * EXPLICIT opt-in. When true, relaxes only the four network-related
+   * blocks (fetch / XMLHttpRequest / sendBeacon / WebSocket) so test
+   * assertions can hit runner APIs directly. Every structural code-
+   * injection block stays in force regardless. Mirrors the sibling
+   * branch in usePageEvents.ts::page_evaluate.
+   */
+  allow_network_requests?: boolean;
 }
 
 interface EvaluateResponsePayload {
@@ -67,24 +75,19 @@ interface EvaluateResponsePayload {
 }
 
 /**
- * Block patterns that enable code injection, data exfiltration, or
- * persistent state corruption. Mirrors the allowlist used by the legacy
- * `page_evaluate` branch in `usePageEvents.ts` — see that file for the
- * rationale on each entry. Deliberately allows: localStorage/sessionStorage
+ * Structural code-injection blocks — always enforced. Mirrors the
+ * structural set in `usePageEvents.ts::page_evaluate`. See that file for
+ * per-entry rationale. Deliberately allows: localStorage/sessionStorage
  * (tab navigation), location.reload (page refresh after config changes),
  * globalThis/Reflect/Proxy (deep inspection).
  */
-const DANGEROUS_PATTERNS: RegExp[] = [
+const STRUCTURAL_PATTERNS: RegExp[] = [
   /\bimport\s*\(/,
   /\brequire\s*\(/,
   /\b__proto__\b/,
   /\bconstructor\s*\[/,
   /\beval\s*\(/,
   /\bnew\s+Function\b/,
-  /\bfetch\s*\(/,
-  /\bXMLHttpRequest\b/,
-  /\bnavigator\.sendBeacon\b/,
-  /\bWebSocket\b/,
   /\bdocument\.cookie\b/,
   /\bwindow\.open\b/,
   /\bwindow\.location\.(assign|replace)\b/,
@@ -94,8 +97,23 @@ const DANGEROUS_PATTERNS: RegExp[] = [
   /\bcrypto\.subtle\b/,
 ];
 
-function rejectIfDangerous(expression: string): void {
-  for (const pattern of DANGEROUS_PATTERNS) {
+/**
+ * Network-related blocks — relaxed when the caller passes
+ * `allowNetworkRequests: true` so test assertions can hit runner APIs
+ * directly without the brittle `window["fet"+"ch"]` workaround.
+ */
+const NETWORK_PATTERNS: RegExp[] = [
+  /\bfetch\s*\(/,
+  /\bXMLHttpRequest\b/,
+  /\bnavigator\.sendBeacon\b/,
+  /\bWebSocket\b/,
+];
+
+function rejectIfDangerous(expression: string, allowNetworkRequests: boolean): void {
+  const patterns = allowNetworkRequests
+    ? STRUCTURAL_PATTERNS
+    : [...STRUCTURAL_PATTERNS, ...NETWORK_PATTERNS];
+  for (const pattern of patterns) {
     if (pattern.test(expression)) {
       throw new Error(`Expression rejected: contains prohibited pattern (${pattern.source})`);
     }
@@ -150,7 +168,7 @@ export function useUIBridgeEvaluateHandler(): void {
               return;
             }
 
-            const { request_id, expression, unwrap } = event.payload;
+            const { request_id, expression, unwrap, allow_network_requests } = event.payload;
             log.debug(`Received evaluate request`, request_id);
 
             let response: EvaluateResponsePayload;
@@ -172,7 +190,7 @@ export function useUIBridgeEvaluateHandler(): void {
               };
             } else {
               try {
-                rejectIfDangerous(expression);
+                rejectIfDangerous(expression, allow_network_requests === true);
                 const resolved = await evaluateExpression(expression);
                 if (unwrap === true) {
                   // Opt-in consistent shape: always `{ value, type }`.

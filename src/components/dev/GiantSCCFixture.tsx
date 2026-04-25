@@ -7,10 +7,16 @@
  * primary chunker always breaks production state machines below the
  * 150-state giant-SCC ceiling.
  *
- * This is a DEV-ONLY fixture. The component early-returns `null` in
- * production builds via the `import.meta.env.DEV` guard, and the lazy
- * ReactFlow mount only runs when a developer explicitly opens the
- * fixture. It is NOT wired into the user-visible tab list; instead it
+ * Available in every build (including the production temp runners the
+ * supervisor spawns for /manual-test). The `import.meta.env.DEV` gate
+ * was removed because temp runners build with `npm run build` and
+ * would otherwise have no way to exercise the fixture. The component
+ * is gated by an obscure keystroke (Ctrl+Shift+G) and an explicit
+ * UI Bridge action — both unreachable to end users without intent.
+ * It renders nothing until `isOpen === true`, so production bundle
+ * impact is the component's static cost only.
+ *
+ * It is NOT wired into the user-visible tab list; instead it
  * registers with the UI Bridge as a first-class component so a dev can
  * reach it via:
  *
@@ -63,7 +69,6 @@ export function GiantSCCFixture() {
 
   // Keyboard shortcut: Ctrl+Shift+G.
   useEffect(() => {
-    if (!import.meta.env.DEV) return;
     const handler = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.shiftKey && e.key === "G") {
         e.preventDefault();
@@ -81,13 +86,12 @@ export function GiantSCCFixture() {
     id: "dev-giant-scc-fixture",
     name: "Giant-SCC Dev Fixture",
     description:
-      "Synthetic 201-state giant-SCC state machine rendered through ChunkedGraphView. Exists purely to exercise the nested-overview drill-in path. DEV-only; actions no-op in production.",
+      "Synthetic 201-state giant-SCC state machine rendered through ChunkedGraphView. Exists purely to exercise the nested-overview drill-in path.",
     actions: [
       {
         id: "open",
         label: "Open fixture",
         handler: async () => {
-          if (!import.meta.env.DEV) return;
           setIsOpen(true);
         },
       },
@@ -95,7 +99,6 @@ export function GiantSCCFixture() {
         id: "close",
         label: "Close fixture",
         handler: async () => {
-          if (!import.meta.env.DEV) return;
           setIsOpen(false);
         },
       },
@@ -105,7 +108,6 @@ export function GiantSCCFixture() {
         description:
           "Selects a state inside the giant SCC; ChunkedGraphView's auto-drill effect should walk the nested path and render the secondary overview.",
         handler: async () => {
-          if (!import.meta.env.DEV) return;
           setIsOpen(true);
           // Pick a state that lives inside the giant SCC — any branch
           // leaf will force auto-drill through the primary chunk and
@@ -117,7 +119,6 @@ export function GiantSCCFixture() {
         id: "select-hub",
         label: "Select hub state",
         handler: async () => {
-          if (!import.meta.env.DEV) return;
           setIsOpen(true);
           setSelectedStateId(hubStateId);
         },
@@ -125,9 +126,6 @@ export function GiantSCCFixture() {
     ],
   });
 
-  // Hard gate: never render in production, even if a consumer mounts
-  // the component by accident.
-  if (!import.meta.env.DEV) return null;
   if (!isOpen) return null;
 
   return (
