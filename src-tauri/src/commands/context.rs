@@ -9,6 +9,7 @@
 //! - Evaluate auto-include rules
 
 use crate::context::{self, Context, ContextAutoInclude, ContextScope, ContextWithMetadata};
+use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -166,6 +167,10 @@ fn find_auto_include_reason(
 /// * `Err(String)` - Error message if contexts cannot be loaded
 #[tauri::command]
 pub fn get_all_contexts() -> Result<CommandResponse, String> {
+    get_all_contexts_impl().map_err(String::from)
+}
+
+fn get_all_contexts_impl() -> Result<CommandResponse, AppError> {
     info!("Getting all contexts");
 
     let contexts = get_all_contexts_combined();
@@ -173,10 +178,7 @@ pub fn get_all_contexts() -> Result<CommandResponse, String> {
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Retrieved {} contexts", contexts.len())),
-        data: Some(
-            serde_json::to_value(&contexts)
-                .map_err(|e| format!("Failed to serialize contexts: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&contexts)?),
     })
 }
 
@@ -192,6 +194,10 @@ pub fn get_all_contexts() -> Result<CommandResponse, String> {
 /// * `Err(String)` - Error message if lookup fails
 #[tauri::command]
 pub fn get_context(id: String) -> Result<CommandResponse, String> {
+    get_context_impl(id).map_err(String::from)
+}
+
+fn get_context_impl(id: String) -> Result<CommandResponse, AppError> {
     info!("Getting context: {}", id);
 
     let all_contexts = get_all_contexts_combined();
@@ -204,10 +210,7 @@ pub fn get_context(id: String) -> Result<CommandResponse, String> {
         } else {
             Some("Context not found".to_string())
         },
-        data: Some(
-            serde_json::to_value(&context)
-                .map_err(|e| format!("Failed to serialize context: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&context)?),
     })
 }
 
@@ -221,6 +224,10 @@ pub fn get_context(id: String) -> Result<CommandResponse, String> {
 /// * `Err(String)` - Error message if creation fails
 #[tauri::command]
 pub fn create_context(request: CreateContextRequest) -> Result<CommandResponse, String> {
+    create_context_impl(request).map_err(String::from)
+}
+
+fn create_context_impl(request: CreateContextRequest) -> Result<CommandResponse, AppError> {
     info!("Creating context: {}", request.name);
 
     let created = context::create_user_context(
@@ -230,15 +237,12 @@ pub fn create_context(request: CreateContextRequest) -> Result<CommandResponse, 
         request.tags.unwrap_or_default(),
         request.auto_include,
     )
-    .map_err(|e| format!("Failed to create context: {}", e))?;
+    .map_err(|e| AppError::ConfigError(format!("Failed to create context: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Context '{}' created", created.name)),
-        data: Some(
-            serde_json::to_value(&created)
-                .map_err(|e| format!("Failed to serialize context: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&created)?),
     })
 }
 
@@ -256,6 +260,13 @@ pub fn update_context(
     id: String,
     request: UpdateContextRequest,
 ) -> Result<CommandResponse, String> {
+    update_context_impl(id, request).map_err(String::from)
+}
+
+fn update_context_impl(
+    id: String,
+    request: UpdateContextRequest,
+) -> Result<CommandResponse, AppError> {
     info!("Updating context: {}", id);
 
     let updated = context::update_user_context(
@@ -266,15 +277,12 @@ pub fn update_context(
         request.tags,
         request.auto_include,
     )
-    .map_err(|e| format!("Failed to update context: {}", e))?;
+    .map_err(|e| AppError::ConfigError(format!("Failed to update context: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Context '{}' updated", updated.name)),
-        data: Some(
-            serde_json::to_value(&updated)
-                .map_err(|e| format!("Failed to serialize context: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&updated)?),
     })
 }
 
@@ -288,9 +296,14 @@ pub fn update_context(
 /// * `Err(String)` - Error message if deletion fails
 #[tauri::command]
 pub fn delete_context(id: String) -> Result<CommandResponse, String> {
+    delete_context_impl(id).map_err(String::from)
+}
+
+fn delete_context_impl(id: String) -> Result<CommandResponse, AppError> {
     info!("Deleting context: {}", id);
 
-    context::delete_user_context(&id).map_err(|e| format!("Failed to delete context: {}", e))?;
+    context::delete_user_context(&id)
+        .map_err(|e| AppError::ConfigError(format!("Failed to delete context: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -311,6 +324,10 @@ pub fn delete_context(id: String) -> Result<CommandResponse, String> {
 /// * `Err(String)` - Error message if search fails
 #[tauri::command]
 pub fn search_contexts(query: String) -> Result<CommandResponse, String> {
+    search_contexts_impl(query).map_err(String::from)
+}
+
+fn search_contexts_impl(query: String) -> Result<CommandResponse, AppError> {
     info!("Searching contexts: {}", query);
 
     let query_lower = query.to_lowercase();
@@ -336,10 +353,7 @@ pub fn search_contexts(query: String) -> Result<CommandResponse, String> {
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} matching contexts", matches.len())),
-        data: Some(
-            serde_json::to_value(&matches)
-                .map_err(|e| format!("Failed to serialize contexts: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&matches)?),
     })
 }
 
@@ -352,6 +366,10 @@ pub fn search_contexts(query: String) -> Result<CommandResponse, String> {
 /// * `Err(String)` - Error message if categories cannot be retrieved
 #[tauri::command]
 pub fn get_context_categories() -> Result<CommandResponse, String> {
+    get_context_categories_impl().map_err(String::from)
+}
+
+fn get_context_categories_impl() -> Result<CommandResponse, AppError> {
     info!("Getting context categories");
 
     let all_contexts = get_all_contexts_combined();
@@ -367,10 +385,7 @@ pub fn get_context_categories() -> Result<CommandResponse, String> {
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} categories", categories.len())),
-        data: Some(
-            serde_json::to_value(&categories)
-                .map_err(|e| format!("Failed to serialize categories: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&categories)?),
     })
 }
 
@@ -385,10 +400,15 @@ pub fn get_context_categories() -> Result<CommandResponse, String> {
 /// * `Err(String)` - Error message if update fails
 #[tauri::command]
 pub fn set_context_enabled(id: String, enabled: bool) -> Result<CommandResponse, String> {
+    set_context_enabled_impl(id, enabled).map_err(String::from)
+}
+
+fn set_context_enabled_impl(id: String, enabled: bool) -> Result<CommandResponse, AppError> {
     info!("Setting context {} enabled={}", id, enabled);
 
-    context::set_context_enabled(&id, enabled)
-        .map_err(|e| format!("Failed to update context enabled state: {}", e))?;
+    context::set_context_enabled(&id, enabled).map_err(|e| {
+        AppError::ConfigError(format!("Failed to update context enabled state: {}", e))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -413,10 +433,14 @@ pub fn set_context_enabled(id: String, enabled: bool) -> Result<CommandResponse,
 /// * `Err(String)` - Error message if recording fails
 #[tauri::command]
 pub fn record_context_usage(id: String) -> Result<CommandResponse, String> {
+    record_context_usage_impl(id).map_err(String::from)
+}
+
+fn record_context_usage_impl(id: String) -> Result<CommandResponse, AppError> {
     info!("Recording context usage: {}", id);
 
     context::record_context_use(&id)
-        .map_err(|e| format!("Failed to record context usage: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to record context usage: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -434,6 +458,10 @@ pub fn record_context_usage(id: String) -> Result<CommandResponse, String> {
 /// * `Err(String)` - Error message if contexts cannot be loaded
 #[tauri::command]
 pub fn get_builtin_contexts_cmd() -> Result<CommandResponse, String> {
+    get_builtin_contexts_cmd_impl().map_err(String::from)
+}
+
+fn get_builtin_contexts_cmd_impl() -> Result<CommandResponse, AppError> {
     info!("Getting builtin contexts");
 
     let builtin: Vec<ContextWithMetadata> = context::get_builtin_contexts()
@@ -451,10 +479,7 @@ pub fn get_builtin_contexts_cmd() -> Result<CommandResponse, String> {
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} builtin contexts", builtin.len())),
-        data: Some(
-            serde_json::to_value(&builtin)
-                .map_err(|e| format!("Failed to serialize contexts: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&builtin)?),
     })
 }
 
@@ -479,6 +504,14 @@ pub fn evaluate_auto_include(
     action_types: Vec<String>,
     recent_errors: Vec<String>,
 ) -> Result<CommandResponse, String> {
+    evaluate_auto_include_impl(task_prompt, action_types, recent_errors).map_err(String::from)
+}
+
+fn evaluate_auto_include_impl(
+    task_prompt: String,
+    action_types: Vec<String>,
+    recent_errors: Vec<String>,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Evaluating auto-include: prompt_len={}, action_types={:?}, errors={}",
         task_prompt.len(),
@@ -515,10 +548,7 @@ pub fn evaluate_auto_include(
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} contexts to auto-include", results.len())),
-        data: Some(
-            serde_json::to_value(&results)
-                .map_err(|e| format!("Failed to serialize results: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&results)?),
     })
 }
 
