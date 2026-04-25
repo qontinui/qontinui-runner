@@ -12,6 +12,7 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tracing::{error, info, warn};
 
+use crate::error::AppError;
 use crate::settings::{self, GlobalLogSource};
 
 use super::CommandResponse;
@@ -121,8 +122,12 @@ fn get_projects_base_dir() -> Result<PathBuf, String> {
 
     // Create if doesn't exist
     if !base.exists() {
-        fs::create_dir_all(&base)
-            .map_err(|e| format!("Failed to create projects directory: {}", e))?;
+        fs::create_dir_all(&base).map_err(|e| {
+            String::from(AppError::IoError(std::io::Error::new(
+                e.kind(),
+                format!("Failed to create projects directory: {}", e),
+            )))
+        })?;
     }
 
     Ok(base)
@@ -135,8 +140,12 @@ fn get_project_dir(project_id: &str) -> Result<PathBuf, String> {
 
     // Create if doesn't exist
     if !project_dir.exists() {
-        fs::create_dir_all(&project_dir)
-            .map_err(|e| format!("Failed to create project directory: {}", e))?;
+        fs::create_dir_all(&project_dir).map_err(|e| {
+            String::from(AppError::IoError(std::io::Error::new(
+                e.kind(),
+                format!("Failed to create project directory: {}", e),
+            )))
+        })?;
     }
 
     Ok(project_dir)
@@ -156,8 +165,12 @@ fn load_project_config(project_id: &str) -> Result<Option<ProjectLogConfig>, Str
         return Ok(None);
     }
 
-    let contents = fs::read_to_string(&config_path)
-        .map_err(|e| format!("Failed to read project config: {}", e))?;
+    let contents = fs::read_to_string(&config_path).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read project config: {}", e),
+        )))
+    })?;
 
     // First, try parsing as the new slim format
     if let Ok(config) = serde_json::from_str::<ProjectLogConfig>(&contents) {
@@ -334,11 +347,19 @@ fn migrate_old_config(
 fn save_project_config(config: &ProjectLogConfig) -> Result<(), String> {
     let config_path = get_project_config_path(&config.project_id)?;
 
-    let contents = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("Failed to serialize project config: {}", e))?;
+    let contents = serde_json::to_string_pretty(config).map_err(|e| {
+        String::from(AppError::ParseError(format!(
+            "Failed to serialize project config: {}",
+            e
+        )))
+    })?;
 
-    fs::write(&config_path, contents)
-        .map_err(|e| format!("Failed to write project config: {}", e))?;
+    fs::write(&config_path, contents).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to write project config: {}", e),
+        )))
+    })?;
 
     info!(
         "Saved project config for '{}' to {:?}",
@@ -350,8 +371,12 @@ fn save_project_config(config: &ProjectLogConfig) -> Result<(), String> {
 
 /// Tail the last N lines from a file
 fn tail_file(path: &PathBuf, num_lines: u32) -> Result<(Vec<String>, u64), String> {
-    let file =
-        File::open(path).map_err(|e| format!("Failed to open file {}: {}", path.display(), e))?;
+    let file = File::open(path).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to open file {}: {}", path.display(), e),
+        )))
+    })?;
 
     let reader = BufReader::new(&file);
     let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
