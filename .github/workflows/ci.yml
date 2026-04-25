@@ -73,7 +73,7 @@ jobs:
       - name: Lint frontend code
         run: |
           cd qontinui-runner
-          npm run lint || true
+          npm run lint
 
       - name: Format Rust code check
         run: |
