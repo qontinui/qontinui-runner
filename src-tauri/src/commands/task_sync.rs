@@ -12,6 +12,7 @@
 use crate::auth::AuthManager;
 use crate::commands::compartments::StorageCompartment;
 use crate::database::pg::PgDb;
+use crate::error::AppError;
 use crate::database::TaskRun;
 use crate::findings::types::{Finding, FindingStatus};
 use serde::{Deserialize, Serialize};
@@ -950,7 +951,7 @@ pub async fn sync_ai_task_created(
         .pg_db()
         .get_task_run(&task_id)
         .await?
-        .ok_or_else(|| format!("Task {} not found", task_id))?;
+        .ok_or_else(|| String::from(AppError::Raw(format!("Task {} not found", task_id))))?;
 
     let service = AITaskSyncService::new();
     service
@@ -1039,7 +1040,7 @@ pub async fn sync_ai_task_completed(
         .pg_db()
         .get_task_run(&task_id)
         .await?
-        .ok_or_else(|| format!("Task {} not found", task_id))?;
+        .ok_or_else(|| String::from(AppError::Raw(format!("Task {} not found", task_id))))?;
 
     let service = AITaskSyncService::new();
     service.sync_task_completed(&task).await
@@ -1073,7 +1074,9 @@ pub async fn sync_all_pending_ai_tasks(
 
     // Check auth first
     if !service.auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in to sync.".to_string());
+        return Err(String::from(AppError::AuthError(
+            "Not authenticated. Please log in to sync.".to_string(),
+        )));
     }
 
     // Get recent task runs (limit to last 50)
