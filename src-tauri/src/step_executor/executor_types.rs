@@ -582,6 +582,28 @@ pub struct ExecutionStepConfig {
     pub vga_async: Option<bool>,
 
     // ========================================================================
+    // Wrapper Action Step Fields (Phase 3)
+    // ========================================================================
+    /// Wrapper Action: ID of the installed wrapper to dispatch through.
+    #[serde(alias = "wrapperId", alias = "wrapper_id", default)]
+    pub wrapper_id: Option<String>,
+
+    /// Wrapper Action: ID of the action exposed by the wrapper.
+    #[serde(alias = "actionId", alias = "action_id", default)]
+    pub wrapper_action_id: Option<String>,
+
+    /// Wrapper Action: JSON object of params to pass to the action.
+    /// Values may contain `{{ variable }}` template references that are
+    /// resolved against the workflow's runtime context before dispatch.
+    #[serde(alias = "wrapperParams", alias = "wrapper_params", default)]
+    pub wrapper_params: Option<serde_json::Value>,
+
+    /// Wrapper Action: Optional name of a workflow variable to write the
+    /// dispatch result to. Empty / `None` means "don't store the result".
+    #[serde(alias = "resultVariable", alias = "result_variable", default)]
+    pub wrapper_result_variable: Option<String>,
+
+    // ========================================================================
     // Console Error Handling
     // ========================================================================
     /// If true, step fails when console errors are captured during execution

@@ -96,6 +96,7 @@ mod vga_automate;
 mod workflow;
 mod workflow_fixup;
 mod workflow_ref;
+mod wrapper_action;
 
 // Re-export handlers for registration
 use code_execution::CodeExecutionHandler;
@@ -111,6 +112,7 @@ use vga_automate::VgaAutomateHandler;
 use workflow::WorkflowStepHandler;
 use workflow_fixup::WorkflowFixupHandler;
 use workflow_ref::WorkflowRefHandler;
+use wrapper_action::WrapperActionHandler;
 
 /// Result of executing a step handler.
 ///
@@ -483,7 +485,7 @@ impl HandlerRegistry {
     /// Create a registry pre-populated with all standard handlers.
     ///
     /// This is the recommended way to create a registry for production use.
-    /// 13 active handlers: command, execute_playbook, ui_bridge, prompt, restart_process, save_workflow_artifact, workflow_fixup, workflow, workflow_ref, dag_cancel, dag_approval, dag_loop, vga_automate
+    /// 14+ active handlers: command, execute_playbook, ui_bridge, prompt, restart_process, save_workflow_artifact, workflow_fixup, workflow, workflow_ref, wrapper_action, dag_cancel, dag_approval, dag_loop, vga_automate
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 
@@ -501,6 +503,7 @@ impl HandlerRegistry {
         registry.register(VgaAutomateHandler);
         registry.register(WorkflowStepHandler);
         registry.register(WorkflowRefHandler);
+        registry.register(WrapperActionHandler);
         registry.register(dag_nodes::DagCancelHandler);
         registry.register(dag_nodes::DagApprovalHandler);
         registry.register(dag_nodes::DagLoopHandler);

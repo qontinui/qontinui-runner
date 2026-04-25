@@ -70,6 +70,8 @@ const PAGE_TO_TAB: Record<string, MainTabId> = {
   "config-hooks": "config-hooks",
   "config-log-sources": "config-log-sources",
   "config-ui-bridge": "config-ui-bridge",
+  // Wrappers
+  wrappers: "wrappers",
   // Tools & System
   "generator-eval": "generator-eval",
   evaluation: "evaluation",

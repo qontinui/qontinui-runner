@@ -97,6 +97,7 @@ import {
   Repeat,
   Video,
   Target,
+  Package,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -191,6 +192,7 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   Repeat,
   Video,
   Target,
+  Package,
 };
 
 function getIconComponent(iconName: IconName): LucideIcon {

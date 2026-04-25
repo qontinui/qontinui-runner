@@ -158,6 +158,7 @@ mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
 mod worktree;
+mod wrappers;
 mod zombie_sweep;
 
 use commands::AppState;
@@ -439,6 +440,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         usb_transport: Arc::new(tokio::sync::OnceCell::new()),
         app_registry: Arc::new(tokio::sync::OnceCell::new()),
         app_dispatcher: Arc::new(tokio::sync::OnceCell::new()),
+        wrapper_state: Arc::new(tokio::sync::OnceCell::new()),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();

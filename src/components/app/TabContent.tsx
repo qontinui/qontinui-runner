@@ -73,6 +73,7 @@ import { MetaOptimizerPage } from "@/pages/MetaOptimizerPage";
 import { OnlineLearningDashboard } from "@/components/online-learning/OnlineLearningDashboard";
 import { SpecsPage } from "@/pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "@/pages/ui-bridge-integration/UIBridgeIntegrationPage";
+import { WrappersLibraryPage } from "@/pages/wrappers/WrappersLibraryPage";
 import { UIBridgeStateMachinePage } from "@/pages/state-machine";
 import { ImageQualityTestsPage } from "@/pages/ImageQualityTestsPage";
 import { EventHistoryPage } from "@/pages/EventHistoryPage";
@@ -1187,6 +1188,18 @@ export function TabContent({
             description="Tutorials, documentation, and getting started guides"
           />
           <HelpTab />
+        </div>
+      );
+
+    case "wrappers":
+      return (
+        <div data-page-id="wrappers" className="h-full overflow-hidden">
+          <PageRegistration
+            id="wrappers"
+            name="Wrappers"
+            description="Install and manage wrapper extensions — typed actions for the runner"
+          />
+          <WrappersLibraryPage />
         </div>
       );
 

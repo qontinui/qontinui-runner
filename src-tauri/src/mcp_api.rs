@@ -437,6 +437,19 @@ pub fn create_router(
         .app_dispatcher
         .set(shared_app_dispatcher.clone());
 
+    // Wrapper subsystem (Phase 1 of the wrapper-runner integration plan).
+    // `create_router` is sync, so spawn the async bootstrap onto the tokio
+    // runtime. The registry's filesystem scan + file watcher startup happen
+    // on the spawned task. Until the OnceCell is populated `/wrappers/*`
+    // returns 503 — `routes::require_wrapper_state` already handles that.
+    {
+        let cell = app_state.wrapper_state.clone();
+        tokio::spawn(async move {
+            let ws = crate::wrappers::WrapperState::new_default().await;
+            let _ = cell.set(ws);
+        });
+    }
+
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
@@ -1393,6 +1406,7 @@ pub fn create_router(
         .merge(crate::mcp::api_requests::routes())
         .merge(crate::mcp::app_discovery::routes())
         .merge(crate::mcp::ws_relay::routes())
+        .merge(crate::wrappers::routes::router())
         .merge(crate::mcp::physical_device_api::routes())
         .merge(crate::mcp::tunnel_api::routes())
         .merge(crate::mcp::automation_runs::routes())

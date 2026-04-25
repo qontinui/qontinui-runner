@@ -5,6 +5,7 @@ import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { AccountUsageInfo } from "./useSessionManager";
 import { LaunchMenu } from "./LaunchMenu";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
+import { WrapperToolsBadge } from "@/components/wrappers/WrapperToolsBadge";
 
 interface TerminalTabBarProps {
   tabs: TerminalTab[];
@@ -575,8 +576,10 @@ export function TerminalTabBar({
         })}
       </div>
 
-      {/* Pinned right: session list dropdown */}
+      {/* Pinned right: wrapper tools badge + session list dropdown */}
       <div className="flex items-center gap-0.5 px-1 shrink-0">
+        {/* Wrapper tools available to AI agents (Phase 4 visibility) */}
+        <WrapperToolsBadge />
         {/* Session dropdown */}
         {tabs.length > 0 && (
           <div className="relative ml-auto shrink-0" ref={dropdownRef}>

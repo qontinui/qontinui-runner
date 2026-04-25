@@ -9,6 +9,7 @@ import {
   WorkflowConfig,
   DataFlowSection,
 } from "./step-config";
+import { WrapperActionStepConfig } from "./WrapperActionStepConfig";
 
 function findStepPhase(
   stepId: string,
@@ -77,6 +78,8 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
         return "UI Bridge";
       case "workflow":
         return "Workflow";
+      case "wrapper_action":
+        return "Wrapper Action";
       default:
         return "Step";
     }
@@ -161,6 +164,12 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
           <WorkflowConfig
             step={selectedStep as UnifiedStep & { type: "workflow" }}
             onChangeWorkflow={onOpenWorkflowPicker}
+          />
+        )}
+        {selectedStep.type === "wrapper_action" && (
+          <WrapperActionStepConfig
+            step={selectedStep as UnifiedStep & { type: "wrapper_action" }}
+            onUpdate={handleUpdate}
           />
         )}
 

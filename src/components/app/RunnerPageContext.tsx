@@ -134,6 +134,7 @@ export function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
       logs: { name: "Logs", section: "system", breadcrumb: ["System", "Logs"] },
       help: { name: "Help", section: "system", breadcrumb: ["Help"] },
       ai: { name: "AI Output", section: "observe", breadcrumb: ["Observe", "AI Output"] },
+      wrappers: { name: "Wrappers", section: "wrappers", breadcrumb: ["Wrappers"] },
     };
 
     return map[activeTab] ?? { name: activeTab, section: "other", breadcrumb: [activeTab] };

@@ -32,7 +32,9 @@ import {
   GitBranch,
   Pointer,
   GitCompareArrows,
+  Plug2,
 } from "lucide-react";
+import { generateStepId } from "@qontinui/workflow-utils";
 import type { WorkflowPhase, UnifiedStep } from "../../types";
 // workflow-ui uses the wire-side UnifiedStep (open `Other` variant); its
 // callback hands us those, so type the handler params against that package.
@@ -153,6 +155,40 @@ export function AddStepDropdown({
             onSkillUsed={onSkillUsed}
             resolveIcon={resolveIcon}
           />
+          {/* Wrapper Action — phase 3 step type, grouped with the
+              integration / external-tool steps. Hidden from the agentic
+              phase since that phase only carries `prompt` steps today. */}
+          {phase !== "agentic" && (
+            <div className="px-3 py-2 border-t border-zinc-700/50">
+              <button
+                className="w-full flex items-center gap-2 px-2 py-1.5 text-xs text-zinc-300 hover:text-zinc-100 hover:bg-zinc-700/50 rounded-md transition-colors"
+                onClick={() => {
+                  // Construct a minimal `wrapper_action` step. The step
+                  // config UI will gate the wrapper / action pickers.
+                  const newStep = {
+                    id: generateStepId(),
+                    type: "wrapper_action" as const,
+                    name: "Wrapper Action",
+                    phase,
+                    wrapperId: "",
+                    actionId: "",
+                    params: {},
+                    resultVariable: "",
+                  };
+                  // Cast through unknown — `wrapper_action` is a runner-side
+                  // extension over the canonical wire contract.
+                  onAddStep(newStep as unknown as UnifiedStep, phase);
+                  onClose();
+                }}
+              >
+                <Plug2 className="w-3.5 h-3.5 text-cyan-400" />
+                <span className="font-medium">Wrapper Action</span>
+                <span className="text-zinc-500 text-[10px]">
+                  Dispatch a typed action through an installed wrapper
+                </span>
+              </button>
+            </div>
+          )}
           <div className="px-3 py-2 border-t border-zinc-700/50">
             <button
               className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/50 rounded-md transition-colors"

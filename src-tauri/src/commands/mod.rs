@@ -406,6 +406,12 @@ pub struct AppState {
     /// without re-wiring ApiState.
     pub app_dispatcher:
         Arc<tokio::sync::OnceCell<Arc<crate::mcp::app_dispatch::AppDispatcher>>>,
+    /// Late-initialized handle to the wrapper subsystem (registry +
+    /// manager + dispatch). Populated during HTTP server bootstrap so
+    /// `/wrappers/*` routes can resolve via the same OnceCell pattern as
+    /// `app_registry` / `app_dispatcher`.
+    pub wrapper_state:
+        Arc<tokio::sync::OnceCell<Arc<crate::wrappers::WrapperState>>>,
 }
 
 impl AppState {
