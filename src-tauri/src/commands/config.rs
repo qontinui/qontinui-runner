@@ -46,9 +46,11 @@ pub async fn load_configuration(
     let config = ConfigLoader::load_from_file(&path)
         .map_err(|e| {
             error!("Failed to load configuration from {}: {}", path, e);
-            AppError::ConfigError(format!("Failed to load configuration: {}", e))
-        })
-        .map_err(|e| e.to_string())?;
+            String::from(AppError::ConfigError(format!(
+                "Failed to load configuration: {}",
+                e
+            )))
+        })?;
 
     let summary = config.summary();
 
@@ -380,9 +382,13 @@ pub fn save_include_summary_step_by_default(enabled: bool) -> Result<CommandResp
 ///   - `spawn_script`: Full path to spawn-independent-claude.py
 #[tauri::command]
 pub fn get_workspace_paths() -> Result<CommandResponse, String> {
-    // Get the current executable's directory
-    let exe_path =
-        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
+    get_workspace_paths_impl().map_err(String::from)
+}
+
+fn get_workspace_paths_impl() -> Result<CommandResponse, AppError> {
+    // Get the current executable's directory.
+    // `?` lifts std::io::Error via the blanket From impl.
+    let exe_path = std::env::current_exe()?;
 
     // The executable is in qontinui-runner/src-tauri/target/debug or release
     // We need to go up to find the qontinui-runner directory, then up again for workspace
@@ -399,8 +405,7 @@ pub fn get_workspace_paths() -> Result<CommandResponse, String> {
             current = parent;
         } else {
             // Fallback: try to find from current working directory
-            let cwd = std::env::current_dir()
-                .map_err(|e| format!("Failed to get current directory: {}", e))?;
+            let cwd = std::env::current_dir()?;
             break cwd;
         }
     };
