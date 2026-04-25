@@ -28,7 +28,7 @@ export function AnomalyFeed({ anomalies }: AnomalyFeedProps) {
           Anomaly Detection
         </h3>
         <div className="text-center text-muted-foreground py-6">
-          <p className="text-sm">No anomalies detected</p>
+          <p className="text-sm">No anomalies detected.</p>
         </div>
       </div>
     );

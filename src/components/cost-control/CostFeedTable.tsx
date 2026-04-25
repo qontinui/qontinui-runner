@@ -53,7 +53,7 @@ export function CostFeedTable({ events }: CostFeedTableProps) {
 
       {displayEvents.length === 0 ? (
         <div className="text-center text-muted-foreground py-6">
-          <p className="text-sm">No cost events yet</p>
+          <p className="text-sm">No cost events recorded yet.</p>
         </div>
       ) : (
         <div className="max-h-64 overflow-y-auto">

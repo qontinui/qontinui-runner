@@ -26,23 +26,29 @@ export function CircuitBreakerStatus({ budget }: CircuitBreakerStatusProps) {
         <h3 className="text-sm font-semibold">Circuit Breaker</h3>
       </div>
 
-      <div className="flex items-center gap-3">
-        <Badge variant={tripped ? "danger" : "success"}>{tripped ? "Tripped" : "Closed"}</Badge>
-        {tripped && (
-          <span className="text-xs text-red-400">Budget exceeded or anomaly detected</span>
-        )}
-        {!tripped && !budget && (
-          <span className="text-xs text-muted-foreground">No active budget</span>
-        )}
-      </div>
-
-      {budget && (
-        <div className="mt-3 text-xs text-muted-foreground space-y-1">
-          <p>Anomaly samples: {budget.anomaly_detector_sample_count}</p>
-          {budget.anomaly_detector_mean > 0 && (
-            <p>Mean cost: ${budget.anomaly_detector_mean.toFixed(4)}</p>
-          )}
+      {!budget ? (
+        <div className="text-sm text-muted-foreground">
+          <p>No circuit breakers active.</p>
+          <p className="text-xs mt-1">
+            Breakers arm automatically when a run with a budget starts.
+          </p>
         </div>
+      ) : (
+        <>
+          <div className="flex items-center gap-3">
+            <Badge variant={tripped ? "danger" : "success"}>{tripped ? "Tripped" : "Closed"}</Badge>
+            {tripped && (
+              <span className="text-xs text-red-400">Budget exceeded or anomaly detected</span>
+            )}
+          </div>
+
+          <div className="mt-3 text-xs text-muted-foreground space-y-1">
+            <p>Anomaly samples: {budget.anomaly_detector_sample_count}</p>
+            {budget.anomaly_detector_mean > 0 && (
+              <p>Mean cost: ${budget.anomaly_detector_mean.toFixed(4)}</p>
+            )}
+          </div>
+        </>
       )}
     </div>
   );

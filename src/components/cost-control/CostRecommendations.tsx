@@ -184,8 +184,8 @@ export function CostRecommendations() {
       ) : !hasContent ? (
         <div className="text-center text-muted-foreground py-6">
           <TrendingDown className="w-8 h-8 mx-auto mb-2 opacity-50" />
-          <p className="text-sm">No cost optimization recommendations yet</p>
-          <p className="text-xs mt-1">Run workflows to accumulate data for cost analysis</p>
+          <p className="text-sm">No recommendations at this time.</p>
+          <p className="text-xs mt-1">Run workflows to accumulate data for cost analysis.</p>
         </div>
       ) : (
         <div className="space-y-2 max-h-64 overflow-y-auto">

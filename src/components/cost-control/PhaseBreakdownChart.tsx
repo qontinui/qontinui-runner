@@ -78,7 +78,7 @@ export function PhaseBreakdownChart({ data }: PhaseBreakdownChartProps) {
           Cost by Phase
         </h3>
         <div className="text-center text-muted-foreground py-8">
-          <p className="text-sm">No phase cost data available</p>
+          <p className="text-sm">Phase breakdown unavailable &mdash; no data yet.</p>
         </div>
       </div>
     );

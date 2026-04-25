@@ -6,7 +6,7 @@
  * dashboard data and active budget status via TanStack Query.
  */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -20,6 +20,32 @@ import type {
 
 const MAX_EVENTS = 200;
 
+/** A single fetch error surfaced to the UI. */
+export interface CostControlSourceError {
+  /** Stable identifier of the failing data source. */
+  source: "cost-dashboard" | "budget";
+  /** Human-readable message; empty queries swallow their errors and never appear here. */
+  message: string;
+}
+
+/** Aggregated query status for the Cost Control panel. */
+export interface CostControlStatus {
+  isLoading: boolean;
+  isError: boolean;
+  errors: CostControlSourceError[];
+}
+
+function errorMessage(err: unknown): string {
+  if (err == null) return "Unknown error";
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
 export function useCostControl() {
   const queryClient = useQueryClient();
   const [costEvents, setCostEvents] = useState<CostUpdateEvent[]>([]);
@@ -31,6 +57,8 @@ export function useCostControl() {
   const {
     data: dashboard,
     isLoading: dashboardLoading,
+    isError: dashboardIsError,
+    error: dashboardError,
     refetch: refetchDashboard,
   } = useQuery<CostDashboard>({
     queryKey: ["cost-dashboard"],
@@ -38,10 +66,15 @@ export function useCostControl() {
     staleTime: 30_000,
   });
 
-  // Active budget status (may not exist yet - degrade gracefully)
+  // Active budget status (may not exist yet - degrade gracefully).
+  // The queryFn swallows backend errors and returns null so the panel can
+  // render a "no active budget" empty state. isError is therefore reserved
+  // for unexpected query-layer failures (e.g. invalidation/serialization).
   const {
     data: activeBudget,
     isLoading: budgetLoading,
+    isError: budgetIsError,
+    error: budgetError,
     refetch: refetchBudget,
   } = useQuery<ActiveBudgetStatus | null>({
     queryKey: ["active-budget-status"],
@@ -99,13 +132,36 @@ export function useCostControl() {
     refetchBudget();
   }, [refetchDashboard, refetchBudget]);
 
+  const status: CostControlStatus = useMemo(() => {
+    const errors: CostControlSourceError[] = [];
+    if (dashboardIsError) {
+      errors.push({ source: "cost-dashboard", message: errorMessage(dashboardError) });
+    }
+    if (budgetIsError) {
+      errors.push({ source: "budget", message: errorMessage(budgetError) });
+    }
+    return {
+      isLoading: dashboardLoading || budgetLoading,
+      isError: errors.length > 0,
+      errors,
+    };
+  }, [
+    dashboardIsError,
+    dashboardError,
+    budgetIsError,
+    budgetError,
+    dashboardLoading,
+    budgetLoading,
+  ]);
+
   return {
     costEvents,
     budgetWarnings,
     anomalies,
     dashboard: dashboard ?? null,
     activeBudget: activeBudget ?? null,
-    isLoading: dashboardLoading || budgetLoading,
+    isLoading: status.isLoading,
+    status,
     refresh,
   };
 }
