@@ -8,6 +8,7 @@
 //! - Action log viewing and management
 
 use crate::commands::compartments::{BridgeCompartment, StorageCompartment};
+use crate::error::AppError;
 use crate::executor::{require_running_bridge_compartment, with_default_bridge_compartment};
 use crate::safe_eprintln;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -44,9 +45,7 @@ pub async fn execute_transition(
     });
 
     with_default_bridge_compartment(&bridge, |bridge| {
-        bridge
-            .send_command("execute_transition", Some(params))
-            .map_err(|e| e.to_string())
+        bridge.send_command("execute_transition", Some(params))
     })??;
 
     Ok(CommandResponse {
@@ -85,9 +84,7 @@ pub async fn navigate_to_state(
     });
 
     with_default_bridge_compartment(&bridge, |bridge| {
-        bridge
-            .send_command("navigate_to_state", Some(params))
-            .map_err(|e| e.to_string())
+        bridge.send_command("navigate_to_state", Some(params))
     })??;
 
     Ok(CommandResponse {
@@ -125,9 +122,7 @@ pub async fn navigate_to_multiple_states(
     });
 
     with_default_bridge_compartment(&bridge, |bridge| {
-        bridge
-            .send_command("navigate_to_multiple_states", Some(params))
-            .map_err(|e| e.to_string())
+        bridge.send_command("navigate_to_multiple_states", Some(params))
     })??;
 
     Ok(CommandResponse {
@@ -159,9 +154,7 @@ pub async fn get_active_states(
     let params = serde_json::json!({});
 
     with_default_bridge_compartment(&bridge, |bridge| {
-        bridge
-            .send_command("get_active_states", Some(params))
-            .map_err(|e| e.to_string())
+        bridge.send_command("get_active_states", Some(params))
     })??;
 
     Ok(CommandResponse {
@@ -194,9 +187,7 @@ pub async fn get_available_transitions(
     let params = serde_json::json!({});
 
     with_default_bridge_compartment(&bridge, |bridge| {
-        bridge
-            .send_command("get_available_transitions", Some(params))
-            .map_err(|e| e.to_string())
+        bridge.send_command("get_available_transitions", Some(params))
     })??;
 
     Ok(CommandResponse {
@@ -232,7 +223,10 @@ pub async fn get_action_log_view(
     let view_data = processor.get_view("action_log").map_err(|e| {
         safe_eprintln!("[DEBUG] get_view failed: {}", e);
         error!("Failed to get action log view: {}", e);
-        format!("Failed to get action log view: {}", e)
+        String::from(AppError::StateError(format!(
+            "Failed to get action log view: {}",
+            e
+        )))
     })?;
 
     safe_eprintln!("[DEBUG] get_view succeeded, view_data: {:?}", view_data);
