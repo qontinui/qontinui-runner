@@ -33,7 +33,7 @@ pub async fn get_meta_optimizer_recommendations(
     status: Option<String>,
 ) -> Result<Vec<Recommendation>, String> {
     crate::meta_optimizer::recommendations::list_recommendations_async(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         optimizer_type.as_deref(),
         status.as_deref(),
     )
@@ -46,7 +46,7 @@ pub async fn apply_meta_optimizer_recommendation(
     recommendation_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::recommendations::apply_recommendation_with_side_effects_async(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         &recommendation_id,
     )
     .await
@@ -58,7 +58,7 @@ pub async fn reject_meta_optimizer_recommendation(
     recommendation_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::recommendations::reject_recommendation_async(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         &recommendation_id,
     )
     .await
@@ -70,7 +70,7 @@ pub async fn rollback_meta_optimizer_recommendation(
     recommendation_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::recommendations::rollback_recommendation_async(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         &recommendation_id,
     )
     .await
@@ -100,7 +100,7 @@ pub async fn activate_prompt_variant(
 pub async fn get_meta_optimizer_runs(
     app_state: State<'_, StorageCompartment>,
 ) -> Result<Vec<MetaOptimizerRun>, String> {
-    crate::meta_optimizer::recommendations::list_optimizer_runs_async(&app_state.pg_db()).await
+    crate::meta_optimizer::recommendations::list_optimizer_runs_async(app_state.pg_db()).await
 }
 
 // ── Progress Tracking ─────────────────────────────────────────────────
@@ -121,7 +121,7 @@ pub async fn get_meta_optimizer_progress(
 ) -> Result<serde_json::Value, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
     let summary =
-        crate::meta_optimizer::snapshots::get_progress_summary_async(&app_state.pg_db(), cat).await?;
+        crate::meta_optimizer::snapshots::get_progress_summary_async(app_state.pg_db(), cat).await?;
     serde_json::to_value(summary).map_err(|e: serde_json::Error| String::from(AppError::from(e)))
 }
 
@@ -132,7 +132,7 @@ pub async fn capture_meta_optimizer_baseline(
 ) -> Result<serde_json::Value, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
     let snapshot =
-        crate::meta_optimizer::snapshots::capture_baseline_async(&app_state.pg_db(), cat).await?;
+        crate::meta_optimizer::snapshots::capture_baseline_async(app_state.pg_db(), cat).await?;
     serde_json::to_value(snapshot).map_err(|e: serde_json::Error| String::from(AppError::from(e)))
 }
 
@@ -142,7 +142,7 @@ pub async fn get_meta_optimizer_snapshots(
     snapshot_type: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let snapshots = crate::meta_optimizer::snapshots::list_snapshots_async(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         snapshot_type.as_deref(),
     )
     .await?;
@@ -170,7 +170,7 @@ pub async fn get_meta_optimizer_failure_analysis(
 ) -> Result<crate::meta_optimizer::failure_analysis::FailureAnalysis, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
     crate::meta_optimizer::failure_analysis::get_failure_analysis(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         days.unwrap_or(30),
         cat,
     )
@@ -183,7 +183,7 @@ pub async fn get_recommendation_outcomes(
     app_state: State<'_, StorageCompartment>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let recs = crate::meta_optimizer::recommendations::list_recommendations_async(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         None,
         Some("applied"),
     )
@@ -209,7 +209,7 @@ pub async fn reevaluate_recommendation_outcome(
     recommendation_id: String,
 ) -> Result<serde_json::Value, String> {
     let outcome = crate::meta_optimizer::snapshots::evaluate_recommendation_outcome(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         &recommendation_id,
     )?;
     serde_json::to_value(outcome).map_err(|e: serde_json::Error| String::from(AppError::from(e)))
@@ -259,7 +259,7 @@ pub async fn start_canary_rollout(
     percentage: Option<i64>,
 ) -> Result<String, String> {
     crate::meta_optimizer::canary::start_canary(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         &recommendation_id,
         percentage.unwrap_or(10),
     )
@@ -269,9 +269,9 @@ pub async fn start_canary_rollout(
 pub async fn get_canary_rollouts(
     app_state: State<'_, StorageCompartment>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let rollouts = crate::meta_optimizer::canary::get_active_canaries(&app_state.pg_db())?;
+    let rollouts = crate::meta_optimizer::canary::get_active_canaries(app_state.pg_db())?;
     let recs = crate::meta_optimizer::recommendations::list_recommendations_async(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         None,
         None,
     )
@@ -298,7 +298,7 @@ pub async fn promote_canary_rollout(
     app_state: State<'_, StorageCompartment>,
     canary_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::canary::promote_canary(&app_state.pg_db(), &canary_id)
+    crate::meta_optimizer::canary::promote_canary(app_state.pg_db(), &canary_id)
 }
 
 #[tauri::command]
@@ -306,7 +306,7 @@ pub async fn rollback_canary_rollout(
     app_state: State<'_, StorageCompartment>,
     canary_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::canary::rollback_canary(&app_state.pg_db(), &canary_id)
+    crate::meta_optimizer::canary::rollback_canary(app_state.pg_db(), &canary_id)
 }
 
 // ── Prompt Template A/B Testing ──────────────────────────────────────────
@@ -390,7 +390,7 @@ pub async fn get_eval_specs(
     app_state: State<'_, StorageCompartment>,
     target_agent: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::eval_spec::EvalSpec>, String> {
-    crate::meta_optimizer::eval_spec::list_eval_specs(&app_state.pg_db(), target_agent.as_deref())
+    crate::meta_optimizer::eval_spec::list_eval_specs(app_state.pg_db(), target_agent.as_deref())
 }
 
 #[tauri::command]
@@ -398,7 +398,7 @@ pub async fn create_eval_spec(
     app_state: State<'_, StorageCompartment>,
     spec: crate::meta_optimizer::eval_spec::EvalSpec,
 ) -> Result<(), String> {
-    crate::meta_optimizer::eval_spec::save_eval_spec(&app_state.pg_db(), &spec)
+    crate::meta_optimizer::eval_spec::save_eval_spec(app_state.pg_db(), &spec)
 }
 
 #[tauri::command]
@@ -406,7 +406,7 @@ pub async fn delete_eval_spec(
     app_state: State<'_, StorageCompartment>,
     spec_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::eval_spec::delete_eval_spec(&app_state.pg_db(), &spec_id)
+    crate::meta_optimizer::eval_spec::delete_eval_spec(app_state.pg_db(), &spec_id)
 }
 
 #[tauri::command]
@@ -416,7 +416,7 @@ pub async fn get_eval_results(
     recommendation_id: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::eval_spec::EvalResult>, String> {
     crate::meta_optimizer::eval_spec::list_eval_results(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         spec_id.as_deref(),
         recommendation_id.as_deref(),
     )
@@ -428,7 +428,7 @@ pub async fn run_recommendation_eval(
     recommendation_id: String,
 ) -> Result<crate::meta_optimizer::eval_spec::EvalResult, String> {
     crate::meta_optimizer::eval_runner::validate_recommendation(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         &recommendation_id,
     )
 }
@@ -439,7 +439,7 @@ pub async fn generate_default_eval_spec(
     target_agent: String,
 ) -> Result<crate::meta_optimizer::eval_spec::EvalSpec, String> {
     let spec = crate::meta_optimizer::eval_spec::generate_default_spec(&target_agent)?;
-    crate::meta_optimizer::eval_spec::save_eval_spec(&app_state.pg_db(), &spec)?;
+    crate::meta_optimizer::eval_spec::save_eval_spec(app_state.pg_db(), &spec)?;
     Ok(spec)
 }
 
@@ -531,7 +531,7 @@ pub async fn run_robustness_test(
     recommendation_id: Option<String>,
 ) -> Result<crate::meta_optimizer::robustness::RobustnessReport, String> {
     crate::meta_optimizer::robustness::run_robustness_test(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         &agent_type,
         prompt_variant_id.as_deref(),
         recommendation_id.as_deref(),
@@ -545,7 +545,7 @@ pub async fn get_robustness_reports(
     recommendation_id: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::robustness::RobustnessReport>, String> {
     crate::meta_optimizer::robustness::list_robustness_reports(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         prompt_variant_id.as_deref(),
         recommendation_id.as_deref(),
     )
@@ -559,7 +559,7 @@ pub async fn get_golden_datasets(
     agent_type: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::golden_dataset::GoldenDataset>, String> {
     crate::meta_optimizer::golden_dataset::list_golden_datasets(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         agent_type.as_deref(),
     )
 }
@@ -571,7 +571,7 @@ pub async fn build_golden_dataset(
     max_entries: Option<usize>,
 ) -> Result<crate::meta_optimizer::golden_dataset::GoldenDataset, String> {
     crate::meta_optimizer::golden_dataset::build_from_history(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         &agent_type,
         max_entries.unwrap_or(50),
     )
@@ -583,7 +583,7 @@ pub async fn build_golden_dataset(
 pub async fn get_model_profiles(
     app_state: State<'_, StorageCompartment>,
 ) -> Result<Vec<crate::routing::model_profiles::ModelProfile>, String> {
-    crate::routing::model_profiles::list_model_profiles(&app_state.pg_db()).await
+    crate::routing::model_profiles::list_model_profiles(app_state.pg_db()).await
 }
 
 #[tauri::command]
@@ -591,7 +591,7 @@ pub async fn refresh_model_profiles(
     app_state: State<'_, StorageCompartment>,
     days: Option<i64>,
 ) -> Result<Vec<crate::routing::model_profiles::ModelProfile>, String> {
-    crate::routing::model_profiles::refresh_all_profiles(&app_state.pg_db(), days.unwrap_or(30)).await
+    crate::routing::model_profiles::refresh_all_profiles(app_state.pg_db(), days.unwrap_or(30)).await
 }
 
 #[tauri::command]
@@ -599,7 +599,7 @@ pub async fn get_model_recommendations(
     app_state: State<'_, StorageCompartment>,
     budget_usd: Option<f64>,
 ) -> Result<Vec<crate::routing::model_profiles::ModelRecommendation>, String> {
-    crate::routing::model_profiles::get_model_recommendation(&app_state.pg_db(), budget_usd).await
+    crate::routing::model_profiles::get_model_recommendation(app_state.pg_db(), budget_usd).await
 }
 
 // ── Comparison Bridge ─────────────────────────────────────────────────
@@ -610,7 +610,7 @@ pub async fn convert_comparison_to_recommendation(
     comparison_id: String,
 ) -> Result<Option<String>, String> {
     crate::meta_optimizer::comparison_bridge::comparison_to_recommendation(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         &comparison_id,
     )
 }
@@ -621,7 +621,7 @@ pub async fn convert_comparison_to_recommendation(
 pub async fn get_prompt_optimization_status(
     app_state: State<'_, StorageCompartment>,
 ) -> Result<serde_json::Value, String> {
-    let pg_db = &app_state.pg_db();
+    let pg_db = app_state.pg_db();
 
     // Get prompt group metrics
     let samples = crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(pg_db, 500)?;
@@ -649,11 +649,11 @@ pub async fn get_prompt_group_metrics(
     app_state: State<'_, StorageCompartment>,
 ) -> Result<Vec<crate::meta_optimizer::prompt_extractor::PromptGroupMetrics>, String> {
     let samples =
-        crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(&app_state.pg_db(), 500)?;
+        crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(app_state.pg_db(), 500)?;
     Ok(
         crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(
             &samples,
-            &app_state.pg_db(),
+            app_state.pg_db(),
         ),
     )
 }
@@ -667,7 +667,7 @@ pub async fn get_prompt_optimization_evidence(
 ) -> Result<serde_json::Value, String> {
     let (failures, successes) =
         crate::meta_optimizer::prompt_extractor::collect_evidence_samples_pg(
-            &app_state.pg_db(),
+            app_state.pg_db(),
             &phase,
             "",
             max_failures.unwrap_or(5),
@@ -688,7 +688,7 @@ pub async fn get_prompt_evolution_history(
     limit: Option<usize>,
 ) -> Result<Vec<crate::meta_optimizer::prompt_evolution::PromptEvolutionEntry>, String> {
     crate::meta_optimizer::prompt_evolution::get_evolution_history(
-        &app_state.pg_db(),
+        app_state.pg_db(),
         agent_type.as_deref(),
         limit.unwrap_or(50),
     )
@@ -710,7 +710,7 @@ pub async fn get_prompt_evolution_diff(
     app_state: State<'_, StorageCompartment>,
     evolution_id: String,
 ) -> Result<serde_json::Value, String> {
-    let pg_db = &app_state.pg_db();
+    let pg_db = app_state.pg_db();
 
     // Get the evolution entry
     let history = crate::meta_optimizer::prompt_evolution::get_evolution_history(pg_db, None, 100)?;

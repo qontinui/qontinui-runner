@@ -1708,6 +1708,40 @@ pub async fn get_workflow_run_context(
 
 // LEGACY get_workflow_run_context_inner removed — was checkpoint_db SQLite-only dead code.
 
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_testing")
+        .invoke_handler(tauri::generate_handler![
+            execute_verification_test,
+            execute_verification_test_suite,
+            get_test_type_info,
+            validate_test_definition,
+            list_verification_tests,
+            get_verification_test,
+            create_verification_test,
+            update_verification_test,
+            delete_verification_test,
+            execute_test_by_id,
+            execute_tests_by_ids,
+            get_test_results,
+            get_task_run_test_results,
+            create_test_association,
+            get_config_test_associations,
+            delete_test_association,
+            export_tests_to_file,
+            export_all_tests_to_file,
+            import_tests_from_file,
+            analyze_page_playwright,
+            analyze_page_playwright_script,
+            analyze_page_vision,
+            generate_test_with_ai,
+            generate_test_metadata,
+            list_recent_task_runs,
+            get_workflow_run_context,
+        ])
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1751,38 +1785,4 @@ mod tests {
         assert!(!result.success);
         assert!(result.message.unwrap().contains("repo_test_config"));
     }
-}
-
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_testing")
-        .invoke_handler(tauri::generate_handler![
-            execute_verification_test,
-            execute_verification_test_suite,
-            get_test_type_info,
-            validate_test_definition,
-            list_verification_tests,
-            get_verification_test,
-            create_verification_test,
-            update_verification_test,
-            delete_verification_test,
-            execute_test_by_id,
-            execute_tests_by_ids,
-            get_test_results,
-            get_task_run_test_results,
-            create_test_association,
-            get_config_test_associations,
-            delete_test_association,
-            export_tests_to_file,
-            export_all_tests_to_file,
-            import_tests_from_file,
-            analyze_page_playwright,
-            analyze_page_playwright_script,
-            analyze_page_vision,
-            generate_test_with_ai,
-            generate_test_metadata,
-            list_recent_task_runs,
-            get_workflow_run_context,
-        ])
-        .build()
 }

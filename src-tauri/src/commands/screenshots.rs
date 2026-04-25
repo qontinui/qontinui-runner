@@ -142,6 +142,13 @@ pub async fn list_screenshots() -> ScreenshotsResponse {
     })
 }
 
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_screenshots")
+        .invoke_handler(tauri::generate_handler![list_screenshots,])
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,11 +172,4 @@ mod tests {
         assert!(response.data.is_none());
         assert_eq!(response.error, Some("Test error".to_string()));
     }
-}
-
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_screenshots")
-        .invoke_handler(tauri::generate_handler![list_screenshots,])
-        .build()
 }

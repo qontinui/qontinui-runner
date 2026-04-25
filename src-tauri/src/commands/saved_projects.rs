@@ -159,6 +159,18 @@ pub fn remove_saved_project(path: String) -> Result<(), String> {
     settings::save_saved_projects(current)
 }
 
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_saved_projects")
+        .invoke_handler(tauri::generate_handler![
+            list_saved_projects,
+            save_saved_projects,
+            add_saved_project,
+            remove_saved_project,
+        ])
+        .build()
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -231,16 +243,4 @@ mod tests {
         );
         assert_eq!(current[0].path, "/tmp/b");
     }
-}
-
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_saved_projects")
-        .invoke_handler(tauri::generate_handler![
-            list_saved_projects,
-            save_saved_projects,
-            add_saved_project,
-            remove_saved_project,
-        ])
-        .build()
 }

@@ -337,6 +337,26 @@ pub async fn get_task_run_mcp_calls(
     }
 }
 
+/// Build the Tauri plugin that registers this module's command handlers.
+pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("qontinui_mcp")
+        .invoke_handler(tauri::generate_handler![
+            list_mcp_servers,
+            get_mcp_server,
+            create_mcp_server,
+            update_mcp_server,
+            delete_mcp_server,
+            connect_mcp_server,
+            disconnect_mcp_server,
+            get_mcp_servers_status,
+            get_mcp_server_status,
+            list_mcp_server_tools,
+            call_mcp_tool,
+            get_task_run_mcp_calls,
+        ])
+        .build()
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -360,24 +380,4 @@ mod tests {
         assert!(response.data.is_none());
         assert_eq!(response.error, Some("error".to_string()));
     }
-}
-
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_mcp")
-        .invoke_handler(tauri::generate_handler![
-            list_mcp_servers,
-            get_mcp_server,
-            create_mcp_server,
-            update_mcp_server,
-            delete_mcp_server,
-            connect_mcp_server,
-            disconnect_mcp_server,
-            get_mcp_servers_status,
-            get_mcp_server_status,
-            list_mcp_server_tools,
-            call_mcp_tool,
-            get_task_run_mcp_calls,
-        ])
-        .build()
 }

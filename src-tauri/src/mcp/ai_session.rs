@@ -190,7 +190,7 @@ pub struct PromoteToWorktreeResponse {
 /// - 200 — promotion succeeded
 /// - 404 — no live session for that id
 /// - 409 — session is already in a worktree, or another holder is preventing
-///         exclusive access (e.g. concurrent caller)
+///   exclusive access (e.g. concurrent caller)
 /// - 500 — worktree creation, respawn, or PG persistence failed
 pub async fn promote_session_to_worktree_handler(
     State(state): State<Arc<ApiState>>,
