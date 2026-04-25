@@ -9,6 +9,7 @@
 
 use crate::commands::compartments::StorageCompartment;
 use crate::commands::CommandResponse;
+use crate::error::AppError;
 use crate::orchestrator::hooks::{Hook, HookAction, HookCondition, HookContext, HookTrigger};
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -401,9 +402,15 @@ fn hook_to_response(
 pub async fn get_all_hooks(
     state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    get_all_hooks_impl(state).await.map_err(String::from)
+}
+
+async fn get_all_hooks_impl(
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Getting all hooks");
 
-    let pg_hooks = state.pg_db().list_hooks().await?;
+    let pg_hooks = state.pg_db().list_hooks().await.map_err(AppError::Raw)?;
 
     let mut hooks: Vec<HookResponse> = Vec::new();
 
@@ -430,8 +437,7 @@ pub async fn get_all_hooks(
             }
         };
 
-        let action_config: serde_json::Value = serde_json::from_str(action_config_str)
-            .map_err(|e| format!("Failed to parse action config: {}", e))?;
+        let action_config: serde_json::Value = serde_json::from_str(action_config_str)?;
 
         let action = match parse_action(&action_type, action_config.clone()) {
             Ok(a) => a,
@@ -463,10 +469,7 @@ pub async fn get_all_hooks(
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Retrieved {} hooks", hooks.len())),
-        data: Some(
-            serde_json::to_value(&hooks)
-                .map_err(|e| format!("Failed to serialize hooks: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&hooks)?),
     })
 }
 
@@ -483,9 +486,16 @@ pub async fn get_hook(
     id: String,
     state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    get_hook_impl(id, state).await.map_err(String::from)
+}
+
+async fn get_hook_impl(
+    id: String,
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Getting hook: {}", id);
 
-    match state.pg_db().get_hook(&id).await? {
+    match state.pg_db().get_hook(&id).await.map_err(AppError::Raw)? {
         Some(hook_json) => {
             let hid = hook_json["id"].as_str().unwrap_or("").to_string();
             let name = hook_json["name"].as_str().unwrap_or("").to_string();
@@ -501,10 +511,9 @@ pub async fn get_hook(
             let created_at = hook_json["created_at"].as_str().unwrap_or("").to_string();
             let updated_at = hook_json["updated_at"].as_str().unwrap_or("").to_string();
 
-            let trigger = parse_trigger(trigger_str)?;
-            let action_config: serde_json::Value = serde_json::from_str(action_config_str)
-                .map_err(|e| format!("Failed to parse action config: {}", e))?;
-            let action = parse_action(&action_type, action_config)?;
+            let trigger = parse_trigger(trigger_str).map_err(AppError::Raw)?;
+            let action_config: serde_json::Value = serde_json::from_str(action_config_str)?;
+            let action = parse_action(&action_type, action_config).map_err(AppError::Raw)?;
             let conditions: Vec<HookCondition> =
                 serde_json::from_str(conditions_str).unwrap_or_default();
 
@@ -526,10 +535,7 @@ pub async fn get_hook(
             Ok(CommandResponse {
                 success: true,
                 message: Some("Hook found".to_string()),
-                data: Some(
-                    serde_json::to_value(&hook)
-                        .map_err(|e| format!("Failed to serialize hook: {}", e))?,
-                ),
+                data: Some(serde_json::to_value(&hook)?),
             })
         }
         None => Ok(CommandResponse {
@@ -564,10 +570,10 @@ pub async fn create_hook(
     let id = Uuid::new_v4().to_string();
 
     let action_config_str = serde_json::to_string(&request.action_config)
-        .map_err(|e| format!("Failed to serialize action config: {}", e))?;
+        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
 
     let conditions_str = serde_json::to_string(&request.conditions)
-        .map_err(|e| format!("Failed to serialize conditions: {}", e))?;
+        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
 
     state
         .pg_db()
@@ -634,7 +640,7 @@ pub async fn update_hook(
         .unwrap_or_else(|| current["action_type"].as_str().unwrap_or("").to_string());
     let action_config_str = match request.action_config {
         Some(config) => serde_json::to_string(&config)
-            .map_err(|e| format!("Failed to serialize action config: {}", e))?,
+            .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
         None => current["action_config"]
             .as_str()
             .unwrap_or("{}")
@@ -651,7 +657,7 @@ pub async fn update_hook(
         .unwrap_or_else(|| current["continue_on_failure"].as_bool().unwrap_or(true));
     let conditions_str = match request.conditions {
         Some(conditions) => serde_json::to_string(&conditions)
-            .map_err(|e| format!("Failed to serialize conditions: {}", e))?,
+            .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
         None => current["conditions"].as_str().unwrap_or("[]").to_string(),
     };
 
@@ -660,7 +666,7 @@ pub async fn update_hook(
 
     // Validate action
     let action_config: serde_json::Value = serde_json::from_str(&action_config_str)
-        .map_err(|e| format!("Failed to parse action config: {}", e))?;
+        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
     let _ = parse_action(&action_type, action_config)?;
 
     state
@@ -813,7 +819,7 @@ pub async fn test_hook(
         .to_string();
 
     let action_config: serde_json::Value = serde_json::from_str(&action_config_str)
-        .map_err(|e| format!("Failed to parse action config: {}", e))?;
+        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
 
     let action = parse_action(&action_type, action_config)?;
 
@@ -861,7 +867,7 @@ pub async fn test_hook(
         message: Some("Hook test completed".to_string()),
         data: Some(
             serde_json::to_value(&result)
-                .map_err(|e| format!("Failed to serialize result: {}", e))?,
+                .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
         ),
     })
 }
