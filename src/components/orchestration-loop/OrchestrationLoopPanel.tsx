@@ -55,6 +55,14 @@ interface RunnerInstance {
   running: boolean;
   pid: number | null;
   api_ready: boolean;
+  /**
+   * `"configured"` for slots saved in `settings.json` (Settings → Runner
+   * Instances), `"discovered"` for runners that exist only in the DB
+   * registry (e.g. supervisor-spawned children that registered themselves
+   * but were never saved as a slot). Optional for backward compatibility
+   * with older runner builds.
+   */
+  source?: "configured" | "discovered";
 }
 
 interface OrchestrationLoopStatus {
@@ -852,6 +860,7 @@ export function OrchestrationLoopPanel() {
                       {runnerInstances.map((inst) => (
                         <option key={inst.id} value={inst.id}>
                           {inst.name} (:{inst.port}){inst.running ? "" : " [stopped]"}
+                          {inst.source === "discovered" ? " (discovered)" : ""}
                         </option>
                       ))}
                     </select>

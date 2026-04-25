@@ -27,6 +27,10 @@ pub struct InstanceStatus {
     pub running: bool,
     pub pid: Option<u32>,
     pub api_ready: bool,
+    /// `"configured"` for entries in `settings.json`, `"discovered"` for
+    /// entries that exist only in the DB registry (e.g. supervisor-spawned
+    /// runners that registered themselves but were never saved as a slot).
+    pub source: &'static str,
 }
 
 /// Handle for a spawned runner instance.
@@ -399,9 +403,18 @@ impl InstanceManager {
     }
 
     /// Get status of a specific instance.
+    ///
+    /// `running` is true if EITHER (a) we own a live child process for this
+    /// id OR (b) the port responds to `/status`. The drop-down consumers
+    /// (Orchestration Loop target picker, Settings → Runner Instances) need
+    /// to see externally-spawned runners — supervisor children, manually
+    /// launched test runners — as live, even though no child handle is held
+    /// here. `api_ready` is the probe result on its own, which lets callers
+    /// distinguish "process alive but API still warming up" from "API
+    /// answering."
     pub async fn get_instance_status(&self, config: &RunnerInstanceConfig) -> InstanceStatus {
         let mut instances = self.instances.lock().await;
-        let (running, pid) = if let Some(handle) = instances.get_mut(&config.id) {
+        let (child_alive, pid) = if let Some(handle) = instances.get_mut(&config.id) {
             if is_process_alive(&mut handle.child) {
                 (true, Some(handle.child.id()))
             } else {
@@ -412,21 +425,18 @@ impl InstanceManager {
         } else {
             (false, None)
         };
+        drop(instances);
 
-        // Probe the instance's HTTP API to check if it's actually ready
-        let api_ready = if running {
-            probe_instance_api(config.port).await
-        } else {
-            false
-        };
+        let api_ready = probe_instance_api(config.port).await;
 
         InstanceStatus {
             id: config.id.clone(),
             name: config.name.clone(),
             port: config.port,
-            running,
+            running: child_alive || api_ready,
             pid,
             api_ready,
+            source: "configured",
         }
     }
 
@@ -436,6 +446,72 @@ impl InstanceManager {
         for config in configs {
             result.push(self.get_instance_status(config).await);
         }
+        result
+    }
+
+    /// Get the unified runner instance list: every configured slot from
+    /// `settings.json`, merged with every non-primary entry in the DB
+    /// `runner_instances` registry that isn't already represented (deduped
+    /// by port). Each entry has its `running`/`api_ready` resolved from a
+    /// fresh `/status` probe so the drop-down reflects what's actually
+    /// alive — not just what's saved as a slot.
+    ///
+    /// This is the source the Orchestration Loop target drop-down should
+    /// consume. The previous `get_all_statuses` path saw only configured
+    /// slots, so a supervisor-spawned runner that registered itself in the
+    /// DB would never appear in the picker even though it was answering on
+    /// its port.
+    pub async fn get_unified_instances(
+        &self,
+        configs: &[RunnerInstanceConfig],
+    ) -> Vec<InstanceStatus> {
+        let mut by_port: HashMap<u16, InstanceStatus> = HashMap::new();
+        for cfg in configs {
+            let status = self.get_instance_status(cfg).await;
+            by_port.insert(cfg.port, status);
+        }
+
+        let own_port = crate::mcp::types::get_mcp_api_port();
+        let db_rows = self
+            .pg_db
+            .get_all_runner_instances()
+            .await
+            .unwrap_or_default();
+
+        // Probe each not-yet-seen DB row's port in parallel — sequential
+        // probes block the whole drop-down load on the slowest endpoint
+        // (1s timeout each), and there can easily be 5+ stale rows.
+        let to_probe: Vec<_> = db_rows
+            .into_iter()
+            .filter(|row| {
+                let port = row.port as u16;
+                !row.is_primary && port != own_port && !by_port.contains_key(&port)
+            })
+            .collect();
+
+        let probes = to_probe
+            .iter()
+            .map(|row| probe_instance_api(row.port as u16));
+        let results = futures::future::join_all(probes).await;
+
+        for (row, api_ready) in to_probe.into_iter().zip(results.into_iter()) {
+            let port = row.port as u16;
+            by_port.insert(
+                port,
+                InstanceStatus {
+                    id: row.id,
+                    name: row.name,
+                    port,
+                    running: api_ready,
+                    pid: row.pid.map(|p| p as u32),
+                    api_ready,
+                    source: "discovered",
+                },
+            );
+        }
+
+        let mut result: Vec<_> = by_port.into_values().collect();
+        result.sort_by_key(|s| s.port);
         result
     }
 }

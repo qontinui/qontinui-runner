@@ -21,7 +21,7 @@ interface InstanceStatus {
   pid: number | null;
   api_ready: boolean;
   /** Source of this instance: "local" = managed by this runner, "registered" = from DB/registry */
-  source?: "local" | "registered";
+  source?: "local" | "registered" | "configured" | "discovered";
   /** Health status from DB registry (starting, healthy, unhealthy, stopped) */
   registry_status?: string;
   /** Running task count from heartbeat */
@@ -44,12 +44,19 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
 
   const loadInstances = useCallback(async () => {
     try {
-      // Fetch locally-managed instances (from settings.json via Tauri command)
+      // get_runner_instances now returns the unified list: every settings.json
+      // slot plus every DB-registered instance whose port isn't already covered
+      // by a slot. Each row carries source="configured" (settings.json) or
+      // source="discovered" (DB-only). Translate to the panel's existing
+      // "local"/"registered" vocabulary so the action-button gating below
+      // (only configured rows get launch/stop/delete) keeps working.
       const local = await invoke<InstanceStatus[]>("get_runner_instances");
       const localPorts = new Set(local.map((i) => i.port));
 
-      // Mark local instances
-      const merged: InstanceStatus[] = local.map((i) => ({ ...i, source: "local" as const }));
+      const merged: InstanceStatus[] = local.map((i) => ({
+        ...i,
+        source: i.source === "discovered" ? "registered" : "local",
+      }));
 
       // Fetch DB-backed registry via HTTP (includes externally-registered instances)
       try {

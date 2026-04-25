@@ -11,13 +11,19 @@ use crate::commands::compartments::HealthCompartment;
 use crate::instance_manager::InstanceManager;
 use crate::settings::{self, RunnerInstanceConfig};
 
-/// Get all configured instances with their live status.
+/// Get every runner instance the picker should know about: every slot in
+/// `settings.json` plus every non-primary entry in the DB registry that
+/// isn't already covered by a slot. Each row has its `running`/`api_ready`
+/// resolved from a live `/status` probe so the Orchestration Loop target
+/// drop-down (and the Settings → Runner Instances panel) reflects what's
+/// actually alive, including externally-spawned children that registered
+/// themselves but were never saved as a configured slot.
 #[tauri::command]
 pub async fn get_runner_instances(
     instance_manager: State<'_, Arc<InstanceManager>>,
 ) -> Result<serde_json::Value, String> {
     let configs = settings::get_runner_instances();
-    let statuses = instance_manager.get_all_statuses(&configs).await;
+    let statuses = instance_manager.get_unified_instances(&configs).await;
     serde_json::to_value(&statuses).map_err(|e| e.to_string())
 }
 
