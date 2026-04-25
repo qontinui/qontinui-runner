@@ -33,35 +33,44 @@ Generate a single TypeScript file that:
      - \`name\`: Human-readable page name
      - \`description\`: What the page does
      - \`actions\`: Array of page-level actions the user can perform (with handler stubs)
+     - This call registers ambient page-scope metadata. **It does NOT return a ref.** Don't capture or destructure its return value.
    - Calls \`useUIElement\` for each significant element with:
      - \`id\`: kebab-case unique identifier (e.g., "search-input", "submit-button")
-     - \`type\`: "button" | "input" | "select" | "container" | "link" | "heading" | "table" | "disclosure"
+     - \`type\`: one of \`"button" | "link" | "input" | "textarea" | "select" | "checkbox" | "radio" | "switch" | "slider" | "tab" | "menuitem" | "disclosure" | "dialog" | "generic"\`. Pick the closest match. Use \`"disclosure"\` for \`<details>/<summary>\`, accordions, and collapsible panels. Use \`"generic"\` for non-interactive registrations (headings, tables, status indicators) and any element whose semantics don't fit another value. **Do NOT use \`"heading"\`, \`"table"\`, or \`"container"\` — they aren't valid ElementType values; use \`"generic"\` instead.**
      - \`label\`: Human-readable description of what this element is/does
-     - \`actions\`: Array of standard actions (["click"] for buttons, etc.)
-   - Returns an object of all refs: \`{ searchInputRef, submitButtonRef, ... }\`
-3. The calling page component destructures these refs and attaches them to DOM elements
+     - \`actions\`: Array of standard actions (e.g. \`["click"]\` for buttons and disclosures)
+     - The call returns \`{ ref, element, registered, ... }\`. Destructure \`ref\` and re-export it under a descriptive name.
+   - Returns an object of refs: \`{ searchInputRef, submitButtonRef, advancedDisclosureRef, ... }\` — every value is a \`React.RefCallback<HTMLElement>\` from \`useUIElement(...).ref\`. Do not include anything from \`useUIComponent\`.
+3. The calling page component destructures these refs and attaches them via the standard \`ref={…}\` JSX prop.
+
+## API surface — do not deviate
+
+- \`useUIComponent({ id, name, description, actions })\` — page-scope metadata. Returns \`{ registered, executeAction, register, unregister }\`. **No ref.**
+- \`useUIElement({ id, type, label, actions })\` — element-scope. Returns \`{ ref, element, registered, getState, ... }\`. Use \`.ref\`.
+- **Neither hook accepts a generic type parameter.** Write \`useUIElement({ ... })\` — **never** \`useUIElement<HTMLButtonElement>({ ... })\` or \`useUIComponent<HTMLDivElement>({ ... })\`. The element type is inferred where the ref attaches in JSX.
 
 ## What to Register
 
 ### MUST register (interactive):
-- All buttons (with action descriptions)
-- All text inputs and textareas (with purpose labels)
-- All select/dropdown elements
-- All toggles, checkboxes, radio buttons
+- All buttons (with action descriptions) — type \`"button"\`
+- All text inputs and textareas — types \`"input"\` / \`"textarea"\`
+- All select/dropdown elements — type \`"select"\`
+- Checkboxes / radio buttons / toggle switches — types \`"checkbox"\` / \`"radio"\` / \`"switch"\`
 - Disclosure widgets: every \`<details>\`/\`<summary>\` pair, accordion section, or collapsible panel — register the \`<summary>\` as type \`"disclosure"\` with actions \`["click"]\` and a label drawn from the summary's visible text (e.g. "Advanced: per-stage controls"). These are how users open hidden panels and AI agents must be able to discover and click them.
-- Navigation links and tabs
-- Form submit/reset actions
+- Navigation links — type \`"link"\`
+- Tabs (each tab is a clickable target) — type \`"tab"\`
+- Form submit/reset actions — type \`"button"\`
 
 ### MUST register (data display):
-- Data tables and lists (as containers with row count in label)
-- Key metric displays
-- Status indicators
-- Error/empty state containers
+- Data tables and lists — type \`"generic"\`, include row count in label
+- Key metric displays — type \`"generic"\`
+- Status indicators — type \`"generic"\`
+- Error/empty state containers — type \`"generic"\`
 
 ### SHOULD register:
-- Section headings (for navigation context)
-- Modal/dialog containers (when open)
-- Tab panels
+- Section headings (for navigation context) — type \`"generic"\`
+- Modal/dialog containers (when open) — type \`"dialog"\`
+- Tab panel content regions — type \`"generic"\` (the tab buttons themselves use type \`"tab"\`)
 
 ### DO NOT register:
 - Individual list items in a dynamic list (register the container instead)
