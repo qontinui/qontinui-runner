@@ -559,21 +559,26 @@ pub async fn create_hook(
     request: CreateHookRequest,
     state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    create_hook_impl(request, state).await.map_err(String::from)
+}
+
+async fn create_hook_impl(
+    request: CreateHookRequest,
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Creating hook: {}", request.name);
 
     // Validate trigger
-    let _ = parse_trigger(&request.trigger)?;
+    let _ = parse_trigger(&request.trigger).map_err(AppError::Raw)?;
 
     // Validate action
-    let _ = parse_action(&request.action_type, request.action_config.clone())?;
+    let _ = parse_action(&request.action_type, request.action_config.clone())
+        .map_err(AppError::Raw)?;
 
     let id = Uuid::new_v4().to_string();
 
-    let action_config_str = serde_json::to_string(&request.action_config)
-        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
-
-    let conditions_str = serde_json::to_string(&request.conditions)
-        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
+    let action_config_str = serde_json::to_string(&request.action_config)?;
+    let conditions_str = serde_json::to_string(&request.conditions)?;
 
     state
         .pg_db()
@@ -590,10 +595,11 @@ pub async fn create_hook(
             &conditions_str,
             request.task_run_id.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(AppError::Raw)?;
 
     // Fetch the created hook
-    get_hook(id, state).await
+    get_hook_impl(id, state).await
 }
 
 /// Update an existing hook.
@@ -611,10 +617,20 @@ pub async fn update_hook(
     request: UpdateHookRequest,
     state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    update_hook_impl(id, request, state)
+        .await
+        .map_err(String::from)
+}
+
+async fn update_hook_impl(
+    id: String,
+    request: UpdateHookRequest,
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Updating hook: {}", id);
 
     // Get current hook values from PG
-    let current = match state.pg_db().get_hook(&id).await? {
+    let current = match state.pg_db().get_hook(&id).await.map_err(AppError::Raw)? {
         Some(v) => v,
         None => {
             return Ok(CommandResponse {
@@ -639,8 +655,7 @@ pub async fn update_hook(
         .action_type
         .unwrap_or_else(|| current["action_type"].as_str().unwrap_or("").to_string());
     let action_config_str = match request.action_config {
-        Some(config) => serde_json::to_string(&config)
-            .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
+        Some(config) => serde_json::to_string(&config)?,
         None => current["action_config"]
             .as_str()
             .unwrap_or("{}")
@@ -656,18 +671,16 @@ pub async fn update_hook(
         .continue_on_failure
         .unwrap_or_else(|| current["continue_on_failure"].as_bool().unwrap_or(true));
     let conditions_str = match request.conditions {
-        Some(conditions) => serde_json::to_string(&conditions)
-            .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
+        Some(conditions) => serde_json::to_string(&conditions)?,
         None => current["conditions"].as_str().unwrap_or("[]").to_string(),
     };
 
     // Validate trigger
-    let _ = parse_trigger(&trigger)?;
+    let _ = parse_trigger(&trigger).map_err(AppError::Raw)?;
 
     // Validate action
-    let action_config: serde_json::Value = serde_json::from_str(&action_config_str)
-        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
-    let _ = parse_action(&action_type, action_config)?;
+    let action_config: serde_json::Value = serde_json::from_str(&action_config_str)?;
+    let _ = parse_action(&action_type, action_config).map_err(AppError::Raw)?;
 
     state
         .pg_db()
@@ -683,10 +696,11 @@ pub async fn update_hook(
             continue_on_failure,
             &conditions_str,
         )
-        .await?;
+        .await
+        .map_err(AppError::Raw)?;
 
     // Fetch the updated hook
-    get_hook(id, state).await
+    get_hook_impl(id, state).await
 }
 
 /// Delete a hook.
@@ -798,10 +812,22 @@ pub async fn test_hook(
     request: TestHookRequest,
     state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    test_hook_impl(request, state).await.map_err(String::from)
+}
+
+async fn test_hook_impl(
+    request: TestHookRequest,
+    state: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Testing hook: {}", request.hook_id);
 
     // Get the hook from PG
-    let hook_json = match state.pg_db().get_hook(&request.hook_id).await? {
+    let hook_json = match state
+        .pg_db()
+        .get_hook(&request.hook_id)
+        .await
+        .map_err(AppError::Raw)?
+    {
         Some(v) => v,
         None => {
             return Ok(CommandResponse {
@@ -818,10 +844,9 @@ pub async fn test_hook(
         .unwrap_or("{}")
         .to_string();
 
-    let action_config: serde_json::Value = serde_json::from_str(&action_config_str)
-        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
+    let action_config: serde_json::Value = serde_json::from_str(&action_config_str)?;
 
-    let action = parse_action(&action_type, action_config)?;
+    let action = parse_action(&action_type, action_config).map_err(AppError::Raw)?;
 
     // Build test context
     let ctx = request.context.unwrap_or_default();
@@ -865,10 +890,7 @@ pub async fn test_hook(
     Ok(CommandResponse {
         success: true,
         message: Some("Hook test completed".to_string()),
-        data: Some(
-            serde_json::to_value(&result)
-                .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
-        ),
+        data: Some(serde_json::to_value(&result)?),
     })
 }
 
