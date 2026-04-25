@@ -194,6 +194,7 @@ pub mod issues;
 pub mod known_issues; // Known issues registry CRUD
 pub mod learning; // Learning insights dashboard commands
 pub mod library_sync; // Sync library items (checks, macros, etc.) to web backend
+pub mod log_api; // Frontend → Rust log sync (general/image/action/AI/issues/RAG/project)
 pub mod logging;
 pub mod mcp; // MCP client management and tool calling
 pub mod meta_optimizer; // Meta-optimizer recommendations and prompt registry

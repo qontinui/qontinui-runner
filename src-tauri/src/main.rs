@@ -455,6 +455,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let storage_compartment =
         commands::compartments::StorageCompartment(shared_app_state.clone());
 
+    // Frontend log-sync store. Holds the most recent batches of logs the React
+    // UI mirrors back into Rust state for HTTP API consumption. Created here
+    // so it can be both `.manage()`d for the Tauri commands in
+    // `commands::log_api` and exposed to the MCP HTTP server later.
+    let log_api_store = commands::log_api::create_log_store();
+
     // Create error monitor config for later initialization
     let error_monitor_pg = shared_app_state.pg_db.clone();
 
@@ -947,6 +953,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::logging::list_session_checkpoints,
             commands::logging::load_ai_output_log,
             commands::logging::load_render_log,
+            commands::log_api::clear_log_api_store,
+            commands::log_api::sync_action_logs,
+            commands::log_api::sync_ai_output_logs,
+            commands::log_api::sync_all_logs,
+            commands::log_api::sync_general_logs,
+            commands::log_api::sync_image_logs,
+            commands::log_api::sync_issues,
+            commands::log_api::sync_project_logs,
+            commands::log_api::sync_rag_logs,
             commands::mcp::call_mcp_tool,
             commands::mcp::connect_mcp_server,
             commands::mcp::create_mcp_server,
@@ -1319,6 +1334,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(integration_compartment)
         .manage(health_compartment)
         .manage(storage_compartment)
+        .manage(log_api_store)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
         .manage(session_manager) // For interactive AI session commands
@@ -1380,9 +1396,35 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // to a hidden 0x0 tool window here. See plan Phase 1.5 validation.
                 } else {
                     let url = tauri::WebviewUrl::App("index.html".into());
+                    let env_pos = {
+                        let x = std::env::var("QONTINUI_WINDOW_X")
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok());
+                        let y = std::env::var("QONTINUI_WINDOW_Y")
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok());
+                        match (x, y) {
+                            (Some(x), Some(y)) => Some((x, y)),
+                            _ => None,
+                        }
+                    };
+                    let env_size = {
+                        let w = std::env::var("QONTINUI_WINDOW_WIDTH")
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok());
+                        let h = std::env::var("QONTINUI_WINDOW_HEIGHT")
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok());
+                        match (w, h) {
+                            (Some(w), Some(h)) => Some((w, h)),
+                            _ => None,
+                        }
+                    };
+                    let initial_size = env_size.unwrap_or((1400.0, 800.0));
+
                     let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
                         .title("Qontinui Runner")
-                        .inner_size(1400.0, 800.0)
+                        .inner_size(initial_size.0, initial_size.1)
                         .min_inner_size(1200.0, 700.0)
                         .fullscreen(false)
                         .resizable(true)
@@ -1392,7 +1434,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         builder = builder.data_directory(std::path::PathBuf::from(dir));
                     }
 
-                    if is_secondary {
+                    if let Some((x, y)) = env_pos {
+                        info!(
+                            "Positioning runner window via env vars at ({}, {}) size ({}, {})",
+                            x, y, initial_size.0, initial_size.1
+                        );
+                        builder = builder.position(x, y);
+                    } else if is_secondary {
                         builder = builder.position(100.0, 100.0);
                     } else {
                         builder = builder.maximized(true);
