@@ -436,6 +436,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         ui_error: Arc::new(ui_error::UiErrorState::new()),
         crash_dumps: Arc::new(crash_dumps::CrashDumpState::new()),
         usb_transport: Arc::new(tokio::sync::OnceCell::new()),
+        app_registry: Arc::new(tokio::sync::OnceCell::new()),
+        app_dispatcher: Arc::new(tokio::sync::OnceCell::new()),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();

@@ -423,6 +423,18 @@ pub fn create_router(
         shared_command_relay.clone(),
     );
 
+    // Bridge the registry + dispatcher onto AppState so non-HTTP code paths
+    // (workflow generation, prompt assembly) can reach them without taking a
+    // dep on ApiState. The cells are pre-allocated by `main::shared_app_state`
+    // construction; setting them here is a one-shot init for the lifetime of
+    // the runner process.
+    let _ = app_state
+        .app_registry
+        .set(shared_app_registry.clone());
+    let _ = app_state
+        .app_dispatcher
+        .set(shared_app_dispatcher.clone());
+
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,

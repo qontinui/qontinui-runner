@@ -42,6 +42,7 @@ pub mod template_promotion;
 pub mod training_data;
 pub mod validation;
 pub mod verification_templates;
+pub mod wrapper_manifest;
 
 pub use generator::{
     extract_json_from_response, generate_workflow, GenerateWorkflowRequest,

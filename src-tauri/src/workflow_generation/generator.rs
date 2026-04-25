@@ -2428,8 +2428,21 @@ fn run_builder_agent(
             Some(s) => crate::mcp::types::runner_api_port(s),
             None => crate::mcp::types::get_mcp_api_port(),
         };
+        // Phase B1: build the wrapper manifest at the call site so the
+        // recognition prompt can advertise live WS-registered apps. This
+        // path is sync (run_builder_agent is sync) but the manifest fetch
+        // is async, hence block_on. When `app_state` is `None`, the
+        // helper short-circuits to "" and the recognition prompt skips
+        // the manifest section entirely.
+        let wrapper_manifest = match app_state {
+            Some(s) => tokio::runtime::Handle::current().block_on(async {
+                super::wrapper_manifest::build_manifest(s, runner_port).await
+            }),
+            None => String::new(),
+        };
         context_section.push_str(&super::meta_workflow::build_spec_brief_recognition_prompt(
             runner_port,
+            &wrapper_manifest,
         ));
         context_section.push_str("\n\n");
     }

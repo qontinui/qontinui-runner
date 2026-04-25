@@ -516,8 +516,11 @@ Return ONLY valid JSON matching this structure. No markdown code blocks, no expl
 ///
 /// Keeping the rules in one place ensures both paths stay in sync when the
 /// control endpoint reference evolves.
-pub fn build_spec_brief_recognition_prompt(runner_api_port: u16) -> String {
-    format!(
+pub fn build_spec_brief_recognition_prompt(
+    runner_api_port: u16,
+    wrapper_manifest: &str,
+) -> String {
+    let mut s = format!(
         r#"
 ## Spec Generation Brief Recognition
 
@@ -609,7 +612,16 @@ Emit exactly ONE such step per group that has `targetStateId`; do NOT additional
 Notice `ui_bridge_target` is a STRING containing JSON — NOT an object. The `ExecutionStepConfig` deserializer on the Rust side expects it in that form.
 "#,
         runner_api_port = runner_api_port,
-    )
+    );
+    // Phase B1: append the live wrapper manifest when at least one
+    // WS-transport app is registered. The helper returns "" when no
+    // wrappers are live, so we guard with `is_empty()` to avoid emitting
+    // an orphan section header.
+    if !wrapper_manifest.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(wrapper_manifest);
+    }
+    s
 }
 
 /// Build the prompt for the builder agent that generates the initial workflow JSON.
@@ -680,7 +692,22 @@ fn build_builder_prompt(
             Some(s) => crate::mcp::types::runner_api_port(s),
             None => crate::mcp::types::get_mcp_api_port(),
         };
-        prompt.push_str(&build_spec_brief_recognition_prompt(brief_runner_port));
+        // Phase B1: build the wrapper manifest at the call site so the
+        // recognition prompt can advertise live WS-registered apps. This
+        // path is sync but the manifest fetch is async, hence block_on.
+        // When `app_state` is `None` (legacy callers, tests, bootstrap
+        // paths), the helper short-circuits to "" and the recognition
+        // prompt skips the manifest section entirely.
+        let wrapper_manifest = match app_state {
+            Some(s) => tokio::runtime::Handle::current().block_on(async {
+                super::wrapper_manifest::build_manifest(s, brief_runner_port).await
+            }),
+            None => String::new(),
+        };
+        prompt.push_str(&build_spec_brief_recognition_prompt(
+            brief_runner_port,
+            &wrapper_manifest,
+        ));
     }
 
     // Add custom template if provided

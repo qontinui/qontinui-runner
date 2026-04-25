@@ -393,6 +393,19 @@ pub struct AppState {
     /// the graceful path where Tauri's window close event fires. Tracked in
     /// the adb-forwarder-port plan §1.6a.
     pub usb_transport: Arc<tokio::sync::OnceCell<crate::mcp::transport::usb::UsbTransport>>,
+    /// Late-initialized handle to the shared `AppRegistry`. Populated by
+    /// `mcp_api::start_server` immediately after it constructs the registry,
+    /// so non-HTTP code paths (workflow generation, agentic prompt
+    /// assembly) can introspect registered apps without taking a dep on
+    /// `ApiState`. Reads via `.get()`; the cell is set exactly once.
+    pub app_registry:
+        Arc<tokio::sync::OnceCell<Arc<crate::mcp::app_registry::AppRegistry>>>,
+    /// Late-initialized handle to the shared `AppDispatcher`. Same lifetime
+    /// + access shape as `app_registry` above. Lets non-HTTP code dispatch
+    /// commands to registered apps via the unified HTTP-or-WS transport
+    /// without re-wiring ApiState.
+    pub app_dispatcher:
+        Arc<tokio::sync::OnceCell<Arc<crate::mcp::app_dispatch::AppDispatcher>>>,
 }
 
 impl AppState {
