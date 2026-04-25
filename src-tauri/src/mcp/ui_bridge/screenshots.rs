@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::screen;
 
-use super::request::ui_bridge_request_sync;
+use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 
 // ============================================================================
 // Screenshot types + helpers
@@ -1650,13 +1650,7 @@ pub async fn ui_bridge_get_element_images_handler(
     info!("UI Bridge API: Get element images");
 
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "get_element_images", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: get_element_images failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_element_images", payload).await)
 }
 
 // ============================================================================
@@ -1668,13 +1662,9 @@ pub async fn ui_bridge_annotations_list_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: List annotations");
-    match ui_bridge_request_sync(&state, "annotations_list", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: List annotations failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "annotations_list", serde_json::json!({})).await,
+    )
 }
 
 /// Create annotation.
@@ -1684,13 +1674,7 @@ pub async fn ui_bridge_annotations_create_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Create annotation");
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "annotations_create", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Create annotation failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "annotations_create", payload).await)
 }
 
 /// Get single annotation.
@@ -1700,13 +1684,7 @@ pub async fn ui_bridge_annotations_get_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Get annotation '{}'", id);
     let payload = serde_json::json!({ "params": { "id": id } });
-    match ui_bridge_request_sync(&state, "annotations_get", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Get annotation failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "annotations_get", payload).await)
 }
 
 /// Update annotation.
@@ -1717,13 +1695,7 @@ pub async fn ui_bridge_annotations_update_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Update annotation '{}'", id);
     let payload = serde_json::json!({ "params": { "id": id, "updates": body } });
-    match ui_bridge_request_sync(&state, "annotations_update", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Update annotation failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "annotations_update", payload).await)
 }
 
 /// Delete annotation.
@@ -1733,13 +1705,7 @@ pub async fn ui_bridge_annotations_delete_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Delete annotation '{}'", id);
     let payload = serde_json::json!({ "params": { "id": id } });
-    match ui_bridge_request_sync(&state, "annotations_delete", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Delete annotation failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "annotations_delete", payload).await)
 }
 
 /// Get annotation coverage metrics.
@@ -1747,13 +1713,9 @@ pub async fn ui_bridge_annotations_coverage_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Annotation coverage");
-    match ui_bridge_request_sync(&state, "annotations_coverage", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Annotation coverage failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "annotations_coverage", serde_json::json!({})).await,
+    )
 }
 
 /// Export annotations.
@@ -1761,13 +1723,9 @@ pub async fn ui_bridge_annotations_export_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Export annotations");
-    match ui_bridge_request_sync(&state, "annotations_export", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Export annotations failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "annotations_export", serde_json::json!({})).await,
+    )
 }
 
 // ============================================================================
@@ -1780,10 +1738,7 @@ pub async fn ui_bridge_media_find_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "find_media", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "find_media", payload).await)
 }
 
 /// Media audit (accessibility or performance).
@@ -1792,10 +1747,7 @@ pub async fn ui_bridge_media_audit_handler(
     Path(audit_type): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let payload = serde_json::json!({ "params": { "auditType": audit_type } });
-    match ui_bridge_request_sync(&state, "media_audit", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "media_audit", payload).await)
 }
 
 /// Capture media snapshot.
@@ -1804,10 +1756,7 @@ pub async fn ui_bridge_media_snapshot_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "capture_media_snapshot", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "capture_media_snapshot", payload).await)
 }
 
 /// Analyze media elements.
@@ -1816,10 +1765,7 @@ pub async fn ui_bridge_media_analyze_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "analyze_media", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "analyze_media", payload).await)
 }
 
 // ============================================================================

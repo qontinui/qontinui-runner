@@ -291,10 +291,20 @@ async fn health(
         embedding_reachable_cached(),
     );
 
+    // One-way readiness flag flipped by the first successful UI Bridge IPC
+    // response (see `mcp::ui_bridge::request::ui_bridge_request_inner`).
+    // Distinguishes "Tauri shell is responsive" from "React app has actually
+    // mounted past App.tsx's loading screen and is processing UI Bridge IPC".
+    let frontend_ready = state
+        .app_state
+        .frontend_ready
+        .load(Ordering::Relaxed);
+
     let mut data = serde_json::json!({
         "status": status,
         "ready": last_pong > 0,
         "responsive": responsive,
+        "frontendReady": frontend_ready,
         "lastHeartbeat": last_pong,
         "heartbeatAgeMs": pong_age_ms,
         "uptimeSeconds": uptime_secs,

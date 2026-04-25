@@ -96,6 +96,7 @@ async fn consolidate_handler(
             data: Some(stats),
             error: None,
             error_detail: None,
+            hint: None,
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -120,6 +121,7 @@ async fn consolidation_log_handler(
             data: Some(entries),
             error: None,
             error_detail: None,
+            hint: None,
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -159,6 +161,7 @@ async fn mental_models_handler(
                 data: Some(summaries),
                 error: None,
                 error_detail: None,
+                hint: None,
             }))
         }
         Err(e) => Err((
@@ -184,6 +187,7 @@ async fn decay_preview_handler(
             data: Some(entries),
             error: None,
             error_detail: None,
+            hint: None,
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -222,6 +226,7 @@ async fn health_handler(
         }),
         error: None,
         error_detail: None,
+        hint: None,
     }))
 }
 
@@ -280,6 +285,7 @@ async fn contradiction_scan_handler(
             data: Some(stats),
             error: None,
             error_detail: None,
+            hint: None,
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -310,6 +316,7 @@ async fn contradiction_log_handler(
             data: Some(resolutions),
             error: None,
             error_detail: None,
+            hint: None,
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -335,6 +342,7 @@ async fn dreamer_run_handler(
             data: Some(stats),
             error: None,
             error_detail: None,
+            hint: None,
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -370,6 +378,7 @@ async fn dreamer_traces_handler(
             data: Some(traces),
             error: None,
             error_detail: None,
+            hint: None,
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -400,6 +409,7 @@ async fn dreamer_log_handler(
             data: Some(entries),
             error: None,
             error_detail: None,
+            hint: None,
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

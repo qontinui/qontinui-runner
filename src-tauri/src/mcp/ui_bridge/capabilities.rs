@@ -985,6 +985,7 @@ pub async fn ui_bridge_batch_handler(
                     MAX_BATCH_SIZE
                 )),
                 error_detail: None,
+                hint: None,
             }),
         ));
     }
@@ -1104,6 +1105,7 @@ pub async fn ui_bridge_control_batch_handler(
                     .unwrap_or_default(),
                 ),
                 error_detail: None,
+                hint: None,
             }),
         ));
     }
@@ -1203,6 +1205,7 @@ pub async fn ui_bridge_control_batch_handler(
             data: Some(payload),
             error: Some("One or more batch steps failed".to_string()),
             error_detail: None,
+            hint: None,
         }))
     }
 }

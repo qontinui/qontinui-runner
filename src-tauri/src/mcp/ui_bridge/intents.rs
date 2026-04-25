@@ -24,7 +24,7 @@ use tracing::{error, info};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 use super::helpers::glob_match;
-use super::request::ui_bridge_request_sync;
+use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 
 /// Wait for a deterministic "navigation complete" signal from the SDK.
 /// Falls back to idle-based detection if no explicit signal arrives.
@@ -90,13 +90,7 @@ pub async fn ui_bridge_wait_for_idle_handler(
         }
     });
 
-    match ui_bridge_request_sync(&state, "wait_for_idle", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Wait for idle failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "wait_for_idle", payload).await)
 }
 
 /// Wait for a specific element to become visually and structurally stable.
@@ -251,13 +245,7 @@ pub async fn ui_bridge_wait_for_idle_signal_handler(
         params = serde_json::json!({ "signal": signal });
     }
     let payload = serde_json::json!({ "params": params });
-    match ui_bridge_request_sync(&state, "wait_for_idle_signal", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Wait for idle signal failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "wait_for_idle_signal", payload).await)
 }
 
 /// Wait for multiple idle targets.
@@ -267,13 +255,7 @@ pub async fn ui_bridge_wait_for_targets_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Wait for targets");
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "wait_for_targets", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Wait for targets failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "wait_for_targets", payload).await)
 }
 
 /// POST /ui-bridge/control/wait-for-element-state
@@ -516,13 +498,7 @@ pub async fn ui_bridge_wait_for_route_change_handler(
     );
 
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "wait_for_route_change", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: wait-for-route-change failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "wait_for_route_change", payload).await)
 }
 
 // ============================================================================

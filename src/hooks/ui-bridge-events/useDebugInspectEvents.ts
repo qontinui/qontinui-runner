@@ -1067,6 +1067,150 @@ export function useDebugInspectEvents(
           return true;
         }
 
+        case "get_element_dom_tree": {
+          // Walk the rendered DOM subtree of a registered element BFS-style.
+          // Returns a structural tree (tagName + filtered attrs + childCount +
+          // children). Different from `get_element_tree` above, which returns
+          // a flat list of every registered element.
+          const treeElementId =
+            (payload.elementId as string | undefined) ??
+            (payload.params?.elementId as string | undefined) ??
+            "";
+          if (!treeElementId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "elementId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const requestedDepthRaw =
+            (payload.depth as number | undefined) ?? (payload.params?.depth as number | undefined);
+          let depthBudget =
+            typeof requestedDepthRaw === "number" && Number.isFinite(requestedDepthRaw)
+              ? Math.floor(requestedDepthRaw)
+              : 3;
+          if (depthBudget < 1) depthBudget = 1;
+          if (depthBudget > 6) depthBudget = 6;
+
+          const reg = currentBridge.elements.find((e) => e.id === treeElementId);
+          if (!reg || !(reg.element instanceof Element)) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "element_not_found",
+              data: { elementId: treeElementId },
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const root = reg.element as Element;
+          const CLASS_MAX_LEN = 80;
+          const NODE_CAP = 200;
+
+          const camelToKebab = (s: string): string =>
+            s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
+
+          const serializeAttrs = (el: Element): Record<string, string> => {
+            const out: Record<string, string> = {};
+            for (const k of ["role", "title", "aria-label", "name", "type"]) {
+              const v = el.getAttribute(k);
+              if (v != null) out[k] = v;
+            }
+            const cls = el.getAttribute("class");
+            if (cls && cls.length > 0) {
+              out["class"] = cls.length > CLASS_MAX_LEN ? cls.slice(0, CLASS_MAX_LEN) + "…" : cls;
+            }
+            const dataset = (el as HTMLElement).dataset;
+            if (dataset) {
+              for (const k in dataset) {
+                const v = dataset[k];
+                if (typeof v === "string") out[`data-${camelToKebab(k)}`] = v;
+              }
+            }
+            return out;
+          };
+
+          interface DomTreeNode {
+            tagName: string;
+            attrs: Record<string, string>;
+            childCount: number;
+            children: DomTreeNode[];
+          }
+
+          let nodeCount = 0;
+          let truncated = false;
+          let actualDepth = 0;
+
+          // BFS so `truncated` reflects breadth-first cap rather than DFS skew.
+          const rootNode: DomTreeNode = {
+            tagName: root.tagName,
+            attrs: serializeAttrs(root),
+            childCount: root.children.length,
+            children: [],
+          };
+          nodeCount++;
+
+          // Each frame: (parentNode, parentEl, currentDepth — depth of parent's children)
+          const queue: Array<{ node: DomTreeNode; el: Element; depth: number }> = [
+            { node: rootNode, el: root, depth: 1 },
+          ];
+
+          while (queue.length > 0) {
+            const frame = queue.shift()!;
+            if (frame.depth > depthBudget) continue;
+            const childEls = Array.from(frame.el.children);
+            for (const childEl of childEls) {
+              if (nodeCount >= NODE_CAP) {
+                truncated = true;
+                break;
+              }
+              const childNode: DomTreeNode = {
+                tagName: childEl.tagName,
+                attrs: serializeAttrs(childEl),
+                childCount: childEl.children.length,
+                children: [],
+              };
+              nodeCount++;
+              frame.node.children.push(childNode);
+              if (frame.depth > actualDepth) actualDepth = frame.depth;
+              if (frame.depth + 1 <= depthBudget) {
+                queue.push({ node: childNode, el: childEl, depth: frame.depth + 1 });
+              }
+            }
+            if (truncated) break;
+          }
+
+          // If root had no children, depth is 0 (no descendants returned).
+          if (rootNode.children.length === 0) actualDepth = 0;
+
+          const responseData: {
+            elementId: string;
+            depth: number;
+            tree: DomTreeNode;
+            truncated?: boolean;
+          } = {
+            elementId: treeElementId,
+            depth: actualDepth,
+            tree: rootNode,
+          };
+          if (truncated) responseData.truncated = true;
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: responseData,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "highlight_element": {
           const highlightId = (payload.params?.elementId as string) ?? payload.elementId ?? "";
           if (!highlightId) {

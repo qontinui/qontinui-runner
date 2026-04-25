@@ -16,9 +16,9 @@ use axum::{
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{ApiResponse, ApiState};
 
 use super::request::{gather_readiness_diagnostics, ui_bridge_request_sync, wrap_ipc_result};
 
@@ -337,13 +337,7 @@ pub async fn ui_bridge_get_idle_status_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting idle status");
 
-    match ui_bridge_request_sync(&state, "get_idle_status", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_idle_status", serde_json::json!({})).await)
 }
 
 /// Get a specific named idle signal (e.g. "network", "animations").
@@ -353,13 +347,7 @@ pub async fn ui_bridge_get_idle_signal_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Get idle signal '{}'", signal);
     let payload = serde_json::json!({ "params": { "signal": signal } });
-    match ui_bridge_request_sync(&state, "get_idle_signal", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Get idle signal failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_idle_signal", payload).await)
 }
 
 // ============================================================================

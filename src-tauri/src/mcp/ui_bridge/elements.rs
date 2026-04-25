@@ -218,6 +218,96 @@ pub async fn ui_bridge_get_element_handler(
     wrap_ipc_result(filtered_result)
 }
 
+/// Optional query params for `/ui-bridge/control/element/{id}/tree`.
+#[derive(Debug, Deserialize, Default)]
+pub struct ElementTreeQueryParams {
+    /// DOM-subtree depth to walk; clamped to [1, 6]. Defaults to 3.
+    #[serde(default)]
+    pub depth: Option<i64>,
+}
+
+/// Return the rendered DOM subtree of a registered element so callers can
+/// understand component structure without composing multiple ad-hoc queries.
+///
+/// `GET /ui-bridge/control/element/{elementId}/tree?depth=N`
+///
+/// Response shape (on success):
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "elementId": "<id>",
+///     "depth": <int — actual depth returned, may be < requested>,
+///     "tree": { "tagName": "DIV", "attrs": {...}, "childCount": N,
+///               "children": [...] },
+///     "truncated": true   // optional, set when the 200-node cap was hit
+///   }
+/// }
+/// ```
+///
+/// The frontend filters attrs to navigation-useful ones only: class
+/// (truncated to 80 chars), data-*, title, role, aria-label, name, type.
+/// Unknown element ids return HTTP 404 with a flat error envelope.
+pub async fn ui_bridge_get_element_tree_subtree_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ElementTreeQueryParams>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let depth = query.depth.unwrap_or(3).clamp(1, 6);
+
+    info!(
+        "UI Bridge API: Get element DOM tree id={} depth={}",
+        id, depth
+    );
+
+    let result = ui_bridge_request_sync(
+        &state,
+        "get_element_dom_tree",
+        serde_json::json!({ "elementId": id, "depth": depth }),
+    )
+    .await;
+
+    match result {
+        Ok(data) => {
+            // Frontend signals "not found" by returning success=false with
+            // error="element_not_found". Map that to HTTP 404 with a structured
+            // error_detail (matches the existing element-not-found shape used
+            // elsewhere, e.g. ui_bridge_assert_element_handler). Agent 3's
+            // closestMatches hint shape isn't in place yet — fall back to a
+            // plain 404 here.
+            if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                let err_str = data
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UI bridge call failed");
+                if err_str == "element_not_found" {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        Json(api_error_detailed(
+                            format!("Element '{}' not found", id),
+                            UiBridgeError::element_not_found(&id),
+                        )),
+                    ));
+                }
+                // Other inner failures: flatten to 400 (matches wrap_ipc_result).
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(err_str.to_string())),
+                ));
+            }
+            Ok(Json(ApiResponse::success(data)))
+        }
+        Err(e) => {
+            error!("UI Bridge API: get_element_dom_tree failed: {}", e);
+            let detail = classify_transport_error(&e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error_detailed(e, detail)),
+            ))
+        }
+    }
+}
+
 /// Declarative element assertion — check multiple predicates against a registered element.
 ///
 /// POST /ui-bridge/control/element/{id}/assert
@@ -564,6 +654,7 @@ pub async fn ui_bridge_execute_action_handler(
                 })),
                 error: Some("element is disabled".to_string()),
                 error_detail: None,
+                hint: None,
             }));
         }
     }
@@ -862,13 +953,9 @@ pub async fn ui_bridge_get_components_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting all components");
 
-    match ui_bridge_request_sync(&state, "get_components", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "get_components", serde_json::json!({})).await,
+    )
 }
 
 /// Get a specific component by ID.
@@ -878,19 +965,14 @@ pub async fn ui_bridge_get_component_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting component {}", id);
 
-    match ui_bridge_request_sync(
-        &state,
-        "get_component",
-        serde_json::json!({ "componentId": id }),
+    wrap_ipc_result(
+        ui_bridge_request_sync(
+            &state,
+            "get_component",
+            serde_json::json!({ "componentId": id }),
+        )
+        .await,
     )
-    .await
-    {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
 }
 
 /// Execute an action on a component.
@@ -1555,16 +1637,7 @@ async fn ui_bridge_wait_for_element_registered_forward(
     );
 
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "wait_for_element_registered", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!(
-                "UI Bridge API: wait-for-element (predicate shape) failed: {}",
-                e
-            );
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "wait_for_element_registered", payload).await)
 }
 
 /// M1 wait-for-element state-predicate validation.
@@ -1700,16 +1773,9 @@ async fn ui_bridge_wait_for_element_state_predicate_handler(
         }
     });
 
-    match ui_bridge_request_sync(&state, "wait_for_element_state_predicate", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!(
-                "UI Bridge API: wait-for-element (state shape) failed: {}",
-                e
-            );
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "wait_for_element_state_predicate", payload).await,
+    )
 }
 
 /// Evaluate the `assertions[]` array for the wait-for-element handler.
@@ -1863,13 +1929,7 @@ pub async fn ui_bridge_find_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Find elements");
 
-    match ui_bridge_request_sync(&state, "find", request).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "find", request).await)
 }
 
 // =========================================================================
@@ -2200,6 +2260,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             get(ui_bridge_get_element_handler),
         )
         .route(
+            "/ui-bridge/control/element/{id}/tree",
+            get(ui_bridge_get_element_tree_subtree_handler),
+        )
+        .route(
             "/ui-bridge/control/element/{id}/assert",
             post(ui_bridge_assert_element_handler),
         )
@@ -2271,6 +2335,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/elements/last-discovered"),
         ("GET", "/ui-bridge/ai/elements/last-discovered"),
         ("GET", "/ui-bridge/control/element/{id}"),
+        ("GET", "/ui-bridge/control/element/{id}/tree"),
         ("POST", "/ui-bridge/control/element/{id}/assert"),
         ("POST", "/ui-bridge/control/element/{id}/action"),
         ("POST", "/ui-bridge/control/batch-actions"),

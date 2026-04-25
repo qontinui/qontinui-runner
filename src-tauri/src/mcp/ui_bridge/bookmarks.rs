@@ -18,11 +18,11 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use tracing::{error, info};
+use tracing::info;
 
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{ApiResponse, ApiState};
 
-use super::request::ui_bridge_request_sync;
+use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 
 /// Save a bookmark (snapshot) by name.
 pub async fn ui_bridge_save_bookmark_handler(
@@ -30,13 +30,7 @@ pub async fn ui_bridge_save_bookmark_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Save bookmark");
-    match ui_bridge_request_sync(&state, "save_bookmark", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Save bookmark failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "save_bookmark", body).await)
 }
 
 /// Get a bookmark by name.
@@ -45,13 +39,7 @@ pub async fn ui_bridge_get_bookmark_handler(
     Path(name): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Get bookmark '{}'", name);
-    match ui_bridge_request_sync(&state, "get_bookmark", serde_json::json!({"name": name})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Get bookmark failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_bookmark", serde_json::json!({"name": name})).await)
 }
 
 /// Delete a bookmark by name.
@@ -60,14 +48,9 @@ pub async fn ui_bridge_delete_bookmark_handler(
     Path(name): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Delete bookmark '{}'", name);
-    match ui_bridge_request_sync(&state, "delete_bookmark", serde_json::json!({"name": name})).await
-    {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Delete bookmark failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "delete_bookmark", serde_json::json!({"name": name})).await,
+    )
 }
 
 /// List all bookmarks.
@@ -75,13 +58,7 @@ pub async fn ui_bridge_list_bookmarks_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: List bookmarks");
-    match ui_bridge_request_sync(&state, "list_bookmarks", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: List bookmarks failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "list_bookmarks", serde_json::json!({})).await)
 }
 
 /// Diff current state from a named bookmark.
@@ -90,19 +67,14 @@ pub async fn ui_bridge_diff_from_bookmark_handler(
     Path(name): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Diff from bookmark '{}'", name);
-    match ui_bridge_request_sync(
-        &state,
-        "diff_from_bookmark",
-        serde_json::json!({"name": name}),
+    wrap_ipc_result(
+        ui_bridge_request_sync(
+            &state,
+            "diff_from_bookmark",
+            serde_json::json!({"name": name}),
+        )
+        .await,
     )
-    .await
-    {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Diff from bookmark failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
 }
 
 /// Execute an action and return the diff.
@@ -111,13 +83,7 @@ pub async fn ui_bridge_execute_with_diff_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Execute with diff");
-    match ui_bridge_request_sync(&state, "execute_with_diff", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Execute with diff failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "execute_with_diff", body).await)
 }
 
 /// Composite endpoint: execute one or more actions with atomic change-buffer tracking.
@@ -132,13 +98,7 @@ pub async fn ui_bridge_with_diff_handler(
     // Detect batch vs single based on presence of "operations" array
     if body.get("operations").is_some() {
         info!("UI Bridge API: Batch execute with diff");
-        match ui_bridge_request_sync(&state, "execute_batch_with_diff", body).await {
-            Ok(data) => Ok(Json(ApiResponse::success(data))),
-            Err(e) => {
-                error!("UI Bridge API: Batch execute with diff failed: {}", e);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-            }
-        }
+        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_batch_with_diff", body).await)
     } else {
         // Single operation — wrap into execute_with_diff format
         // ChangeTracker.executeWithDiff expects { elementAction: { elementId, action, params } }
@@ -160,13 +120,7 @@ pub async fn ui_bridge_with_diff_handler(
             "action": operation,
             "params": params,
         });
-        match ui_bridge_request_sync(&state, "execute_with_diff", payload).await {
-            Ok(data) => Ok(Json(ApiResponse::success(data))),
-            Err(e) => {
-                error!("UI Bridge API: Single execute with diff failed: {}", e);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-            }
-        }
+        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_with_diff", payload).await)
     }
 }
 
@@ -176,13 +130,7 @@ pub async fn ui_bridge_wait_for_change_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Wait for change");
-    match ui_bridge_request_sync(&state, "wait_for_change", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Wait for change failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "wait_for_change", body).await)
 }
 
 /// Categorize the last diff.
@@ -190,13 +138,9 @@ pub async fn ui_bridge_categorize_last_diff_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Categorize last diff");
-    match ui_bridge_request_sync(&state, "categorize_last_diff", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Categorize last diff failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "categorize_last_diff", serde_json::json!({})).await,
+    )
 }
 
 /// Compute a scoped diff.
@@ -205,13 +149,7 @@ pub async fn ui_bridge_scoped_diff_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Scoped diff");
-    match ui_bridge_request_sync(&state, "scoped_diff", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Scoped diff failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "scoped_diff", body).await)
 }
 
 /// Summarize a diff.
@@ -220,13 +158,7 @@ pub async fn ui_bridge_summarize_diff_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Summarize diff");
-    match ui_bridge_request_sync(&state, "summarize_diff", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Summarize diff failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "summarize_diff", body).await)
 }
 
 /// Get structured changes.
@@ -235,13 +167,7 @@ pub async fn ui_bridge_structured_changes_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Structured changes");
-    match ui_bridge_request_sync(&state, "structured_changes", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Structured changes failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "structured_changes", body).await)
 }
 
 /// Enable the change buffer.
@@ -249,13 +175,9 @@ pub async fn ui_bridge_enable_change_buffer_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Enable change buffer");
-    match ui_bridge_request_sync(&state, "enable_change_buffer", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Enable change buffer failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "enable_change_buffer", serde_json::json!({})).await,
+    )
 }
 
 /// Disable the change buffer.
@@ -263,13 +185,9 @@ pub async fn ui_bridge_disable_change_buffer_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Disable change buffer");
-    match ui_bridge_request_sync(&state, "disable_change_buffer", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Disable change buffer failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "disable_change_buffer", serde_json::json!({})).await,
+    )
 }
 
 /// Drain the change buffer.
@@ -277,13 +195,9 @@ pub async fn ui_bridge_drain_change_buffer_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Drain change buffer");
-    match ui_bridge_request_sync(&state, "drain_change_buffer", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Drain change buffer failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "drain_change_buffer", serde_json::json!({})).await,
+    )
 }
 
 /// Get the change buffer size.
@@ -291,13 +205,9 @@ pub async fn ui_bridge_get_change_buffer_size_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Get change buffer size");
-    match ui_bridge_request_sync(&state, "get_change_buffer_size", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Get change buffer size failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "get_change_buffer_size", serde_json::json!({})).await,
+    )
 }
 
 /// Bookmark + change-tracking + with-diff routes (control + ai aliases).

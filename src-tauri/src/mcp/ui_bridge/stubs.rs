@@ -26,7 +26,7 @@ use tracing::{error, info};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
-use super::request::ui_bridge_request_sync;
+use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 
 // ============================================================================
 // Request types
@@ -156,13 +156,7 @@ pub async fn ui_bridge_register_network_stub_handler(
         return Err((StatusCode::BAD_REQUEST, Json(api_error(msg))));
     }
 
-    match ui_bridge_request_sync(&state, "register_network_stub", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "register_network_stub", body).await)
 }
 
 /// GET /control/network/stubs — list registered stubs.
@@ -171,13 +165,9 @@ pub async fn ui_bridge_list_network_stubs_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: List network stubs");
 
-    match ui_bridge_request_sync(&state, "list_network_stubs", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "list_network_stubs", serde_json::json!({})).await,
+    )
 }
 
 /// DELETE /control/network/stubs/:id — delete a specific stub.
@@ -188,25 +178,23 @@ pub async fn ui_bridge_delete_network_stub_handler(
     info!("UI Bridge API: Delete network stub {}", id);
 
     let payload = serde_json::json!({ "id": id });
-    match ui_bridge_request_sync(&state, "delete_network_stub", payload).await {
-        Ok(data) => {
-            // The SDK-side handler returns { success, code? } — preserve the
-            // NOT_FOUND signal by surfacing 404 when appropriate.
-            if let Some(code) = data.get("code").and_then(|c| c.as_str()) {
-                if code == "NOT_FOUND" {
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        Json(api_error(format!("stub {} not found", id))),
-                    ));
-                }
+    let result = ui_bridge_request_sync(&state, "delete_network_stub", payload).await;
+
+    // The SDK-side handler returns { success, code? } — preserve the
+    // NOT_FOUND signal by surfacing 404 when appropriate, before falling
+    // through to the standard wrap_ipc_result flattening for other shapes.
+    if let Ok(ref data) = result {
+        if let Some(code) = data.get("code").and_then(|c| c.as_str()) {
+            if code == "NOT_FOUND" {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(api_error(format!("stub {} not found", id))),
+                ));
             }
-            Ok(Json(ApiResponse::success(data)))
-        }
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
+
+    wrap_ipc_result(result)
 }
 
 /// DELETE /control/network/stubs — clear every stub.
@@ -215,13 +203,9 @@ pub async fn ui_bridge_clear_network_stubs_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Clear all network stubs");
 
-    match ui_bridge_request_sync(&state, "clear_network_stubs", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "clear_network_stubs", serde_json::json!({})).await,
+    )
 }
 
 // ============================================================================
@@ -291,13 +275,7 @@ pub async fn ui_bridge_verify_network_stub_handler(
         return Err((StatusCode::BAD_REQUEST, Json(api_error(msg))));
     }
 
-    match ui_bridge_request_sync(&state, "verify_network_stub", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "verify_network_stub", body).await)
 }
 
 // ============================================================================

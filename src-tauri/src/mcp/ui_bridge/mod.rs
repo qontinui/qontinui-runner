@@ -209,15 +209,19 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 // State machine routes (IPC to webview SDK)
 // ============================================================================
 
+// F2 sweep (2026-04-22): all four `ipc_handler_*!` macros now route through
+// `wrap_ipc_result`, which flattens an inner `{success:false, error}` envelope
+// from the frontend into a flat HTTP 400 (no inner data, no nested success).
+// Macro expansion sites (the per-family `misc.rs` / `state_machine.rs` /
+// `screenshots.rs` callers) inherit this behavior with no changes required.
 macro_rules! ipc_handler_get {
     ($fn_name:ident, $ipc_type:expr) => {
         pub async fn $fn_name(
             State(state): State<Arc<ApiState>>,
         ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-            match ui_bridge_request_sync(&state, $ipc_type, serde_json::json!({})).await {
-                Ok(data) => Ok(Json(ApiResponse::success(data))),
-                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-            }
+            $crate::mcp::ui_bridge::request::wrap_ipc_result(
+                ui_bridge_request_sync(&state, $ipc_type, serde_json::json!({})).await,
+            )
         }
     };
 }
@@ -229,10 +233,9 @@ macro_rules! ipc_handler_post {
             Json(body): Json<serde_json::Value>,
         ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
             let payload = serde_json::json!({ "params": body });
-            match ui_bridge_request_sync(&state, $ipc_type, payload).await {
-                Ok(data) => Ok(Json(ApiResponse::success(data))),
-                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-            }
+            $crate::mcp::ui_bridge::request::wrap_ipc_result(
+                ui_bridge_request_sync(&state, $ipc_type, payload).await,
+            )
         }
     };
 }
@@ -244,10 +247,9 @@ macro_rules! ipc_handler_path_get {
             axum::extract::Path(id): axum::extract::Path<String>,
         ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
             let payload = serde_json::json!({ "params": { $param_name: id } });
-            match ui_bridge_request_sync(&state, $ipc_type, payload).await {
-                Ok(data) => Ok(Json(ApiResponse::success(data))),
-                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-            }
+            $crate::mcp::ui_bridge::request::wrap_ipc_result(
+                ui_bridge_request_sync(&state, $ipc_type, payload).await,
+            )
         }
     };
 }
@@ -267,10 +269,9 @@ macro_rules! ipc_handler_path_post {
                 params = serde_json::json!({ $param_name: id });
             }
             let payload = serde_json::json!({ "params": params });
-            match ui_bridge_request_sync(&state, $ipc_type, payload).await {
-                Ok(data) => Ok(Json(ApiResponse::success(data))),
-                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-            }
+            $crate::mcp::ui_bridge::request::wrap_ipc_result(
+                ui_bridge_request_sync(&state, $ipc_type, payload).await,
+            )
         }
     };
 }

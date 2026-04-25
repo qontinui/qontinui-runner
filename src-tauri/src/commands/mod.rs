@@ -316,6 +316,14 @@ pub struct AppState {
     /// Set by `mcp_api::start_server` after successful bind, checked by the
     /// `is_api_ready` Tauri command so the frontend can gate HTTP calls.
     pub api_ready: AtomicBool,
+    /// Flag indicating the React frontend has finished its loading screen and
+    /// is processing UI Bridge IPC. Flips to `true` the first time
+    /// `ui_bridge_request_sync` decodes a successful response from the
+    /// frontend; one-way (never flipped back to false). Surfaced in `/health`
+    /// as `frontendReady` so external pollers can distinguish "Tauri shell is
+    /// responsive" from "the React app has actually mounted past `App.tsx`'s
+    /// loading screen branch and is ready for UI Bridge calls".
+    pub frontend_ready: AtomicBool,
     /// Actual port the HTTP API server bound to.
     /// Set by `mcp_api::start_server` after successful bind.
     pub api_port: AtomicU16,

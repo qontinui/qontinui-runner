@@ -319,7 +319,19 @@ async fn ui_bridge_request_inner(
     // Wait for response with timeout
     let timeout_duration = std::time::Duration::from_millis(get_ui_bridge_timeout_ms());
     match tokio::time::timeout(timeout_duration, rx).await {
-        Ok(Ok(response)) => Ok(response),
+        Ok(Ok(response)) => {
+            // First successful IPC response means the React frontend has
+            // mounted past `App.tsx`'s loading-screen branch and its
+            // ui-bridge-response listener is wired up. Flip the one-way
+            // readiness flag so /health can report `frontendReady: true`.
+            // (Stays true for the rest of the process lifetime — see
+            // `AppState::frontend_ready` doc.)
+            state
+                .app_state
+                .frontend_ready
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(response)
+        }
         Ok(Err(_)) => Err("UI Bridge request channel closed unexpectedly".to_string()),
         Err(_) => {
             // Timeout - clean up the pending entry
@@ -379,35 +391,49 @@ pub async fn handle_ui_bridge_response(
     }
 }
 
-/// Wrap a UI Bridge IPC result into an API response, propagating inner success/error status.
+/// Wrap a UI Bridge IPC result into an API response, flattening any inner
+/// `{success:false, error}` envelope from the frontend into a flat HTTP 400.
 ///
-/// When the frontend returns `{success: false, error: "..."}` in the IPC data,
-/// this propagates the failure to the outer API envelope instead of wrapping
-/// it in `ApiResponse::success()` (which would create a misleading double-envelope:
-/// `{success: true, data: {success: false, error: "..."}}`).
+/// **F2 two-tier envelope contract** (sweep applied 2026-04-22):
+/// - Inner `success: true` (or no `success` field at all — some handlers omit
+///   it on the happy path) → HTTP 200 with `ApiResponse::success(data)`.
+/// - Inner `success: false` → HTTP 400 with a flat `{success: false, error}`
+///   body (no nested `data`, no inner success field). Falls back to a generic
+///   "UI bridge call failed" message if `data.error` is missing or non-string.
+/// - Transport-level `Err(_)` → HTTP 503 (frontend not ready) or HTTP 500
+///   (everything else), with structured `error_detail` for machine-readable
+///   recovery hints.
 ///
-/// Also populates `error_detail` with a structured `UiBridgeError` for machine-readable
-/// error handling by AI agents.
-pub(super) fn wrap_ipc_result(
+/// This mirrors the F2 fix originally landed in `design.rs` for the audit
+/// handler (`unwrap_inner_audit_error`) and is now the canonical unwrapper
+/// every IPC-backed handler funnels through.
+///
+/// Note: this is a **back-compat shift** for callers that previously saw
+/// `HTTP 200 + {success:false, ...}` on soft failures — they now get HTTP 400.
+pub(crate) fn wrap_ipc_result(
     result: Result<serde_json::Value, String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     match result {
         Ok(data) => {
-            // Check if the IPC response indicates failure
             if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                // Inner-failure envelope: flatten to HTTP 400 + flat error body.
                 let error_msg = data
                     .get("error")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("Operation failed")
-                    .to_string();
-                let error_detail = classify_transport_error(&error_msg);
-                Ok(Json(ApiResponse {
-                    success: false,
-                    data: Some(data),
-                    error: Some(error_msg),
-                    error_detail: Some(error_detail),
-                }))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "UI bridge call failed".to_string());
+                let detail = classify_transport_error(&error_msg);
+                // Forward an optional `hint` sibling field from the inner
+                // IPC envelope (set by frontend handlers like
+                // `useControlEvents` for typo-recovery on element-not-found
+                // / action-not-allowed). The hint stays a sibling of
+                // `error` — the success/error envelope shape is unchanged.
+                let hint = data.get("hint").cloned();
+                let mut body = api_error_detailed(error_msg, detail);
+                body.hint = hint;
+                Err((StatusCode::BAD_REQUEST, Json(body)))
             } else {
+                // Healthy IPC response (success: true OR success absent).
                 Ok(Json(ApiResponse::success(data)))
             }
         }
@@ -420,5 +446,100 @@ pub(super) fn wrap_ipc_result(
             };
             Err((status, Json(api_error_detailed(e, detail))))
         }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod wrap_ipc_result_tests {
+    //! F2 two-tier envelope flattening tests for the canonical
+    //! `wrap_ipc_result` helper. Lock down each decision point: inner
+    //! success, inner failure (with/without error field), absent success
+    //! field, and non-bool success values.
+    use super::wrap_ipc_result;
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use std::ops::Deref;
+
+    #[test]
+    fn inner_success_returns_http_200() {
+        let data = json!({"success": true, "report": {"violations": []}});
+        let resp = wrap_ipc_result(Ok(data.clone())).expect("inner success must produce Ok");
+        let body = resp.deref();
+        assert!(body.success);
+        assert!(body.error.is_none());
+        assert_eq!(body.data.as_ref().unwrap(), &data);
+    }
+
+    #[test]
+    fn inner_failure_with_explicit_error_flattens_to_400() {
+        let data = json!({
+            "success": false,
+            "error": "No style guide provided or loaded.",
+            "type": "design_run_audit",
+        });
+        let (status, body) = wrap_ipc_result(Ok(data))
+            .expect_err("inner failure must produce Err with HTTP 400");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let inner = body.deref();
+        assert!(!inner.success);
+        let msg = inner.error.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("No style guide provided"),
+            "expected inner error to surface, got: {msg}"
+        );
+        // Outer body must be flat (no nested `data` from the inner envelope).
+        assert!(inner.data.is_none(), "outer body must not nest inner data");
+    }
+
+    #[test]
+    fn inner_failure_without_error_field_uses_fallback_message() {
+        let data = json!({"success": false});
+        let (status, body) = wrap_ipc_result(Ok(data))
+            .expect_err("inner failure must produce Err");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body.deref().error.as_deref().unwrap_or_default();
+        assert_eq!(msg, "UI bridge call failed");
+    }
+
+    #[test]
+    fn absent_success_field_passes_through_as_200() {
+        // Some IPC responses don't include `success` at all — those should
+        // be treated as healthy success (no misclassification as failure).
+        let data = json!({"report": {"violations": []}});
+        let resp =
+            wrap_ipc_result(Ok(data.clone())).expect("absent success field must produce Ok");
+        let body = resp.deref();
+        assert!(body.success);
+        assert_eq!(body.data.as_ref().unwrap(), &data);
+    }
+
+    #[test]
+    fn non_bool_success_value_passes_through_as_200() {
+        // Robustness: if `success` is a string or number rather than a bool,
+        // treat it as "shape unknown, don't flag failure" rather than
+        // panicking or misclassifying it.
+        let data = json!({"success": "true", "payload": 1});
+        let resp = wrap_ipc_result(Ok(data)).expect("string success must produce Ok");
+        assert!(resp.deref().success);
+
+        let data = json!({"success": 1, "payload": 2});
+        let resp = wrap_ipc_result(Ok(data)).expect("numeric success must produce Ok");
+        assert!(resp.deref().success);
+    }
+
+    #[test]
+    fn transport_error_returns_5xx() {
+        // Sanity: a transport-level Err (e.g. timeout) still surfaces as
+        // HTTP 5xx, not 400.
+        let (status, _body) =
+            wrap_ipc_result(Err("UI Bridge request timed out after 5000ms".to_string()))
+                .expect_err("transport error must produce Err");
+        // Either 500 (default) or 503 (frontend not ready) — not 400.
+        assert_ne!(status, StatusCode::BAD_REQUEST);
+        assert!(status.is_server_error());
     }
 }

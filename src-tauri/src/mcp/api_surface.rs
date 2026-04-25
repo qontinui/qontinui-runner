@@ -184,6 +184,7 @@ async fn handle_scan(
                 data: None,
                 error: Some(format!("Scan task failed: {}", e)),
                 error_detail: None,
+                hint: None,
             }),
         )
     })?;
@@ -193,6 +194,7 @@ async fn handle_scan(
         data: Some(surface),
         error: None,
         error_detail: None,
+        hint: None,
     }))
 }
 

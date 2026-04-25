@@ -2764,6 +2764,7 @@ async fn sync_slash_commands_handler(
                 data: Some(result),
                 error: None,
                 error_detail: None,
+                hint: None,
             }))
         }
         Err(e) => {

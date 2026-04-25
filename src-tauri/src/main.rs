@@ -412,6 +412,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()
         api_ready: AtomicBool::new(false),              // Set when MCP API server binds
+        frontend_ready: AtomicBool::new(false), // Set on first successful UI Bridge IPC response
         api_port: AtomicU16::new(crate::mcp::types::get_mcp_api_port()), // Updated when server binds
         ai_pid_tracker: Arc::new(std::sync::Mutex::new(Vec::new())),
         canvas_state: Arc::new(tokio::sync::RwLock::new(
@@ -1448,6 +1449,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     match builder.build() {
                         Ok(win) => {
+                            // tauri-plugin-window-state restores saved size/position
+                            // on window creation, which overrides .position()/.inner_size()
+                            // from the builder. When the supervisor explicitly tells us
+                            // where to land via env vars, force-apply those after build
+                            // to win against the plugin's restore.
+                            if let Some((x, y)) = env_pos {
+                                let pos = tauri::PhysicalPosition::new(x as i32, y as i32);
+                                if let Err(e) = win.set_position(pos) {
+                                    warn!("Failed to apply env-var window position: {}", e);
+                                }
+                                let size = tauri::PhysicalSize::new(
+                                    initial_size.0 as u32,
+                                    initial_size.1 as u32,
+                                );
+                                if let Err(e) = win.set_size(size) {
+                                    warn!("Failed to apply env-var window size: {}", e);
+                                }
+                            }
                             let _ = win.show();
                             let _ = win.set_focus();
                             info!(

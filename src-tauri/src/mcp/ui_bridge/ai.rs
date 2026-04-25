@@ -22,12 +22,12 @@ use axum::{
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::info;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 use super::helpers::extract_first_element_id;
-use super::request::ui_bridge_request_sync;
+use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 
 // ============================================================================
 // AI search / find / execute / assert / snapshot / summary
@@ -42,13 +42,7 @@ pub async fn ui_bridge_ai_search_handler(
 
     let payload = serde_json::json!({ "params": body });
 
-    match ui_bridge_request_sync(&state, "ai_search", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: AI search failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "ai_search", payload).await)
 }
 
 /// Natural language element find.
@@ -64,8 +58,12 @@ pub async fn ui_bridge_ai_find_handler(
 
     let payload = serde_json::json!({ "params": body });
 
-    match ui_bridge_request_sync(&state, "ai_find", payload).await {
-        Ok(mut data) => {
+    // Post-process the IPC response to apply the confidence gate before
+    // delegating to wrap_ipc_result for the outer envelope (so a frontend
+    // soft-failure still flattens to HTTP 400 like every other handler).
+    let processed = ui_bridge_request_sync(&state, "ai_find", payload)
+        .await
+        .map(|mut data| {
             // Confidence gate: if the best match is below threshold, return
             // element: null so callers don't act on a wrong match.  The raw
             // confidence and alternatives are preserved for debugging.
@@ -115,13 +113,9 @@ pub async fn ui_bridge_ai_find_handler(
                     );
                 }
             }
-            Ok(Json(ApiResponse::success(data)))
-        }
-        Err(e) => {
-            error!("UI Bridge API: AI find failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+            data
+        });
+    wrap_ipc_result(processed)
 }
 
 /// Natural language action execution.
@@ -131,13 +125,7 @@ pub async fn ui_bridge_ai_execute_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: AI execute");
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "ai_execute", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: AI execute failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "ai_execute", payload).await)
 }
 
 /// AI assertion evaluation.
@@ -147,13 +135,7 @@ pub async fn ui_bridge_ai_assert_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: AI assert");
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "ai_assert", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: AI assert failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "ai_assert", payload).await)
 }
 
 /// Batch AI assertion evaluation.
@@ -163,13 +145,7 @@ pub async fn ui_bridge_ai_assert_batch_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: AI assert batch");
     let payload = serde_json::json!({ "params": body });
-    match ui_bridge_request_sync(&state, "ai_assert_batch", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: AI assert batch failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "ai_assert_batch", payload).await)
 }
 
 /// Query parameters for the AI snapshot endpoint.
@@ -195,13 +171,7 @@ pub async fn ui_bridge_ai_snapshot_handler(
     if let Some(max_tokens) = query.max_tokens {
         payload["maxTokens"] = serde_json::json!(max_tokens);
     }
-    match ui_bridge_request_sync(&state, "ai_snapshot", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: AI snapshot failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "ai_snapshot", payload).await)
 }
 
 /// Natural language page summary.
@@ -209,13 +179,7 @@ pub async fn ui_bridge_ai_summary_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: AI summary");
-    match ui_bridge_request_sync(&state, "ai_summary", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: AI summary failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "ai_summary", serde_json::json!({})).await)
 }
 
 // ============================================================================

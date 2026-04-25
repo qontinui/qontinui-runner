@@ -3,7 +3,7 @@ import type { BridgeSnapshot } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
 import { createLogger } from "@/lib/logger";
-import { ACTIVE_TAB_STORAGE_KEY } from "@/components/app/tab-types";
+import { ACTIVE_TAB_STORAGE_KEY, TAB_LIST } from "@/components/app/tab-types";
 import { instanceStorage } from "@/lib/instance-storage";
 
 const logger = createLogger("UIBridgeDiscoveryEvents");
@@ -238,6 +238,32 @@ export function useDiscoveryEvents(
             | undefined;
 
           logger.debug("get_snapshot: enriching...");
+          // Resolve the active tab once so `availableTabs` can flag which entry
+          // matches and the `getActiveTab` callback above stays the source of
+          // truth (instanceStorage + initial-tab fallback).
+          const activeTabId = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
+          // Derive a short alias from the tab id by stripping a known prefix
+          // (`sm-tab-`). The runner's MainTabId catalog doesn't use that prefix
+          // — TAB_LIST ids are already terse — so canonical is typically the
+          // id itself. The strip-prefix step is kept for forward-compat with
+          // any future tabbed page that namespaces its ids.
+          const toCanonical = (tabId: string): string =>
+            tabId.startsWith("sm-tab-") ? tabId.slice("sm-tab-".length) : tabId;
+          const availableTabs = TAB_LIST.map((entry) => ({
+            id: entry.id,
+            label: entry.label,
+            canonical: toCanonical(entry.id),
+            active: entry.id === activeTabId,
+          }));
+          // Static documentation hint — same on every snapshot, regardless of
+          // whether the current page has tabs registered. Lets tooling/agents
+          // discover the activation endpoint without reading external docs.
+          const tabActivation = {
+            description: "Switch tabs without a UI click",
+            method: "POST",
+            path: "/ui-bridge/control/tab/activate",
+            bodyExample: { tabId: "<one of availableTabs[].id>" },
+          };
           const enrichedSnapshot = {
             ...snapshot,
             page: safeGet(() => navTracker?.getSnapshotPageContext()),
@@ -247,6 +273,8 @@ export function useDiscoveryEvents(
             dragDrop: safeGet(() => dndDetector?.getSnapshotDragDropContext(elementPairs)),
             undoRedo: safeGet(() => undoTracker?.getSnapshotUndoContext()),
             shortcuts: safeGet(() => shortcutTracker?.getSnapshotShortcutContext()),
+            availableTabs,
+            tabActivation,
           };
 
           const response = {

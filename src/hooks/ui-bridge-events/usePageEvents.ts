@@ -14,6 +14,7 @@ import {
   installStubFetchInterceptor,
   validateStubRequest,
 } from "@qontinui/ui-bridge";
+import { serializeComponent, getUIBridgeGlobal } from "./utils";
 
 const logger = createLogger("UIBridgePageEvents");
 
@@ -40,6 +41,7 @@ const PAGE_EVENT_TYPES: ReadonlySet<PageEventTypes> = new Set<PageEventTypes>([
   "navigate_by_adapter",
   "tabs_list",
   "tab_activate",
+  "get_playbook",
   "register_network_stub",
   "list_network_stubs",
   "delete_network_stub",
@@ -55,7 +57,7 @@ function isPageEventType(type: string): type is PageEventTypes {
  * Handles: page_refresh, page_navigate, page_go_back, page_go_forward, query_selector, page_evaluate
  */
 export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">) {
-  const { sendResponse } = context;
+  const { bridgeRef, sendResponse } = context;
 
   return useCallback(
     async (payload: UIBridgeRequestPayload): Promise<boolean> => {
@@ -1244,6 +1246,84 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
           return true;
         }
 
+        case "get_playbook": {
+          // Combined "what can I do on this page right now" snapshot. The
+          // Rust handler at GET /ui-bridge/control/page/playbook merges in
+          // a static `primaryActions` list — we just supply the dynamic
+          // pieces here (current tab, tab list, components, intents).
+          try {
+            const activeTab = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
+
+            const tabs = TAB_LIST.map((entry) => ({
+              id: entry.id,
+              label: entry.label,
+              section: entry.section,
+              active: entry.id === activeTab,
+            }));
+
+            const currentBridge = bridgeRef.current;
+            const components = currentBridge
+              ? currentBridge.components.map((c) => {
+                  const serialized = serializeComponent(c);
+                  return {
+                    id: serialized.id,
+                    kind: serialized.name,
+                    actions: serialized.actions.map((a) => a.id),
+                    actionInvocationPath: serialized.actionInvocationPath,
+                  };
+                })
+              : [];
+
+            // Mirror the lookup useAISearchEvents does: prefer the global
+            // intent registry's getAll/list, fall back to whatever's there.
+            // Intent shape is loose (registries differ) so we read id/label
+            // defensively.
+            const uiBridgeGlobal = getUIBridgeGlobal();
+            const intentRegistry = uiBridgeGlobal?.intentRegistry as
+              | { getAll?: () => unknown[]; list?: () => unknown[] }
+              | undefined;
+            const rawIntents = intentRegistry?.getAll?.() ?? intentRegistry?.list?.() ?? [];
+            const intents = (Array.isArray(rawIntents) ? rawIntents : [])
+              .map((raw) => {
+                const obj = (raw ?? {}) as Record<string, unknown>;
+                const id = typeof obj.id === "string" ? obj.id : undefined;
+                if (!id) return null;
+                const label = typeof obj.label === "string" ? obj.label : undefined;
+                return {
+                  id,
+                  label,
+                  path: `/ui-bridge/intent/${id}`,
+                };
+              })
+              .filter(
+                (x): x is { id: string; label: string | undefined; path: string } => x !== null,
+              );
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                page: window.location.pathname,
+                activeTab,
+                tabs,
+                components,
+                intents,
+              },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
         default: {
           // Exhaustiveness check — if TypeScript errors here with
           // "Type 'X' is not assignable to type 'never'", add a case for the
@@ -1257,6 +1337,6 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
         }
       }
     },
-    [sendResponse],
+    [bridgeRef, sendResponse],
   );
 }

@@ -90,6 +90,7 @@ async fn handle_diff(
         data: Some(diff),
         error: None,
         error_detail: None,
+        hint: None,
     }))
 }
 
@@ -107,6 +108,7 @@ async fn handle_save_snapshot(
                 data: None,
                 error: Some(format!("PG pool error: {}", e)),
                 error_detail: None,
+                hint: None,
             }),
         )
     })?;
@@ -125,6 +127,7 @@ async fn handle_save_snapshot(
                 data: None,
                 error: Some(format!("Serialize scan: {}", e)),
                 error_detail: None,
+                hint: None,
             }),
         )
     })?;
@@ -153,6 +156,7 @@ async fn handle_save_snapshot(
                     data: None,
                     error: Some(format!("PG insert snapshot: {}", e)),
                     error_detail: None,
+                    hint: None,
                 }),
             )
         })?;
@@ -176,6 +180,7 @@ async fn handle_save_snapshot(
         }),
         error: None,
         error_detail: None,
+        hint: None,
     }))
 }
 
@@ -194,6 +199,7 @@ async fn handle_list_snapshots(
                 data: None,
                 error: Some(format!("PG pool error: {}", e)),
                 error_detail: None,
+                hint: None,
             }),
         )
     })?;
@@ -213,6 +219,7 @@ async fn handle_list_snapshots(
                     data: None,
                     error: Some(format!("PG query snapshots: {}", e)),
                     error_detail: None,
+                    hint: None,
                 }),
             )
         })?;
@@ -233,6 +240,7 @@ async fn handle_list_snapshots(
         data: Some(snapshots),
         error: None,
         error_detail: None,
+        hint: None,
     }))
 }
 

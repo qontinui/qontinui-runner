@@ -21,11 +21,11 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use tracing::{error, info};
+use tracing::info;
 
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{ApiResponse, ApiState};
 
-use super::request::ui_bridge_request_sync;
+use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 use super::{ipc_handler_get, ipc_handler_path_get, ipc_handler_post};
 
 // ============================================================================
@@ -38,13 +38,7 @@ pub async fn ui_bridge_get_undo_state_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting undo state");
 
-    match ui_bridge_request_sync(&state, "get_undo_state", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_undo_state", serde_json::json!({})).await)
 }
 
 /// Execute undo via the UI Bridge.
@@ -53,13 +47,7 @@ pub async fn ui_bridge_undo_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Undo");
 
-    match ui_bridge_request_sync(&state, "undo", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Undo failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "undo", serde_json::json!({})).await)
 }
 
 /// Execute redo via the UI Bridge.
@@ -68,13 +56,7 @@ pub async fn ui_bridge_redo_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Redo");
 
-    match ui_bridge_request_sync(&state, "redo", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Redo failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "redo", serde_json::json!({})).await)
 }
 
 // ============================================================================
@@ -87,13 +69,7 @@ pub async fn ui_bridge_get_specs_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting all specs");
 
-    match ui_bridge_request_sync(&state, "get_specs", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_specs", serde_json::json!({})).await)
 }
 
 /// Get a specific spec by ID from the SpecStore.
@@ -103,13 +79,9 @@ pub async fn ui_bridge_get_spec_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting spec {}", id);
 
-    match ui_bridge_request_sync(&state, "get_spec", serde_json::json!({ "specId": id })).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "get_spec", serde_json::json!({ "specId": id })).await,
+    )
 }
 
 // ============================================================================

@@ -111,3 +111,71 @@ export function getUIBridgeGlobal(): Record<string, unknown> | undefined {
     | Record<string, unknown>
     | undefined;
 }
+
+/**
+ * Compute the Levenshtein edit distance between two strings.
+ *
+ * Used by the IPC error paths in {@link ./useControlEvents.ts useControlEvents}
+ * to suggest closest-match element ids when the caller hits an
+ * unknown id (typo recovery). The implementation is a classic
+ * iterative DP — O(|a|*|b|) time, O(min(|a|,|b|)) space — and
+ * stable enough that we keep it inline rather than pulling in a
+ * dependency for ~15 LOC of arithmetic.
+ *
+ * Returns the minimum number of single-character insertions,
+ * deletions, or substitutions to transform `a` into `b`.
+ */
+export function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  // Always iterate over the shorter string in the inner loop to keep
+  // the row buffer small.
+  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+  const m = shorter.length;
+  const n = longer.length;
+
+  let prev: number[] = new Array(m + 1);
+  let curr: number[] = new Array(m + 1);
+  for (let j = 0; j <= m; j++) prev[j] = j;
+
+  for (let i = 1; i <= n; i++) {
+    curr[0] = i;
+    const longerCh = longer.charCodeAt(i - 1);
+    for (let j = 1; j <= m; j++) {
+      const cost = shorter.charCodeAt(j - 1) === longerCh ? 0 : 1;
+      const del = prev[j] + 1;
+      const ins = curr[j - 1] + 1;
+      const sub = prev[j - 1] + cost;
+      curr[j] = del < ins ? (del < sub ? del : sub) : ins < sub ? ins : sub;
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[m];
+}
+
+/**
+ * Pick up to 5 element ids closest to `target` by Levenshtein distance,
+ * filtered to ids whose distance is at most `floor(target.length / 2)`.
+ *
+ * This is the closest-match scaffolding used by the element-not-found
+ * IPC error path to surface typo-recovery suggestions in the response
+ * `hint.closestMatches` field. The threshold cap prevents `"foo"` from
+ * matching every 4+ char id in the registry — short queries get tight
+ * thresholds so we only return genuinely similar ids.
+ */
+export function closestElementIds(target: string, candidates: readonly string[]): string[] {
+  if (!target) return [];
+  const threshold = Math.floor(target.length / 2);
+  const scored: Array<{ id: string; distance: number }> = [];
+  for (const id of candidates) {
+    if (id === target) continue;
+    const distance = levenshtein(target, id);
+    if (distance <= threshold) {
+      scored.push({ id, distance });
+    }
+  }
+  scored.sort((a, b) => a.distance - b.distance || a.id.localeCompare(b.id));
+  return scored.slice(0, 5).map((s) => s.id);
+}

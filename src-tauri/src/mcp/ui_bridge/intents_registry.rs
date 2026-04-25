@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::Json};
 
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{ApiResponse, ApiState};
 
 use super::request::ui_bridge_request_sync;
 use super::{ipc_handler_get, ipc_handler_post};

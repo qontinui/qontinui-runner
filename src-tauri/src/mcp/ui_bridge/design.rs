@@ -18,11 +18,11 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use tracing::{error, info};
+use tracing::info;
 
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{ApiResponse, ApiState};
 
-use super::request::ui_bridge_request_sync;
+use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 
 /// Get extended computed styles for a single element.
 pub async fn ui_bridge_design_element_styles_handler(
@@ -35,13 +35,7 @@ pub async fn ui_bridge_design_element_styles_handler(
         "elementId": id
     });
 
-    match ui_bridge_request_sync(&state, "design_get_element_styles", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Design element styles failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_get_element_styles", payload).await)
 }
 
 /// Get styles across interaction states (hover, focus, active, disabled).
@@ -64,13 +58,7 @@ pub async fn ui_bridge_design_state_styles_handler(
         }
     }
 
-    match ui_bridge_request_sync(&state, "design_get_state_styles", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Design state styles failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_get_state_styles", payload).await)
 }
 
 /// Get design snapshot for all or filtered elements.
@@ -82,13 +70,7 @@ pub async fn ui_bridge_design_snapshot_handler(
 
     let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
 
-    match ui_bridge_request_sync(&state, "design_get_snapshot", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Design snapshot failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_get_snapshot", payload).await)
 }
 
 /// Capture responsive snapshots at multiple viewport widths.
@@ -98,49 +80,17 @@ pub async fn ui_bridge_design_responsive_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Design - get responsive snapshots");
 
-    match ui_bridge_request_sync(&state, "design_get_responsive", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Design responsive failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// F2 — Two-tier envelope flattening for design-audit responses.
-///
-/// The frontend handler in `useDesignEvents.ts` returns
-/// `{success:false, error:"..."}` inside the IPC `data` payload when the audit
-/// can't run (e.g. no style guide loaded). Without unwrapping, the HTTP
-/// response would carry the misleading shape
-/// `{success:true, data:{success:false, error:"..."}}` — outer success says
-/// "IPC delivered", inner success says "the operation actually failed".
-/// Callers had to defensively peek at `data.success` to detect failure.
-///
-/// This helper detects the inner-failure shape and returns the inner error
-/// string so the route handler can convert it to a flat HTTP 400 with
-/// `{success:false, error:"..."}`. Returns `None` on a healthy success
-/// payload (or when `success` is absent — some response shapes don't include
-/// it and we shouldn't misclassify those as failures).
-pub(super) fn unwrap_inner_audit_error(data: &serde_json::Value) -> Option<String> {
-    if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
-        let msg = data
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("design audit failed")
-            .to_string();
-        Some(msg)
-    } else {
-        None
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_get_responsive", body).await)
 }
 
 /// Run a style audit against a loaded or provided style guide.
 ///
-/// On inner-error responses (see `unwrap_inner_audit_error`), this returns
-/// HTTP 400 with a flat `{success:false, error:"..."}` body instead of the
-/// historical two-tier envelope. The happy path is unchanged: HTTP 200 with
-/// `{success:true, data:<audit report>}`.
+/// On inner-error responses (e.g. no style guide loaded), `wrap_ipc_result`
+/// flattens the two-tier `{success:true, data:{success:false}}` envelope
+/// into a flat HTTP 400 with `{success:false, error:"..."}`. The happy path
+/// is unchanged: HTTP 200 with `{success:true, data:<audit report>}`. This
+/// is the F2 fix originally landed here as `unwrap_inner_audit_error` and
+/// now centralized in `wrap_ipc_result` (sweep 2026-04-22).
 pub async fn ui_bridge_design_audit_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
@@ -149,23 +99,7 @@ pub async fn ui_bridge_design_audit_handler(
 
     let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
 
-    match ui_bridge_request_sync(&state, "design_run_audit", payload).await {
-        Ok(data) => {
-            // F2: flatten two-tier envelope. The frontend handler emits
-            // `{success:false, error:...}` inside `data` for soft failures
-            // like "no style guide loaded". Surface that as a flat HTTP 400
-            // so callers don't have to inspect `data.success` themselves.
-            if let Some(inner_err) = unwrap_inner_audit_error(&data) {
-                error!("UI Bridge API: Design audit inner failure: {}", inner_err);
-                return Err((StatusCode::BAD_REQUEST, Json(api_error(inner_err))));
-            }
-            Ok(Json(ApiResponse::success(data)))
-        }
-        Err(e) => {
-            error!("UI Bridge API: Design audit failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_run_audit", payload).await)
 }
 
 /// Load a style guide for subsequent audits.
@@ -175,13 +109,7 @@ pub async fn ui_bridge_design_load_style_guide_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Design - load style guide");
 
-    match ui_bridge_request_sync(&state, "design_load_style_guide", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Design load style guide failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_load_style_guide", body).await)
 }
 
 /// Get the currently loaded style guide.
@@ -192,13 +120,7 @@ pub async fn ui_bridge_design_get_style_guide_handler(
 
     let payload = serde_json::json!({});
 
-    match ui_bridge_request_sync(&state, "design_get_style_guide", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Design get style guide failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_get_style_guide", payload).await)
 }
 
 /// Clear the currently loaded style guide.
@@ -209,13 +131,7 @@ pub async fn ui_bridge_design_clear_style_guide_handler(
 
     let payload = serde_json::json!({});
 
-    match ui_bridge_request_sync(&state, "design_clear_style_guide", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Design clear style guide failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_clear_style_guide", payload).await)
 }
 
 /// Manual design-review routes (does not include the macro-generated
@@ -291,12 +207,16 @@ mod design_audit_envelope_tests {
     //! F2 — Regression tests for the two-tier envelope flattening on
     //! `POST /ui-bridge/ai/design-audit`. The handler can't be exercised
     //! end-to-end without a live frontend + Tauri runtime, so these tests
-    //! lock down the pure unwrap helper that the handler delegates to.
+    //! lock down the centralized `wrap_ipc_result` helper that the handler
+    //! delegates to (formerly a local `unwrap_inner_audit_error` helper —
+    //! folded into `wrap_ipc_result` during the F2 sweep 2026-04-22).
     //!
-    //! Same shape as `page_navigate_mode_tests`: poke the helper through its
-    //! decision points (inner-failure → Some(msg), healthy success → None,
-    //! missing fields → safe defaults).
-    use super::unwrap_inner_audit_error;
+    //! Same decision points as before: inner-failure → flat HTTP 400,
+    //! healthy success → HTTP 200, missing/non-bool `success` field →
+    //! treated as healthy.
+    use crate::mcp::ui_bridge::request::wrap_ipc_result;
+    use axum::http::StatusCode;
+    use std::ops::Deref;
 
     #[test]
     fn inner_failure_with_explicit_error_is_unwrapped() {
@@ -309,22 +229,27 @@ mod design_audit_envelope_tests {
             "timestamp": 1745552000000_i64,
             "type": "design_run_audit",
         });
-        let err = unwrap_inner_audit_error(&data).expect("inner failure must unwrap");
-        assert!(err.contains("No style guide provided or loaded"));
-        assert!(err.contains("design_load_style_guide"));
+        let (status, body) = wrap_ipc_result(Ok(data)).expect_err("inner failure must flatten");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body.deref().error.as_deref().unwrap_or_default();
+        assert!(msg.contains("No style guide provided or loaded"));
+        assert!(msg.contains("design_load_style_guide"));
     }
 
     #[test]
     fn inner_failure_without_error_falls_back_to_default() {
         // Defensive: success:false but no error field shouldn't drop the
-        // failure signal — we still return Some(_) so the handler sends a 400.
+        // failure signal — we still return HTTP 400 with a generic message.
         let data = serde_json::json!({"success": false});
-        let err = unwrap_inner_audit_error(&data).expect("must still flag failure");
-        assert_eq!(err, "design audit failed");
+        let (status, body) =
+            wrap_ipc_result(Ok(data)).expect_err("must still flag failure as 400");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body.deref().error.as_deref().unwrap_or_default();
+        assert_eq!(msg, "UI bridge call failed");
     }
 
     #[test]
-    fn healthy_success_payload_returns_none() {
+    fn healthy_success_payload_returns_200() {
         // The audit-report happy path: success:true with results. The
         // handler must NOT convert this into an HTTP 400.
         let data = serde_json::json!({
@@ -334,24 +259,28 @@ mod design_audit_envelope_tests {
                 "elementsChecked": 42,
             },
         });
-        assert!(unwrap_inner_audit_error(&data).is_none());
+        let resp = wrap_ipc_result(Ok(data)).expect("healthy success must return Ok");
+        assert!(resp.deref().success);
     }
 
     #[test]
-    fn payload_without_success_field_returns_none() {
+    fn payload_without_success_field_returns_200() {
         // Some IPC responses don't include `success` at all — those should
         // pass through to the success arm rather than be misclassified.
         let data = serde_json::json!({"report": {"violations": []}});
-        assert!(unwrap_inner_audit_error(&data).is_none());
+        let resp = wrap_ipc_result(Ok(data)).expect("absent success must return Ok");
+        assert!(resp.deref().success);
     }
 
     #[test]
-    fn success_field_with_non_bool_value_returns_none() {
+    fn success_field_with_non_bool_value_returns_200() {
         // Robustness: if `success` is a string or number, treat it as
         // "shape unknown, don't flag failure" rather than panicking.
         let data = serde_json::json!({"success": "true"});
-        assert!(unwrap_inner_audit_error(&data).is_none());
+        let resp = wrap_ipc_result(Ok(data)).expect("string success must return Ok");
+        assert!(resp.deref().success);
         let data = serde_json::json!({"success": 1});
-        assert!(unwrap_inner_audit_error(&data).is_none());
+        let resp = wrap_ipc_result(Ok(data)).expect("numeric success must return Ok");
+        assert!(resp.deref().success);
     }
 }

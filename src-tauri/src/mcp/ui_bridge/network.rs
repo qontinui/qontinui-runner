@@ -13,9 +13,9 @@ use axum::{
     response::Json,
 };
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::info;
 
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{ApiResponse, ApiState};
 
 use super::helpers::deserialize_timestamp;
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
@@ -117,9 +117,11 @@ pub async fn ui_bridge_get_console_errors_handler(
 
     let is_grouped = query.group.unwrap_or(false);
 
-    match ui_bridge_request_sync(&state, "get_console_errors", payload).await {
-        Ok(data) => {
-            // Update the console error count for the health endpoint
+    let result = ui_bridge_request_sync(&state, "get_console_errors", payload)
+        .await
+        .map(|data| {
+            // Update the console error count for the health endpoint before
+            // forwarding through wrap_ipc_result.
             if !is_grouped {
                 if let Some(errors) = data.get("errors").and_then(|e| e.as_array()) {
                     state
@@ -135,13 +137,9 @@ pub async fn ui_bridge_get_console_errors_handler(
             // droppedCount, bufferedCount}; legacy callers (no sinceId) see
             // only {errors, count}. Either shape passes through unchanged
             // because `data` is the serde_json::Value the frontend emitted.
-            Ok(Json(ApiResponse::success(data)))
-        }
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+            data
+        });
+    wrap_ipc_result(result)
 }
 
 /// Clear console errors captured by the UI Bridge ConsoleCapture.
@@ -150,18 +148,15 @@ pub async fn ui_bridge_clear_console_errors_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Clearing console errors");
 
-    match ui_bridge_request_sync(&state, "clear_console_errors", serde_json::json!({})).await {
-        Ok(data) => {
+    let result = ui_bridge_request_sync(&state, "clear_console_errors", serde_json::json!({}))
+        .await
+        .map(|data| {
             state
                 .ui_bridge_console_error_count
                 .store(0, std::sync::atomic::Ordering::Relaxed);
-            Ok(Json(ApiResponse::success(data)))
-        }
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+            data
+        });
+    wrap_ipc_result(result)
 }
 
 // ============================================================================
@@ -245,13 +240,7 @@ pub async fn ui_bridge_get_network_requests_handler(
         }
     });
 
-    match ui_bridge_request_sync(&state, "get_network_requests", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_network_requests", payload).await)
 }
 
 /// Get currently in-flight network requests.
@@ -260,19 +249,14 @@ pub async fn ui_bridge_get_network_requests_in_flight_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting in-flight network requests");
 
-    match ui_bridge_request_sync(
-        &state,
-        "get_network_requests_in_flight",
-        serde_json::json!({}),
+    wrap_ipc_result(
+        ui_bridge_request_sync(
+            &state,
+            "get_network_requests_in_flight",
+            serde_json::json!({}),
+        )
+        .await,
     )
-    .await
-    {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
 }
 
 /// Wait for a specific network request matching criteria.
@@ -282,13 +266,7 @@ pub async fn ui_bridge_wait_for_network_request_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Wait for network request");
 
-    match ui_bridge_request_sync(&state, "wait_for_network_request", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "wait_for_network_request", body).await)
 }
 
 /// Get a specific network request by ID.
@@ -298,19 +276,14 @@ pub async fn ui_bridge_get_network_request_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting network request {}", id);
 
-    match ui_bridge_request_sync(
-        &state,
-        "get_network_request",
-        serde_json::json!({ "id": id }),
+    wrap_ipc_result(
+        ui_bridge_request_sync(
+            &state,
+            "get_network_request",
+            serde_json::json!({ "id": id }),
+        )
+        .await,
     )
-    .await
-    {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
 }
 
 // ============================================================================

@@ -266,6 +266,13 @@ pub struct ApiResponse<T: Serialize> {
     /// Added alongside `error` for backward compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<crate::mcp::ui_bridge::UiBridgeError>,
+    /// Optional closest-match / recovery hint payload. Sibling field to
+    /// `error` (does NOT replace the error envelope shape). Used by the
+    /// three high-friction UI Bridge error paths (element-not-found,
+    /// action-not-allowed, eval-rejected) to surface typo-recovery
+    /// suggestions or workaround guidance to callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<serde_json::Value>,
 }
 
 impl<T: Serialize> ApiResponse<T> {
@@ -275,6 +282,7 @@ impl<T: Serialize> ApiResponse<T> {
             data: Some(data),
             error: None,
             error_detail: None,
+            hint: None,
         }
     }
 
@@ -284,6 +292,7 @@ impl<T: Serialize> ApiResponse<T> {
             data: None,
             error: Some(message.into()),
             error_detail: None,
+            hint: None,
         }
     }
 
@@ -296,6 +305,7 @@ impl<T: Serialize> ApiResponse<T> {
             data: None,
             error: Some(message.into()),
             error_detail: Some(detail),
+            hint: None,
         }
     }
 }
@@ -307,6 +317,7 @@ pub fn api_error(message: impl Into<String>) -> ApiResponse<()> {
         data: None,
         error: Some(message.into()),
         error_detail: None,
+        hint: None,
     }
 }
 
@@ -320,6 +331,27 @@ pub fn api_error_detailed(
         data: None,
         error: Some(message.into()),
         error_detail: Some(detail),
+        hint: None,
+    }
+}
+
+/// Create an error response with both a structured detail and a closest-match
+/// / recovery `hint` payload. Used by the three high-friction UI Bridge
+/// paths (element-not-found, action-not-allowed, eval-rejected) — see
+/// `ApiResponse::hint` for the design rationale. The `hint` is a sibling
+/// field to `error`, preserving the existing `success: false` / `error`
+/// envelope shape.
+pub fn api_error_with_hint(
+    message: impl Into<String>,
+    detail: crate::mcp::ui_bridge::UiBridgeError,
+    hint: serde_json::Value,
+) -> ApiResponse<()> {
+    ApiResponse {
+        success: false,
+        data: None,
+        error: Some(message.into()),
+        error_detail: Some(detail),
+        hint: Some(hint),
     }
 }
 

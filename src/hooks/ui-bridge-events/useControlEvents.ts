@@ -3,7 +3,7 @@ import { getApiPort } from "@/lib/runner-api";
 import type { MainTabId } from "@/components/app/tab-types";
 import { migrateTabId } from "@/components/app/tab-types";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
-import { serializeElement, serializeComponent } from "./utils";
+import { closestElementIds, serializeElement, serializeComponent } from "./utils";
 
 /**
  * Handles: get_elements, get_element, execute_action, get_components, get_component,
@@ -85,11 +85,27 @@ export function useControlEvents(
             // Discovery fallback failed — continue to error
           }
 
+          // Element-not-found 404: enrich the IPC error payload with up
+          // to 5 closest-match ids by Levenshtein distance so callers can
+          // recover from typos without a manual snapshot dance. The
+          // candidate set unions registry ids with whatever discover/find
+          // surfaced (so freshly-discovered elements are still suggestable
+          // even when the caller is asking by a slightly-wrong id).
+          const knownIds = new Set<string>(currentBridge.elements.map((e) => e.id));
+          try {
+            const discovered = await currentBridge.discover({ includeHidden: true });
+            for (const e of discovered.elements) knownIds.add(e.id);
+          } catch {
+            // Discovery for hint generation is best-effort — fall through
+            // with whatever the registry already had.
+          }
+          const closestMatches = closestElementIds(elementId, Array.from(knownIds));
           await sendResponse({
             requestId,
             type,
             success: false,
             error: `Element not found: ${elementId}`,
+            hint: closestMatches.length > 0 ? { closestMatches } : undefined,
             timestamp: Date.now(),
           });
           return true;
@@ -112,11 +128,62 @@ export function useControlEvents(
           // or an object { action, params, waitOptions } (from control endpoint)
           const actionObj = typeof action === "string" ? { action } : action;
 
+          // Action-not-allowed pre-check: when the element is registered and
+          // we already know its declared action set, surface a hint with the
+          // allowed actions before dispatching. The SDK's executeAction
+          // already validates against a global supported set, but per-element
+          // gating ("submit on a div") happens silently — agents need to know
+          // which actions the registry actually advertises for this element.
+          const targetElement = currentBridge.getElement(elementId);
+          if (targetElement) {
+            const builtinActions = Array.isArray(targetElement.actions)
+              ? targetElement.actions
+              : [];
+            const customActions = targetElement.customActions
+              ? Object.keys(targetElement.customActions)
+              : [];
+            const allowedActions = [...builtinActions, ...customActions];
+            if (allowedActions.length > 0 && !allowedActions.includes(actionObj.action)) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `Action '${actionObj.action}' is not allowed for element '${elementId}'`,
+                hint: { allowedActions },
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+          }
+
           const result = await currentBridge.executeAction(elementId, {
             action: actionObj.action,
             params: actionObj.params,
             waitOptions: actionObj.waitOptions,
           });
+
+          // If the action failed because the element wasn't found at all,
+          // enrich the response with closest-match element-id suggestions
+          // so callers can recover from typos in the same round-trip the
+          // get_element 404 path would have produced.
+          let actionHint: { closestMatches?: string[] } | undefined;
+          if (
+            result.success === false &&
+            typeof result.error === "string" &&
+            /element not found/i.test(result.error)
+          ) {
+            const knownIds = new Set<string>(currentBridge.elements.map((e) => e.id));
+            try {
+              const discovered = await currentBridge.discover({ includeHidden: true });
+              for (const e of discovered.elements) knownIds.add(e.id);
+            } catch {
+              // Best-effort — keep whatever the registry already had.
+            }
+            const closestMatches = closestElementIds(elementId, Array.from(knownIds));
+            if (closestMatches.length > 0) {
+              actionHint = { closestMatches };
+            }
+          }
 
           await sendResponse({
             requestId,
@@ -128,6 +195,7 @@ export function useControlEvents(
               (result.success === false
                 ? `Action '${actionObj.action}' failed on element '${elementId}'`
                 : undefined),
+            hint: actionHint,
             timestamp: Date.now(),
           });
 

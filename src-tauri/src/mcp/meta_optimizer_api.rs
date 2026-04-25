@@ -1397,6 +1397,7 @@ async fn get_prompt_optimization_status_handler(
         })),
         error: None,
         error_detail: None,
+        hint: None,
     }))
 }
 
@@ -1415,6 +1416,7 @@ async fn get_prompt_group_metrics_handler(
         data: Some(serde_json::json!(groups)),
         error: None,
         error_detail: None,
+        hint: None,
     }))
 }
 
@@ -1445,6 +1447,7 @@ async fn get_prompt_optimization_evidence_handler(
         })),
         error: None,
         error_detail: None,
+        hint: None,
     }))
 }
 
@@ -1467,6 +1470,7 @@ async fn get_prompt_evolution_handler(
         data: Some(serde_json::json!(history)),
         error: None,
         error_detail: None,
+        hint: None,
     }))
 }
 

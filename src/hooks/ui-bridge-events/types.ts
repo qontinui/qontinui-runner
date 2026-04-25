@@ -181,6 +181,7 @@ export type UIBridgeRequestType =
   | "execute_intent_from_query"
   // Debug
   | "get_element_tree"
+  | "get_element_dom_tree"
   | "highlight_element"
   // App-agnostic convenience
   | "click_by_text"
@@ -207,6 +208,8 @@ export type UIBridgeRequestType =
   // Tab control (F4 — first-class tab activation)
   | "tabs_list"
   | "tab_activate"
+  // Page playbook (combined tab + component + intent + primary-action snapshot)
+  | "get_playbook"
   // Network stubs (F2)
   | "register_network_stub"
   | "list_network_stubs"
@@ -287,6 +290,7 @@ export type PageEventTypes =
   | "navigate_by_adapter"
   | "tabs_list"
   | "tab_activate"
+  | "get_playbook"
   | "register_network_stub"
   | "list_network_stubs"
   | "delete_network_stub"
@@ -354,6 +358,7 @@ export type DebugInspectEventTypes =
   | "get_performance_entries"
   | "clear_performance_entries"
   | "get_element_tree"
+  | "get_element_dom_tree"
   | "highlight_element"
   | "get_toast_buffer";
 
@@ -518,6 +523,8 @@ export interface UIBridgeRequestPayload {
   maxTokens?: number;
   /** Target tab id for `tab_activate`. */
   tabId?: string;
+  /** DOM-tree depth for `get_element_dom_tree` (clamped server-side to [1,6]). */
+  depth?: number;
 }
 
 /**
@@ -529,6 +536,18 @@ export interface UIBridgeResponsePayload {
   success: boolean;
   data?: unknown;
   error?: string;
+  /**
+   * Optional closest-match / recovery hint payload. Sibling field to
+   * `error` (does NOT replace the success/error envelope shape). The
+   * Rust side forwards this through `wrap_ipc_result` so the HTTP
+   * response surfaces it as a top-level sibling of the error message.
+   *
+   * Currently used by three high-friction error paths:
+   * - Element-not-found (useControlEvents.ts): `{ closestMatches: string[] }`
+   * - Action-not-allowed (useControlEvents.ts): `{ allowedActions: string[] }`
+   * - Eval-rejected (Rust page.rs): `string` workaround guidance.
+   */
+  hint?: unknown;
   timestamp: number;
 }
 

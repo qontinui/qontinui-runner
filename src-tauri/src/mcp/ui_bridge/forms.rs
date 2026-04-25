@@ -12,7 +12,7 @@ use tracing::{error, info};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
-use super::request::ui_bridge_request_sync;
+use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 use super::types::ClipboardWriteRequest;
 
 /// Read the current system clipboard content.
@@ -88,13 +88,7 @@ pub async fn ui_bridge_get_forms_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting form state");
 
-    match ui_bridge_request_sync(&state, "get_forms", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_forms", serde_json::json!({})).await)
 }
 
 /// Smart form fill action via the UI Bridge.
@@ -104,13 +98,7 @@ pub async fn ui_bridge_fill_form_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Fill form");
 
-    match ui_bridge_request_sync(&state, "fill_form", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Fill form failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "fill_form", body).await)
 }
 
 /// Capture a form state snapshot via the UI Bridge.
@@ -119,13 +107,7 @@ pub async fn ui_bridge_snapshot_forms_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Snapshot forms");
 
-    match ui_bridge_request_sync(&state, "snapshot_forms", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Snapshot forms failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "snapshot_forms", serde_json::json!({})).await)
 }
 
 /// Diff two form snapshots via the UI Bridge.
@@ -135,13 +117,7 @@ pub async fn ui_bridge_diff_forms_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Diff forms");
 
-    match ui_bridge_request_sync(&state, "diff_forms", body).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: Diff forms failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "diff_forms", body).await)
 }
 
 /// Form state + fill + snapshot/diff routes (control + ai aliases) plus
