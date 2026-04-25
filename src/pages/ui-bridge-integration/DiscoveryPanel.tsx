@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronRight,
   Plus,
+  Plug,
   Radio,
   Trash2,
 } from "lucide-react";
@@ -727,6 +728,16 @@ function RegisteredAppCard({
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground">
             {app.appType}
           </span>
+          {app.transport === "websocket" && (
+            <span
+              data-ui-bridge-test-id="wrapper-transport-badge"
+              title="Wrapper apps register via WebSocket from a running wrapper process; their actions are dispatched over the websocket rather than HTTP."
+              className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 font-medium"
+            >
+              <Plug className="w-3 h-3" aria-hidden="true" />
+              Wrapper
+            </span>
+          )}
           <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-500/10 text-green-400 font-medium">
             registered
           </span>
