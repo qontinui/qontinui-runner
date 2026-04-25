@@ -60,15 +60,8 @@ fn save_screenshot_to_disk_impl(
 
     let storage =
         crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
-    let path = storage
-        .save_screenshot(&session_id, &screenshot_id, &data)
-        .map_err(|e| {
-            error!("Failed to save screenshot: {}", e);
-            AppError::IoError(std::io::Error::other(format!(
-                "Failed to save screenshot: {}",
-                e
-            )))
-        })?;
+    // `?` lifts anyhow::Error via From impl into AppError::UnexpectedError.
+    let path = storage.save_screenshot(&session_id, &screenshot_id, &data)?;
 
     info!("Screenshot saved successfully: {:?}", path);
 
@@ -100,6 +93,14 @@ pub fn save_video_to_disk(
     data: Vec<u8>,
     state: State<StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    save_video_to_disk_impl(session_id, data, &state).map_err(String::from)
+}
+
+fn save_video_to_disk_impl(
+    session_id: String,
+    data: Vec<u8>,
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Saving video to disk: session={}, size={} bytes",
         session_id,
@@ -108,10 +109,8 @@ pub fn save_video_to_disk(
 
     let storage =
         crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
-    let path = storage.save_video(&session_id, &data).map_err(|e| {
-        error!("Failed to save video: {}", e);
-        format!("Failed to save video: {}", e)
-    })?;
+    // `?` lifts anyhow::Error via From impl into AppError::UnexpectedError.
+    let path = storage.save_video(&session_id, &data)?;
 
     info!("Video saved successfully: {:?}", path);
 
@@ -139,14 +138,17 @@ pub fn save_video_to_disk(
 pub fn get_local_storage_usage(
     state: State<StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    get_local_storage_usage_impl(&state).map_err(String::from)
+}
+
+fn get_local_storage_usage_impl(
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!("Getting local storage usage");
 
     let storage =
         crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
-    let usage = storage.get_storage_usage().map_err(|e| {
-        error!("Failed to get storage usage: {}", e);
-        format!("Failed to get storage usage: {}", e)
-    })?;
+    let usage = storage.get_storage_usage()?;
 
     info!(
         "Storage usage: screenshots={:.2} MB ({} files), videos={:.2} MB ({} files)",
@@ -156,10 +158,7 @@ pub fn get_local_storage_usage(
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::to_value(&usage).map_err(|e| {
-            error!("Failed to serialize storage usage: {}", e);
-            format!("Failed to serialize storage usage: {}", e)
-        })?),
+        data: Some(serde_json::to_value(&usage)?),
     })
 }
 
@@ -181,6 +180,14 @@ pub fn delete_old_sessions(
     older_than_days: u32,
     state: State<StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    delete_old_sessions_impl(storage_type, older_than_days, &state).map_err(String::from)
+}
+
+fn delete_old_sessions_impl(
+    storage_type: String,
+    older_than_days: u32,
+    state: &StorageCompartment,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Deleting old sessions: type={}, older_than_days={}",
         storage_type, older_than_days
@@ -188,12 +195,7 @@ pub fn delete_old_sessions(
 
     let storage =
         crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
-    storage
-        .delete_old_sessions(&storage_type, older_than_days)
-        .map_err(|e| {
-            error!("Failed to delete old sessions: {}", e);
-            format!("Failed to delete old sessions: {}", e)
-        })?;
+    storage.delete_old_sessions(&storage_type, older_than_days)?;
 
     info!("Old sessions deleted successfully");
 
@@ -219,14 +221,15 @@ pub fn delete_old_sessions(
 /// * `Err(String)` - Error if clear operation fails
 #[tauri::command]
 pub fn clear_all_storage(state: State<StorageCompartment>) -> Result<CommandResponse, String> {
+    clear_all_storage_impl(&state).map_err(String::from)
+}
+
+fn clear_all_storage_impl(state: &StorageCompartment) -> Result<CommandResponse, AppError> {
     info!("Clearing all local storage");
 
     let storage =
         crate::safe_lock::safe_lock_or_recover(state.local_storage().as_ref(), "local_storage");
-    storage.clear_all_storage().map_err(|e| {
-        error!("Failed to clear all storage: {}", e);
-        format!("Failed to clear all storage: {}", e)
-    })?;
+    storage.clear_all_storage()?;
 
     info!("All storage cleared successfully");
 
@@ -282,13 +285,14 @@ pub fn get_storage_paths(state: State<StorageCompartment>) -> Result<CommandResp
 /// * `Err(String)` - Error if file cannot be read
 #[tauri::command]
 pub fn read_image_as_base64(path: String) -> Result<String, String> {
+    read_image_as_base64_impl(path).map_err(String::from)
+}
+
+fn read_image_as_base64_impl(path: String) -> Result<String, AppError> {
     info!("Reading image as base64: {}", path);
 
-    // Read the file
-    let data = fs::read(&path).map_err(|e| {
-        error!("Failed to read image file {}: {}", path, e);
-        format!("Failed to read file: {}", e)
-    })?;
+    // Read the file. `?` lifts std::io::Error via the blanket From impl.
+    let data = fs::read(&path)?;
 
     // Determine MIME type from extension
     let mime_type = if path.to_lowercase().ends_with(".png") {
@@ -344,13 +348,15 @@ pub fn get_findings_data_path() -> std::path::PathBuf {
 /// * `Err(String)` - Error if save fails
 #[tauri::command]
 pub fn save_findings_data(data: String) -> Result<(), String> {
+    save_findings_data_impl(data).map_err(String::from)
+}
+
+fn save_findings_data_impl(data: String) -> Result<(), AppError> {
     let path = get_findings_data_path();
     info!("Saving findings data to: {:?}", path);
 
-    fs::write(&path, &data).map_err(|e| {
-        error!("Failed to save findings data: {}", e);
-        format!("Failed to save findings data: {}", e)
-    })?;
+    // `?` lifts std::io::Error via the blanket From impl.
+    fs::write(&path, &data)?;
 
     info!("Findings data saved successfully ({} bytes)", data.len());
     Ok(())
@@ -366,6 +372,10 @@ pub fn save_findings_data(data: String) -> Result<(), String> {
 /// * `Err(String)` - Error if read fails
 #[tauri::command]
 pub fn load_findings_data() -> Result<String, String> {
+    load_findings_data_impl().map_err(String::from)
+}
+
+fn load_findings_data_impl() -> Result<String, AppError> {
     let path = get_findings_data_path();
     info!("Loading findings data from: {:?}", path);
 
@@ -374,10 +384,8 @@ pub fn load_findings_data() -> Result<String, String> {
         return Ok(String::new());
     }
 
-    let data = fs::read_to_string(&path).map_err(|e| {
-        error!("Failed to load findings data: {}", e);
-        format!("Failed to load findings data: {}", e)
-    })?;
+    // `?` lifts std::io::Error via the blanket From impl.
+    let data = fs::read_to_string(&path)?;
 
     info!("Findings data loaded successfully ({} bytes)", data.len());
     Ok(data)
