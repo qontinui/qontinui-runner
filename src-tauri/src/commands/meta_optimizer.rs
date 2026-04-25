@@ -11,6 +11,7 @@ use tauri::State;
 // `trigger_meta_optimizer` keeps `Arc<AppState>` (see note above the fn).
 use crate::commands::compartments::StorageCompartment;
 use crate::commands::AppState;
+use crate::error::AppError;
 use crate::meta_optimizer::types::{
     MetaOptimizerRun, OptimizerType, PromptVariant, Recommendation,
 };
@@ -121,7 +122,7 @@ pub async fn get_meta_optimizer_progress(
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
     let summary =
         crate::meta_optimizer::snapshots::get_progress_summary_async(&app_state.pg_db(), cat).await?;
-    serde_json::to_value(summary).map_err(|e| format!("Serialization error: {}", e))
+    serde_json::to_value(summary).map_err(|e: serde_json::Error| String::from(AppError::from(e)))
 }
 
 #[tauri::command]
@@ -132,7 +133,7 @@ pub async fn capture_meta_optimizer_baseline(
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
     let snapshot =
         crate::meta_optimizer::snapshots::capture_baseline_async(&app_state.pg_db(), cat).await?;
-    serde_json::to_value(snapshot).map_err(|e| format!("Serialization error: {}", e))
+    serde_json::to_value(snapshot).map_err(|e: serde_json::Error| String::from(AppError::from(e)))
 }
 
 #[tauri::command]
@@ -145,7 +146,7 @@ pub async fn get_meta_optimizer_snapshots(
         snapshot_type.as_deref(),
     )
     .await?;
-    serde_json::to_value(snapshots).map_err(|e| format!("Serialization error: {}", e))
+    serde_json::to_value(snapshots).map_err(|e: serde_json::Error| String::from(AppError::from(e)))
 }
 
 // ── Agent Effectiveness ───────────────────────────────────────────────
@@ -191,7 +192,7 @@ pub async fn get_recommendation_outcomes(
     let mut results = Vec::new();
     for rec in recs {
         let mut val =
-            serde_json::to_value(&rec).map_err(|e| format!("Serialization error: {}", e))?;
+            serde_json::to_value(&rec).map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
         if let Some(outcome_str) = &rec.outcome_after_apply {
             if let Ok(outcome) = serde_json::from_str::<serde_json::Value>(outcome_str) {
                 val["outcome_parsed"] = outcome;
@@ -211,7 +212,7 @@ pub async fn reevaluate_recommendation_outcome(
         &app_state.pg_db(),
         &recommendation_id,
     )?;
-    serde_json::to_value(outcome).map_err(|e| format!("Serialization error: {}", e))
+    serde_json::to_value(outcome).map_err(|e: serde_json::Error| String::from(AppError::from(e)))
 }
 
 // ── Cost-Effectiveness ──────────────────────────────────────────────────
@@ -342,9 +343,9 @@ pub async fn get_prompt_canary_status(
     let evaluation = crate::meta_optimizer::canary::evaluate_prompt_canary(&canary);
 
     let mut val =
-        serde_json::to_value(&canary).map_err(|e| format!("Serialization error: {}", e))?;
+        serde_json::to_value(&canary).map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
     val["evaluation"] =
-        serde_json::to_value(&evaluation).map_err(|e| format!("Serialization error: {}", e))?;
+        serde_json::to_value(&evaluation).map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
     Ok(val)
 }
 
@@ -460,7 +461,7 @@ pub async fn evaluate_with_io(
 ) -> Result<Vec<crate::meta_optimizer::eval_spec::AssertionResult>, String> {
     let _ = app_state;
     let spec: crate::meta_optimizer::eval_spec::EvalSpec = serde_json::from_str(&eval_spec_json)
-        .map_err(|e| format!("Failed to parse eval spec: {}", e))?;
+        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
 
     // Build dummy aggregate metrics for non-judge assertions.
     // If a target agent is specified, try to load real metrics from the database.
@@ -640,7 +641,7 @@ pub async fn get_prompt_optimization_status(
         "active_canaries": active_canaries,
         "evolution_history": evolution,
     }))
-    .map_err(|e| format!("Serialization error: {}", e))
+    .map_err(|e: serde_json::Error| String::from(AppError::from(e)))
 }
 
 #[tauri::command]
@@ -677,7 +678,7 @@ pub async fn get_prompt_optimization_evidence(
         "failures": failures,
         "successes": successes,
     }))
-    .map_err(|e| format!("Serialization error: {}", e))
+    .map_err(|e: serde_json::Error| String::from(AppError::from(e)))
 }
 
 #[tauri::command]
