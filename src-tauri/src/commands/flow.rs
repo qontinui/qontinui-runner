@@ -11,6 +11,7 @@
 // step/run/resume/step_into flow-execution handlers use multi-State
 // (Storage + Health) since they read both pg_db and doctor_handle.
 use crate::commands::compartments::{HealthCompartment, StorageCompartment};
+use crate::error::AppError;
 use crate::orchestrator::flow::{Condition, Flow, FlowState, FlowStatus, FlowStep};
 use crate::orchestrator::flow_executor::{FlowEvent, FlowExecutor};
 use once_cell::sync::Lazy;
@@ -102,8 +103,8 @@ pub async fn get_flow(state: State<'_, StorageCompartment>, id: String) -> Resul
 /// Save a flow (create or update).
 #[tauri::command]
 pub async fn save_flow(state: State<'_, StorageCompartment>, flow: Flow) -> Result<String, String> {
-    let flow_json =
-        serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
+    let flow_json = serde_json::to_value(&flow)
+        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
     state.pg_db().save_flow(&flow_json).await
 }
 
@@ -586,8 +587,8 @@ pub fn create_sample_flow() -> Result<Flow, String> {
 #[tauri::command]
 pub async fn add_sample_flow(state: State<'_, StorageCompartment>) -> Result<String, String> {
     let flow = create_sample_flow()?;
-    let flow_json =
-        serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
+    let flow_json = serde_json::to_value(&flow)
+        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
     state.pg_db().save_flow(&flow_json).await
 }
 
@@ -1193,11 +1194,19 @@ pub async fn export_flow_json(
     state: State<'_, StorageCompartment>,
     flow_id: String,
 ) -> Result<String, String> {
+    export_flow_json_impl(state, flow_id).await.map_err(String::from)
+}
+
+async fn export_flow_json_impl(
+    state: State<'_, StorageCompartment>,
+    flow_id: String,
+) -> Result<String, AppError> {
     let flow_json = state
         .pg_db()
         .get_flow(&flow_id)
-        .await?
-        .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
+        .await
+        .map_err(AppError::Raw)?
+        .ok_or_else(|| AppError::Raw(format!("Flow '{}' not found", flow_id)))?;
 
     let export = FlowExport {
         format_version: "1.0.0".to_string(),
@@ -1205,7 +1214,7 @@ pub async fn export_flow_json(
         flow: flow_json,
     };
 
-    serde_json::to_string_pretty(&export).map_err(|e| format!("Failed to serialize flow: {}", e))
+    Ok(serde_json::to_string_pretty(&export)?)
 }
 
 /// Export a flow to YAML format.
@@ -1216,11 +1225,19 @@ pub async fn export_flow_yaml(
     state: State<'_, StorageCompartment>,
     flow_id: String,
 ) -> Result<String, String> {
+    export_flow_yaml_impl(state, flow_id).await.map_err(String::from)
+}
+
+async fn export_flow_yaml_impl(
+    state: State<'_, StorageCompartment>,
+    flow_id: String,
+) -> Result<String, AppError> {
     let flow_json = state
         .pg_db()
         .get_flow(&flow_id)
-        .await?
-        .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
+        .await
+        .map_err(AppError::Raw)?
+        .ok_or_else(|| AppError::Raw(format!("Flow '{}' not found", flow_id)))?;
 
     let export = FlowExport {
         format_version: "1.0.0".to_string(),
@@ -1228,7 +1245,8 @@ pub async fn export_flow_yaml(
         flow: flow_json,
     };
 
-    serde_yaml::to_string(&export).map_err(|e| format!("Failed to serialize flow to YAML: {}", e))
+    serde_yaml::to_string(&export)
+        .map_err(|e| AppError::Raw(format!("Failed to serialize flow to YAML: {}", e)))
 }
 
 /// Import a flow from JSON format.
@@ -1240,18 +1258,27 @@ pub async fn import_flow_json(
     content: String,
     generate_new_id: bool,
 ) -> Result<Flow, String> {
+    import_flow_json_impl(state, content, generate_new_id)
+        .await
+        .map_err(String::from)
+}
+
+async fn import_flow_json_impl(
+    state: State<'_, StorageCompartment>,
+    content: String,
+    generate_new_id: bool,
+) -> Result<Flow, AppError> {
     // Try to parse as FlowExport first
     let flow_json: serde_json::Value =
         if let Ok(export) = serde_json::from_str::<FlowExport>(&content) {
             export.flow
         } else {
             // Fall back to parsing as raw Flow
-            serde_json::from_str(&content).map_err(|e| format!("Invalid JSON: {}", e))?
+            serde_json::from_str(&content)?
         };
 
     // Deserialize to Flow to validate structure
-    let mut flow: Flow =
-        serde_json::from_value(flow_json).map_err(|e| format!("Invalid flow structure: {}", e))?;
+    let mut flow: Flow = serde_json::from_value(flow_json)?;
 
     // Generate new ID if requested
     if generate_new_id {
@@ -1259,9 +1286,12 @@ pub async fn import_flow_json(
     }
 
     // Save to database
-    let flow_json =
-        serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.pg_db().save_flow(&flow_json).await?;
+    let flow_json = serde_json::to_value(&flow)?;
+    state
+        .pg_db()
+        .save_flow(&flow_json)
+        .await
+        .map_err(AppError::Raw)?;
 
     Ok(flow)
 }
@@ -1275,6 +1305,16 @@ pub async fn import_flow_yaml(
     content: String,
     generate_new_id: bool,
 ) -> Result<Flow, String> {
+    import_flow_yaml_impl(state, content, generate_new_id)
+        .await
+        .map_err(String::from)
+}
+
+async fn import_flow_yaml_impl(
+    state: State<'_, StorageCompartment>,
+    content: String,
+    generate_new_id: bool,
+) -> Result<Flow, AppError> {
     // Try to parse as FlowExport first
     let flow_value: serde_json::Value = if let Ok(export) =
         serde_yaml::from_str::<FlowExport>(&content)
@@ -1282,14 +1322,13 @@ pub async fn import_flow_yaml(
         export.flow
     } else {
         // Fall back to parsing as raw Flow
-        let yaml_value: serde_yaml::Value =
-            serde_yaml::from_str(&content).map_err(|e| format!("Invalid YAML: {}", e))?;
-        serde_json::to_value(yaml_value).map_err(|e| format!("Failed to convert YAML: {}", e))?
+        let yaml_value: serde_yaml::Value = serde_yaml::from_str(&content)
+            .map_err(|e| AppError::Raw(format!("Invalid YAML: {}", e)))?;
+        serde_json::to_value(yaml_value)?
     };
 
     // Deserialize to Flow to validate structure
-    let mut flow: Flow =
-        serde_json::from_value(flow_value).map_err(|e| format!("Invalid flow structure: {}", e))?;
+    let mut flow: Flow = serde_json::from_value(flow_value)?;
 
     // Generate new ID if requested
     if generate_new_id {
@@ -1297,9 +1336,12 @@ pub async fn import_flow_yaml(
     }
 
     // Save to database
-    let flow_json =
-        serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.pg_db().save_flow(&flow_json).await?;
+    let flow_json = serde_json::to_value(&flow)?;
+    state
+        .pg_db()
+        .save_flow(&flow_json)
+        .await
+        .map_err(AppError::Raw)?;
 
     Ok(flow)
 }
@@ -1310,10 +1352,17 @@ pub async fn export_flows_bulk(
     state: State<'_, StorageCompartment>,
     flow_ids: Vec<String>,
 ) -> Result<String, String> {
+    export_flows_bulk_impl(state, flow_ids).await.map_err(String::from)
+}
+
+async fn export_flows_bulk_impl(
+    state: State<'_, StorageCompartment>,
+    flow_ids: Vec<String>,
+) -> Result<String, AppError> {
     let mut flows = Vec::new();
 
     for flow_id in flow_ids {
-        if let Some(flow_json) = state.pg_db().get_flow(&flow_id).await? {
+        if let Some(flow_json) = state.pg_db().get_flow(&flow_id).await.map_err(AppError::Raw)? {
             flows.push(flow_json);
         }
     }
@@ -1324,7 +1373,7 @@ pub async fn export_flows_bulk(
         "flows": flows,
     });
 
-    serde_json::to_string_pretty(&export).map_err(|e| format!("Failed to serialize flows: {}", e))
+    Ok(serde_json::to_string_pretty(&export)?)
 }
 
 /// Import multiple flows from a bulk export.
@@ -1334,18 +1383,26 @@ pub async fn import_flows_bulk(
     content: String,
     generate_new_ids: bool,
 ) -> Result<Vec<Flow>, String> {
-    let import: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("Invalid JSON: {}", e))?;
+    import_flows_bulk_impl(state, content, generate_new_ids)
+        .await
+        .map_err(String::from)
+}
+
+async fn import_flows_bulk_impl(
+    state: State<'_, StorageCompartment>,
+    content: String,
+    generate_new_ids: bool,
+) -> Result<Vec<Flow>, AppError> {
+    let import: serde_json::Value = serde_json::from_str(&content)?;
 
     let flows_array = import["flows"]
         .as_array()
-        .ok_or("Expected 'flows' array in import file")?;
+        .ok_or_else(|| AppError::Raw("Expected 'flows' array in import file".to_string()))?;
 
     let mut imported_flows = Vec::new();
 
     for flow_value in flows_array {
-        let mut flow: Flow = serde_json::from_value(flow_value.clone())
-            .map_err(|e| format!("Invalid flow structure: {}", e))?;
+        let mut flow: Flow = serde_json::from_value(flow_value.clone())?;
 
         if generate_new_ids {
             flow.id = format!(
@@ -1355,9 +1412,12 @@ pub async fn import_flows_bulk(
             );
         }
 
-        let flow_json =
-            serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-        state.pg_db().save_flow(&flow_json).await?;
+        let flow_json = serde_json::to_value(&flow)?;
+        state
+            .pg_db()
+            .save_flow(&flow_json)
+            .await
+            .map_err(AppError::Raw)?;
 
         imported_flows.push(flow);
     }
