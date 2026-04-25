@@ -103,9 +103,19 @@ pub async fn get_flow(state: State<'_, StorageCompartment>, id: String) -> Resul
 /// Save a flow (create or update).
 #[tauri::command]
 pub async fn save_flow(state: State<'_, StorageCompartment>, flow: Flow) -> Result<String, String> {
-    let flow_json = serde_json::to_value(&flow)
-        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
-    state.pg_db().save_flow(&flow_json).await
+    save_flow_impl(state, flow).await.map_err(String::from)
+}
+
+async fn save_flow_impl(
+    state: State<'_, StorageCompartment>,
+    flow: Flow,
+) -> Result<String, AppError> {
+    let flow_json = serde_json::to_value(&flow)?;
+    state
+        .pg_db()
+        .save_flow(&flow_json)
+        .await
+        .map_err(AppError::Raw)
 }
 
 /// Delete a flow by ID.
@@ -135,15 +145,26 @@ pub async fn start_flow_execution(
     flow_id: String,
     inputs: HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
+    start_flow_execution_impl(app_state, app_handle, flow_id, inputs)
+        .await
+        .map_err(String::from)
+}
+
+async fn start_flow_execution_impl(
+    app_state: State<'_, StorageCompartment>,
+    app_handle: AppHandle,
+    flow_id: String,
+    inputs: HashMap<String, serde_json::Value>,
+) -> Result<String, AppError> {
     // Get flow from database
     let flow_json = app_state
         .pg_db()
         .get_flow(&flow_id)
-        .await?
-        .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
+        .await
+        .map_err(AppError::Raw)?
+        .ok_or_else(|| AppError::Raw(format!("Flow '{}' not found", flow_id)))?;
 
-    let flow: Flow = serde_json::from_value(flow_json)
-        .map_err(|e| format!("Failed to deserialize flow: {}", e))?;
+    let flow: Flow = serde_json::from_value(flow_json)?;
 
     let mut state = FlowState::new(&flow);
 
@@ -164,9 +185,12 @@ pub async fn start_flow_execution(
     }
 
     // Persist to database
-    let state_json = serde_json::to_value(&state)
-        .map_err(|e| format!("Failed to serialize flow execution: {}", e))?;
-    app_state.pg_db().save_flow_execution(&state_json).await?;
+    let state_json = serde_json::to_value(&state)?;
+    app_state
+        .pg_db()
+        .save_flow_execution(&state_json)
+        .await
+        .map_err(AppError::Raw)?;
 
     // Emit flow started event
     emit_flow_event(
@@ -586,10 +610,17 @@ pub fn create_sample_flow() -> Result<Flow, String> {
 /// Add the sample flow to storage.
 #[tauri::command]
 pub async fn add_sample_flow(state: State<'_, StorageCompartment>) -> Result<String, String> {
-    let flow = create_sample_flow()?;
-    let flow_json = serde_json::to_value(&flow)
-        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
-    state.pg_db().save_flow(&flow_json).await
+    add_sample_flow_impl(state).await.map_err(String::from)
+}
+
+async fn add_sample_flow_impl(state: State<'_, StorageCompartment>) -> Result<String, AppError> {
+    let flow = create_sample_flow().map_err(AppError::Raw)?;
+    let flow_json = serde_json::to_value(&flow)?;
+    state
+        .pg_db()
+        .save_flow(&flow_json)
+        .await
+        .map_err(AppError::Raw)
 }
 
 // ============================================================================
