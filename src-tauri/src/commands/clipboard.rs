@@ -4,6 +4,7 @@
 //! backend so they can be relayed to mobile devices.
 
 use crate::auth::AuthManager;
+use crate::error::AppError;
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -62,23 +63,23 @@ fn get_device_name() -> String {
 /// The created clipboard entry from the backend
 #[tauri::command]
 pub async fn share_to_mobile(text: String) -> Result<ClipboardEntryResponse, String> {
+    share_to_mobile_impl(text).await.map_err(String::from)
+}
+
+async fn share_to_mobile_impl(text: String) -> Result<ClipboardEntryResponse, AppError> {
     info!("Sharing text to mobile ({} chars)", text.len());
 
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::AuthError(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
-    })?;
-
-    let device_id = auth_manager.get_device_id().map_err(|e| {
-        error!("Failed to get device ID: {}", e);
-        format!("Failed to get device ID: {}", e)
-    })?;
+    // `?` lifts anyhow::Error from auth_manager via From<anyhow::Error>.
+    let access_token = auth_manager.get_access_token()?;
+    let device_id = auth_manager.get_device_id()?;
 
     let request_body = ClipboardPushRequest {
         source_device_id: device_id,
@@ -93,29 +94,16 @@ pub async fn share_to_mobile(text: String) -> Result<ClipboardEntryResponse, Str
         .bearer_auth(&access_token)
         .json(&request_body)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Clipboard push failed: {:?}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!(
-            "Clipboard push failed with status {}: {}",
-            status, error_text
-        );
-        return Err(format!("Failed to share: {}", error_text));
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        error!("Clipboard push failed with status {}: {}", status, body);
+        return Err(AppError::HttpStatusError { status, body });
     }
 
-    let entry: ClipboardEntryResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse clipboard response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let entry: ClipboardEntryResponse = response.json().await?;
 
     info!("Shared to mobile: entry_id={}", entry.id);
     Ok(entry)
@@ -143,23 +131,26 @@ pub struct SharedFileResponse {
 /// The created shared file entry from the backend
 #[tauri::command]
 pub async fn share_file_to_mobile(file_path: String) -> Result<SharedFileResponse, String> {
+    share_file_to_mobile_impl(file_path).await.map_err(String::from)
+}
+
+async fn share_file_to_mobile_impl(file_path: String) -> Result<SharedFileResponse, AppError> {
     let path = PathBuf::from(&file_path);
 
     if !path.exists() {
-        return Err(format!("File not found: {}", file_path));
+        return Err(AppError::Raw(format!("File not found: {}", file_path)));
     }
 
-    // Check file size before reading into memory (50 MB limit, matches backend)
-    let metadata = tokio::fs::metadata(&path)
-        .await
-        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+    // Check file size before reading into memory (50 MB limit, matches backend).
+    // `?` lifts std::io::Error via the blanket From impl.
+    let metadata = tokio::fs::metadata(&path).await?;
     const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
     if metadata.len() > MAX_FILE_SIZE {
-        return Err(format!(
+        return Err(AppError::Raw(format!(
             "File too large ({:.1} MB). Maximum size is {} MB.",
             metadata.len() as f64 / (1024.0 * 1024.0),
             MAX_FILE_SIZE / (1024 * 1024)
-        ));
+        )));
     }
 
     let filename = path
@@ -168,10 +159,7 @@ pub async fn share_file_to_mobile(file_path: String) -> Result<SharedFileRespons
         .unwrap_or("file")
         .to_string();
 
-    let file_bytes = tokio::fs::read(&path).await.map_err(|e| {
-        error!("Failed to read file {}: {}", file_path, e);
-        format!("Failed to read file: {}", e)
-    })?;
+    let file_bytes = tokio::fs::read(&path).await?;
 
     let size = file_bytes.len();
     info!("Sharing file to mobile: {} ({} bytes)", filename, size);
@@ -179,18 +167,13 @@ pub async fn share_file_to_mobile(file_path: String) -> Result<SharedFileRespons
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::AuthError(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
-    })?;
-
-    let device_id = auth_manager.get_device_id().map_err(|e| {
-        error!("Failed to get device ID: {}", e);
-        format!("Failed to get device ID: {}", e)
-    })?;
+    let access_token = auth_manager.get_access_token()?;
+    let device_id = auth_manager.get_device_id()?;
 
     // Guess MIME type from extension
     let mime_type = mime_guess::from_path(&path)
@@ -199,8 +182,7 @@ pub async fn share_file_to_mobile(file_path: String) -> Result<SharedFileRespons
 
     let file_part = multipart::Part::bytes(file_bytes)
         .file_name(filename.clone())
-        .mime_str(&mime_type)
-        .map_err(|e| format!("Invalid MIME type: {}", e))?;
+        .mime_str(&mime_type)?;
 
     let form = multipart::Form::new()
         .text("source_device_id", device_id)
@@ -212,26 +194,16 @@ pub async fn share_file_to_mobile(file_path: String) -> Result<SharedFileRespons
         .bearer_auth(&access_token)
         .multipart(form)
         .send()
-        .await
-        .map_err(|e| {
-            error!("File upload failed: {:?}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!("File upload failed with status {}: {}", status, error_text);
-        return Err(format!("Upload failed: {}", error_text));
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        error!("File upload failed with status {}: {}", status, body);
+        return Err(AppError::HttpStatusError { status, body });
     }
 
-    let entry: SharedFileResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse file upload response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let entry: SharedFileResponse = response.json().await?;
 
     info!(
         "File shared to mobile: id={}, filename={}",
