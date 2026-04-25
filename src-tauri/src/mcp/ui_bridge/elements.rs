@@ -275,22 +275,24 @@ pub async fn ui_bridge_get_element_tree_subtree_handler(
             // Frontend signals "not found" by returning success=false with
             // error="element_not_found". Map that to HTTP 404 with a structured
             // error_detail (matches the existing element-not-found shape used
-            // elsewhere, e.g. ui_bridge_assert_element_handler). Agent 3's
-            // closestMatches hint shape isn't in place yet — fall back to a
-            // plain 404 here.
+            // elsewhere) and forward the frontend's `hint.closestMatches`
+            // payload (added by the closest-match-hint feature) onto the
+            // outer ApiResponse so a typoed id gets the same typo suggestions
+            // it would on `GET /control/element/<id>`.
             if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
                 let err_str = data
                     .get("error")
                     .and_then(|v| v.as_str())
                     .unwrap_or("UI bridge call failed");
                 if err_str == "element_not_found" {
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        Json(api_error_detailed(
-                            format!("Element '{}' not found", id),
-                            UiBridgeError::element_not_found(&id),
-                        )),
-                    ));
+                    let mut body = api_error_detailed(
+                        format!("Element '{}' not found", id),
+                        UiBridgeError::element_not_found(&id),
+                    );
+                    if let Some(hint) = data.get("hint") {
+                        body.hint = Some(hint.clone());
+                    }
+                    return Err((StatusCode::NOT_FOUND, Json(body)));
                 }
                 // Other inner failures: flatten to 400 (matches wrap_ipc_result).
                 return Err((

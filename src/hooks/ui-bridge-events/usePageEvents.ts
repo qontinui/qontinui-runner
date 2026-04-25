@@ -14,7 +14,7 @@ import {
   installStubFetchInterceptor,
   validateStubRequest,
 } from "@qontinui/ui-bridge";
-import { serializeComponent, getUIBridgeGlobal } from "./utils";
+import { serializeComponent, getUIBridgeGlobal, toTabCanonical } from "./utils";
 
 const logger = createLogger("UIBridgePageEvents");
 
@@ -935,11 +935,14 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               data: {
                 activeTab,
                 // Each entry keeps the existing {id, label} shape and adds
-                // `section` so agents can filter / group the 90+ tab catalog
-                // (sidebar nav vs. run-detail vs. settings sub-tabs, etc.).
+                // `canonical` (short alias matching the snapshot's
+                // availableTabs entries) plus `section` so agents can
+                // filter / group the 90+ tab catalog (sidebar nav vs.
+                // run-detail vs. settings sub-tabs, etc.).
                 tabs: TAB_LIST.map((entry) => ({
                   id: entry.id,
                   label: entry.label,
+                  canonical: toTabCanonical(entry.id),
                   section: entry.section,
                 })),
               },
@@ -1257,6 +1260,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             const tabs = TAB_LIST.map((entry) => ({
               id: entry.id,
               label: entry.label,
+              canonical: toTabCanonical(entry.id),
               section: entry.section,
               active: entry.id === activeTab,
             }));

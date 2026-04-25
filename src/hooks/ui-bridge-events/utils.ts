@@ -113,6 +113,25 @@ export function getUIBridgeGlobal(): Record<string, unknown> | undefined {
 }
 
 /**
+ * Derive a short canonical alias for a tab id by stripping a known
+ * namespacing prefix (`sm-tab-`). The runner's `MainTabId` catalog
+ * doesn't use that prefix, so canonical is typically the id itself —
+ * but tabbed sub-pages (state-machine's `sm-tab-graph` / `sm-tab-states`
+ * etc.) use a prefix scheme, and exposing the bare segment as
+ * `canonical` lets agents reason about the tab uniformly across pages.
+ *
+ * Used in three places that emit the tab catalog: `tabs_list` and
+ * `get_playbook` IPC handlers in `usePageEvents.ts`, and the
+ * `availableTabs` enrichment in `useDiscoveryEvents.ts`. Lifting this
+ * to a shared helper avoids the three sites drifting apart on what
+ * "canonical" means.
+ */
+export function toTabCanonical(tabId: string): string {
+  const prefix = "sm-tab-";
+  return tabId.startsWith(prefix) ? tabId.slice(prefix.length) : tabId;
+}
+
+/**
  * Compute the Levenshtein edit distance between two strings.
  *
  * Used by the IPC error paths in {@link ./useControlEvents.ts useControlEvents}

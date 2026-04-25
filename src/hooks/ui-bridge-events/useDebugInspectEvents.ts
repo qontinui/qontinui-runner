@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
-import { getUIBridgeGlobal } from "./utils";
+import { closestElementIds, getUIBridgeGlobal } from "./utils";
 import { getAllSpecs } from "../../lib/spec-registry";
 
 // ---------------------------------------------------------------------------
@@ -1098,12 +1098,25 @@ export function useDebugInspectEvents(
 
           const reg = currentBridge.elements.find((e) => e.id === treeElementId);
           if (!reg || !(reg.element instanceof Element)) {
+            // Build the same closestMatches hint shape `get_element` /
+            // `execute_action` already use, so a typoed id gets a typo
+            // suggestion here too. Best-effort discovery to widen the
+            // candidate pool past the current registry snapshot.
+            const knownIds = new Set<string>(currentBridge.elements.map((e) => e.id));
+            try {
+              const discovered = await currentBridge.discover({ includeHidden: true });
+              for (const e of discovered.elements) knownIds.add(e.id);
+            } catch {
+              // Best-effort — proceed with the registry snapshot we have.
+            }
+            const closestMatches = closestElementIds(treeElementId, Array.from(knownIds));
             await sendResponse({
               requestId,
               type,
               success: false,
               error: "element_not_found",
               data: { elementId: treeElementId },
+              hint: closestMatches.length > 0 ? { closestMatches } : undefined,
               timestamp: Date.now(),
             });
             return true;

@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import type { BridgeSnapshot } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
-import { getUIBridgeGlobal } from "./utils";
+import { getUIBridgeGlobal, toTabCanonical } from "./utils";
 import { createLogger } from "@/lib/logger";
 import { ACTIVE_TAB_STORAGE_KEY, TAB_LIST } from "@/components/app/tab-types";
 import { instanceStorage } from "@/lib/instance-storage";
@@ -242,17 +242,13 @@ export function useDiscoveryEvents(
           // matches and the `getActiveTab` callback above stays the source of
           // truth (instanceStorage + initial-tab fallback).
           const activeTabId = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
-          // Derive a short alias from the tab id by stripping a known prefix
-          // (`sm-tab-`). The runner's MainTabId catalog doesn't use that prefix
-          // — TAB_LIST ids are already terse — so canonical is typically the
-          // id itself. The strip-prefix step is kept for forward-compat with
-          // any future tabbed page that namespaces its ids.
-          const toCanonical = (tabId: string): string =>
-            tabId.startsWith("sm-tab-") ? tabId.slice("sm-tab-".length) : tabId;
+          // Canonical alias derived via the shared `toTabCanonical` helper
+          // (utils.ts) so the playbook + tabs_list + this snapshot
+          // enrichment all speak the same shape.
           const availableTabs = TAB_LIST.map((entry) => ({
             id: entry.id,
             label: entry.label,
-            canonical: toCanonical(entry.id),
+            canonical: toTabCanonical(entry.id),
             active: entry.id === activeTabId,
           }));
           // Static documentation hint — same on every snapshot, regardless of
