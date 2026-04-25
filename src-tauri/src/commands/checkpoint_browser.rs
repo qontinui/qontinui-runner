@@ -8,6 +8,7 @@
 
 use crate::commands::compartments::StorageCompartment;
 use crate::database::CreateTaskRunInput;
+use crate::error::AppError;
 use crate::orchestrator::checkpoint::{
     Checkpoint, CheckpointDiff, CheckpointManager, CheckpointSummary, CheckpointTrigger,
     LineageInfo, LineageTree, ReplayManager, ReplaySession, RestorationInstructions,
@@ -141,7 +142,9 @@ pub async fn create_orchestrator_checkpoint(
 
     // Also save to in-memory manager for real-time operations
     let id = {
-        let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+        let mut manager = CHECKPOINT_MANAGER
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
         let mut checkpoint =
             Checkpoint::new(&task_id, snapshot.clone()).with_trigger(CheckpointTrigger::Manual);
 
@@ -180,7 +183,9 @@ pub async fn delete_orchestrator_checkpoint(
 ) -> Result<bool, String> {
     // Delete from in-memory manager
     {
-        let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+        let mut manager = CHECKPOINT_MANAGER
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
         manager.delete(&id);
     } // MutexGuard dropped before .await
 
@@ -191,7 +196,9 @@ pub async fn delete_orchestrator_checkpoint(
 /// Find checkpoints by tag.
 #[tauri::command]
 pub fn find_checkpoints_by_tag(tag: String) -> Result<Vec<CheckpointSummary>, String> {
-    let manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+    let manager = CHECKPOINT_MANAGER
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
     Ok(manager.find_by_tag(&tag))
 }
 
@@ -201,14 +208,21 @@ pub fn compare_orchestrator_checkpoints(
     from_id: String,
     to_id: String,
 ) -> Result<CheckpointDiff, String> {
-    let manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+    compare_orchestrator_checkpoints_impl(from_id, to_id).map_err(String::from)
+}
+
+fn compare_orchestrator_checkpoints_impl(
+    from_id: String,
+    to_id: String,
+) -> Result<CheckpointDiff, AppError> {
+    let manager = CHECKPOINT_MANAGER.lock()?;
 
     let from_checkpoint = manager
         .load(&from_id)
-        .ok_or_else(|| format!("Checkpoint '{}' not found", from_id))?;
+        .ok_or_else(|| AppError::Raw(format!("Checkpoint '{}' not found", from_id)))?;
     let to_checkpoint = manager
         .load(&to_id)
-        .ok_or_else(|| format!("Checkpoint '{}' not found", to_id))?;
+        .ok_or_else(|| AppError::Raw(format!("Checkpoint '{}' not found", to_id)))?;
 
     Ok(CheckpointDiff::compute(from_checkpoint, to_checkpoint))
 }
@@ -216,18 +230,24 @@ pub fn compare_orchestrator_checkpoints(
 /// Get the latest checkpoint for a task.
 #[tauri::command]
 pub fn get_latest_checkpoint(task_id: String) -> Result<Option<Checkpoint>, String> {
-    let manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+    let manager = CHECKPOINT_MANAGER
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
     Ok(manager.latest_for_task(&task_id).cloned())
 }
 
 /// Start a replay session from a checkpoint.
 #[tauri::command]
 pub fn start_replay_session(checkpoint_id: String) -> Result<ReplaySession, String> {
-    let manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+    start_replay_session_impl(checkpoint_id).map_err(String::from)
+}
+
+fn start_replay_session_impl(checkpoint_id: String) -> Result<ReplaySession, AppError> {
+    let manager = CHECKPOINT_MANAGER.lock()?;
 
     let checkpoint = manager
         .load(&checkpoint_id)
-        .ok_or_else(|| format!("Checkpoint '{}' not found", checkpoint_id))?;
+        .ok_or_else(|| AppError::Raw(format!("Checkpoint '{}' not found", checkpoint_id)))?;
 
     Ok(ReplaySession::from_checkpoint(checkpoint))
 }
@@ -250,7 +270,9 @@ pub async fn get_checkpoint_task_ids(
 /// Clear all checkpoints (for testing/reset).
 #[tauri::command]
 pub fn clear_all_checkpoints() -> Result<(), String> {
-    let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+    let mut manager = CHECKPOINT_MANAGER
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
     *manager = CheckpointManager::new().with_max_per_task(50);
     Ok(())
 }
@@ -266,7 +288,9 @@ pub async fn add_sample_checkpoints(app_state: State<'_, StorageCompartment>) ->
 
     // Save to in-memory manager (sync, mutex held briefly)
     {
-        let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+        let mut manager = CHECKPOINT_MANAGER
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
 
         for i in 1..=5 {
             let state = match i {
@@ -427,19 +451,28 @@ pub async fn replay_from_checkpoint(
     app_state: State<'_, StorageCompartment>,
     checkpoint_id: String,
 ) -> Result<ReplayFromCheckpointResponse, String> {
+    replay_from_checkpoint_impl(app_state, checkpoint_id)
+        .await
+        .map_err(String::from)
+}
+
+async fn replay_from_checkpoint_impl(
+    app_state: State<'_, StorageCompartment>,
+    checkpoint_id: String,
+) -> Result<ReplayFromCheckpointResponse, AppError> {
     // Get the checkpoint from in-memory manager
     let checkpoint = {
-        let manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+        let manager = CHECKPOINT_MANAGER.lock()?;
         manager
             .load(&checkpoint_id)
-            .ok_or_else(|| format!("Checkpoint '{}' not found", checkpoint_id))?
+            .ok_or_else(|| AppError::Raw(format!("Checkpoint '{}' not found", checkpoint_id)))?
             .clone()
     };
 
     // Start replay session
     let replay_result = {
-        let mut replay_manager = REPLAY_MANAGER.lock().map_err(|e| e.to_string())?;
-        let manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+        let mut replay_manager = REPLAY_MANAGER.lock()?;
+        let manager = CHECKPOINT_MANAGER.lock()?;
         replay_manager.start_replay(&checkpoint, &manager)
     };
 
@@ -475,11 +508,14 @@ pub async fn replay_from_checkpoint(
     let input = CreateTaskRunInput::new(&new_task_run_id, &replay_task_name)
         .with_prompt(&replay_prompt)
         .with_auto_continue(true);
-    app_state.pg_db().create_task_run(&input).await?;
+    app_state
+        .pg_db()
+        .create_task_run(&input)
+        .await
+        .map_err(AppError::Raw)?;
 
     // Save replay lineage to database
-    let _lineage_json = serde_json::to_string(&replay_result.lineage)
-        .map_err(|e| format!("Failed to serialize lineage: {}", e))?;
+    let _lineage_json = serde_json::to_string(&replay_result.lineage)?;
 
     // Store lineage in task_runs custom field (runtime_context_json)
     let runtime_ctx = serde_json::json!({
@@ -492,7 +528,8 @@ pub async fn replay_from_checkpoint(
     app_state
         .pg_db()
         .update_task_run_runtime_context(&new_task_run_id, &runtime_ctx)
-        .await?;
+        .await
+        .map_err(AppError::Raw)?;
 
     Ok(ReplayFromCheckpointResponse {
         session: replay_result.session,
@@ -514,7 +551,9 @@ pub async fn replay_from_checkpoint(
 /// The lineage tree if the task has lineage info, or None if it's unknown.
 #[tauri::command]
 pub fn get_replay_lineage(task_run_id: String) -> Result<Option<LineageTree>, String> {
-    let replay_manager = REPLAY_MANAGER.lock().map_err(|e| e.to_string())?;
+    let replay_manager = REPLAY_MANAGER
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
 
     // Get lineage info
     let lineage = replay_manager.get_lineage(&task_run_id);
@@ -542,7 +581,9 @@ pub fn get_replay_lineage(task_run_id: String) -> Result<Option<LineageTree>, St
 /// * `task_run_id` - The task run ID to register.
 #[tauri::command]
 pub fn register_task_for_lineage(task_run_id: String) -> Result<(), String> {
-    let mut replay_manager = REPLAY_MANAGER.lock().map_err(|e| e.to_string())?;
+    let mut replay_manager = REPLAY_MANAGER
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
     replay_manager.register_original_task(task_run_id);
     Ok(())
 }
@@ -556,14 +597,18 @@ pub fn register_task_for_lineage(task_run_id: String) -> Result<(), String> {
 /// The lineage info if available.
 #[tauri::command]
 pub fn get_task_lineage_info(task_run_id: String) -> Result<Option<LineageInfo>, String> {
-    let replay_manager = REPLAY_MANAGER.lock().map_err(|e| e.to_string())?;
+    let replay_manager = REPLAY_MANAGER
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
     Ok(replay_manager.get_lineage(&task_run_id).cloned())
 }
 
 /// List all active replay sessions.
 #[tauri::command]
 pub fn list_active_replay_sessions() -> Result<Vec<ReplaySession>, String> {
-    let replay_manager = REPLAY_MANAGER.lock().map_err(|e| e.to_string())?;
+    let replay_manager = REPLAY_MANAGER
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
     Ok(replay_manager
         .list_active_sessions()
         .into_iter()
@@ -577,7 +622,9 @@ pub fn list_active_replay_sessions() -> Result<Vec<ReplaySession>, String> {
 /// * `session_id` - The replay session ID.
 #[tauri::command]
 pub fn complete_replay_session(session_id: String) -> Result<(), String> {
-    let mut replay_manager = REPLAY_MANAGER.lock().map_err(|e| e.to_string())?;
+    let mut replay_manager = REPLAY_MANAGER
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
     replay_manager.complete_session(&session_id)
 }
 
@@ -588,7 +635,9 @@ pub fn complete_replay_session(session_id: String) -> Result<(), String> {
 /// * `error` - Optional error message.
 #[tauri::command]
 pub fn fail_replay_session(session_id: String, _error: Option<String>) -> Result<(), String> {
-    let mut replay_manager = REPLAY_MANAGER.lock().map_err(|e| e.to_string())?;
+    let mut replay_manager = REPLAY_MANAGER
+        .lock()
+        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
     replay_manager.fail_session(&session_id)
 }
 
