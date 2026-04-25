@@ -29,6 +29,11 @@ pub enum Framework {
     Angular,
     Svelte,
     PlainHtml,
+    /// Expo Router project (file-routed React Native via `expo-router`).
+    /// Detected when both `expo` and `expo-router` are in package.json deps.
+    ExpoRouter,
+    /// Bare React Native (no Expo). Reserved variant; detection is a stub.
+    ReactNative,
     Unknown,
 }
 
@@ -229,9 +234,16 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                     let deps = pkg.get("dependencies").cloned().unwrap_or_default();
                     let dev_deps = pkg.get("devDependencies").cloned().unwrap_or_default();
 
-                    // Detect framework from dependencies
+                    // Detect framework from dependencies.
+                    // ExpoRouter must be checked BEFORE React (Expo projects always
+                    // ship `react` as a transitive dep, which would otherwise win).
+                    let has_expo = deps.get("expo").is_some() || dev_deps.get("expo").is_some();
+                    let has_expo_router = deps.get("expo-router").is_some()
+                        || dev_deps.get("expo-router").is_some();
                     if deps.get("next").is_some() || dev_deps.get("next").is_some() {
                         framework = Framework::NextJs;
+                    } else if has_expo && has_expo_router {
+                        framework = Framework::ExpoRouter;
                     } else if deps.get("react").is_some() || dev_deps.get("react").is_some() {
                         framework = Framework::React;
                     } else if deps.get("vue").is_some() || dev_deps.get("vue").is_some() {
@@ -242,6 +254,17 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                         framework = Framework::Angular;
                     } else if deps.get("svelte").is_some() || dev_deps.get("svelte").is_some() {
                         framework = Framework::Svelte;
+                    }
+
+                    // Track presence of the native UI Bridge SDK independently of the
+                    // web SDK — RN apps integrate against `@qontinui/ui-bridge-native`,
+                    // which is a separate published package.
+                    if let Some(version) = deps
+                        .get("@qontinui/ui-bridge-native")
+                        .or_else(|| dev_deps.get("@qontinui/ui-bridge-native"))
+                    {
+                        existing_sdk_version = version.as_str().map(|s| s.to_string());
+                        ui_bridge_status = IntegrationStatus::Partial;
                     }
 
                     // Check for UI Bridge SDK
@@ -304,6 +327,9 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                                 Framework::Vue => Some(5173),
                                 Framework::Angular => Some(4200),
                                 Framework::Svelte => Some(5173),
+                                // Metro bundler default for Expo / RN.
+                                Framework::ExpoRouter => Some(8081),
+                                Framework::ReactNative => Some(8081),
                                 _ => None,
                             };
                         }
@@ -316,8 +342,12 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
         framework = Framework::PlainHtml;
     }
 
-    // Detect Rust/Axum server framework from Cargo.toml (check project dir and parent)
-    if server_framework == ServerFramework::None {
+    // Detect Rust/Axum server framework from Cargo.toml (check project dir and parent).
+    // Skip for React Native frameworks — RN apps host the UI Bridge HTTP server
+    // in-process via `serverAdapter`, not via a sibling Rust backend.
+    let is_rn_framework =
+        framework == Framework::ExpoRouter || framework == Framework::ReactNative;
+    if server_framework == ServerFramework::None && !is_rn_framework {
         for cargo_dir in &[project_path.clone(), project_path.join("..").to_path_buf()] {
             let cargo_path = cargo_dir.join("Cargo.toml");
             if cargo_path.exists() {
@@ -414,22 +444,66 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                 });
             }
         }
+        Framework::ExpoRouter => {
+            // Root layout: app/_layout.tsx (or .ts / .jsx). Take the first one
+            // that exists — Expo only honors a single layout per directory.
+            for path_str in &[
+                "app/_layout.tsx",
+                "app/_layout.ts",
+                "app/_layout.jsx",
+            ] {
+                if project_path.join(path_str).exists() {
+                    entry_points.push(EntryPoint {
+                        path: path_str.to_string(),
+                        entry_type: "layout".to_string(),
+                    });
+                    break;
+                }
+            }
+            // Optional tabs layout: app/(tabs)/_layout.tsx. Surface separately
+            // so the integrator can reason about tab-shaped projects.
+            for path_str in &[
+                "app/(tabs)/_layout.tsx",
+                "app/(tabs)/_layout.ts",
+                "app/(tabs)/_layout.jsx",
+            ] {
+                if project_path.join(path_str).exists() {
+                    entry_points.push(EntryPoint {
+                        path: path_str.to_string(),
+                        entry_type: "tabs_layout".to_string(),
+                    });
+                    break;
+                }
+            }
+        }
         _ => {}
     }
 
-    // Scan source for UIBridgeProvider to verify full integration
+    // Scan source for the appropriate provider to verify full integration.
+    // ExpoRouter uses `UIBridgeNativeProvider` from `@qontinui/ui-bridge-native`
+    // and routes live under `app/`, not `src/`. Web frameworks use
+    // `UIBridgeProvider` from `@qontinui/ui-bridge` under `src/`.
     if existing_sdk_version.is_some() {
+        let (search_dirs, provider_name): (&[&str], &str) = match framework {
+            Framework::ExpoRouter | Framework::ReactNative => {
+                (&["app", "src"], "UIBridgeNativeProvider")
+            }
+            _ => (&["src"], "UIBridgeProvider"),
+        };
         let has_provider = scan_for_pattern(
             &project_path,
-            &["src"],
-            "UIBridgeProvider",
+            search_dirs,
+            provider_name,
             &["tsx", "jsx", "ts", "js"],
         )
         .await;
         if has_provider {
             ui_bridge_status = IntegrationStatus::Full;
         } else {
-            issues.push("SDK installed but UIBridgeProvider not found in source".to_string());
+            issues.push(format!(
+                "SDK installed but {} not found in source",
+                provider_name
+            ));
         }
     }
 
@@ -711,6 +785,23 @@ async fn integrate_source(
                 "Optional: Register form library adapters (React Hook Form, Formik) for accurate form state extraction".to_string()
             );
         }
+        Framework::ExpoRouter => {
+            integrate_expo_router(
+                &project,
+                analysis,
+                options,
+                &mut modifications,
+                &mut warnings,
+                &mut next_steps,
+            )
+            .await;
+        }
+        Framework::ReactNative => {
+            warnings.push(
+                "Bare React Native detected. Automated integration is not yet implemented for non-Expo RN projects. Install @qontinui/ui-bridge-native manually and follow the SDK documentation."
+                    .to_string(),
+            );
+        }
         Framework::Vue | Framework::Angular | Framework::Svelte => {
             warnings.push(format!(
                 "{:?} detected. Full SDK integration is currently only available for React/Next.js. Manual integration is required for other frameworks.",
@@ -727,7 +818,14 @@ async fn integrate_source(
     }
 
     // Server-side relay integration (separate from client-side framework setup).
-    // Next.js server relay is already handled in integrate_nextjs().
+    // Next.js server relay is already handled in integrate_nextjs(). Skip for
+    // RN frameworks — they host the UI Bridge HTTP server in-process via
+    // `serverAdapter`, not via a sibling Node server.
+    let skip_server_integration = matches!(
+        analysis.framework,
+        Framework::ExpoRouter | Framework::ReactNative
+    );
+    if !skip_server_integration {
     match analysis.server_framework {
         ServerFramework::Express => {
             integrate_express_server(&project, analysis, &mut modifications, &mut warnings).await;
@@ -765,6 +863,7 @@ async fn integrate_source(
             // Already handled in integrate_nextjs()
         }
     }
+    } // end if !skip_server_integration
 
     // Apply file modifications first (so package.json is written before install)
     let (success, write_warnings) = write_file_modifications(&project, &modifications).await;
@@ -980,6 +1079,270 @@ async fn add_sdk_to_package_json(
 
 // Server adapter is now bundled in @qontinui/ui-bridge (no separate @qontinui/ui-bridge-server needed).
 // Babel/SWC plugins are deprecated — AutoRegisterProvider handles element discovery at runtime.
+
+/// Add `@qontinui/ui-bridge-native` to package.json dependencies if not already
+/// present. RN apps use this published package (NOT a `file:` link, NOT
+/// `@qontinui/ui-bridge`). The default version is `latest`; the live
+/// published version at the time of writing is `^0.1.6`.
+async fn add_native_sdk_to_package_json(
+    project: &std::path::Path,
+    options: &IntegrationOptions,
+    modifications: &mut Vec<FileModification>,
+    _warnings: &mut Vec<String>,
+) {
+    let pkg_path = project.join("package.json");
+    if let Ok(content) = tokio::fs::read_to_string(&pkg_path).await {
+        if let Ok(mut pkg) = serde_json::from_str::<serde_json::Value>(&content) {
+            let version = options.sdk_version.as_deref().unwrap_or("latest");
+
+            // Ensure dependencies object exists.
+            if pkg.get("dependencies").is_none() {
+                if let Some(map) = pkg.as_object_mut() {
+                    map.insert(
+                        "dependencies".to_string(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    );
+                }
+            }
+
+            let deps = pkg.get_mut("dependencies").and_then(|d| d.as_object_mut());
+            if let Some(deps) = deps {
+                if !deps.contains_key("@qontinui/ui-bridge-native") {
+                    deps.insert(
+                        "@qontinui/ui-bridge-native".to_string(),
+                        serde_json::Value::String(version.to_string()),
+                    );
+                    let new_content =
+                        serde_json::to_string_pretty(&pkg).unwrap_or_else(|_| content.clone());
+                    modifications.push(FileModification {
+                        file_path: "package.json".to_string(),
+                        modification_type: ModificationType::Replace,
+                        description: "Add @qontinui/ui-bridge-native to dependencies".to_string(),
+                        original_content: Some(content),
+                        new_content,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Derive a (sanitized) appId / appName pair from a package.json `name` field.
+/// Returns `(app_id, app_name)`. The id keeps the raw package name; the
+/// display name title-cases hyphenated segments.
+fn derive_expo_app_info(pkg_name: &str) -> (String, String) {
+    let app_id = if pkg_name.is_empty() {
+        "expo-app".to_string()
+    } else {
+        pkg_name.to_string()
+    };
+    // Strip `@scope/` prefix if present for the display name basis.
+    let raw = pkg_name
+        .rsplit_once('/')
+        .map(|(_, n)| n)
+        .unwrap_or(pkg_name);
+    if raw.is_empty() {
+        return (app_id, "Expo App".to_string());
+    }
+    let display = raw
+        .split(|c: char| c == '-' || c == '_')
+        .map(|seg| {
+            let mut chars = seg.chars();
+            match chars.next() {
+                Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    (app_id, display)
+}
+
+/// Wrap a Stack/Slot-based Expo Router root layout with
+/// `<UIBridgeNativeProvider>`. Keeps the wrap minimal: only `features` and
+/// `config` are populated. Server adapter, screenshot/navigation/route
+/// providers, deviceId, cloud relay are left out — they require sibling
+/// deps and runtime decisions the integrator can't make.
+fn wrap_with_provider_expo_router(content: &str, app_id: &str, app_name: &str) -> String {
+    let import_line =
+        "import { UIBridgeNativeProvider } from '@qontinui/ui-bridge-native';\n";
+    let insert_pos = find_last_import_pos(content);
+
+    let mut result = String::new();
+    result.push_str(&content[..insert_pos]);
+    if !content.contains("UIBridgeNativeProvider") {
+        result.push_str(import_line);
+    }
+    let rest = &content[insert_pos..];
+
+    // Build the provider open tag with the derived appInfo block.
+    let provider_open = format!(
+        "<UIBridgeNativeProvider\n      features={{{{ server: __DEV__, debug: __DEV__ }}}}\n      config={{{{\n        serverPort: 8087,\n        appInfo: {{{{\n          appId: '{}',\n          appName: '{}',\n          appType: 'mobile',\n          framework: 'expo',\n        }}}},\n      }}}}\n    >",
+        app_id.replace('\'', "\\'"),
+        app_name.replace('\'', "\\'"),
+    );
+    let provider_close = "</UIBridgeNativeProvider>";
+
+    // Try, in order, to wrap a self-closing <Stack ... /> or <Slot ... />,
+    // then a paired open/close form. The replacements are first-match: only
+    // one wrap is applied.
+    let wrapped = if let Some(wrapped) =
+        wrap_self_closing_root(rest, "Stack", &provider_open, provider_close)
+    {
+        wrapped
+    } else if let Some(wrapped) =
+        wrap_self_closing_root(rest, "Slot", &provider_open, provider_close)
+    {
+        wrapped
+    } else if rest.contains("<Stack>") && rest.contains("</Stack>") {
+        rest.replacen("<Stack>", &format!("{}\n      <Stack>", provider_open), 1)
+            .replacen("</Stack>", &format!("</Stack>\n    {}", provider_close), 1)
+    } else if rest.contains("<Slot>") && rest.contains("</Slot>") {
+        rest.replacen("<Slot>", &format!("{}\n      <Slot>", provider_open), 1)
+            .replacen("</Slot>", &format!("</Slot>\n    {}", provider_close), 1)
+    } else {
+        // No Stack/Slot found — leave content untouched. The caller emits
+        // a next_step directing the user to the qontinui-mobile reference.
+        rest.to_string()
+    };
+
+    result.push_str(&wrapped);
+    result
+}
+
+/// Helper: wrap a single self-closing `<Tag ... />` (e.g. `<Stack />`) with the
+/// given provider open/close tags. Returns Some(new_content) only if a match
+/// was found; None otherwise.
+fn wrap_self_closing_root(
+    content: &str,
+    tag: &str,
+    provider_open: &str,
+    provider_close: &str,
+) -> Option<String> {
+    let needle_open = format!("<{}", tag);
+    let pos = content.find(&needle_open)?;
+    // Verify the next char after `<Tag` is whitespace, `/`, or `>`. Avoid
+    // matching `<StackHeader>` or similar.
+    let after_tag_byte = content.as_bytes().get(pos + needle_open.len()).copied();
+    match after_tag_byte {
+        Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'/') | Some(b'>') => {}
+        _ => return None,
+    }
+    // Find the closing `/>` of this self-closing tag.
+    let close_search_from = pos + needle_open.len();
+    let close_rel = content[close_search_from..].find("/>")?;
+    let close_abs = close_search_from + close_rel + 2; // after `/>`
+    // Bail if there's a `>` (non-self-closing) before the `/>` — it's a
+    // paired tag, not self-closing.
+    if let Some(gt_rel) = content[close_search_from..close_abs - 2].find('>') {
+        if gt_rel < close_rel {
+            return None;
+        }
+    }
+
+    let original_tag = &content[pos..close_abs];
+    let replacement = format!(
+        "{}\n      {}\n    {}",
+        provider_open, original_tag, provider_close
+    );
+
+    let mut out = String::with_capacity(content.len() + replacement.len());
+    out.push_str(&content[..pos]);
+    out.push_str(&replacement);
+    out.push_str(&content[close_abs..]);
+    Some(out)
+}
+
+/// Integrate UI Bridge into an Expo Router project.
+///
+/// Already-integrated fast path: if `analysis.ui_bridge_status == Full`,
+/// emits zero modifications and a single `next_step`. Otherwise, adds
+/// `@qontinui/ui-bridge-native` to deps and patches the root layout with
+/// a minimal `<UIBridgeNativeProvider>` wrap.
+async fn integrate_expo_router(
+    project: &std::path::Path,
+    analysis: &ProjectAnalysis,
+    options: &IntegrationOptions,
+    modifications: &mut Vec<FileModification>,
+    warnings: &mut Vec<String>,
+    next_steps: &mut Vec<String>,
+) {
+    // Already-integrated fast path.
+    if analysis.ui_bridge_status == IntegrationStatus::Full {
+        next_steps.push("UI Bridge already integrated. Skip to page registrations.".to_string());
+        return;
+    }
+
+    // Add the native SDK to package.json (skipped if already present —
+    // a `Partial` status means dep is there but provider isn't).
+    add_native_sdk_to_package_json(project, options, modifications, warnings).await;
+
+    // Read package.json `name` for appId / appName derivation.
+    let (app_id, app_name) = match tokio::fs::read_to_string(project.join("package.json")).await {
+        Ok(c) => {
+            let pkg_name = serde_json::from_str::<serde_json::Value>(&c)
+                .ok()
+                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+            derive_expo_app_info(&pkg_name)
+        }
+        Err(_) => derive_expo_app_info(""),
+    };
+
+    // Find the root layout entry (preferred) — fall back to tabs_layout if
+    // no root layout was discovered (unusual).
+    let layout_entry = analysis
+        .entry_points
+        .iter()
+        .find(|e| e.entry_type == "layout")
+        .or_else(|| {
+            analysis
+                .entry_points
+                .iter()
+                .find(|e| e.entry_type == "tabs_layout")
+        });
+
+    if let Some(entry) = layout_entry {
+        let entry_path = project.join(&entry.path);
+        if let Ok(content) = tokio::fs::read_to_string(&entry_path).await {
+            if !content.contains("UIBridgeNativeProvider") {
+                let new_content = wrap_with_provider_expo_router(&content, &app_id, &app_name);
+                if new_content != content {
+                    modifications.push(FileModification {
+                        file_path: entry.path.clone(),
+                        modification_type: ModificationType::Replace,
+                        description:
+                            "Wrap root layout with UIBridgeNativeProvider (features: server, debug)"
+                                .to_string(),
+                        original_content: Some(content),
+                        new_content,
+                    });
+                } else {
+                    warnings.push(format!(
+                        "Could not auto-wrap {} — no <Stack> or <Slot> root tag found. Add UIBridgeNativeProvider manually.",
+                        entry.path
+                    ));
+                }
+            }
+        }
+    } else {
+        warnings.push(
+            "No app/_layout.tsx found. Please add UIBridgeNativeProvider to your root layout."
+                .to_string(),
+        );
+    }
+
+    next_steps
+        .push("Restart your Expo dev server (Metro) to pick up the new dependency".to_string());
+    next_steps.push(
+        "The minimal wrap enables HTTP-based UI Bridge use. For full provider wire-up (TCP server adapter, screenshot capture, programmatic navigation, mDNS, cloud relay) see qontinui-mobile/app/_layout.tsx as the reference."
+            .to_string(),
+    );
+    next_steps.push(
+        "Optional providers require sibling deps: serverAdapter (react-native-tcp-socket), screenshotProvider (react-native-view-shot), navigationProvider, routeProvider, deviceId, cloudRelayConfig."
+            .to_string(),
+    );
+}
 
 fn wrap_with_provider_react(content: &str, file_path: &str) -> String {
     let import_line =
@@ -1493,24 +1856,46 @@ async fn handle_preview(
                     )
                     .await;
                 }
-                _ => {}
-            }
-
-            // Include server-side integration files in preview
-            match analysis.server_framework {
-                ServerFramework::Express => {
-                    integrate_express_server(
+                Framework::ExpoRouter => {
+                    let mut next_steps = Vec::new();
+                    integrate_expo_router(
                         &project,
                         &analysis,
+                        &req.options,
                         &mut modifications,
                         &mut warnings,
+                        &mut next_steps,
                     )
                     .await;
                 }
-                ServerFramework::None if analysis.framework == Framework::React => {
-                    integrate_standalone_server(&project, &mut modifications, &mut warnings).await;
-                }
                 _ => {}
+            }
+
+            // Include server-side integration files in preview. Skip for
+            // ExpoRouter / ReactNative — RN apps host the UI Bridge HTTP
+            // server in-process via `serverAdapter`, not via a sibling
+            // server framework.
+            let is_rn = matches!(
+                analysis.framework,
+                Framework::ExpoRouter | Framework::ReactNative
+            );
+            if !is_rn {
+                match analysis.server_framework {
+                    ServerFramework::Express => {
+                        integrate_express_server(
+                            &project,
+                            &analysis,
+                            &mut modifications,
+                            &mut warnings,
+                        )
+                        .await;
+                    }
+                    ServerFramework::None if analysis.framework == Framework::React => {
+                        integrate_standalone_server(&project, &mut modifications, &mut warnings)
+                            .await;
+                    }
+                    _ => {}
+                }
             }
 
             Json(ApiResponse::success(modifications))
@@ -2360,6 +2745,10 @@ async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, Strin
             // CRA/Vite: src/pages/**/*.tsx or src/app/**/*.tsx
             discover_react_pages(&project, &mut pages).await;
         }
+        Framework::ExpoRouter => {
+            // Expo Router file-based routing under app/.
+            discover_expo_router_pages(&project, &mut pages).await;
+        }
         _ => {
             // Generic: scan for common page patterns
             discover_generic_pages(&project, &mut pages).await;
@@ -2629,6 +3018,192 @@ async fn discover_tauri_pages(project: &PathBuf, pages: &mut Vec<PageComponent>)
             });
         }
     }
+}
+
+/// Discover pages in an Expo Router project. Expo Router uses convention-based
+/// file routing under `app/`:
+///   - `app/index.tsx`              -> `/`
+///   - `app/<name>.tsx`             -> `/<name>`
+///   - `app/<name>/index.tsx`       -> `/<name>`
+///   - `app/(group)/<name>.tsx`     -> `/<name>` (group is layout-only)
+///   - `app/[param].tsx`            -> `/[param]` (dynamic)
+///   - `app/[...rest].tsx`          -> `/[...rest]` (catch-all)
+///   - `app/[[...rest]].tsx`        -> `/[[...rest]]` (optional catch-all)
+///   - `app/_layout.tsx`            -> skipped (layout, not a page)
+///   - any file starting with `_`   -> skipped (helpers/layouts)
+async fn discover_expo_router_pages(project: &PathBuf, pages: &mut Vec<PageComponent>) {
+    let app_dir = project.join("app");
+    if !app_dir.exists() {
+        return;
+    }
+
+    let mut stack = vec![app_dir.clone()];
+    while let Some(current) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&current).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            if path.is_dir() {
+                // Skip noise / generated output. Group dirs `(group)` are
+                // recursed into so their children participate in route
+                // derivation; the segment is stripped at route-derivation
+                // time, not here.
+                if file_name.starts_with('.')
+                    || file_name == "node_modules"
+                    || file_name == "dist"
+                    || file_name == "build"
+                {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+
+            // Only .tsx / .ts / .jsx files; skip test/stories.
+            let is_route_file = (file_name.ends_with(".tsx")
+                || file_name.ends_with(".ts")
+                || file_name.ends_with(".jsx"))
+                && !file_name.ends_with(".d.ts")
+                && !file_name.ends_with(".test.tsx")
+                && !file_name.ends_with(".test.ts")
+                && !file_name.ends_with(".test.jsx")
+                && !file_name.ends_with(".stories.tsx")
+                && !file_name.ends_with(".stories.jsx");
+            if !is_route_file {
+                continue;
+            }
+
+            // Skip layouts and any file starting with `_` (helpers/layouts).
+            if file_name.starts_with('_') {
+                continue;
+            }
+
+            let rel_path = path
+                .strip_prefix(project)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            let route = derive_expo_router_route(&rel_path);
+            let component_name = derive_expo_router_component_name(&rel_path);
+
+            pages.push(PageComponent {
+                route,
+                component_path: rel_path,
+                component_name,
+                has_registrations: false,
+                has_data_page_id: false,
+                has_spec: false,
+                has_tutorial: false,
+            });
+        }
+    }
+}
+
+/// Derive an Expo Router route from a file path under `app/`.
+///   - Strips the leading `app/` prefix and the trailing extension.
+///   - Drops `(group)` segments (group dirs are layout-only, not part of URL).
+///   - Collapses trailing `/index` to the parent route.
+///   - Preserves dynamic segments (`[param]`, `[...rest]`, `[[...rest]]`).
+fn derive_expo_router_route(rel_path: &str) -> String {
+    let normalized = rel_path.replace('\\', "/");
+    // Strip leading "app/"
+    let after_app = normalized.strip_prefix("app/").unwrap_or(&normalized);
+
+    // Strip trailing extension (.tsx, .ts, .jsx).
+    let without_ext = if let Some(stem) = after_app
+        .strip_suffix(".tsx")
+        .or_else(|| after_app.strip_suffix(".ts"))
+        .or_else(|| after_app.strip_suffix(".jsx"))
+    {
+        stem
+    } else {
+        after_app
+    };
+
+    // Split into segments and drop `(group)` segments.
+    let segments: Vec<&str> = without_ext
+        .split('/')
+        .filter(|s| !(s.starts_with('(') && s.ends_with(')')))
+        .collect();
+
+    // Collapse trailing `index` (e.g., `foo/index` -> `foo`, bare `index` -> ``).
+    let segments: Vec<&str> = if segments.last() == Some(&"index") {
+        segments[..segments.len() - 1].to_vec()
+    } else {
+        segments
+    };
+
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
+/// Derive a PascalCase component name + `Page` suffix from an Expo Router
+/// file path. Dynamic-segment brackets and rest spreads are stripped, and
+/// hyphenated names are converted to PascalCase.
+///
+/// Examples:
+///   - `app/prompts.tsx`            -> `PromptsPage`
+///   - `app/index.tsx`              -> `IndexPage`
+///   - `app/[id].tsx`               -> `IdPage`
+///   - `app/[...path].tsx`          -> `PathPage`
+///   - `app/(tabs)/settings.tsx`    -> `SettingsPage`
+///   - `app/state-explorer.tsx`     -> `StateExplorerPage`
+///   - `app/run/[id].tsx`           -> `IdPage`
+fn derive_expo_router_component_name(rel_path: &str) -> String {
+    let normalized = rel_path.replace('\\', "/");
+    // Use the file stem (without ext) as the basis. The directory name does
+    // not contribute — `app/run/[id].tsx` becomes `IdPage`, mirroring the
+    // route's leaf segment.
+    let stem = std::path::Path::new(&normalized)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("page");
+
+    // Strip optional-catch-all double-bracket wrap, then catch-all spread,
+    // then ordinary dynamic-segment brackets.
+    let stripped = stem
+        .trim_start_matches("[[...")
+        .trim_end_matches("]]")
+        .trim_start_matches("[...")
+        .trim_end_matches(']')
+        .trim_start_matches('[');
+
+    if stripped.is_empty() {
+        return "Page".to_string();
+    }
+
+    // PascalCase from kebab-case / snake_case / dot-case.
+    let mut name = String::with_capacity(stripped.len() + 4);
+    let mut capitalize_next = true;
+    for c in stripped.chars() {
+        if c == '-' || c == '_' || c == '.' {
+            capitalize_next = true;
+            continue;
+        }
+        if capitalize_next {
+            name.extend(c.to_uppercase());
+            capitalize_next = false;
+        } else {
+            name.push(c);
+        }
+    }
+    if name.is_empty() {
+        return "Page".to_string();
+    }
+    name.push_str("Page");
+    name
 }
 
 /// Convert a PascalCase component name (typically ending in `Page`) into a
@@ -3066,5 +3641,340 @@ mod tests {
     #[test]
     fn extract_port_short_flag_equals() {
         assert_eq!(extract_port_from_script("-p=9000"), Some(9000));
+    }
+}
+
+#[cfg(test)]
+mod expo_router_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        // CARGO_MANIFEST_DIR points at the src-tauri/ crate root.
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("test-fixtures");
+        p.push(name);
+        p
+    }
+
+    #[test]
+    fn framework_serializes_to_snake_case() {
+        let s = serde_json::to_string(&Framework::ExpoRouter).unwrap();
+        assert_eq!(s, "\"expo_router\"");
+        let s = serde_json::to_string(&Framework::ReactNative).unwrap();
+        assert_eq!(s, "\"react_native\"");
+    }
+
+    #[test]
+    fn derive_route_basic() {
+        assert_eq!(derive_expo_router_route("app/index.tsx"), "/");
+        assert_eq!(derive_expo_router_route("app/prompts.tsx"), "/prompts");
+        assert_eq!(derive_expo_router_route("app/run/[id].tsx"), "/run/[id]");
+        assert_eq!(
+            derive_expo_router_route("app/files/[...path].tsx"),
+            "/files/[...path]"
+        );
+        assert_eq!(
+            derive_expo_router_route("app/files/[[...path]].tsx"),
+            "/files/[[...path]]"
+        );
+    }
+
+    #[test]
+    fn derive_route_strips_groups() {
+        assert_eq!(derive_expo_router_route("app/(tabs)/index.tsx"), "/");
+        assert_eq!(
+            derive_expo_router_route("app/(tabs)/settings.tsx"),
+            "/settings"
+        );
+        assert_eq!(
+            derive_expo_router_route("app/(auth)/login.tsx"),
+            "/login"
+        );
+        assert_eq!(
+            derive_expo_router_route("app/(tabs)/(nested)/foo.tsx"),
+            "/foo"
+        );
+    }
+
+    #[test]
+    fn derive_route_collapses_nested_index() {
+        assert_eq!(
+            derive_expo_router_route("app/settings/index.tsx"),
+            "/settings"
+        );
+    }
+
+    #[test]
+    fn derive_component_name_basic() {
+        assert_eq!(derive_expo_router_component_name("app/prompts.tsx"), "PromptsPage");
+        assert_eq!(derive_expo_router_component_name("app/index.tsx"), "IndexPage");
+        assert_eq!(
+            derive_expo_router_component_name("app/state-explorer.tsx"),
+            "StateExplorerPage"
+        );
+        assert_eq!(
+            derive_expo_router_component_name("app/(tabs)/settings.tsx"),
+            "SettingsPage"
+        );
+    }
+
+    #[test]
+    fn derive_component_name_dynamic_segments() {
+        assert_eq!(derive_expo_router_component_name("app/[id].tsx"), "IdPage");
+        assert_eq!(
+            derive_expo_router_component_name("app/run/[id].tsx"),
+            "IdPage"
+        );
+        assert_eq!(
+            derive_expo_router_component_name("app/files/[...path].tsx"),
+            "PathPage"
+        );
+        assert_eq!(
+            derive_expo_router_component_name("app/files/[[...path]].tsx"),
+            "PathPage"
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_blank_fixture_detects_expo_router() {
+        let fixture = fixture_path("expo-router-blank");
+        let analysis = analyze_project(&fixture.to_string_lossy())
+            .await
+            .expect("blank fixture should analyze");
+        assert_eq!(analysis.framework, Framework::ExpoRouter);
+        assert_eq!(analysis.ui_bridge_status, IntegrationStatus::None);
+        assert_eq!(analysis.server_framework, ServerFramework::None);
+        assert!(analysis.server_adapter.is_none());
+        assert_eq!(analysis.dev_server_port, Some(8081));
+        // Root layout entry must be discovered.
+        assert!(
+            analysis
+                .entry_points
+                .iter()
+                .any(|e| e.entry_type == "layout" && e.path == "app/_layout.tsx"),
+            "expected app/_layout.tsx layout entry, got: {:?}",
+            analysis.entry_points
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_integrated_fixture_detects_full_status() {
+        let fixture = fixture_path("expo-router-integrated");
+        let analysis = analyze_project(&fixture.to_string_lossy())
+            .await
+            .expect("integrated fixture should analyze");
+        assert_eq!(analysis.framework, Framework::ExpoRouter);
+        assert_eq!(
+            analysis.ui_bridge_status,
+            IntegrationStatus::Full,
+            "expected Full, got {:?} (issues: {:?})",
+            analysis.ui_bridge_status,
+            analysis.issues
+        );
+        assert_eq!(analysis.existing_sdk_version.as_deref(), Some("^0.1.6"));
+    }
+
+    #[tokio::test]
+    async fn discover_pages_fixture_finds_expected_routes() {
+        let fixture = fixture_path("expo-router-pages");
+        let mut pages = Vec::new();
+        discover_expo_router_pages(&fixture, &mut pages).await;
+
+        let mut paths: Vec<String> = pages.iter().map(|p| p.component_path.clone()).collect();
+        paths.sort();
+
+        // Expected leaves (with normalized forward slashes):
+        // - app/(tabs)/index.tsx
+        // - app/(tabs)/settings.tsx
+        // - app/files/[...path].tsx
+        // - app/index.tsx
+        // - app/prompts.tsx
+        // - app/run/[id].tsx
+        // _layout.tsx files MUST NOT appear.
+        let expected = vec![
+            "app/(tabs)/index.tsx".to_string(),
+            "app/(tabs)/settings.tsx".to_string(),
+            "app/files/[...path].tsx".to_string(),
+            "app/index.tsx".to_string(),
+            "app/prompts.tsx".to_string(),
+            "app/run/[id].tsx".to_string(),
+        ];
+        assert_eq!(paths, expected, "discovered page set mismatch");
+
+        // Verify routes for representative pages.
+        let by_path: std::collections::HashMap<&str, &PageComponent> = pages
+            .iter()
+            .map(|p| (p.component_path.as_str(), p))
+            .collect();
+        assert_eq!(by_path["app/index.tsx"].route, "/");
+        assert_eq!(by_path["app/prompts.tsx"].route, "/prompts");
+        assert_eq!(by_path["app/(tabs)/settings.tsx"].route, "/settings");
+        assert_eq!(by_path["app/(tabs)/index.tsx"].route, "/");
+        assert_eq!(by_path["app/run/[id].tsx"].route, "/run/[id]");
+        assert_eq!(by_path["app/files/[...path].tsx"].route, "/files/[...path]");
+
+        // Verify component names for representative pages.
+        assert_eq!(by_path["app/prompts.tsx"].component_name, "PromptsPage");
+        assert_eq!(
+            by_path["app/files/[...path].tsx"].component_name,
+            "PathPage"
+        );
+        assert_eq!(by_path["app/run/[id].tsx"].component_name, "IdPage");
+    }
+
+    #[tokio::test]
+    async fn integrate_already_integrated_fast_path() {
+        let fixture = fixture_path("expo-router-integrated");
+        let analysis = analyze_project(&fixture.to_string_lossy())
+            .await
+            .expect("analysis should succeed");
+        assert_eq!(analysis.ui_bridge_status, IntegrationStatus::Full);
+
+        let mut modifications = Vec::new();
+        let mut warnings = Vec::new();
+        let mut next_steps = Vec::new();
+        let opts = IntegrationOptions::default();
+        integrate_expo_router(
+            &fixture,
+            &analysis,
+            &opts,
+            &mut modifications,
+            &mut warnings,
+            &mut next_steps,
+        )
+        .await;
+
+        assert!(
+            modifications.is_empty(),
+            "expected zero modifications on already-integrated fast path, got {:?}",
+            modifications
+        );
+        assert!(warnings.is_empty(), "expected no warnings, got {:?}", warnings);
+        assert_eq!(next_steps.len(), 1, "expected single next_step");
+        assert!(next_steps[0].contains("already integrated"));
+    }
+
+    #[tokio::test]
+    async fn integrate_blank_fixture_emits_minimal_wrap() {
+        let fixture = fixture_path("expo-router-blank");
+        let analysis = analyze_project(&fixture.to_string_lossy())
+            .await
+            .expect("analysis should succeed");
+        assert_eq!(analysis.ui_bridge_status, IntegrationStatus::None);
+
+        let mut modifications = Vec::new();
+        let mut warnings = Vec::new();
+        let mut next_steps = Vec::new();
+        let opts = IntegrationOptions::default();
+        integrate_expo_router(
+            &fixture,
+            &analysis,
+            &opts,
+            &mut modifications,
+            &mut warnings,
+            &mut next_steps,
+        )
+        .await;
+
+        // Should produce at least 2 modifications: package.json + app/_layout.tsx.
+        let pkg_mod = modifications
+            .iter()
+            .find(|m| m.file_path == "package.json")
+            .expect("should add @qontinui/ui-bridge-native to package.json");
+        assert!(pkg_mod.new_content.contains("@qontinui/ui-bridge-native"));
+        // MUST NOT use a `file:` link.
+        assert!(
+            !pkg_mod.new_content.contains("\"file:"),
+            "package.json must NOT contain a file: link"
+        );
+
+        let layout_mod = modifications
+            .iter()
+            .find(|m| m.file_path == "app/_layout.tsx")
+            .expect("should patch app/_layout.tsx");
+        assert!(layout_mod.new_content.contains("UIBridgeNativeProvider"));
+        assert!(
+            layout_mod
+                .new_content
+                .contains("from '@qontinui/ui-bridge-native'"),
+            "import must come from @qontinui/ui-bridge-native, got:\n{}",
+            layout_mod.new_content
+        );
+        assert!(
+            layout_mod.new_content.contains("server: __DEV__"),
+            "expected features.server: __DEV__"
+        );
+        assert!(
+            layout_mod.new_content.contains("serverPort: 8087"),
+            "expected serverPort 8087"
+        );
+        assert!(
+            layout_mod.new_content.contains("appType: 'mobile'"),
+            "expected appType: 'mobile'"
+        );
+        // appId derived from package.json name.
+        assert!(
+            layout_mod.new_content.contains("appId: 'expo-router-blank'"),
+            "appId should be derived from package name; layout was:\n{}",
+            layout_mod.new_content
+        );
+        // Existing <Stack /> should still be present (wrapped, not replaced).
+        assert!(layout_mod.new_content.contains("<Stack"));
+        // No regressions: must NOT introduce the web-SDK provider.
+        assert!(!layout_mod.new_content.contains("UIBridgeProvider\n"));
+
+        // Next steps should reference qontinui-mobile reference.
+        assert!(
+            next_steps
+                .iter()
+                .any(|s| s.contains("qontinui-mobile/app/_layout.tsx")),
+            "expected next_step pointing at qontinui-mobile reference, got: {:?}",
+            next_steps
+        );
+    }
+
+    #[test]
+    fn wrap_self_closing_stack_works() {
+        let layout = "import { Stack } from 'expo-router';\n\nexport default function R() { return <Stack />; }\n";
+        let wrapped = wrap_with_provider_expo_router(layout, "my-app", "My App");
+        assert!(wrapped.contains("UIBridgeNativeProvider"));
+        assert!(wrapped.contains("<Stack />"));
+        assert!(wrapped.contains("</UIBridgeNativeProvider>"));
+        assert!(wrapped.contains("appId: 'my-app'"));
+        assert!(wrapped.contains("appName: 'My App'"));
+    }
+
+    #[test]
+    fn wrap_paired_slot_works() {
+        let layout = "import { Slot } from 'expo-router';\n\nexport default function R() {\n  return <Slot></Slot>;\n}\n";
+        let wrapped = wrap_with_provider_expo_router(layout, "app", "App");
+        assert!(wrapped.contains("UIBridgeNativeProvider"));
+        assert!(wrapped.contains("<Slot>"));
+        assert!(wrapped.contains("</Slot>"));
+        assert!(wrapped.contains("</UIBridgeNativeProvider>"));
+    }
+
+    #[test]
+    fn derive_app_info_from_package_name() {
+        assert_eq!(
+            derive_expo_app_info("qontinui-mobile"),
+            ("qontinui-mobile".to_string(), "Qontinui Mobile".to_string())
+        );
+        assert_eq!(
+            derive_expo_app_info("@qontinui/mobile"),
+            ("@qontinui/mobile".to_string(), "Mobile".to_string())
+        );
+        assert_eq!(
+            derive_expo_app_info(""),
+            ("expo-app".to_string(), "Expo App".to_string())
+        );
+        assert_eq!(
+            derive_expo_app_info("expo-router-blank"),
+            (
+                "expo-router-blank".to_string(),
+                "Expo Router Blank".to_string()
+            )
+        );
     }
 }
