@@ -14,6 +14,7 @@
 use crate::commands::compartments::HealthCompartment;
 use crate::commands::CommandResponse;
 use crate::doctor::DoctorHandle;
+use crate::error::AppError;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -90,7 +91,10 @@ fn run_analysis(
             e,
             &stripped[..stripped.len().min(200)]
         );
-        format!("Failed to parse AI response as JSON: {}", e)
+        String::from(AppError::ParseError(format!(
+            "Failed to parse AI response as JSON: {}",
+            e
+        )))
     })
 }
 
@@ -132,7 +136,7 @@ Focus on what matters for a developer to quickly understand what happened in thi
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -190,7 +194,7 @@ For the Qontinui project specifically: frontend=Next.js or Vite UI, backend=Fast
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -247,7 +251,7 @@ Be specific about what the changes do and what could break."#;
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -301,7 +305,7 @@ Be realistic about completion — only mark something done if there's clear evid
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -354,7 +358,7 @@ Use the tab name as the panel title. Keep each per-tab summary concise (3–6 bu
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -546,8 +550,12 @@ pub fn get_latest_plan_content() -> Result<CommandResponse, String> {
         .unwrap_or("plan.md")
         .to_string();
 
-    let content = std::fs::read_to_string(best_path)
-        .map_err(|e| format!("Failed to read {}: {}", best_path.display(), e))?;
+    let content = std::fs::read_to_string(best_path).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read {}: {}", best_path.display(), e),
+        )))
+    })?;
 
     info!(
         "get_latest_plan_content: loaded '{}' ({} chars)",
