@@ -305,6 +305,8 @@ async fn health(
         "ready": last_pong > 0,
         "responsive": responsive,
         "frontendReady": frontend_ready,
+        "sdkFeatures": crate::sdk_features::SDK_FEATURES,
+        "sdkFeaturesDocUrl": crate::sdk_features::SDK_FEATURE_DOC_URL,
         "lastHeartbeat": last_pong,
         "heartbeatAgeMs": pong_age_ms,
         "uptimeSeconds": uptime_secs,

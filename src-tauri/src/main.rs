@@ -99,6 +99,7 @@ mod scheduler;
 mod scheduler_service;
 mod schema_registry;
 mod screen;
+mod sdk_features;
 mod secure_storage;
 mod security;
 mod semantic_conventions;
