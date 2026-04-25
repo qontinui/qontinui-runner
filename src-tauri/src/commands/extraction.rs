@@ -496,6 +496,14 @@ pub struct ExtractionSessionResponse {
 pub async fn create_extraction_session(
     request: CreateExtractionSessionRequest,
 ) -> Result<ExtractionSessionResponse, String> {
+    create_extraction_session_impl(request)
+        .await
+        .map_err(String::from)
+}
+
+async fn create_extraction_session_impl(
+    request: CreateExtractionSessionRequest,
+) -> Result<ExtractionSessionResponse, AppError> {
     info!(
         "Creating extraction session for project {} with {} URLs",
         request.project_id,
@@ -506,13 +514,15 @@ pub async fn create_extraction_session(
 
     // Check authentication
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
     // Get access token
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     // Prepare the request body for the API
@@ -547,7 +557,7 @@ pub async fn create_extraction_session(
         },
     };
 
-    // Call the backend API
+    // Call the backend API — reqwest::Error and serde_json::Error convert via `?`.
     let client = reqwest::Client::new();
     let response = client
         .post(format!(
@@ -558,11 +568,7 @@ pub async fn create_extraction_session(
         .bearer_auth(&access_token)
         .json(&api_request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to create extraction session: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -574,16 +580,13 @@ pub async fn create_extraction_session(
             "Create extraction session failed with status {}: {}",
             status, error_text
         );
-        return Err(format!(
+        return Err(AppError::Raw(format!(
             "Failed to create extraction session: {}",
             error_text
-        ));
+        )));
     }
 
-    let session: ExtractionSessionResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse extraction session response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let session: ExtractionSessionResponse = response.json().await?;
 
     info!("Extraction session created: {}", session.id);
     Ok(session)
@@ -603,17 +606,27 @@ pub struct UpdateExtractionSessionRequest {
 pub async fn update_extraction_session(
     request: UpdateExtractionSessionRequest,
 ) -> Result<ExtractionSessionResponse, String> {
+    update_extraction_session_impl(request)
+        .await
+        .map_err(String::from)
+}
+
+async fn update_extraction_session_impl(
+    request: UpdateExtractionSessionRequest,
+) -> Result<ExtractionSessionResponse, AppError> {
     info!("Updating extraction session: {}", request.extraction_id);
 
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     #[derive(Serialize)]
@@ -642,11 +655,7 @@ pub async fn update_extraction_session(
         .bearer_auth(&access_token)
         .json(&api_request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to update extraction session: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -658,16 +667,13 @@ pub async fn update_extraction_session(
             "Update extraction session failed with status {}: {}",
             status, error_text
         );
-        return Err(format!(
+        return Err(AppError::Raw(format!(
             "Failed to update extraction session: {}",
             error_text
-        ));
+        )));
     }
 
-    let session: ExtractionSessionResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse extraction session response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let session: ExtractionSessionResponse = response.json().await?;
 
     info!("Extraction session updated: {}", session.id);
     Ok(session)
@@ -705,6 +711,14 @@ pub struct AnnotationResponse {
 pub async fn upload_extraction_annotations(
     request: UploadAnnotationsRequest,
 ) -> Result<AnnotationResponse, String> {
+    upload_extraction_annotations_impl(request)
+        .await
+        .map_err(String::from)
+}
+
+async fn upload_extraction_annotations_impl(
+    request: UploadAnnotationsRequest,
+) -> Result<AnnotationResponse, AppError> {
     info!(
         "Uploading annotations for extraction {} screenshot {}",
         request.extraction_id, request.screenshot_id
@@ -713,12 +727,14 @@ pub async fn upload_extraction_annotations(
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     #[derive(Serialize)]
@@ -744,11 +760,7 @@ pub async fn upload_extraction_annotations(
         .bearer_auth(&access_token)
         .json(&api_request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to upload annotations: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -760,13 +772,13 @@ pub async fn upload_extraction_annotations(
             "Upload annotations failed with status {}: {}",
             status, error_text
         );
-        return Err(format!("Failed to upload annotations: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Failed to upload annotations: {}",
+            error_text
+        )));
     }
 
-    let annotation: AnnotationResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse annotation response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let annotation: AnnotationResponse = response.json().await?;
 
     info!("Annotations uploaded successfully");
     Ok(annotation)
@@ -797,6 +809,14 @@ pub struct StateStructureResponse {
 pub async fn upload_state_structure(
     request: UploadStateStructureRequest,
 ) -> Result<StateStructureResponse, String> {
+    upload_state_structure_impl(request)
+        .await
+        .map_err(String::from)
+}
+
+async fn upload_state_structure_impl(
+    request: UploadStateStructureRequest,
+) -> Result<StateStructureResponse, AppError> {
     info!(
         "Uploading state structure for extraction {}",
         request.extraction_id
@@ -805,12 +825,14 @@ pub async fn upload_state_structure(
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     #[derive(Serialize)]
@@ -832,11 +854,7 @@ pub async fn upload_state_structure(
         .bearer_auth(&access_token)
         .json(&api_request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to upload state structure: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -848,13 +866,13 @@ pub async fn upload_state_structure(
             "Upload state structure failed with status {}: {}",
             status, error_text
         );
-        return Err(format!("Failed to upload state structure: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Failed to upload state structure: {}",
+            error_text
+        )));
     }
 
-    let state_response: StateStructureResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse state structure response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let state_response: StateStructureResponse = response.json().await?;
 
     info!("State structure uploaded successfully");
     Ok(state_response)
@@ -865,17 +883,27 @@ pub async fn upload_state_structure(
 pub async fn get_project_extractions(
     project_id: String,
 ) -> Result<Vec<ExtractionSessionResponse>, String> {
+    get_project_extractions_impl(project_id)
+        .await
+        .map_err(String::from)
+}
+
+async fn get_project_extractions_impl(
+    project_id: String,
+) -> Result<Vec<ExtractionSessionResponse>, AppError> {
     info!("Getting extractions for project: {}", project_id);
 
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     let client = reqwest::Client::new();
@@ -887,11 +915,7 @@ pub async fn get_project_extractions(
         ))
         .bearer_auth(&access_token)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to get extractions: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -903,13 +927,13 @@ pub async fn get_project_extractions(
             "Get extractions failed with status {}: {}",
             status, error_text
         );
-        return Err(format!("Failed to get extractions: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Failed to get extractions: {}",
+            error_text
+        )));
     }
 
-    let sessions: Vec<ExtractionSessionResponse> = response.json().await.map_err(|e| {
-        error!("Failed to parse extractions response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let sessions: Vec<ExtractionSessionResponse> = response.json().await?;
 
     info!("Retrieved {} extractions", sessions.len());
     Ok(sessions)
