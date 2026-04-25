@@ -55,10 +55,9 @@ fn get_playwright_settings_impl() -> Result<CommandResponse, AppError> {
 
     let playwright_settings = settings::get_playwright_settings();
 
-    // Check if password exists in keychain (for backward compatibility, also check settings)
-    let has_password = has_playwright_password()
-        .map_err(|e| AppError::ConfigError(format!("Failed to check keychain: {}", e)))?
-        || playwright_settings.test_password.is_some();
+    // Check if password exists in keychain (for backward compatibility, also check settings).
+    // `?` lifts anyhow::Error via From impl into AppError::UnexpectedError.
+    let has_password = has_playwright_password()? || playwright_settings.test_password.is_some();
 
     // Build response - include a placeholder if password is set (don't expose actual password)
     let response_settings = serde_json::json!({
@@ -91,20 +90,17 @@ fn save_playwright_settings_impl(
 ) -> Result<CommandResponse, AppError> {
     info!("Saving Playwright settings");
 
-    // Handle password storage in keychain
+    // Handle password storage in keychain.
+    // `?` lifts anyhow::Error via From impl into AppError::UnexpectedError.
     if let Some(ref password) = test_password {
         if !password.is_empty() && password != "********" {
             // Only store if it's a real password (not the placeholder)
-            store_playwright_password(password).map_err(|e| {
-                AppError::ConfigError(format!("Failed to store password in keychain: {}", e))
-            })?;
+            store_playwright_password(password)?;
             info!("Playwright test password stored in keychain");
         }
     } else {
         // If password is None, delete from keychain
-        delete_playwright_password().map_err(|e| {
-            AppError::ConfigError(format!("Failed to delete password from keychain: {}", e))
-        })?;
+        delete_playwright_password()?;
     }
 
     // Save settings without password (password is in keychain)
@@ -141,9 +137,10 @@ pub fn save_playwright_settings(
 pub fn has_playwright_test_password() -> Result<CommandResponse, String> {
     info!("Checking if Playwright test password exists");
 
-    // Check keychain first, then fall back to settings for backward compatibility
+    // Check keychain first, then fall back to settings for backward compatibility.
+    // `?` lifts anyhow::Error via From impl into AppError, then String::from converts.
     let keychain_has = has_playwright_password()
-        .map_err(|e| String::from(AppError::ConfigError(format!("Failed to check keychain: {}", e))))?;
+        .map_err(|e: anyhow::Error| String::from(AppError::from(e)))?;
     let settings_has = settings::get_playwright_settings().test_password.is_some();
 
     Ok(CommandResponse {
@@ -157,17 +154,14 @@ pub fn has_playwright_test_password() -> Result<CommandResponse, String> {
 fn delete_playwright_test_password_impl() -> Result<CommandResponse, AppError> {
     info!("Deleting Playwright test password");
 
-    delete_playwright_password().map_err(|e| {
-        AppError::ConfigError(format!("Failed to delete password from keychain: {}", e))
-    })?;
+    // `?` lifts anyhow::Error via From impl into AppError::UnexpectedError.
+    delete_playwright_password()?;
 
     // Also clear from settings if present (backward compatibility)
     let mut playwright_settings = settings::get_playwright_settings();
     if playwright_settings.test_password.is_some() {
         playwright_settings.test_password = None;
-        settings::save_playwright_settings(playwright_settings).map_err(|e| {
-            AppError::ConfigError(format!("Failed to clear password from settings: {}", e))
-        })?;
+        settings::save_playwright_settings(playwright_settings).map_err(AppError::ConfigError)?;
     }
 
     Ok(CommandResponse {
