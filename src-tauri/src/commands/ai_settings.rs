@@ -162,8 +162,12 @@ pub fn save_ai_settings(
             .unwrap_or(existing_settings.interactive_sessions_enabled),
     };
 
-    settings::save_ai_settings(ai_settings)
-        .map_err(|e| format!("Failed to save AI settings: {}", e))?;
+    settings::save_ai_settings(ai_settings).map_err(|e| {
+        String::from(AppError::ConfigError(format!(
+            "Failed to save AI settings: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -247,8 +251,12 @@ pub fn save_gemini_settings(
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
     };
 
-    settings::save_ai_settings(ai_settings)
-        .map_err(|e| format!("Failed to save Gemini settings: {}", e))?;
+    settings::save_ai_settings(ai_settings).map_err(|e| {
+        String::from(AppError::ConfigError(format!(
+            "Failed to save Gemini settings: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -416,26 +424,31 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
                 .output()
                 .await
                 .map_err(|e| {
-                    format!(
+                    String::from(AppError::Raw(format!(
                         "Failed to execute claude CLI: {}. Is Claude Code installed and in PATH?",
                         e
-                    )
+                    )))
                 })?
         }
         CliExecutionMode::Wsl => crate::process_helpers::tokio_no_window("wsl")
             .args([claude_program, "--version"])
             .output()
             .await
-            .map_err(|e| format!("Failed to execute claude via WSL: {}. Is WSL installed?", e))?,
+            .map_err(|e| {
+                String::from(AppError::Raw(format!(
+                    "Failed to execute claude via WSL: {}. Is WSL installed?",
+                    e
+                )))
+            })?,
         CliExecutionMode::Native => crate::process_helpers::tokio_no_window(claude_program)
             .args(["--version"])
             .output()
             .await
             .map_err(|e| {
-                format!(
+                String::from(AppError::Raw(format!(
                     "Failed to execute claude CLI: {}. Is Claude Code installed and in PATH?",
                     e
-                )
+                )))
             })?,
     };
 
@@ -455,7 +468,12 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
 async fn test_claude_api_connection(settings: &ClaudeApiSettings) -> Result<String, String> {
     // Get API key from keychain
     let api_key = get_ai_api_key("claude_api")
-        .map_err(|e| format!("Failed to retrieve API key: {}", e))?
+        .map_err(|e| {
+            String::from(AppError::ConfigError(format!(
+                "Failed to retrieve API key: {}",
+                e
+            )))
+        })?
         .ok_or_else(|| "No API key configured. Please enter your Claude API key.".to_string())?;
 
     info!(
@@ -477,7 +495,7 @@ async fn test_claude_api_connection(settings: &ClaudeApiSettings) -> Result<Stri
         }))
         .send()
         .await
-        .map_err(|e| format!("Network error: {}", e))?;
+        .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;
 
     if response.status().is_success() {
         Ok(format!(
@@ -534,26 +552,31 @@ async fn test_gemini_cli_connection(settings: &GeminiCliSettings) -> Result<Stri
                 .output()
                 .await
                 .map_err(|e| {
-                    format!(
+                    String::from(AppError::Raw(format!(
                         "Failed to execute gemini CLI: {}. Is Gemini CLI installed and in PATH?",
                         e
-                    )
+                    )))
                 })?
         }
         CliExecutionMode::Wsl => crate::process_helpers::tokio_no_window("wsl")
             .args([gemini_program, "--version"])
             .output()
             .await
-            .map_err(|e| format!("Failed to execute gemini via WSL: {}. Is WSL installed?", e))?,
+            .map_err(|e| {
+                String::from(AppError::Raw(format!(
+                    "Failed to execute gemini via WSL: {}. Is WSL installed?",
+                    e
+                )))
+            })?,
         CliExecutionMode::Native => crate::process_helpers::tokio_no_window(gemini_program)
             .args(["--version"])
             .output()
             .await
             .map_err(|e| {
-                format!(
+                String::from(AppError::Raw(format!(
                     "Failed to execute gemini CLI: {}. Is Gemini CLI installed and in PATH?",
                     e
-                )
+                )))
             })?,
     };
 
@@ -579,7 +602,12 @@ async fn test_gemini_cli_connection(settings: &GeminiCliSettings) -> Result<Stri
 async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<String, String> {
     // Get API key from keychain
     let api_key = get_ai_api_key("gemini_api")
-        .map_err(|e| format!("Failed to retrieve API key: {}", e))?
+        .map_err(|e| {
+            String::from(AppError::ConfigError(format!(
+                "Failed to retrieve API key: {}",
+                e
+            )))
+        })?
         .ok_or_else(|| "No API key configured. Please enter your Gemini API key.".to_string())?;
 
     info!(
@@ -606,7 +634,7 @@ async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<Stri
         }))
         .send()
         .await
-        .map_err(|e| format!("Network error: {}", e))?;
+        .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;
 
     if response.status().is_success() {
         Ok(format!(
@@ -769,8 +797,12 @@ pub fn save_agentic_settings(
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
     };
 
-    settings::save_ai_settings(ai_settings)
-        .map_err(|e| format!("Failed to save agentic settings: {}", e))?;
+    settings::save_ai_settings(ai_settings).map_err(|e| {
+        String::from(AppError::ConfigError(format!(
+            "Failed to save agentic settings: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -843,10 +875,18 @@ fn compute_expected_usage(
 /// Read the OAuth access token from a Claude config directory's credentials file.
 pub(crate) fn read_oauth_token(config_dir: &str) -> Result<String, String> {
     let creds_path = std::path::PathBuf::from(config_dir).join(".credentials.json");
-    let content = std::fs::read_to_string(&creds_path)
-        .map_err(|e| format!("Cannot read {}: {}", creds_path.display(), e))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("Invalid credentials JSON: {}", e))?;
+    let content = std::fs::read_to_string(&creds_path).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Cannot read {}: {}", creds_path.display(), e),
+        )))
+    })?;
+    let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        String::from(AppError::ParseError(format!(
+            "Invalid credentials JSON: {}",
+            e
+        )))
+    })?;
     json["claudeAiOauth"]["accessToken"]
         .as_str()
         .map(|s| s.to_string())
@@ -995,8 +1035,7 @@ pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandRes
         success: true,
         message: Some(format!("Checked {} accounts", results.len())),
         data: Some(
-            serde_json::to_value(&results)
-                .map_err(|e| format!("Failed to serialize usage results: {}", e))?,
+            serde_json::to_value(&results).map_err(|e| String::from(AppError::JsonError(e)))?,
         ),
     })
 }
@@ -1331,7 +1370,12 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
             ])
             .output()
             .await
-            .map_err(|e| format!("Failed to open authentication window: {}", e))?;
+            .map_err(|e| {
+                String::from(AppError::ProcessError(format!(
+                    "Failed to open authentication window: {}",
+                    e
+                )))
+            })?;
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1479,8 +1523,12 @@ pub fn save_wsv_settings(
         ever_saved: true,
     };
 
-    settings::save_world_state_verifier_settings(new_settings.clone())
-        .map_err(|e| format!("Failed to save WSV settings: {}", e))?;
+    settings::save_world_state_verifier_settings(new_settings.clone()).map_err(|e| {
+        String::from(AppError::ConfigError(format!(
+            "Failed to save WSV settings: {}",
+            e
+        )))
+    })?;
 
     // Update in-process live config so the next iteration picks it up.
     crate::verification::WsvConfig::set_global(crate::verification::WsvConfig::from_settings(
@@ -1516,7 +1564,7 @@ pub async fn test_wsv_connection(endpoint: String) -> Result<WsvConnectionTestRe
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;
 
     let start = std::time::Instant::now();
     let resp = match client.get(&url).send().await {
