@@ -2,6 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { useUIBridge } from "@qontinui/ui-bridge";
 import { tracedFetch } from "@/lib/traced-fetch";
 import { getApiBase } from "@/lib/runner-api";
+import { isValidTabId, type MainTabId } from "@/components/app/tab-types";
 import { buildPageCatalog } from "./pageCatalog";
 
 export interface PlanStep {
@@ -122,9 +123,9 @@ export function usePromptExecution(): UsePromptExecutionReturn {
           setProgress({ currentIndex: i, total: planData.steps.length, currentStep: step });
 
           if (step.type === "navigate" && step.target) {
-            // Use state machine navigation with pathfinding
-            if (sm?.stateMachine?.navigateTo) {
-              await sm.stateMachine.navigateTo(step.target);
+            const navResult = await navigateToTarget(step.target, sm);
+            if (!navResult.ok) {
+              throw new Error(`Step ${i + 1} failed: ${navResult.error}`);
             }
             // Wait for page to settle
             await new Promise((r) => setTimeout(r, 500));
@@ -179,4 +180,44 @@ interface StateMachineAPI {
   navigateTo(stateId: string): Promise<unknown>;
   findPath(from: string, to: string): unknown;
   getActiveStates(): string[];
+}
+
+type NavResult = { ok: true } | { ok: false; error: string };
+
+async function navigateToTarget(
+  target: string,
+  sm: { stateMachine?: StateMachineAPI } | undefined,
+): Promise<NavResult> {
+  // Resolve target → tab id. Planner uses "page-<slug>" convention; the runner's
+  // PAGE_TO_TAB / MainTabId map uses the bare slug.
+  const tabId = (target.startsWith("page-") ? target.slice(5) : target) as MainTabId;
+
+  // Preferred path: state machine navigation, which runs compiled transitions
+  // (active-state updates, side effects, multi-hop pathfinding). Only works
+  // once the state machine has been compiled — visit the Specs / State Machine
+  // tab once to populate it. Verify the switch by polling getActiveStates().
+  if (sm?.stateMachine?.navigateTo) {
+    try {
+      await sm.stateMachine.navigateTo(target);
+      await new Promise((r) => setTimeout(r, 500));
+      if (sm.stateMachine.getActiveStates().includes(target)) {
+        return { ok: true };
+      }
+      // Navigation completed without throwing but the active state didn't
+      // update — fall through to event-dispatch fallback.
+    } catch {
+      // Fall through.
+    }
+  }
+
+  // Fallback: dispatch the same `ui-bridge-set-tab` event the sidebar uses.
+  // Works without a compiled state machine (essential on fresh runners).
+  if (!isValidTabId(tabId)) {
+    return {
+      ok: false,
+      error: `unknown navigation target "${target}" — no tab matches "${tabId}". The runner's planner page list may be out of date.`,
+    };
+  }
+  window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", { detail: { tab: tabId } }));
+  return { ok: true };
 }
