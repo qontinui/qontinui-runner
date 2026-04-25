@@ -13,9 +13,11 @@ use tracing::{error, info, warn};
 use crate::claude_session::manager::SessionManager;
 use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
 use crate::claude_session::state::SessionState;
-// Migrated to StorageCompartment (Workstream C) — 5 handlers. `generate_workflow_from_session`
-// keeps `Arc<AppState>` because it needs raw `&AppState` for workflow_generation plus fields
-// across Storage + Health compartments.
+// Migrated to StorageCompartment (Workstream C) — 5 handlers.
+// `generate_workflow_from_session` is multi-State on Storage + Health: typed
+// access for `pg_db` / `doctor_handle`, plus `health.app_state()` escape hatch
+// for the legacy `generate_workflow` and `fetch_existing_specs` calls that
+// pre-date the compartment split.
 use crate::commands::compartments::{HealthCompartment, StorageCompartment};
 use crate::commands::{AppState, CommandResponse};
 use crate::database::CreateTaskRunInput;

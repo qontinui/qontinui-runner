@@ -7,8 +7,10 @@ use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::State;
 
-// Migrated to StorageCompartment (Workstream C) — 43 of 44 handlers.
-// `trigger_meta_optimizer` keeps `Arc<AppState>` (see note above the fn).
+// Migrated to StorageCompartment (Workstream C) — 43 handlers. The 44th
+// (`trigger_meta_optimizer`) uses ExecutionCompartment; see note above the
+// fn for why it goes through `execution.app_state()` for the legacy
+// `MetaOptimizerDeps.app_state` field.
 use crate::commands::compartments::{ExecutionCompartment, StorageCompartment};
 use crate::commands::AppState;
 use crate::error::AppError;
@@ -351,9 +353,11 @@ pub async fn get_prompt_canary_status(
 
 // ── Manual Trigger ─────────────────────────────────────────────────────
 
-// trigger_meta_optimizer keeps `Arc<AppState>` because it passes a raw
-// `Arc<AppState>` into MetaOptimizerDeps and also reads `ai_pid_tracker`
-// (ExecutionCompartment) alongside, so no single compartment covers it.
+// `trigger_meta_optimizer` uses `State<ExecutionCompartment>`. It reads
+// `ai_pid_tracker` via the typed `execution.ai_pid_tracker()` accessor and
+// passes the legacy `Arc<AppState>` field of `MetaOptimizerDeps` through
+// the explicit `execution.app_state()` escape hatch — `MetaOptimizerDeps`
+// pre-dates the compartment split and still demands the full AppState.
 #[tauri::command]
 pub async fn trigger_meta_optimizer(
     execution: State<'_, ExecutionCompartment>,

@@ -4,9 +4,8 @@
 //! plus a standalone workflow generation command that doesn't require an existing task_run_id.
 
 use crate::commands::compartments::{ExecutionCompartment, HealthCompartment, StorageCompartment};
-use crate::commands::{AppState, CommandResponse};
+use crate::commands::CommandResponse;
 use crate::terminal::transcript;
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tracing::{info, warn};
