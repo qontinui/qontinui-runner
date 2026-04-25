@@ -17,7 +17,7 @@ import { SPEC_CREATION_INSTRUCTIONS, SPEC_MERGE_INSTRUCTIONS } from "./spec-prom
 // Registration Prompt
 // =============================================================================
 
-const REGISTRATION_INSTRUCTIONS = `You are generating UI Bridge element registrations for a React page component.
+const WEB_REGISTRATION_INSTRUCTIONS = `You are generating UI Bridge element registrations for a React page component.
 
 ## Goal
 
@@ -96,6 +96,152 @@ Start the file with:
 \`\`\`
 
 This marker is used to extract the file from your response.`;
+
+const RN_REGISTRATION_INSTRUCTIONS = `You are generating UI Bridge element registrations for a React Native / Expo Router page component.
+
+## Goal
+
+Register every significant interactive and data-display element with the UI Bridge native SDK so that AI agents can discover, inspect, and interact with them programmatically on the running app (phone, emulator, or web fallback).
+
+## Output Format
+
+**Inline modification — NOT a side-file.** Emit a complete modified version of the page component file with \`useUIElement\` calls inserted inline and the JSX updated to attach the registration props. Do not produce a separate registrations module.
+
+The output file must:
+1. Import the hook: \`import { useUIElement } from '@qontinui/ui-bridge-native'\`. Do NOT import from the web package paths (the React Native SDK lives under a different package name).
+2. Call \`useUIElement(...)\` once per significant element, at the top of the page component, before any conditional returns.
+3. Attach **all three** of \`ref\`, \`onLayout\`, and the spread of \`bridgeProps\` at the JSX site of every registered element. Omitting \`onLayout\` breaks bounds tracking. Omitting \`bridgeProps\` breaks accessibility-based discovery. Omitting \`ref\` breaks identification entirely.
+
+There is **no page-scope hook** in the native SDK; emit only \`useUIElement\` calls.
+
+## Hook Surface
+
+\`useUIElement({ id, type, label, actions })\` returns:
+\`\`\`ts
+{ ref, onLayout, bridgeProps, registered, getState, getIdentifier, trigger, register, unregister, registeredElement, updateStyle }
+\`\`\`
+
+Note: there is **NO \`element\` field** on the native return shape (unlike the web version). \`ref\` is a \`RefObject<NativeElementRef>\` (object ref), not a callback ref.
+
+## The Three-Attach Pattern
+
+Every registered element must attach \`ref\`, \`onLayout\`, and \`{...bridgeProps}\` together. Example:
+
+\`\`\`tsx
+const { ref, onLayout, bridgeProps } = useUIElement({
+  id: 'submit-btn',
+  type: 'pressable',
+  label: 'Submit',
+  actions: ['press'],
+});
+
+<Pressable ref={ref} onLayout={onLayout} {...bridgeProps} onPress={handleSubmit}>
+  <Text>Submit</Text>
+</Pressable>
+\`\`\`
+
+When a single component registers more than one element, alias the destructure to keep names unique:
+
+\`\`\`tsx
+const { ref: submitRef, onLayout: submitOnLayout, bridgeProps: submitProps } =
+  useUIElement({ id: 'submit-btn', type: 'pressable', label: 'Submit', actions: ['press'] });
+const { ref: searchRef, onLayout: searchOnLayout, bridgeProps: searchProps } =
+  useUIElement({ id: 'search-input', type: 'input', label: 'Search', actions: ['type', 'clear'] });
+\`\`\`
+
+## Element Type Set (NativeElementType)
+
+Use ONLY these values for \`type\`:
+
+\`button | input | text | view | scroll | list | listItem | switch | checkbox | radio | image | touchable | pressable | modal | custom\`
+
+Mapping guidance:
+- \`<View>\` → \`"view"\`
+- \`<Pressable>\` → \`"pressable"\`
+- \`<TouchableOpacity>\` / \`<TouchableHighlight>\` → \`"touchable"\`
+- \`<Button>\` → \`"button"\`
+- \`<TextInput>\` → \`"input"\` (multiline TextInput is still \`"input"\` — there is no separate textarea type in the native set)
+- \`<Switch>\` → \`"switch"\`
+- \`<Text>\` (when registered as a label or data display) → \`"text"\`
+- \`<FlatList>\` / \`<SectionList>\` → \`"list"\`
+- \`<ScrollView>\` → \`"scroll"\`
+- \`<Modal>\` → \`"modal"\`
+- Expo Router \`<Tabs.Screen>\` clickable region → \`"pressable"\`
+- Anything that doesn't fit any of the above → \`"custom"\`
+
+Do NOT use any of these HTML-only values (they are not valid NativeElementType): \`"link"\`. Do NOT use \`"tab"\`. Do NOT use \`"slider"\`. Do NOT use \`"menuitem"\`. Do NOT use \`"disclosure"\`. Do NOT use \`"generic"\`. Do NOT use \`"dialog"\`. Do NOT use \`"select"\`. Do NOT use \`"heading"\`. Do NOT use \`"table"\`. Do NOT use \`"container"\`. Do NOT use \`"textarea"\`. (Note: \`"radio"\` IS valid in the native set — keep it.)
+
+## Standard Actions (NativeStandardAction)
+
+Use ONLY these values for entries in \`actions\`:
+
+\`press | click | longPress | doubleTap | type | clear | focus | blur | scroll | swipe | toggle\`
+
+Recommended mappings:
+- Pressables / buttons / touchables → \`["press"]\`
+- Text inputs → \`["type", "clear"]\`
+- Switches → \`["toggle"]\`
+- Scroll views / lists → \`["scroll"]\`
+
+## What to Register
+
+### MUST register (interactive):
+- Every \`<Pressable>\`, \`<TouchableOpacity>\`, \`<TouchableHighlight>\`, and \`<Button>\` — type \`"pressable"\` / \`"touchable"\` / \`"button"\` as appropriate, actions \`["press"]\`.
+- Every \`<TextInput>\` — type \`"input"\`, actions \`["type", "clear"]\`.
+- Every \`<Switch>\` — type \`"switch"\`, actions \`["toggle"]\`.
+- Every \`<Modal>\` (when present in the JSX, regardless of open state) — type \`"modal"\`.
+
+### MUST register (data display):
+- Every \`<FlatList>\` / \`<SectionList>\` — type \`"list"\`, label includes what the list contains.
+- Every \`<ScrollView>\` that holds primary content — type \`"scroll"\`, actions \`["scroll"]\`.
+- Key metric / status \`<Text>\` nodes — type \`"text"\`.
+
+### SHOULD register:
+- Major \`<View>\` containers that delineate sections (header, sidebar, content area) — type \`"view"\`.
+
+### DO NOT register:
+- Individual rows inside a \`<FlatList>\` (register the list itself; rows are addressed by index).
+- Decorative \`<Image>\`, \`<Text>\`, or \`<View>\` nodes that have no functional or informational role.
+- Elements inside third-party native components where you can't attach \`ref\` / \`onLayout\` / spread props.
+
+## Naming Conventions
+
+- IDs: kebab-case, prefixed with page context (e.g., \`"prompts-search-input"\`, \`"settings-save-button"\`).
+- Labels: Human-readable; describe purpose, not implementation.
+  - Good: "Search prompts by title"
+  - Bad: "TextInput component"
+
+## File Header
+
+Start the modified file with a single FILE marker comment at the top, on its own line, before all imports:
+
+\`\`\`
+// FILE: app/<page-slug>.tsx
+\`\`\`
+
+If the actual page lives at a different Expo Router path (e.g. \`app/(tabs)/settings.tsx\` or \`app/run/[id].tsx\`), use that real path in the marker. The marker is used to locate the destination file when applying the change. Emit the COMPLETE file contents after the marker — original imports, the modified component, all unchanged JSX preserved exactly except where \`ref\` / \`onLayout\` / \`{...bridgeProps}\` are added.`;
+
+/**
+ * Normalize a framework string to a canonical lowercase, underscore-separated
+ * form so callers can pass `expo-router`, `expo_router`, `Expo Router`, etc.
+ * and we still match the same branch.
+ */
+function normalizeFramework(framework: string): string {
+  return framework.replace(/[-.]/g, "_").replace(/\s+/g, "_").toLowerCase();
+}
+
+/**
+ * Returns true when the given framework string identifies a React Native
+ * / Expo Router project, for which the registration prompt must use the
+ * native SDK (`@qontinui/ui-bridge-native`) and the inline-modification
+ * output format. Accepts hyphen, underscore, dot, and space separators
+ * and any case (so `expo-router`, `expo_router`, `Expo Router`, and
+ * `react_native` all match).
+ */
+export function isReactNativeFramework(framework: string): boolean {
+  const normalized = normalizeFramework(framework);
+  return normalized === "expo_router" || normalized === "react_native";
+}
 
 /**
  * A `useUIElement` / `useUIComponent` call found inline in page source.
@@ -178,8 +324,9 @@ export function buildRegistrationPrompt(
   inlineRegistrations?: InlineRegistration[],
 ): string {
   const parts: string[] = [];
+  const isRN = isReactNativeFramework(framework);
 
-  parts.push(REGISTRATION_INSTRUCTIONS);
+  parts.push(isRN ? RN_REGISTRATION_INSTRUCTIONS : WEB_REGISTRATION_INSTRUCTIONS);
 
   parts.push(`\n## Page Information\n`);
   parts.push(`- **Page name:** ${pageName}`);
@@ -203,17 +350,29 @@ export function buildRegistrationPrompt(
 
   if (inlineRegistrations && inlineRegistrations.length > 0) {
     parts.push(`\n## Elements Already Tagged Inline (DO NOT RE-EMIT)\n`);
-    parts.push(
-      "The page component above already contains the following `useUIElement` / `useUIComponent` calls inline. These elements are ALREADY registered by the page itself — if you include them in the generated side-file, runtime will register them twice and the second call will collide on `id`. Emit registrations ONLY for elements that are NOT in this list:\n",
-    );
+    if (isRN) {
+      parts.push(
+        "The page component above already contains the following `useUIElement` calls inline. These elements are ALREADY registered by the page itself — if you include the same `id` again in the modified page output you emit, runtime will register them twice and the second call will collide on `id`. Keep these calls EXACTLY as they are in the original source, and do not emit additional `useUIElement` calls for any id below:\n",
+      );
+    } else {
+      parts.push(
+        "The page component above already contains the following `useUIElement` / `useUIComponent` calls inline. These elements are ALREADY registered by the page itself — if you include them in the generated side-file, runtime will register them twice and the second call will collide on `id`. Emit registrations ONLY for elements that are NOT in this list:\n",
+      );
+    }
     for (const reg of inlineRegistrations) {
       const label = reg.label ? ` — ${JSON.stringify(reg.label)}` : "";
       const type = reg.type ? ` (type: ${reg.type})` : "";
       parts.push(`- \`${reg.hook}\` id=\`${reg.id}\`${type}${label}`);
     }
-    parts.push(
-      "\nSpecifically: **skip** any element whose id appears above. If you believe an inline-tagged element needs different metadata, note it in a comment in your output — do NOT re-emit a `useUIElement` / `useUIComponent` call for it.",
-    );
+    if (isRN) {
+      parts.push(
+        "\nSpecifically: **do not emit** a new `useUIElement` call for any id listed above; **skip** these elements when adding new registrations. If you believe an inline-tagged element needs different metadata, note it in a comment in your output — do NOT change or duplicate its `useUIElement` call.",
+      );
+    } else {
+      parts.push(
+        "\nSpecifically: **skip** any element whose id appears above. If you believe an inline-tagged element needs different metadata, note it in a comment in your output — do NOT re-emit a `useUIElement` / `useUIComponent` call for it.",
+      );
+    }
   }
 
   if (existingRegistrations) {
@@ -229,9 +388,16 @@ export function buildRegistrationPrompt(
     parts.push("```");
   }
 
-  parts.push(
-    `\n## Output\n\nGenerate the complete registration file. Start with \`\`\`tsx\\n// FILE: src/lib/ui-bridge/pages/${pageName.toLowerCase().replace(/\s+/g, "-")}-registrations.tsx\``,
-  );
+  if (isRN) {
+    const slug = (route.replace(/^\//, "").replace(/\/$/, "") || "index").replace(/\//g, "-");
+    parts.push(
+      `\n## Output\n\nEmit the COMPLETE modified page component file inline (not a side-file). Start with a tsx code block whose first line is the FILE marker. Use the page's real Expo Router path if it differs from the example below (e.g. \`app/(tabs)/${slug}.tsx\` or \`app/${slug}/index.tsx\`):\n\n\`\`\`tsx\n// FILE: app/${slug}.tsx\n`,
+    );
+  } else {
+    parts.push(
+      `\n## Output\n\nGenerate the complete registration file. Start with \`\`\`tsx\\n// FILE: src/lib/ui-bridge/pages/${pageName.toLowerCase().replace(/\s+/g, "-")}-registrations.tsx\``,
+    );
+  }
 
   return parts.join("\n");
 }
