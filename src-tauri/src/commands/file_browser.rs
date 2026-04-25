@@ -4,6 +4,7 @@
 //! All paths are validated against a whitelist of allowed directories
 //! to prevent unauthorized access.
 
+use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -92,8 +93,12 @@ fn validate_path(requested: &str) -> Result<PathBuf, String> {
     let requested_path = PathBuf::from(requested);
 
     // Resolve to absolute path
-    let canonical = std::fs::canonicalize(&requested_path)
-        .map_err(|e| format!("Path not found or inaccessible: {}", e))?;
+    let canonical = std::fs::canonicalize(&requested_path).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Path not found or inaccessible: {}", e),
+        )))
+    })?;
 
     let safe_dirs = get_safe_directories();
 
@@ -123,8 +128,12 @@ fn validate_path(requested: &str) -> Result<PathBuf, String> {
 /// check but before the I/O operation. Combined with re-canonicalization
 /// immediately before I/O, this narrows the race window to near zero.
 fn verify_not_symlink(path: &Path) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("Failed to read symlink metadata: {}", e))?;
+    let meta = std::fs::symlink_metadata(path).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read symlink metadata: {}", e),
+        )))
+    })?;
     if meta.file_type().is_symlink() {
         warn!("file_browser_symlink_rejected: path={}", path.display());
         return Err("Access denied: symlinks are not allowed".to_string());
@@ -136,8 +145,12 @@ fn verify_not_symlink(path: &Path) -> Result<(), String> {
 /// roots. This is called immediately before the actual filesystem operation to
 /// narrow the TOCTOU window between `validate_path` and the I/O call.
 fn revalidate_path(path: &Path) -> Result<PathBuf, String> {
-    let canonical =
-        std::fs::canonicalize(path).map_err(|e| format!("Re-canonicalization failed: {}", e))?;
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Re-canonicalization failed: {}", e),
+        )))
+    })?;
 
     let safe_dirs = get_safe_directories();
     for (safe_root, _label) in &safe_dirs {
@@ -284,14 +297,18 @@ pub async fn browse_directory(path: String) -> Result<BrowseResult, String> {
     let mut entries = Vec::new();
     let mut read_dir = tokio::fs::read_dir(&canonical).await.map_err(|e| {
         error!("Failed to read directory {}: {}", path, e);
-        format!("Failed to read directory: {}", e)
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read directory: {}", e),
+        )))
     })?;
 
-    while let Some(entry) = read_dir
-        .next_entry()
-        .await
-        .map_err(|e| format!("Error reading entry: {}", e))?
-    {
+    while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Error reading entry: {}", e),
+        )))
+    })? {
         let metadata = match entry.metadata().await {
             Ok(m) => m,
             Err(_) => continue, // skip entries we can't stat
@@ -368,9 +385,12 @@ pub async fn read_file_content(
     // Re-canonicalize immediately before I/O to narrow the TOCTOU window.
     let canonical = revalidate_path(&canonical)?;
 
-    let metadata = tokio::fs::metadata(&canonical)
-        .await
-        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+    let metadata = tokio::fs::metadata(&canonical).await.map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read file metadata: {}", e),
+        )))
+    })?;
 
     let size = metadata.len();
     let limit = max_bytes.unwrap_or(MAX_READ_BYTES).min(MAX_READ_BYTES);
