@@ -1392,6 +1392,11 @@ async fn handle_ai_search(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "aiSearch", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/search", Some(body.clone())).await {
         Ok(data) => {
             // Unwrap ApiResponse {success, data} wrapper from control endpoint
@@ -1421,6 +1426,11 @@ async fn handle_ai_execute(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "aiExecute", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/execute", Some(body.clone())).await {
         Ok(data) => Json(data),
         Err(_sdk_err) => {
@@ -1439,6 +1449,11 @@ async fn handle_ai_assert(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "aiAssert", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/assert", Some(body.clone())).await {
         Ok(data) => Json(data),
         Err(_sdk_err) => {
@@ -1722,6 +1737,11 @@ async fn handle_network_request(
 
 /// GET /ui-bridge/sdk/ai/snapshot — Semantic AI snapshot
 async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getSemanticSnapshot", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/snapshot", None).await {
         Ok(data) => Json(data),
         Err(_sdk_err) => {
@@ -1736,6 +1756,11 @@ async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_js
 
 /// GET /ui-bridge/sdk/ai/summary — Page summary
 async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getPageSummary", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/summary", None).await {
         Ok(data) => Json(data),
         Err(_sdk_err) => {
@@ -2004,6 +2029,11 @@ async fn handle_debug_highlight(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "highlightElement", serde_json::json!({ "id": id })).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     let path = format!("/debug/highlight/{}", id);
     match sdk_request(&state, Method::POST, &path, None).await {
         Ok(data) => Json(data),
@@ -2155,6 +2185,11 @@ async fn handle_screenshot(
 
 /// GET /ui-bridge/sdk/ai/analyze/data — Extract page data
 async fn handle_ai_analyze_data(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "analyzePageData", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/analyze/data", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2163,6 +2198,11 @@ async fn handle_ai_analyze_data(State(state): State<Arc<ApiState>>) -> Json<serd
 
 /// GET /ui-bridge/sdk/ai/analyze/regions — Segment page regions
 async fn handle_ai_analyze_regions(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "analyzePageRegions", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/analyze/regions", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2173,6 +2213,11 @@ async fn handle_ai_analyze_regions(State(state): State<Arc<ApiState>>) -> Json<s
 async fn handle_ai_analyze_structured_data(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "analyzeStructuredData", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/analyze/structured-data", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2184,6 +2229,11 @@ async fn handle_ai_analyze_cross_app_compare(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "crossAppCompare", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(
         &state,
         Method::POST,
@@ -2425,6 +2475,11 @@ async fn handle_design_element_styles(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getElementStyles", serde_json::json!({ "id": id })).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     let path = format!("/design/element/{}/styles", id);
     match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
@@ -2438,8 +2493,20 @@ async fn handle_design_element_state_styles(
     Path(id): Path<String>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
+    let body_inner = body.map(|b| b.0);
+    let mut ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
+    if let Some(obj) = ws_payload.as_object_mut() {
+        obj.insert("id".to_string(), serde_json::json!(id));
+    } else {
+        ws_payload = serde_json::json!({ "id": id });
+    }
+    match try_ws_dispatch(&state, "getElementStateStyles", ws_payload).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     let path = format!("/design/element/{}/state-styles", id);
-    match sdk_request(&state, Method::POST, &path, body.map(|b| b.0)).await {
+    match sdk_request(&state, Method::POST, &path, body_inner).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -2450,7 +2517,14 @@ async fn handle_design_snapshot(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/design/snapshot", body.map(|b| b.0)).await {
+    let body_inner = body.map(|b| b.0);
+    let ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
+    match try_ws_dispatch(&state, "getDesignSnapshot", ws_payload).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
+    match sdk_request(&state, Method::POST, "/design/snapshot", body_inner).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -2461,6 +2535,11 @@ async fn handle_design_responsive(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getResponsiveSnapshots", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/design/responsive", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2472,7 +2551,14 @@ async fn handle_design_audit(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/design/audit", body.map(|b| b.0)).await {
+    let body_inner = body.map(|b| b.0);
+    let ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
+    match try_ws_dispatch(&state, "runDesignAudit", ws_payload).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
+    match sdk_request(&state, Method::POST, "/design/audit", body_inner).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -2483,6 +2569,11 @@ async fn handle_design_load_style_guide(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "loadStyleGuide", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/design/style-guide/load", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2493,6 +2584,11 @@ async fn handle_design_load_style_guide(
 async fn handle_design_get_style_guide(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getStyleGuide", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/design/style-guide", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2503,6 +2599,11 @@ async fn handle_design_get_style_guide(
 async fn handle_design_clear_style_guide(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "clearStyleGuide", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::DELETE, "/design/style-guide", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2857,6 +2958,11 @@ async fn handle_console_error_baseline_compare(
 
 /// GET /ui-bridge/sdk/ai/bookmarks — List all bookmarks
 async fn handle_ct_list_bookmarks(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "listBookmarks", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/bookmarks", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2868,6 +2974,11 @@ async fn handle_ct_save_bookmark(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "saveBookmark", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/bookmarks", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2879,6 +2990,11 @@ async fn handle_ct_get_bookmark(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getBookmark", serde_json::json!({ "name": name })).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     let path = format!("/ai/bookmark/{}", name);
     match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
@@ -2891,6 +3007,11 @@ async fn handle_ct_delete_bookmark(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "deleteBookmark", serde_json::json!({ "name": name })).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     let path = format!("/ai/bookmark/{}", name);
     match sdk_request(&state, Method::DELETE, &path, None).await {
         Ok(data) => Json(data),
@@ -2903,6 +3024,11 @@ async fn handle_ct_diff_from_bookmark(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "diffFromBookmark", serde_json::json!({ "name": name })).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     let path = format!("/ai/bookmark/{}/diff", name);
     match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
@@ -2915,6 +3041,11 @@ async fn handle_ct_execute_with_diff(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "executeWithDiff", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/execute-with-diff", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2926,6 +3057,11 @@ async fn handle_ct_wait_for_change(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "waitForChange", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/wait-for-change", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2936,6 +3072,11 @@ async fn handle_ct_wait_for_change(
 async fn handle_ct_categorize_last_diff(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "categorizeLastDiff", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/categorize-last-diff", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2947,6 +3088,11 @@ async fn handle_ct_scoped_diff(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getScopedDiff", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/scoped-diff", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2958,6 +3104,11 @@ async fn handle_ct_summarize_diff(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "summarizeDiff", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/summarize-diff", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2969,6 +3120,11 @@ async fn handle_ct_structured_changes(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "analyzeStructuredChanges", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/structured-changes", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2979,6 +3135,11 @@ async fn handle_ct_structured_changes(
 async fn handle_ct_enable_change_buffer(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "enableChangeBuffer", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/change-buffer/enable", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2989,6 +3150,11 @@ async fn handle_ct_enable_change_buffer(
 async fn handle_ct_disable_change_buffer(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "disableChangeBuffer", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/change-buffer/disable", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2999,6 +3165,11 @@ async fn handle_ct_disable_change_buffer(
 async fn handle_ct_drain_change_buffer(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "drainChangeBuffer", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/change-buffer/drain", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3009,6 +3180,11 @@ async fn handle_ct_drain_change_buffer(
 async fn handle_ct_get_change_buffer_size(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getChangeBufferSize", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/change-buffer/size", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3073,6 +3249,11 @@ async fn handle_redo(State(state): State<Arc<ApiState>>) -> Json<serde_json::Val
 
 /// GET /ui-bridge/sdk/render-log — Get render log entries
 async fn handle_render_log(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getRenderLog", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/render-log", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3081,6 +3262,11 @@ async fn handle_render_log(State(state): State<Arc<ApiState>>) -> Json<serde_jso
 
 /// DELETE /ui-bridge/sdk/render-log — Clear render log
 async fn handle_clear_render_log(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "clearRenderLog", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::DELETE, "/render-log", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3089,6 +3275,11 @@ async fn handle_clear_render_log(State(state): State<Arc<ApiState>>) -> Json<ser
 
 /// POST /ui-bridge/sdk/render-log/snapshot — Capture render log snapshot
 async fn handle_render_log_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "captureSnapshot", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/render-log/snapshot", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3274,6 +3465,11 @@ async fn handle_workflow_status(
 
 /// GET /ui-bridge/sdk/debug/action-history — Get action history
 async fn handle_action_history(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getActionHistory", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/debug/action-history", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3282,6 +3478,11 @@ async fn handle_action_history(State(state): State<Arc<ApiState>>) -> Json<serde
 
 /// GET /ui-bridge/sdk/debug/element-tree — Get element tree
 async fn handle_element_tree(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getElementTree", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/debug/element-tree", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3297,6 +3498,11 @@ async fn handle_ai_find(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "aiFind", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/find", Some(body.clone())).await {
         Ok(data) => Json(data),
         Err(_sdk_err) => {
@@ -3315,6 +3521,11 @@ async fn handle_ai_assert_batch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "aiAssertBatch", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/assert/batch", Some(body.clone())).await {
         Ok(data) => Json(data),
         Err(_sdk_err) => {
@@ -3330,6 +3541,11 @@ async fn handle_ai_assert_batch(
 
 /// GET /ui-bridge/sdk/ai/diff — Get semantic diff
 async fn handle_ai_diff(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getSemanticDiff", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/diff", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3341,6 +3557,11 @@ async fn handle_ai_semantic_search(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "aiSemanticSearch", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/semantic-search", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3599,6 +3820,11 @@ async fn handle_execute_transition(
 
 /// GET /ui-bridge/sdk/ai/intents — List all intents
 async fn handle_list_intents(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "listIntents", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/ai/intents", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3610,6 +3836,11 @@ async fn handle_execute_intent(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "executeIntent", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/intents/execute", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3621,6 +3852,11 @@ async fn handle_find_intent(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "findIntent", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/intents/find", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3632,6 +3868,11 @@ async fn handle_register_intent(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "registerIntent", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/intents/register", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3643,6 +3884,11 @@ async fn handle_execute_intent_from_query(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "executeIntentFromQuery", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(
         &state,
         Method::POST,
@@ -3665,6 +3911,11 @@ async fn handle_recovery_attempt(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "attemptRecovery", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/recovery/attempt", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3677,6 +3928,11 @@ async fn handle_recovery_attempt(
 
 /// GET /ui-bridge/sdk/annotations — Get all annotations
 async fn handle_annotations(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getAnnotations", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/annotations", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3685,6 +3941,11 @@ async fn handle_annotations(State(state): State<Arc<ApiState>>) -> Json<serde_js
 
 /// GET /ui-bridge/sdk/annotations/export — Export annotations
 async fn handle_annotations_export(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "exportAnnotations", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/annotations/export", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3695,6 +3956,11 @@ async fn handle_annotations_export(State(state): State<Arc<ApiState>>) -> Json<s
 async fn handle_annotations_coverage(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getAnnotationCoverage", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/annotations/coverage", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3706,6 +3972,11 @@ async fn handle_annotations_import(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "importAnnotations", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/annotations/import", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3717,6 +3988,11 @@ async fn handle_annotation_get(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getAnnotation", serde_json::json!({ "id": id })).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     let path = format!("/annotations/{}", id);
     match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
@@ -3730,6 +4006,17 @@ async fn handle_annotation_set(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(
+        &state,
+        "setAnnotation",
+        serde_json::json!({ "id": id, "annotation": body }),
+    )
+    .await
+    {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     let path = format!("/annotations/{}", id);
     match sdk_request(&state, Method::PUT, &path, Some(body)).await {
         Ok(data) => Json(data),
@@ -3742,6 +4029,11 @@ async fn handle_annotation_delete(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "deleteAnnotation", serde_json::json!({ "id": id })).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     let path = format!("/annotations/{}", id);
     match sdk_request(&state, Method::DELETE, &path, None).await {
         Ok(data) => Json(data),
@@ -3827,7 +4119,14 @@ async fn handle_evaluate_quality(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/design/evaluate", body.map(|b| b.0)).await {
+    let body_inner = body.map(|b| b.0);
+    let ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
+    match try_ws_dispatch(&state, "evaluateQuality", ws_payload).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
+    match sdk_request(&state, Method::POST, "/design/evaluate", body_inner).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -3835,6 +4134,11 @@ async fn handle_evaluate_quality(
 
 /// GET /ui-bridge/sdk/design/evaluate/contexts — Get quality evaluation contexts
 async fn handle_quality_contexts(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "getQualityContexts", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::GET, "/design/evaluate/contexts", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -3846,11 +4150,18 @@ async fn handle_save_baseline(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
+    let body_inner = body.map(|b| b.0);
+    let ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
+    match try_ws_dispatch(&state, "saveBaseline", ws_payload).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(
         &state,
         Method::POST,
         "/design/evaluate/baseline",
-        body.map(|b| b.0),
+        body_inner,
     )
     .await
     {
@@ -3864,11 +4175,18 @@ async fn handle_diff_baseline(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
+    let body_inner = body.map(|b| b.0);
+    let ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
+    match try_ws_dispatch(&state, "diffBaseline", ws_payload).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(
         &state,
         Method::POST,
         "/design/evaluate/diff",
-        body.map(|b| b.0),
+        body_inner,
     )
     .await
     {
@@ -4912,6 +5230,11 @@ async fn handle_media_find(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "findMedia", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/media/find", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -4922,6 +5245,11 @@ async fn handle_media_find(
 async fn handle_media_audit_accessibility(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "mediaAuditAccessibility", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/media/audit/accessibility", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -4932,6 +5260,11 @@ async fn handle_media_audit_accessibility(
 async fn handle_media_audit_performance(
     State(state): State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "mediaAuditPerformance", serde_json::json!({})).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/media/audit/performance", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -4943,6 +5276,11 @@ async fn handle_media_snapshot(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "captureMediaSnapshot", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/media/snapshot", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -4954,6 +5292,11 @@ async fn handle_media_compare(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "compareMediaSnapshots", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/media/compare", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -4965,6 +5308,11 @@ async fn handle_media_analyze(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "analyzeMedia", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/media/analyze", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -4976,6 +5324,11 @@ async fn handle_media_analyze_batch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "analyzeMediaBatch", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/media/analyze/batch", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -4987,6 +5340,11 @@ async fn handle_media_analyze_page(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    match try_ws_dispatch(&state, "analyzeMediaPage", body.clone()).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
     match sdk_request(&state, Method::POST, "/ai/media/analyze/page", Some(body)).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -5185,5 +5543,46 @@ mod tests {
             normalize_localhost_url("http://localhost:8080/api/v1?key=val"),
             "http://127.0.0.1:8080/api/v1?key=val"
         );
+    }
+
+    /// Every action name passed to `try_ws_dispatch` must be a valid camelCase
+    /// identifier. The wrapper SDK's `HandlerRegistry` keys on the action
+    /// string verbatim — a typo or empty string fails silently with NO_HANDLER
+    /// at runtime. Catching it at compile-test time is cheap insurance.
+    ///
+    /// The dispatch round-trip itself (frame format, payload preservation,
+    /// response decoding) is covered by `app_dispatch::tests::websocket_path_round_trips`,
+    /// which exercises the same `CommandRelay::dispatch` code path
+    /// `try_ws_dispatch` delegates to.
+    #[test]
+    fn ws_dispatch_action_names_are_well_formed() {
+        let src = include_str!("sdk_client.rs");
+        let pattern = "try_ws_dispatch(&state, \"";
+        let mut names = Vec::new();
+        let mut cursor = 0;
+        while let Some(idx) = src[cursor..].find(pattern) {
+            let start = cursor + idx + pattern.len();
+            let end = src[start..]
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated action name at byte {}", start));
+            names.push(&src[start..start + end]);
+            cursor = start + end + 1;
+        }
+        assert!(
+            !names.is_empty(),
+            "expected at least one try_ws_dispatch call site"
+        );
+        for name in &names {
+            let valid = !name.is_empty()
+                && name.chars().next().unwrap().is_ascii_lowercase()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric());
+            assert!(
+                valid,
+                "action name `{}` is not a valid camelCase identifier",
+                name
+            );
+        }
     }
 }
