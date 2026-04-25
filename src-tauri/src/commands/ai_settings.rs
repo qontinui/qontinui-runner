@@ -7,6 +7,7 @@
 
 use crate::ai_router::RoutingConfig;
 use crate::config_facade::ai_keychain;
+use crate::error::AppError;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
 use crate::settings::{
     self, AccountSelectionMode, AiProvider, AiSettings, ClaudeApiSettings, ClaudeCliSettings,
@@ -64,6 +65,10 @@ pub struct AiConnectionTestResult {
 /// * `Err(String)` - Error message if settings cannot be loaded
 #[tauri::command]
 pub fn get_ai_settings() -> Result<CommandResponse, String> {
+    get_ai_settings_impl().map_err(String::from)
+}
+
+fn get_ai_settings_impl() -> Result<CommandResponse, AppError> {
     info!("Getting AI settings");
 
     let ai_settings = settings::get_ai_settings();
@@ -71,10 +76,7 @@ pub fn get_ai_settings() -> Result<CommandResponse, String> {
     Ok(CommandResponse {
         success: true,
         message: Some("AI settings retrieved".to_string()),
-        data: Some(
-            serde_json::to_value(&ai_settings)
-                .map_err(|e| format!("Failed to serialize AI settings: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&ai_settings)?),
     })
 }
 
@@ -269,9 +271,16 @@ pub fn save_ai_api_key_command(
     provider: String,
     api_key: String,
 ) -> Result<CommandResponse, String> {
+    save_ai_api_key_command_impl(provider, api_key).map_err(String::from)
+}
+
+fn save_ai_api_key_command_impl(
+    provider: String,
+    api_key: String,
+) -> Result<CommandResponse, AppError> {
     info!("Saving AI API key for provider: {}", provider);
 
-    store_ai_api_key(&provider, &api_key).map_err(|e| format!("Failed to save API key: {}", e))?;
+    store_ai_api_key(&provider, &api_key)?;
 
     Ok(CommandResponse {
         success: true,
@@ -290,9 +299,13 @@ pub fn save_ai_api_key_command(
 /// * `Err(String)` - Error message if key cannot be deleted
 #[tauri::command]
 pub fn delete_ai_api_key_command(provider: String) -> Result<CommandResponse, String> {
+    delete_ai_api_key_command_impl(provider).map_err(String::from)
+}
+
+fn delete_ai_api_key_command_impl(provider: String) -> Result<CommandResponse, AppError> {
     info!("Deleting AI API key for provider: {}", provider);
 
-    delete_ai_api_key(&provider).map_err(|e| format!("Failed to delete API key: {}", e))?;
+    delete_ai_api_key(&provider)?;
 
     Ok(CommandResponse {
         success: true,
@@ -311,11 +324,13 @@ pub fn delete_ai_api_key_command(provider: String) -> Result<CommandResponse, St
 /// * `Err(String)` - Error message if check fails
 #[tauri::command]
 pub fn has_ai_api_key(provider: String) -> Result<CommandResponse, String> {
+    has_ai_api_key_impl(provider).map_err(String::from)
+}
+
+fn has_ai_api_key_impl(provider: String) -> Result<CommandResponse, AppError> {
     info!("Checking if AI API key exists for provider: {}", provider);
 
-    let has_key = get_ai_api_key(&provider)
-        .map_err(|e| format!("Failed to check API key: {}", e))?
-        .is_some();
+    let has_key = get_ai_api_key(&provider)?.is_some();
 
     Ok(CommandResponse {
         success: true,
@@ -334,6 +349,10 @@ pub fn has_ai_api_key(provider: String) -> Result<CommandResponse, String> {
 /// * `Err(String)` - Error message if test fails
 #[tauri::command]
 pub async fn test_ai_connection() -> Result<CommandResponse, String> {
+    test_ai_connection_impl().await.map_err(String::from)
+}
+
+async fn test_ai_connection_impl() -> Result<CommandResponse, AppError> {
     info!("Testing AI connection");
 
     let ai_settings = settings::get_ai_settings();
@@ -361,10 +380,7 @@ pub async fn test_ai_connection() -> Result<CommandResponse, String> {
     Ok(CommandResponse {
         success: test_result.success,
         message: Some(test_result.message.clone()),
-        data: Some(
-            serde_json::to_value(&test_result)
-                .map_err(|e| format!("Failed to serialize test result: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&test_result)?),
     })
 }
 
@@ -1051,6 +1067,10 @@ pub struct AccountInfo {
 /// Returns which account is active, which are rate-limited, etc.
 #[tauri::command]
 pub fn get_claude_accounts() -> Result<CommandResponse, String> {
+    get_claude_accounts_impl().map_err(String::from)
+}
+
+fn get_claude_accounts_impl() -> Result<CommandResponse, AppError> {
     let statuses = crate::ai_provider::get_account_statuses();
     let accounts: Vec<AccountInfo> = statuses
         .into_iter()
@@ -1065,10 +1085,7 @@ pub fn get_claude_accounts() -> Result<CommandResponse, String> {
     Ok(CommandResponse {
         success: true,
         message: Some(format!("{} accounts configured", accounts.len())),
-        data: Some(
-            serde_json::to_value(&accounts)
-                .map_err(|e| format!("Failed to serialize accounts: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&accounts)?),
     })
 }
 
@@ -1258,6 +1275,10 @@ pub fn get_cli_auth_status() -> CliAuthStatus {
 /// Reads the credentials file and checks if the OAuth token is expired.
 #[tauri::command]
 pub async fn check_claude_cli_auth() -> Result<CommandResponse, String> {
+    check_claude_cli_auth_impl().await.map_err(String::from)
+}
+
+async fn check_claude_cli_auth_impl() -> Result<CommandResponse, AppError> {
     let status = get_cli_auth_status();
 
     Ok(CommandResponse {
@@ -1267,7 +1288,7 @@ pub async fn check_claude_cli_auth() -> Result<CommandResponse, String> {
         } else {
             Some("Claude CLI authentication is valid".to_string())
         },
-        data: Some(serde_json::to_value(&status).map_err(|e| e.to_string())?),
+        data: Some(serde_json::to_value(&status)?),
     })
 }
 
@@ -1366,7 +1387,7 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
 /// Get the API key for a provider (used by mcp_api.rs for API calls)
 #[allow(dead_code)]
 pub fn get_provider_api_key(provider: &str) -> Result<Option<String>, String> {
-    get_ai_api_key(provider).map_err(|e| format!("Failed to get API key: {}", e))
+    get_ai_api_key(provider).map_err(|e: anyhow::Error| String::from(AppError::from(e)))
 }
 
 // ============================================================================
