@@ -119,7 +119,7 @@ pub async fn ui_bridge_get_console_errors_handler(
 
     let result = ui_bridge_request_sync(&state, "get_console_errors", payload)
         .await
-        .map(|data| {
+        .inspect(|data| {
             // Update the console error count for the health endpoint before
             // forwarding through wrap_ipc_result.
             if !is_grouped {
@@ -137,7 +137,6 @@ pub async fn ui_bridge_get_console_errors_handler(
             // droppedCount, bufferedCount}; legacy callers (no sinceId) see
             // only {errors, count}. Either shape passes through unchanged
             // because `data` is the serde_json::Value the frontend emitted.
-            data
         });
     wrap_ipc_result(result)
 }
@@ -150,11 +149,10 @@ pub async fn ui_bridge_clear_console_errors_handler(
 
     let result = ui_bridge_request_sync(&state, "clear_console_errors", serde_json::json!({}))
         .await
-        .map(|data| {
+        .inspect(|_| {
             state
                 .ui_bridge_console_error_count
                 .store(0, std::sync::atomic::Ordering::Relaxed);
-            data
         });
     wrap_ipc_result(result)
 }
