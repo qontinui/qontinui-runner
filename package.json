@@ -91,8 +91,9 @@
   "scripts": {
     "build": "tsc && vite build",
     "build-storybook": "storybook build",
-    "check": "npm run typecheck && npm run lint && npm run format:check",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run validate:ws-actions",
     "check:all": "npm run check && npm run rust:check && npm run rust:lint",
+    "validate:ws-actions": "node scripts/validate-ws-actions.mjs",
     "dev": "vite",
     "format": "prettier --write \"src/**/*.{ts,tsx,js,jsx,json,css,md}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,js,jsx,json,css,md}\"",
