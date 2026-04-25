@@ -8,6 +8,7 @@
 
 use crate::auth::AuthManager;
 use crate::commands::compartments::HealthCompartment;
+use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::sync::atomic::Ordering;
@@ -136,6 +137,10 @@ fn get_device_name() -> String {
 /// - Device registration fails
 #[tauri::command]
 pub async fn login(email: String, password: String) -> Result<LoginResponse, String> {
+    login_impl(email, password).await.map_err(String::from)
+}
+
+async fn login_impl(email: String, password: String) -> Result<LoginResponse, AppError> {
     info!("Login attempt for email: {}", email);
 
     let auth_manager = AuthManager::new();
@@ -152,11 +157,7 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
         .post(format!("{}/api/v1/auth/jwt/login", get_api_base_url()))
         .form(&form_data)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Login request failed: {:?}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -185,13 +186,10 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
             }
         };
 
-        return Err(user_message);
+        return Err(AppError::Raw(user_message));
     }
 
-    let api_response: ApiLoginResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse login response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let api_response: ApiLoginResponse = response.json().await?;
 
     info!("Login successful, fetching user info...");
 
@@ -200,11 +198,7 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
         .get(format!("{}/api/v1/auth/users/me", get_api_base_url()))
         .bearer_auth(&api_response.access_token)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to fetch user info: {}", e);
-            format!("Failed to fetch user information: {}", e)
-        })?;
+        .await?;
 
     if !user_response.status().is_success() {
         let status = user_response.status();
@@ -216,13 +210,13 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
             "Failed to fetch user info with status {}: {}",
             status, error_text
         );
-        return Err(format!("Failed to fetch user information: {}", status));
+        return Err(AppError::Raw(format!(
+            "Failed to fetch user information: {}",
+            status
+        )));
     }
 
-    let user_info: ApiUserInfo = user_response.json().await.map_err(|e| {
-        error!("Failed to parse user info response: {}", e);
-        format!("Invalid user information response: {}", e)
-    })?;
+    let user_info: ApiUserInfo = user_response.json().await?;
 
     info!("Login successful for user: {}", user_info.id);
 
@@ -231,13 +225,13 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
         .store_tokens(&api_response.access_token, &api_response.refresh_token)
         .map_err(|e| {
             error!("Failed to store tokens: {}", e);
-            format!("Failed to store authentication tokens: {}", e)
+            AppError::Raw(format!("Failed to store authentication tokens: {}", e))
         })?;
 
     // 3. Get or generate device ID
     let device_id = auth_manager.get_device_id().map_err(|e| {
         error!("Failed to get device ID: {}", e);
-        format!("Failed to generate device ID: {}", e)
+        AppError::Raw(format!("Failed to generate device ID: {}", e))
     })?;
 
     // 4. Register device with backend
@@ -258,11 +252,7 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
         .bearer_auth(&api_response.access_token)
         .json(&register_request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Device registration request failed: {}", e);
-            format!("Failed to register device: {}", e)
-        })?;
+        .await?;
 
     if !register_response.status().is_success() {
         let status = register_response.status();
@@ -310,6 +300,10 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
 /// Network errors during device deactivation are logged but don't fail the operation.
 #[tauri::command]
 pub async fn logout() -> Result<(), String> {
+    logout_impl().await.map_err(String::from)
+}
+
+async fn logout_impl() -> Result<(), AppError> {
     info!("Logout requested");
 
     let auth_manager = AuthManager::new();
@@ -347,7 +341,7 @@ pub async fn logout() -> Result<(), String> {
     // Clear tokens from keychain
     auth_manager.clear_tokens().map_err(|e| {
         error!("Failed to clear tokens: {}", e);
-        format!("Failed to clear authentication tokens: {}", e)
+        AppError::Raw(format!("Failed to clear authentication tokens: {}", e))
     })?;
 
     info!("Logout successful");
@@ -366,6 +360,10 @@ pub async fn logout() -> Result<(), String> {
 /// Returns an error string if the validation request fails or tokens are invalid.
 #[tauri::command]
 pub async fn check_auth_status() -> Result<AuthStatus, String> {
+    check_auth_status_impl().await.map_err(String::from)
+}
+
+async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     info!("Checking authentication status");
 
     let auth_manager = AuthManager::new();
@@ -383,14 +381,16 @@ pub async fn check_auth_status() -> Result<AuthStatus, String> {
     // Get access token
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to retrieve access token: {}", e);
-        format!("Failed to retrieve access token: {}", e)
+        AppError::Raw(format!("Failed to retrieve access token: {}", e))
     })?;
 
-    // Validate token by calling /users/me endpoint
+    // Validate token by calling /users/me endpoint — reqwest::Error From impl
+    // wraps build failures into AppError::NetworkError, but we keep the
+    // historical wire string via AppError::Raw to preserve frontend parsing.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| AppError::Raw(format!("Failed to create HTTP client: {}", e)))?;
     let response = match client
         .get(format!("{}/api/v1/auth/users/me", get_api_base_url()))
         .bearer_auth(&access_token)
@@ -430,17 +430,14 @@ pub async fn check_auth_status() -> Result<AuthStatus, String> {
                 device_id: None,
             });
         } else {
-            return Err(format!(
+            return Err(AppError::Raw(format!(
                 "Auth status check failed with transient error: {}",
                 status
-            ));
+            )));
         }
     }
 
-    let user_info: ApiUserInfo = response.json().await.map_err(|e| {
-        error!("Failed to parse user info: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let user_info: ApiUserInfo = response.json().await?;
 
     let device_id = auth_manager.get_device_id().ok();
 
@@ -466,12 +463,16 @@ pub async fn check_auth_status() -> Result<AuthStatus, String> {
 /// Returns an error string if device ID retrieval fails.
 #[tauri::command]
 pub async fn get_device_info() -> Result<DeviceInfo, String> {
+    get_device_info_impl().await.map_err(String::from)
+}
+
+async fn get_device_info_impl() -> Result<DeviceInfo, AppError> {
     info!("Getting device info");
 
     let auth_manager = AuthManager::new();
     let device_id = auth_manager.get_device_id().map_err(|e| {
         error!("Failed to get device ID: {}", e);
-        format!("Failed to get device ID: {}", e)
+        AppError::Raw(format!("Failed to get device ID: {}", e))
     })?;
 
     let device_name = get_device_name();
@@ -509,22 +510,28 @@ pub struct ConnectionInfo {
 /// - Backend API call fails
 #[tauri::command]
 pub async fn get_connection_info() -> Result<ConnectionInfo, String> {
+    get_connection_info_impl().await.map_err(String::from)
+}
+
+async fn get_connection_info_impl() -> Result<ConnectionInfo, AppError> {
     info!("Getting connection info");
 
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     let device_id = auth_manager.get_device_id().map_err(|e| {
         error!("Failed to get device ID: {}", e);
-        format!("Failed to get device ID: {}", e)
+        AppError::Raw(format!("Failed to get device ID: {}", e))
     })?;
 
     let url = format!(
@@ -537,11 +544,7 @@ pub async fn get_connection_info() -> Result<ConnectionInfo, String> {
         .get(&url)
         .bearer_auth(&access_token)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to get connection info: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -550,13 +553,10 @@ pub async fn get_connection_info() -> Result<ConnectionInfo, String> {
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
         error!("Connection info request failed: {} {}", status, body);
-        return Err(format!("Backend error ({}): {}", status, body));
+        return Err(AppError::Raw(format!("Backend error ({}): {}", status, body)));
     }
 
-    let info: ConnectionInfo = response.json().await.map_err(|e| {
-        error!("Failed to parse connection info: {}", e);
-        format!("Invalid connection info response: {}", e)
-    })?;
+    let info: ConnectionInfo = response.json().await?;
 
     Ok(info)
 }
@@ -585,19 +585,25 @@ pub struct Project {
 /// - Backend API call fails
 #[tauri::command]
 pub async fn get_user_projects() -> Result<Vec<Project>, String> {
+    get_user_projects_impl().await.map_err(String::from)
+}
+
+async fn get_user_projects_impl() -> Result<Vec<Project>, AppError> {
     info!("Getting user projects");
 
     let auth_manager = AuthManager::new();
 
     // Check authentication
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
     // Get access token
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     // Call backend API
@@ -606,11 +612,7 @@ pub async fn get_user_projects() -> Result<Vec<Project>, String> {
         .get(format!("{}/api/v1/projects", get_api_base_url()))
         .bearer_auth(&access_token)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to get projects: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -619,13 +621,13 @@ pub async fn get_user_projects() -> Result<Vec<Project>, String> {
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
         error!("Get projects failed with status {}: {}", status, error_text);
-        return Err(format!("Failed to get projects: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Failed to get projects: {}",
+            error_text
+        )));
     }
 
-    let projects: Vec<Project> = response.json().await.map_err(|e| {
-        error!("Failed to parse projects: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let projects: Vec<Project> = response.json().await?;
 
     info!("Retrieved {} projects", projects.len());
     Ok(projects)
@@ -643,6 +645,10 @@ pub async fn get_user_projects() -> Result<Vec<Project>, String> {
 /// - Token refresh fails
 #[tauri::command]
 pub async fn refresh_token() -> Result<(), String> {
+    refresh_token_impl().await.map_err(String::from)
+}
+
+async fn refresh_token_impl() -> Result<(), AppError> {
     info!("Refreshing access token");
 
     let auth_manager = AuthManager::new();
@@ -650,7 +656,7 @@ pub async fn refresh_token() -> Result<(), String> {
     // Get refresh token
     let refresh_token = auth_manager.get_refresh_token().map_err(|e| {
         error!("Failed to get refresh token: {}", e);
-        format!("Failed to get refresh token: {}", e)
+        AppError::Raw(format!("Failed to get refresh token: {}", e))
     })?;
 
     // Call refresh endpoint
@@ -673,11 +679,7 @@ pub async fn refresh_token() -> Result<(), String> {
         .post(format!("{}/api/v1/auth/jwt/refresh", get_api_base_url()))
         .json(&refresh_request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Token refresh request failed: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -697,13 +699,13 @@ pub async fn refresh_token() -> Result<(), String> {
             let _ = auth_manager.clear_tokens();
         }
 
-        return Err(format!("Token refresh failed: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Token refresh failed: {}",
+            error_text
+        )));
     }
 
-    let refresh_response: RefreshResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse refresh response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let refresh_response: RefreshResponse = response.json().await?;
 
     // Store new tokens
     auth_manager
@@ -713,7 +715,7 @@ pub async fn refresh_token() -> Result<(), String> {
         )
         .map_err(|e| {
             error!("Failed to store refreshed tokens: {}", e);
-            format!("Failed to store tokens: {}", e)
+            AppError::Raw(format!("Failed to store tokens: {}", e))
         })?;
 
     info!("Token refreshed successfully");
@@ -732,19 +734,27 @@ pub async fn refresh_token() -> Result<(), String> {
 /// - Keychain access fails
 #[tauri::command]
 pub async fn get_access_token_for_websocket() -> Result<String, String> {
+    get_access_token_for_websocket_impl()
+        .await
+        .map_err(String::from)
+}
+
+async fn get_access_token_for_websocket_impl() -> Result<String, AppError> {
     info!("Getting access token for WebSocket");
 
     let auth_manager = AuthManager::new();
 
     // Check authentication
     if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
 
     // Get access token
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     info!("Access token retrieved for WebSocket");
@@ -776,6 +786,14 @@ pub struct HeartbeatResponse {
 pub async fn send_device_heartbeat(
     project_id: Option<String>,
 ) -> Result<HeartbeatResponse, String> {
+    send_device_heartbeat_impl(project_id)
+        .await
+        .map_err(String::from)
+}
+
+async fn send_device_heartbeat_impl(
+    project_id: Option<String>,
+) -> Result<HeartbeatResponse, AppError> {
     info!(
         "[HEARTBEAT] Starting device heartbeat (project_id: {:?})",
         project_id
@@ -787,7 +805,9 @@ pub async fn send_device_heartbeat(
     // Check authentication
     if !auth_manager.has_tokens() {
         warn!("[HEARTBEAT] No tokens found - not authenticated");
-        return Err("Not authenticated. Please log in first.".to_string());
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in first.".to_string(),
+        ));
     }
     info!("[HEARTBEAT] Tokens present, proceeding");
 
@@ -795,14 +815,14 @@ pub async fn send_device_heartbeat(
     info!("[HEARTBEAT] Getting device ID...");
     let device_id = auth_manager.get_device_id().map_err(|e| {
         error!("[HEARTBEAT] Failed to get device ID: {}", e);
-        format!("Failed to get device ID: {}", e)
+        AppError::Raw(format!("Failed to get device ID: {}", e))
     })?;
     info!("[HEARTBEAT] Got device ID: {}", device_id);
 
     info!("[HEARTBEAT] Getting access token...");
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("[HEARTBEAT] Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
     info!(
         "[HEARTBEAT] Got access token (length: {} chars)",
@@ -826,7 +846,7 @@ pub async fn send_device_heartbeat(
         }
         Err(e) => {
             error!("[HEARTBEAT] Failed to create HTTP client: {}", e);
-            return Err(format!("Failed to create HTTP client: {}", e));
+            return Err(AppError::Raw(format!("Failed to create HTTP client: {}", e)));
         }
     };
 
@@ -874,7 +894,7 @@ pub async fn send_device_heartbeat(
             if let Some(source) = e.source() {
                 error!("[HEARTBEAT] Error source: {}", source);
             }
-            return Err(format!("Network error: {}", e));
+            return Err(AppError::Raw(format!("Network error: {}", e)));
         }
     };
 
@@ -889,12 +909,15 @@ pub async fn send_device_heartbeat(
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
         error!("[HEARTBEAT] Failed with status {}: {}", status, error_text);
-        return Err(format!("Heartbeat failed: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Heartbeat failed: {}",
+            error_text
+        )));
     }
 
     let heartbeat_response: HeartbeatResponse = response.json().await.map_err(|e| {
         error!("[HEARTBEAT] Failed to parse response: {}", e);
-        format!("Failed to parse heartbeat response: {}", e)
+        AppError::Raw(format!("Failed to parse heartbeat response: {}", e))
     })?;
 
     info!(
