@@ -30,6 +30,7 @@
 
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 
+use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{Emitter, Manager, State};
@@ -71,7 +72,12 @@ pub async fn ui_bridge_get_elements(app: tauri::AppHandle) -> Result<CommandResp
             "type": "get_elements"
         }),
     )
-    .map_err(|e| format!("Failed to emit UI Bridge request: {}", e))?;
+    .map_err(|e| {
+        String::from(AppError::TauriError(format!(
+            "Failed to emit UI Bridge request: {}",
+            e
+        )))
+    })?;
 
     // For now, return a placeholder response.
     // The actual implementation will use a channel/oneshot to wait for the React response.
@@ -100,7 +106,12 @@ pub async fn ui_bridge_get_element(
             "elementId": element_id
         }),
     )
-    .map_err(|e| format!("Failed to emit UI Bridge request: {}", e))?;
+    .map_err(|e| {
+        String::from(AppError::TauriError(format!(
+            "Failed to emit UI Bridge request: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -129,7 +140,12 @@ pub async fn ui_bridge_execute_action(
             "action": action
         }),
     )
-    .map_err(|e| format!("Failed to emit UI Bridge request: {}", e))?;
+    .map_err(|e| {
+        String::from(AppError::TauriError(format!(
+            "Failed to emit UI Bridge request: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -152,7 +168,12 @@ pub async fn ui_bridge_get_components(app: tauri::AppHandle) -> Result<CommandRe
             "type": "get_components"
         }),
     )
-    .map_err(|e| format!("Failed to emit UI Bridge request: {}", e))?;
+    .map_err(|e| {
+        String::from(AppError::TauriError(format!(
+            "Failed to emit UI Bridge request: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -176,7 +197,12 @@ pub async fn ui_bridge_get_component(
             "componentId": component_id
         }),
     )
-    .map_err(|e| format!("Failed to emit UI Bridge request: {}", e))?;
+    .map_err(|e| {
+        String::from(AppError::TauriError(format!(
+            "Failed to emit UI Bridge request: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -207,7 +233,12 @@ pub async fn ui_bridge_execute_component_action(
             "params": params
         }),
     )
-    .map_err(|e| format!("Failed to emit UI Bridge request: {}", e))?;
+    .map_err(|e| {
+        String::from(AppError::TauriError(format!(
+            "Failed to emit UI Bridge request: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -234,7 +265,12 @@ pub async fn ui_bridge_discover(
             "options": options
         }),
     )
-    .map_err(|e| format!("Failed to emit UI Bridge request: {}", e))?;
+    .map_err(|e| {
+        String::from(AppError::TauriError(format!(
+            "Failed to emit UI Bridge request: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -254,7 +290,12 @@ pub async fn ui_bridge_get_snapshot(app: tauri::AppHandle) -> Result<CommandResp
             "type": "get_snapshot"
         }),
     )
-    .map_err(|e| format!("Failed to emit UI Bridge request: {}", e))?;
+    .map_err(|e| {
+        String::from(AppError::TauriError(format!(
+            "Failed to emit UI Bridge request: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -348,11 +389,12 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
     info!("UI Bridge: Discovering states from fingerprints (Rust)");
 
     // Run on a blocking thread since the discovery may be CPU-intensive
-    tokio::task::spawn_blocking(move || -> Result<CommandResponse, String> {
-        // Deserialize the co-occurrence export
+    tokio::task::spawn_blocking(move || -> Result<CommandResponse, AppError> {
+        // Deserialize the co-occurrence export — serde_json::Error converts via `?`.
         let export: crate::exploration::types::CooccurrenceExport =
-            serde_json::from_value(cooccurrence_export)
-                .map_err(|e| format!("Failed to parse co-occurrence export: {}", e))?;
+            serde_json::from_value(cooccurrence_export).map_err(|e| {
+                AppError::ParseError(format!("Failed to parse co-occurrence export: {}", e))
+            })?;
 
         // Build discovery config
         let discovery_config = if let Some(c) = config {
@@ -378,8 +420,7 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
             result.transitions.len()
         );
 
-        let data = serde_json::to_value(&result)
-            .map_err(|e| format!("Failed to serialize result: {}", e))?;
+        let data = serde_json::to_value(&result)?;
 
         Ok(CommandResponse {
             success: true,
@@ -389,6 +430,7 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
+    .map_err(String::from)
 }
 
 /// Reload the runner's webview.
@@ -405,9 +447,12 @@ pub async fn ui_bridge_reload_webview(app: tauri::AppHandle) -> Result<CommandRe
 
     // Get all webview windows and reload the main one
     if let Some(window) = app.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
-        window
-            .eval("location.reload()")
-            .map_err(|e| format!("Failed to reload webview: {}", e))?;
+        window.eval("location.reload()").map_err(|e| {
+            String::from(AppError::TauriError(format!(
+                "Failed to reload webview: {}",
+                e
+            )))
+        })?;
         Ok(CommandResponse {
             success: true,
             message: Some("Webview reload triggered".to_string()),
@@ -646,8 +691,9 @@ pub async fn ui_bridge_run_exploration_native(
 
     let result = result?;
 
-    let result_json = serde_json::to_value(&result)
-        .map_err(|e| format!("Failed to serialize discovery result: {}", e))?;
+    let result_json = serde_json::to_value(&result).map_err(|e| {
+        String::from(AppError::JsonError(e))
+    })?;
 
     Ok(CommandResponse {
         success: true,
@@ -690,8 +736,12 @@ pub async fn ui_bridge_discover_states_native(
     info!("UI Bridge: Running native Rust state discovery");
 
     let export: crate::exploration::CooccurrenceExport =
-        serde_json::from_value(cooccurrence_export)
-            .map_err(|e| format!("Failed to parse co-occurrence export: {}", e))?;
+        serde_json::from_value(cooccurrence_export).map_err(|e| {
+            String::from(AppError::ParseError(format!(
+                "Failed to parse co-occurrence export: {}",
+                e
+            )))
+        })?;
 
     let discovery_config = config.unwrap_or_default();
     let mut discovery = crate::exploration::FingerprintStateDiscovery::new(discovery_config);
@@ -700,7 +750,7 @@ pub async fn ui_bridge_discover_states_native(
     let result = discovery.into_result();
 
     let result_json =
-        serde_json::to_value(&result).map_err(|e| format!("Failed to serialize result: {}", e))?;
+        serde_json::to_value(&result).map_err(|e| String::from(AppError::JsonError(e)))?;
 
     Ok(CommandResponse {
         success: true,
