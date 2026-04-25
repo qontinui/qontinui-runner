@@ -222,17 +222,10 @@ async fn login_impl(email: String, password: String) -> Result<LoginResponse, Ap
 
     // 2. Store tokens in keychain
     auth_manager
-        .store_tokens(&api_response.access_token, &api_response.refresh_token)
-        .map_err(|e| {
-            error!("Failed to store tokens: {}", e);
-            AppError::Raw(format!("Failed to store authentication tokens: {}", e))
-        })?;
+        .store_tokens(&api_response.access_token, &api_response.refresh_token)?;
 
     // 3. Get or generate device ID
-    let device_id = auth_manager.get_device_id().map_err(|e| {
-        error!("Failed to get device ID: {}", e);
-        AppError::Raw(format!("Failed to generate device ID: {}", e))
-    })?;
+    let device_id = auth_manager.get_device_id()?;
 
     // 4. Register device with backend
     let device_name = get_device_name();
@@ -339,10 +332,7 @@ async fn logout_impl() -> Result<(), AppError> {
     }
 
     // Clear tokens from keychain
-    auth_manager.clear_tokens().map_err(|e| {
-        error!("Failed to clear tokens: {}", e);
-        AppError::Raw(format!("Failed to clear authentication tokens: {}", e))
-    })?;
+    auth_manager.clear_tokens()?;
 
     info!("Logout successful");
     Ok(())
@@ -379,10 +369,7 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     }
 
     // Get access token
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to retrieve access token: {}", e);
-        AppError::Raw(format!("Failed to retrieve access token: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
 
     // Validate token by calling /users/me endpoint — reqwest::Error From impl
     // wraps build failures into AppError::NetworkError, but we keep the
@@ -470,10 +457,7 @@ async fn get_device_info_impl() -> Result<DeviceInfo, AppError> {
     info!("Getting device info");
 
     let auth_manager = AuthManager::new();
-    let device_id = auth_manager.get_device_id().map_err(|e| {
-        error!("Failed to get device ID: {}", e);
-        AppError::Raw(format!("Failed to get device ID: {}", e))
-    })?;
+    let device_id = auth_manager.get_device_id()?;
 
     let device_name = get_device_name();
     let platform = get_platform();
@@ -519,20 +503,13 @@ async fn get_connection_info_impl() -> Result<ConnectionInfo, AppError> {
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err(AppError::Raw(
+        return Err(AppError::AuthError(
             "Not authenticated. Please log in first.".to_string(),
         ));
     }
 
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        AppError::Raw(format!("Failed to get access token: {}", e))
-    })?;
-
-    let device_id = auth_manager.get_device_id().map_err(|e| {
-        error!("Failed to get device ID: {}", e);
-        AppError::Raw(format!("Failed to get device ID: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
+    let device_id = auth_manager.get_device_id()?;
 
     let url = format!(
         "{}/api/v1/runner-devices/{}/connection-info",
@@ -547,13 +524,10 @@ async fn get_connection_info_impl() -> Result<ConnectionInfo, AppError> {
         .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
         error!("Connection info request failed: {} {}", status, body);
-        return Err(AppError::Raw(format!("Backend error ({}): {}", status, body)));
+        return Err(AppError::HttpStatusError { status, body });
     }
 
     let info: ConnectionInfo = response.json().await?;
@@ -595,16 +569,13 @@ async fn get_user_projects_impl() -> Result<Vec<Project>, AppError> {
 
     // Check authentication
     if !auth_manager.has_tokens() {
-        return Err(AppError::Raw(
+        return Err(AppError::AuthError(
             "Not authenticated. Please log in first.".to_string(),
         ));
     }
 
     // Get access token
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        AppError::Raw(format!("Failed to get access token: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
 
     // Call backend API
     let client = reqwest::Client::new();
@@ -615,16 +586,10 @@ async fn get_user_projects_impl() -> Result<Vec<Project>, AppError> {
         .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!("Get projects failed with status {}: {}", status, error_text);
-        return Err(AppError::Raw(format!(
-            "Failed to get projects: {}",
-            error_text
-        )));
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        error!("Get projects failed with status {}: {}", status, body);
+        return Err(AppError::HttpStatusError { status, body });
     }
 
     let projects: Vec<Project> = response.json().await?;
@@ -654,10 +619,7 @@ async fn refresh_token_impl() -> Result<(), AppError> {
     let auth_manager = AuthManager::new();
 
     // Get refresh token
-    let refresh_token = auth_manager.get_refresh_token().map_err(|e| {
-        error!("Failed to get refresh token: {}", e);
-        AppError::Raw(format!("Failed to get refresh token: {}", e))
-    })?;
+    let refresh_token = auth_manager.get_refresh_token()?;
 
     // Call refresh endpoint
     let client = reqwest::Client::new();
@@ -708,15 +670,10 @@ async fn refresh_token_impl() -> Result<(), AppError> {
     let refresh_response: RefreshResponse = response.json().await?;
 
     // Store new tokens
-    auth_manager
-        .store_tokens(
-            &refresh_response.access_token,
-            &refresh_response.refresh_token,
-        )
-        .map_err(|e| {
-            error!("Failed to store refreshed tokens: {}", e);
-            AppError::Raw(format!("Failed to store tokens: {}", e))
-        })?;
+    auth_manager.store_tokens(
+        &refresh_response.access_token,
+        &refresh_response.refresh_token,
+    )?;
 
     info!("Token refreshed successfully");
     Ok(())
@@ -746,16 +703,13 @@ async fn get_access_token_for_websocket_impl() -> Result<String, AppError> {
 
     // Check authentication
     if !auth_manager.has_tokens() {
-        return Err(AppError::Raw(
+        return Err(AppError::AuthError(
             "Not authenticated. Please log in first.".to_string(),
         ));
     }
 
     // Get access token
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        AppError::Raw(format!("Failed to get access token: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
 
     info!("Access token retrieved for WebSocket");
     Ok(access_token)
@@ -805,7 +759,7 @@ async fn send_device_heartbeat_impl(
     // Check authentication
     if !auth_manager.has_tokens() {
         warn!("[HEARTBEAT] No tokens found - not authenticated");
-        return Err(AppError::Raw(
+        return Err(AppError::AuthError(
             "Not authenticated. Please log in first.".to_string(),
         ));
     }
@@ -813,17 +767,11 @@ async fn send_device_heartbeat_impl(
 
     // Get device ID and access token
     info!("[HEARTBEAT] Getting device ID...");
-    let device_id = auth_manager.get_device_id().map_err(|e| {
-        error!("[HEARTBEAT] Failed to get device ID: {}", e);
-        AppError::Raw(format!("Failed to get device ID: {}", e))
-    })?;
+    let device_id = auth_manager.get_device_id()?;
     info!("[HEARTBEAT] Got device ID: {}", device_id);
 
     info!("[HEARTBEAT] Getting access token...");
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("[HEARTBEAT] Failed to get access token: {}", e);
-        AppError::Raw(format!("Failed to get access token: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
     info!(
         "[HEARTBEAT] Got access token (length: {} chars)",
         access_token.len()
@@ -899,26 +847,17 @@ async fn send_device_heartbeat_impl(
     };
 
     if !response.status().is_success() {
-        let status = response.status();
+        let status = response.status().as_u16();
         info!(
             "[HEARTBEAT] Non-success status: {}, reading body...",
             status
         );
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!("[HEARTBEAT] Failed with status {}: {}", status, error_text);
-        return Err(AppError::Raw(format!(
-            "Heartbeat failed: {}",
-            error_text
-        )));
+        let body = response.text().await.unwrap_or_default();
+        error!("[HEARTBEAT] Failed with status {}: {}", status, body);
+        return Err(AppError::HttpStatusError { status, body });
     }
 
-    let heartbeat_response: HeartbeatResponse = response.json().await.map_err(|e| {
-        error!("[HEARTBEAT] Failed to parse response: {}", e);
-        AppError::Raw(format!("Failed to parse heartbeat response: {}", e))
-    })?;
+    let heartbeat_response: HeartbeatResponse = response.json().await?;
 
     info!(
         "[HEARTBEAT] Heartbeat sent successfully (has_active_connection: {})",
