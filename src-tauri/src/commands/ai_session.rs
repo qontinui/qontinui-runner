@@ -16,7 +16,7 @@ use crate::claude_session::state::SessionState;
 // Migrated to StorageCompartment (Workstream C) — 5 handlers. `generate_workflow_from_session`
 // keeps `Arc<AppState>` because it needs raw `&AppState` for workflow_generation plus fields
 // across Storage + Health compartments.
-use crate::commands::compartments::StorageCompartment;
+use crate::commands::compartments::{HealthCompartment, StorageCompartment};
 use crate::commands::{AppState, CommandResponse};
 use crate::database::CreateTaskRunInput;
 use crate::execution_context::AiSessionContext;
@@ -570,7 +570,8 @@ pub async fn get_ai_output(
 #[tauri::command]
 pub async fn generate_workflow_from_session(
     app_handle: tauri::AppHandle,
-    app_state: tauri::State<'_, Arc<AppState>>,
+    storage: tauri::State<'_, StorageCompartment>,
+    health: tauri::State<'_, HealthCompartment>,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
     task_run_id: String,
     description: Option<String>,
@@ -584,7 +585,7 @@ pub async fn generate_workflow_from_session(
     );
 
     // Get conversation from DB output_log (needed as fallback if no source_content)
-    let output_log = match app_state.pg_db.get_task_output(&task_run_id).await {
+    let output_log = match storage.pg_db().get_task_output(&task_run_id).await {
         Ok(log) if !log.is_empty() => log,
         _ => {
             if source_content.is_none() {
@@ -604,7 +605,10 @@ pub async fn generate_workflow_from_session(
     // When generating from a specific message, fetch existing specs and build
     // enriched context with spec generation instructions
     let inline_context = if source_content.is_some() {
-        let existing_specs = fetch_existing_specs(&app_state).await;
+        // `fetch_existing_specs` is a pre-compartment helper that takes
+        // `&AppState`. Use the explicit `app_state()` escape hatch so the
+        // dependency stays greppable for a future split.
+        let existing_specs = fetch_existing_specs(health.app_state()).await;
         build_spec_aware_context(plan_text, &existing_specs)
     } else {
         format!(
@@ -669,13 +673,15 @@ pub async fn generate_workflow_from_session(
         }
     }
 
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
-    let pg_db = app_state.pg_db.clone();
+    let doctor_handle = health.doctor_handle().lock().await.clone();
+    let pg_db = storage.pg_db().clone();
     let pg_clone = pg_db.clone();
     let artifact_task_run_id = task_run_id.clone();
     // See transcript.rs rationale — threading AppState here lets brief-mode
     // runs advertise the correct runner port in the Builder prompt.
-    let app_state_for_gen = app_state.inner().clone();
+    // `generate_workflow` is a pre-compartment helper; escape-hatch via
+    // health.app_state() keeps the legacy passthrough greppable.
+    let app_state_for_gen = health.app_state().clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
         let (response, mut artifact) = crate::workflow_generation::generate_workflow(
@@ -763,7 +769,7 @@ pub async fn generate_workflow_from_session(
                         htn_state_machine_path: workflow.htn_state_machine_path.clone(),
                     };
 
-                    match app_state.pg_db.create_unified_workflow(&create_req).await {
+                    match storage.pg_db().create_unified_workflow(&create_req).await {
                         Ok(saved) => {
                             info!(
                                 "Saved generated workflow '{}' to library (id={})",
@@ -784,8 +790,8 @@ pub async fn generate_workflow_from_session(
                             "generated_workflow_name": wf_name,
                         });
                         let rd_str = result_data.to_string();
-                        if let Err(e) = app_state
-                            .pg_db
+                        if let Err(e) = storage
+                            .pg_db()
                             .update_task_result_data(&task_run_id, &rd_str)
                             .await
                         {
@@ -841,8 +847,8 @@ pub async fn generate_workflow_from_session(
                     {
                         let formatted =
                             format!("\n[SYSTEM_NOTE]\n{}\n[/SYSTEM_NOTE]\n", system_note);
-                        if let Err(e) = app_state
-                            .pg_db
+                        if let Err(e) = storage
+                            .pg_db()
                             .append_task_output_ex(&task_run_id, &formatted, false, false)
                             .await
                         {
@@ -888,8 +894,8 @@ pub async fn generate_workflow_from_session(
 
                 {
                     let formatted = format!("\n[SYSTEM_NOTE]\n{}\n[/SYSTEM_NOTE]\n", fail_note);
-                    if let Err(e) = app_state
-                        .pg_db
+                    if let Err(e) = storage
+                        .pg_db()
                         .append_task_output_ex(&task_run_id, &formatted, false, false)
                         .await
                     {

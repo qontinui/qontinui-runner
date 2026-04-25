@@ -3,7 +3,7 @@
 //! Provides commands to list, read, and extract Claude Code session transcripts,
 //! plus a standalone workflow generation command that doesn't require an existing task_run_id.
 
-use crate::commands::compartments::ExecutionCompartment;
+use crate::commands::compartments::{ExecutionCompartment, HealthCompartment, StorageCompartment};
 use crate::commands::{AppState, CommandResponse};
 use crate::terminal::transcript;
 use std::sync::Arc;
@@ -267,7 +267,8 @@ pub async fn transcript_find_external_processes(
 /// but doesn't need an existing AI session.
 #[tauri::command]
 pub async fn generate_workflow_standalone(
-    app_state: tauri::State<'_, Arc<AppState>>,
+    storage: tauri::State<'_, StorageCompartment>,
+    health: tauri::State<'_, HealthCompartment>,
     description: String,
     inline_context: String,
     include_ui_bridge: Option<bool>,
@@ -302,7 +303,11 @@ pub async fn generate_workflow_standalone(
         // "Spec Generation Brief Recognition" rules section.
         inline_context.clone()
     } else {
-        let existing_specs = crate::commands::ai_session::fetch_existing_specs(&app_state).await;
+        // `fetch_existing_specs` is a pre-compartment helper that takes
+        // `&AppState`. Use the explicit `app_state()` escape hatch on
+        // health to keep the legacy passthrough greppable.
+        let existing_specs =
+            crate::commands::ai_session::fetch_existing_specs(health.app_state()).await;
         if existing_specs != "No existing specs found" {
             crate::commands::ai_session::build_spec_aware_context(&inline_context, &existing_specs)
         } else {
@@ -357,14 +362,16 @@ pub async fn generate_workflow_standalone(
     };
 
     // Get doctor handle for health monitoring
-    let doctor_handle = app_state.doctor_handle.lock().await.clone();
-    let pg_db = app_state.pg_db.clone();
+    let doctor_handle = health.doctor_handle().lock().await.clone();
+    let pg_db = storage.pg_db().clone();
     let pg_clone = pg_db.clone();
     // Clone the AppState Arc so the builder's brief-mode port resolution
     // can use the actually-bound runner port (matters for temp runners on
     // 9877+). Without this the synchronous path falls back to
     // get_mcp_api_port() which reads $QONTINUI_PORT / defaults to 9876.
-    let app_state_for_gen = app_state.inner().clone();
+    // `generate_workflow` is a pre-compartment helper; escape-hatch via
+    // health.app_state() keeps the legacy passthrough greppable.
+    let app_state_for_gen = health.app_state().clone();
 
     // catch_unwind safety net: converts any latent panic inside the generation
     // pipeline (e.g. a future PG deserialization drift) into a clean structured
@@ -488,7 +495,7 @@ pub async fn generate_workflow_standalone(
                         htn_state_machine_path: workflow.htn_state_machine_path.clone(),
                     };
 
-                    match app_state.pg_db.create_unified_workflow(&create_req).await {
+                    match storage.pg_db().create_unified_workflow(&create_req).await {
                         Ok(saved) => {
                             info!(
                                 "Saved standalone generated workflow '{}' (id={})",

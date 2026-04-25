@@ -9,7 +9,7 @@ use tauri::State;
 
 // Migrated to StorageCompartment (Workstream C) — 43 of 44 handlers.
 // `trigger_meta_optimizer` keeps `Arc<AppState>` (see note above the fn).
-use crate::commands::compartments::StorageCompartment;
+use crate::commands::compartments::{ExecutionCompartment, StorageCompartment};
 use crate::commands::AppState;
 use crate::error::AppError;
 use crate::meta_optimizer::types::{
@@ -356,7 +356,7 @@ pub async fn get_prompt_canary_status(
 // (ExecutionCompartment) alongside, so no single compartment covers it.
 #[tauri::command]
 pub async fn trigger_meta_optimizer(
-    app_state: State<'_, Arc<AppState>>,
+    execution: State<'_, ExecutionCompartment>,
     app_handle: tauri::AppHandle,
     optimizer_type: String,
 ) -> Result<String, String> {
@@ -372,11 +372,16 @@ pub async fn trigger_meta_optimizer(
     let config_storage = crate::config_storage::ConfigStorage::new()
         .unwrap_or_else(|_| crate::config_storage::ConfigStorage::new_degraded());
 
+    // `MetaOptimizerDeps` is a pre-compartment carrier that bundles
+    // `Arc<AppState>` with several other handles. `ai_pid_tracker` is on
+    // the ExecutionCompartment so we read it via the typed accessor;
+    // the AppState itself comes through the explicit `app_state()` escape
+    // hatch (greppable for a future split of MetaOptimizerDeps).
     let deps = crate::meta_optimizer::types::MetaOptimizerDeps {
-        app_state: app_state.inner().clone(),
+        app_state: execution.app_state().clone(),
         config_storage: Arc::new(tokio::sync::Mutex::new(config_storage)),
         app_handle,
-        pid_tracker: app_state.ai_pid_tracker.clone(),
+        pid_tracker: execution.ai_pid_tracker().clone(),
         session_manager: None,
     };
 

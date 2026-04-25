@@ -85,6 +85,23 @@ impl BridgeCompartment {
     ) -> &Arc<tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> {
         &self.0.exploration_cancel
     }
+
+    /// **Escape hatch — use sparingly.**
+    ///
+    /// Returns a clonable `Arc<AppState>` reference for handlers that must
+    /// pass the full AppState to a downstream constructor (e.g. legacy types
+    /// like `state_explorer::ExplorationTask::new`, `meta_optimizer::
+    /// MetaOptimizerDeps`, or `workflow_generation::generate_workflow`) which
+    /// pre-date the compartment split and have not been refactored to take
+    /// only the fields they need.
+    ///
+    /// New code should NOT use this — pick the compartment whose accessor
+    /// methods cover the fields you need, or split the call across multiple
+    /// `State<_, <Compartment>>` parameters. Greppable at call sites as
+    /// `.app_state()` so a future migration can find and remove every use.
+    pub fn app_state(&self) -> &Arc<AppState> {
+        &self.0
+    }
 }
 
 /// Execution / orchestration / per-run tracking concerns.
@@ -164,6 +181,11 @@ impl ExecutionCompartment {
     pub async fn remove_cost_trackers(&self, execution_id: &str) {
         self.0.remove_cost_trackers(execution_id).await
     }
+
+    /// **Escape hatch — use sparingly.** See [`BridgeCompartment::app_state`].
+    pub fn app_state(&self) -> &Arc<AppState> {
+        &self.0
+    }
 }
 
 /// SDK / MCP / server-mode / USB transport / event broadcast concerns.
@@ -200,6 +222,11 @@ impl IntegrationCompartment {
     pub fn event_broadcast(&self) -> &tokio::sync::broadcast::Sender<serde_json::Value> {
         &self.0.event_broadcast
     }
+
+    /// **Escape hatch — use sparingly.** See [`BridgeCompartment::app_state`].
+    pub fn app_state(&self) -> &Arc<AppState> {
+        &self.0
+    }
 }
 
 /// Doctor / error-monitor / crash-dump / UI-error / API-ready state.
@@ -234,6 +261,11 @@ impl HealthCompartment {
     pub fn api_port(&self) -> &std::sync::atomic::AtomicU16 {
         &self.0.api_port
     }
+
+    /// **Escape hatch — use sparingly.** See [`BridgeCompartment::app_state`].
+    pub fn app_state(&self) -> &Arc<AppState> {
+        &self.0
+    }
 }
 
 /// PostgreSQL / local-storage / video-recorder / display-processor concerns.
@@ -259,5 +291,10 @@ impl StorageCompartment {
         &self,
     ) -> &Arc<tokio::sync::Mutex<crate::display::DisplayProcessor>> {
         &self.0.display_processor
+    }
+
+    /// **Escape hatch — use sparingly.** See [`BridgeCompartment::app_state`].
+    pub fn app_state(&self) -> &Arc<AppState> {
+        &self.0
     }
 }

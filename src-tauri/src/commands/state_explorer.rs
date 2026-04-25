@@ -3,13 +3,12 @@
 //! This module provides Tauri commands for the state explorer that
 //! enables AI-driven exploration of application states.
 
-use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tauri::State;
 use tracing::{error, info};
 
-use super::{AppState, CommandResponse};
+use super::CommandResponse;
 use crate::commands::compartments::ExecutionCompartment;
 use crate::state_explorer::{ExplorationConfig, ExplorationStrategy, ExplorationTask};
 
@@ -28,7 +27,7 @@ use crate::state_explorer::{ExplorationConfig, ExplorationStrategy, ExplorationT
 #[tauri::command]
 pub async fn start_exploration(
     config: ExplorationConfig,
-    state: State<'_, Arc<AppState>>,
+    execution: State<'_, ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Starting exploration task for {} with strategy {}",
@@ -40,8 +39,10 @@ pub async fn start_exploration(
         return Err("Config path is required".to_string());
     }
 
-    // Create the exploration task
-    let task = ExplorationTask::new(config.clone(), state.inner().clone());
+    // ExplorationTask is a pre-compartment legacy orchestrator that takes
+    // Arc<AppState> directly. Use the explicit `app_state()` escape hatch on
+    // the compartment so the dependency stays greppable for a future split.
+    let task = ExplorationTask::new(config.clone(), execution.app_state().clone());
 
     // Run the task asynchronously
     let result = tokio::spawn(async move { task.execute().await }).await;
