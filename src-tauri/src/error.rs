@@ -438,6 +438,21 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+impl From<tokio::task::JoinError> for AppError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        // JoinError reaches the boundary when a spawn_blocking / spawn task
+        // panics or is cancelled. Treat as ProcessError — the inner task is
+        // structurally a sub-process from the handler's POV.
+        AppError::ProcessError(format!("Task join failed: {}", err))
+    }
+}
+
+impl From<serde_yaml::Error> for AppError {
+    fn from(err: serde_yaml::Error) -> Self {
+        AppError::ParseError(format!("YAML parse error: {}", err))
+    }
+}
+
 impl fmt::Display for UserFacingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] {}: {}", self.error_code, self.title, self.message)
