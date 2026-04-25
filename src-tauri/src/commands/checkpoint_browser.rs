@@ -125,6 +125,19 @@ pub async fn create_orchestrator_checkpoint(
     state: String,
     iteration: u32,
 ) -> Result<String, String> {
+    create_orchestrator_checkpoint_impl(app_state, task_id, name, description, state, iteration)
+        .await
+        .map_err(String::from)
+}
+
+async fn create_orchestrator_checkpoint_impl(
+    app_state: State<'_, StorageCompartment>,
+    task_id: String,
+    name: Option<String>,
+    description: Option<String>,
+    state: String,
+    iteration: u32,
+) -> Result<String, AppError> {
     // Create state snapshot
     let snapshot = StateSnapshot {
         state: state.clone(),
@@ -142,9 +155,7 @@ pub async fn create_orchestrator_checkpoint(
 
     // Also save to in-memory manager for real-time operations
     let id = {
-        let mut manager = CHECKPOINT_MANAGER
-            .lock()
-            .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+        let mut manager = CHECKPOINT_MANAGER.lock()?;
         let mut checkpoint =
             Checkpoint::new(&task_id, snapshot.clone()).with_trigger(CheckpointTrigger::Manual);
 
@@ -170,7 +181,8 @@ pub async fn create_orchestrator_checkpoint(
             &state_json,
             name.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(AppError::Raw)?;
 
     Ok(id)
 }
@@ -181,24 +193,37 @@ pub async fn delete_orchestrator_checkpoint(
     state: State<'_, StorageCompartment>,
     id: String,
 ) -> Result<bool, String> {
+    delete_orchestrator_checkpoint_impl(state, id)
+        .await
+        .map_err(String::from)
+}
+
+async fn delete_orchestrator_checkpoint_impl(
+    state: State<'_, StorageCompartment>,
+    id: String,
+) -> Result<bool, AppError> {
     // Delete from in-memory manager
     {
-        let mut manager = CHECKPOINT_MANAGER
-            .lock()
-            .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+        let mut manager = CHECKPOINT_MANAGER.lock()?;
         manager.delete(&id);
     } // MutexGuard dropped before .await
 
     // Delete from database
-    state.pg_db().delete_orchestrator_checkpoint(&id).await
+    state
+        .pg_db()
+        .delete_orchestrator_checkpoint(&id)
+        .await
+        .map_err(AppError::Raw)
 }
 
 /// Find checkpoints by tag.
 #[tauri::command]
 pub fn find_checkpoints_by_tag(tag: String) -> Result<Vec<CheckpointSummary>, String> {
-    let manager = CHECKPOINT_MANAGER
-        .lock()
-        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+    find_checkpoints_by_tag_impl(tag).map_err(String::from)
+}
+
+fn find_checkpoints_by_tag_impl(tag: String) -> Result<Vec<CheckpointSummary>, AppError> {
+    let manager = CHECKPOINT_MANAGER.lock()?;
     Ok(manager.find_by_tag(&tag))
 }
 
@@ -230,9 +255,11 @@ fn compare_orchestrator_checkpoints_impl(
 /// Get the latest checkpoint for a task.
 #[tauri::command]
 pub fn get_latest_checkpoint(task_id: String) -> Result<Option<Checkpoint>, String> {
-    let manager = CHECKPOINT_MANAGER
-        .lock()
-        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+    get_latest_checkpoint_impl(task_id).map_err(String::from)
+}
+
+fn get_latest_checkpoint_impl(task_id: String) -> Result<Option<Checkpoint>, AppError> {
+    let manager = CHECKPOINT_MANAGER.lock()?;
     Ok(manager.latest_for_task(&task_id).cloned())
 }
 
@@ -270,9 +297,11 @@ pub async fn get_checkpoint_task_ids(
 /// Clear all checkpoints (for testing/reset).
 #[tauri::command]
 pub fn clear_all_checkpoints() -> Result<(), String> {
-    let mut manager = CHECKPOINT_MANAGER
-        .lock()
-        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+    clear_all_checkpoints_impl().map_err(String::from)
+}
+
+fn clear_all_checkpoints_impl() -> Result<(), AppError> {
+    let mut manager = CHECKPOINT_MANAGER.lock()?;
     *manager = CheckpointManager::new().with_max_per_task(50);
     Ok(())
 }
@@ -280,6 +309,14 @@ pub fn clear_all_checkpoints() -> Result<(), String> {
 /// Add sample checkpoints for demonstration.
 #[tauri::command]
 pub async fn add_sample_checkpoints(app_state: State<'_, StorageCompartment>) -> Result<(), String> {
+    add_sample_checkpoints_impl(app_state)
+        .await
+        .map_err(String::from)
+}
+
+async fn add_sample_checkpoints_impl(
+    app_state: State<'_, StorageCompartment>,
+) -> Result<(), AppError> {
     let task_id = "sample-task-001";
 
     // Collect items to save to PG after releasing the mutex
@@ -288,9 +325,7 @@ pub async fn add_sample_checkpoints(app_state: State<'_, StorageCompartment>) ->
 
     // Save to in-memory manager (sync, mutex held briefly)
     {
-        let mut manager = CHECKPOINT_MANAGER
-            .lock()
-            .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+        let mut manager = CHECKPOINT_MANAGER.lock()?;
 
         for i in 1..=5 {
             let state = match i {
@@ -551,9 +586,11 @@ async fn replay_from_checkpoint_impl(
 /// The lineage tree if the task has lineage info, or None if it's unknown.
 #[tauri::command]
 pub fn get_replay_lineage(task_run_id: String) -> Result<Option<LineageTree>, String> {
-    let replay_manager = REPLAY_MANAGER
-        .lock()
-        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+    get_replay_lineage_impl(task_run_id).map_err(String::from)
+}
+
+fn get_replay_lineage_impl(task_run_id: String) -> Result<Option<LineageTree>, AppError> {
+    let replay_manager = REPLAY_MANAGER.lock()?;
 
     // Get lineage info
     let lineage = replay_manager.get_lineage(&task_run_id);
@@ -581,9 +618,11 @@ pub fn get_replay_lineage(task_run_id: String) -> Result<Option<LineageTree>, St
 /// * `task_run_id` - The task run ID to register.
 #[tauri::command]
 pub fn register_task_for_lineage(task_run_id: String) -> Result<(), String> {
-    let mut replay_manager = REPLAY_MANAGER
-        .lock()
-        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+    register_task_for_lineage_impl(task_run_id).map_err(String::from)
+}
+
+fn register_task_for_lineage_impl(task_run_id: String) -> Result<(), AppError> {
+    let mut replay_manager = REPLAY_MANAGER.lock()?;
     replay_manager.register_original_task(task_run_id);
     Ok(())
 }
@@ -597,18 +636,22 @@ pub fn register_task_for_lineage(task_run_id: String) -> Result<(), String> {
 /// The lineage info if available.
 #[tauri::command]
 pub fn get_task_lineage_info(task_run_id: String) -> Result<Option<LineageInfo>, String> {
-    let replay_manager = REPLAY_MANAGER
-        .lock()
-        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+    get_task_lineage_info_impl(task_run_id).map_err(String::from)
+}
+
+fn get_task_lineage_info_impl(task_run_id: String) -> Result<Option<LineageInfo>, AppError> {
+    let replay_manager = REPLAY_MANAGER.lock()?;
     Ok(replay_manager.get_lineage(&task_run_id).cloned())
 }
 
 /// List all active replay sessions.
 #[tauri::command]
 pub fn list_active_replay_sessions() -> Result<Vec<ReplaySession>, String> {
-    let replay_manager = REPLAY_MANAGER
-        .lock()
-        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
+    list_active_replay_sessions_impl().map_err(String::from)
+}
+
+fn list_active_replay_sessions_impl() -> Result<Vec<ReplaySession>, AppError> {
+    let replay_manager = REPLAY_MANAGER.lock()?;
     Ok(replay_manager
         .list_active_sessions()
         .into_iter()
@@ -622,10 +665,14 @@ pub fn list_active_replay_sessions() -> Result<Vec<ReplaySession>, String> {
 /// * `session_id` - The replay session ID.
 #[tauri::command]
 pub fn complete_replay_session(session_id: String) -> Result<(), String> {
-    let mut replay_manager = REPLAY_MANAGER
-        .lock()
-        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
-    replay_manager.complete_session(&session_id)
+    complete_replay_session_impl(session_id).map_err(String::from)
+}
+
+fn complete_replay_session_impl(session_id: String) -> Result<(), AppError> {
+    let mut replay_manager = REPLAY_MANAGER.lock()?;
+    replay_manager
+        .complete_session(&session_id)
+        .map_err(AppError::Raw)
 }
 
 /// Fail a replay session.
@@ -635,10 +682,17 @@ pub fn complete_replay_session(session_id: String) -> Result<(), String> {
 /// * `error` - Optional error message.
 #[tauri::command]
 pub fn fail_replay_session(session_id: String, _error: Option<String>) -> Result<(), String> {
-    let mut replay_manager = REPLAY_MANAGER
-        .lock()
-        .map_err(|e: std::sync::PoisonError<_>| String::from(AppError::from(e)))?;
-    replay_manager.fail_session(&session_id)
+    fail_replay_session_impl(session_id, _error).map_err(String::from)
+}
+
+fn fail_replay_session_impl(
+    session_id: String,
+    _error: Option<String>,
+) -> Result<(), AppError> {
+    let mut replay_manager = REPLAY_MANAGER.lock()?;
+    replay_manager
+        .fail_session(&session_id)
+        .map_err(AppError::Raw)
 }
 
 // ============================================================================
