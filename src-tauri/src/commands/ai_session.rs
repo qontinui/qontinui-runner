@@ -358,6 +358,7 @@ pub async fn create_ai_session(
             None,              // progress_ctx
             None,              // pid_tracker
             None,              // model_override
+            None,              // worktree
         ) {
             Ok(session) => {
                 let session = Arc::new(session);
@@ -921,6 +922,52 @@ pub async fn generate_workflow_from_session(
     }
 }
 
+/// Promote a running AI session into an isolated git worktree (Phase 4).
+///
+/// The Tauri-facing sibling of `POST /sessions/{id}/promote-to-worktree`.
+/// Both routes funnel through `crate::mcp::ai_session::promote_session_inner`
+/// so behaviour stays in lockstep.
+///
+/// On success returns the new worktree's id, path, and branch name in `data`.
+/// On failure returns `success: false` with the error message; the original
+/// session is left re-registered in `SessionManager` so the chat UI keeps
+/// working.
+///
+/// TODO(worktrees Phase 4 stretch): extend `create_ai_session` with
+/// `start_in_worktree: Option<bool>` so a session can be born inside a
+/// worktree instead of needing a separate promotion call.
+#[tauri::command]
+pub async fn promote_session_to_worktree(
+    app_handle: tauri::AppHandle,
+    task_run_id: String,
+) -> Result<CommandResponse, String> {
+    info!(
+        "promote_session_to_worktree: task_run_id={}",
+        task_run_id
+    );
+
+    match crate::mcp::ai_session::promote_session_inner(&app_handle, &task_run_id).await {
+        Ok(resp) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!(
+                "Session promoted to worktree {} (branch={})",
+                resp.worktree_id, resp.branch_name
+            )),
+            data: Some(serde_json::json!({
+                "task_run_id": task_run_id,
+                "worktree_id": resp.worktree_id,
+                "worktree_path": resp.worktree_path,
+                "branch_name": resp.branch_name,
+            })),
+        }),
+        Err((status, message)) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("[{}] {}", status.as_u16(), message)),
+            data: None,
+        }),
+    }
+}
+
 /// Resume interrupted AI sessions on startup.
 ///
 /// Queries for task runs with status='running' and workflow_type='chat'
@@ -1082,6 +1129,7 @@ pub async fn resume_ai_sessions(
                 None, // progress_ctx
                 None, // pid_tracker
                 None, // model_override
+                None, // worktree
             )
             .map_err(|e| format!("spawn failed: {}", e))?;
 
@@ -1366,6 +1414,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             rename_ai_session,
             get_ai_output,
             generate_workflow_from_session,
+            promote_session_to_worktree,
         ])
         .build()
 }

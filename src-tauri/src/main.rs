@@ -592,6 +592,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_session::get_ai_session_state,
             commands::ai_session::interrupt_ai_session,
             commands::ai_session::list_ai_sessions,
+            commands::ai_session::promote_session_to_worktree,
             commands::ai_session::rename_ai_session,
             commands::ai_session::send_user_message,
             commands::ai_settings::check_accounts_usage,

@@ -1,6 +1,25 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { TerminalSquare, Eye, Copy, AlertTriangle, FileWarning, Pin, Tag } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  TerminalSquare,
+  Eye,
+  Copy,
+  AlertTriangle,
+  FileWarning,
+  Pin,
+  Tag,
+  GitBranch,
+  Loader2,
+  CheckCircle2,
+} from "lucide-react";
 import type { UnifiedSession, SessionLiveStatus } from "./useSessionManager";
+import type { CommandResponse } from "./types";
+
+interface PromoteToWorktreeData {
+  worktree_id: string;
+  worktree_path: string;
+  branch_name: string;
+}
 
 interface SessionCardProps {
   session: UnifiedSession;
@@ -17,6 +36,8 @@ interface SessionCardProps {
   onToggleSelect: (sessionId: string) => void;
   onTogglePin: (sessionId: string) => void;
   onSetLabel: (sessionId: string, label: string | null) => void;
+  /** Optional: notify parent that the session list should refresh after a promotion. */
+  onAfterPromote?: () => void;
 }
 
 const STATUS_DOT: Record<SessionLiveStatus, { color: string; pulse: boolean; label: string }> = {
@@ -79,6 +100,7 @@ export function SessionCard({
   onToggleSelect,
   onTogglePin,
   onSetLabel,
+  onAfterPromote,
 }: SessionCardProps) {
   const statusInfo = STATUS_DOT[session.liveStatus];
   const accountBadge = ACCOUNT_BADGE_COLORS[session.accountLabel];
@@ -89,6 +111,81 @@ export function SessionCard({
   const [labelInput, setLabelInput] = useState("");
   const [showLabelInput, setShowLabelInput] = useState(false);
   const contextRef = useRef<HTMLDivElement>(null);
+
+  // ── Promote to worktree state ────────────────────────────────────────────
+  // The promote command takes a few seconds (kill the current PTY, create
+  // worktree, respawn). Local state is enough — there's no toast lib in this
+  // app; we surface progress and errors inline on the card itself.
+  const [promoteState, setPromoteState] = useState<
+    | { kind: "idle" }
+    | { kind: "loading" }
+    | { kind: "success"; data: PromoteToWorktreeData }
+    | { kind: "error"; message: string; busy: boolean; alreadyInWorktree: boolean }
+  >({ kind: "idle" });
+
+  // Promotion is only meaningful for sessions that are actually live in this
+  // runner — promote_session_to_worktree looks the session up in
+  // SessionManager by task_run_id, which equals the claude session id for
+  // this runner's live PTYs. External / dormant / completed sessions can't
+  // be promoted from this UI (the backend would just 404).
+  const canPromote =
+    session.liveStatus === "active-in-zone" ||
+    session.liveStatus === "needs-input" ||
+    session.liveStatus === "frozen";
+
+  // Hide the button entirely once the promotion has succeeded — the parent
+  // refreshes session state and the next render will reflect the new
+  // (worktree-backed) session. We keep a brief success badge for ~6s so the
+  // user sees the outcome.
+  const promoted = promoteState.kind === "success";
+
+  const handlePromote = useCallback(
+    async (e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (!canPromote || promoteState.kind === "loading") return;
+      setPromoteState({ kind: "loading" });
+      try {
+        const result = await invoke<CommandResponse>("promote_session_to_worktree", {
+          taskRunId: session.sessionId,
+        });
+        if (result.success && result.data) {
+          const data = result.data as PromoteToWorktreeData;
+          setPromoteState({ kind: "success", data });
+          onAfterPromote?.();
+          // Auto-clear the success badge after a few seconds so the card
+          // doesn't carry stale UI forever; by then the refreshed session
+          // list should reflect the new worktree state directly.
+          setTimeout(() => {
+            setPromoteState((prev) => (prev.kind === "success" ? { kind: "idle" } : prev));
+          }, 6000);
+        } else {
+          const msg = result.message ?? "Promotion failed";
+          const lower = msg.toLowerCase();
+          // The backend distinguishes 409 cases via the message text
+          // ("already in worktree" vs "busy"). We can't see the HTTP status
+          // through `invoke`, so we sniff the message.
+          const alreadyInWorktree = lower.includes("already") && lower.includes("worktree");
+          const busy = lower.includes("busy") || lower.includes("in use");
+          setPromoteState({ kind: "error", message: msg, busy, alreadyInWorktree });
+          setTimeout(() => {
+            setPromoteState((prev) => (prev.kind === "error" ? { kind: "idle" } : prev));
+          }, 8000);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setPromoteState({
+          kind: "error",
+          message: msg,
+          busy: false,
+          alreadyInWorktree: false,
+        });
+        setTimeout(() => {
+          setPromoteState((prev) => (prev.kind === "error" ? { kind: "idle" } : prev));
+        }, 8000);
+      }
+    },
+    [canPromote, promoteState.kind, session.sessionId, onAfterPromote],
+  );
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -214,6 +311,35 @@ export function SessionCard({
             <span>Session appears frozen — may need resume</span>
           </div>
         )}
+
+        {/* Promote-to-worktree status */}
+        {promoteState.kind === "loading" && (
+          <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#7aa2f7]/80">
+            <Loader2 className="w-3 h-3 animate-spin" />
+            <span>Promoting session to a new worktree…</span>
+          </div>
+        )}
+        {promoteState.kind === "success" && (
+          <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#9ece6a]/90">
+            <CheckCircle2 className="w-3 h-3" />
+            <span className="truncate">
+              Promoted to worktree{" "}
+              <span className="font-mono">{promoteState.data.branch_name}</span>
+            </span>
+          </div>
+        )}
+        {promoteState.kind === "error" && (
+          <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#f7768e]/90">
+            <AlertTriangle className="w-3 h-3 shrink-0" />
+            <span className="truncate" title={promoteState.message}>
+              {promoteState.alreadyInWorktree
+                ? "Already running in a worktree."
+                : promoteState.busy
+                  ? `Session is busy — try again in a moment. (${promoteState.message})`
+                  : `Promote failed: ${promoteState.message}`}
+            </span>
+          </div>
+        )}
       </button>
 
       {/* Quick action buttons — visible on hover */}
@@ -228,6 +354,20 @@ export function SessionCard({
         >
           <TerminalSquare className="w-3.5 h-3.5" />
         </button>
+        {canPromote && !promoted && (
+          <button
+            onClick={handlePromote}
+            disabled={promoteState.kind === "loading"}
+            className="p-1 rounded text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Promote this session into an isolated git worktree"
+          >
+            {promoteState.kind === "loading" ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <GitBranch className="w-3.5 h-3.5" />
+            )}
+          </button>
+        )}
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -307,6 +447,23 @@ export function SessionCard({
               >
                 <Copy className="w-3 h-3" /> Copy Session ID
               </button>
+              {canPromote && !promoted && (
+                <button
+                  onClick={(e) => {
+                    setContextMenu(null);
+                    void handlePromote(e);
+                  }}
+                  disabled={promoteState.kind === "loading"}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
+                >
+                  {promoteState.kind === "loading" ? (
+                    <Loader2 className="w-3 h-3 text-[#7aa2f7] animate-spin" />
+                  ) : (
+                    <GitBranch className="w-3 h-3 text-[#7aa2f7]" />
+                  )}
+                  Promote to Worktree
+                </button>
+              )}
               <div className="my-1 h-px bg-[#2a2d3d]" />
               <button
                 onClick={() => {

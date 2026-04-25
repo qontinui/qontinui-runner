@@ -1340,12 +1340,18 @@ pub async fn ui_bridge_wait_for_element_handler(
         .map(|Json(v)| v)
         .unwrap_or_else(|| serde_json::json!({}));
 
-    // Body-shape routing: the SDK's `waitForElementRegistered` uses the new
-    // `predicate: {id?, label?, testId?, selector?}` shape, while the legacy
-    // handler below expects `query` / `elementId`. If `predicate` is present
-    // we forward to the SDK handler and return its payload verbatim. This
-    // avoids a route collision without requiring a URL rename (callers keep
-    // using `/ai/wait-for-element`).
+    // Body-shape routing — three accepted shapes share `/ai/wait-for-element`:
+    //
+    //   1. `{ state: "...", elementId|selector, ... }` — M1 state-predicate.
+    //      Forwarded to the SDK runtime which polls the registry and returns
+    //      `{ found, durationMs, finalState | lastObservedState }`. The
+    //      `state` field is a string predicate (visible|enabled|...), which
+    //      no other shape uses, so this disambiguator is unambiguous.
+    //   2. `{ predicate: {...}, requirement?, ... }` — `waitForElementRegistered`.
+    //   3. `{ query|elementId, assertions?, ... }` — legacy poll-via-ai_find.
+    if body.get("state").and_then(|v| v.as_str()).is_some() {
+        return ui_bridge_wait_for_element_state_predicate_handler(state, body).await;
+    }
     if body.get("predicate").is_some() {
         return ui_bridge_wait_for_element_registered_forward(state, body).await;
     }
@@ -1554,6 +1560,151 @@ async fn ui_bridge_wait_for_element_registered_forward(
         Err(e) => {
             error!(
                 "UI Bridge API: wait-for-element (predicate shape) failed: {}",
+                e
+            );
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// M1 wait-for-element state-predicate validation.
+///
+/// `Ok(WaitForElementStateRequest)` on success; `Err((status, msg))` with
+/// HTTP status + descriptive error on failure. Pulled out as a pure helper
+/// so unit tests can lock down the validation seam without spinning up axum.
+///
+/// Spec accepts:
+///   - elementId XOR selector (at least one required)
+///   - state ∈ {present|visible|enabled|disabled|value-not-empty|value-empty|checked|unchecked|absent}
+///   - timeoutMs in [0, 30000] (default 5000)
+///   - pollMs >= 10 (default 50)
+///
+/// `timeoutMs` larger than the ceiling is rejected (400) rather than
+/// silently clamped, so callers don't unknowingly wait less than they
+/// asked. `pollMs` smaller than the floor is similarly rejected.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WaitForElementStateRequest {
+    pub element_id: Option<String>,
+    pub selector: Option<String>,
+    pub state: String,
+    pub timeout_ms: u64,
+    pub poll_ms: u64,
+}
+
+const VALID_WAIT_FOR_ELEMENT_STATES: &[&str] = &[
+    "present",
+    "visible",
+    "enabled",
+    "disabled",
+    "value-not-empty",
+    "value-empty",
+    "checked",
+    "unchecked",
+    "absent",
+];
+
+pub fn validate_wait_for_element_state_request(
+    body: &serde_json::Value,
+) -> Result<WaitForElementStateRequest, String> {
+    let element_id = body
+        .get("elementId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let selector = body
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if element_id.is_none() && selector.is_none() {
+        return Err("wait-for-element: 'elementId' or 'selector' is required".to_string());
+    }
+
+    let state = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "wait-for-element: 'state' is required".to_string())?;
+    if !VALID_WAIT_FOR_ELEMENT_STATES.contains(&state) {
+        return Err(format!(
+            "wait-for-element: invalid state '{}', expected one of {}",
+            state,
+            VALID_WAIT_FOR_ELEMENT_STATES.join("|")
+        ));
+    }
+
+    let timeout_ms = match body.get("timeoutMs") {
+        None => 5000_u64,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .or_else(|| v.as_i64().filter(|i| *i >= 0).map(|i| i as u64))
+                .or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.is_finite()).map(|f| f as u64))
+                .ok_or_else(|| "wait-for-element: 'timeoutMs' must be a non-negative number".to_string())?;
+            if n > 30_000 {
+                return Err(
+                    "wait-for-element: 'timeoutMs' must be between 0 and 30000".to_string(),
+                );
+            }
+            n
+        }
+    };
+
+    let poll_ms = match body.get("pollMs") {
+        None => 50_u64,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.is_finite()).map(|f| f as u64))
+                .ok_or_else(|| "wait-for-element: 'pollMs' must be a number".to_string())?;
+            if n < 10 {
+                return Err("wait-for-element: 'pollMs' must be >= 10".to_string());
+            }
+            n
+        }
+    };
+
+    Ok(WaitForElementStateRequest {
+        element_id,
+        selector,
+        state: state.to_string(),
+        timeout_ms,
+        poll_ms,
+    })
+}
+
+/// Forwards a `state`-shape wait-for-element body to the SDK
+/// `wait_for_element_state_predicate` runtime handler. Validates the body
+/// up-front (returning HTTP 400 on bad shapes) so the SDK side only sees
+/// well-formed payloads. The SDK handler returns the predicate outcome
+/// verbatim; we surface it 1:1 inside the standard `ApiResponse::success`
+/// envelope so `found:false` (timeout) is **not** an HTTP error.
+async fn ui_bridge_wait_for_element_state_predicate_handler(
+    state: Arc<ApiState>,
+    body: serde_json::Value,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let req = validate_wait_for_element_state_request(&body)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, Json(api_error(msg))))?;
+
+    info!(
+        "UI Bridge API: wait-for-element (state shape) elementId={:?} selector={:?} state={} timeoutMs={} pollMs={}",
+        req.element_id, req.selector, req.state, req.timeout_ms, req.poll_ms
+    );
+
+    let payload = serde_json::json!({
+        "params": {
+            "elementId": req.element_id,
+            "selector": req.selector,
+            "state": req.state,
+            "timeoutMs": req.timeout_ms,
+            "pollMs": req.poll_ms,
+        }
+    });
+
+    match ui_bridge_request_sync(&state, "wait_for_element_state_predicate", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!(
+                "UI Bridge API: wait-for-element (state shape) failed: {}",
                 e
             );
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
@@ -2140,4 +2291,118 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/page/read-value"),
         ("POST", "/ui-bridge/control/page/type-into"),
     ]
+}
+
+#[cfg(test)]
+mod wait_for_element_state_tests {
+    //! Validation seam for the M1 `/ai/wait-for-element` state-predicate
+    //! body shape. Exercises the pure helper so we don't need an axum
+    //! router / live SDK.
+
+    use super::{validate_wait_for_element_state_request, WaitForElementStateRequest};
+    use serde_json::json;
+
+    fn ok(body: serde_json::Value) -> WaitForElementStateRequest {
+        validate_wait_for_element_state_request(&body)
+            .expect("expected validation to succeed")
+    }
+
+    fn err(body: serde_json::Value) -> String {
+        validate_wait_for_element_state_request(&body)
+            .expect_err("expected validation to fail")
+    }
+
+    #[test]
+    fn missing_both_element_id_and_selector_is_rejected() {
+        let msg = err(json!({ "state": "visible" }));
+        assert!(
+            msg.contains("'elementId' or 'selector'"),
+            "expected missing-id-or-selector error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_strings_count_as_missing() {
+        // The validator must treat "" as absent so callers can't slip past the
+        // gate by sending a blank string.
+        let msg = err(json!({ "elementId": "", "selector": "", "state": "visible" }));
+        assert!(msg.contains("'elementId' or 'selector'"));
+    }
+
+    #[test]
+    fn missing_state_is_rejected() {
+        let msg = err(json!({ "elementId": "x" }));
+        assert!(msg.contains("'state' is required"), "got: {msg}");
+    }
+
+    #[test]
+    fn invalid_state_is_rejected() {
+        let msg = err(json!({ "elementId": "x", "state": "bogus" }));
+        assert!(msg.contains("invalid state 'bogus'"), "got: {msg}");
+        assert!(msg.contains("present"), "should list valid states: {msg}");
+        assert!(msg.contains("absent"), "should list valid states: {msg}");
+    }
+
+    #[test]
+    fn timeout_ms_above_ceiling_is_rejected() {
+        let msg = err(json!({ "elementId": "x", "state": "visible", "timeoutMs": 30_001 }));
+        assert!(msg.contains("between 0 and 30000"), "got: {msg}");
+    }
+
+    #[test]
+    fn timeout_ms_negative_is_rejected() {
+        let msg = err(json!({ "elementId": "x", "state": "visible", "timeoutMs": -5 }));
+        assert!(
+            msg.contains("non-negative") || msg.contains("between 0 and 30000"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn timeout_ms_at_ceiling_is_accepted() {
+        let req = ok(json!({ "elementId": "x", "state": "visible", "timeoutMs": 30_000 }));
+        assert_eq!(req.timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn poll_ms_below_floor_is_rejected() {
+        let msg = err(json!({ "elementId": "x", "state": "visible", "pollMs": 5 }));
+        assert!(msg.contains("'pollMs' must be >= 10"), "got: {msg}");
+    }
+
+    #[test]
+    fn defaults_applied_when_omitted() {
+        let req = ok(json!({ "elementId": "x", "state": "present" }));
+        assert_eq!(req.timeout_ms, 5000);
+        assert_eq!(req.poll_ms, 50);
+        assert_eq!(req.element_id.as_deref(), Some("x"));
+        assert_eq!(req.selector, None);
+        assert_eq!(req.state, "present");
+    }
+
+    #[test]
+    fn selector_only_is_accepted() {
+        let req = ok(json!({ "selector": "input[name=foo]", "state": "value-not-empty" }));
+        assert_eq!(req.element_id, None);
+        assert_eq!(req.selector.as_deref(), Some("input[name=foo]"));
+        assert_eq!(req.state, "value-not-empty");
+    }
+
+    #[test]
+    fn all_documented_states_accepted() {
+        for state in [
+            "present",
+            "visible",
+            "enabled",
+            "disabled",
+            "value-not-empty",
+            "value-empty",
+            "checked",
+            "unchecked",
+            "absent",
+        ] {
+            let req = ok(json!({ "elementId": "x", "state": state }));
+            assert_eq!(req.state, state, "state {state} should round-trip");
+        }
+    }
 }

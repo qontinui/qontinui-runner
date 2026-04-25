@@ -4,7 +4,13 @@
 //! AI-powered sessions. Includes prompt execution, task completion tracking,
 //! log migration, and MCP tool context generation.
 
-use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::Json,
+    routing::post,
+    Router,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::Manager;
@@ -141,6 +147,208 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/stop-ai-analysis", post(stop_ai_analysis))
         .route("/restart-runner", post(restart_runner))
         .route("/prompts/run", post(run_prompt))
+        .route(
+            "/sessions/{session_id}/promote-to-worktree",
+            post(promote_session_to_worktree_handler),
+        )
+}
+
+// ============================================================================
+// Worktree Promotion (Phase 4)
+// ============================================================================
+
+/// Response from a successful session-to-worktree promotion.
+///
+/// Returned by both the MCP HTTP handler (`POST /sessions/:id/promote-to-worktree`)
+/// and the Tauri command (`promote_session_to_worktree`). Mirrors the fields of
+/// `claude_session::WorktreeInfo` but with stringified paths so it serialises cleanly.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromoteToWorktreeResponse {
+    pub worktree_id: String,
+    pub worktree_path: String,
+    pub branch_name: String,
+}
+
+/// MCP HTTP handler: promote a running session to its own git worktree.
+///
+/// `POST /sessions/{session_id}/promote-to-worktree`
+///
+/// Looks up the live session via `SessionManager`, takes exclusive ownership of
+/// the underlying `ClaudeSession` (since `promote_to_worktree` requires `&mut self`),
+/// runs the promotion, and re-registers the new session under the same id.
+///
+/// Status codes:
+/// - 200 — promotion succeeded
+/// - 404 — no live session for that id
+/// - 409 — session is already in a worktree, or another holder is preventing
+///         exclusive access (e.g. concurrent caller)
+/// - 500 — worktree creation, respawn, or PG persistence failed
+pub async fn promote_session_to_worktree_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<ApiResponse<PromoteToWorktreeResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: promote_to_worktree requested for session_id={}",
+        session_id
+    );
+
+    promote_session_inner(&state.app_handle, &session_id)
+        .await
+        .map(|resp| Json(ApiResponse::success(resp)))
+        .map_err(|(status, message)| (status, Json(api_error(message))))
+}
+
+/// Shared implementation behind the MCP handler and the Tauri command.
+///
+/// Returns `(StatusCode, error_message)` on failure so each frontend can map it
+/// to the appropriate response shape (HTTP status vs `Result<_, String>`).
+pub(crate) async fn promote_session_inner(
+    app_handle: &tauri::AppHandle,
+    session_id: &str,
+) -> Result<PromoteToWorktreeResponse, (StatusCode, String)> {
+    use crate::claude_session::manager::SessionManager;
+    use crate::claude_session::ClaudeSession;
+
+    // 1. Resolve the SessionManager from Tauri's managed state.
+    let session_manager: Arc<SessionManager> = app_handle
+        .try_state::<Arc<SessionManager>>()
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SessionManager not available".to_string(),
+            )
+        })?
+        .inner()
+        .clone();
+
+    // 2. Resolve repo path. `current_project_path()` returns the workspace root,
+    //    which is what create_worktree expects (per worktrees.rs handlers).
+    let repo_path = crate::mcp::shared::current_project_path().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "No project path available".to_string(),
+    ))?;
+
+    // 3. Take ownership of the session out of the manager. promote_to_worktree
+    //    needs &mut self, but the manager hands out Arc<ClaudeSession>. Removing
+    //    + try_unwrap is the only safe way to obtain exclusive ownership.
+    let session_arc = session_manager
+        .remove(session_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No active session found for session_id: {}", session_id)))?;
+
+    // Already-promoted check: cheap, no need to unwrap the Arc to discover this.
+    if let Some(existing) = session_arc.worktree() {
+        let resp = PromoteToWorktreeResponse {
+            worktree_id: existing.id.clone(),
+            worktree_path: existing.path.to_string_lossy().to_string(),
+            branch_name: existing.branch.clone(),
+        };
+        // Put it back so the frontend can keep using it.
+        if let Err(e) = session_manager.register(session_id, session_arc) {
+            warn!(
+                "promote_to_worktree: failed to re-register already-promoted session {}: {}",
+                session_id, e
+            );
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Session {} is already in worktree {} (branch={})",
+                session_id, resp.worktree_id, resp.branch_name
+            ),
+        ));
+    }
+
+    // 4. Try to acquire exclusive ownership. If another caller holds an Arc
+    //    clone (e.g. a concurrent send_user_message), this fails — return 409
+    //    so the caller can retry once the other holder releases.
+    let mut session: ClaudeSession = match Arc::try_unwrap(session_arc) {
+        Ok(session) => session,
+        Err(arc) => {
+            // Put it back so the frontend can keep using it.
+            if let Err(e) = session_manager.register(session_id, arc) {
+                warn!(
+                    "promote_to_worktree: failed to re-register busy session {}: {}",
+                    session_id, e
+                );
+            }
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Session {} is busy — another caller holds a reference. Retry shortly.",
+                    session_id
+                ),
+            ));
+        }
+    };
+
+    // 5. Reconstruct AiSessionContext for the new spawn so output events keep
+    //    flowing with the right task_run_id. Mirrors create_ai_session's setup
+    //    path (which is what regular interactive sessions use).
+    let session_ctx = AiSessionContext::setup(session_id, session_id);
+
+    // 6. Run the promotion. promote_to_worktree handles state transitions,
+    //    git worktree creation, PG persistence, kill+respawn, and replay.
+    let promote_result = session
+        .promote_to_worktree(
+            std::path::Path::new(&repo_path),
+            app_handle,
+            Some(session_ctx),
+        )
+        .await;
+
+    let info = match promote_result {
+        Ok(info) => info,
+        Err(e) => {
+            // The session is back in Ready state (transition rolled back inside
+            // promote_to_worktree on early failure paths). Re-register so the
+            // caller can keep using it as before.
+            warn!(
+                "promote_to_worktree: failed for session {}: {}",
+                session_id, e
+            );
+            let session_arc = Arc::new(session);
+            if let Err(re) = session_manager.register(session_id, session_arc) {
+                warn!(
+                    "promote_to_worktree: failed to re-register after promote failure {}: {}",
+                    session_id, re
+                );
+            }
+            // Map "already promoted" race to 409, anything else to 500.
+            let status = if e.contains("already") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return Err((status, format!("worktree promotion failed: {}", e)));
+        }
+    };
+
+    // 7. Re-register the (now-mutated) session under the same id.
+    let session_arc = Arc::new(session);
+    if let Err(e) = session_manager.register(session_id, session_arc) {
+        warn!(
+            "promote_to_worktree: post-promotion register failed for {}: {}",
+            session_id, e
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worktree promoted but re-register failed: {}", e),
+        ));
+    }
+
+    info!(
+        "promote_to_worktree: session {} now in worktree {} (branch={}, path={})",
+        session_id,
+        info.id,
+        info.branch,
+        info.path.display()
+    );
+
+    Ok(PromoteToWorktreeResponse {
+        worktree_id: info.id,
+        worktree_path: info.path.to_string_lossy().to_string(),
+        branch_name: info.branch,
+    })
 }
 
 // ============================================================================

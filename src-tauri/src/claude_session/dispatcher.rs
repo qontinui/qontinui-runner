@@ -64,6 +64,7 @@ pub struct DispatcherResult {
 /// - State transitions on Result messages
 ///
 /// Returns the extracted text (if any).
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_line(
     line: &str,
     app_handle: &tauri::AppHandle,
@@ -82,6 +83,10 @@ pub fn dispatch_line(
     persisted_output_len: &AtomicUsize,
     // Fallback session ID for file locking when session_ctx is None
     fallback_session_id: Option<&str>,
+    // Worktree ID for the session (Some when session has been promoted into
+    // a git worktree). Scopes file-registry entries so two sessions editing
+    // the same path in different worktrees do not flag each other as conflicts.
+    worktree_id: Option<&str>,
 ) -> Option<String> {
     // Decode the NDJSON line
     let msg = match decode_message(line) {
@@ -107,6 +112,7 @@ pub fn dispatch_line(
             fallback_session_id,
             tool_name,
             &data,
+            worktree_id,
         );
     }
 
@@ -125,6 +131,7 @@ pub fn dispatch_line(
             fallback_session_id,
             &tool_name,
             &data,
+            worktree_id,
         );
     }
 
@@ -371,6 +378,7 @@ fn auto_register_file(
     fallback_session_id: Option<&str>,
     tool_name: &str,
     data: &serde_json::Map<String, serde_json::Value>,
+    worktree_id: Option<&str>,
 ) {
     // Only register for file-modifying tools
     match tool_name {
@@ -460,12 +468,14 @@ fn auto_register_file(
             let file_path_reg = file_path.clone();
             let task_run_id_reg = task_run_id.clone();
             let holder_name_reg = holder_name.clone();
+            let worktree_id_reg = worktree_id.map(|s| s.to_string());
             rt.spawn(async move {
                 let conflicts = registry
                     .register(
                         std::slice::from_ref(&file_path_reg),
                         &task_run_id_reg,
                         &holder_name_reg,
+                        worktree_id_reg,
                     )
                     .await;
 

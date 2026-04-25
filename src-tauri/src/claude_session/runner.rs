@@ -2127,6 +2127,7 @@ pub fn run_claude_session_interactive(
         progress_ctx,
         pid_tracker,
         model_override,
+        None, // worktree — promoted later via ClaudeSession::promote_to_worktree
     )?;
 
     // Register with Doctor health monitoring

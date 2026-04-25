@@ -229,6 +229,7 @@ export function SessionManagerPanel({
                   onToggleSelect={toggleSelect}
                   onTogglePin={togglePin}
                   onSetLabel={setSessionLabel}
+                  onAfterPromote={refresh}
                 />
               ))}
             </div>

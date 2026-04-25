@@ -26,6 +26,10 @@ pub struct RegisterFilesRequest {
     pub task_run_id: String,
     /// Human-readable session/workflow name.
     pub holder_name: String,
+    /// Optional worktree ID — registrations are scoped per-worktree.
+    /// `None` (default) means the main tree (historical behavior).
+    #[serde(default)]
+    pub worktree_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +46,10 @@ pub struct UnregisterFilesRequest {
     pub file_paths: Vec<String>,
     /// Task run ID of the session releasing the files.
     pub task_run_id: String,
+    /// Optional worktree ID — unregistration is scoped per-worktree.
+    /// `None` (default) means the main tree.
+    #[serde(default)]
+    pub worktree_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +65,11 @@ pub struct CheckConflictsRequest {
     /// Optional: only check these specific files. If empty, checks all.
     #[serde(default)]
     pub file_paths: Vec<String>,
+    /// Optional worktree ID — when `file_paths` is non-empty, conflicts are
+    /// scoped to this worktree. Ignored when `file_paths` is empty (the
+    /// global `check_conflicts` query is inherently cross-worktree).
+    #[serde(default)]
+    pub worktree_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,7 +100,12 @@ async fn register_files(
     let conflicts = state
         .app_state
         .file_registry_manager
-        .register(&req.file_paths, &req.task_run_id, &req.holder_name)
+        .register(
+            &req.file_paths,
+            &req.task_run_id,
+            &req.holder_name,
+            req.worktree_id.clone(),
+        )
         .await;
 
     Ok(Json(RegisterFilesResponse {
@@ -106,7 +124,11 @@ async fn unregister_files(
     state
         .app_state
         .file_registry_manager
-        .unregister(&req.file_paths, &req.task_run_id)
+        .unregister(
+            &req.file_paths,
+            &req.task_run_id,
+            req.worktree_id.clone(),
+        )
         .await;
 
     Ok(Json(serde_json::json!({ "success": true })))
@@ -146,7 +168,11 @@ async fn check_conflicts(
         state
             .app_state
             .file_registry_manager
-            .check_conflicts_for_files(&req.file_paths, &req.task_run_id)
+            .check_conflicts_for_files(
+                &req.file_paths,
+                &req.task_run_id,
+                req.worktree_id.clone(),
+            )
             .await
     };
 

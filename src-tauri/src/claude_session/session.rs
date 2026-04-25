@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -31,6 +32,34 @@ use std::os::windows::io::AsRawHandle;
 
 /// Maximum number of pending user messages in the queue.
 const MAX_PENDING_MESSAGES: usize = 10;
+
+/// Metadata about a git worktree this session has been promoted into.
+///
+/// When `Some`, the underlying Claude CLI process has its `cwd` set to
+/// `path` and any file work it does is isolated to the `branch` checkout.
+/// Phase 3 (dispatcher.rs) reads `id` to scope the file registry so two
+/// concurrent sessions writing to the same logical file but in different
+/// worktrees do not flag each other as conflicts.
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    /// Worktrees table primary key (matches the `worktrees.id` TEXT column).
+    pub id: String,
+    /// Absolute path to the worktree checkout directory (also the CLI cwd).
+    pub path: PathBuf,
+    /// Git branch name created for this worktree.
+    pub branch: String,
+}
+
+/// Internal error type for `build_replay_from_history`.
+///
+/// Distinguishes "no history found" (`Ok(None)`) from "PG isn't available"
+/// (`Err(NoPg)`) so that callers like `promote_to_worktree` can decide
+/// whether to abort or proceed without replay context.
+#[derive(Debug)]
+enum BuildReplayErr {
+    /// PG global isn't initialized — no way to read the output_log.
+    NoPg,
+}
 
 /// An interactive Claude CLI session.
 pub struct ClaudeSession {
@@ -77,6 +106,10 @@ pub struct ClaudeSession {
     persisted_output_len: Arc<AtomicUsize>,
     /// Sender for AI output deltas to persist to DB after each turn.
     turn_persist_tx: Option<mpsc::Sender<String>>,
+    /// Worktree metadata when this session has been promoted into an isolated
+    /// git worktree. `None` means the session is running in the original
+    /// working directory (the default for fresh sessions).
+    worktree: Option<WorktreeInfo>,
 }
 
 // SAFETY: ClaudeSession contains a raw Windows handle (RawHandle = *mut c_void) for the stdout
@@ -90,6 +123,11 @@ impl ClaudeSession {
     ///
     /// Performs the initialization handshake (sends `initialize` control request,
     /// waits for control response) before returning.
+    ///
+    /// When `worktree` is `Some`, `working_dir` MUST already be the worktree's
+    /// path — the CLI inherits its cwd from there and the metadata is stored on
+    /// the resulting session for downstream consumers (e.g. file registry).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         working_dir: &str,
         session_id: &str,
@@ -99,6 +137,7 @@ impl ClaudeSession {
         progress_ctx: Option<ProgressContext>,
         pid_tracker: Option<Arc<Mutex<Vec<u32>>>>,
         model_override: Option<&str>,
+        worktree: Option<WorktreeInfo>,
     ) -> Result<Self, String> {
         info!(
             "Spawning interactive Claude session: {} in {}",
@@ -333,6 +372,10 @@ impl ClaudeSession {
         let progress_ctx_for_stdout = progress_ctx.clone();
         let persist_tx_for_stdout = turn_persist_tx_option.clone();
         let persisted_len_for_stdout = persisted_output_len.clone();
+        // Worktree ID for file-registry scoping (None for unpromoted sessions).
+        // Cloned here so the stdout reader thread can move its own copy.
+        let worktree_id_for_stdout: Option<String> =
+            worktree.as_ref().map(|w| w.id.clone());
         // Fallback session ID for file locking when session_ctx is None (terminal sessions)
         let fallback_id_for_stdout = if session_ctx.is_none() {
             Some(session_id.to_string())
@@ -390,6 +433,7 @@ impl ClaudeSession {
                                 &persist_tx_for_stdout,
                                 &persisted_len_for_stdout,
                                 fallback_id_for_stdout.as_deref(),
+                                worktree_id_for_stdout.as_deref(),
                             ) {
                                 has_output_stdout.store(true, Ordering::Relaxed);
                                 all_text.push_str(&text);
@@ -892,6 +936,7 @@ impl ClaudeSession {
             completion_tx: Mutex::new(None),
             persisted_output_len,
             turn_persist_tx: turn_persist_tx_option,
+            worktree,
         })
     }
 
@@ -918,6 +963,18 @@ impl ClaudeSession {
     /// Whether a user has interacted with this session.
     pub fn has_user_interacted(&self) -> bool {
         self.user_has_interacted.load(Ordering::Relaxed)
+    }
+
+    /// Get a reference to this session's worktree metadata, if any.
+    ///
+    /// Returns `None` for sessions running in the original working directory.
+    /// Returns `Some(&info)` after `promote_to_worktree()` has succeeded — the
+    /// CLI process for this session has its `cwd` set to `info.path`.
+    ///
+    /// Phase 3 callers in dispatcher.rs use this to scope file-registry
+    /// entries: `session.worktree().map(|w| w.id.clone())`.
+    pub fn worktree(&self) -> Option<&WorktreeInfo> {
+        self.worktree.as_ref()
     }
 
     /// Send the initial prompt to start the first turn.
@@ -1139,6 +1196,204 @@ impl ClaudeSession {
         Ok(())
     }
 
+    /// Read this session's task output log from PG and build a replay prompt.
+    ///
+    /// Shared by `auto_restart_on_rate_limit` (account rotation) and
+    /// `promote_to_worktree` (worktree promotion) — both kill-and-respawn the
+    /// CLI process and need to give the new instance the prior conversation.
+    ///
+    /// Returns:
+    /// - `Ok(Some(prompt))` — there is history; send this as the initial prompt.
+    /// - `Ok(None)` — no `session_ctx`, empty output_log, or no parseable turns.
+    /// - `Err(BuildReplayErr::NoPg)` — PG global isn't initialized; caller
+    ///   typically aborts the respawn since persistence won't work either way.
+    fn build_replay_from_history(
+        session_id: &str,
+        session_ctx: Option<&AiSessionContext>,
+    ) -> Result<Option<String>, BuildReplayErr> {
+        use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
+
+        let ctx = match session_ctx {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let task_run_id = ctx.task_run_id();
+        let pg = match crate::database::pg::PgDb::try_global() {
+            Some(pg) => pg,
+            None => return Err(BuildReplayErr::NoPg),
+        };
+
+        let output_log =
+            tauri::async_runtime::block_on(pg.get_task_output(task_run_id)).unwrap_or_default();
+
+        if output_log.is_empty() {
+            info!("No conversation history to replay for session {}", session_id);
+            return Ok(None);
+        }
+
+        let turns = parse_conversation(&output_log);
+        if turns.is_empty() {
+            return Ok(None);
+        }
+
+        let replay = build_replay_prompt(&turns, None);
+        info!(
+            "Built replay prompt for session {} ({} turns, {} chars)",
+            session_id,
+            turns.len(),
+            replay.len()
+        );
+        Ok(Some(replay))
+    }
+
+    /// Promote a running session into an isolated git worktree.
+    ///
+    /// Sequence:
+    /// 1. Guard against double-promotion (early return if `worktree.is_some()`).
+    /// 2. Transition state Ready -> Promoting.
+    /// 3. Create the worktree on disk via `crate::worktree::create_worktree`.
+    /// 4. Persist a `worktrees` row (id = session_id + "-wt") via PG.
+    /// 5. Read conversation history and build a replay prompt (shared helper).
+    /// 6. Close the existing CLI process (cwd is immutable — kill + respawn).
+    /// 7. Spawn a fresh CLI with `cwd = worktree.path` and `worktree = Some(...)`.
+    /// 8. Send the replay prompt so the user does not lose context.
+    /// 9. Swap the new session into `*self` (state ends in Ready via spawn handshake).
+    ///
+    /// Phase 4 will expose this via an MCP command. Phase 3's dispatcher reads
+    /// `self.worktree()` so file-registry entries are scoped to the worktree.
+    pub async fn promote_to_worktree(
+        &mut self,
+        repo_path: &Path,
+        app_handle: &tauri::AppHandle,
+        session_ctx: Option<AiSessionContext>,
+    ) -> Result<WorktreeInfo, String> {
+        // 1. Already promoted? Return existing metadata unchanged.
+        if let Some(existing) = &self.worktree {
+            info!(
+                "Session {} already promoted to worktree {} (branch={}); skipping",
+                self.session_id, existing.id, existing.branch
+            );
+            return Ok(existing.clone());
+        }
+
+        // 2. Transition Ready -> Promoting (other states are user errors).
+        self.state_tracker
+            .transition(SessionState::Promoting)
+            .map_err(|e| format!("promote_to_worktree: {}", e))?;
+
+        // 3. Create the worktree on disk. Branch name is derived from session_id.
+        let create_result =
+            crate::worktree::create_worktree(repo_path, &self.session_id, &self.session_id)
+                .map_err(|e| {
+                    // Try to roll the state back so the session can keep working.
+                    let _ = self.state_tracker.transition(SessionState::Ready);
+                    format!("worktree creation failed: {}", e)
+                })?;
+
+        let worktree_id = format!("{}-wt", self.session_id);
+        let worktree_path = create_result.worktree_path.clone();
+        let worktree_path_str = worktree_path.to_string_lossy().to_string();
+        let branch_name = create_result.branch_name.clone();
+
+        // 4. Persist the worktree row. Best-effort: if PG fails we still proceed,
+        //    but log loudly — without a row Phase 3's file-registry scoping is
+        //    a no-op for this session.
+        let task_run_id = session_ctx.as_ref().map(|c| c.task_run_id().to_string());
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = crate::worktree::WorktreeRecord {
+            id: worktree_id.clone(),
+            worktree_path: worktree_path_str.clone(),
+            branch_name: branch_name.clone(),
+            source_branch: create_result.source_branch.clone(),
+            source_commit: create_result.source_commit.clone(),
+            repo_path: repo_path.to_string_lossy().to_string(),
+            task_run_id,
+            workflow_name: Some(self.session_id.clone()),
+            status: crate::worktree::WorktreeStatus::Active,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        if let Some(pg) = crate::database::pg::PgDb::try_global() {
+            if let Err(e) = pg.insert_worktree(&record).await {
+                warn!(
+                    "promote_to_worktree: failed to persist worktrees row {}: {}",
+                    worktree_id, e
+                );
+            }
+        } else {
+            warn!(
+                "promote_to_worktree: no PG global; worktrees row {} not persisted",
+                worktree_id
+            );
+        }
+
+        let info = WorktreeInfo {
+            id: worktree_id,
+            path: worktree_path,
+            branch: branch_name,
+        };
+
+        // 5. Read prior conversation so the new CLI can replay it.
+        let replay_prompt = match Self::build_replay_from_history(&self.session_id, session_ctx.as_ref()) {
+            Ok(prompt) => prompt,
+            Err(BuildReplayErr::NoPg) => {
+                warn!(
+                    "promote_to_worktree: no PG; respawning without replay context for {}",
+                    self.session_id
+                );
+                None
+            }
+        };
+
+        // 6. Kill the existing CLI. cwd is immutable; this is the only way to
+        //    move the process into the worktree.
+        if let Err(e) = self.close() {
+            warn!(
+                "promote_to_worktree: close() returned {} (continuing anyway)",
+                e
+            );
+        }
+
+        // 7. Spawn a fresh CLI with cwd = worktree.path and worktree metadata.
+        let session_id = self.session_id.clone();
+        let new_session = Self::spawn(
+            &worktree_path_str,
+            &session_id,
+            app_handle,
+            session_ctx,
+            None, // finding_ctx — re-attached by caller if needed
+            None, // progress_ctx
+            self.pid_tracker.clone(),
+            None, // model_override
+            Some(info.clone()),
+        )
+        .map_err(|e| format!("promote_to_worktree: respawn failed: {}", e))?;
+
+        // 8. Replay history, if any, BEFORE swapping into self. This way if the
+        //    initial prompt fails we know the in-place swap hasn't happened yet
+        //    and the caller gets a clean error.
+        if let Some(ref prompt) = replay_prompt {
+            if let Err(e) = new_session.send_initial_prompt(prompt) {
+                warn!(
+                    "promote_to_worktree: failed to send replay prompt: {} (proceeding)",
+                    e
+                );
+            }
+        }
+
+        // 9. Swap into self. The old struct's Drop runs, but state is already
+        //    Closed (force_close in close()), so it's a no-op.
+        *self = new_session;
+
+        info!(
+            "Session {} promoted to worktree {} (branch={}, path={})",
+            self.session_id, info.id, info.branch, worktree_path_str
+        );
+
+        Ok(info)
+    }
+
     /// Auto-restart the session on another account after a rate-limit exit.
     ///
     /// Reads conversation history from the DB output_log, rotates the account,
@@ -1150,7 +1405,6 @@ impl ClaudeSession {
         session_ctx: Option<&AiSessionContext>,
     ) {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
-        use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
         use tauri::Manager;
 
         // 1. Rotate to another account
@@ -1175,43 +1429,12 @@ impl ClaudeSession {
         );
 
         // 2. Read conversation history from DB
-        let conversation_context = if let Some(ctx) = session_ctx {
-            let task_run_id = ctx.task_run_id();
-
-            let pg = match crate::database::pg::PgDb::try_global() {
-                Some(pg) => pg,
-                None => {
-                    warn!("No PG connection for reading conversation history");
-                    return;
-                }
-            };
-
-            let output_log =
-                tauri::async_runtime::block_on(pg.get_task_output(task_run_id)).unwrap_or_default();
-
-            if output_log.is_empty() {
-                info!(
-                    "No conversation history to replay for session {}",
-                    session_id
-                );
-                None
-            } else {
-                let turns = parse_conversation(&output_log);
-                if turns.is_empty() {
-                    None
-                } else {
-                    let replay = build_replay_prompt(&turns, None);
-                    info!(
-                        "Built replay prompt for session {} ({} turns, {} chars)",
-                        session_id,
-                        turns.len(),
-                        replay.len()
-                    );
-                    Some(replay)
-                }
+        let conversation_context = match Self::build_replay_from_history(session_id, session_ctx) {
+            Ok(replay) => replay,
+            Err(BuildReplayErr::NoPg) => {
+                warn!("No PG connection for reading conversation history");
+                return;
             }
-        } else {
-            None
         };
 
         // 3. Spawn new session
@@ -1240,6 +1463,7 @@ impl ClaudeSession {
             None, // progress_ctx
             None, // pid_tracker
             None, // model_override
+            None, // worktree (rate-limit restart preserves the original cwd)
         ) {
             Ok(new_session) => {
                 let new_session = Arc::new(new_session);

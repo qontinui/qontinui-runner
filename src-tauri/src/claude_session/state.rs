@@ -22,6 +22,10 @@ pub enum SessionState {
     Processing,
     /// Interrupt requested, waiting for CLI to acknowledge.
     Interrupting,
+    /// Currently in the kill -> spawn transition for worktree promotion.
+    /// The old CLI process has been terminated and a new one is being
+    /// respawned with `cwd` set to a freshly-created git worktree path.
+    Promoting,
     /// Graceful shutdown in progress.
     Closing,
     /// Session fully closed.
@@ -36,6 +40,7 @@ impl fmt::Display for SessionState {
             SessionState::Ready => write!(f, "ready"),
             SessionState::Processing => write!(f, "processing"),
             SessionState::Interrupting => write!(f, "interrupting"),
+            SessionState::Promoting => write!(f, "promoting"),
             SessionState::Closing => write!(f, "closing"),
             SessionState::Closed => write!(f, "closed"),
         }
@@ -63,6 +68,12 @@ impl SessionState {
         !matches!(self, SessionState::Closing | SessionState::Closed)
     }
 
+    /// Whether the session is currently promoting to a worktree
+    /// (kill -> respawn transition in progress).
+    pub fn is_promoting(&self) -> bool {
+        matches!(self, SessionState::Promoting)
+    }
+
     /// Convert to the string used in frontend events.
     pub fn as_event_str(&self) -> &str {
         match self {
@@ -71,6 +82,7 @@ impl SessionState {
             SessionState::Ready => "ready",
             SessionState::Processing => "processing",
             SessionState::Interrupting => "interrupting",
+            SessionState::Promoting => "promoting",
             SessionState::Closing => "closing",
             SessionState::Closed => "closed",
         }
@@ -131,12 +143,17 @@ fn is_valid_transition(from: SessionState, to: SessionState) -> bool {
             | (Interrupting, Ready)
             // Interrupt
             | (Processing, Interrupting)
+            // Worktree promotion (kill -> respawn). Only valid from Ready;
+            // returns to Ready after a fresh CLI hands off via init handshake.
+            | (Ready, Promoting)
+            | (Promoting, Ready)
             // Closing from any active state
             | (Created, Closing)
             | (Initializing, Closing)
             | (Ready, Closing)
             | (Processing, Closing)
             | (Interrupting, Closing)
+            | (Promoting, Closing)
             | (Closing, Closed)
             // Direct close from any state (force_close)
             | (Created, Closed)
@@ -144,6 +161,7 @@ fn is_valid_transition(from: SessionState, to: SessionState) -> bool {
             | (Ready, Closed)
             | (Processing, Closed)
             | (Interrupting, Closed)
+            | (Promoting, Closed)
     )
 }
 
@@ -200,6 +218,43 @@ mod tests {
     }
 
     #[test]
+    fn test_promoting_flow() {
+        // Ready -> Promoting -> Ready (worktree promotion happy path).
+        let tracker = SessionStateTracker::new();
+        tracker.transition(SessionState::Initializing).unwrap();
+        tracker.transition(SessionState::Ready).unwrap();
+        tracker.transition(SessionState::Promoting).unwrap();
+        assert_eq!(tracker.get(), SessionState::Promoting);
+        assert!(tracker.get().is_promoting());
+        assert!(tracker.get().is_active());
+        tracker.transition(SessionState::Ready).unwrap();
+        assert_eq!(tracker.get(), SessionState::Ready);
+    }
+
+    #[test]
+    fn test_promoting_only_from_ready() {
+        // Cannot enter Promoting from Processing or Initializing.
+        let tracker = SessionStateTracker::new();
+        tracker.transition(SessionState::Initializing).unwrap();
+        assert!(tracker.transition(SessionState::Promoting).is_err());
+
+        tracker.transition(SessionState::Ready).unwrap();
+        tracker.transition(SessionState::Processing).unwrap();
+        assert!(tracker.transition(SessionState::Promoting).is_err());
+    }
+
+    #[test]
+    fn test_promoting_can_force_close() {
+        // force_close works from Promoting (e.g. respawn fails, caller aborts).
+        let tracker = SessionStateTracker::new();
+        tracker.transition(SessionState::Initializing).unwrap();
+        tracker.transition(SessionState::Ready).unwrap();
+        tracker.transition(SessionState::Promoting).unwrap();
+        let state = tracker.force_close();
+        assert_eq!(state, SessionState::Closed);
+    }
+
+    #[test]
     fn test_close_from_any_state() {
         // Can close from any state
         for initial in &[
@@ -208,6 +263,7 @@ mod tests {
             SessionState::Ready,
             SessionState::Processing,
             SessionState::Interrupting,
+            SessionState::Promoting,
         ] {
             let tracker = SessionStateTracker::new();
             // Get to the desired state
@@ -230,6 +286,11 @@ mod tests {
                     tracker.transition(SessionState::Ready).unwrap();
                     tracker.transition(SessionState::Processing).unwrap();
                     tracker.transition(SessionState::Interrupting).unwrap();
+                }
+                SessionState::Promoting => {
+                    tracker.transition(SessionState::Initializing).unwrap();
+                    tracker.transition(SessionState::Ready).unwrap();
+                    tracker.transition(SessionState::Promoting).unwrap();
                 }
                 _ => {}
             }

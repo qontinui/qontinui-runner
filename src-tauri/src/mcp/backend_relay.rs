@@ -631,6 +631,7 @@ async fn handle_relay_command(
                     None,
                     None,
                     None, // model_override
+                    None, // worktree
                 ) {
                     Ok(session) => {
                         let session = Arc::new(session);
