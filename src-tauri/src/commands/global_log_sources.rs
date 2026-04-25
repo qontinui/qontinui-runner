@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use crate::error::AppError;
 use crate::settings::{
     self, GlobalLogSource, GlobalLogSourceProfile, GlobalLogSourceSettings,
     LogSourceAiSelectionMode, LogSourceCategory,
@@ -34,16 +35,17 @@ use super::CommandResponse;
 /// Get all global log source settings
 #[tauri::command]
 pub fn get_global_log_sources() -> Result<CommandResponse, String> {
+    get_global_log_sources_impl().map_err(String::from)
+}
+
+fn get_global_log_sources_impl() -> Result<CommandResponse, AppError> {
     info!("Getting global log source settings");
     let settings = settings::get_global_log_source_settings();
 
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(
-            serde_json::to_value(&settings)
-                .map_err(|e| format!("Failed to serialize settings: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&settings)?),
     })
 }
 
@@ -52,6 +54,12 @@ pub fn get_global_log_sources() -> Result<CommandResponse, String> {
 pub fn save_global_log_sources(
     settings: GlobalLogSourceSettings,
 ) -> Result<CommandResponse, String> {
+    save_global_log_sources_impl(settings).map_err(String::from)
+}
+
+fn save_global_log_sources_impl(
+    settings: GlobalLogSourceSettings,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Saving global log source settings: {} sources, {} profiles",
         settings.sources.len(),
@@ -59,7 +67,7 @@ pub fn save_global_log_sources(
     );
 
     settings::save_global_log_source_settings(settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to save settings: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -81,6 +89,32 @@ pub fn add_global_log_source(
     color: Option<String>,
     keywords: Option<Vec<String>>,
 ) -> Result<CommandResponse, String> {
+    add_global_log_source_impl(
+        name,
+        description,
+        category,
+        source_type,
+        path,
+        pattern,
+        tail_lines,
+        color,
+        keywords,
+    )
+    .map_err(String::from)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_global_log_source_impl(
+    name: String,
+    description: String,
+    category: String,
+    source_type: String,
+    path: String,
+    pattern: Option<String>,
+    tail_lines: Option<u32>,
+    color: Option<String>,
+    keywords: Option<Vec<String>>,
+) -> Result<CommandResponse, AppError> {
     info!("Adding global log source: {}", name);
 
     let mut settings = settings::get_global_log_source_settings();
@@ -115,15 +149,12 @@ pub fn add_global_log_source(
     settings.sources.push(source);
 
     settings::save_global_log_source_settings(settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to save settings: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some("Log source added".to_string()),
-        data: Some(
-            serde_json::to_value(&created_source)
-                .map_err(|e| format!("Failed to serialize source: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&created_source)?),
     })
 }
 
@@ -142,6 +173,36 @@ pub fn update_global_log_source(
     color: Option<Option<String>>,
     keywords: Option<Vec<String>>,
 ) -> Result<CommandResponse, String> {
+    update_global_log_source_impl(
+        id,
+        name,
+        description,
+        category,
+        source_type,
+        path,
+        pattern,
+        tail_lines,
+        enabled,
+        color,
+        keywords,
+    )
+    .map_err(String::from)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_global_log_source_impl(
+    id: String,
+    name: Option<String>,
+    description: Option<String>,
+    category: Option<String>,
+    source_type: Option<String>,
+    path: Option<String>,
+    pattern: Option<Option<String>>,
+    tail_lines: Option<u32>,
+    enabled: Option<bool>,
+    color: Option<Option<String>>,
+    keywords: Option<Vec<String>>,
+) -> Result<CommandResponse, AppError> {
     info!("Updating global log source: {}", id);
 
     let mut settings = settings::get_global_log_source_settings();
@@ -150,7 +211,7 @@ pub fn update_global_log_source(
         .sources
         .iter_mut()
         .find(|s| s.id == id)
-        .ok_or_else(|| format!("Source '{}' not found", id))?;
+        .ok_or_else(|| AppError::Raw(format!("Source '{}' not found", id)))?;
 
     if let Some(n) = name {
         source.name = n;
@@ -187,21 +248,22 @@ pub fn update_global_log_source(
     let updated_source = source.clone();
 
     settings::save_global_log_source_settings(settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to save settings: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some("Log source updated".to_string()),
-        data: Some(
-            serde_json::to_value(&updated_source)
-                .map_err(|e| format!("Failed to serialize source: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&updated_source)?),
     })
 }
 
 /// Delete a log source
 #[tauri::command]
 pub fn delete_global_log_source(id: String) -> Result<CommandResponse, String> {
+    delete_global_log_source_impl(id).map_err(String::from)
+}
+
+fn delete_global_log_source_impl(id: String) -> Result<CommandResponse, AppError> {
     info!("Deleting global log source: {}", id);
 
     let mut settings = settings::get_global_log_source_settings();
@@ -210,7 +272,7 @@ pub fn delete_global_log_source(id: String) -> Result<CommandResponse, String> {
     settings.sources.retain(|s| s.id != id);
 
     if settings.sources.len() == initial_len {
-        return Err(format!("Source '{}' not found", id));
+        return Err(AppError::Raw(format!("Source '{}' not found", id)));
     }
 
     // Also remove from any profiles
@@ -219,7 +281,7 @@ pub fn delete_global_log_source(id: String) -> Result<CommandResponse, String> {
     }
 
     settings::save_global_log_source_settings(settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to save settings: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -239,6 +301,14 @@ pub fn create_global_log_source_profile(
     description: Option<String>,
     source_ids: Vec<String>,
 ) -> Result<CommandResponse, String> {
+    create_global_log_source_profile_impl(name, description, source_ids).map_err(String::from)
+}
+
+fn create_global_log_source_profile_impl(
+    name: String,
+    description: Option<String>,
+    source_ids: Vec<String>,
+) -> Result<CommandResponse, AppError> {
     info!("Creating global log source profile: {}", name);
 
     let mut settings = settings::get_global_log_source_settings();
@@ -262,15 +332,12 @@ pub fn create_global_log_source_profile(
     }
 
     settings::save_global_log_source_settings(settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to save settings: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some("Profile created".to_string()),
-        data: Some(
-            serde_json::to_value(&created_profile)
-                .map_err(|e| format!("Failed to serialize profile: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&created_profile)?),
     })
 }
 
@@ -282,6 +349,15 @@ pub fn update_global_log_source_profile(
     description: Option<Option<String>>,
     source_ids: Option<Vec<String>>,
 ) -> Result<CommandResponse, String> {
+    update_global_log_source_profile_impl(id, name, description, source_ids).map_err(String::from)
+}
+
+fn update_global_log_source_profile_impl(
+    id: String,
+    name: Option<String>,
+    description: Option<Option<String>>,
+    source_ids: Option<Vec<String>>,
+) -> Result<CommandResponse, AppError> {
     info!("Updating global log source profile: {}", id);
 
     let mut settings = settings::get_global_log_source_settings();
@@ -290,7 +366,7 @@ pub fn update_global_log_source_profile(
         .profiles
         .iter_mut()
         .find(|p| p.id == id)
-        .ok_or_else(|| format!("Profile '{}' not found", id))?;
+        .ok_or_else(|| AppError::Raw(format!("Profile '{}' not found", id)))?;
 
     if let Some(n) = name {
         profile.name = n;
@@ -306,21 +382,22 @@ pub fn update_global_log_source_profile(
     let updated_profile = profile.clone();
 
     settings::save_global_log_source_settings(settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to save settings: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some("Profile updated".to_string()),
-        data: Some(
-            serde_json::to_value(&updated_profile)
-                .map_err(|e| format!("Failed to serialize profile: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&updated_profile)?),
     })
 }
 
 /// Delete a profile
 #[tauri::command]
 pub fn delete_global_log_source_profile(id: String) -> Result<CommandResponse, String> {
+    delete_global_log_source_profile_impl(id).map_err(String::from)
+}
+
+fn delete_global_log_source_profile_impl(id: String) -> Result<CommandResponse, AppError> {
     info!("Deleting global log source profile: {}", id);
 
     let mut settings = settings::get_global_log_source_settings();
@@ -329,7 +406,7 @@ pub fn delete_global_log_source_profile(id: String) -> Result<CommandResponse, S
     settings.profiles.retain(|p| p.id != id);
 
     if settings.profiles.len() == initial_len {
-        return Err(format!("Profile '{}' not found", id));
+        return Err(AppError::Raw(format!("Profile '{}' not found", id)));
     }
 
     // Clear default if we deleted it
@@ -338,7 +415,7 @@ pub fn delete_global_log_source_profile(id: String) -> Result<CommandResponse, S
     }
 
     settings::save_global_log_source_settings(settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to save settings: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -352,6 +429,12 @@ pub fn delete_global_log_source_profile(id: String) -> Result<CommandResponse, S
 pub fn set_default_log_source_profile(
     profile_id: Option<String>,
 ) -> Result<CommandResponse, String> {
+    set_default_log_source_profile_impl(profile_id).map_err(String::from)
+}
+
+fn set_default_log_source_profile_impl(
+    profile_id: Option<String>,
+) -> Result<CommandResponse, AppError> {
     info!("Setting default log source profile: {:?}", profile_id);
 
     let mut settings = settings::get_global_log_source_settings();
@@ -359,14 +442,14 @@ pub fn set_default_log_source_profile(
     // Verify profile exists if setting one
     if let Some(ref pid) = profile_id {
         if !settings.profiles.iter().any(|p| p.id == *pid) {
-            return Err(format!("Profile '{}' not found", pid));
+            return Err(AppError::Raw(format!("Profile '{}' not found", pid)));
         }
     }
 
     settings.default_profile_id = profile_id;
 
     settings::save_global_log_source_settings(settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to save settings: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -378,19 +461,23 @@ pub fn set_default_log_source_profile(
 /// Set the AI selection mode
 #[tauri::command]
 pub fn set_log_source_ai_selection_mode(mode: String) -> Result<CommandResponse, String> {
+    set_log_source_ai_selection_mode_impl(mode).map_err(String::from)
+}
+
+fn set_log_source_ai_selection_mode_impl(mode: String) -> Result<CommandResponse, AppError> {
     info!("Setting log source AI selection mode: {}", mode);
 
     let mut settings = settings::get_global_log_source_settings();
 
     settings.ai_selection_mode = serde_json::from_str(&format!("\"{}\"", mode)).map_err(|_| {
-        format!(
+        AppError::ValidationError(format!(
             "Invalid mode '{}'. Use 'dynamic', 'static', or 'disabled'",
             mode
-        )
+        ))
     })?;
 
     settings::save_global_log_source_settings(settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+        .map_err(|e| AppError::ConfigError(format!("Failed to save settings: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -418,6 +505,10 @@ pub struct LogSourceContent {
 /// Read content from specific log sources by ID
 #[tauri::command]
 pub fn read_global_log_sources(source_ids: Vec<String>) -> Result<CommandResponse, String> {
+    read_global_log_sources_impl(source_ids).map_err(String::from)
+}
+
+fn read_global_log_sources_impl(source_ids: Vec<String>) -> Result<CommandResponse, AppError> {
     debug!("Reading global log sources: {:?}", source_ids);
 
     let settings = settings::get_global_log_source_settings();
@@ -435,16 +526,19 @@ pub fn read_global_log_sources(source_ids: Vec<String>) -> Result<CommandRespons
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(
-            serde_json::to_value(&contents)
-                .map_err(|e| format!("Failed to serialize contents: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&contents)?),
     })
 }
 
 /// Read content from all enabled sources in a profile
 #[tauri::command]
 pub fn read_log_sources_by_profile(profile_id: Option<String>) -> Result<CommandResponse, String> {
+    read_log_sources_by_profile_impl(profile_id).map_err(String::from)
+}
+
+fn read_log_sources_by_profile_impl(
+    profile_id: Option<String>,
+) -> Result<CommandResponse, AppError> {
     debug!("Reading log sources by profile: {:?}", profile_id);
 
     let sources = settings::get_enabled_log_sources(profile_id.as_deref());
@@ -458,10 +552,7 @@ pub fn read_log_sources_by_profile(profile_id: Option<String>) -> Result<Command
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(
-            serde_json::to_value(&contents)
-                .map_err(|e| format!("Failed to serialize contents: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&contents)?),
     })
 }
 
@@ -653,6 +744,8 @@ pub fn migrate_project_sources_to_global_impl() -> Result<u32, String> {
     info!("Migrated {} log sources to global", migrated_count);
     Ok(migrated_count)
 }
+// Note: migrate_project_sources_to_global_impl above keeps `Result<u32, String>`
+// because it is called from external HTTP handlers expecting that signature.
 
 /// Migrate sources from per-project configs to global
 /// This is a one-time migration that deduplicates sources by path
@@ -714,6 +807,12 @@ pub struct SelectionReason {
 pub fn select_log_sources_for_context(
     context: LogSourceSelectionContext,
 ) -> Result<CommandResponse, String> {
+    select_log_sources_for_context_impl(context).map_err(String::from)
+}
+
+fn select_log_sources_for_context_impl(
+    context: LogSourceSelectionContext,
+) -> Result<CommandResponse, AppError> {
     info!("Selecting log sources for context: {:?}", context);
 
     let settings = settings::get_global_log_source_settings();
@@ -725,21 +824,18 @@ pub fn select_log_sources_for_context(
         return Ok(CommandResponse {
             success: true,
             message: Some("AI selection disabled, using profile/all sources".to_string()),
-            data: Some(
-                serde_json::to_value(LogSourceSelectionResult {
-                    selected_source_ids: sources.iter().map(|s| s.id.clone()).collect(),
-                    selection_reasons: sources
-                        .iter()
-                        .map(|s| SelectionReason {
-                            source_id: s.id.clone(),
-                            source_name: s.name.clone(),
-                            reason: "AI selection disabled".to_string(),
-                        })
-                        .collect(),
-                    ai_selection_used: false,
-                })
-                .map_err(|e| format!("Failed to serialize result: {}", e))?,
-            ),
+            data: Some(serde_json::to_value(LogSourceSelectionResult {
+                selected_source_ids: sources.iter().map(|s| s.id.clone()).collect(),
+                selection_reasons: sources
+                    .iter()
+                    .map(|s| SelectionReason {
+                        source_id: s.id.clone(),
+                        source_name: s.name.clone(),
+                        reason: "AI selection disabled".to_string(),
+                    })
+                    .collect(),
+                ai_selection_used: false,
+            })?),
         });
     }
 
@@ -752,10 +848,7 @@ pub fn select_log_sources_for_context(
             "Selected {} sources",
             result.selected_source_ids.len()
         )),
-        data: Some(
-            serde_json::to_value(result)
-                .map_err(|e| format!("Failed to serialize result: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(result)?),
     })
 }
 
