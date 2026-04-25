@@ -94,6 +94,7 @@ import runnerTriggersSpec from "../specs/triggers.spec.uibridge.json";
 import runnerTurixCuaMultimodalSpec from "../specs/turix-cua-multimodal.spec.uibridge.json";
 import runnerUnifiedSearchSpec from "../specs/unified-search.spec.uibridge.json";
 import runnerWatchersSpec from "../specs/watchers.spec.uibridge.json";
+import runnerWrappersSpec from "../specs/wrappers.spec.uibridge.json";
 import runnerWorkflowCriteriaSpec from "../specs/workflow-criteria.spec.uibridge.json";
 import runnerWorkflowVersionsSpec from "../specs/workflow-versions.spec.uibridge.json";
 import runnerWorkflowsSpec from "../specs/workflows.spec.uibridge.json";
@@ -302,6 +303,7 @@ const ALL_SPECS: RawSpec[] = [
   },
   { specId: "runner:unified-search", appName: "Qontinui Runner", json: runnerUnifiedSearchSpec },
   { specId: "runner:watchers", appName: "Qontinui Runner", json: runnerWatchersSpec },
+  { specId: "runner:wrappers", appName: "Qontinui Runner", json: runnerWrappersSpec },
   {
     specId: "runner:workflow-criteria",
     appName: "Qontinui Runner",

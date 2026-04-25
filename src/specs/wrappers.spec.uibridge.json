@@ -1,0 +1,874 @@
+{
+  "version": "1.0.0",
+  "description": "The Wrappers Library page lists installed wrapper extensions and lets users discover/install new ones from the public registry. Wrappers are first-class extensions that add typed actions to the runner — think MCP servers, but native. The page has two tabs (Installed / Browse) and is the entry point to per-wrapper detail views (Actions, Settings, Logs, About). Backed by the runner's HTTP endpoints under /wrappers/* (registry, install, lifecycle, dispatch).",
+  "metadata": {
+    "component": "WrappersLibraryPage",
+    "pageUrl": "wrappers",
+    "tags": ["wrappers", "extensions", "registry", "install", "library"]
+  },
+  "groups": [
+    {
+      "id": "page-structure",
+      "name": "Page Structure & Layout",
+      "description": "The page uses a centered max-width container with a header, tab bar, and content area. Layout is consistent with other refined runner pages (UI Bridge, etc.) — max-w-[1024px] container, padded content, dark theme.",
+      "category": "layout",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "wrappers-page-mounted",
+          "description": "The Wrappers page renders inside the runner's tab content area when the 'wrappers' tab is active. The outer container has data-page-id='wrappers'.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataAttributes": { "page-id": "wrappers" } },
+            "label": "Wrappers page container"
+          },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wrappers-page-heading-visible",
+          "description": "The page displays an h1 heading with the text 'Wrappers'. This is the canonical title users see when they land on the page.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers heading"
+          },
+          "assertionType": "visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wrappers-page-description",
+          "description": "Below the heading, a small paragraph explains what wrappers are: 'Install wrapper extensions to give the runner new typed actions — think MCP servers, but first-class.'",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Install wrapper extensions to give the runner" },
+            "label": "Page description paragraph"
+          },
+          "assertionType": "visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "header-icon-tile",
+      "name": "Header Icon Tile",
+      "description": "The header includes a 36×36 cyan-tinted icon tile holding a Package icon — this matches the 'icon-tile' visual pattern established on the UI Bridge integration page.",
+      "category": "design",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "header-icon-tile-styling",
+          "description": "The icon tile is rounded with a cyan tint, matching the established header pattern. The icon itself is the lucide Package icon in cyan-400.",
+          "category": "design",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers heading (visual neighbor of the icon tile)"
+          },
+          "assertionType": "semantic",
+          "precondition": "The Wrappers page is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "tab-navigation",
+      "name": "Tab Navigation (Installed / Browse)",
+      "description": "Two tabs at the top of the content area let users switch between viewing installed wrappers and browsing the public registry. The active tab is indicated by a cyan-400 underline and cyan-400 text color. The Installed tab also shows a count badge of installed wrappers when > 0.",
+      "category": "navigation",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "installed-tab-button-exists",
+          "description": "An 'Installed' tab button is present and clickable.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "label": "Installed tab button"
+          },
+          "assertionType": "visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "browse-tab-button-exists",
+          "description": "A 'Browse' tab button is present and clickable.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Browse" },
+            "label": "Browse tab button"
+          },
+          "assertionType": "visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "tab-switch-behavior",
+          "description": "Clicking the Browse tab switches the content area from the Installed grid (or its empty/loading state) to the Browse content (search input + registry list). Clicking Installed switches it back. The active tab is visually distinct (cyan text + cyan underline at the bottom of the button).",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Browse" },
+            "label": "Browse tab button"
+          },
+          "assertionType": "behavior",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "installed-tab-count-badge",
+          "description": "When at least one wrapper is installed, the Installed tab button shows a small pill-shaped count badge to the right of the label (e.g., '2'). When zero wrappers are installed, no badge is rendered.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "label": "Installed tab button"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one wrapper is installed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "installed-tab-empty-state",
+      "name": "Installed Tab — Empty State",
+      "description": "When no wrappers are installed, the Installed tab renders an empty-state card with a dashed border, a Package icon-tile, the heading 'No wrappers installed yet', and a hint pointing the user to the Browse tab.",
+      "category": "data-display",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "empty-state-heading",
+          "description": "Empty-state heading reads 'No wrappers installed yet'.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "No wrappers installed yet" },
+            "label": "Empty-state heading"
+          },
+          "assertionType": "visible",
+          "precondition": "No wrappers are installed and the Installed tab is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "empty-state-hint-text",
+          "description": "Empty-state body text directs the user to the Browse tab: 'Switch to the Browse tab to discover wrappers from the public registry, or install one directly via the API.'",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Switch to the Browse tab to discover wrappers" },
+            "label": "Empty-state hint paragraph"
+          },
+          "assertionType": "visible",
+          "precondition": "No wrappers are installed and the Installed tab is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "installed-tab-loading-error",
+      "name": "Installed Tab — Loading & Error States",
+      "description": "While the wrapper list is being fetched from GET /wrappers, a centered spinner with the text 'Loading installed wrappers…' is shown. If the fetch fails, an error card is shown with a Retry button that re-runs the fetch.",
+      "category": "data-display",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "installed-loading-text",
+          "description": "While GET /wrappers is in flight on initial load (or after a refreshKey bump from install), the Installed tab shows a Loader2 spinner and the text 'Loading installed wrappers…'.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Loading installed wrappers" },
+            "label": "Installed loading message"
+          },
+          "assertionType": "visible",
+          "precondition": "GET /wrappers is in flight",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "installed-error-card",
+          "description": "If GET /wrappers fails, an error card with a red AlertTriangle icon is shown. The card displays 'Failed to load installed wrappers' and the underlying error message. A Retry button re-runs the fetch.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Failed to load installed wrappers" },
+            "label": "Installed-tab error card"
+          },
+          "assertionType": "visible",
+          "precondition": "GET /wrappers returned an error",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "installed-error-retry",
+          "description": "Clicking Retry inside the installed-tab error card re-runs the GET /wrappers fetch. If the second attempt succeeds, the error card is replaced by the wrapper grid (or empty state).",
+          "category": "interaction",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Retry" },
+            "label": "Retry button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Installed-tab error card is visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "installed-tab-card-grid",
+      "name": "Installed Tab — Wrapper Card Grid",
+      "description": "When wrappers are installed, the Installed tab renders a 1- or 2-column grid (responsive on md+) of wrapper cards. Each card displays the wrapper's display name, package name + version, description (line-clamped to 2 lines), transport badge, status badge, action count, a three-dot menu for lifecycle actions, and an Open button.",
+      "category": "data-display",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "wrapper-card-count-matches-list",
+          "description": "The number of wrapper cards rendered equals the number of wrappers returned by GET /wrappers. If the API returns 3 wrappers, exactly 3 cards are rendered. Cards are sorted alphabetically by displayName (or by id when displayName is missing).",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers page (count check anchor)"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one wrapper is installed and the Installed tab is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wrapper-card-displays-name-and-package",
+          "description": "Each wrapper card shows a name (manifest.displayName, falls back to wrapper id) and the package name + version (e.g., '@qontinui/wrapper-v0 v0.1.0') in monospace.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers page (card content anchor)"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one wrapper is installed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wrapper-card-shows-status-and-transport",
+          "description": "Each card shows a TransportBadge (e.g., 'api') and a StatusBadge whose color reflects the live status: running (green-tinted), idle (muted), error (red-tinted), degraded (yellow-tinted), unknown (gray). Status is polled every 10s while the tab is mounted.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers page (badge anchor)"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one wrapper is installed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wrapper-card-action-count",
+          "description": "Each card shows an action count summarizing how many actions the wrapper exposes (e.g., '5 actions' or '1 action'). The count comes from wrapper.actions.length.",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "actions" },
+            "label": "Action count text"
+          },
+          "assertionType": "exists",
+          "precondition": "At least one wrapper is installed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wrapper-card-actions-menu",
+          "description": "Each card has a three-dot 'Wrapper actions' button (lucide MoreVertical). Clicking it opens a dropdown menu with: Start (if not running) OR Stop (if running), Update, Uninstall (red, destructive). Selecting Uninstall first prompts via window.confirm before calling DELETE /wrappers/:id.",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "accessibleName": "Wrapper actions" },
+            "label": "Wrapper actions menu trigger"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one wrapper is installed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wrapper-card-open-navigates-to-detail",
+          "description": "Clicking the 'Open' button on a wrapper card navigates to the per-wrapper detail view (Actions / Settings / Logs / About tabs) for that wrapper. The library page state is preserved so the back button on the detail page returns to the Installed tab unchanged.",
+          "category": "navigation",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Open" },
+            "label": "Open wrapper button"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one wrapper is installed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wrapper-card-highlight-after-install",
+          "description": "After a successful install in the Browse tab, the page switches to the Installed tab and the newly installed card is briefly outlined with a cyan ring (border-cyan-500/60 + ring-2 ring-cyan-500/30) for ~4 seconds before fading.",
+          "category": "interaction",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers page (highlight check anchor)"
+          },
+          "assertionType": "behavior",
+          "precondition": "An install completed in the Browse tab in the last 4 seconds",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "browse-tab-search",
+      "name": "Browse Tab — Search & Refresh",
+      "description": "The Browse tab has a search input (with a Search icon prefix) and a Refresh button next to it. Search filters the registry entries by id, package, displayName, description, categories, or author name (case-insensitive substring match). Refresh forces a re-fetch of the registry, bypassing the 24h cache.",
+      "category": "interaction",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "browse-search-input-exists",
+          "description": "A search text input is present with the placeholder 'Search wrappers by name, category, or author'.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "placeholder": "Search wrappers by name, category, or author"
+            },
+            "label": "Browse search input"
+          },
+          "assertionType": "visible",
+          "precondition": "The Browse tab is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "browse-search-filters-list",
+          "description": "Typing a query into the search input filters the registry list in real-time. The query matches case-insensitively against id, package, displayName, description, categories, and author.name. When no entries match, the no-results state is shown ('No wrappers match \"<query>\".').",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "placeholder": "Search wrappers by name, category, or author"
+            },
+            "label": "Browse search input"
+          },
+          "assertionType": "behavior",
+          "precondition": "Browse tab is active and the registry has at least one entry",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "browse-refresh-button",
+          "description": "A Refresh button to the right of the search input forces a fresh fetch of the registry (bypassing the cache). While the fetch is in flight, the icon spins and the button is disabled.",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Refresh" },
+            "label": "Refresh registry button"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Browse tab is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "browse-tab-states",
+      "name": "Browse Tab — Loading / Error / Empty States",
+      "description": "The Browse tab handles three non-populated states: a loading spinner while fetching the registry, an error card if the fetch fails, and an empty/no-results state when the registry is empty or the search query matches nothing.",
+      "category": "data-display",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "browse-loading-text",
+          "description": "While GET /wrappers/registry is in flight, the Browse tab shows a Loader2 spinner and the text 'Loading registry…'.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Loading registry" },
+            "label": "Registry loading message"
+          },
+          "assertionType": "visible",
+          "precondition": "Registry fetch is in flight",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "browse-error-card",
+          "description": "If the registry fetch fails, an error card with the heading 'Couldn't reach the registry' and the underlying error message is shown.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "reach the registry" },
+            "label": "Registry error card"
+          },
+          "assertionType": "visible",
+          "precondition": "Registry fetch failed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "browse-empty-state",
+          "description": "When the registry returns zero entries OR the search query has no matches, an empty-state card is rendered. Without a query, it reads 'The registry is empty (or hasn't been populated yet).'. With a query, it reads 'No wrappers match \"<query>\".'.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "registry is empty" },
+            "label": "Empty registry message"
+          },
+          "assertionType": "visible",
+          "precondition": "The registry is empty AND the Browse tab is active AND no search query is set",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "browse-tab-entries",
+      "name": "Browse Tab — Registry Entries",
+      "description": "Each registry entry is rendered as a list item showing the wrapper's displayName, an optional 'verified' badge (with ShieldCheck icon, emerald-tinted), the author name, the npm package name + version (monospace), description, category chips, an optional repo link (with ExternalLink icon), a TransportBadge, and an Install button.",
+      "category": "data-display",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "registry-entry-shows-displayname",
+          "description": "Each registry entry's heading is its displayName from the registry.json (e.g., 'Vercel v0', 'Gmail').",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "li" },
+            "label": "Registry entry list item"
+          },
+          "assertionType": "semantic",
+          "precondition": "The Browse tab is active and at least one registry entry is loaded",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "registry-entry-package-and-version",
+          "description": "Each registry entry shows the npm package name + version range in monospace immediately under the heading (e.g., '@qontinui/wrapper-v0 >=0.1.0').",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "li" },
+            "label": "Registry entry"
+          },
+          "assertionType": "semantic",
+          "precondition": "The Browse tab is active and at least one registry entry is loaded",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "registry-entry-verified-badge",
+          "description": "Entries with verified=true show an emerald-tinted 'VERIFIED' pill with a ShieldCheck icon next to the displayName. Entries without verified do NOT show this pill.",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "verified" },
+            "label": "Verified badge"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one registry entry has verified=true",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "registry-entry-categories",
+          "description": "Each entry's categories array is rendered as a row of small uppercase pills (e.g., 'AI', 'FRONTEND'). Entries with no categories simply omit the pill row.",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "li" },
+            "label": "Registry entry"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one registry entry has non-empty categories",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "registry-entry-install-button",
+          "description": "Each entry has an Install button (gradient cyan-to-purple, with a lucide Download icon). Clicking it POSTs /wrappers/install with the entry's package name. While installing, the button is disabled and shows a spinner + 'Installing…'. On success, the parent's onInstalled callback fires (switching to Installed tab + highlighting the new card). On failure, the button re-enables and an inline error message is shown beneath the entry.",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Install" },
+            "label": "Install registry entry button"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Browse tab is active and at least one not-yet-installed registry entry exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "registry-entry-already-installed",
+          "description": "If a registry entry's id matches an already-installed wrapper, the Install button is replaced with a disabled 'Installed' button (no spinner, no download icon, muted styling).",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "label": "Already-installed indicator"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one registry entry has the same id as an installed wrapper",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "registry-entry-repo-link",
+          "description": "Entries with a 'repo' field render a small 'repo' link with an ExternalLink icon. The link opens the repo URL in a new tab (target='_blank' rel='noopener noreferrer').",
+          "category": "navigation",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "repo" },
+            "label": "Repo external link"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one registry entry has a non-empty repo URL",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "visual-typography",
+      "name": "Visual Design — Typography",
+      "description": "Heading hierarchy: h1 'Wrappers' is text-2xl + font-bold + tracking-tight. Section headings (e.g., 'No wrappers installed yet') are h3 + text-sm + font-semibold. Body text is text-xs muted. Package names are font-mono.",
+      "category": "design",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "page-heading-typography",
+          "description": "The h1 'Wrappers' heading uses text-2xl (24px) with font-bold and tracking-tight. The element's color is the foreground token (legible against the dark page background).",
+          "category": "design",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers h1"
+          },
+          "assertionType": "cssPropertyInSet",
+          "propertyName": "font-size",
+          "expected": ["24px", "1.5rem"],
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "description-text-muted",
+          "description": "The page-description paragraph and other secondary text use the muted-foreground color token. This ensures secondary content is legible but visually subordinate to headings.",
+          "category": "design",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Install wrapper extensions"
+            },
+            "label": "Page description paragraph"
+          },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "visual-color-scheme",
+      "name": "Visual Design — Color Scheme",
+      "description": "Cyan-400 is the primary accent (active tab, icon-tile borders, links, ring highlights). Cyan-to-purple gradient is reserved for primary action buttons (Install). Status badges use semantic colors: green for running, red for error, yellow for degraded.",
+      "category": "design",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "active-tab-uses-cyan",
+          "description": "The active tab button text color is cyan-400 (the runner's primary accent token). Inactive tabs use muted-foreground. The active tab also has a 0.5px cyan-400 underline at the bottom (positioned absolute inset-x-3 bottom-[-1px]).",
+          "category": "design",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "label": "Active Installed tab"
+          },
+          "assertionType": "semantic",
+          "precondition": "The Installed tab is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "install-button-gradient",
+          "description": "The primary Install button on each registry entry uses a cyan-to-purple linear gradient (from-cyan-600 to-purple-600) with white text — the same gradient established by the UI Bridge integration page's primary CTA. On hover the gradient shifts lighter (from-cyan-500 to-purple-500).",
+          "category": "design",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Install" },
+            "label": "Install button"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one registry entry is rendered with an enabled Install button",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "visual-spacing-layout",
+      "name": "Visual Design — Spacing & Layout",
+      "description": "The content is constrained to a centered max-w-[1024px] container with px-4/sm:px-6 horizontal padding and py-8 vertical padding. Inside the container, a flex column with gap-4 spaces the header / tab bar / content. Wrapper cards in the Installed grid use gap-4 and switch from 1 column to 2 columns at md+.",
+      "category": "layout",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "max-width-container",
+          "description": "The page content sits inside a centered container capped at 1024px wide (max-w-[1024px]). Wider viewports do NOT cause the cards/tabs to stretch full-width — this is the consistent visual identity established for refined runner pages.",
+          "category": "layout",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers heading (anchor for layout assertion)"
+          },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "card-grid-responsive",
+          "description": "The Installed-tab card grid is 1 column on small screens and 2 columns on md+ (≥768px). Cards within the grid have gap-4 spacing.",
+          "category": "layout",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers page (grid anchor)"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least 2 wrappers are installed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "data-correctness",
+      "name": "Data Correctness — Installed list reflects backend",
+      "description": "The Installed tab is the user's window into the runner's wrapper subsystem. What the page shows MUST match what the backend reports. These assertions specify the contract between the UI and GET /wrappers / GET /wrappers/:id/status.",
+      "category": "state-consistency",
+      "source": "ai-generated",
+      "assertions": [
+        {
+          "id": "installed-list-equals-backend",
+          "description": "The set of wrapper card displayNames + ids on the Installed tab equals the set returned by GET /wrappers (success envelope's `data` array, mapped by id). Cards never include wrappers not returned by the API; the API never includes wrappers not rendered as cards. Mismatch indicates either a stale cache or a registry/backend inconsistency.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers page (correctness anchor)"
+          },
+          "assertionType": "semantic",
+          "precondition": "The Installed tab is active and the runner is reachable",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "tab-count-matches-card-count",
+          "description": "The numeric badge on the Installed tab button equals the number of wrapper cards rendered in the grid. If the badge shows '3', exactly 3 cards must be on screen when the tab is active. Mismatch indicates a stale `installedIds` set vs the live wrapper list.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "label": "Installed tab button (count anchor)"
+          },
+          "assertionType": "semantic",
+          "precondition": "The Installed tab is active and at least one wrapper is installed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "status-badge-matches-status-endpoint",
+          "description": "Each card's StatusBadge color/label must match the latest poll response from GET /wrappers/:id/status. Status is polled every 10s while the Installed tab is mounted. A 'running' badge while the backend reports 'idle' (or vice versa) indicates a polling-loop bug.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "label": "Wrappers page (status anchor)"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one wrapper is installed and the Installed tab is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "registry-installed-state-cross-reference",
+          "description": "On the Browse tab, an entry shows 'Installed' (disabled, muted) iff its `id` is in the parent's installedIds set, which is derived from GET /wrappers. If GET /wrappers includes an id that has a Browse entry, that entry MUST show 'Installed'; otherwise it MUST show the Install gradient button. Drift between these two surfaces indicates the parent's id-sync useEffect is broken.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "button", "textContent": "Browse" },
+            "label": "Browse tab button (cross-ref anchor)"
+          },
+          "assertionType": "semantic",
+          "precondition": "The Browse tab is active and at least one registry entry shares an id with an installed wrapper",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "wrappers-installed-tab",
+        "name": "Installed Tab",
+        "description": "Default view. The Installed tab is active and the page renders either the empty-state card, the loading spinner, the error card, or the wrapper card grid — whichever matches the backend state.",
+        "elements": [
+          { "dataAttributes": { "page-id": "wrappers" } },
+          { "role": "heading", "textContent": "Wrappers" },
+          { "tagName": "button", "textContent": "Installed" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "installed-to-browse",
+            "name": "Switch to Browse tab",
+            "description": "Click the Browse tab button. The content area swaps to the Browse view (search + registry list).",
+            "activateStates": ["wrappers-browse-tab"],
+            "deactivateStates": ["wrappers-installed-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "tagName": "button", "textContent": "Browse" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "wrappers-browse-tab",
+        "name": "Browse Tab",
+        "description": "The Browse tab is active. The search input + registry list are visible.",
+        "elements": [
+          { "dataAttributes": { "page-id": "wrappers" } },
+          { "role": "heading", "textContent": "Wrappers" },
+          { "placeholder": "Search wrappers by name, category, or author" }
+        ],
+        "transitions": [
+          {
+            "id": "browse-to-installed",
+            "name": "Switch to Installed tab",
+            "description": "Click the Installed tab button to return to the local-wrappers grid.",
+            "activateStates": ["wrappers-installed-tab"],
+            "deactivateStates": ["wrappers-browse-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "tagName": "button", "textContent": "Installed" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
