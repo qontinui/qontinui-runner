@@ -26,9 +26,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Json,
 };
+use reqwest::Method;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
+use crate::mcp::app_dispatch::AppDispatcher;
+use crate::mcp::app_registry::{AppRegistry, AppTransport};
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
 use super::helpers::{
@@ -947,23 +950,233 @@ pub async fn ui_bridge_execute_action_handler(
     result
 }
 
+// ----------------------------------------------------------------------------
+// Phase A1 (wrapper-Builder fix): WS-aware component handlers.
+//
+// `POST /ui-bridge/control/component/{id}/action/{action_id}` and the two
+// companion read endpoints used to Tauri-IPC into the runner's React frontend
+// unconditionally. That frontend only knows about its own React tree, so
+// WebSocket-registered wrapper apps (Phase 1 wrapper framework) were
+// unreachable through the canonical `/control/` surface — the wrapper plan's
+// stated orchestration model claims this path works for wrappers.
+//
+// The helpers below let each handler consult `AppRegistry` first. When the
+// caller's `id` matches a `Websocket`-transport registered app, we dispatch
+// the command over its `/ui-bridge/ws` socket via `AppDispatcher`. Otherwise
+// we fall through to the existing IPC path so runner-internal React
+// components continue to behave exactly as before.
+//
+// Tie-break rule for ID collisions (extremely unlikely but possible — e.g. a
+// wrapper named "terminal"): WS wins. Runner-internal IDs are kebab-cased
+// React component names like `nav-button-terminal`; wrapper IDs are typically
+// domain-named (`gmail`, `v0`, `test-wrapper`).
+//
+// On WS dispatch error we deliberately do NOT fall through to IPC. The
+// wrapper has registered as the owner of that id; falling back would
+// silently address the runner-frontend's React tree instead and produce
+// confusing results.
+// ----------------------------------------------------------------------------
+
+/// Outcome of a WS-first lookup against `AppRegistry` and dispatch through
+/// `AppDispatcher`.
+///
+/// - `None` — no WS-transport entry exists for this id; caller should fall
+///   through to IPC.
+/// - `Some(Ok(value))` — the registered wrapper handled the command.
+/// - `Some(Err(message))` — the wrapper is registered as WS but dispatch
+///   failed (disconnected, timeout, transport error). Caller MUST surface
+///   the error and NOT fall through to IPC.
+async fn try_ws_dispatch_for_app(
+    registry: &AppRegistry,
+    dispatcher: &AppDispatcher,
+    app_id: &str,
+    action: &str,
+    http_method: Method,
+    http_path: &str,
+    payload: serde_json::Value,
+) -> Option<Result<serde_json::Value, String>> {
+    let entry = registry.get(app_id).await?;
+    if entry.transport != AppTransport::Websocket {
+        return None;
+    }
+    debug!(
+        "[ui-bridge/elements] {} via WS → app_id='{}' (path={})",
+        action, app_id, http_path
+    );
+    Some(
+        dispatcher
+            .dispatch(app_id, action, http_method, http_path, payload)
+            .await
+            .map_err(|e| e.to_user_message()),
+    )
+}
+
+/// Iterate every live WS-transport app and ask each for its components list.
+/// Errors from any individual app are logged but not propagated, so a single
+/// flaky wrapper cannot abort the merged response. Used by the LIST endpoint
+/// only.
+async fn ws_collect_components(
+    registry: &AppRegistry,
+    dispatcher: &AppDispatcher,
+) -> Vec<serde_json::Value> {
+    let live = registry.list_live().await;
+    let mut out = Vec::new();
+    for entry in live {
+        if entry.transport != AppTransport::Websocket {
+            continue;
+        }
+        let app_id = entry.app.app_id.clone();
+        match dispatcher
+            .dispatch(
+                &app_id,
+                "getComponents",
+                Method::GET,
+                "/ui-bridge/control/components",
+                serde_json::json!({}),
+            )
+            .await
+        {
+            Ok(value) => {
+                // Wrappers may either return a bare array or wrap it in
+                // `{success, data}` / `{components: [...]}`. Accept any of
+                // those shapes and append the contained items.
+                if let Some(arr) = value.as_array() {
+                    out.extend(arr.iter().cloned());
+                } else if let Some(arr) = value.get("data").and_then(|v| v.as_array()) {
+                    out.extend(arr.iter().cloned());
+                } else if let Some(arr) = value.get("components").and_then(|v| v.as_array()) {
+                    out.extend(arr.iter().cloned());
+                } else if value.is_object() {
+                    // Single-component object — push as-is.
+                    out.push(value);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[ui-bridge/elements] getComponents WS dispatch to '{}' failed: {}",
+                    app_id, e
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Build a flat 400 error response from a WS dispatch failure. Mirrors the
+/// shape `wrap_ipc_result` produces for inner-failure envelopes so callers
+/// see a consistent error contract regardless of transport.
+fn ws_dispatch_error_response(
+    error_msg: String,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    let detail = classify_transport_error(&error_msg);
+    (
+        StatusCode::BAD_REQUEST,
+        Json(api_error_detailed(error_msg, detail)),
+    )
+}
+
 /// Get all registered components.
+///
+/// Phase A1 merge behavior: returns the IPC component list (runner-internal
+/// React components) concatenated with the components reported by every live
+/// WebSocket-transport registered app (wrappers). IPC entries come first;
+/// per-wrapper errors during the WS fan-out are logged but never abort the
+/// merged response, so a flaky wrapper degrades gracefully. Both bare-array
+/// and `{data: [...]}` / `{components: [...]}` shapes from wrappers are
+/// accepted and unwrapped.
 pub async fn ui_bridge_get_components_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting all components");
 
-    wrap_ipc_result(
-        ui_bridge_request_sync(&state, "get_components", serde_json::json!({})).await,
-    )
+    // Fan out to WS-transport wrappers in parallel with the IPC call.
+    let registry = state.app_registry.clone();
+    let dispatcher = state.app_dispatcher.clone();
+    let ws_future = async move { ws_collect_components(&registry, &dispatcher).await };
+    let ipc_future = ui_bridge_request_sync(&state, "get_components", serde_json::json!({}));
+    let (ipc_result, mut ws_components) = tokio::join!(ipc_future, ws_future);
+
+    // Surface IPC transport errors normally — but if IPC is broken AND we
+    // do have WS components, prefer to return the WS list rather than 5xx,
+    // since wrapper components are the more interesting payload for callers
+    // that explicitly registered them.
+    let mut merged: Vec<serde_json::Value> = match ipc_result {
+        Ok(ipc_data) => {
+            // The frontend can return either a bare array or a wrapped
+            // `{components: [...]}` / `{data: {components: [...]}}` shape.
+            // Defensive extraction mirrors `ws_collect_components` above.
+            if let Some(arr) = ipc_data.as_array() {
+                arr.iter().cloned().collect()
+            } else if let Some(arr) = ipc_data.get("data").and_then(|v| v.as_array()) {
+                arr.iter().cloned().collect()
+            } else if let Some(arr) = ipc_data.get("components").and_then(|v| v.as_array()) {
+                arr.iter().cloned().collect()
+            } else if let Some(arr) = ipc_data
+                .get("data")
+                .and_then(|d| d.get("components"))
+                .and_then(|v| v.as_array())
+            {
+                arr.iter().cloned().collect()
+            } else if ipc_data.is_object() {
+                vec![ipc_data]
+            } else {
+                Vec::new()
+            }
+        }
+        Err(e) => {
+            if ws_components.is_empty() {
+                // Pure-IPC environment: surface the transport error.
+                let detail = classify_transport_error(&e);
+                let status = match detail.code {
+                    super::types::UiBridgeErrorCode::FrontendNotReady => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                error!("UI Bridge API: get_components IPC failed: {}", e);
+                return Err((status, Json(api_error_detailed(e, detail))));
+            } else {
+                warn!(
+                    "UI Bridge API: get_components IPC failed ({}); returning {} WS-only components",
+                    e,
+                    ws_components.len()
+                );
+                Vec::new()
+            }
+        }
+    };
+
+    merged.append(&mut ws_components);
+    Ok(Json(ApiResponse::success(serde_json::Value::Array(merged))))
 }
 
 /// Get a specific component by ID.
+///
+/// Phase A1: WS-transport registered apps win over the IPC path when their
+/// `appId` matches the URL `id` segment.
 pub async fn ui_bridge_get_component_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting component {}", id);
+
+    let ws_path = format!("/ui-bridge/control/component/{}", id);
+    if let Some(ws_outcome) = try_ws_dispatch_for_app(
+        &state.app_registry,
+        &state.app_dispatcher,
+        &id,
+        "getComponent",
+        Method::GET,
+        &ws_path,
+        serde_json::json!({ "componentId": id }),
+    )
+    .await
+    {
+        return match ws_outcome {
+            Ok(value) => Ok(Json(ApiResponse::success(value))),
+            Err(e) => Err(ws_dispatch_error_response(e)),
+        };
+    }
 
     wrap_ipc_result(
         ui_bridge_request_sync(
@@ -976,6 +1189,12 @@ pub async fn ui_bridge_get_component_handler(
 }
 
 /// Execute an action on a component.
+///
+/// Phase A1: WS-transport registered apps win over the IPC path when their
+/// `appId` matches the URL `id` segment. WS dispatch failures are surfaced
+/// directly (no IPC fallback), because the wrapper has registered as the
+/// owner of that id and falling back would silently target the runner-
+/// frontend's React tree instead.
 pub async fn ui_bridge_execute_component_action_handler(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
@@ -991,6 +1210,24 @@ pub async fn ui_bridge_execute_component_action_handler(
         "actionId": action_id,
         "params": request.params
     });
+
+    let ws_path = format!("/ui-bridge/control/component/{}/action/{}", id, action_id);
+    if let Some(ws_outcome) = try_ws_dispatch_for_app(
+        &state.app_registry,
+        &state.app_dispatcher,
+        &id,
+        "executeComponentAction",
+        Method::POST,
+        &ws_path,
+        payload.clone(),
+    )
+    .await
+    {
+        return match ws_outcome {
+            Ok(value) => Ok(Json(ApiResponse::success(value))),
+            Err(e) => Err(ws_dispatch_error_response(e)),
+        };
+    }
 
     wrap_ipc_result(ui_bridge_request_sync(&state, "execute_component_action", payload).await)
 }
@@ -2469,5 +2706,321 @@ mod wait_for_element_state_tests {
             let req = ok(json!({ "elementId": "x", "state": state }));
             assert_eq!(req.state, state, "state {state} should round-trip");
         }
+    }
+}
+
+// ============================================================================
+// Phase A1: WS-vs-IPC dispatch tests for the component handlers.
+//
+// These exercise `try_ws_dispatch_for_app` and `ws_collect_components`
+// directly because constructing a full `ApiState` for axum router-level
+// integration tests is heavy. The handlers themselves are 5-line wrappers
+// around these helpers plus an unchanged IPC fallback, so what matters for
+// regression coverage is proving:
+//
+//   1. WS-transport apps: dispatch goes over the websocket and the relayed
+//      response surfaces back unchanged.
+//   2. ID-collision: when an HTTP-transport app and a WS-transport app share
+//      a name (or no app exists), the WS branch is only taken for true
+//      WS-transport entries — `try_ws_dispatch_for_app` returns `None` for
+//      Http and unregistered ids, so handlers correctly fall through.
+//   3. Fallback: when no entry exists, the helper returns `None` so the
+//      handler's IPC path runs.
+//
+// These three guarantees together prove the WS-vs-IPC selection rule that
+// Phase A1 introduces.
+// ============================================================================
+#[cfg(test)]
+mod ws_dispatch_selection_tests {
+    use super::{try_ws_dispatch_for_app, ws_collect_components};
+    use crate::mcp::app_discovery::DiscoveredApp;
+    use crate::mcp::app_dispatch::AppDispatcher;
+    use crate::mcp::app_registry::{AppRegistry, AppTransport};
+    use crate::mcp::command_relay::{CommandRelay, CommandResponse};
+    use crate::mcp::ws_relay::WsConnectionManager;
+    use reqwest::Method;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn sample_app(app_id: &str) -> DiscoveredApp {
+        DiscoveredApp {
+            app_id: app_id.to_string(),
+            app_name: app_id.to_string(),
+            app_type: "web".into(),
+            framework: None,
+            url: "http://unused".into(),
+            port: 0,
+            base_path: "".into(),
+            version: None,
+            capabilities: vec![],
+            element_count: None,
+            component_count: None,
+            discovered_at: 0,
+        }
+    }
+
+    /// Test 1 — WS-vs-IPC dispatch: register a WS-transport wrapper, call the
+    /// helper that the action handler uses, and prove the WS path was taken
+    /// (a frame appears on the relay's outbound channel, the wrapper resolves
+    /// it, and the helper returns the resolved value as `Some(Ok(_))`).
+    #[tokio::test]
+    async fn ws_dispatch_for_app_routes_websocket_traffic() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn_id, mut outbound_rx) = ws.test_register("test-wrapper").await;
+        registry
+            .upsert(
+                sample_app("test-wrapper"),
+                None,
+                AppTransport::Websocket,
+                Some(7),
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        // Spawn the dispatcher call so we can play wrapper on the other end.
+        let registry_handle = registry.clone();
+        let dispatcher_handle = dispatcher.clone();
+        let dispatch_fut = tokio::spawn(async move {
+            try_ws_dispatch_for_app(
+                &registry_handle,
+                &dispatcher_handle,
+                "test-wrapper",
+                "executeComponentAction",
+                Method::POST,
+                "/ui-bridge/control/component/test-wrapper/action/echo",
+                json!({
+                    "componentId": "test-wrapper",
+                    "actionId": "echo",
+                    "params": { "input": "hi" }
+                }),
+            )
+            .await
+        });
+
+        // Pull the outbound frame the dispatcher pushed to the wrapper.
+        let frame = outbound_rx.recv().await.expect("frame must arrive");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let command_id = v["commandId"].as_str().unwrap().to_string();
+        assert_eq!(v["action"], "executeComponentAction");
+        assert_eq!(v["payload"]["actionId"], "echo");
+        assert_eq!(v["payload"]["params"]["input"], "hi");
+
+        // Resolve as the wrapper would.
+        relay
+            .resolve(CommandResponse {
+                command_id,
+                success: true,
+                result: Some(json!({ "output": "hi" })),
+                error: None,
+            })
+            .await;
+
+        let outcome = dispatch_fut.await.unwrap();
+        match outcome {
+            Some(Ok(value)) => assert_eq!(value, json!({ "output": "hi" })),
+            other => panic!("expected Some(Ok(...)) from WS dispatch, got: {:?}", other),
+        }
+    }
+
+    /// Test 2 — ID collision: register a WS-transport wrapper named
+    /// `terminal` (a name that collides in spirit with a runner-internal
+    /// React component id). The helper used by the action handler must take
+    /// the WS path. Then verify that an HTTP-transport entry with the same
+    /// id triggers `None` (so the IPC fallback in the handler would run) —
+    /// proving the read paths the runner-internal `terminal` component owns
+    /// are not silently rerouted to a non-existent WS connection.
+    #[tokio::test]
+    async fn id_collision_ws_wins_for_action_endpoint_only() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn_id, mut outbound_rx) = ws.test_register("terminal").await;
+        registry
+            .upsert(
+                sample_app("terminal"),
+                None,
+                AppTransport::Websocket,
+                Some(99),
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        // Action handler path → must take WS branch.
+        let r1 = registry.clone();
+        let d1 = dispatcher.clone();
+        let action_fut = tokio::spawn(async move {
+            try_ws_dispatch_for_app(
+                &r1,
+                &d1,
+                "terminal",
+                "executeComponentAction",
+                Method::POST,
+                "/ui-bridge/control/component/terminal/action/run",
+                json!({ "componentId": "terminal", "actionId": "run", "params": {} }),
+            )
+            .await
+        });
+        let frame = outbound_rx.recv().await.expect("WS frame must arrive");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let command_id = v["commandId"].as_str().unwrap().to_string();
+        relay
+            .resolve(CommandResponse {
+                command_id,
+                success: true,
+                result: Some(json!({ "ran": true })),
+                error: None,
+            })
+            .await;
+        match action_fut.await.unwrap() {
+            Some(Ok(value)) => assert_eq!(value, json!({ "ran": true })),
+            other => panic!("expected WS to win on action endpoint, got: {:?}", other),
+        }
+
+        // Now overwrite registration with HTTP transport for the same id.
+        // Helpers MUST return `None` so the action handler would fall
+        // through to its IPC path — proving the WS-wins rule applies only
+        // to true WS-transport registrations, not to any registered id.
+        registry
+            .upsert(sample_app("terminal"), None, AppTransport::Http, None)
+            .await;
+        let none_outcome = try_ws_dispatch_for_app(
+            &registry,
+            &dispatcher,
+            "terminal",
+            "executeComponentAction",
+            Method::POST,
+            "/ui-bridge/control/component/terminal/action/run",
+            json!({}),
+        )
+        .await;
+        assert!(
+            none_outcome.is_none(),
+            "HTTP-transport entry must NOT take the WS branch; got: {:?}",
+            none_outcome
+        );
+    }
+
+    /// Test 3 — Fallback: with no entry in `AppRegistry`, the helper returns
+    /// `None` and the handler's IPC path takes over. We assert no frame
+    /// reaches the relay's outbound channel (would be visible as a
+    /// `try_recv()` Ok, since WS dispatch never fires).
+    #[tokio::test]
+    async fn no_registration_falls_back_to_ipc() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        // We register a WS connection for a DIFFERENT app to prove the
+        // helper consults the id, not just any-WS-app-is-registered.
+        let (_conn_id, mut outbound_rx) = ws.test_register("other-app").await;
+        registry
+            .upsert(
+                sample_app("other-app"),
+                None,
+                AppTransport::Websocket,
+                Some(13),
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay);
+
+        let outcome = try_ws_dispatch_for_app(
+            &registry,
+            &dispatcher,
+            "unregistered-id",
+            "executeComponentAction",
+            Method::POST,
+            "/ui-bridge/control/component/unregistered-id/action/x",
+            json!({}),
+        )
+        .await;
+        assert!(
+            outcome.is_none(),
+            "unregistered id must return None so IPC fallback runs"
+        );
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "no WS frame must have been dispatched"
+        );
+    }
+
+    /// Test 4 — `ws_collect_components` merges WS app responses while
+    /// degrading gracefully: a non-WS app contributes nothing, and a wrapper
+    /// returning a bare array or a `{components: [...]}` object is
+    /// unwrapped and concatenated.
+    #[tokio::test]
+    async fn ws_collect_components_merges_live_wrappers() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_a_conn, mut a_rx) = ws.test_register("alpha").await;
+        let (_b_conn, mut b_rx) = ws.test_register("beta").await;
+        registry
+            .upsert(sample_app("alpha"), None, AppTransport::Websocket, Some(1))
+            .await;
+        registry
+            .upsert(sample_app("beta"), None, AppTransport::Websocket, Some(2))
+            .await;
+        // An HTTP-transport entry should be ignored entirely by
+        // `ws_collect_components`.
+        registry
+            .upsert(sample_app("legacy-http"), None, AppTransport::Http, None)
+            .await;
+
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        let registry_h = registry.clone();
+        let dispatcher_h = dispatcher.clone();
+        let collect_fut =
+            tokio::spawn(async move { ws_collect_components(&registry_h, &dispatcher_h).await });
+
+        // `ws_collect_components` dispatches to each WS app SEQUENTIALLY
+        // (it awaits each dispatch before moving to the next app), and
+        // HashMap iteration order is unspecified. So we cannot assume the
+        // dispatcher will hit alpha before beta — instead, we race both
+        // receivers and resolve whichever arrives, twice. The wrapper-name
+        // determines the response payload shape so each is exercised.
+        let relay_for_resolve = relay.clone();
+        let resolve_one = |frame: String, app_id: &str| {
+            let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            let cmd = v["commandId"].as_str().unwrap().to_string();
+            let result = if app_id == "alpha" {
+                // Bare array shape from the frame's payload context.
+                json!([{ "id": "alpha-1" }, { "id": "alpha-2" }])
+            } else {
+                // `{components: [...]}` shape.
+                json!({ "components": [{ "id": "beta-1" }] })
+            };
+            let relay_h = relay_for_resolve.clone();
+            async move {
+                relay_h
+                    .resolve(CommandResponse {
+                        command_id: cmd,
+                        success: true,
+                        result: Some(result),
+                        error: None,
+                    })
+                    .await;
+            }
+        };
+
+        // Resolve frames in the order they're produced, regardless of
+        // which receiver fires first.
+        for _ in 0..2 {
+            tokio::select! {
+                Some(frame) = a_rx.recv() => resolve_one(frame, "alpha").await,
+                Some(frame) = b_rx.recv() => resolve_one(frame, "beta").await,
+            }
+        }
+
+        let merged = collect_fut.await.unwrap();
+        // Order between alpha and beta is unspecified; assert membership.
+        let ids: std::collections::BTreeSet<String> = merged
+            .iter()
+            .filter_map(|v| v.get("id").and_then(|s| s.as_str()).map(String::from))
+            .collect();
+        let expected: std::collections::BTreeSet<String> =
+            ["alpha-1", "alpha-2", "beta-1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(ids, expected, "merged ids must contain every WS component");
     }
 }
