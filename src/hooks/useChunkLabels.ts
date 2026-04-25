@@ -56,7 +56,6 @@ export function useChunkLabels(configId: string | null): UseChunkLabelsResult {
 
   useEffect(() => {
     if (!configId || !isTauriAvailable()) {
-      setLabels(new Map());
       return;
     }
     let cancelled = false;
@@ -78,6 +77,7 @@ export function useChunkLabels(configId: string | null): UseChunkLabelsResult {
       });
     return () => {
       cancelled = true;
+      setLabels(new Map());
     };
   }, [configId]);
 
