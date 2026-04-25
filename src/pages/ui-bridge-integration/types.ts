@@ -7,6 +7,8 @@ export type Framework =
   | "angular"
   | "svelte"
   | "plain_html"
+  | "expo_router"
+  | "react_native"
   | "unknown";
 
 export type PackageManager = "npm" | "yarn" | "pnpm" | "bun" | "unknown";
@@ -21,7 +23,7 @@ export type IntegrationHealthStatus = "active" | "disconnected" | "outdated";
 
 export interface EntryPoint {
   path: string;
-  entry_type: "app_root" | "layout" | "index_html" | "main";
+  entry_type: "app_root" | "layout" | "tabs_layout" | "index_html" | "main";
 }
 
 export interface ProjectAnalysis {
