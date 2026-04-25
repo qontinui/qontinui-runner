@@ -318,6 +318,158 @@ export function useAISearchEvents(
           return true;
         }
 
+        case "wait_for_element_state_predicate": {
+          // M1 — element-level state polling. Shares the same registry as
+          // `wait_for_element_registered` but evaluates a richer set of
+          // declarative predicates (visible / enabled / value-not-empty / ...)
+          // exported from `@qontinui/ui-bridge/ai`.
+          //
+          // The Rust handler validates + clamps the body before forwarding;
+          // we still defensively re-clamp here in case the SDK ever evolves
+          // independently. Predicate logic comes from the SDK to keep the
+          // SDK's own unit tests authoritative.
+          const { evaluateElementPredicate, pollWaitForElement, snapshotFromRegisteredElement } =
+            await import("@qontinui/ui-bridge/ai");
+
+          const p = (payload.params ?? payload.body ?? {}) as {
+            elementId?: string;
+            selector?: string;
+            state?: string;
+            timeoutMs?: number;
+            pollMs?: number;
+          };
+          const elementId =
+            typeof p.elementId === "string" && p.elementId.length > 0 ? p.elementId : null;
+          const selector =
+            typeof p.selector === "string" && p.selector.length > 0 ? p.selector : null;
+          const predicateState = p.state as Parameters<typeof evaluateElementPredicate>[1];
+          const timeoutMs = Math.min(
+            Math.max(typeof p.timeoutMs === "number" ? p.timeoutMs : 5000, 0),
+            30_000,
+          );
+          const pollMs = Math.max(typeof p.pollMs === "number" ? p.pollMs : 50, 10);
+
+          // Project a registry row → snapshot. Re-resolved each poll so
+          // mid-wait re-renders / re-registrations are picked up.
+          const findRegistered = (): {
+            row: {
+              id: string;
+              type?: unknown;
+              label?: string;
+              element?: HTMLElement;
+              getState?: () => unknown;
+            } | null;
+          } => {
+            const registry = (
+              currentBridge as unknown as {
+                registry?: {
+                  getElement?: (id: string) => unknown;
+                  getAllElements?: () => Array<{
+                    id: string;
+                    type?: unknown;
+                    label?: string;
+                    element?: HTMLElement;
+                    getState?: () => unknown;
+                  }>;
+                } | null;
+              }
+            ).registry;
+            if (!registry) return { row: null };
+
+            // 1) elementId direct lookup.
+            if (elementId && registry.getElement) {
+              const direct = registry.getElement(elementId) as {
+                id: string;
+                type?: unknown;
+                label?: string;
+                element?: HTMLElement;
+                getState?: () => unknown;
+              } | null;
+              if (direct) return { row: direct };
+            }
+            // 2) Selector → DOM → reverse-lookup by data-ui-bridge-id, falling
+            // back to a synthetic row if nothing in the registry matches.
+            if (selector) {
+              try {
+                const dom = document.querySelector(selector) as HTMLElement | null;
+                if (dom) {
+                  const bridgeId = dom.getAttribute("data-ui-bridge-id");
+                  if (bridgeId && registry.getElement) {
+                    const matched = registry.getElement(bridgeId) as {
+                      id: string;
+                      type?: unknown;
+                      label?: string;
+                      element?: HTMLElement;
+                      getState?: () => unknown;
+                    } | null;
+                    if (matched) return { row: matched };
+                  }
+                }
+              } catch {
+                /* invalid selector — treat as miss */
+              }
+            }
+            return { row: null };
+          };
+
+          const takeSnapshot = () => {
+            const { row } = findRegistered();
+            // `snapshotFromRegisteredElement` tolerates `null` and surfaces
+            // `{ registered: false, state: null }` for the absent path.
+            return snapshotFromRegisteredElement(
+              (row as unknown as Parameters<typeof snapshotFromRegisteredElement>[0]) ?? null,
+            );
+          };
+
+          const outcome = await pollWaitForElement({
+            takeSnapshot,
+            predicate: predicateState,
+            timeoutMs,
+            pollMs,
+          });
+
+          // Project the registered element (if any) into the response shape.
+          const finalRow = findRegistered().row;
+          const serialize = (
+            row: typeof finalRow,
+            snap: ReturnType<typeof takeSnapshot> | null,
+          ) => ({
+            id: row?.id ?? elementId ?? "",
+            type: row?.type,
+            label: row?.label,
+            registered: snap?.registered ?? false,
+            fromRegistry: snap?.registered ?? false,
+            state: snap?.state ?? null,
+          });
+
+          if (outcome.found) {
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                found: true,
+                durationMs: outcome.durationMs,
+                finalState: serialize(finalRow, outcome.observed),
+              },
+              timestamp: Date.now(),
+            });
+          } else {
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                found: false,
+                durationMs: outcome.durationMs,
+                lastObservedState: outcome.observed ? serialize(finalRow, outcome.observed) : null,
+              },
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
         case "wait_for_element_by_condition": {
           // Tier 3.1 companion to the Rust forwarder
           // (qontinui-runner/src-tauri/src/mcp/ui_bridge.rs::ui_bridge_wait_for_element_condition_handler).

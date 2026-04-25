@@ -3,6 +3,8 @@ import type { BridgeSnapshot } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
 import { createLogger } from "@/lib/logger";
+import { ACTIVE_TAB_STORAGE_KEY } from "@/components/app/tab-types";
+import { instanceStorage } from "@/lib/instance-storage";
 
 const logger = createLogger("UIBridgeDiscoveryEvents");
 
@@ -175,6 +177,15 @@ export function useDiscoveryEvents(
           // to produce URLs callers can hit directly.
           const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync(50, {
             componentBasePath: "/ui-bridge/control/component",
+            // F1 — supply the runner's active-tab provider so cross-tab
+            // automation can read both `route` and `activeTab` from a single
+            // snapshot. The runner's tab system stores its active tab in
+            // instanceStorage under `ACTIVE_TAB_STORAGE_KEY` (the same key
+            // the `tabs_list` IPC handler reads), so this matches whatever
+            // `tab_activate` last set. Falls back to "prompt-home" — the
+            // initial tab the runner shell selects on first launch — when
+            // nothing is persisted yet.
+            getActiveTab: () => instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home",
           });
           logger.debug(`get_snapshot: snapshot created (${snapshot.elements.length} elements)`);
 

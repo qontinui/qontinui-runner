@@ -77,6 +77,7 @@ export type UIBridgeRequestType =
   | "find"
   | "wait_for_element_by_condition"
   | "wait_for_element_registered"
+  | "wait_for_element_state_predicate"
   | "get_workflows"
   | "get_element_state"
   // Workflow execution
@@ -373,6 +374,7 @@ export type AISearchEventTypes =
   | "ai_search"
   | "ai_find"
   | "wait_for_element_registered"
+  | "wait_for_element_state_predicate"
   | "wait_for_element_by_condition"
   | "ai_execute"
   | "ai_assert"

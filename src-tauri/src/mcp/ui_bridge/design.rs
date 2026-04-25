@@ -107,7 +107,40 @@ pub async fn ui_bridge_design_responsive_handler(
     }
 }
 
+/// F2 — Two-tier envelope flattening for design-audit responses.
+///
+/// The frontend handler in `useDesignEvents.ts` returns
+/// `{success:false, error:"..."}` inside the IPC `data` payload when the audit
+/// can't run (e.g. no style guide loaded). Without unwrapping, the HTTP
+/// response would carry the misleading shape
+/// `{success:true, data:{success:false, error:"..."}}` — outer success says
+/// "IPC delivered", inner success says "the operation actually failed".
+/// Callers had to defensively peek at `data.success` to detect failure.
+///
+/// This helper detects the inner-failure shape and returns the inner error
+/// string so the route handler can convert it to a flat HTTP 400 with
+/// `{success:false, error:"..."}`. Returns `None` on a healthy success
+/// payload (or when `success` is absent — some response shapes don't include
+/// it and we shouldn't misclassify those as failures).
+pub(super) fn unwrap_inner_audit_error(data: &serde_json::Value) -> Option<String> {
+    if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        let msg = data
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("design audit failed")
+            .to_string();
+        Some(msg)
+    } else {
+        None
+    }
+}
+
 /// Run a style audit against a loaded or provided style guide.
+///
+/// On inner-error responses (see `unwrap_inner_audit_error`), this returns
+/// HTTP 400 with a flat `{success:false, error:"..."}` body instead of the
+/// historical two-tier envelope. The happy path is unchanged: HTTP 200 with
+/// `{success:true, data:<audit report>}`.
 pub async fn ui_bridge_design_audit_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
@@ -117,7 +150,17 @@ pub async fn ui_bridge_design_audit_handler(
     let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
 
     match ui_bridge_request_sync(&state, "design_run_audit", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(data) => {
+            // F2: flatten two-tier envelope. The frontend handler emits
+            // `{success:false, error:...}` inside `data` for soft failures
+            // like "no style guide loaded". Surface that as a flat HTTP 400
+            // so callers don't have to inspect `data.success` themselves.
+            if let Some(inner_err) = unwrap_inner_audit_error(&data) {
+                error!("UI Bridge API: Design audit inner failure: {}", inner_err);
+                return Err((StatusCode::BAD_REQUEST, Json(api_error(inner_err))));
+            }
+            Ok(Json(ApiResponse::success(data)))
+        }
         Err(e) => {
             error!("UI Bridge API: Design audit failed: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
@@ -237,4 +280,78 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/design/style-guide/clear"),
         ("POST", "/ui-bridge/ai/design-audit"),
     ]
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod design_audit_envelope_tests {
+    //! F2 — Regression tests for the two-tier envelope flattening on
+    //! `POST /ui-bridge/ai/design-audit`. The handler can't be exercised
+    //! end-to-end without a live frontend + Tauri runtime, so these tests
+    //! lock down the pure unwrap helper that the handler delegates to.
+    //!
+    //! Same shape as `page_navigate_mode_tests`: poke the helper through its
+    //! decision points (inner-failure → Some(msg), healthy success → None,
+    //! missing fields → safe defaults).
+    use super::unwrap_inner_audit_error;
+
+    #[test]
+    fn inner_failure_with_explicit_error_is_unwrapped() {
+        // The exact wire shape observed during manual testing 2026-04-25 when
+        // posting to /ai/design-audit without first loading a style guide.
+        let data = serde_json::json!({
+            "error": "No style guide provided or loaded. Load one with design_load_style_guide first, or pass a guide in the request.",
+            "requestId": "req-123",
+            "success": false,
+            "timestamp": 1745552000000_i64,
+            "type": "design_run_audit",
+        });
+        let err = unwrap_inner_audit_error(&data).expect("inner failure must unwrap");
+        assert!(err.contains("No style guide provided or loaded"));
+        assert!(err.contains("design_load_style_guide"));
+    }
+
+    #[test]
+    fn inner_failure_without_error_falls_back_to_default() {
+        // Defensive: success:false but no error field shouldn't drop the
+        // failure signal — we still return Some(_) so the handler sends a 400.
+        let data = serde_json::json!({"success": false});
+        let err = unwrap_inner_audit_error(&data).expect("must still flag failure");
+        assert_eq!(err, "design audit failed");
+    }
+
+    #[test]
+    fn healthy_success_payload_returns_none() {
+        // The audit-report happy path: success:true with results. The
+        // handler must NOT convert this into an HTTP 400.
+        let data = serde_json::json!({
+            "success": true,
+            "report": {
+                "violations": [],
+                "elementsChecked": 42,
+            },
+        });
+        assert!(unwrap_inner_audit_error(&data).is_none());
+    }
+
+    #[test]
+    fn payload_without_success_field_returns_none() {
+        // Some IPC responses don't include `success` at all — those should
+        // pass through to the success arm rather than be misclassified.
+        let data = serde_json::json!({"report": {"violations": []}});
+        assert!(unwrap_inner_audit_error(&data).is_none());
+    }
+
+    #[test]
+    fn success_field_with_non_bool_value_returns_none() {
+        // Robustness: if `success` is a string or number, treat it as
+        // "shape unknown, don't flag failure" rather than panicking.
+        let data = serde_json::json!({"success": "true"});
+        assert!(unwrap_inner_audit_error(&data).is_none());
+        let data = serde_json::json!({"success": 1});
+        assert!(unwrap_inner_audit_error(&data).is_none());
+    }
 }
