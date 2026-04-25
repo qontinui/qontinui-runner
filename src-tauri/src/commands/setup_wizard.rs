@@ -4,6 +4,7 @@
 //! Discovery operations call the qontinui-setup-mcp CLI via subprocess
 //! (works offline, no AI connection required).
 
+use crate::error::AppError;
 use crate::settings::{self, AiProvider, CliExecutionMode, GlobalLogSource};
 use serde_json::Value;
 
@@ -122,9 +123,12 @@ fn run_setup_cli(args: &[&str]) -> Result<Value, String> {
         );
     }
 
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to run setup CLI: {}", e))?;
+    let output = cmd.output().map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "Failed to run setup CLI: {}",
+            e
+        )))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -133,7 +137,12 @@ fn run_setup_cli(args: &[&str]) -> Result<Value, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse setup CLI output: {}", e))
+    serde_json::from_str(&stdout).map_err(|e| {
+        String::from(AppError::ParseError(format!(
+            "Failed to parse setup CLI output: {}",
+            e
+        )))
+    })
 }
 
 // ============================================================================
@@ -152,7 +161,7 @@ pub async fn scan_workspace_for_setup(
         run_setup_cli(&["scan_workspace", &path, "--max-depth", &depth])
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))?
+    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
 }
 
 /// Detect the framework used by a project
@@ -161,7 +170,7 @@ pub async fn detect_project_framework_for_setup(project_path: String) -> Result<
     info!("Setup wizard: detecting framework at {}", project_path);
     tokio::task::spawn_blocking(move || run_setup_cli(&["detect_framework", &project_path]))
         .await
-        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
 }
 
 /// Suggest log sources for a project
@@ -170,7 +179,7 @@ pub async fn suggest_log_sources_for_setup(project_path: String) -> Result<Value
     info!("Setup wizard: suggesting log sources for {}", project_path);
     tokio::task::spawn_blocking(move || run_setup_cli(&["suggest_log_sources", &project_path]))
         .await
-        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
 }
 
 /// Suggest workspace-level dev-log sources (.dev-logs/ directory)
@@ -184,7 +193,7 @@ pub async fn suggest_workspace_sources_for_setup(workspace_path: String) -> Resu
         run_setup_cli(&["suggest_workspace_sources", &workspace_path])
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))?
+    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
 }
 
 // ============================================================================
@@ -953,8 +962,12 @@ pub fn save_dev_services_from_setup(
 
     for service_value in services {
         let mut config: crate::process_capture::ProcessConfig =
-            serde_json::from_value(service_value)
-                .map_err(|e| format!("Invalid process config: {}", e))?;
+            serde_json::from_value(service_value).map_err(|e| {
+                String::from(AppError::ValidationError(format!(
+                    "Invalid process config: {}",
+                    e
+                )))
+            })?;
 
         // Set auto_start based on whether the user selected this service
         config.auto_start = selected_ids.contains(&config.id);
