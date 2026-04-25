@@ -58,20 +58,57 @@ pub enum InstallError {
 
 /// Pick the preferred Node package manager. Order: `pnpm`, then `npm`.
 /// Resolved at startup and at each install (cheap — `--version` is fast).
+///
+/// Windows note: package managers ship as `.cmd` shim batch files
+/// (`pnpm.cmd`, `npm.cmd`). Rust's `Command::new("pnpm")` does NOT walk
+/// `PATHEXT` to resolve extensions, so the bare-name probe fails even
+/// when the manager is installed and on PATH. We try the bare name first
+/// (works on macOS/Linux and on Windows when invoked from a shell), then
+/// fall back to `<name>.cmd` for Windows-shimmed installs.
 pub fn detect_package_manager() -> Option<&'static str> {
     for pm in ["pnpm", "npm"] {
-        let ok = Command::new(pm)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
+        if probe_pm(pm) {
             return Some(pm);
+        }
+        #[cfg(windows)]
+        {
+            // Try the .cmd shim explicitly. We still report the bare
+            // name to callers — `Command::new(pm)` later in this file
+            // is the install invocation and would hit the same failure
+            // mode, so we centralize the workaround in `pm_command`.
+            let shim = format!("{}.cmd", pm);
+            if probe_pm(&shim) {
+                return Some(pm);
+            }
         }
     }
     None
+}
+
+fn probe_pm(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Build a `Command` for the given package manager that also works on
+/// Windows where the manager is shipped as a `.cmd` shim.
+fn pm_command(pm: &str) -> Command {
+    #[cfg(windows)]
+    {
+        // Try `<pm>.cmd` first; if it doesn't probe-clean, the bare
+        // name is the right thing to invoke (probably resolved via
+        // PowerShell's PATHEXT or a real .exe).
+        let shim = format!("{}.cmd", pm);
+        if probe_pm(&shim) {
+            return Command::new(shim);
+        }
+    }
+    Command::new(pm)
 }
 
 /// Install (or update) a wrapper. The flow:
@@ -129,7 +166,8 @@ pub async fn install(
     let pm_owned = pm.to_string();
     let spec_owned = spec.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let mut cmd = Command::new(&pm_owned);
+        // pm_command resolves the .cmd shim on Windows when needed.
+        let mut cmd = pm_command(&pm_owned);
         cmd.current_dir(&stage_clone)
             .arg("install")
             .arg(&spec_owned)
