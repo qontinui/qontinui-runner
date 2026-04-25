@@ -38,7 +38,70 @@ use tracing::{debug, info, warn};
 use super::app_registry::{AppRegistry, AppTransport};
 use super::app_discovery::DiscoveredApp;
 use super::command_relay::{CommandRelay, CommandResponse};
+use super::sdk_client::{SdkAppInfo, SdkConnection, SdkConnectionManager};
 use super::types::ApiState;
+
+/// Synthetic URL scheme for WS-transport apps in `SdkConnectionManager`.
+/// `try_ws_dispatch` reads the active app_id from `sdk_connection`, so
+/// WS-only wrappers (which expose no HTTP server) need an entry there too.
+/// The scheme makes WS-only entries unambiguous in logs and prevents
+/// collision with real HTTP `/sdk/connect` URLs.
+fn ws_synthetic_url(app_id: &str) -> String {
+    format!("ws-app://{}", app_id)
+}
+
+/// Mirror the WS-registered app into `sdk_connection` so `try_ws_dispatch`
+/// can resolve `app_id` from `active_connection()`. Returns the previous
+/// `active_url` so the disconnect path can restore it if our entry is still
+/// the active one.
+async fn install_ws_sdk_connection(
+    sdk_connection: &Arc<Mutex<SdkConnectionManager>>,
+    register: &RegisterFrame,
+) -> (String, Option<String>) {
+    let synthetic_url = ws_synthetic_url(&register.app_id);
+    let app_info = SdkAppInfo {
+        app_id: register.app_id.clone(),
+        app_name: register.app_name.clone(),
+        app_type: register.app_type.clone(),
+        framework: register.framework.clone(),
+        version: register.version.clone(),
+        capabilities: register.capabilities.clone().unwrap_or_default(),
+        port: 0,
+    };
+    let conn = SdkConnection {
+        app_url: synthetic_url.clone(),
+        base_path: String::new(),
+        app_info,
+        client: reqwest::Client::new(),
+        connected_at: chrono::Utc::now().timestamp_millis(),
+        transport_kind: None,
+        physical_device_id: None,
+    };
+    let mut guard = sdk_connection.lock().await;
+    let prior_active = guard.active_url.clone();
+    guard.connections.insert(synthetic_url.clone(), conn);
+    guard.active_url = Some(synthetic_url.clone());
+    guard.active_responsive = Some(true);
+    guard.active_responsive_checked_at = chrono::Utc::now().timestamp_millis();
+    (synthetic_url, prior_active)
+}
+
+/// Unwind `install_ws_sdk_connection`. Removes our synthetic entry from
+/// `connections`. If `active_url` still points at us (i.e. nothing else
+/// became active in the meantime), restore `prior_active`.
+async fn uninstall_ws_sdk_connection(
+    sdk_connection: &Arc<Mutex<SdkConnectionManager>>,
+    synthetic_url: &str,
+    prior_active: Option<String>,
+) {
+    let mut guard = sdk_connection.lock().await;
+    guard.connections.remove(synthetic_url);
+    if guard.active_url.as_deref() == Some(synthetic_url) {
+        guard.active_url = prior_active;
+        guard.active_responsive = None;
+        guard.active_responsive_checked_at = 0;
+    }
+}
 
 /// Heartbeat configuration. Sent every `HEARTBEAT_INTERVAL`; if we don't see a
 /// pong (or any inbound frame, which also resets liveness) for
@@ -322,6 +385,13 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
         )
         .await;
 
+    // 3b. Mirror into sdk_connection so try_ws_dispatch can look up app_id.
+    //     Without this, WS-only wrappers can never be reached via the
+    //     /ui-bridge/sdk/control/* HTTP routes — those handlers gate on
+    //     `state.sdk_connection.active_connection()`.
+    let (synthetic_url, prior_active) =
+        install_ws_sdk_connection(&state.sdk_connection, &register).await;
+
     info!(
         "[ws-relay] app '{}' connected (conn_id={}, framework={:?})",
         register.app_id, conn_id, register.framework
@@ -413,6 +483,7 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
     //    mirrors the TS relay's behavior on tab close.
     ws_manager.remove(conn_id).await;
     registry.remove(&register.app_id).await;
+    uninstall_ws_sdk_connection(&state.sdk_connection, &synthetic_url, prior_active).await;
     relay.reject_all_on_disconnect().await;
     send_task.abort();
     info!(
@@ -559,5 +630,61 @@ mod tests {
         drop(rx);
         let err = m.send_text(conn_id, "hi".into()).await.unwrap_err();
         assert!(matches!(err, WsOutboundError::Send));
+    }
+
+    fn sample_register(app_id: &str) -> RegisterFrame {
+        RegisterFrame {
+            r#type: "register".into(),
+            app_id: app_id.into(),
+            app_name: "test".into(),
+            app_type: "web".into(),
+            transport: Some("websocket".into()),
+            origin: None,
+            page_url: None,
+            framework: None,
+            capabilities: None,
+            version: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn install_ws_sdk_connection_sets_active() {
+        let mgr = Arc::new(Mutex::new(SdkConnectionManager::new()));
+        let reg = sample_register("wapp");
+        let (synthetic, prior) = install_ws_sdk_connection(&mgr, &reg).await;
+        assert_eq!(synthetic, "ws-app://wapp");
+        assert!(prior.is_none());
+        let guard = mgr.lock().await;
+        let active = guard.active_connection().expect("active connection");
+        assert_eq!(active.app_info.app_id, "wapp");
+        assert_eq!(active.app_url, "ws-app://wapp");
+    }
+
+    #[tokio::test]
+    async fn uninstall_restores_prior_active_when_still_ours() {
+        let mgr = Arc::new(Mutex::new(SdkConnectionManager::new()));
+        let reg = sample_register("wapp");
+        let (synthetic, prior) = install_ws_sdk_connection(&mgr, &reg).await;
+        uninstall_ws_sdk_connection(&mgr, &synthetic, prior).await;
+        let guard = mgr.lock().await;
+        assert!(guard.active_url.is_none());
+        assert!(guard.connections.get("ws-app://wapp").is_none());
+    }
+
+    #[tokio::test]
+    async fn uninstall_leaves_active_alone_when_changed() {
+        let mgr = Arc::new(Mutex::new(SdkConnectionManager::new()));
+        let reg = sample_register("wapp");
+        let (synthetic, prior) = install_ws_sdk_connection(&mgr, &reg).await;
+        // Simulate something else stealing active_url between install and uninstall.
+        {
+            let mut guard = mgr.lock().await;
+            guard.active_url = Some("http://other".into());
+        }
+        uninstall_ws_sdk_connection(&mgr, &synthetic, prior).await;
+        let guard = mgr.lock().await;
+        assert_eq!(guard.active_url.as_deref(), Some("http://other"));
+        // Our synthetic entry should still be removed even if active_url moved on.
+        assert!(guard.connections.get("ws-app://wapp").is_none());
     }
 }
