@@ -70,6 +70,15 @@ pub enum AppError {
 
     #[error("Network error: {0}")]
     NetworkError(String),
+
+    /// Pass-through variant that preserves the inner string verbatim — no
+    /// "Variant: " prefix is added by `Display`. Use this when migrating a
+    /// handler from `Result<T, String>` to `Result<T, AppError>` and the
+    /// frontend already parses or displays the raw error string. Other
+    /// variants prefix the variant tag (e.g. `"Database error: …"`), which
+    /// is fine for new code but a wire-format break for legacy callers.
+    #[error("{0}")]
+    Raw(String),
 }
 
 // =============================================================================
@@ -106,6 +115,7 @@ impl Serialize for AppError {
             AppError::EncodingError(_) => "EncodingError",
             AppError::TauriError(_) => "TauriError",
             AppError::NetworkError(_) => "NetworkError",
+            AppError::Raw(_) => "Raw",
         };
 
         state.serialize_field("variant", variant)?;
@@ -357,6 +367,16 @@ impl AppError {
                 severity: ErrorSeverity::Warning,
                 recoverable: true,
                 suggested_action: Some("Check your network connection and try again.".to_string()),
+            },
+
+            AppError::Raw(msg) => UserFacingError {
+                title: "Error".to_string(),
+                message: msg.clone(),
+                details: None,
+                error_code: "GEN_RAW".to_string(),
+                severity: ErrorSeverity::Error,
+                recoverable: false,
+                suggested_action: None,
             },
         }
     }
