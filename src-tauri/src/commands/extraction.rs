@@ -514,16 +514,13 @@ async fn create_extraction_session_impl(
 
     // Check authentication
     if !auth_manager.has_tokens() {
-        return Err(AppError::Raw(
+        return Err(AppError::AuthError(
             "Not authenticated. Please log in first.".to_string(),
         ));
     }
 
     // Get access token
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        AppError::Raw(format!("Failed to get access token: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
 
     // Prepare the request body for the API
     #[derive(Serialize)]
@@ -571,19 +568,13 @@ async fn create_extraction_session_impl(
         .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
         error!(
             "Create extraction session failed with status {}: {}",
-            status, error_text
+            status, body
         );
-        return Err(AppError::Raw(format!(
-            "Failed to create extraction session: {}",
-            error_text
-        )));
+        return Err(AppError::HttpStatusError { status, body });
     }
 
     let session: ExtractionSessionResponse = response.json().await?;
@@ -624,10 +615,7 @@ async fn update_extraction_session_impl(
         ));
     }
 
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        AppError::Raw(format!("Failed to get access token: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
 
     #[derive(Serialize)]
     struct ApiUpdateRequest {
@@ -658,19 +646,13 @@ async fn update_extraction_session_impl(
         .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
         error!(
             "Update extraction session failed with status {}: {}",
-            status, error_text
+            status, body
         );
-        return Err(AppError::Raw(format!(
-            "Failed to update extraction session: {}",
-            error_text
-        )));
+        return Err(AppError::HttpStatusError { status, body });
     }
 
     let session: ExtractionSessionResponse = response.json().await?;
@@ -727,15 +709,12 @@ async fn upload_extraction_annotations_impl(
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err(AppError::Raw(
+        return Err(AppError::AuthError(
             "Not authenticated. Please log in first.".to_string(),
         ));
     }
 
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        AppError::Raw(format!("Failed to get access token: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
 
     #[derive(Serialize)]
     struct ApiAnnotationRequest {
@@ -763,19 +742,13 @@ async fn upload_extraction_annotations_impl(
         .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
         error!(
             "Upload annotations failed with status {}: {}",
-            status, error_text
+            status, body
         );
-        return Err(AppError::Raw(format!(
-            "Failed to upload annotations: {}",
-            error_text
-        )));
+        return Err(AppError::HttpStatusError { status, body });
     }
 
     let annotation: AnnotationResponse = response.json().await?;
@@ -825,15 +798,12 @@ async fn upload_state_structure_impl(
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err(AppError::Raw(
+        return Err(AppError::AuthError(
             "Not authenticated. Please log in first.".to_string(),
         ));
     }
 
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        AppError::Raw(format!("Failed to get access token: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
 
     #[derive(Serialize)]
     struct ApiStateStructureRequest {
@@ -857,19 +827,13 @@ async fn upload_state_structure_impl(
         .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
         error!(
             "Upload state structure failed with status {}: {}",
-            status, error_text
+            status, body
         );
-        return Err(AppError::Raw(format!(
-            "Failed to upload state structure: {}",
-            error_text
-        )));
+        return Err(AppError::HttpStatusError { status, body });
     }
 
     let state_response: StateStructureResponse = response.json().await?;
@@ -896,15 +860,12 @@ async fn get_project_extractions_impl(
     let auth_manager = AuthManager::new();
 
     if !auth_manager.has_tokens() {
-        return Err(AppError::Raw(
+        return Err(AppError::AuthError(
             "Not authenticated. Please log in first.".to_string(),
         ));
     }
 
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        AppError::Raw(format!("Failed to get access token: {}", e))
-    })?;
+    let access_token = auth_manager.get_access_token()?;
 
     let client = reqwest::Client::new();
     let response = client
@@ -918,19 +879,10 @@ async fn get_project_extractions_impl(
         .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!(
-            "Get extractions failed with status {}: {}",
-            status, error_text
-        );
-        return Err(AppError::Raw(format!(
-            "Failed to get extractions: {}",
-            error_text
-        )));
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        error!("Get extractions failed with status {}: {}", status, body);
+        return Err(AppError::HttpStatusError { status, body });
     }
 
     let sessions: Vec<ExtractionSessionResponse> = response.json().await?;
