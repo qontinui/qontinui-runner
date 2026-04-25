@@ -240,6 +240,7 @@ export function OrchestrationLoopPanel() {
   };
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const runnerPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // --- Form state helpers ---
 
@@ -352,9 +353,16 @@ export function OrchestrationLoopPanel() {
       await Promise.all([fetchStatus(), loadSavedConfigs(), loadRunnerInstances()]);
     })();
     pollRef.current = setInterval(fetchStatus, 3000);
+    // Re-poll the runner-instance list so the target drop-down picks up
+    // newly-spawned runners and reflects liveness changes (e.g., a slot
+    // that was [stopped] coming back online). 5s cadence is comfortably
+    // longer than the worst-case parallel probe latency (~1s for join_all
+    // across all not-yet-seen DB rows) and short enough to feel live.
+    runnerPollRef.current = setInterval(loadRunnerInstances, 5000);
     return () => {
       cancelled = true;
       if (pollRef.current) clearInterval(pollRef.current);
+      if (runnerPollRef.current) clearInterval(runnerPollRef.current);
     };
   }, [fetchStatus, loadSavedConfigs, loadRunnerInstances]);
 
