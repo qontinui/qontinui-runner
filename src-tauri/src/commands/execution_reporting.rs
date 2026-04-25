@@ -7,6 +7,7 @@
 //! This module replaces the testing.rs module with a more flexible, unified schema.
 
 use crate::auth::AuthManager;
+use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -500,6 +501,12 @@ pub struct ExecutionRunCompleteResponse {
 pub async fn create_execution_run(
     input: ExecutionRunCreateInput,
 ) -> Result<ExecutionRunResponse, String> {
+    create_execution_run_impl(input).await.map_err(String::from)
+}
+
+async fn create_execution_run_impl(
+    input: ExecutionRunCreateInput,
+) -> Result<ExecutionRunResponse, AppError> {
     info!(
         "Creating {} execution run '{}' for project {}",
         format!("{:?}", input.run_type).to_lowercase(),
@@ -524,13 +531,13 @@ pub async fn create_execution_run(
     // Check authentication
     if !auth_manager.has_tokens() {
         warn!("Cannot create execution run: not authenticated");
-        return Err("Not authenticated. Please log in.".to_string());
+        return Err(AppError::Raw("Not authenticated. Please log in.".to_string()));
     }
 
     // Get access token
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     let request = ExecutionRunCreateRequest {
@@ -548,18 +555,14 @@ pub async fn create_execution_run(
         info!("[CREATE_EXECUTION_RUN] Request JSON: {}", json_str);
     }
 
-    // Send to backend
+    // Send to backend — reqwest::Error and serde_json::Error convert via `?`.
     let client = reqwest::Client::new();
     let response = client
         .post(format!("{}/api/v1/execution/runs", get_api_base_url()))
         .bearer_auth(&access_token)
         .json(&request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to create execution run: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -571,13 +574,13 @@ pub async fn create_execution_run(
             "Create execution run failed with status {}: {}",
             status, error_text
         );
-        return Err(format!("Failed to create execution run: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Failed to create execution run: {}",
+            error_text
+        )));
     }
 
-    let run: ExecutionRunResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse execution run response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let run: ExecutionRunResponse = response.json().await?;
 
     info!("Execution run created successfully: {}", run.run_id);
 
@@ -598,6 +601,15 @@ pub async fn report_action_executions(
     run_id: String,
     actions: Vec<ActionExecutionCreate>,
 ) -> Result<ActionExecutionResponse, String> {
+    report_action_executions_impl(run_id, actions)
+        .await
+        .map_err(String::from)
+}
+
+async fn report_action_executions_impl(
+    run_id: String,
+    actions: Vec<ActionExecutionCreate>,
+) -> Result<ActionExecutionResponse, AppError> {
     if actions.is_empty() {
         return Ok(ActionExecutionResponse {
             recorded: 0,
@@ -616,12 +628,12 @@ pub async fn report_action_executions(
 
     if !auth_manager.has_tokens() {
         warn!("Cannot report actions: not authenticated");
-        return Err("Not authenticated".to_string());
+        return Err(AppError::Raw("Not authenticated".to_string()));
     }
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     let request = ActionExecutionBatchRequest { actions };
@@ -636,11 +648,7 @@ pub async fn report_action_executions(
         .bearer_auth(&access_token)
         .json(&request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to report actions: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -652,13 +660,13 @@ pub async fn report_action_executions(
             "Report actions failed with status {}: {}",
             status, error_text
         );
-        return Err(format!("Failed to report actions: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Failed to report actions: {}",
+            error_text
+        )));
     }
 
-    let result: ActionExecutionResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse actions response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let result: ActionExecutionResponse = response.json().await?;
 
     info!(
         "Actions reported successfully: {} recorded",
@@ -681,6 +689,16 @@ pub async fn upload_execution_screenshot(
     screenshot: ExecutionScreenshotCreate,
     image_data: Vec<u8>,
 ) -> Result<ExecutionScreenshotResponse, String> {
+    upload_execution_screenshot_impl(run_id, screenshot, image_data)
+        .await
+        .map_err(String::from)
+}
+
+async fn upload_execution_screenshot_impl(
+    run_id: String,
+    screenshot: ExecutionScreenshotCreate,
+    image_data: Vec<u8>,
+) -> Result<ExecutionScreenshotResponse, AppError> {
     info!(
         "Uploading screenshot {} for run {}",
         screenshot.screenshot_id, run_id
@@ -690,12 +708,12 @@ pub async fn upload_execution_screenshot(
 
     if !auth_manager.has_tokens() {
         warn!("Cannot upload screenshot: not authenticated");
-        return Err("Not authenticated".to_string());
+        return Err(AppError::Raw("Not authenticated".to_string()));
     }
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     // Determine content type from image data
@@ -707,20 +725,15 @@ pub async fn upload_execution_screenshot(
         "application/octet-stream"
     };
 
-    // Build multipart form
-    let metadata_json = serde_json::to_string(&screenshot).map_err(|e| {
-        error!("Failed to serialize screenshot metadata: {}", e);
-        format!("Failed to serialize metadata: {}", e)
-    })?;
+    // Build multipart form — serde_json::Error converts via `?`.
+    let metadata_json = serde_json::to_string(&screenshot)?;
 
     let image_part = reqwest::multipart::Part::bytes(image_data)
         .file_name("screenshot")
-        .mime_str(content_type)
-        .map_err(|e| format!("Failed to create image part: {}", e))?;
+        .mime_str(content_type)?;
 
     let metadata_part = reqwest::multipart::Part::text(metadata_json)
-        .mime_str("application/json")
-        .map_err(|e| format!("Failed to create metadata part: {}", e))?;
+        .mime_str("application/json")?;
 
     let form = reqwest::multipart::Form::new()
         .part("image", image_part)
@@ -736,11 +749,7 @@ pub async fn upload_execution_screenshot(
         .bearer_auth(&access_token)
         .multipart(form)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to upload screenshot: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -752,13 +761,13 @@ pub async fn upload_execution_screenshot(
             "Upload screenshot failed with status {}: {}",
             status, error_text
         );
-        return Err(format!("Failed to upload screenshot: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Failed to upload screenshot: {}",
+            error_text
+        )));
     }
 
-    let result: ExecutionScreenshotResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse screenshot response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let result: ExecutionScreenshotResponse = response.json().await?;
 
     info!("Screenshot uploaded successfully: {}", result.image_url);
 
@@ -776,6 +785,15 @@ pub async fn report_execution_issues(
     run_id: String,
     issues: Vec<ExecutionIssueCreate>,
 ) -> Result<ExecutionIssueResponse, String> {
+    report_execution_issues_impl(run_id, issues)
+        .await
+        .map_err(String::from)
+}
+
+async fn report_execution_issues_impl(
+    run_id: String,
+    issues: Vec<ExecutionIssueCreate>,
+) -> Result<ExecutionIssueResponse, AppError> {
     if issues.is_empty() {
         return Ok(ExecutionIssueResponse {
             recorded: 0,
@@ -790,12 +808,12 @@ pub async fn report_execution_issues(
 
     if !auth_manager.has_tokens() {
         warn!("Cannot report issues: not authenticated");
-        return Err("Not authenticated".to_string());
+        return Err(AppError::Raw("Not authenticated".to_string()));
     }
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     let request = ExecutionIssueBatchRequest { issues };
@@ -810,11 +828,7 @@ pub async fn report_execution_issues(
         .bearer_auth(&access_token)
         .json(&request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to report issues: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -826,13 +840,13 @@ pub async fn report_execution_issues(
             "Report issues failed with status {}: {}",
             status, error_text
         );
-        return Err(format!("Failed to report issues: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Failed to report issues: {}",
+            error_text
+        )));
     }
 
-    let result: ExecutionIssueResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse issues response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let result: ExecutionIssueResponse = response.json().await?;
 
     info!("Issues reported successfully: {} recorded", result.recorded);
 
@@ -850,6 +864,15 @@ pub async fn complete_execution_run(
     run_id: String,
     input: ExecutionRunCompleteInput,
 ) -> Result<ExecutionRunCompleteResponse, String> {
+    complete_execution_run_impl(run_id, input)
+        .await
+        .map_err(String::from)
+}
+
+async fn complete_execution_run_impl(
+    run_id: String,
+    input: ExecutionRunCompleteInput,
+) -> Result<ExecutionRunCompleteResponse, AppError> {
     info!(
         "Completing execution run {} with status: {:?}",
         run_id, input.status
@@ -859,12 +882,12 @@ pub async fn complete_execution_run(
 
     if !auth_manager.has_tokens() {
         warn!("Cannot complete execution run: not authenticated");
-        return Err("Not authenticated".to_string());
+        return Err(AppError::Raw("Not authenticated".to_string()));
     }
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
+        AppError::Raw(format!("Failed to get access token: {}", e))
     })?;
 
     let request = ExecutionRunCompleteRequest {
@@ -886,11 +909,7 @@ pub async fn complete_execution_run(
         .bearer_auth(&access_token)
         .json(&request)
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to complete execution run: {}", e);
-            format!("Network error: {}", e)
-        })?;
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -902,13 +921,13 @@ pub async fn complete_execution_run(
             "Complete execution run failed with status {}: {}",
             status, error_text
         );
-        return Err(format!("Failed to complete execution run: {}", error_text));
+        return Err(AppError::Raw(format!(
+            "Failed to complete execution run: {}",
+            error_text
+        )));
     }
 
-    let result: ExecutionRunCompleteResponse = response.json().await.map_err(|e| {
-        error!("Failed to parse complete response: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
+    let result: ExecutionRunCompleteResponse = response.json().await?;
 
     info!(
         "Execution run {} completed with duration: {}s",
