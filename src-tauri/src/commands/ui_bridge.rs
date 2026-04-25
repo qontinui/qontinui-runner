@@ -72,12 +72,7 @@ pub async fn ui_bridge_get_elements(app: tauri::AppHandle) -> Result<CommandResp
             "type": "get_elements"
         }),
     )
-    .map_err(|e| {
-        String::from(AppError::TauriError(format!(
-            "Failed to emit UI Bridge request: {}",
-            e
-        )))
-    })?;
+    .map_err(|e: tauri::Error| String::from(AppError::from(e)))?;
 
     // For now, return a placeholder response.
     // The actual implementation will use a channel/oneshot to wait for the React response.
@@ -106,12 +101,7 @@ pub async fn ui_bridge_get_element(
             "elementId": element_id
         }),
     )
-    .map_err(|e| {
-        String::from(AppError::TauriError(format!(
-            "Failed to emit UI Bridge request: {}",
-            e
-        )))
-    })?;
+    .map_err(|e: tauri::Error| String::from(AppError::from(e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -140,12 +130,7 @@ pub async fn ui_bridge_execute_action(
             "action": action
         }),
     )
-    .map_err(|e| {
-        String::from(AppError::TauriError(format!(
-            "Failed to emit UI Bridge request: {}",
-            e
-        )))
-    })?;
+    .map_err(|e: tauri::Error| String::from(AppError::from(e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -168,12 +153,7 @@ pub async fn ui_bridge_get_components(app: tauri::AppHandle) -> Result<CommandRe
             "type": "get_components"
         }),
     )
-    .map_err(|e| {
-        String::from(AppError::TauriError(format!(
-            "Failed to emit UI Bridge request: {}",
-            e
-        )))
-    })?;
+    .map_err(|e: tauri::Error| String::from(AppError::from(e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -197,12 +177,7 @@ pub async fn ui_bridge_get_component(
             "componentId": component_id
         }),
     )
-    .map_err(|e| {
-        String::from(AppError::TauriError(format!(
-            "Failed to emit UI Bridge request: {}",
-            e
-        )))
-    })?;
+    .map_err(|e: tauri::Error| String::from(AppError::from(e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -233,12 +208,7 @@ pub async fn ui_bridge_execute_component_action(
             "params": params
         }),
     )
-    .map_err(|e| {
-        String::from(AppError::TauriError(format!(
-            "Failed to emit UI Bridge request: {}",
-            e
-        )))
-    })?;
+    .map_err(|e: tauri::Error| String::from(AppError::from(e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -265,12 +235,7 @@ pub async fn ui_bridge_discover(
             "options": options
         }),
     )
-    .map_err(|e| {
-        String::from(AppError::TauriError(format!(
-            "Failed to emit UI Bridge request: {}",
-            e
-        )))
-    })?;
+    .map_err(|e: tauri::Error| String::from(AppError::from(e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -290,12 +255,7 @@ pub async fn ui_bridge_get_snapshot(app: tauri::AppHandle) -> Result<CommandResp
             "type": "get_snapshot"
         }),
     )
-    .map_err(|e| {
-        String::from(AppError::TauriError(format!(
-            "Failed to emit UI Bridge request: {}",
-            e
-        )))
-    })?;
+    .map_err(|e: tauri::Error| String::from(AppError::from(e)))?;
 
     Ok(CommandResponse {
         success: true,
