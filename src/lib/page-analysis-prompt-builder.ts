@@ -35,7 +35,7 @@ Generate a single TypeScript file that:
      - \`actions\`: Array of page-level actions the user can perform (with handler stubs)
    - Calls \`useUIElement\` for each significant element with:
      - \`id\`: kebab-case unique identifier (e.g., "search-input", "submit-button")
-     - \`type\`: "button" | "input" | "select" | "container" | "link" | "heading" | "table"
+     - \`type\`: "button" | "input" | "select" | "container" | "link" | "heading" | "table" | "disclosure"
      - \`label\`: Human-readable description of what this element is/does
      - \`actions\`: Array of standard actions (["click"] for buttons, etc.)
    - Returns an object of all refs: \`{ searchInputRef, submitButtonRef, ... }\`
@@ -48,6 +48,7 @@ Generate a single TypeScript file that:
 - All text inputs and textareas (with purpose labels)
 - All select/dropdown elements
 - All toggles, checkboxes, radio buttons
+- Disclosure widgets: every \`<details>\`/\`<summary>\` pair, accordion section, or collapsible panel — register the \`<summary>\` as type \`"disclosure"\` with actions \`["click"]\` and a label drawn from the summary's visible text (e.g. "Advanced: per-stage controls"). These are how users open hidden panels and AI agents must be able to discover and click them.
 - Navigation links and tabs
 - Form submit/reset actions
 
@@ -65,7 +66,7 @@ Generate a single TypeScript file that:
 ### DO NOT register:
 - Individual list items in a dynamic list (register the container instead)
 - Decorative icons
-- Layout wrappers with no semantic meaning
+- Layout wrappers with no semantic meaning (note: a \`<details>\` element IS semantic — register its \`<summary>\` as a disclosure, not the outer details wrapper)
 - Elements inside third-party component libraries that you can't attach refs to
 
 ## Naming Conventions

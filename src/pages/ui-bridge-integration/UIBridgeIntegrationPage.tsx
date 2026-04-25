@@ -3,6 +3,7 @@ import { Plug, Settings2 } from "lucide-react";
 import { SourceIntegrationPanel } from "./SourceIntegrationPanel";
 import { DiscoveryPanel } from "./DiscoveryPanel";
 import { ProjectCoordinator } from "./ProjectCoordinator";
+import { useUIBridgeIntegrationPageRegistrations } from "@/lib/ui-bridge/pages/uibridgeintegrationpage-registrations";
 
 /**
  * Top-level UI Bridge Integration page.
@@ -21,6 +22,7 @@ import { ProjectCoordinator } from "./ProjectCoordinator";
  * app card in Advanced's DiscoveryPanel updates the coordinator.
  */
 export function UIBridgeIntegrationPage() {
+  const { advancedDisclosureRef } = useUIBridgeIntegrationPageRegistrations();
   const [selectedProjectPath, setSelectedProjectPath] = useState<string | undefined>();
 
   const handleSelectApp = useCallback((basePath: string) => {
@@ -55,7 +57,10 @@ export function UIBridgeIntegrationPage() {
           the inner panels hold their own state; <details> just toggles
           visibility, it does not remount. */}
       <details className="group rounded-lg border border-border bg-card/30">
-        <summary className="flex items-center gap-2 p-3 cursor-pointer text-sm font-medium select-none list-none">
+        <summary
+          ref={advancedDisclosureRef}
+          className="flex items-center gap-2 p-3 cursor-pointer text-sm font-medium select-none list-none"
+        >
           <Settings2 className="w-4 h-4 text-muted-foreground group-open:text-cyan-400 transition-colors" />
           <span>Advanced: per-stage controls</span>
           <span className="ml-auto text-[10px] text-muted-foreground">
