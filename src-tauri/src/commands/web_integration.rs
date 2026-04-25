@@ -28,6 +28,7 @@ use tracing::{info, warn};
 
 use crate::commands::compartments::{HealthCompartment, IntegrationCompartment};
 use crate::commands::AppState;
+use crate::error::AppError;
 use crate::server_mode::{ServerModeConfig, ServerModeState};
 use crate::settings::{self, WebIntegrationSettings};
 
@@ -71,7 +72,7 @@ fn build_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|e| format!("failed to build HTTP client: {}", e))
+        .map_err(|e| String::from(AppError::NetworkError(format!("failed to build HTTP client: {}", e))))
 }
 
 fn trim_backend_url(url: &str) -> String {
@@ -172,7 +173,12 @@ pub async fn apply_web_integration_settings<R: Runtime>(
     {
         let mut full = settings::load_settings();
         full.web_integration = normalized.clone();
-        settings::save_settings(&full).map_err(|e| format!("failed to save settings: {}", e))?;
+        settings::save_settings(&full).map_err(|e| {
+            String::from(AppError::ConfigError(format!(
+                "failed to save settings: {}",
+                e
+            )))
+        })?;
     }
 
     // Hot-reload: shut down the old state, build the new one.
@@ -389,23 +395,27 @@ pub async fn test_web_integration_connection(
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("network error contacting {}: {}", trimmed_backend, e))?;
+        .map_err(|e| {
+            String::from(AppError::NetworkError(format!(
+                "network error contacting {}: {}",
+                trimmed_backend, e
+            )))
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        let truncated_body = body.chars().take(200).collect::<String>();
         let msg = if status.as_u16() == 401 || status.as_u16() == 403 {
-            format!(
+            String::from(AppError::AuthError(format!(
                 "auth failed ({}): {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            )
+                status, truncated_body
+            )))
         } else {
-            format!(
-                "register returned {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            )
+            String::from(AppError::HttpStatusError {
+                status: status.as_u16(),
+                body: truncated_body,
+            })
         };
         return Err(msg);
     }
@@ -413,10 +423,12 @@ pub async fn test_web_integration_connection(
     // Parse the response; on decode failure we still want to attempt
     // cleanup. We first pull the raw body so we can log + attempt decode
     // without re-requesting.
-    let body_text = resp
-        .text()
-        .await
-        .map_err(|e| format!("failed to read register response body: {}", e))?;
+    let body_text = resp.text().await.map_err(|e| {
+        String::from(AppError::NetworkError(format!(
+            "failed to read register response body: {}",
+            e
+        )))
+    })?;
     let parsed: Result<ProbeRegisterResponse, _> = serde_json::from_str(&body_text);
 
     match parsed {
@@ -518,8 +530,12 @@ pub async fn start_web_token_flow<R: Runtime>(
             let mut full = settings::load_settings();
             if full.web_integration.backend_url != trimmed {
                 full.web_integration.backend_url = trimmed.clone();
-                settings::save_settings(&full)
-                    .map_err(|e| format!("failed to persist backend_url: {}", e))?;
+                settings::save_settings(&full).map_err(|e| {
+                    String::from(AppError::ConfigError(format!(
+                        "failed to persist backend_url: {}",
+                        e
+                    )))
+                })?;
                 // Don't flip `enabled` — just staging the URL. The callback
                 // sets `enabled=true` when it lands the token.
                 if let Err(e) = app_handle.emit(WEB_INTEGRATION_CHANGED_EVENT, ()) {
@@ -598,7 +614,12 @@ pub async fn start_web_token_flow<R: Runtime>(
         web_origin, runner_port, effective_backend
     );
 
-    open::that(&web_url).map_err(|e| format!("failed to open browser: {}", e))?;
+    open::that(&web_url).map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "failed to open browser: {}",
+            e
+        )))
+    })?;
 
     Ok(())
 }
