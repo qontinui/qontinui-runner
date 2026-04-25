@@ -10,6 +10,7 @@
 use super::compartments::BridgeCompartment;
 use super::CommandResponse;
 use crate::auth::AuthManager;
+use crate::error::AppError;
 use crate::executor::with_default_bridge_compartment;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -101,7 +102,7 @@ pub async fn get_screenshot_monitors(
         })?
     })
     .await
-    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
 
     match result {
         Ok(response) => {
@@ -165,7 +166,7 @@ async fn capture_screenshot_internal(
         })?
     })
     .await
-    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
 
     match result {
         Ok(response) => {
@@ -299,7 +300,7 @@ pub async fn capture_and_upload_screenshot(
 
     let access_token = auth_manager.get_access_token().map_err(|e| {
         error!("Failed to get access token: {}", e);
-        format!("Authentication error: {}", e)
+        String::from(AppError::AuthError(format!("{}", e)))
     })?;
 
     // 3. Convert base64 to binary for upload
@@ -307,7 +308,10 @@ pub async fn capture_and_upload_screenshot(
         .decode(&screenshot_base64)
         .map_err(|e| {
             error!("Failed to decode screenshot: {}", e);
-            format!("Invalid screenshot data: {}", e)
+            String::from(AppError::EncodingError(format!(
+                "Invalid screenshot data: {}",
+                e
+            )))
         })?;
 
     // 4. Create multipart form for upload
@@ -321,7 +325,12 @@ pub async fn capture_and_upload_screenshot(
     let part = reqwest::multipart::Part::bytes(image_bytes)
         .file_name(filename.clone())
         .mime_str("image/png")
-        .map_err(|e| format!("Failed to create upload part: {}", e))?;
+        .map_err(|e| {
+            String::from(AppError::NetworkError(format!(
+                "Failed to create upload part: {}",
+                e
+            )))
+        })?;
 
     let form = reqwest::multipart::Form::new().part("file", part);
 
@@ -349,7 +358,7 @@ pub async fn capture_and_upload_screenshot(
         .await
         .map_err(|e| {
             error!("Failed to upload screenshot: {}", e);
-            format!("Upload failed: {}", e)
+            String::from(AppError::NetworkError(format!("Upload failed: {}", e)))
         })?;
 
     if !response.status().is_success() {
@@ -372,7 +381,10 @@ pub async fn capture_and_upload_screenshot(
 
     let upload_response: serde_json::Value = response.json().await.map_err(|e| {
         error!("Failed to parse upload response: {}", e);
-        format!("Invalid response from server: {}", e)
+        String::from(AppError::ParseError(format!(
+            "Invalid response from server: {}",
+            e
+        )))
     })?;
 
     let screenshot_id = upload_response
