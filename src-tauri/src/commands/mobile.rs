@@ -14,6 +14,7 @@
 use crate::commands::compartments::StorageCompartment;
 use crate::commands::CommandResponse;
 use crate::database::{CreateMobileLogInput, CreateMobileStateInput};
+use crate::error::AppError;
 use crate::settings;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -213,8 +214,14 @@ async fn run_adb_command(args: &[&str]) -> Result<String, String> {
 /// Returns a list of connected devices with their IDs, types, and states.
 #[tauri::command]
 pub async fn list_mobile_devices(
-    _storage: State<'_, StorageCompartment>,
+    storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    list_mobile_devices_impl(storage).await.map_err(String::from)
+}
+
+async fn list_mobile_devices_impl(
+    _storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Listing connected mobile devices");
 
     // Plan 1A: use pure-Rust adb_client via mcp::adb_helper instead of shelling out.
@@ -242,10 +249,7 @@ pub async fn list_mobile_devices(
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} devices", devices.len())),
-        data: Some(
-            serde_json::to_value(&devices)
-                .map_err(|e| format!("Failed to serialize devices: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&devices)?),
     })
 }
 
@@ -292,6 +296,17 @@ pub async fn capture_mobile_screenshot(
     output_dir: Option<String>,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    capture_mobile_screenshot_impl(task_run_id, device_id, output_dir, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn capture_mobile_screenshot_impl(
+    task_run_id: Option<String>,
+    device_id: Option<String>,
+    output_dir: Option<String>,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Capturing mobile screenshot (task_run_id: {:?}, device_id: {:?})",
         task_run_id, device_id
@@ -305,7 +320,7 @@ pub async fn capture_mobile_screenshot(
         Some(id) => id,
         None => get_default_device()
             .await
-            .ok_or("No connected devices found")?,
+            .ok_or_else(|| AppError::Raw("No connected devices found".to_string()))?,
     };
 
     // Determine output path (parameter > settings > default)
@@ -320,9 +335,8 @@ pub async fn capture_mobile_screenshot(
         },
     };
 
-    // Create output directory
-    std::fs::create_dir_all(&output_path)
-        .map_err(|e| format!("Failed to create output directory: {}", e))?;
+    // Create output directory — std::io::Error converts via `?`.
+    std::fs::create_dir_all(&output_path)?;
 
     // Generate filename
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
@@ -332,10 +346,9 @@ pub async fn capture_mobile_screenshot(
     // Plan 1A: pure-Rust framebuffer capture — no screencap / pull / rm dance.
     let png_bytes = crate::mcp::adb_helper::screenshot_png(device.clone())
         .await
-        .map_err(|e| format!("Failed to capture framebuffer: {}", e))?;
+        .map_err(|e| AppError::Raw(format!("Failed to capture framebuffer: {}", e)))?;
 
-    std::fs::write(&local_path, &png_bytes)
-        .map_err(|e| format!("Failed to write screenshot file: {}", e))?;
+    std::fs::write(&local_path, &png_bytes)?;
 
     let screenshot_path = local_path.to_string_lossy().to_string();
     info!("Screenshot captured: {}", screenshot_path);
@@ -382,10 +395,7 @@ pub async fn capture_mobile_screenshot(
     Ok(CommandResponse {
         success: true,
         message: Some("Screenshot captured successfully".to_string()),
-        data: Some(
-            serde_json::to_value(&result)
-                .map_err(|e| format!("Failed to serialize result: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&result)?),
     })
 }
 
@@ -410,6 +420,19 @@ pub async fn capture_mobile_logcat(
     output_dir: Option<String>,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    capture_mobile_logcat_impl(task_run_id, device_id, lines, filter_app, output_dir, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn capture_mobile_logcat_impl(
+    task_run_id: Option<String>,
+    device_id: Option<String>,
+    lines: Option<u32>,
+    filter_app: Option<bool>,
+    output_dir: Option<String>,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Capturing mobile logcat (task_run_id: {:?}, device_id: {:?}, lines: {:?})",
         task_run_id, device_id, lines
@@ -423,7 +446,7 @@ pub async fn capture_mobile_logcat(
         Some(id) => id,
         None => get_default_device()
             .await
-            .ok_or("No connected devices found")?,
+            .ok_or_else(|| AppError::Raw("No connected devices found".to_string()))?,
     };
 
     // Use settings for defaults, falling back to hardcoded values
@@ -436,7 +459,7 @@ pub async fn capture_mobile_logcat(
         format!("logcat -d -t {}", line_count),
     )
     .await
-    .map_err(|e| format!("Failed to capture logcat: {}", e))?;
+    .map_err(|e| AppError::Raw(format!("Failed to capture logcat: {}", e)))?;
 
     // Determine output path (parameter > settings > default)
     let output_path = match output_dir {
@@ -450,9 +473,8 @@ pub async fn capture_mobile_logcat(
         },
     };
 
-    // Create output directory
-    std::fs::create_dir_all(&output_path)
-        .map_err(|e| format!("Failed to create output directory: {}", e))?;
+    // Create output directory — std::io::Error converts via `?`.
+    std::fs::create_dir_all(&output_path)?;
 
     // Generate filename
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
@@ -460,8 +482,7 @@ pub async fn capture_mobile_logcat(
     let local_path = output_path.join(&filename);
 
     // Write logcat to file
-    std::fs::write(&local_path, &output)
-        .map_err(|e| format!("Failed to write logcat file: {}", e))?;
+    std::fs::write(&local_path, &output)?;
 
     let log_path = local_path.to_string_lossy().to_string();
     let lines_captured = output.lines().count();
@@ -510,10 +531,7 @@ pub async fn capture_mobile_logcat(
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Captured {} logcat lines", lines_captured)),
-        data: Some(
-            serde_json::to_value(&result)
-                .map_err(|e| format!("Failed to serialize result: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&result)?),
     })
 }
 
@@ -563,21 +581,28 @@ pub async fn get_mobile_states(
     limit: Option<u32>,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    get_mobile_states_impl(task_run_id, limit, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn get_mobile_states_impl(
+    task_run_id: String,
+    limit: Option<u32>,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Getting mobile states for task run: {}", task_run_id);
 
     let states = storage
         .pg_db()
         .get_mobile_states(&task_run_id, limit)
         .await
-        .map_err(|e| format!("Failed to get mobile states: {}", e))?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to get mobile states: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} mobile states", states.len())),
-        data: Some(
-            serde_json::to_value(&states)
-                .map_err(|e| format!("Failed to serialize states: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&states)?),
     })
 }
 
@@ -590,13 +615,22 @@ pub async fn get_latest_mobile_state(
     task_run_id: String,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    get_latest_mobile_state_impl(task_run_id, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn get_latest_mobile_state_impl(
+    task_run_id: String,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Getting latest mobile state for task run: {}", task_run_id);
 
     let mobile_state = storage
         .pg_db()
         .get_latest_mobile_state(&task_run_id)
         .await
-        .map_err(|e| format!("Failed to get mobile state: {}", e))?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to get mobile state: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -604,10 +638,7 @@ pub async fn get_latest_mobile_state(
             Some(_) => Some("Mobile state found".to_string()),
             None => Some("No mobile state found".to_string()),
         },
-        data: Some(
-            serde_json::to_value(&mobile_state)
-                .map_err(|e| format!("Failed to serialize state: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&mobile_state)?),
     })
 }
 
@@ -620,6 +651,15 @@ pub async fn create_mobile_state(
     input: CreateMobileStateRequest,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    create_mobile_state_impl(input, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn create_mobile_state_impl(
+    input: CreateMobileStateRequest,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Creating mobile state for task run: {}", input.task_run_id);
 
     let db_input = CreateMobileStateInput {
@@ -644,15 +684,12 @@ pub async fn create_mobile_state(
         .pg_db()
         .create_mobile_state(&db_input)
         .await
-        .map_err(|e| format!("Failed to create mobile state: {}", e))?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to create mobile state: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some("Mobile state created".to_string()),
-        data: Some(
-            serde_json::to_value(&mobile_state)
-                .map_err(|e| format!("Failed to serialize state: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&mobile_state)?),
     })
 }
 
@@ -675,6 +712,18 @@ pub async fn get_mobile_logs(
     limit: Option<u32>,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    get_mobile_logs_impl(task_run_id, log_source, errors_only, limit, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn get_mobile_logs_impl(
+    task_run_id: String,
+    log_source: Option<String>,
+    errors_only: Option<bool>,
+    limit: Option<u32>,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Getting mobile logs for task run: {} (source: {:?}, errors_only: {:?})",
         task_run_id, log_source, errors_only
@@ -689,14 +738,12 @@ pub async fn get_mobile_logs(
             limit,
         )
         .await
-        .map_err(|e| format!("Failed to get mobile logs: {}", e))?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to get mobile logs: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} mobile logs", logs.len())),
-        data: Some(
-            serde_json::to_value(&logs).map_err(|e| format!("Failed to serialize logs: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&logs)?),
     })
 }
 
@@ -711,21 +758,28 @@ pub async fn get_mobile_errors(
     limit: Option<u32>,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    get_mobile_errors_impl(task_run_id, limit, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn get_mobile_errors_impl(
+    task_run_id: String,
+    limit: Option<u32>,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Getting mobile errors for task run: {}", task_run_id);
 
     let errors = storage
         .pg_db()
         .get_mobile_errors(&task_run_id, limit)
         .await
-        .map_err(|e| format!("Failed to get mobile errors: {}", e))?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to get mobile errors: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} mobile errors", errors.len())),
-        data: Some(
-            serde_json::to_value(&errors)
-                .map_err(|e| format!("Failed to serialize errors: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&errors)?),
     })
 }
 
@@ -738,6 +792,15 @@ pub async fn create_mobile_log(
     input: CreateMobileLogRequest,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    create_mobile_log_impl(input, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn create_mobile_log_impl(
+    input: CreateMobileLogRequest,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Creating mobile log for task run: {} (source: {})",
         input.task_run_id, input.log_source
@@ -765,14 +828,12 @@ pub async fn create_mobile_log(
         .pg_db()
         .create_mobile_log(&db_input)
         .await
-        .map_err(|e| format!("Failed to create mobile log: {}", e))?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to create mobile log: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
         message: Some("Mobile log created".to_string()),
-        data: Some(
-            serde_json::to_value(&log).map_err(|e| format!("Failed to serialize log: {}", e))?,
-        ),
+        data: Some(serde_json::to_value(&log)?),
     })
 }
 
@@ -796,6 +857,17 @@ pub async fn capture_mobile_feedback(
     logcat_lines: Option<u32>,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    capture_mobile_feedback_impl(task_run_id, device_id, logcat_lines, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn capture_mobile_feedback_impl(
+    task_run_id: String,
+    device_id: Option<String>,
+    logcat_lines: Option<u32>,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!(
         "Capturing mobile feedback for task run: {} (device: {:?})",
         task_run_id, device_id
@@ -806,7 +878,7 @@ pub async fn capture_mobile_feedback(
         Some(id) => id,
         None => get_default_device()
             .await
-            .ok_or("No connected devices found")?,
+            .ok_or_else(|| AppError::Raw("No connected devices found".to_string()))?,
     };
 
     // Capture screenshot
@@ -882,7 +954,7 @@ pub async fn capture_mobile_feedback(
         .pg_db()
         .create_mobile_state(&input)
         .await
-        .map_err(|e| format!("Failed to create mobile state: {}", e))?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to create mobile state: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
@@ -906,13 +978,22 @@ pub async fn delete_mobile_data(
     task_run_id: String,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
+    delete_mobile_data_impl(task_run_id, storage)
+        .await
+        .map_err(String::from)
+}
+
+async fn delete_mobile_data_impl(
+    task_run_id: String,
+    storage: State<'_, StorageCompartment>,
+) -> Result<CommandResponse, AppError> {
     info!("Deleting mobile data for task run: {}", task_run_id);
 
     storage
         .pg_db()
         .delete_mobile_data_for_task(&task_run_id)
         .await
-        .map_err(|e| format!("Failed to delete mobile data: {}", e))?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to delete mobile data: {}", e)))?;
 
     Ok(CommandResponse {
         success: true,
