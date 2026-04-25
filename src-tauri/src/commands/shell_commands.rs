@@ -305,7 +305,7 @@ pub async fn list_shell_commands(
         message: Some(format!("Found {} shell commands", commands.len())),
         data: Some(
             serde_json::to_value(&commands)
-                .map_err(|e| format!("Failed to serialize shell commands: {}", e))?,
+                .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
         ),
     })
 }
@@ -350,9 +350,8 @@ pub async fn update_shell_command(
     let fail_on_error = input.fail_on_error.unwrap_or(current.fail_on_error);
     let category = input.category.or_else(|| Some(current.category.clone()));
     let tags_str = match input.tags {
-        Some(tags) => {
-            serde_json::to_string(&tags).map_err(|e| format!("Failed to serialize tags: {}", e))?
-        }
+        Some(tags) => serde_json::to_string(&tags)
+            .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
         None => serde_json::to_string(&current.tags).unwrap_or_else(|_| "[]".to_string()),
     };
     let enabled = input.enabled.unwrap_or(current.enabled);
@@ -643,7 +642,7 @@ pub async fn execute_shell_command(
         )),
         data: Some(
             serde_json::to_value(&response)
-                .map_err(|e| format!("Failed to serialize response: {}", e))?,
+                .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
         ),
     })
 }
@@ -680,7 +679,7 @@ pub async fn get_shell_command_results(
         message: Some(format!("Found {} results", pg_results.len())),
         data: Some(
             serde_json::to_value(&pg_results)
-                .map_err(|e| format!("Failed to serialize results: {}", e))?,
+                .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
         ),
     })
 }
@@ -703,7 +702,7 @@ pub async fn get_shell_command_categories(
         message: Some(format!("Found {} categories", categories.len())),
         data: Some(
             serde_json::to_value(&categories)
-                .map_err(|e| format!("Failed to serialize categories: {}", e))?,
+                .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?,
         ),
     })
 }
