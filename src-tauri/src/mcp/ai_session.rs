@@ -142,8 +142,17 @@ pub struct RunPromptResponse {
 // ============================================================================
 
 /// Build the router for AI session management endpoints.
+///
+/// The `.without_v07_checks()` call works around an axum 0.8.8 panic on
+/// the `/sessions/{session_id}/...` route: axum's v0.7-syntax detector
+/// fires even though the capture uses correct `{name}` syntax, claiming
+/// "Path segments must not start with `:`". The panic site is the route
+/// call itself (no matter the surrounding routes), and the docs of the
+/// panic message itself recommend this exact bypass for the false
+/// positive. All other axum 0.8 path features still work.
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
+        .without_v07_checks()
         .route("/stop-ai-analysis", post(stop_ai_analysis))
         .route("/restart-runner", post(restart_runner))
         .route("/prompts/run", post(run_prompt))
