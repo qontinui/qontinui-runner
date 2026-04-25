@@ -394,6 +394,25 @@ pub fn create_router(
 
     let current_ai_pids = app_state.ai_pid_tracker.clone();
     let shared_sdk_connection = app_state.sdk_connection.clone();
+
+    // Phase 1 wrapper framework wiring:
+    // - AppRegistry is shared between the HTTP phone-home path and the WS
+    //   upgrade path.
+    // - WsConnectionManager owns the outbound mpsc channels to wrappers.
+    // - CommandRelay owns the pending-command oneshot map and uses the
+    //   connection manager to dispatch frames.
+    // - AppDispatcher is the single entry point handlers should use when
+    //   proxying to a specific app_id; it picks HTTP or WS based on the
+    //   registry entry's transport.
+    let shared_app_registry = crate::mcp::app_registry::AppRegistry::new();
+    let shared_ws_manager = crate::mcp::ws_relay::WsConnectionManager::new();
+    let shared_command_relay =
+        crate::mcp::command_relay::CommandRelay::new(shared_ws_manager.clone());
+    let shared_app_dispatcher = crate::mcp::app_dispatch::AppDispatcher::new(
+        shared_app_registry.clone(),
+        shared_command_relay.clone(),
+    );
+
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
@@ -426,7 +445,10 @@ pub fn create_router(
         physical_device_registry: Arc::new(
             crate::mcp::physical_device::PhysicalDeviceRegistry::new(),
         ),
-        app_registry: crate::mcp::app_registry::AppRegistry::new(),
+        app_registry: shared_app_registry.clone(),
+        ws_connection_manager: shared_ws_manager,
+        ws_command_relay: shared_command_relay,
+        app_dispatcher: shared_app_dispatcher,
         pairing_manager: Arc::new(crate::mcp::transport::pairing::PairingManager::new()),
         tunnel_client: Arc::new(crate::tunnel::RatholeClient::new()),
         ios_transport: Arc::new(crate::mcp::transport::ios::IosTransport::new()),
@@ -1346,6 +1368,7 @@ pub fn create_router(
         .merge(crate::mcp::ai_wait_for::routes())
         .merge(crate::mcp::api_requests::routes())
         .merge(crate::mcp::app_discovery::routes())
+        .merge(crate::mcp::ws_relay::routes())
         .merge(crate::mcp::physical_device_api::routes())
         .merge(crate::mcp::tunnel_api::routes())
         .merge(crate::mcp::automation_runs::routes())

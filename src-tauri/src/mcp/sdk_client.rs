@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use super::app_registry::AppTransport;
+use super::command_relay::CommandRelayError;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
 
@@ -163,6 +165,62 @@ pub struct ConnectResponse {
 // =============================================================================
 // Core Client
 // =============================================================================
+
+/// If the currently-active SDK connection corresponds to an app registered
+/// over the `/ui-bridge/ws` transport, dispatch the command via the
+/// CommandRelay and return the response. Returns `Ok(None)` when no such
+/// registration exists (caller should fall back to the HTTP `sdk_request`
+/// path). Returns `Err(String)` only when a WS dispatch was attempted and
+/// failed — HTTP fallback is not safe in that case because the wrapper has
+/// taken ownership of the app.
+///
+/// Phase 1 wires this on two routes:
+/// - `POST /ui-bridge/sdk/control/component/:id/action/:actionId`
+/// - `GET  /ui-bridge/sdk/control/snapshot`
+///
+/// Additional routes can be retrofitted by calling this helper before
+/// falling through to `sdk_request`.
+async fn try_ws_dispatch(
+    state: &Arc<ApiState>,
+    action: &str,
+    payload: serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    // Read the active connection's app_id WITHOUT holding the lock for the
+    // duration of the dispatch — CommandRelay::dispatch awaits the wrapper.
+    let app_id = {
+        let guard = state.sdk_connection.lock().await;
+        match guard.active_connection() {
+            Some(conn) => conn.app_info.app_id.clone(),
+            None => return Ok(None),
+        }
+    };
+
+    let entry = match state.app_registry.get(&app_id).await {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    if entry.transport != AppTransport::Websocket {
+        return Ok(None);
+    }
+
+    match state
+        .ws_command_relay
+        .dispatch(&app_id, action, payload)
+        .await
+    {
+        Ok(response) => Ok(Some(response.result.unwrap_or(serde_json::Value::Null))),
+        Err(CommandRelayError::NotConnected(_)) | Err(CommandRelayError::Disconnected) => {
+            // The wrapper's socket is gone — surface as an error rather than
+            // silently falling back to HTTP (which would hit an app that
+            // doesn't actually serve HTTP).
+            Err(format!(
+                "wrapper '{}' registered via websocket but is disconnected",
+                app_id
+            ))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
 
 /// Send an HTTP request to the connected SDK app.
 ///
@@ -1000,6 +1058,24 @@ async fn handle_snapshot(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    // Phase 1 wrapper framework: if the active app registered via WebSocket,
+    // dispatch getControlSnapshot over its socket.
+    let ws_payload = match query.get("recency") {
+        Some(r) => serde_json::json!({ "recency": r }),
+        None => serde_json::json!({}),
+    };
+    match try_ws_dispatch(&state, "getControlSnapshot", ws_payload).await {
+        Ok(Some(data)) => return (StatusCode::OK, Json(data)).into_response(),
+        Ok(None) => {}
+        Err(e) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "success": false, "error": e })),
+            )
+                .into_response();
+        }
+    }
+
     // Forward recency query param to the SDK app for cache control
     let path = if let Some(recency) = query.get("recency") {
         format!("/control/snapshot?recency={}", urlencoding::encode(recency))
@@ -1007,7 +1083,7 @@ async fn handle_snapshot(
         "/control/snapshot".to_string()
     };
     match sdk_request(&state, Method::GET, &path, None).await {
-        Ok(data) => (StatusCode::OK, Json(data)),
+        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
         Err(_sdk_err) => {
             // No SDK app connected — fall back to the runner's own UI via control endpoint
             debug!("SDK snapshot unavailable, falling back to control endpoint");
@@ -1015,11 +1091,13 @@ async fn handle_snapshot(
                 Ok(data) => (
                     StatusCode::OK,
                     Json(serde_json::json!({ "success": true, "data": data })),
-                ),
+                )
+                    .into_response(),
                 Err(e) => (
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({ "success": false, "error": e })),
-                ),
+                )
+                    .into_response(),
             }
         }
     }
@@ -2709,6 +2787,20 @@ async fn handle_component_action(
     Path((id, action_id)): Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: if the active app registered via WebSocket,
+    // dispatch the command over its socket. Otherwise fall through to the
+    // HTTP proxy path.
+    let ws_payload = serde_json::json!({
+        "componentId": id,
+        "actionId": action_id,
+        "body": body,
+    });
+    match try_ws_dispatch(&state, "executeComponentAction", ws_payload).await {
+        Ok(Some(data)) => return Json(data),
+        Ok(None) => {}
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    }
+
     let path = format!("/control/component/{}/action/{}", id, action_id);
     match sdk_request(&state, Method::POST, &path, Some(body)).await {
         Ok(data) => Json(data),

@@ -6,6 +6,12 @@
 //!
 //! Entries are keyed by `appId`. The SDK re-POSTs on a heartbeat (~10s);
 //! a background sweeper evicts entries older than `REGISTRATION_TTL_MS`.
+//!
+//! Phase 1 (wrapper framework): entries now carry an `AppTransport` discriminator.
+//! Apps that speak HTTP register as `Http` (the runner reaches them via
+//! their `base_url`); apps that speak WebSocket register as `Websocket` and
+//! the runner dispatches commands through `CommandRelay` over the
+//! `/ui-bridge/ws` connection identified by `websocket_conn_id`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,6 +24,23 @@ use super::app_discovery::DiscoveredApp;
 pub const REGISTRATION_TTL_MS: i64 = 30_000;
 const SWEEP_INTERVAL_MS: u64 = 15_000;
 
+/// Transport an app uses to receive commands from the runner.
+///
+/// - `Http`: runner reaches the app by POSTing to its `base_url`. This is the
+///   legacy / same-origin case (desktop apps hosting their own UI Bridge HTTP
+///   server, dev servers that proxy runner requests, etc.).
+/// - `Websocket`: the app opened a WebSocket to `/ui-bridge/ws` on the runner
+///   and is receiving commands on that socket. This is the wrapper-framework
+///   case — it works for third-party browser tabs, headless Playwright shims,
+///   extensions, and anywhere else the runner cannot reach the app via HTTP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AppTransport {
+    #[default]
+    Http,
+    Websocket,
+}
+
 #[derive(Debug, Clone)]
 pub struct RegisteredApp {
     pub app: DiscoveredApp,
@@ -26,6 +49,11 @@ pub struct RegisteredApp {
     /// hostnames. Display logic assumes one-live-entry-per-appId (last POST wins).
     pub origin: Option<String>,
     pub last_seen_ms: i64,
+    /// How the runner delivers commands to this app. Defaults to `Http`.
+    pub transport: AppTransport,
+    /// If `transport == Websocket`, the `conn_id` of the active
+    /// `/ui-bridge/ws` connection. `None` for HTTP apps.
+    pub websocket_conn_id: Option<u64>,
 }
 
 pub struct AppRegistry {
@@ -39,7 +67,17 @@ impl AppRegistry {
         })
     }
 
-    pub async fn upsert(&self, app: DiscoveredApp, origin: Option<String>) {
+    /// Insert or refresh an entry. The `transport` + `websocket_conn_id` pair
+    /// must be consistent: `Websocket` requires `Some(conn_id)`, `Http`
+    /// requires `None`. The caller (register handler / WS relay) is
+    /// responsible for this invariant.
+    pub async fn upsert(
+        &self,
+        app: DiscoveredApp,
+        origin: Option<String>,
+        transport: AppTransport,
+        websocket_conn_id: Option<u64>,
+    ) {
         let now = chrono::Utc::now().timestamp_millis();
         let mut w = self.inner.write().await;
         w.insert(
@@ -48,6 +86,8 @@ impl AppRegistry {
                 app,
                 origin,
                 last_seen_ms: now,
+                transport,
+                websocket_conn_id,
             },
         );
     }
@@ -55,6 +95,13 @@ impl AppRegistry {
     pub async fn remove(&self, app_id: &str) -> bool {
         let mut w = self.inner.write().await;
         w.remove(app_id).is_some()
+    }
+
+    /// Look up an entry by app_id (regardless of freshness). Returns a clone
+    /// so callers can inspect the transport without holding the lock.
+    pub async fn get(&self, app_id: &str) -> Option<RegisteredApp> {
+        let r = self.inner.read().await;
+        r.get(app_id).cloned()
     }
 
     /// Returns entries that haven't been stale-evicted (last_seen_ms within TTL).
@@ -90,4 +137,94 @@ pub fn spawn_sweeper(registry: Arc<AppRegistry>) {
             }
         }
     });
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_app(app_id: &str) -> DiscoveredApp {
+        DiscoveredApp {
+            app_id: app_id.to_string(),
+            app_name: "Sample".to_string(),
+            app_type: "web".to_string(),
+            framework: None,
+            url: "http://127.0.0.1:3000".to_string(),
+            port: 3000,
+            base_path: "".to_string(),
+            version: None,
+            capabilities: vec![],
+            element_count: None,
+            component_count: None,
+            discovered_at: 0,
+        }
+    }
+
+    #[test]
+    fn transport_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&AppTransport::Http).unwrap(),
+            "\"http\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AppTransport::Websocket).unwrap(),
+            "\"websocket\""
+        );
+    }
+
+    #[test]
+    fn transport_deserializes_lowercase() {
+        let http: AppTransport = serde_json::from_str("\"http\"").unwrap();
+        let ws: AppTransport = serde_json::from_str("\"websocket\"").unwrap();
+        assert_eq!(http, AppTransport::Http);
+        assert_eq!(ws, AppTransport::Websocket);
+    }
+
+    #[test]
+    fn transport_default_is_http() {
+        let t: AppTransport = Default::default();
+        assert_eq!(t, AppTransport::Http);
+    }
+
+    #[tokio::test]
+    async fn upsert_http_then_upgrade_to_websocket() {
+        let reg = AppRegistry::new();
+        reg.upsert(sample_app("a1"), None, AppTransport::Http, None)
+            .await;
+        let entry = reg.get("a1").await.unwrap();
+        assert_eq!(entry.transport, AppTransport::Http);
+        assert_eq!(entry.websocket_conn_id, None);
+
+        reg.upsert(sample_app("a1"), None, AppTransport::Websocket, Some(42))
+            .await;
+        let entry = reg.get("a1").await.unwrap();
+        assert_eq!(entry.transport, AppTransport::Websocket);
+        assert_eq!(entry.websocket_conn_id, Some(42));
+    }
+
+    #[tokio::test]
+    async fn remove_returns_true_when_present() {
+        let reg = AppRegistry::new();
+        reg.upsert(sample_app("a1"), None, AppTransport::Http, None)
+            .await;
+        assert!(reg.remove("a1").await);
+        assert!(!reg.remove("a1").await);
+    }
+
+    #[tokio::test]
+    async fn list_live_filters_stale() {
+        let reg = AppRegistry::new();
+        reg.upsert(sample_app("a1"), None, AppTransport::Http, None)
+            .await;
+        // Manually backdate the entry.
+        {
+            let mut w = reg.inner.write().await;
+            w.get_mut("a1").unwrap().last_seen_ms -= REGISTRATION_TTL_MS + 1;
+        }
+        assert!(reg.list_live().await.is_empty());
+    }
 }

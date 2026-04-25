@@ -223,6 +223,19 @@ pub struct ApiState {
     pub physical_device_registry: Arc<crate::mcp::physical_device::PhysicalDeviceRegistry>,
     /// Phone-home registry for apps that have registered via POST /ui-bridge/apps/register.
     pub app_registry: Arc<crate::mcp::app_registry::AppRegistry>,
+    /// Phase 1 wrapper framework: tracks WebSocket connections keyed by
+    /// monotonic `conn_id`, with a reverse `app_id → conn_id` map for
+    /// last-tab-wins routing. Populated by `/ui-bridge/ws` upgrades.
+    pub ws_connection_manager: Arc<crate::mcp::ws_relay::WsConnectionManager>,
+    /// Phase 1 wrapper framework: pending-command state machine that
+    /// dispatches to WebSocket-transport apps and awaits their response
+    /// frames. Used by `AppDispatcher`.
+    pub ws_command_relay: Arc<crate::mcp::command_relay::CommandRelay>,
+    /// Unified dispatcher that picks HTTP or WebSocket transport based on
+    /// each registered app's declared transport. Handlers that want to
+    /// proxy to a specific `app_id` should use this instead of reqwest
+    /// directly.
+    pub app_dispatcher: Arc<crate::mcp::app_dispatch::AppDispatcher>,
     /// Pairing manager for LAN and Cloud device authentication
     pub pairing_manager: Arc<crate::mcp::transport::pairing::PairingManager>,
     /// Rathole tunnel client (Plan 1B). Singleton — only one tunnel active.

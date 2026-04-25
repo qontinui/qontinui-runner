@@ -30,6 +30,13 @@ export interface DiscoveredApp {
   elementCount?: number;
   componentCount?: number;
   discoveredAt: number;
+  /**
+   * Runner-assigned transport kind. Present on entries returned by
+   * `/ui-bridge/apps/registered`; absent from scan-only results. `"websocket"`
+   * indicates a wrapper app registered via `/ui-bridge/ws` — such entries have
+   * no reachable `url`/`port` for HTTP proxying.
+   */
+  transport?: "http" | "websocket";
 }
 
 export interface MobileDevice {

@@ -97,6 +97,23 @@ pub struct RegisterAppRequest {
     pub version: Option<String>,
     #[serde(default)]
     pub origin: Option<String>,
+    /// Optional WebSocket connection id, used when an app is promoting an
+    /// already-open `/ui-bridge/ws` connection into the registry via a
+    /// subsequent phone-home POST. Normally set by the WS handler itself,
+    /// but accepting it here keeps the payload symmetric.
+    #[serde(default)]
+    pub websocket_conn_id: Option<u64>,
+}
+
+/// Response returned from `POST /ui-bridge/apps/register`. Mirrors
+/// `DiscoveredApp` plus the runner's canonical view of the app's transport
+/// so the SDK can confirm it registered as expected.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterAppResponse {
+    #[serde(flatten)]
+    pub app: DiscoveredApp,
+    pub transport: crate::mcp::app_registry::AppTransport,
 }
 
 // ============================================================================
@@ -659,9 +676,33 @@ async fn ios_forward(
 async fn register_app(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<RegisterAppRequest>,
-) -> Result<Json<ApiResponse<DiscoveredApp>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<RegisterAppResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use crate::mcp::app_registry::AppTransport;
+
+    // Parse the declared transport (defaults to HTTP when absent). Unknown
+    // values are rejected so wrappers get a clear signal rather than being
+    // silently downgraded.
+    let transport = match req.transport.as_deref() {
+        None | Some("") | Some("http") => AppTransport::Http,
+        Some("websocket") => AppTransport::Websocket,
+        Some(other) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error(format!(
+                    "unknown transport '{}' — expected 'http' or 'websocket'",
+                    other
+                ))),
+            ));
+        }
+    };
+
     // Derive a canonical (origin, port, base_path) triple from either the
     // preferred `base_url` or the legacy `url` + `port` + `base_path` shape.
+    //
+    // WebSocket-transport apps do not need a reachable `baseUrl` (the runner
+    // pushes commands over the socket), so we synthesize placeholder values
+    // when they are absent. This lets third-party browser tabs and headless
+    // wrappers register without exposing an HTTP server of their own.
     let (origin_url, port, base_path) = match &req.base_url {
         Some(raw) if !raw.is_empty() => match url::Url::parse(raw) {
             Ok(parsed) => {
@@ -688,13 +729,15 @@ async fn register_app(
         },
         _ => {
             // Legacy shape: url + port (+ optional basePath).
+            // For WebSocket-transport apps these fields are optional — the
+            // runner reaches them over the socket, not their own HTTP port.
             let url_val = req.url.clone().unwrap_or_default();
             let port_val = req.port.unwrap_or(0);
-            if url_val.is_empty() || port_val == 0 {
+            if transport == AppTransport::Http && (url_val.is_empty() || port_val == 0) {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(ApiResponse::error(
-                        "register_app requires either `baseUrl` or (`url` + `port`)",
+                        "register_app requires either `baseUrl` or (`url` + `port`) for HTTP transport",
                     )),
                 ));
             }
@@ -719,26 +762,42 @@ async fn register_app(
         discovered_at: chrono::Utc::now().timestamp_millis(),
     };
 
-    state.app_registry.upsert(app.clone(), req.origin).await;
+    state
+        .app_registry
+        .upsert(
+            app.clone(),
+            req.origin,
+            transport,
+            req.websocket_conn_id,
+        )
+        .await;
 
     debug!(
-        "[app-registry] registered appId={} origin={} port={} basePath={}",
-        app.app_id, app.url, app.port, app.base_path
+        "[app-registry] registered appId={} origin={} port={} basePath={} transport={:?}",
+        app.app_id, app.url, app.port, app.base_path, transport
     );
 
-    Ok(Json(ApiResponse::success(app)))
+    Ok(Json(ApiResponse::success(RegisterAppResponse {
+        app,
+        transport,
+    })))
 }
 
 /// List apps that have phoned home and are still within the TTL window.
+/// Returns the transport discriminator per entry so the integration tool
+/// can distinguish HTTP-phone-home apps from WebSocket-registered wrappers.
 async fn list_registered_apps(
     State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<Vec<DiscoveredApp>>> {
+) -> Json<ApiResponse<Vec<RegisterAppResponse>>> {
     let apps = state
         .app_registry
         .list_live()
         .await
         .into_iter()
-        .map(|e| e.app)
+        .map(|e| RegisterAppResponse {
+            app: e.app,
+            transport: e.transport,
+        })
         .collect();
     Json(ApiResponse::success(apps))
 }
