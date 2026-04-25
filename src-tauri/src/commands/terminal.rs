@@ -8,6 +8,7 @@ use tauri::Manager;
 use tracing::{info, warn};
 
 use crate::commands::CommandResponse;
+use crate::error::AppError;
 use crate::terminal::TerminalManager;
 
 /// Create a new terminal session.
@@ -43,9 +44,12 @@ pub fn terminal_write(
         .get(&terminal_id)
         .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
 
-    let bytes = STANDARD
-        .decode(&data)
-        .map_err(|e| format!("Invalid base64 data: {}", e))?;
+    let bytes = STANDARD.decode(&data).map_err(|e| {
+        String::from(AppError::EncodingError(format!(
+            "Invalid base64 data: {}",
+            e
+        )))
+    })?;
 
     session.write(&bytes)?;
 
@@ -88,7 +92,7 @@ pub async fn terminal_close(
     let id = terminal_id.clone();
     tokio::task::spawn_blocking(move || manager.close(&id))
         .await
-        .map_err(|e| format!("Join error: {}", e))??;
+        .map_err(|e| String::from(AppError::ProcessError(format!("Join error: {}", e))))??;
 
     Ok(CommandResponse {
         success: true,
@@ -190,15 +194,23 @@ pub fn terminal_save_scrollback(
     let scrollback_dir = app_handle
         .path()
         .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?
+        .map_err(|e| String::from(AppError::TauriError(format!("Failed to get app data dir: {}", e))))?
         .join("terminal-scrollback");
 
-    std::fs::create_dir_all(&scrollback_dir)
-        .map_err(|e| format!("Failed to create scrollback directory: {}", e))?;
+    std::fs::create_dir_all(&scrollback_dir).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to create scrollback directory: {}", e),
+        )))
+    })?;
 
     let file_path = scrollback_dir.join(format!("{}.bin", terminal_id));
-    std::fs::write(&file_path, &data)
-        .map_err(|e| format!("Failed to write scrollback file: {}", e))?;
+    std::fs::write(&file_path, &data).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to write scrollback file: {}", e),
+        )))
+    })?;
 
     let path_str = file_path.to_string_lossy().to_string();
     info!(
@@ -230,7 +242,12 @@ pub fn terminal_get_saved_scrollback(file_path: String) -> Result<CommandRespons
         });
     }
 
-    let data = std::fs::read(path).map_err(|e| format!("Failed to read scrollback file: {}", e))?;
+    let data = std::fs::read(path).map_err(|e| {
+        String::from(AppError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read scrollback file: {}", e),
+        )))
+    })?;
 
     let encoded = STANDARD.encode(&data);
     info!(
@@ -256,7 +273,7 @@ pub fn terminal_cleanup_scrollback(
     let scrollback_dir = app_handle
         .path()
         .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?
+        .map_err(|e| String::from(AppError::TauriError(format!("Failed to get app data dir: {}", e))))?
         .join("terminal-scrollback");
 
     if !scrollback_dir.exists() {
