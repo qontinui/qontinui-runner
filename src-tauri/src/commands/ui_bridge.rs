@@ -352,9 +352,7 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
     tokio::task::spawn_blocking(move || -> Result<CommandResponse, AppError> {
         // Deserialize the co-occurrence export — serde_json::Error converts via `?`.
         let export: crate::exploration::types::CooccurrenceExport =
-            serde_json::from_value(cooccurrence_export).map_err(|e| {
-                AppError::ParseError(format!("Failed to parse co-occurrence export: {}", e))
-            })?;
+            serde_json::from_value(cooccurrence_export)?;
 
         // Build discovery config
         let discovery_config = if let Some(c) = config {
@@ -389,7 +387,7 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
         })
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))?
+    .map_err(|e| String::from(AppError::from(e)))?
     .map_err(String::from)
 }
 
@@ -407,12 +405,9 @@ pub async fn ui_bridge_reload_webview(app: tauri::AppHandle) -> Result<CommandRe
 
     // Get all webview windows and reload the main one
     if let Some(window) = app.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
-        window.eval("location.reload()").map_err(|e| {
-            String::from(AppError::TauriError(format!(
-                "Failed to reload webview: {}",
-                e
-            )))
-        })?;
+        window
+            .eval("location.reload()")
+            .map_err(|e| String::from(AppError::from(e)))?;
         Ok(CommandResponse {
             success: true,
             message: Some("Webview reload triggered".to_string()),
@@ -508,7 +503,7 @@ pub async fn ui_bridge_run_exploration(
         if let Some(ref mut executor) = *executor_lock {
             executor.ensure_started().map_err(|e| {
                 error!("Failed to start extraction executor: {}", e);
-                e
+                String::from(AppError::ExecutorError(e))
             })?;
 
             let params = json!({
@@ -530,7 +525,7 @@ pub async fn ui_bridge_run_exploration(
                     Some(params),
                     std::time::Duration::from_secs(300),
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| String::from(AppError::ExecutorError(e)))?;
 
             if response_result.success {
                 Ok(CommandResponse {
@@ -549,7 +544,7 @@ pub async fn ui_bridge_run_exploration(
         }
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))?
+    .map_err(|e| String::from(AppError::from(e)))?
 }
 
 /// Stop a running UI Bridge exploration
@@ -587,14 +582,14 @@ pub async fn ui_bridge_stop_exploration(
                         None,
                         std::time::Duration::from_secs(10),
                     )
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| String::from(AppError::ExecutorError(e)))
             } else {
                 Err("Extraction executor not initialized".to_string())
             }
         },
     )
     .await
-    .map_err(|e| format!("Task join error: {}", e))??;
+    .map_err(|e| String::from(AppError::from(e)))??;
 
     if response_result.success {
         Ok(CommandResponse {
