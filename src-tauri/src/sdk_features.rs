@@ -9,6 +9,14 @@
 //! `data`, `uiBridge`, `timestamp` — matching the supervisor's `/health`
 //! envelope). Test drivers compare against the features they need; an
 //! absent feature means the binary predates that feature's SDK release.
+//!
+//! **Mixed-category flags.** Entries here cover both transport-level
+//! primitives (e.g. `softNavigate`, `tabActivation`, `flatErrorEnvelope`)
+//! AND data-shape contracts the host emits in its responses
+//! (e.g. `snapshotF3`, `snapshotCanonicalElements`). Test drivers can
+//! `sdkFeatures.includes("snapshotF3")` to feature-detect the snapshot
+//! shape instead of probing field presence. See [`SDK_FEATURE_DOC_URL`]
+//! for the canonical reference of every flag.
 
 pub const SDK_FEATURES: &[&str] = &[
     "softNavigate",
@@ -27,6 +35,17 @@ pub const SDK_FEATURES: &[&str] = &[
     "componentTree",
     "errorClosestMatches",
     "frontendReadyFlag",
+    // Snapshot-shape contracts (data-shape, not transport-level)
+    // F3 metadata in snapshot envelope: registration{totalRegistered,
+    // everHadRegistrations, byRoute} + route + snapshotTakenAtMs.
+    // Added 2026-04-24 (ui-bridge commit d50ce72); full coverage
+    // 2026-04-25 (a8a4bb4 patched the relay handler).
+    "snapshotF3",
+    // Snapshot elements use the canonical SDK serialization (bbox,
+    // identifier, tagName, stableRef, kind, category, visible, origin,
+    // route) rather than the legacy minimal {id, type, label, actions,
+    // state} shape. Added 2026-04-26 via the Phase 1+6 audit fix.
+    "snapshotCanonicalElements",
 ];
 
 pub const SDK_FEATURE_DOC_URL: &str =
