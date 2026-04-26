@@ -966,9 +966,41 @@ pub fn get_resolved_custom_variables() -> HashMap<String, String> {
 // Runner Instance CRUD Helpers
 // ============================================================================
 
+/// Once-per-process guard for the duplicate-port warning emitted by
+/// `get_runner_instances`. Restarting the runner re-arms it, so a user who
+/// fixes their duplicates can confirm by reloading and seeing no warning.
+static DUPLICATE_PORT_WARNING_FIRED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Walk `runner_instances` for duplicate ports and emit a structured warning
+/// per offending port. Logged at most once per process via the OnceLock guard
+/// when called from `get_runner_instances`; called eagerly from
+/// `save_runner_instance` to catch newly-introduced duplicates.
+fn warn_on_duplicate_ports(instances: &[RunnerInstanceConfig]) {
+    let mut by_port: HashMap<u16, Vec<&str>> = HashMap::new();
+    for inst in instances {
+        by_port.entry(inst.port).or_default().push(&inst.name);
+    }
+    for (port, names) in by_port.iter() {
+        if names.len() > 1 {
+            tracing::warn!(
+                target = "config_facade",
+                "settings.json runner_instances has duplicate port {}: {:?}. \
+                 Consumers that dedupe by port (the Tauri get_runner_instances \
+                 fallback in the Orchestration Loop picker) will silently drop \
+                 all but one entry. Rename or delete the duplicates in \
+                 Settings → Runner Instances.",
+                port,
+                names
+            );
+        }
+    }
+}
+
 /// Get all configured runner instances.
 pub fn get_runner_instances() -> Vec<RunnerInstanceConfig> {
-    load_settings().runner_instances
+    let instances = load_settings().runner_instances;
+    DUPLICATE_PORT_WARNING_FIRED.get_or_init(|| warn_on_duplicate_ports(&instances));
+    instances
 }
 
 /// Save or update a runner instance configuration.
@@ -984,7 +1016,12 @@ pub fn save_runner_instance(config: RunnerInstanceConfig) -> Result<(), String> 
     } else {
         settings.runner_instances.push(config);
     }
-    save_settings(&settings)
+    save_settings(&settings)?;
+    // After every save, re-check the full set for duplicates — catches the
+    // moment when a user (or the auto-suggest port logic, if it ever drifts)
+    // introduces a collision with an existing slot.
+    warn_on_duplicate_ports(&settings.runner_instances);
+    Ok(())
 }
 
 /// Delete a runner instance configuration by ID.

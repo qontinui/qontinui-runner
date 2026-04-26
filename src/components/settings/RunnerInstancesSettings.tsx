@@ -435,6 +435,9 @@ interface InstanceRowProps {
   onLaunch: (instance: InstanceStatus) => void;
   onStop: (instance: InstanceStatus) => void;
   onDelete: (instance: InstanceStatus) => void;
+  /** Deregister an externally-registered instance from both the in-memory
+   *  map and the DB registry. Configured slots use `onDelete` instead. */
+  onDeregister: (instance: InstanceStatus) => void;
   onSavePlacement: (instance: InstanceStatus, placement: SpawnPlacement | null) => void;
   onLog: LogFunction;
 }
@@ -446,6 +449,7 @@ function InstanceRow({
   onLaunch,
   onStop,
   onDelete,
+  onDeregister,
   onSavePlacement,
   onLog,
 }: InstanceRowProps) {
@@ -536,7 +540,17 @@ function InstanceRow({
             </button>
           )}
           {instance.source === "registered" ? (
-            <span className="text-[10px] text-muted-foreground px-2">external</span>
+            <>
+              <span className="text-[10px] text-muted-foreground px-2">external</span>
+              <button
+                onClick={() => onDeregister(instance)}
+                disabled={actionInProgress === instance.id}
+                className="p-1.5 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50"
+                title="Deregister (clear from registry — does not stop the runner)"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </>
           ) : instance.running ? (
             <button
               onClick={() => onStop(instance)}
@@ -892,6 +906,34 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
     }
   };
 
+  /** Externally-registered (source="registered") rows have no settings.json
+   *  slot to delete and aren't a child process we can stop. The right
+   *  cleanup is `DELETE /instances/{id}` on this runner — it removes the
+   *  in-memory and DB entries so the row stops cluttering the registry.
+   *  Does not actually stop the external runner; that's its own owner's
+   *  responsibility. Useful when a phantom row is left over after a
+   *  crashed external runner. */
+  const handleDeregister = async (instance: InstanceStatus) => {
+    setActionInProgress(instance.id);
+    try {
+      const port = getApiPort();
+      const resp = await fetch(
+        `http://localhost:${port}/instances/${encodeURIComponent(instance.id)}`,
+        { method: "DELETE" },
+      );
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`HTTP ${resp.status}: ${body.slice(0, 200)}`);
+      }
+      onLog("success", `Instance '${instance.name}' deregistered`);
+      await loadInstances();
+    } catch (err) {
+      onLog("error", `Failed to deregister: ${err}`);
+    } finally {
+      setActionInProgress(null);
+    }
+  };
+
   const handleSavePlacement = async (
     instance: InstanceStatus,
     placement: SpawnPlacement | null,
@@ -947,6 +989,7 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
             onLaunch={handleLaunch}
             onStop={handleStop}
             onDelete={handleDelete}
+            onDeregister={handleDeregister}
             onSavePlacement={handleSavePlacement}
             onLog={onLog}
           />
