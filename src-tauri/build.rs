@@ -31,36 +31,53 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=QONTINUI_GIT_SHA={}", git_sha_short);
 
-    // RUNNER_BUILD_ID — the SW-cache-invalidation signal. Format
-    // `<git-sha-short>-<unix-ms>`, mirroring the build-id used by the
-    // supervisor and qontinui-web. Read at runtime by the `get_build_id`
-    // Tauri command and compared by the React refresh banner against the
-    // value baked into index.html at Vite-build time. The Vite side computes
-    // the same format independently — they don't have to match to the
-    // millisecond, only differ across builds (Vite reruns first, so they
-    // diverge on every rebuild, which is the whole point).
+    // RUNNER_BUILD_ID — the SW-cache-invalidation signal. Vite is the
+    // single source of truth: `vite.config.ts` computes the value once
+    // (`<git-sha-short>-<unix-ms>`), bakes it into index.html as
+    // `<meta name="build-id">`, AND writes it to `dist/build-id.txt`.
+    // We read that file here and re-emit the same string as the cargo env
+    // so the meta tag and the binary's compile-time stamp match exactly
+    // for any freshly-built binary. Without this, Vite's `Date.now()` and
+    // cargo's `SystemTime::now()` capture would always differ by tens of
+    // seconds, causing `useBuildIdWatcher` to fire on every cold spawn
+    // instead of only on real mid-session binary swaps.
     //
-    // Use a 7-char short SHA (vs the 12 above) to stay aligned with what the
-    // Vite plugin emits (`git rev-parse --short HEAD` defaults to 7).
-    let git_sha = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
+    // Fallback: if `dist/build-id.txt` is missing (e.g. a manual `cargo
+    // build` without a prior `npm run build`), compute fresh from
+    // git+timestamp. This degrades gracefully — the binary is still
+    // stamped with *something* — but the meta-tag/env match guarantee
+    // only holds when the supervisor's standard build sequence runs
+    // (`npm run build` → `cargo build`).
+    let runner_build_id = std::fs::read_to_string("../dist/build-id.txt")
         .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    let unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    println!("cargo:rustc-env=RUNNER_BUILD_ID={}-{}", git_sha, unix_ms);
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let git_sha = std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        String::from_utf8(o.stdout)
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("{}-{}", git_sha, unix_ms)
+        });
+    println!("cargo:rustc-env=RUNNER_BUILD_ID={}", runner_build_id);
+    // Re-stamp when Vite writes a new build-id (covered by the broader
+    // `../dist` rerun rule above, but keep the explicit hint so a future
+    // refactor that narrows the dist watch doesn't silently freeze the id).
+    println!("cargo:rerun-if-changed=../dist/build-id.txt");
 
     // Re-run this script when HEAD moves. qontinui-runner's .git lives at
     // ../.git relative to src-tauri.

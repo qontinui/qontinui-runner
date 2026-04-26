@@ -6,12 +6,15 @@ import tailwindcss from "@tailwindcss/vite";
 import { version } from "./package.json";
 
 // Compute the runner build-id at Vite-build time. Format
-// `<git-sha-short>-<unix-ms>`, mirroring `build.rs`. The Vite value is baked
-// into the embedded index.html via the `inject-build-id-meta` plugin below;
-// the cargo value is exposed by the `get_build_id` Tauri command. They're
-// computed independently — what matters is that BOTH change on every
-// rebuild, which is the divergence signal `useBuildIdWatcher` needs to
-// detect a binary swap mid-session.
+// `<git-sha-short>-<unix-ms>`. Vite is the *single source of truth* for the
+// build-id: the value is baked into the embedded index.html as
+// `<meta name="build-id">` AND written to `dist/build-id.txt`, which
+// `build.rs` reads back when stamping `RUNNER_BUILD_ID` into the binary.
+// This guarantees the meta tag and the cargo-baked env match for any
+// freshly-built binary, so `useBuildIdWatcher` only fires on a real
+// mid-session binary swap (not on every cold spawn — Vite and cargo used
+// to capture independent timestamps tens of seconds apart, which produced
+// false positives on every fresh build).
 function computeBuildId(): string {
   let sha = "unknown";
   try {
@@ -49,6 +52,18 @@ export default defineConfig({
           );
         }
         return html.replace("</head>", `    ${tag}\n  </head>`);
+      },
+      // Emit dist/build-id.txt so `build.rs` can read the same value Vite
+      // baked into the meta tag. Without this, Vite and cargo would each
+      // capture an independent `Date.now()` and the resulting RUNNER_BUILD_ID
+      // would never match the meta tag — the banner would fire on every
+      // fresh spawn rather than only on real mid-session binary swaps.
+      generateBundle() {
+        this.emitFile({
+          type: "asset",
+          fileName: "build-id.txt",
+          source: RUNNER_BUILD_ID,
+        });
       },
     },
     // Strip module-related attributes from built HTML. The IIFE bundle
