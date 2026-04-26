@@ -1146,12 +1146,49 @@ impl Default for WorldStateVerifierSettings {
 // Runner Instance Configuration (Dev Feature)
 // ============================================================================
 
+/// Describes a target monitor for spawn placement. The serde tag is
+/// `kind` and matches the discriminator in the JSON written to
+/// `settings.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MonitorDescriptor {
+    /// 0-based index into Tauri's `available_monitors()` list.
+    Index { index: usize },
+    /// Spatial role: "primary", "left", "right", "center".
+    /// Resolved against the same labeling logic the runner uses
+    /// in `mcp::monitors::get_monitors`.
+    Position { position: String },
+    /// Match a monitor by its OS name (e.g. `\\.\DISPLAY1`).
+    Name { name: String },
+}
+
+/// Per-instance spawn-window placement, configured by the user and
+/// resolved at launch time to absolute virtual-desktop physical coords.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnPlacement {
+    pub monitor: MonitorDescriptor,
+    /// Position in monitor-local logical CSS pixels. (0, 0) is the
+    /// monitor's top-left.
+    pub x: i32,
+    pub y: i32,
+    /// Window size in monitor-local logical CSS pixels. Falls back to
+    /// 1920x1080 when None.
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
 /// Configuration for a secondary runner instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerInstanceConfig {
     pub id: String,
     pub name: String,
     pub port: u16,
+    /// Optional per-instance spawn-window placement. None = let the OS
+    /// place it (current behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_placement: Option<SpawnPlacement>,
 }
 
 fn default_auto_load_last_config() -> bool {

@@ -681,6 +681,11 @@ pub struct DiscoveredInstance {
     is_self: bool,
     /// Whether the instance's HTTP API is reachable
     reachable: bool,
+    /// Per-instance spawn-window placement, if configured. None for
+    /// the primary, registered/discovered instances, and configured
+    /// instances that haven't had a placement set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spawn_placement: Option<crate::settings::SpawnPlacement>,
 }
 
 /// Discover all runner instances (this runner + configured secondary instances).
@@ -701,6 +706,7 @@ pub async fn get_instances(
         port: self_port,
         is_self: true,
         reachable: true,
+        spawn_placement: None,
     }];
 
     // Collect all known ports to avoid duplicates
@@ -729,6 +735,7 @@ pub async fn get_instances(
             port: config.port,
             is_self: false,
             reachable,
+            spawn_placement: config.spawn_placement.clone(),
         });
     }
 
@@ -749,6 +756,7 @@ pub async fn get_instances(
             port: reg.port,
             is_self: false,
             reachable,
+            spawn_placement: None,
         });
     }
 
@@ -770,6 +778,7 @@ pub async fn get_instances(
                 port,
                 is_self: false,
                 reachable,
+                spawn_placement: None,
             });
         }
     }
@@ -1557,6 +1566,7 @@ async fn spawn_instance(
         id: id.clone(),
         name: name.clone(),
         port,
+        spawn_placement: body.spawn_placement.clone(),
     };
 
     // Save config
@@ -1570,7 +1580,7 @@ async fn spawn_instance(
     // Launch
     let pid = state
         .instance_manager
-        .launch_instance(&config)
+        .launch_instance_with_app(&config, Some(&state.app_handle))
         .await
         .map_err(|e| {
             (
@@ -1662,7 +1672,7 @@ async fn launch_instance(
 
     let pid = state
         .instance_manager
-        .launch_instance(config)
+        .launch_instance_with_app(config, Some(&state.app_handle))
         .await
         .map_err(|e| {
             (
@@ -1681,6 +1691,11 @@ struct SpawnInstanceRequest {
     name: String,
     /// Port for the new instance. If omitted, auto-allocated from 9877-9899.
     port: Option<u16>,
+    /// Optional per-instance spawn-window placement. Persisted with
+    /// the instance config and applied at every launch (this one and
+    /// future ones).
+    #[serde(default)]
+    spawn_placement: Option<crate::settings::SpawnPlacement>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1910,6 +1925,188 @@ async fn purge_stale_instances(
     })))
 }
 
+// ─── Spawn-placement preview endpoint ───────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct SpawnPlacementPreviewQuery {
+    /// Slot index. 0 = primary, 1.. = configured `runner_instances`
+    /// in saved order.
+    slot: usize,
+    /// Behavior when `slot` is past the end of the list. `wrap` rotates
+    /// `slot % count` over slots that have placements; default = 404.
+    #[serde(default)]
+    overflow: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct SpawnPlacementPreviewResponse {
+    global_x: i32,
+    global_y: i32,
+    width: u32,
+    height: u32,
+    monitor_label: String,
+    slot_index: usize,
+    /// Either the resolved instance name or `"primary"`.
+    slot_label: String,
+    /// Always `"configured"` for now — kept as a discriminator for
+    /// future supervisor-side fallback sources.
+    source: &'static str,
+}
+
+/// `GET /spawn-placement/preview?slot=N[&overflow=wrap|default]`
+///
+/// Resolve the placement for the given slot against the live monitor
+/// list. Slot 0 is the primary (which never has its own placement, so
+/// always 404 unless overflow=wrap). Slots 1.. map to the configured
+/// `runner_instances` in saved order.
+async fn preview_spawn_placement_route(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(q): axum::extract::Query<SpawnPlacementPreviewQuery>,
+) -> Result<Json<ApiResponse<SpawnPlacementPreviewResponse>>, (axum::http::StatusCode, Json<serde_json::Value>)>
+{
+    let configs = crate::settings::get_runner_instances();
+    // Slot 0 is the primary; slots 1.. are configured instances.
+    let total_slots = configs.len() + 1;
+
+    let (effective_slot, slot_label, placement) = if q.slot == 0 {
+        // Primary has no placement of its own. Allow overflow=wrap to
+        // rotate, but the simple "0" call always 404s.
+        if q.overflow.as_deref() == Some("wrap") {
+            // Find the first configured slot with a placement.
+            let placed: Vec<(usize, &crate::settings::RunnerInstanceConfig)> = configs
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.spawn_placement.is_some())
+                .collect();
+            if placed.is_empty() {
+                return Err((
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "no slots have placements",
+                        "slot": q.slot,
+                    })),
+                ));
+            }
+            let pick = q.slot % placed.len();
+            let (idx, cfg) = placed[pick];
+            (idx + 1, cfg.name.clone(), cfg.spawn_placement.clone())
+        } else {
+            return Err((
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "slot has no placement",
+                    "slot": q.slot,
+                })),
+            ));
+        }
+    } else if q.slot < total_slots {
+        // 1-based into configs.
+        let cfg_idx = q.slot - 1;
+        let cfg = &configs[cfg_idx];
+        if cfg.spawn_placement.is_none() {
+            // overflow=wrap rotates over placement-having slots even when
+            // the requested slot is in-range but un-placed. Without this,
+            // a sparse runner_instances list (e.g. slots 1-3 unplaced,
+            // slot 5 placed) would 404 every request from slot 1.
+            if q.overflow.as_deref() == Some("wrap") {
+                let placed: Vec<(usize, &crate::settings::RunnerInstanceConfig)> = configs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.spawn_placement.is_some())
+                    .collect();
+                if placed.is_empty() {
+                    return Err((
+                        axum::http::StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": "no slots have placements",
+                            "slot": q.slot,
+                        })),
+                    ));
+                }
+                let pick = q.slot % placed.len();
+                let (idx, cfg) = placed[pick];
+                (idx + 1, cfg.name.clone(), cfg.spawn_placement.clone())
+            } else {
+                return Err((
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "slot has no placement",
+                        "slot": q.slot,
+                    })),
+                ));
+            }
+        } else {
+            (q.slot, cfg.name.clone(), cfg.spawn_placement.clone())
+        }
+    } else {
+        // Slot past the end of the list.
+        match q.overflow.as_deref() {
+            Some("wrap") => {
+                // Rotate `q.slot % len` over slots that have placements.
+                let placed: Vec<(usize, &crate::settings::RunnerInstanceConfig)> = configs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.spawn_placement.is_some())
+                    .collect();
+                if placed.is_empty() {
+                    return Err((
+                        axum::http::StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": "no slots have placements",
+                            "slot": q.slot,
+                        })),
+                    ));
+                }
+                let pick = q.slot % placed.len();
+                let (idx, cfg) = placed[pick];
+                (idx + 1, cfg.name.clone(), cfg.spawn_placement.clone())
+            }
+            _ => {
+                return Err((
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "slot out of range",
+                        "slot": q.slot,
+                        "max_slot": total_slots.saturating_sub(1),
+                    })),
+                ));
+            }
+        }
+    };
+
+    let placement = placement.ok_or_else(|| {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "slot has no placement",
+                "slot": q.slot,
+            })),
+        )
+    })?;
+
+    let resolved = crate::spawn_placement::resolve_to_global_physical(&state.app_handle, &placement)
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to resolve placement: {}", e),
+                    "slot": q.slot,
+                })),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(SpawnPlacementPreviewResponse {
+        global_x: resolved.global_x,
+        global_y: resolved.global_y,
+        width: resolved.width,
+        height: resolved.height,
+        monitor_label: resolved.monitor_label,
+        slot_index: effective_slot,
+        slot_label,
+        source: "configured",
+    })))
+}
+
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{delete, get, post};
     axum::Router::new()
@@ -1937,6 +2134,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/instances/{id}/stop", post(stop_instance))
         .route("/instances/{id}/launch", post(launch_instance))
         .route("/instances/{id}/heartbeat", post(instance_heartbeat))
+        .route(
+            "/spawn-placement/preview",
+            get(preview_spawn_placement_route),
+        )
         .route("/tool-version", get(get_tool_version))
         .route("/load-config", post(load_config))
         .route("/load-last-config", post(load_last_config))

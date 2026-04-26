@@ -112,6 +112,7 @@ mod settings;
 // pick up. Must come before any module that panics during static init.
 mod skills;
 mod slash_commands;
+mod spawn_placement;
 mod spec_experimentation;
 mod spec_utils;
 mod startup_panic;
@@ -668,6 +669,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::backup::get_export_summary,
             commands::backup::get_import_preview,
             commands::backup::import_all_data,
+            commands::build_id::get_build_id,
             commands::checkpoint_browser::add_sample_checkpoints,
             commands::checkpoint_browser::clear_all_checkpoints,
             commands::checkpoint_browser::compare_orchestrator_checkpoints,
@@ -924,6 +926,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::instances::get_runner_identity,
             commands::instances::get_runner_instances,
             commands::instances::launch_runner_instance,
+            commands::instances::list_monitors_for_placement,
+            commands::instances::preview_spawn_placement,
             commands::instances::save_runner_instance,
             commands::instances::stop_runner_instance,
             commands::interaction::get_interaction_recording_status,
@@ -2147,7 +2151,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
-                            match im.launch_instance(config).await {
+                            match im
+                                .launch_instance_with_app(config, Some(&app_handle_for_restore))
+                                .await
+                            {
                                 Ok(pid) => {
                                     info!(
                                         "Restored instance '{}' (PID: {}, port: {})",

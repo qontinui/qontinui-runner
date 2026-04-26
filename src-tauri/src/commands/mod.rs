@@ -161,6 +161,7 @@ pub mod ai_settings;
 pub mod auth;
 pub mod autostart; // Phase F.1 — launch-on-system-startup toggle (tauri-plugin-autostart wrapper)
 pub mod backup; // Comprehensive backup and restore
+pub mod build_id; // SW-cache-invalidation: exposes RUNNER_BUILD_ID baked at compile time
 pub mod checkpoint_browser; // Orchestrator checkpoint browser (time-travel debugging)
 pub mod checkpoints;
 pub mod checks; // Code quality checks (linting, formatting, type checking)

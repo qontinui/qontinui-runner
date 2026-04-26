@@ -2,14 +2,15 @@
 
 use std::sync::Arc;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
+use tauri::Manager;
 use tauri::State;
 use tracing::info;
 
 use super::CommandResponse;
 use crate::commands::compartments::HealthCompartment;
 use crate::instance_manager::InstanceManager;
-use crate::settings::{self, RunnerInstanceConfig};
+use crate::settings::{self, RunnerInstanceConfig, SpawnPlacement};
+use crate::spawn_placement::{resolve_to_global_physical, ResolvedPlacement};
 
 /// Get every runner instance the picker should know about: every slot in
 /// `settings.json` plus every non-primary entry in the DB registry that
@@ -33,6 +34,7 @@ pub async fn save_runner_instance(
     id: String,
     name: String,
     port: u16,
+    spawn_placement: Option<SpawnPlacement>,
 ) -> Result<CommandResponse, String> {
     if port < 1024 {
         return Err(format!(
@@ -44,6 +46,7 @@ pub async fn save_runner_instance(
         id,
         name: name.clone(),
         port,
+        spawn_placement,
     };
     settings::save_runner_instance(config)?;
     info!("Saved runner instance config: {} on port {}", name, port);
@@ -51,6 +54,108 @@ pub async fn save_runner_instance(
         success: true,
         message: Some(format!("Instance '{}' saved", name)),
         data: None,
+    })
+}
+
+/// Preview how a `SpawnPlacement` would resolve against the current
+/// monitor layout, without persisting anything. The UI calls this
+/// while the user drags / edits the placement so they can see the
+/// resulting global coords before saving.
+#[tauri::command]
+pub async fn preview_spawn_placement(
+    app: tauri::AppHandle,
+    placement: SpawnPlacement,
+) -> Result<ResolvedPlacement, String> {
+    resolve_to_global_physical(&app, &placement)
+}
+
+/// Per-monitor metadata returned to the placement editor UI. Mirrors
+/// the shape of `MonitorInfoResponse` from `mcp::types` so a frontend
+/// can use either source interchangeably.
+#[derive(Debug, serde::Serialize)]
+pub struct MonitorListEntry {
+    pub index: usize,
+    pub name: Option<String>,
+    /// Spatial role: "left" / "center" / "right" (or "center" if there
+    /// is only one monitor). Matches `mcp::monitors::get_monitors`.
+    pub position_label: String,
+    /// Top-left corner of the monitor in virtual-desktop physical px.
+    pub x: i32,
+    pub y: i32,
+    /// Monitor size in physical pixels.
+    pub width: u32,
+    pub height: u32,
+    pub scale_factor: f64,
+    pub is_primary: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MonitorList {
+    pub count: usize,
+    pub monitors: Vec<MonitorListEntry>,
+}
+
+/// List monitors with the metadata the placement editor needs. This
+/// duplicates the labeling logic from `mcp::monitors::get_monitors`
+/// (which returns a slightly different shape and goes through the MCP
+/// HTTP server) so the Tauri command path doesn't have to spin up the
+/// HTTP layer just to get monitor info.
+#[tauri::command]
+pub async fn list_monitors_for_placement(app: tauri::AppHandle) -> Result<MonitorList, String> {
+    let monitors = app
+        .available_monitors()
+        .map_err(|e| format!("available_monitors failed: {}", e))?;
+
+    let primary = app.primary_monitor().ok().flatten();
+
+    let xs: Vec<i32> = monitors.iter().map(|m| m.position().x).collect();
+    let min_x = xs.iter().min().copied().unwrap_or(0);
+    let max_x = xs.iter().max().copied().unwrap_or(0);
+    let single = monitors.len() == 1;
+
+    let entries: Vec<MonitorListEntry> = monitors
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| {
+            let pos = m.position();
+            let size = m.size();
+            let is_primary = match &primary {
+                Some(prim) => {
+                    let pp = prim.position();
+                    let ps = prim.size();
+                    pos.x == pp.x
+                        && pos.y == pp.y
+                        && size.width == ps.width
+                        && size.height == ps.height
+                }
+                None => idx == 0,
+            };
+            let position_label = if single {
+                "center".to_string()
+            } else if pos.x == min_x {
+                "left".to_string()
+            } else if pos.x == max_x {
+                "right".to_string()
+            } else {
+                "center".to_string()
+            };
+            MonitorListEntry {
+                index: idx,
+                name: m.name().map(|n| n.to_string()),
+                position_label,
+                x: pos.x,
+                y: pos.y,
+                width: size.width,
+                height: size.height,
+                scale_factor: m.scale_factor(),
+                is_primary,
+            }
+        })
+        .collect();
+
+    Ok(MonitorList {
+        count: entries.len(),
+        monitors: entries,
     })
 }
 
@@ -80,6 +185,7 @@ pub async fn delete_runner_instance(
 /// Launch a runner instance.
 #[tauri::command]
 pub async fn launch_runner_instance(
+    app: tauri::AppHandle,
     id: String,
     instance_manager: State<'_, Arc<InstanceManager>>,
 ) -> Result<CommandResponse, String> {
@@ -89,7 +195,9 @@ pub async fn launch_runner_instance(
         .find(|c| c.id == id)
         .ok_or_else(|| format!("Instance '{}' not found in settings", id))?;
 
-    let pid = instance_manager.launch_instance(config).await?;
+    let pid = instance_manager
+        .launch_instance_with_app(config, Some(&app))
+        .await?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
@@ -135,7 +243,12 @@ pub async fn get_runner_identity(
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+///
+/// The plugin is non-generic (defaulting to `tauri::Wry`) because
+/// some commands here take `tauri::AppHandle` (Wry-default) directly.
+/// This matches the pattern used by `commands::ui_bridge` and
+/// `commands::ai_session`.
+pub fn plugin() -> TauriPlugin<tauri::Wry> {
     PluginBuilder::new("qontinui_instances")
         .invoke_handler(tauri::generate_handler![
             get_runner_instances,
@@ -144,6 +257,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             launch_runner_instance,
             stop_runner_instance,
             get_runner_identity,
+            preview_spawn_placement,
+            list_monitors_for_placement,
         ])
         .build()
 }

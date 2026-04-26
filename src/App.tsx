@@ -49,6 +49,7 @@ import { useErrorNotifications } from "./hooks/useErrorNotifications";
 import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration";
 
 import { ToastContainer } from "./components/ToastContainer";
+import { BuildRefreshBanner } from "./components/BuildRefreshBanner";
 import { ApprovalDialog } from "./components/dag-workflow-editor";
 import StatusIndicator from "./components/StatusIndicator";
 import ActionDetailModal from "./components/ActionDetailModal";
@@ -723,6 +724,15 @@ function TauriEventNamesLoader() {
 export default function App() {
   return (
     <ApolloProvider client={getGraphQLClient()}>
+      {/*
+        BuildRefreshBanner sits outside UIBridgeProvider so it keeps watching
+        even if the bridge tears down (e.g. during navigation/error states).
+        Banner is hidden by default and only renders the toast when
+        `invoke('get_build_id')` reports a value different from the
+        `<meta name="build-id">` baked into the embedded index.html — i.e.
+        the runner exe was swapped while this webview stayed open.
+      */}
+      <BuildRefreshBanner />
       <UIBridgeProvider
         features={{ renderLog: true, control: true, debug: true }}
         browserCaptureConfig={{ console: true }}

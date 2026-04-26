@@ -1,14 +1,56 @@
 import path from "path";
+import { execSync } from "child_process";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { version } from "./package.json";
+
+// Compute the runner build-id at Vite-build time. Format
+// `<git-sha-short>-<unix-ms>`, mirroring `build.rs`. The Vite value is baked
+// into the embedded index.html via the `inject-build-id-meta` plugin below;
+// the cargo value is exposed by the `get_build_id` Tauri command. They're
+// computed independently — what matters is that BOTH change on every
+// rebuild, which is the divergence signal `useBuildIdWatcher` needs to
+// detect a binary swap mid-session.
+function computeBuildId(): string {
+  let sha = "unknown";
+  try {
+    sha = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim();
+  } catch {
+    // git missing or not a repo — fall through to "unknown"
+  }
+  return `${sha || "unknown"}-${Date.now()}`;
+}
+const RUNNER_BUILD_ID = computeBuildId();
 
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    // Inject `<meta name="build-id" content="...">` into the served HTML so
+    // `useBuildIdWatcher` (consumed by BuildRefreshBanner) has a stable
+    // initial value to compare against `invoke('get_build_id')`. Runs in
+    // `transformIndexHtml` (early) so the strip-module-attrs and
+    // extract-css-from-bundle plugins later in this list don't have to know
+    // about it.
+    {
+      name: "inject-build-id-meta",
+      enforce: "pre" as const,
+      transformIndexHtml(html: string) {
+        const escaped = RUNNER_BUILD_ID.replace(/"/g, "&quot;");
+        const tag = `<meta name="build-id" content="${escaped}">`;
+        if (html.includes('name="build-id"')) {
+          return html.replace(
+            /<meta\s+name="build-id"[^>]*>/,
+            tag,
+          );
+        }
+        return html.replace("</head>", `    ${tag}\n  </head>`);
+      },
+    },
     // Strip module-related attributes from built HTML. The IIFE bundle
     // doesn't use ES module syntax, so type="module" and crossorigin are
     // unnecessary. Removing type="module" is critical: it makes the browser

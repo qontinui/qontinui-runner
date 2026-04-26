@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::database::pg::PgDb;
-use crate::settings::RunnerInstanceConfig;
+use crate::settings::{RunnerInstanceConfig, SpawnPlacement};
 
 /// Status of a runner instance.
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +31,11 @@ pub struct InstanceStatus {
     /// entries that exist only in the DB registry (e.g. supervisor-spawned
     /// runners that registered themselves but were never saved as a slot).
     pub source: &'static str,
+    /// Per-instance spawn-window placement, if configured. Only present
+    /// for `"configured"` entries — `"discovered"` rows from the DB
+    /// registry don't carry placement info.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_placement: Option<SpawnPlacement>,
 }
 
 /// Handle for a spawned runner instance.
@@ -310,6 +315,21 @@ impl InstanceManager {
 
     /// Launch a new runner instance with the given configuration.
     pub async fn launch_instance(&self, config: &RunnerInstanceConfig) -> Result<u32, String> {
+        self.launch_instance_with_app(config, None).await
+    }
+
+    /// Launch a new runner instance, optionally resolving spawn
+    /// placement against the supplied AppHandle. Callers from a Tauri
+    /// context (commands, HTTP handlers) should pass `Some(app)` so
+    /// `config.spawn_placement` can be honored. Callers without a
+    /// Tauri handle (e.g. session-restore on startup before the
+    /// AppHandle is shared with us) can pass `None` and the OS picks
+    /// the position.
+    pub async fn launch_instance_with_app(
+        &self,
+        config: &RunnerInstanceConfig,
+        app: Option<&tauri::AppHandle>,
+    ) -> Result<u32, String> {
         let mut instances = self.instances.lock().await;
 
         // Check if already running
@@ -339,6 +359,45 @@ impl InstanceManager {
         // process capture requests back and send heartbeats.
         let own_port = crate::mcp::types::get_mcp_api_port();
         cmd.env("QONTINUI_PRIMARY_PORT", own_port.to_string());
+
+        // Apply spawn-window placement if configured. This is best-effort:
+        // a resolution failure (e.g. monitor disconnected since config) is
+        // logged at WARN and the spawn proceeds without the env vars.
+        if let Some(placement) = &config.spawn_placement {
+            match app {
+                Some(app) => {
+                    match crate::spawn_placement::resolve_to_global_physical(app, placement) {
+                        Ok(resolved) => {
+                            info!(
+                                "Applying spawn placement to instance '{}': global=({}, {}) size=({}x{}) [{}]",
+                                config.name,
+                                resolved.global_x,
+                                resolved.global_y,
+                                resolved.width,
+                                resolved.height,
+                                resolved.monitor_label
+                            );
+                            cmd.env("QONTINUI_WINDOW_X", resolved.global_x.to_string());
+                            cmd.env("QONTINUI_WINDOW_Y", resolved.global_y.to_string());
+                            cmd.env("QONTINUI_WINDOW_WIDTH", resolved.width.to_string());
+                            cmd.env("QONTINUI_WINDOW_HEIGHT", resolved.height.to_string());
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Spawn placement for '{}' could not be resolved ({}); launching without explicit position",
+                                config.name, e
+                            );
+                        }
+                    }
+                }
+                None => {
+                    warn!(
+                        "Instance '{}' has spawn_placement configured but launch was invoked without an AppHandle; skipping placement",
+                        config.name
+                    );
+                }
+            }
+        }
 
         // Critical: remove CLAUDECODE env var so Claude CLI can start inside the instance
         cmd.env_remove("CLAUDECODE");
@@ -467,6 +526,7 @@ impl InstanceManager {
             pid,
             api_ready,
             source: "configured",
+            spawn_placement: config.spawn_placement.clone(),
         }
     }
 
@@ -536,6 +596,7 @@ impl InstanceManager {
                     pid: row.pid.map(|p| p as u32),
                     api_ready,
                     source: "discovered",
+                    spawn_placement: None,
                 },
             );
         }
