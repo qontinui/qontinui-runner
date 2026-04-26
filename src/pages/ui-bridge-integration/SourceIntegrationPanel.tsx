@@ -550,6 +550,8 @@ function formatFramework(fw: string): string {
     angular: "Angular",
     svelte: "Svelte",
     plain_html: "Plain HTML",
+    expo_router: "Expo Router",
+    react_native: "React Native",
     unknown: "Unknown",
   };
   return map[fw] || fw;
