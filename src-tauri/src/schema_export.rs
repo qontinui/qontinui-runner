@@ -584,6 +584,11 @@ pub fn export_all_schemas() -> Value {
     add!("DiscoveryResponse", qub::DiscoveryResponse);
     add!("WorkflowInfo", qub::WorkflowInfo);
     add!("UIBridgeSnapshot", qub::UIBridgeSnapshot);
+    add!("UIBridgeModalInfo", qub::UIBridgeModalInfo);
+    add!("UIBridgeModalStack", qub::UIBridgeModalStack);
+    add!("UIBridgeCapturedToast", qub::UIBridgeCapturedToast);
+    add!("UIBridgeToastContext", qub::UIBridgeToastContext);
+    add!("UIBridgeUndoContext", qub::UIBridgeUndoContext);
 
     // ── qontinui-types: rag (extended) ──
     add!("ElementType", qr::ElementType);
