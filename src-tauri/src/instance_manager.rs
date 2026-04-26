@@ -381,6 +381,16 @@ impl InstanceManager {
                             cmd.env("QONTINUI_WINDOW_Y", resolved.global_y.to_string());
                             cmd.env("QONTINUI_WINDOW_WIDTH", resolved.width.to_string());
                             cmd.env("QONTINUI_WINDOW_HEIGHT", resolved.height.to_string());
+                            // Decorations is plumbed independently of the
+                            // resolve step — it doesn't depend on monitor
+                            // geometry and falls back to true (Tauri default)
+                            // when the field is None.
+                            if let Some(deco) = placement.decorations {
+                                cmd.env(
+                                    "QONTINUI_WINDOW_DECORATIONS",
+                                    if deco { "1" } else { "0" },
+                                );
+                            }
                         }
                         Err(e) => {
                             warn!(

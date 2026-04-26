@@ -1177,6 +1177,12 @@ pub struct SpawnPlacement {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+    /// Show window decorations (title bar, borders, resize handles).
+    /// Default true. Set false for borderless windows that sit flush
+    /// with the monitor's edge — useful when the few-pixel window-border
+    /// inset matters and the user doesn't need to drag/resize the window.
+    #[serde(default)]
+    pub decorations: Option<bool>,
 }
 
 /// Configuration for a secondary runner instance.

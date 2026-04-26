@@ -34,6 +34,8 @@ interface SpawnPlacement {
   y: number;
   width?: number | null;
   height?: number | null;
+  /** Show window decorations (title bar, borders). Default true. */
+  decorations?: boolean | null;
 }
 
 interface ResolvedPlacement {
@@ -92,6 +94,8 @@ interface PlacementDraft {
   y: string;
   width: string;
   height: string;
+  /** Show window decorations (title bar, borders, resize handles). */
+  decorations: boolean;
 }
 
 const DEFAULT_DRAFT: PlacementDraft = {
@@ -101,6 +105,7 @@ const DEFAULT_DRAFT: PlacementDraft = {
   y: "0",
   width: "",
   height: "",
+  decorations: true,
 };
 
 function placementToDraft(placement: SpawnPlacement | null | undefined): PlacementDraft {
@@ -118,6 +123,7 @@ function placementToDraft(placement: SpawnPlacement | null | undefined): Placeme
     y: String(placement.y),
     width: placement.width != null ? String(placement.width) : "",
     height: placement.height != null ? String(placement.height) : "",
+    decorations: placement.decorations !== false,
   };
 }
 
@@ -134,6 +140,7 @@ function draftToPlacement(draft: PlacementDraft): SpawnPlacement | null {
     y,
     width: width != null && Number.isFinite(width) ? width : null,
     height: height != null && Number.isFinite(height) ? height : null,
+    decorations: draft.decorations,
   };
 }
 
@@ -363,6 +370,19 @@ function PlacementEditor({ draft, onChange, monitors, onLog }: PlacementEditorPr
           Use full
         </button>
       </div>
+
+      <label
+        className="flex items-center gap-2 text-[11px] text-muted-foreground"
+        title="Off = borderless (window content sits flush with the configured rect; can't be dragged or resized by the user)"
+      >
+        <input
+          type="checkbox"
+          checked={draft.decorations}
+          onChange={(e) => setField("decorations", e.target.checked)}
+          className="h-3 w-3"
+        />
+        Window decorations (title bar, borders)
+      </label>
 
       {/* Live preview */}
       <div className="text-[11px] text-muted-foreground font-mono">

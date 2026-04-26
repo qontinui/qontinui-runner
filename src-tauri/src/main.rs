@@ -1356,7 +1356,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::websocket::disconnect_websocket,
             commands::window_manager::activate_system_window,
             commands::window_manager::list_system_windows,
-            commands::workflow_events::emit_workflow_event
+            commands::workflow_events::emit_workflow_event,
+            commands::worktrees::merge_worktree,
+            commands::worktrees::merge_worktree_force
         ])
         .manage(shared_app_state)
         .manage(bridge_compartment)
@@ -1471,6 +1473,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     let initial_size = env_size.unwrap_or((1400.0, 800.0));
+                    // QONTINUI_WINDOW_DECORATIONS=0 forces a borderless
+                    // window; default is true (Tauri's default chrome).
+                    // Borderless lets a placement land flush with the
+                    // monitor's edge — the few-pixel right-of-edge inset
+                    // people see with chrome on is the OS window border.
+                    let env_decorations = std::env::var("QONTINUI_WINDOW_DECORATIONS")
+                        .ok()
+                        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")));
 
                     let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
                         .title("Qontinui Runner")
@@ -1478,7 +1488,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         .min_inner_size(1200.0, 700.0)
                         .fullscreen(false)
                         .resizable(true)
-                        .decorations(true);
+                        .decorations(env_decorations.unwrap_or(true));
 
                     if let Some(ref dir) = data_dir {
                         builder = builder.data_directory(std::path::PathBuf::from(dir));
