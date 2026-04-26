@@ -20,31 +20,49 @@ use crate::scheduler::{ScheduledTaskExt, TaskExecutionRecordExt};
 
 /// Request body for creating a scheduled task
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateScheduledTaskRequest {
     pub name: String,
     pub description: Option<String>,
     pub schedule: crate::scheduler::ScheduleExpression,
     pub task: crate::scheduler::ScheduledTaskType,
-    #[serde(default)]
+    #[serde(default, alias = "skip_if_completed")]
     pub skip_if_completed: bool,
-    #[serde(default)]
+    #[serde(default, alias = "auto_fix_on_failure")]
     pub auto_fix_on_failure: bool,
+    #[serde(alias = "success_criteria")]
     pub success_criteria: Option<String>,
     pub conditions: Option<crate::scheduler::ScheduleConditions>,
+    #[serde(default, alias = "catch_up_policy")]
+    pub catch_up_policy: Option<crate::scheduler::CatchUpPolicy>,
+    #[serde(default, alias = "catch_up_grace_seconds")]
+    pub catch_up_grace_seconds: Option<u32>,
+    #[serde(default, alias = "launch_failure_backoff_seconds")]
+    pub launch_failure_backoff_seconds: Option<u32>,
 }
 
 /// Request body for updating a scheduled task
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateScheduledTaskRequest {
     pub name: Option<String>,
     pub description: Option<Option<String>>,
     pub enabled: Option<bool>,
     pub schedule: Option<crate::scheduler::ScheduleExpression>,
     pub task: Option<crate::scheduler::ScheduledTaskType>,
+    #[serde(default, alias = "skip_if_completed")]
     pub skip_if_completed: Option<bool>,
+    #[serde(default, alias = "auto_fix_on_failure")]
     pub auto_fix_on_failure: Option<bool>,
+    #[serde(default, alias = "success_criteria")]
     pub success_criteria: Option<Option<String>>,
     pub conditions: Option<Option<crate::scheduler::ScheduleConditions>>,
+    #[serde(default, alias = "catch_up_policy")]
+    pub catch_up_policy: Option<crate::scheduler::CatchUpPolicy>,
+    #[serde(default, alias = "catch_up_grace_seconds")]
+    pub catch_up_grace_seconds: Option<u32>,
+    #[serde(default, alias = "launch_failure_backoff_seconds")]
+    pub launch_failure_backoff_seconds: Option<u32>,
 }
 
 /// Request body for updating scheduler settings
@@ -97,6 +115,15 @@ pub async fn create_scheduled_task(
     scheduled_task.auto_fix_on_failure = request.auto_fix_on_failure;
     scheduled_task.success_criteria = request.success_criteria;
     scheduled_task.conditions = request.conditions;
+    if let Some(policy) = request.catch_up_policy {
+        scheduled_task.catch_up_policy = policy;
+    }
+    if let Some(grace) = request.catch_up_grace_seconds {
+        scheduled_task.catch_up_grace_seconds = grace;
+    }
+    if let Some(backoff) = request.launch_failure_backoff_seconds {
+        scheduled_task.launch_failure_backoff_seconds = backoff;
+    }
 
     let now = chrono::Utc::now();
     scheduled_task.next_run =
@@ -199,6 +226,15 @@ pub async fn update_scheduled_task(
     if let Some(conditions) = request.conditions {
         scheduled_task.conditions = conditions;
         scheduled_task.condition_status = None;
+    }
+    if let Some(policy) = request.catch_up_policy {
+        scheduled_task.catch_up_policy = policy;
+    }
+    if let Some(grace) = request.catch_up_grace_seconds {
+        scheduled_task.catch_up_grace_seconds = grace;
+    }
+    if let Some(backoff) = request.launch_failure_backoff_seconds {
+        scheduled_task.launch_failure_backoff_seconds = backoff;
     }
 
     let now = chrono::Utc::now();
@@ -383,6 +419,38 @@ pub async fn get_scheduler_status(
     Json(ApiResponse::success(status))
 }
 
+/// Manually trigger the missed-run reconciler. Normally `reconcile_missed_runs`
+/// runs once at scheduler startup; this endpoint lets operators / tests fire it
+/// on demand without restarting the runner. Idempotent — running it twice in a
+/// row does nothing the second time, since the first pass already filled any
+/// gaps in `scheduler_history.scheduled_for`.
+pub async fn reconcile_now(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let service = crate::scheduler_service::get_scheduler_service()
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(api_error(
+                    "Scheduler service not running on this instance".to_string(),
+                )),
+            )
+        })?;
+
+    service.clone().reconcile_missed_runs().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Reconciler failed: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "triggered": true,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))))
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -408,4 +476,5 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(get_scheduler_settings).put(update_scheduler_settings),
         )
         .route("/scheduler/status", get(get_scheduler_status))
+        .route("/scheduler/reconcile-now", post(reconcile_now))
 }
