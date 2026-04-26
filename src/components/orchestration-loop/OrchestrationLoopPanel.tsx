@@ -65,6 +65,17 @@ interface RunnerInstance {
   source?: "configured" | "discovered";
 }
 
+/** Subset of supervisor `/runners` rows the picker actually consumes. */
+interface SupervisorRunner {
+  id: string;
+  name: string;
+  port: number;
+  is_primary: boolean;
+  running: boolean;
+  pid: number | null;
+  api_responding: boolean;
+}
+
 interface OrchestrationLoopStatus {
   running: boolean;
   phase: string;
@@ -205,6 +216,9 @@ export function OrchestrationLoopPanel() {
   // Runner instances for the target dropdown
   const [runnerInstances, setRunnerInstances] = useState<RunnerInstance[]>([]);
   const [targetRunner, setTargetRunner] = useState("self"); // "self" or instance id
+  // This runner's own port — used to filter "self" out of the supervisor
+  // dropdown rows. Populated once via get_runner_identity on mount.
+  const ownPortRef = useRef<number | null>(null);
 
   // Form state
   const [mode, setMode] = useState<"simple" | "pipeline">("pipeline");
@@ -336,19 +350,60 @@ export function OrchestrationLoopPanel() {
   }, []);
 
   const loadRunnerInstances = useCallback(async () => {
+    // Source of truth is the supervisor's /runners endpoint — it lists
+    // every actually-running instance (primary + supervised children +
+    // self-registered with a live heartbeat) by their canonical names,
+    // and matches the supervisor dashboard exactly. Stale settings slots
+    // and dead DB rows aren't represented, which is what we want for a
+    // target picker.
+    try {
+      const portStr = supervisorPort.trim() || "9875";
+      const resp = await fetch(`http://localhost:${portStr}/runners`);
+      if (!resp.ok) throw new Error(`supervisor /runners: HTTP ${resp.status}`);
+      const all: SupervisorRunner[] = await resp.json();
+      const ownPort = ownPortRef.current;
+      const active: RunnerInstance[] = all
+        .filter((r) => r.running && r.port !== ownPort)
+        .map((r) => ({
+          id: r.id,
+          name: r.name,
+          port: r.port,
+          running: r.running,
+          pid: r.pid,
+          api_ready: r.api_responding,
+        }));
+      setRunnerInstances(active);
+      return;
+    } catch {
+      // Supervisor unreachable — fall through to the Tauri command. The
+      // fallback is less accurate (it merges settings.json with the DB
+      // registry), but better than rendering an empty picker when the
+      // user is running the runner standalone (no supervisor).
+    }
+
     try {
       const instances = await invoke<RunnerInstance[]>("get_runner_instances");
-      setRunnerInstances(instances);
+      setRunnerInstances(instances.filter((i) => i.running));
     } catch {
-      /* instance manager may not be available */
+      /* both sources down — leave list empty */
     }
-  }, []);
+  }, [supervisorPort]);
 
   useEffect(() => {
     // Async IIFE: avoid invoking setState-bearing callbacks synchronously
     // in the effect body (set-state-in-effect).
     let cancelled = false;
     void (async () => {
+      // Resolve own port FIRST so the very first loadRunnerInstances call
+      // can filter the self-row out of the supervisor response. Falling
+      // back to null is safe — the filter just keeps every row, which is
+      // a worse UX (extra "self" duplicate) but not a bug.
+      try {
+        const identity = await invoke<{ port: number }>("get_runner_identity");
+        if (!cancelled) ownPortRef.current = identity.port;
+      } catch {
+        /* own port unknown — picker may show a duplicate self row */
+      }
       if (cancelled) return;
       await Promise.all([fetchStatus(), loadSavedConfigs(), loadRunnerInstances()]);
     })();
