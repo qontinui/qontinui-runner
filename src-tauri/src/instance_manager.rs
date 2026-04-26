@@ -39,6 +39,23 @@ struct InstanceHandle {
     child: std::process::Child,
 }
 
+/// What `deregister_instance` cleaned up. The two flags can disagree —
+/// in-memory has the entry only if THIS runner accepted the original
+/// `register_instance` call, while the DB row may persist independently
+/// from a previous session that crashed before deregistering. Callers
+/// returning HTTP responses use `.any()` to decide between 200 and 404.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DeregisterResult {
+    pub removed_in_memory: bool,
+    pub removed_db: bool,
+}
+
+impl DeregisterResult {
+    pub fn any(self) -> bool {
+        self.removed_in_memory || self.removed_db
+    }
+}
+
 /// An externally-registered runner instance (not a child process of this runner).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredInstance {
@@ -183,15 +200,28 @@ impl InstanceManager {
         false
     }
 
-    /// Deregister an externally-registered instance.
-    pub async fn deregister_instance(&self, id: &str) -> bool {
+    /// Deregister an externally-registered instance from both the in-memory
+    /// `registered` map and the persistent DB registry. Either side may be
+    /// empty for a given id — the in-memory map is per-process so a row
+    /// from a previous session lives only in the DB; conversely a freshly
+    /// registered instance whose DB write-through failed lives only in
+    /// memory. The returned `DeregisterResult` tells callers which side(s)
+    /// were actually cleaned up.
+    pub async fn deregister_instance(&self, id: &str) -> DeregisterResult {
         let mut registered = self.registered.lock().await;
-        let removed = registered.remove(id).is_some();
+        let removed_in_memory = registered.remove(id).is_some();
         drop(registered);
 
-        // Remove from DB too
-        let _ = self.pg_db.remove_runner_instance(id).await;
-        removed
+        let removed_db = self
+            .pg_db
+            .remove_runner_instance(id)
+            .await
+            .unwrap_or(false);
+
+        DeregisterResult {
+            removed_in_memory,
+            removed_db,
+        }
     }
 
     /// Get all registered (external) instances.

@@ -1753,6 +1753,50 @@ struct HeartbeatRequest {
     running_task_ids: Option<Vec<String>>,
 }
 
+/// DELETE /instances/{id} — deregister a runner instance from both the
+/// in-memory map and the DB registry.
+///
+/// The matching `POST /instances/register` adds an in-memory entry (this
+/// process) and a DB row (shared across processes). Stopping a managed
+/// child via `POST /instances/{id}/stop` cleans up its row, but external
+/// runners that crash, get force-killed, or otherwise exit without
+/// signalling the runner leave a phantom row behind that
+/// `purge_unreachable_registered` only catches once the heartbeat has
+/// gone stale (`STALE_THRESHOLD_SECS`). This endpoint lets a caller
+/// reclaim the slot immediately.
+///
+/// Returns 200 if either side was cleaned up, 404 if the id wasn't known
+/// in either. Body carries the granular flags so callers can tell.
+async fn delete_instance(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
+    let result = state.instance_manager.deregister_instance(&id).await;
+
+    if !result.any() {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(&format!(
+                "Instance '{}' not found in in-memory map or DB registry",
+                id
+            ))),
+        ));
+    }
+
+    tracing::info!(
+        "Deregistered instance '{}' (in_memory={}, db={})",
+        id,
+        result.removed_in_memory,
+        result.removed_db
+    );
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "id": id,
+        "removed_in_memory": result.removed_in_memory,
+        "removed_db": result.removed_db,
+    }))))
+}
+
 /// POST /instances/{id}/heartbeat — update heartbeat for a registered instance.
 ///
 /// Returns 200 if the instance is known, 404 if not (secondary should re-register).
@@ -1867,7 +1911,7 @@ async fn purge_stale_instances(
 }
 
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
-    use axum::routing::{get, post};
+    use axum::routing::{delete, get, post};
     axum::Router::new()
         .route("/bridges", get(list_bridges).post(create_bridge))
         .route(
@@ -1889,6 +1933,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/instances/spawn", post(spawn_instance))
         .route("/instances/register", post(register_instance))
         .route("/instances/purge-stale", post(purge_stale_instances))
+        .route("/instances/{id}", delete(delete_instance))
         .route("/instances/{id}/stop", post(stop_instance))
         .route("/instances/{id}/launch", post(launch_instance))
         .route("/instances/{id}/heartbeat", post(instance_heartbeat))
