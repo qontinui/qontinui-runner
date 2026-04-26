@@ -1106,14 +1106,23 @@ export function SchedulerTaskForm({
                 />
               )}
             </div>
-            <div>
-              <span className="block text-sm font-medium mb-1">Allowed tools</span>
-              <div className="flex flex-wrap gap-2">
+            <div id="agent-allowed-tools-field">
+              <span id="agent-allowed-tools-label" className="block text-sm font-medium mb-1">
+                Allowed tools
+              </span>
+              <div
+                id="agent-allowed-tools"
+                role="group"
+                aria-labelledby="agent-allowed-tools-label"
+                className="flex flex-wrap gap-2"
+              >
                 {REMOTE_AGENT_AVAILABLE_TOOLS.map((tool) => {
                   const checked = agentAllowedTools.includes(tool);
+                  const chipId = `agent-allowed-tool-${tool.toLowerCase()}`;
                   return (
                     <label
                       key={tool}
+                      htmlFor={chipId}
                       className={`flex items-center gap-1.5 px-2 py-1 rounded border text-xs cursor-pointer transition-colors ${
                         checked
                           ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/40"
@@ -1121,9 +1130,11 @@ export function SchedulerTaskForm({
                       }`}
                     >
                       <input
+                        id={chipId}
                         type="checkbox"
                         checked={checked}
                         onChange={() => toggleAllowedTool(tool)}
+                        aria-label={`Allowed tool: ${tool}`}
                         className="sr-only"
                       />
                       <span>{tool}</span>
