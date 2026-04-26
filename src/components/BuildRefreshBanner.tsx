@@ -1,37 +1,14 @@
 import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { useBuildIdWatcher } from "@qontinui/ui-bridge/react";
 
-/**
- * Watches for a binary-swap-mid-session and renders a non-blocking refresh
- * banner when the runner exe behind the live webview no longer matches the
- * build the page was loaded from.
- *
- * Flow:
- *   1. `build.rs` bakes `RUNNER_BUILD_ID = <git-sha-short>-<unix-ms>` into
- *      the binary. `vite.config.ts` independently bakes the same format
- *      into `index.html` as `<meta name="build-id" content="...">`.
- *   2. `useBuildIdWatcher` reads the meta tag once on mount and compares it
- *      against the value returned by `invoke('get_build_id')` (which the
- *      Tauri command exposes from the embedded `env!("RUNNER_BUILD_ID")`).
- *   3. Because Vite reruns before cargo on a real rebuild, both values
- *      diverge naturally on a binary swap; on a fresh, intact install the
- *      values pair up and `onBuildIdChange` never fires.
- *   4. The banner offers a one-click reload that forces WebView2 to refetch
- *      the embedded index.html plus assets.
- *
- * `pollIntervalMs: 0` — a one-shot check on mount is enough. Mid-session
- * binary swap is the only divergence cause; nothing else changes the
- * compiled `RUNNER_BUILD_ID` while the webview stays open.
- *
- * Inline styles mirror the supervisor's `BuildRefreshBanner` so the two
- * surfaces feel the same to operators glancing across browser tabs.
- */
+// TODO: shared `useBuildIdWatcher` no longer accepts `getCurrentBuildId` /
+// pollIntervalMs:0 (custom-getter mode was removed by 0251a9e in the
+// ui-bridge package). Re-wire either by polling the runner's /health
+// endpoint with a server-side {buildId} adapter or by re-adding the
+// invoke source to the shared hook. Until then this banner is inert.
 export function BuildRefreshBanner() {
   const [stale, setStale] = useState(false);
   useBuildIdWatcher({
-    getCurrentBuildId: () => invoke<string>("get_build_id"),
-    pollIntervalMs: 0,
     onBuildIdChange: () => setStale(true),
   });
 
