@@ -31,6 +31,18 @@ export function useUIBridgeIntegrationPageRegistrations() {
           window.scrollTo({ top: 0, behavior: "smooth" });
         },
       },
+      {
+        id: "get-pipeline-phase",
+        label: "Read the current ProjectCoordinator pipeline phase",
+        handler: () => {
+          // ProjectCoordinator marks its root with `data-pipeline-phase={phase}`,
+          // so callers can introspect progress without scraping button labels.
+          // Phase values: idle | analyzing | integrating | discovering | no-pages
+          //             | generating | generated | applied | failed
+          const root = document.querySelector<HTMLElement>("[data-pipeline-phase]");
+          return { phase: root?.dataset.pipelinePhase ?? "unknown" };
+        },
+      },
     ],
   });
 

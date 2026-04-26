@@ -541,7 +541,7 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-function formatFramework(fw: string): string {
+export function formatFramework(fw: string): string {
   const map: Record<string, string> = {
     react: "React",
     next_js: "Next.js",

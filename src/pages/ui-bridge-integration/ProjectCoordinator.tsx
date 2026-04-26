@@ -46,6 +46,7 @@ import {
 } from "lucide-react";
 import { getApiBase } from "@/lib/runner-api";
 import { useSavedProjects, type SavedProject } from "@/hooks/useSavedProjects";
+import { formatFramework } from "./SourceIntegrationPanel";
 import type {
   ApiResponse,
   ProjectAnalysis,
@@ -562,7 +563,7 @@ export function ProjectCoordinator({
   // =========================================================================
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4" data-pipeline-phase={phase}>
       {/* ----- Project picker ----- */}
       <div className="p-4 rounded-lg border border-border bg-card/50">
         <div className="flex items-center justify-between mb-2">
@@ -672,6 +673,32 @@ export function ProjectCoordinator({
           IDs for every page. For specs, tutorials, or videos, open Advanced below.
         </p>
       </div>
+
+      {/* ----- Analysis summary (visible once Analyze has completed) ----- */}
+      {analysis && (
+        <div className="p-3 rounded-lg border border-border bg-card/50 grid grid-cols-3 gap-3 text-xs">
+          <div>
+            <div className="text-[10px] text-muted-foreground uppercase tracking-wide">
+              Framework
+            </div>
+            <div className="font-medium">{formatFramework(analysis.framework)}</div>
+          </div>
+          <div>
+            <div className="text-[10px] text-muted-foreground uppercase tracking-wide">Status</div>
+            <div className="font-medium">
+              {analysis.ui_bridge_status === "full"
+                ? "Already integrated"
+                : analysis.ui_bridge_status === "partial"
+                  ? "Partial"
+                  : "Not integrated"}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] text-muted-foreground uppercase tracking-wide">Pages</div>
+            <div className="font-medium">{discoveredPages.length || "—"}</div>
+          </div>
+        </div>
+      )}
 
       {/* ----- Unified progress view ----- */}
       {(pipelineRunning || phase === "generated" || phase === "applied" || phase === "failed") && (
