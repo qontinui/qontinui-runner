@@ -54,7 +54,11 @@ chrono = "0.4"
 url = "2"
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "anyhow", "reqwest", "rustls"] }
 dirs = "6.0"
-keyring = "3.6"
+# Without an explicit backend feature the keyring crate compiles a no-op
+# stub that returns Ok(()) from set_password and NoEntry from get_password
+# — silently dropping every credential. Enable the platform-native
+# backends so wrapper credentials actually persist.
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 mdns-sd = "0.11"
 # Pure-Rust ADB client (Plan 1A) — replaces fragile subprocess adb.exe parsing.
 # Plan mention: cocool97/adb_client. Features: `usb` for direct USB device I/O,

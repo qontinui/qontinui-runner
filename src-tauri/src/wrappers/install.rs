@@ -174,6 +174,16 @@ pub async fn install(
             .arg("--ignore-scripts") // No postinstall — see plan §5.1 PR template.
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // pnpm's default node_modules layout uses symlinks into a content
+        // store (`.pnpm/`). When we later move the wrapper out of the
+        // staging dir, those symlinks dangle. `--node-linker=hoisted`
+        // forces a flat npm-style node_modules tree where every package
+        // is a real directory — at the cost of some disk space, but the
+        // resulting tree is self-contained and movable. npm is naturally
+        // hoisted and ignores this flag, so we pass it unconditionally.
+        if pm_owned == "pnpm" {
+            cmd.arg("--node-linker=hoisted");
+        }
         let output = cmd.output().map_err(|e| format!("spawn {}: {}", pm_owned, e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -217,26 +227,72 @@ pub async fn install(
     let id = wrapper.manifest.id.clone();
     let canonical = root.join(&id);
 
-    // Move pkg_dir → canonical, replacing any prior install of the
-    // same id. This is an atomic-on-same-volume rename when possible.
+    // Layout transform: stage → canonical. We need the wrapper's package
+    // files at `canonical/` (so `canonical/dist/index-node.js` is the
+    // entry point) AND the wrapper's runtime deps reachable via Node's
+    // module resolution from there (so `canonical/node_modules/dotenv/`
+    // etc. exist).
+    //
+    // pnpm with --node-linker=hoisted (set above) produces:
+    //   stage/package.json                          (the install stub)
+    //   stage/node_modules/<scope>/<pkg>/           (the wrapper itself)
+    //   stage/node_modules/<dep>/                   (each transitive dep)
+    //
+    // We rename the WHOLE staging tree to canonical (atomic on same
+    // volume), then promote the wrapper's package contents to the top
+    // of canonical, overwriting the stub package.json. Deps remain
+    // beneath canonical/node_modules/ where Node will find them.
     if canonical.exists() {
-        // Remove the previous install fully — wrapper bookkeeping owns
-        // the directory contents.
         std::fs::remove_dir_all(&canonical)?;
     }
-    if let Err(e) = std::fs::rename(&pkg_dir, &canonical) {
-        // Cross-device moves fall back to a recursive copy.
+    if let Err(e) = std::fs::rename(&stage, &canonical) {
         warn!(
             "wrappers.install: rename '{}' → '{}' failed ({}), copying",
-            pkg_dir.display(),
+            stage.display(),
             canonical.display(),
             e
         );
-        copy_dir_recursive(&pkg_dir, &canonical)?;
+        if let Err(copy_err) = copy_dir_recursive(&stage, &canonical) {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(InstallError::InstallFailed(format!(
+                "failed to install wrapper to {}: {}",
+                canonical.display(),
+                copy_err
+            )));
+        }
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
-    // Tear down the staging dir.
-    let _ = std::fs::remove_dir_all(&stage);
+    // Promote `<canonical>/node_modules/<package>/*` → `<canonical>/*`.
+    // Use the same relative path the original pkg_dir followed (works
+    // for scoped and unscoped names alike).
+    let pkg_rel = pkg_dir
+        .strip_prefix(&stage)
+        .map_err(|e| InstallError::InstallFailed(format!("path prefix mismatch: {}", e)))?
+        .to_path_buf();
+    let inner_pkg = canonical.join(&pkg_rel);
+    if let Err(e) = promote_package_to_top(&inner_pkg, &canonical) {
+        return Err(InstallError::InstallFailed(format!(
+            "failed to flatten wrapper layout under {}: {}",
+            canonical.display(),
+            e
+        )));
+    }
+    // Remove the now-empty `<canonical>/node_modules/<scope>/<pkg>/` and
+    // any empty parent (e.g. an empty @scope dir if no other packages
+    // remain under it). Not fatal if these fail.
+    let _ = std::fs::remove_dir_all(&inner_pkg);
+    if let Some(parent) = inner_pkg.parent() {
+        // Only remove the parent if it's empty — sibling packages under
+        // the same scope must stay.
+        if parent
+            .read_dir()
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
 
     // Refresh the cache so subsequent `GET /wrappers` calls see it.
     registry
@@ -333,6 +389,46 @@ fn short_random() -> String {
     (0..8)
         .map(|_| chars[rng.random_range(0..chars.len())])
         .collect()
+}
+
+/// Move every direct child of `pkg_dir` into `dst`, overwriting any
+/// file that already exists in `dst`. Used to promote the wrapper's
+/// package files (currently nested under
+/// `<canonical>/node_modules/<scope>/<pkg>/`) up to the top of the
+/// canonical wrapper directory so `<canonical>/dist/index-node.js` is
+/// the entry point. Directories are renamed (atomic same-volume) when
+/// possible, copied as a fallback.
+fn promote_package_to_top(pkg_dir: &Path, dst: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(pkg_dir)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if to.exists() {
+            // Stub package.json (or any other path that happens to
+            // collide) — drop it before the move.
+            if to.is_dir() {
+                std::fs::remove_dir_all(&to)?;
+            } else {
+                std::fs::remove_file(&to)?;
+            }
+        }
+        if let Err(e) = std::fs::rename(&from, &to) {
+            // Cross-device or other rename failure — fall back to copy.
+            if from.is_dir() {
+                copy_dir_recursive(&from, &to)?;
+                std::fs::remove_dir_all(&from)?;
+            } else {
+                std::fs::copy(&from, &to)?;
+                std::fs::remove_file(&from).map_err(|inner| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("rename failed ({}); copy ok but remove failed: {}", e, inner),
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Recursive directory copy fallback for cross-device renames.
