@@ -16,7 +16,7 @@ use axum::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Json,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use futures_util::{stream::Stream, StreamExt};
@@ -1764,6 +1764,90 @@ async fn handle_wait_for_targets(
     }
 }
 
+/// POST /ui-bridge/sdk/control/wait-for-element — Wait for an element matching a query
+async fn handle_wait_for_element_sdk(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
+    match dispatch_app_request(
+        &state,
+        "waitForElement",
+        body.clone(),
+        Method::POST,
+        "/control/wait-for-element",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/control/wait-for-element-by-condition — Wait until an element satisfies a condition
+async fn handle_wait_for_element_by_condition(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
+    match dispatch_app_request(
+        &state,
+        "waitForElementByCondition",
+        body.clone(),
+        Method::POST,
+        "/control/wait-for-element-by-condition",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/control/wait-for-element-registered — Wait for an element to register
+async fn handle_wait_for_element_registered(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
+    match dispatch_app_request(
+        &state,
+        "waitForElementRegistered",
+        body.clone(),
+        Method::POST,
+        "/control/wait-for-element-registered",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/control/wait-for-route-change — Wait for a router route change
+async fn handle_wait_for_route_change(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
+    match dispatch_app_request(
+        &state,
+        "waitForRouteChange",
+        body.clone(),
+        Method::POST,
+        "/control/wait-for-route-change",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
 // =============================================================================
 // Page Navigation Relay Handlers
 // =============================================================================
@@ -1844,6 +1928,27 @@ async fn handle_page_go_forward(
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     let ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
     match dispatch_app_request(&state, "pageGoForward", ws_payload, Method::POST, "/control/page/forward", body_inner).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/control/page/scroll — Scroll the page or a target element
+async fn handle_page_scroll(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
+    match dispatch_app_request(
+        &state,
+        "pageScroll",
+        body.clone(),
+        Method::POST,
+        "/control/page/scroll",
+        Some(body),
+    )
+    .await
+    {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -2322,6 +2427,27 @@ async fn handle_design_responsive(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     match dispatch_app_request(&state, "getResponsiveSnapshots", body.clone(), Method::POST, "/design/responsive", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/control/viewport — Set viewport constraints for the active window
+async fn handle_set_viewport_constraints(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
+    match dispatch_app_request(
+        &state,
+        "setViewportConstraints",
+        body.clone(),
+        Method::POST,
+        "/control/viewport",
+        Some(body),
+    )
+    .await
+    {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -2967,6 +3093,136 @@ async fn handle_component_action(
     }
 }
 
+/// GET /ui-bridge/sdk/control/element/:id/state-generic — Get generic element state
+async fn handle_element_state_generic(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let id = id.trim().to_string();
+    let path = format!("/control/element/{}/state-generic", id);
+    match dispatch_app_request(
+        &state,
+        "getElementState",
+        serde_json::json!({ "id": id }),
+        Method::GET,
+        &path,
+        None,
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/control/element/:id/images — Get images associated with an element
+async fn handle_element_images(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let id = id.trim().to_string();
+    let mut payload = serde_json::Map::new();
+    payload.insert("id".to_string(), serde_json::Value::String(id.clone()));
+    for (k, v) in &query {
+        payload.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    let mut path = format!("/control/element/{}/images", id);
+    if !query.is_empty() {
+        let qs: Vec<String> = query
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect();
+        path = format!("{}?{}", path, qs.join("&"));
+    }
+    match dispatch_app_request(
+        &state,
+        "getElementImages",
+        serde_json::Value::Object(payload),
+        Method::GET,
+        &path,
+        None,
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/control/element/:id/history — Get element history
+async fn handle_element_history(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let id = id.trim().to_string();
+    let options: serde_json::Value = serde_json::to_value(&query).unwrap_or(serde_json::json!({}));
+    let mut path = format!("/control/element/{}/history", id);
+    if !query.is_empty() {
+        let qs: Vec<String> = query
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect();
+        path = format!("{}?{}", path, qs.join("&"));
+    }
+    match dispatch_app_request(
+        &state,
+        "getElementHistory",
+        serde_json::json!({ "elementId": id, "options": options }),
+        Method::GET,
+        &path,
+        None,
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/control/batch-action — Execute a batch of element actions
+async fn handle_execute_batch_action(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
+    match dispatch_app_request(
+        &state,
+        "executeBatchAction",
+        serde_json::json!({ "request": body.clone() }),
+        Method::POST,
+        "/control/batch-action",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/control/batch — Execute a batched control request
+async fn handle_control_batch(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
+    match dispatch_app_request(
+        &state,
+        "controlBatch",
+        body.clone(),
+        Method::POST,
+        "/control/batch",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
 // =============================================================================
 // Workflow Handlers
 // =============================================================================
@@ -3337,6 +3593,27 @@ async fn handle_execute_intent_from_query(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     match dispatch_app_request(&state, "executeIntentFromQuery", body.clone(), Method::POST, "/ai/intents/execute-from-query", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// DELETE /ui-bridge/sdk/control/intent/:name — Delete a registered intent
+async fn handle_delete_intent(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/intent/{}", urlencoding::encode(&name));
+    match dispatch_app_request(
+        &state,
+        "deleteIntent",
+        serde_json::json!({ "name": name }),
+        Method::DELETE,
+        &path,
+        None,
+    )
+    .await
+    {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -4314,6 +4591,59 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/control/page-evaluate",
             post(handle_page_evaluate),
+        )
+        // Intents (additional)
+        .route(
+            "/ui-bridge/sdk/control/intent/{name}",
+            delete(handle_delete_intent),
+        )
+        // Element/Component (additional)
+        .route(
+            "/ui-bridge/sdk/control/element/{id}/state-generic",
+            get(handle_element_state_generic),
+        )
+        .route(
+            "/ui-bridge/sdk/control/element/{id}/images",
+            get(handle_element_images),
+        )
+        .route(
+            "/ui-bridge/sdk/control/element/{id}/history",
+            get(handle_element_history),
+        )
+        .route(
+            "/ui-bridge/sdk/control/batch-action",
+            post(handle_execute_batch_action),
+        )
+        .route(
+            "/ui-bridge/sdk/control/batch",
+            post(handle_control_batch),
+        )
+        // Page (additional)
+        .route(
+            "/ui-bridge/sdk/control/page/scroll",
+            post(handle_page_scroll),
+        )
+        // Viewport
+        .route(
+            "/ui-bridge/sdk/control/viewport",
+            post(handle_set_viewport_constraints),
+        )
+        // Wait-for-* (additional)
+        .route(
+            "/ui-bridge/sdk/control/wait-for-element",
+            post(handle_wait_for_element_sdk),
+        )
+        .route(
+            "/ui-bridge/sdk/control/wait-for-element-by-condition",
+            post(handle_wait_for_element_by_condition),
+        )
+        .route(
+            "/ui-bridge/sdk/control/wait-for-element-registered",
+            post(handle_wait_for_element_registered),
+        )
+        .route(
+            "/ui-bridge/sdk/control/wait-for-route-change",
+            post(handle_wait_for_route_change),
         )
 }
 
