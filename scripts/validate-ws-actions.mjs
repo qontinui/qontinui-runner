@@ -51,11 +51,18 @@ function readFile(path) {
 // Match both:
 //   dispatch_app_request(&state, "<name>", ...
 //   try_ws_dispatch(&state, "<name>", ...
-// The action string is the second argument as a "double-quoted" literal.
+// `\s*` between tokens crosses newlines, so multi-line call shapes like
+//   dispatch_app_request(
+//       &state,
+//       "<name>",
+//       ...
+//   )
+// are matched too. The action string is always the second argument as a
+// "double-quoted" literal.
 function extractRunnerActions(src) {
   const patterns = [
-    /dispatch_app_request\(&state,\s*"([^"]+)"/g,
-    /try_ws_dispatch\(&state,\s*"([^"]+)"/g,
+    /dispatch_app_request\(\s*&state,\s*"([^"]+)"/g,
+    /try_ws_dispatch\(\s*&state,\s*"([^"]+)"/g,
   ];
   const out = new Set();
   for (const re of patterns) {
