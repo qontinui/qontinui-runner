@@ -28,14 +28,6 @@ interface UseMonitorDetectionReturn {
   availableMonitors: number[];
   /** Detect system monitors */
   detectSystemMonitors: () => Promise<void>;
-
-  // Legacy single-monitor API for backward compatibility
-  /** @deprecated Use selectedMonitors[0] instead */
-  selectedMonitor: number;
-  /** @deprecated Use setSelectedMonitors instead */
-  setSelectedMonitor: (index: number) => void;
-  /** @deprecated Use selectMonitorsWithPersistence instead */
-  selectMonitorWithPersistence: (index: number) => Promise<void>;
 }
 
 /**
@@ -109,31 +101,11 @@ export function useMonitorDetection(
     }
   }, [detectOnMount, detectSystemMonitors]);
 
-  // Legacy single-monitor API for backward compatibility
-  const selectedMonitor = selectedMonitors[0] ?? 0;
-
-  const setSelectedMonitor = useCallback((index: number) => {
-    setSelectedMonitors([index]);
-  }, []);
-
-  const selectMonitorWithPersistence = useCallback(
-    async (index: number) => {
-      await selectMonitorsWithPersistence([index]);
-    },
-    [selectMonitorsWithPersistence],
-  );
-
   return {
-    // New multi-monitor API
     selectedMonitors,
     setSelectedMonitors,
     selectMonitorsWithPersistence,
     availableMonitors,
     detectSystemMonitors,
-
-    // Legacy single-monitor API
-    selectedMonitor,
-    setSelectedMonitor,
-    selectMonitorWithPersistence,
   };
 }

@@ -56,13 +56,7 @@ import {
   useTaskRunEvents,
   useTaskRunMigratedLogsSummary,
 } from "../../hooks/useAiData";
-import type {
-  JsonlLogType,
-  TextLogType,
-  ContextInfo,
-  AiOutputChunk,
-  TaskRunEvent,
-} from "../../types/aiData";
+import type { TextLogType, ContextInfo, AiOutputChunk, TaskRunEvent } from "../../types/aiData";
 import { MarkdownViewer } from "../MarkdownViewer";
 import { DomSnapshotsPanel } from "../dom-captures";
 import { getStatusColors, getAccentColors } from "@/design-system";
@@ -437,22 +431,6 @@ function ConsolidatedAiOutputDisplay({
       )}
     </div>
   );
-}
-
-// Note: Currently unused but kept for future use when filtering events by log type
-function _getEventTypeForLogType(logType: JsonlLogType): string | undefined {
-  switch (logType) {
-    case "ai-output":
-      return "ai_output";
-    case "general":
-      return "general";
-    case "actions":
-      return "action";
-    case "image-recognition":
-      return "image_recognition";
-    default:
-      return undefined;
-  }
 }
 
 function EventsDisplay({ events }: { events: TaskRunEvent[] }) {

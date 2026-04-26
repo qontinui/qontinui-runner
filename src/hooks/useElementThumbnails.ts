@@ -114,16 +114,6 @@ export function useElementThumbnails(
     return screenshotBase64 ? hashScreenshot(screenshotBase64) : "";
   }, [screenshotBase64]);
 
-  // Build element bounds map for quick lookup
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const elementBoundsMap = useMemo(() => {
-    const map = new Map<string, ElementBounds>();
-    for (const el of elements) {
-      map.set(el.id, el.bounds);
-    }
-    return map;
-  }, [elements]);
-
   // Request a single thumbnail (for lazy loading)
   const requestThumbnail = useCallback(
     async (elementId: string, bounds: ElementBounds): Promise<string | null> => {

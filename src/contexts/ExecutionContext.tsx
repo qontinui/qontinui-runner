@@ -70,14 +70,6 @@ interface ExecutionContextValue {
   availableMonitors: number[];
   detectSystemMonitors: () => Promise<void>;
 
-  // Legacy single-monitor API (backward compatibility)
-  /** @deprecated Use selectedMonitors instead */
-  selectedMonitor: number;
-  /** @deprecated Use setSelectedMonitors instead */
-  setSelectedMonitor: (index: number) => void;
-  /** @deprecated Use selectMonitorsWithPersistence instead */
-  selectMonitorWithPersistence: (index: number) => Promise<void>;
-
   // Execution Control
   executionActive: boolean;
   setExecutionActive: (active: boolean) => void;
@@ -206,10 +198,6 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
     selectMonitorsWithPersistence,
     availableMonitors,
     detectSystemMonitors,
-    // Legacy single-monitor API
-    selectedMonitor,
-    setSelectedMonitor,
-    selectMonitorWithPersistence,
   } = useMonitorDetection({
     onLog,
     detectOnMount: true,
@@ -365,11 +353,6 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
     selectMonitorsWithPersistence,
     availableMonitors,
     detectSystemMonitors,
-
-    // Legacy single-monitor API
-    selectedMonitor,
-    setSelectedMonitor,
-    selectMonitorWithPersistence,
 
     // Execution Control
     executionActive,
