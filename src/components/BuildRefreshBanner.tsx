@@ -1,14 +1,34 @@
 import { useState } from "react";
 import { useBuildIdWatcher } from "@qontinui/ui-bridge/react";
+import { getApiBase } from "../lib/runner-api";
 
-// TODO: shared `useBuildIdWatcher` no longer accepts `getCurrentBuildId` /
-// pollIntervalMs:0 (custom-getter mode was removed by 0251a9e in the
-// ui-bridge package). Re-wire either by polling the runner's /health
-// endpoint with a server-side {buildId} adapter or by re-adding the
-// invoke source to the shared hook. Until then this banner is inert.
+/**
+ * Watches for a binary swap mid-session and renders a non-blocking refresh
+ * banner when the runner exe behind the live webview no longer matches the
+ * build the page was loaded from.
+ *
+ * Flow:
+ *   1. `build.rs` bakes `RUNNER_BUILD_ID = <git-sha-short>-<unix-ms>` into
+ *      the binary; `vite.config.ts` independently bakes the same format
+ *      into `index.html` as `<meta name="build-id">`.
+ *   2. The runner's `/health` handler exposes the compile-time value at
+ *      `buildId` (top-level mirror of `data.buildId`).
+ *   3. `useBuildIdWatcher` reads the meta tag once on mount and polls
+ *      `/health` for `{ buildId }`. On divergence (mid-session binary
+ *      swap) it fires `onBuildIdChange` once.
+ *   4. The banner offers a one-click reload that forces WebView2 to
+ *      refetch the embedded index.html plus assets.
+ *
+ * Vite reruns before cargo on a real rebuild, so the meta tag and the
+ * binary's RUNNER_BUILD_ID always pair up on a fresh, intact install —
+ * `onBuildIdChange` never fires unless someone swapped the exe behind
+ * the running webview.
+ */
 export function BuildRefreshBanner() {
   const [stale, setStale] = useState(false);
   useBuildIdWatcher({
+    pollUrl: `${getApiBase()}/health`,
+    pollIntervalMs: 30_000,
     onBuildIdChange: () => setStale(true),
   });
 

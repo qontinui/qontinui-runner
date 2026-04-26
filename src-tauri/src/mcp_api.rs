@@ -320,6 +320,14 @@ async fn health(
         // by build.rs via QONTINUI_GIT_SHA. Manual-test sessions can assert
         // the temp runner is actually running the commit under debug.
         "gitSha": env!("QONTINUI_GIT_SHA"),
+        // Compile-time build identifier (`<git-sha-short>-<unix-ms>`) baked
+        // into the binary by build.rs. Vite bakes the same value into
+        // index.html as `<meta name="build-id">`. The shared
+        // `useBuildIdWatcher` hook polls this endpoint and fires its
+        // onBuildIdChange callback when the page's meta tag diverges from
+        // the running binary's value — the only divergence vector is a
+        // mid-session binary swap behind the live webview.
+        "buildId": env!("RUNNER_BUILD_ID"),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
@@ -351,6 +359,10 @@ async fn health(
             "framework": "tauri",
             "capabilities": ["control", "renderLog", "debug"],
         },
+        // Top-level mirror of `data.buildId` so the shared
+        // `useBuildIdWatcher` hook (qontinui/ui-bridge/react) can read
+        // the field directly from the response root without an adapter.
+        "buildId": env!("RUNNER_BUILD_ID"),
         // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
         // so supervisor/fleet consumers can read them without descending into
         // the inner `data` block. The inner `data.status` / `data.derived_status`
