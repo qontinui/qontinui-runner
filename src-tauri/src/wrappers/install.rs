@@ -325,10 +325,9 @@ pub async fn update(
     wrapper_id: &str,
     version: Option<&str>,
 ) -> Result<InstallResponse, InstallError> {
-    let existing = registry
-        .get(wrapper_id)
-        .await
-        .ok_or_else(|| InstallError::InstallFailed(format!("wrapper '{}' is not installed", wrapper_id)))?;
+    let existing = registry.get(wrapper_id).await.ok_or_else(|| {
+        InstallError::InstallFailed(format!("wrapper '{}' is not installed", wrapper_id))
+    })?;
     // Stop first so we don't try to overwrite a held-open file.
     if let Err(e) = manager.stop(wrapper_id).await {
         warn!(

@@ -131,7 +131,9 @@ pub struct SharedFileResponse {
 /// The created shared file entry from the backend
 #[tauri::command]
 pub async fn share_file_to_mobile(file_path: String) -> Result<SharedFileResponse, String> {
-    share_file_to_mobile_impl(file_path).await.map_err(String::from)
+    share_file_to_mobile_impl(file_path)
+        .await
+        .map_err(String::from)
 }
 
 async fn share_file_to_mobile_impl(file_path: String) -> Result<SharedFileResponse, AppError> {

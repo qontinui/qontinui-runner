@@ -35,8 +35,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use super::app_registry::{AppRegistry, AppTransport};
 use super::app_discovery::DiscoveredApp;
+use super::app_registry::{AppRegistry, AppTransport};
 use super::command_relay::{CommandRelay, CommandResponse};
 use super::sdk_client::{SdkAppInfo, SdkConnection, SdkConnectionManager};
 use super::types::ApiState;
@@ -173,11 +173,7 @@ impl WsConnectionManager {
 
     /// Register a newly-connected WebSocket. Returns the `conn_id`.
     /// Displaces any prior connection for the same `app_id` (last-tab-wins).
-    async fn register(
-        &self,
-        app_id: String,
-        outbound: mpsc::Sender<String>,
-    ) -> (u64, Option<u64>) {
+    async fn register(&self, app_id: String, outbound: mpsc::Sender<String>) -> (u64, Option<u64>) {
         let conn_id = self.allocate_conn_id();
         let mut inner = self.inner.lock().await;
         let displaced = inner.by_app.insert(app_id.clone(), conn_id);
@@ -216,10 +212,7 @@ impl WsConnectionManager {
                 .map(|e| e.outbound.clone())
                 .ok_or(WsOutboundError::NotConnected)?
         };
-        sender
-            .send(text)
-            .await
-            .map_err(|_| WsOutboundError::Send)
+        sender.send(text).await.map_err(|_| WsOutboundError::Send)
     }
 
     /// Test helper: register a fake outbound channel so unit tests can

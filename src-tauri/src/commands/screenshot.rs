@@ -102,7 +102,12 @@ pub async fn get_screenshot_monitors(
         })?
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking error: {}",
+            e
+        )))
+    })?;
 
     match result {
         Ok(response) => {
@@ -166,7 +171,12 @@ async fn capture_screenshot_internal(
         })?
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking error: {}",
+            e
+        )))
+    })?;
 
     match result {
         Ok(response) => {

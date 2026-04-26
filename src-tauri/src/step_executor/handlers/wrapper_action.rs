@@ -12,13 +12,13 @@
 //! - `wrapper_id` (alias `wrapperId`) — required.
 //! - `wrapper_action_id` (alias `actionId`) — required.
 //! - `wrapper_params` (alias `params`) — optional JSON object. String-typed
-//!    leaf values may contain `{{ var }}` template references; they're
-//!    resolved against `RuntimeContext` (and `SharedVariableStore`) before
-//!    dispatch.
+//!   leaf values may contain `{{ var }}` template references; they're
+//!   resolved against `RuntimeContext` (and `SharedVariableStore`) before
+//!   dispatch.
 //! - `wrapper_result_variable` (alias `resultVariable`) — optional. When
-//!    non-empty, the dispatch result is written to
-//!    [`SharedVariableStore`][cropro] under that name as a JSON string so
-//!    later steps can read it via the existing `{{ name }}` syntax.
+//!   non-empty, the dispatch result is written to
+//!   [`SharedVariableStore`][cropro] under that name as a JSON string so
+//!   later steps can read it via the existing `{{ name }}` syntax.
 //!
 //! [cropro]: crate::orchestrator::context_propagation::SharedVariableStore
 //!
@@ -234,9 +234,12 @@ fn walk(
                 _ => Value::String(out),
             }
         }
-        Value::Array(items) => {
-            Value::Array(items.iter().map(|v| walk(v, evaluator, runtime, shared)).collect())
-        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| walk(v, evaluator, runtime, shared))
+                .collect(),
+        ),
         Value::Object(map) => {
             let mut out = Map::with_capacity(map.len());
             for (k, v) in map {

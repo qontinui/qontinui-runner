@@ -3,6 +3,7 @@
  */
 
 import { useState, useCallback, useMemo, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { getAllSpecs } from "@/lib/spec-registry";
 import { getKnownPages, type KnownPage } from "@/lib/page-catalog";
 import { useSpecFileLoader } from "./useSpecFileLoader";
@@ -199,17 +200,35 @@ export function useSpecsState() {
     _cache = { specs, selection, expandedNodes, connection, editMode };
   }, [specs, selection, expandedNodes, connection, editMode]);
 
-  // Load bundled specs from the spec registry
-  const loadBundledSpecs = useCallback(() => {
+  // Load bundled + user-saved specs. User specs overlay bundled ones (same specId wins).
+  const loadBundledSpecs = useCallback(async () => {
     const discovered = getAllSpecs();
-    const loaded: LoadedSpec[] = discovered.map((spec) => ({
+    const bundled: LoadedSpec[] = discovered.map((spec) => ({
       specId: spec.specId,
       appName: spec.appName || "Unknown",
       kind: "page-spec" as const,
       config: spec.config as SpecConfig,
       source: "bundled" as const,
     }));
-    setSpecs(loaded);
+
+    let userSpecs: LoadedSpec[] = [];
+    try {
+      const raw = await invoke<Array<{ specId: string; specJson: SpecConfig }>>("load_user_specs");
+      userSpecs = raw.map(({ specId, specJson }) => ({
+        specId,
+        appName: specId.startsWith("runner:") ? "Qontinui Runner" : "Qontinui Web",
+        kind: "page-spec" as const,
+        config: specJson,
+        source: "file" as const,
+      }));
+    } catch (e) {
+      console.warn("Failed to load user specs:", e);
+    }
+
+    // Merge: user specs replace bundled ones with the same ID
+    const userIds = new Set(userSpecs.map((s) => s.specId));
+    const merged = [...bundled.filter((s) => !userIds.has(s.specId)), ...userSpecs];
+    setSpecs(merged);
   }, []);
 
   // Compute unspecced pages — pages in the app that don't have specs
@@ -342,7 +361,7 @@ export function useSpecsState() {
   // Spec CRUD (Step 1 — editing)
   // ============================================================================
 
-  /** Add a spec (used by creation flow) */
+  /** Add a spec (used by creation flow) and persist page-specs to the user spec store. */
   const addSpec = useCallback((spec: LoadedSpec) => {
     setSpecs((prev) => {
       const existing = prev.findIndex((s) => s.specId === spec.specId);
@@ -353,6 +372,14 @@ export function useSpecsState() {
       }
       return [...prev, spec];
     });
+
+    // Persist page specs to the user spec store so they survive restarts.
+    if (spec.kind === "page-spec") {
+      const specJson = JSON.stringify(spec.config);
+      invoke("save_page_spec", { specId: spec.specId, specJson }).catch((e: unknown) => {
+        console.warn("Failed to persist page spec:", e);
+      });
+    }
     setSelection({ type: "spec", specId: spec.specId });
     setExpandedNodes((prev) => new Set([...prev, spec.specId]));
   }, []);

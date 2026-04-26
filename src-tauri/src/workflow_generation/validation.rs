@@ -1500,6 +1500,7 @@ mod tests {
             htn_enabled: false,
             htn_state_machine_path: None,
             htn_ui_bridge_url: None,
+            auto_commit_subagents: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1639,6 +1640,7 @@ mod tests {
             htn_enabled: false,
             htn_state_machine_path: None,
             htn_ui_bridge_url: None,
+            auto_commit_subagents: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -1789,6 +1791,7 @@ mod tests {
             htn_enabled: false,
             htn_state_machine_path: None,
             htn_ui_bridge_url: None,
+            auto_commit_subagents: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1885,6 +1888,7 @@ mod tests {
             htn_enabled: false,
             htn_state_machine_path: None,
             htn_ui_bridge_url: None,
+            auto_commit_subagents: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -2257,6 +2261,7 @@ mod tests {
             htn_enabled: false,
             htn_state_machine_path: None,
             htn_ui_bridge_url: None,
+            auto_commit_subagents: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };

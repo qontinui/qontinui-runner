@@ -463,7 +463,10 @@ pub async fn rename_ai_session(
         task_run_id, name
     );
 
-    let result: Result<(), String> = app_state.pg_db().update_task_name(&task_run_id, &name).await;
+    let result: Result<(), String> = app_state
+        .pg_db()
+        .update_task_name(&task_run_id, &name)
+        .await;
 
     match result {
         Ok(()) => Ok(CommandResponse {
@@ -949,10 +952,7 @@ pub async fn promote_session_to_worktree(
     app_handle: tauri::AppHandle,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
-    info!(
-        "promote_session_to_worktree: task_run_id={}",
-        task_run_id
-    );
+    info!("promote_session_to_worktree: task_run_id={}", task_run_id);
 
     match crate::mcp::ai_session::promote_session_inner(&app_handle, &task_run_id).await {
         Ok(resp) => Ok(CommandResponse {

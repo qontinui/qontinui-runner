@@ -179,9 +179,7 @@ pub async fn transfer_gui_lock(
 /// * `Ok(CommandResponse)` - Success with list of bridge info
 /// * `Err(String)` - Error if bridge manager not initialized
 #[tauri::command]
-pub async fn list_bridges(
-    bridge: State<'_, BridgeCompartment>,
-) -> Result<CommandResponse, String> {
+pub async fn list_bridges(bridge: State<'_, BridgeCompartment>) -> Result<CommandResponse, String> {
     debug!("Listing all bridges");
 
     let manager = get_bridge_manager_compartment(&bridge)?;

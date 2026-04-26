@@ -328,8 +328,11 @@ export function useAISearchEvents(
           // we still defensively re-clamp here in case the SDK ever evolves
           // independently. Predicate logic comes from the SDK to keep the
           // SDK's own unit tests authoritative.
-          const { evaluateElementPredicate, pollWaitForElement, snapshotFromRegisteredElement } =
-            await import("@qontinui/ui-bridge/ai");
+          const {
+            evaluateElementPredicate: _evaluateElementPredicate,
+            pollWaitForElement,
+            snapshotFromRegisteredElement,
+          } = await import("@qontinui/ui-bridge/ai");
 
           const p = (payload.params ?? payload.body ?? {}) as {
             elementId?: string;
@@ -342,7 +345,7 @@ export function useAISearchEvents(
             typeof p.elementId === "string" && p.elementId.length > 0 ? p.elementId : null;
           const selector =
             typeof p.selector === "string" && p.selector.length > 0 ? p.selector : null;
-          const predicateState = p.state as Parameters<typeof evaluateElementPredicate>[1];
+          const predicateState = p.state as Parameters<typeof _evaluateElementPredicate>[1];
           const timeoutMs = Math.min(
             Math.max(typeof p.timeoutMs === "number" ? p.timeoutMs : 5000, 0),
             30_000,

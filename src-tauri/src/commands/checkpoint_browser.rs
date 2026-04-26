@@ -308,7 +308,9 @@ fn clear_all_checkpoints_impl() -> Result<(), AppError> {
 
 /// Add sample checkpoints for demonstration.
 #[tauri::command]
-pub async fn add_sample_checkpoints(app_state: State<'_, StorageCompartment>) -> Result<(), String> {
+pub async fn add_sample_checkpoints(
+    app_state: State<'_, StorageCompartment>,
+) -> Result<(), String> {
     add_sample_checkpoints_impl(app_state)
         .await
         .map_err(String::from)
@@ -685,10 +687,7 @@ pub fn fail_replay_session(session_id: String, _error: Option<String>) -> Result
     fail_replay_session_impl(session_id, _error).map_err(String::from)
 }
 
-fn fail_replay_session_impl(
-    session_id: String,
-    _error: Option<String>,
-) -> Result<(), AppError> {
+fn fail_replay_session_impl(session_id: String, _error: Option<String>) -> Result<(), AppError> {
     let mut replay_manager = REPLAY_MANAGER.lock()?;
     replay_manager
         .fail_session(&session_id)
@@ -808,7 +807,10 @@ pub async fn get_checkpoints_count(
     state: State<'_, StorageCompartment>,
     task_id: Option<String>,
 ) -> Result<i64, String> {
-    state.pg_db().get_checkpoints_count(task_id.as_deref()).await
+    state
+        .pg_db()
+        .get_checkpoints_count(task_id.as_deref())
+        .await
 }
 
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {

@@ -44,14 +44,8 @@
 macro_rules! add_dual {
     ($router:expr, $method:ident, $tail:literal, $handler:expr) => {{
         $router
-            .route(
-                concat!("/ui-bridge/control/", $tail),
-                $method($handler),
-            )
-            .route(
-                concat!("/ui-bridge/ai/", $tail),
-                $method($handler),
-            )
+            .route(concat!("/ui-bridge/control/", $tail), $method($handler))
+            .route(concat!("/ui-bridge/ai/", $tail), $method($handler))
     }};
 }
 

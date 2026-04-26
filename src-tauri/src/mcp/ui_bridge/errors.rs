@@ -450,7 +450,12 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             get(ui_bridge_health_signals_handler),
         );
     // idle-status: identical handler under /control + /ai.
-    add_dual!(router, get, "idle-status", ui_bridge_get_idle_status_handler)
+    add_dual!(
+        router,
+        get,
+        "idle-status",
+        ui_bridge_get_idle_status_handler
+    )
 }
 
 /// Static (method, path) tuples matching every route registered by `routes()`.

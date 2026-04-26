@@ -72,6 +72,7 @@ export interface SpecConfig {
     [key: string]: unknown;
   };
   stateMachine?: SpecStateMachine;
+  testing?: unknown;
 }
 
 export interface DiscoveredSpec {
@@ -598,6 +599,88 @@ Include it when the page has:
 - Mode switches (edit mode, view mode)
 
 Do NOT include it for simple pages with only one configuration.
+
+## Testing Section (Optional)
+
+Add a \`testing\` field when the page has behavioral complexity that requires more than snapshot
+assertions to verify. The testing section is consumed by workflow generators — it describes HOW to
+test each group, not just WHAT is expected.
+
+**Add it when the page has:**
+- Behavioral assertions (\`behavior\`, \`semantic\` assertionTypes) that require user interaction
+- Async operations (loading states, real-time updates, polling, PTY output)
+- External dependencies (API calls, file system, Claude CLI, LLM backend, Tauri events)
+
+**Omit it when the page has only structural assertions** (\`exists\`, \`visible\`, \`hasText\`, etc.) —
+the testing section adds no value for pages that are fully testable from a static snapshot.
+
+\`\`\`json
+{
+  "testing": {
+    "defaultTimeoutMs": 5000,
+    "defaultPollIntervalMs": 200,
+    "groups": {
+      "<group-id>": {
+        "scenarios": [
+          {
+            "id": "scenario-id",
+            "name": "Human-readable scenario name",
+            "description": "What end-to-end workflow this verifies",
+            "groupIds": ["<group-id>"],
+            "difficulty": "easy | medium | hard",
+            "hardnessReason": "Only for hard — e.g. 'requires live PTY shell'",
+            "fixtures": [
+              { "type": "localStorage", "key": "zone-profiles:page1", "value": {} },
+              { "type": "apiMock", "endpoint": "/api/endpoint", "method": "GET", "response": {} },
+              { "type": "tauriEvent", "event": "event-name", "payload": {}, "delayMs": 500 }
+            ],
+            "steps": [
+              { "type": "navigate", "url": "/page-url" },
+              { "type": "componentAction", "componentId": "component-id", "actionId": "action-id", "params": {} },
+              { "type": "wait", "condition": "element", "target": { "type": "search", "criteria": { "role": "button" } }, "timeoutMs": 3000 },
+              { "type": "assert", "assertionId": "<assertion-id-from-this-spec>" },
+              { "type": "sendKeys", "target": { "type": "search", "criteria": { "role": "textbox" } }, "keys": ["Enter"] }
+            ],
+            "teardown": [],
+            "requiresRealBackend": false,
+            "hasTiming": true,
+            "retryStrategy": { "maxAttempts": 3, "delayMs": 500 }
+          }
+        ],
+        "asyncStrategies": {
+          "strategyName": { "timeoutMs": 3000, "pollIntervalMs": 200, "description": "What we're waiting for" }
+        },
+        "beforeEach": [{ "type": "navigate", "url": "/page-url" }],
+        "afterEach": [],
+        "requiresInfrastructure": {
+          "pty": false,
+          "fileSystem": false,
+          "claudeAPI": false,
+          "llmBackend": false,
+          "runnerBackend": false,
+          "tauriEvents": false
+        },
+        "automationCoverage": 80,
+        "manualAssertions": [],
+        "flakyAssertions": [],
+        "notes": "Optional notes for test implementers"
+      }
+    }
+  }
+}
+\`\`\`
+
+### Testing section rules
+
+- **\`difficulty: "easy"\`** — pure UI navigation, no async, no external services
+- **\`difficulty: "medium"\`** — requires fixtures or state setup, some async waits
+- **\`difficulty: "hard"\`** — requires real PTY / Claude CLI / LLM backend / Tauri events that can't be simulated
+- **\`requiresInfrastructure\`** controls whether CI can run the test — set it accurately
+- **\`automationCoverage\`** is 0–100; don't claim 100% if some assertions need manual review
+- Prefer **\`componentAction\`** steps over raw clicks when the component has registered actions
+- Reference assertion IDs from **this same spec** in \`assert\` steps — don't redefine assertions
+- Only add testing configs for groups that actually need them — skip groups with only structural assertions
+- When merging: preserve existing testing configs verbatim; only add entries for newly added groups
 `.trim();
 
 /**
@@ -751,6 +834,7 @@ You are UPDATING an existing spec, not creating from scratch. The current spec i
    - ADD new assertions for uncovered functionality — give them new unique IDs
 4. **NEVER reduce detail** — if an existing assertion has a detailed behavioral description, your replacement must be AT LEAST as detailed. When in doubt, keep the existing version.
 5. **Preserve assertion IDs** for assertions that haven't meaningfully changed — this enables tracking changes over time
+6. **Preserve the \`testing\` section exactly as-is** — if the existing spec has a \`testing\` field, copy it verbatim into the output. Do not modify existing testing configs. Only add new group entries under \`testing.groups\` for groups that were newly added in this update. Do not add a \`testing\` section if one is not already present.
 
 ### Output Format
 

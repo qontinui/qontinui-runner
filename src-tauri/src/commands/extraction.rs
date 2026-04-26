@@ -744,10 +744,7 @@ async fn upload_extraction_annotations_impl(
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        error!(
-            "Upload annotations failed with status {}: {}",
-            status, body
-        );
+        error!("Upload annotations failed with status {}: {}", status, body);
         return Err(AppError::HttpStatusError { status, body });
     }
 

@@ -1,5 +1,6 @@
 import { useCallback } from "react";
-import { getGlobalSpecStore } from "@qontinui/ui-bridge";
+import { getGlobalSpecStore, SpecExecutor } from "@qontinui/ui-bridge";
+import type { SpecExecutionOptions } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { closestElementIds, getUIBridgeGlobal } from "./utils";
 import { getAllSpecs } from "../../lib/spec-registry";
@@ -124,7 +125,7 @@ const errorBaselines = new Map<string, ErrorBaseline>();
  *          get_error_sessions, capture_error_baseline, compare_error_baseline,
  *          get_error_report, get_action_history, get_interaction_metrics,
  *          get_performance_entries, clear_performance_entries,
- *          get_element_tree, highlight_element
+ *          get_element_tree, highlight_element, run_spec
  */
 export function useDebugInspectEvents(
   context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">,
@@ -313,6 +314,48 @@ export function useDebugInspectEvents(
             type,
             success: true,
             data: { specId, config: specConfig },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "run_spec": {
+          const { specId: runSpecId } = payload;
+          if (!runSpecId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "specId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const runSpecConfig = getGlobalSpecStore().get(runSpecId);
+          if (!runSpecConfig) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Spec not found: ${runSpecId}`,
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const runSpecOptions = payload.params as SpecExecutionOptions | undefined;
+
+          const discovered = await currentBridge.discover({ includeHidden: false });
+          const executor = new SpecExecutor();
+          executor.updateElements(discovered.elements);
+          const result = await executor.execute(runSpecConfig, runSpecOptions);
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: result,
             timestamp: Date.now(),
           });
           return true;

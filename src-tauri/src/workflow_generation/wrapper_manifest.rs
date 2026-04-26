@@ -96,10 +96,7 @@ pub struct ManifestEntry {
 /// callers), this function returns an empty string and the prompt's
 /// append-when-non-empty branch skips the "Registered Wrapper Apps"
 /// section entirely.
-pub async fn build_manifest(
-    app_state: &crate::commands::AppState,
-    runner_api_port: u16,
-) -> String {
+pub async fn build_manifest(app_state: &crate::commands::AppState, runner_api_port: u16) -> String {
     let registry = match app_state.app_registry.get() {
         Some(r) => r,
         None => return String::new(),
@@ -399,10 +396,15 @@ mod tests {
         };
         let s = format_manifest(&[entry], 9877);
         // Section header appears.
-        assert!(s.contains("## Registered Wrapper Apps"), "section header missing");
+        assert!(
+            s.contains("## Registered Wrapper Apps"),
+            "section header missing"
+        );
         // Curl template uses the runner port we passed in.
         assert!(
-            s.contains("http://localhost:9877/ui-bridge/control/component/<wrapperId>/action/<actionId>"),
+            s.contains(
+                "http://localhost:9877/ui-bridge/control/component/<wrapperId>/action/<actionId>"
+            ),
             "curl template missing or has wrong port"
         );
         // Wrapper id & display name surface.
@@ -479,10 +481,7 @@ mod tests {
             .await;
 
         let entries = build_fut.await.unwrap();
-        let app_ids: Vec<String> = entries
-            .iter()
-            .map(|e| e.app.app.app_id.clone())
-            .collect();
+        let app_ids: Vec<String> = entries.iter().map(|e| e.app.app.app_id.clone()).collect();
         assert_eq!(
             app_ids,
             vec!["ws-app".to_string()],

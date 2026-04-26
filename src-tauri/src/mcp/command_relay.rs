@@ -170,10 +170,9 @@ impl CommandRelay {
                 if response.success {
                     Ok(response)
                 } else {
-                    let msg = response
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "wrapper returned success=false without an error message".to_string());
+                    let msg = response.error.clone().unwrap_or_else(|| {
+                        "wrapper returned success=false without an error message".to_string()
+                    });
                     Err(CommandRelayError::WrapperError(msg))
                 }
             }
@@ -313,7 +312,10 @@ mod tests {
         let ws = WsConnectionManager::new();
         let relay = CommandRelay::new(ws);
 
-        let err = relay.dispatch("ghost", "noop", json!({})).await.unwrap_err();
+        let err = relay
+            .dispatch("ghost", "noop", json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, CommandRelayError::NotConnected(ref id) if id == "ghost"));
     }
 
@@ -327,7 +329,11 @@ mod tests {
 
         let err = relay.dispatch("slow", "noop", json!({})).await.unwrap_err();
         assert!(matches!(err, CommandRelayError::Timeout(_)));
-        assert_eq!(relay.pending_count().await, 0, "pending entry must be cleaned up");
+        assert_eq!(
+            relay.pending_count().await,
+            0,
+            "pending entry must be cleaned up"
+        );
     }
 
     #[tokio::test]

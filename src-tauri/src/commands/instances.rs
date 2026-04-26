@@ -230,9 +230,7 @@ pub async fn get_runner_identity(
     let is_secondary = crate::process_capture::primary_proxy::is_secondary();
     let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
     let primary_port = crate::process_capture::primary_proxy::primary_port();
-    let own_port = health
-        .api_port()
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let own_port = health.api_port().load(std::sync::atomic::Ordering::Relaxed);
 
     Ok(serde_json::json!({
         "is_secondary": is_secondary,

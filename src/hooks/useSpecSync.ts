@@ -330,6 +330,7 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
         ``,
         `Output the complete updated spec JSON with the stateMachine section added.`,
         `Preserve ALL existing groups, assertions, and IDs exactly as they are.`,
+        `Preserve the "testing" section exactly if it exists. Do NOT add a testing section if one is not already present.`,
         `Only ADD the stateMachine section. Output as a single JSON code block.`,
       ].join("\n");
     }

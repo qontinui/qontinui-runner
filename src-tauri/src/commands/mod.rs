@@ -167,8 +167,8 @@ pub mod checkpoints;
 pub mod checks; // Code quality checks (linting, formatting, type checking)
 pub mod chunk_labels; // Per-config user-chosen chunk label overrides for chunked state-machine graph view
 pub mod clipboard; // Clipboard sync: share text to mobile via backend relay
-pub mod compartments; // Workstream C: scoped wrappers around Arc<AppState> for gradual migration
 pub mod comparison; // Side-by-side architecture comparison runs
+pub mod compartments; // Workstream C: scoped wrappers around Arc<AppState> for gradual migration
 pub mod config;
 pub mod container_settings;
 pub mod context;
@@ -204,6 +204,7 @@ pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
 pub mod mobile_settings; // Mobile settings (ADB path, device config)
 pub mod orchestration_loop_configs; // Orchestration loop saved config CRUD
 pub mod otel_settings; // OpenTelemetry settings (endpoint, sampling, enable/disable)
+pub mod page_spec_store; // User-saved page specs (persist generated specs to app data dir)
 pub mod performance_metrics; // Performance metrics dashboard
 pub mod playwright_settings;
 pub mod project_logs;
@@ -400,20 +401,17 @@ pub struct AppState {
     /// so non-HTTP code paths (workflow generation, agentic prompt
     /// assembly) can introspect registered apps without taking a dep on
     /// `ApiState`. Reads via `.get()`; the cell is set exactly once.
-    pub app_registry:
-        Arc<tokio::sync::OnceCell<Arc<crate::mcp::app_registry::AppRegistry>>>,
+    pub app_registry: Arc<tokio::sync::OnceCell<Arc<crate::mcp::app_registry::AppRegistry>>>,
     /// Late-initialized handle to the shared `AppDispatcher`. Same lifetime
     /// + access shape as `app_registry` above. Lets non-HTTP code dispatch
     /// commands to registered apps via the unified HTTP-or-WS transport
     /// without re-wiring ApiState.
-    pub app_dispatcher:
-        Arc<tokio::sync::OnceCell<Arc<crate::mcp::app_dispatch::AppDispatcher>>>,
+    pub app_dispatcher: Arc<tokio::sync::OnceCell<Arc<crate::mcp::app_dispatch::AppDispatcher>>>,
     /// Late-initialized handle to the wrapper subsystem (registry +
     /// manager + dispatch). Populated during HTTP server bootstrap so
     /// `/wrappers/*` routes can resolve via the same OnceCell pattern as
     /// `app_registry` / `app_dispatcher`.
-    pub wrapper_state:
-        Arc<tokio::sync::OnceCell<Arc<crate::wrappers::WrapperState>>>,
+    pub wrapper_state: Arc<tokio::sync::OnceCell<Arc<crate::wrappers::WrapperState>>>,
 }
 
 impl AppState {

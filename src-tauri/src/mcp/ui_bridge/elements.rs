@@ -1067,9 +1067,7 @@ async fn ws_collect_components(
 /// Build a flat 400 error response from a WS dispatch failure. Mirrors the
 /// shape `wrap_ipc_result` produces for inner-failure envelopes so callers
 /// see a consistent error contract regardless of transport.
-fn ws_dispatch_error_response(
-    error_msg: String,
-) -> (StatusCode, Json<ApiResponse<()>>) {
+fn ws_dispatch_error_response(error_msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
     let detail = classify_transport_error(&error_msg);
     (
         StatusCode::BAD_REQUEST,
@@ -1862,10 +1860,7 @@ async fn ui_bridge_wait_for_element_registered_forward(
         .unwrap_or(5000);
     let timeout_ms = raw_timeout.clamp(100, 60_000);
     if let serde_json::Value::Object(ref mut map) = body {
-        map.insert(
-            "timeoutMs".to_string(),
-            serde_json::Value::from(timeout_ms),
-        );
+        map.insert("timeoutMs".to_string(), serde_json::Value::from(timeout_ms));
     }
 
     info!(
@@ -1950,12 +1945,16 @@ pub fn validate_wait_for_element_state_request(
             let n = v
                 .as_u64()
                 .or_else(|| v.as_i64().filter(|i| *i >= 0).map(|i| i as u64))
-                .or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.is_finite()).map(|f| f as u64))
-                .ok_or_else(|| "wait-for-element: 'timeoutMs' must be a non-negative number".to_string())?;
+                .or_else(|| {
+                    v.as_f64()
+                        .filter(|f| *f >= 0.0 && f.is_finite())
+                        .map(|f| f as u64)
+                })
+                .ok_or_else(|| {
+                    "wait-for-element: 'timeoutMs' must be a non-negative number".to_string()
+                })?;
             if n > 30_000 {
-                return Err(
-                    "wait-for-element: 'timeoutMs' must be between 0 and 30000".to_string(),
-                );
+                return Err("wait-for-element: 'timeoutMs' must be between 0 and 30000".to_string());
             }
             n
         }
@@ -1966,7 +1965,11 @@ pub fn validate_wait_for_element_state_request(
         Some(v) => {
             let n = v
                 .as_u64()
-                .or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.is_finite()).map(|f| f as u64))
+                .or_else(|| {
+                    v.as_f64()
+                        .filter(|f| *f >= 0.0 && f.is_finite())
+                        .map(|f| f as u64)
+                })
                 .ok_or_else(|| "wait-for-element: 'pollMs' must be a number".to_string())?;
             if n < 10 {
                 return Err("wait-for-element: 'pollMs' must be >= 10".to_string());
@@ -2482,11 +2485,10 @@ pub async fn ui_bridge_type_into_handler(
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use super::routing::add_dual;
     use axum::routing::{get, post};
-    let router = axum::Router::new()
-        .route(
-            "/ui-bridge/control/elements",
-            get(ui_bridge_get_elements_handler),
-        );
+    let router = axum::Router::new().route(
+        "/ui-bridge/control/elements",
+        get(ui_bridge_get_elements_handler),
+    );
     let router = add_dual!(
         router,
         get,
@@ -2607,13 +2609,11 @@ mod wait_for_element_state_tests {
     use serde_json::json;
 
     fn ok(body: serde_json::Value) -> WaitForElementStateRequest {
-        validate_wait_for_element_state_request(&body)
-            .expect("expected validation to succeed")
+        validate_wait_for_element_state_request(&body).expect("expected validation to succeed")
     }
 
     fn err(body: serde_json::Value) -> String {
-        validate_wait_for_element_state_request(&body)
-            .expect_err("expected validation to fail")
+        validate_wait_for_element_state_request(&body).expect_err("expected validation to fail")
     }
 
     #[test]
@@ -3021,8 +3021,10 @@ mod ws_dispatch_selection_tests {
             .iter()
             .filter_map(|v| v.get("id").and_then(|s| s.as_str()).map(String::from))
             .collect();
-        let expected: std::collections::BTreeSet<String> =
-            ["alpha-1", "alpha-2", "beta-1"].iter().map(|s| s.to_string()).collect();
+        let expected: std::collections::BTreeSet<String> = ["alpha-1", "alpha-2", "beta-1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(ids, expected, "merged ids must contain every WS component");
     }
 }

@@ -221,8 +221,7 @@ async fn login_impl(email: String, password: String) -> Result<LoginResponse, Ap
     info!("Login successful for user: {}", user_info.id);
 
     // 2. Store tokens in keychain
-    auth_manager
-        .store_tokens(&api_response.access_token, &api_response.refresh_token)?;
+    auth_manager.store_tokens(&api_response.access_token, &api_response.refresh_token)?;
 
     // 3. Get or generate device ID
     let device_id = auth_manager.get_device_id()?;
@@ -794,7 +793,10 @@ async fn send_device_heartbeat_impl(
         }
         Err(e) => {
             error!("[HEARTBEAT] Failed to create HTTP client: {}", e);
-            return Err(AppError::Raw(format!("Failed to create HTTP client: {}", e)));
+            return Err(AppError::Raw(format!(
+                "Failed to create HTTP client: {}",
+                e
+            )));
         }
     };
 

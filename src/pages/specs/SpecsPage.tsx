@@ -350,10 +350,10 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     groupId: string;
   } | null>(null);
 
-  // Auto-load bundled specs on first mount only (skip if restored from cache)
+  // Auto-load bundled + user-saved specs on first mount (skip if restored from cache)
   useEffect(() => {
     if (!state.restoredFromCache) {
-      state.loadBundledSpecs();
+      void state.loadBundledSpecs();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

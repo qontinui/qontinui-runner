@@ -215,7 +215,9 @@ pub async fn get_shell_command(
     id: String,
     state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    get_shell_command_impl(id, &state).await.map_err(String::from)
+    get_shell_command_impl(id, &state)
+        .await
+        .map_err(String::from)
 }
 
 async fn get_shell_command_impl(

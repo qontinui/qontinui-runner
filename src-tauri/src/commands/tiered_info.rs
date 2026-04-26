@@ -100,7 +100,11 @@ pub async fn get_flaky_templates(
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
     let threshold = threshold.unwrap_or(0.2);
-    match storage.pg_db().get_flaky_templates(&config_id, threshold).await {
+    match storage
+        .pg_db()
+        .get_flaky_templates(&config_id, threshold)
+        .await
+    {
         Ok(items) => {
             let typed: Vec<FlakyItem> = items
                 .into_iter()
@@ -371,7 +375,11 @@ pub async fn cleanup_old_runs(
 ) -> Result<TieredInfoResponse<u32>, String> {
     let keep_count = keep_count.unwrap_or(100);
 
-    match storage.pg_db().cleanup_old_runs(&config_id, keep_count).await {
+    match storage
+        .pg_db()
+        .cleanup_old_runs(&config_id, keep_count)
+        .await
+    {
         Ok(deleted) => {
             info!(
                 "Cleaned up {} old automation records for config {}",

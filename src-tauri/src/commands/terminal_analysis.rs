@@ -136,7 +136,12 @@ Focus on what matters for a developer to quickly understand what happened in thi
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking failed: {}",
+            e
+        )))
+    })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -194,7 +199,12 @@ For the Qontinui project specifically: frontend=Next.js or Vite UI, backend=Fast
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking failed: {}",
+            e
+        )))
+    })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -251,7 +261,12 @@ Be specific about what the changes do and what could break."#;
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking failed: {}",
+            e
+        )))
+    })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -305,7 +320,12 @@ Be realistic about completion — only mark something done if there's clear evid
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking failed: {}",
+            e
+        )))
+    })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -358,7 +378,12 @@ Use the tab name as the panel title. Keep each per-tab summary concise (3–6 bu
         run_analysis(system_prompt, &input, doctor_handle.as_ref())
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking failed: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking failed: {}",
+            e
+        )))
+    })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {

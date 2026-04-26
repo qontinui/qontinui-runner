@@ -1946,6 +1946,7 @@ pub async fn execute_inline_workflow(
         htn_enabled: false,
         htn_ui_bridge_url: None,
         htn_state_machine_path: None,
+        auto_commit_subagents: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };

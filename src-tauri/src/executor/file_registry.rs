@@ -996,10 +996,12 @@ mod tests {
         // Both registrations should be present
         let info = mgr.info().await;
         assert_eq!(info.len(), 2);
-        let mut ids: Vec<Option<String>> =
-            info.iter().map(|i| i.worktree_id.clone()).collect();
+        let mut ids: Vec<Option<String>> = info.iter().map(|i| i.worktree_id.clone()).collect();
         ids.sort();
-        assert_eq!(ids, vec![Some("wt-1".to_string()), Some("wt-2".to_string())]);
+        assert_eq!(
+            ids,
+            vec![Some("wt-1".to_string()), Some("wt-2".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -1066,7 +1068,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(conflicts.len(), 1, "Same path in same worktree must conflict");
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "Same path in same worktree must conflict"
+        );
         assert_eq!(conflicts[0].file_path, "src/lib.rs");
         assert_eq!(conflicts[0].worktree_id, Some("wt-1".to_string()));
         assert_eq!(conflicts[0].other_holders.len(), 1);
@@ -1078,7 +1084,8 @@ mod tests {
         let mgr = FileRegistryManager::new();
 
         // Same task registers in main tree, worktree 1, and worktree 2
-        mgr.register(&["a.rs".into()], "task-1", "Multi", None).await;
+        mgr.register(&["a.rs".into()], "task-1", "Multi", None)
+            .await;
         mgr.register(
             &["b.rs".into()],
             "task-1",
@@ -1109,20 +1116,10 @@ mod tests {
         let mgr = FileRegistryManager::new();
 
         // Same task registers same path in two worktrees
-        mgr.register(
-            &["lib.rs".into()],
-            "task-1",
-            "S",
-            Some("wt-1".to_string()),
-        )
-        .await;
-        mgr.register(
-            &["lib.rs".into()],
-            "task-1",
-            "S",
-            Some("wt-2".to_string()),
-        )
-        .await;
+        mgr.register(&["lib.rs".into()], "task-1", "S", Some("wt-1".to_string()))
+            .await;
+        mgr.register(&["lib.rs".into()], "task-1", "S", Some("wt-2".to_string()))
+            .await;
 
         // Unregister only in worktree 1
         mgr.unregister(&["lib.rs".into()], "task-1", Some("wt-1".to_string()))

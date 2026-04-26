@@ -114,10 +114,7 @@ impl AppDispatcher {
                     "[app-dispatch] {} via websocket → app='{}' conn_id={:?}",
                     action, app_id, entry.websocket_conn_id
                 );
-                let response = self
-                    .command_relay
-                    .dispatch(app_id, action, payload)
-                    .await?;
+                let response = self.command_relay.dispatch(app_id, action, payload).await?;
                 Ok(response.result.unwrap_or(serde_json::Value::Null))
             }
             AppTransport::Http => {
@@ -137,13 +134,10 @@ impl AppDispatcher {
                 if !payload.is_null() {
                     req = req.json(&payload);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| DispatchError::HttpSend {
-                        url: url.clone(),
-                        source: e,
-                    })?;
+                let resp = req.send().await.map_err(|e| DispatchError::HttpSend {
+                    url: url.clone(),
+                    source: e,
+                })?;
                 let status = resp.status();
                 let body = resp
                     .text()

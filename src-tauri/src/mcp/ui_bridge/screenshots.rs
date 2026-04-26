@@ -1662,9 +1662,7 @@ pub async fn ui_bridge_annotations_list_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: List annotations");
-    wrap_ipc_result(
-        ui_bridge_request_sync(&state, "annotations_list", serde_json::json!({})).await,
-    )
+    wrap_ipc_result(ui_bridge_request_sync(&state, "annotations_list", serde_json::json!({})).await)
 }
 
 /// Create annotation.

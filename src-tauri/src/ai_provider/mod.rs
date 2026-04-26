@@ -21,6 +21,7 @@ mod gemini_cli;
 pub(crate) mod gemma_local_warm;
 pub mod middleware;
 pub mod multimodal;
+pub(crate) mod oauth_refresh;
 mod process;
 pub mod retry;
 pub(crate) mod routing;

@@ -15,10 +15,10 @@ use crate::check_executor::{
     CheckExecutionResult, CheckSuiteSummary, CheckToolInfoSerialized, ProjectDetectionResult,
     CHECK_TOOLS, CHECK_TYPE_INFO,
 };
+use crate::commands::compartments::StorageCompartment;
 use crate::database::{
     Check, CreateCheckGroupInput, CreateCheckInput, UpdateCheckGroupInput, UpdateCheckInput,
 };
-use crate::commands::compartments::StorageCompartment;
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;

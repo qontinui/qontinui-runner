@@ -69,9 +69,7 @@ pub fn optimize_database(
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with database statistics
 /// * `Err(String)` - Error message if statistics cannot be retrieved
-async fn get_database_stats_impl(
-    state: &StorageCompartment,
-) -> Result<CommandResponse, AppError> {
+async fn get_database_stats_impl(state: &StorageCompartment) -> Result<CommandResponse, AppError> {
     info!("Getting database statistics");
 
     let stats: DatabaseStats = state

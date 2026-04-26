@@ -95,8 +95,8 @@ pub use elements::{
     ui_bridge_find_handler, ui_bridge_get_component_handler, ui_bridge_get_components_handler,
     ui_bridge_get_element_handler, ui_bridge_get_elements_handler,
     ui_bridge_get_last_discovered_handler, ui_bridge_get_snapshot_handler,
-    ui_bridge_read_value_handler, ui_bridge_type_into_handler,
-    ui_bridge_wait_for_element_handler, ActionQueryParams,
+    ui_bridge_read_value_handler, ui_bridge_type_into_handler, ui_bridge_wait_for_element_handler,
+    ActionQueryParams,
 };
 pub use errors::{
     ui_bridge_capture_error_baseline_handler, ui_bridge_circuit_breaker_reset_handler,
@@ -146,10 +146,10 @@ pub use page::{
     ui_bridge_page_go_forward_handler, ui_bridge_page_hard_refresh_handler,
     ui_bridge_page_navigate_handler, ui_bridge_page_refresh_handler,
     ui_bridge_page_set_tab_handler, ui_bridge_page_summary_handler,
-    ui_bridge_query_selector_handler, ui_bridge_tab_activate_handler,
-    ui_bridge_tabs_list_handler, BatchEvaluateRequest, BatchExpression, BatchExpressionResult,
-    NavigateAndWaitRequest, PageEvaluateRequest, PageNavigateRequest, QuerySelectorRequest,
-    SetTabRequest, SetTabResponse, TabActivateRequest,
+    ui_bridge_query_selector_handler, ui_bridge_tab_activate_handler, ui_bridge_tabs_list_handler,
+    BatchEvaluateRequest, BatchExpression, BatchExpressionResult, NavigateAndWaitRequest,
+    PageEvaluateRequest, PageNavigateRequest, QuerySelectorRequest, SetTabRequest, SetTabResponse,
+    TabActivateRequest,
 };
 pub use request::{handle_ui_bridge_response, ui_bridge_request_sync};
 pub use screenshots::{
@@ -160,9 +160,9 @@ pub use screenshots::{
     ui_bridge_annotations_update_handler, ui_bridge_capture_element_images_handler,
     ui_bridge_diagnose_stuck_screen_handler, ui_bridge_element_screenshot_handler,
     ui_bridge_get_element_images_handler, ui_bridge_media_analyze_handler,
-    ui_bridge_media_audit_handler, ui_bridge_media_find_handler,
-    ui_bridge_media_snapshot_handler, ui_bridge_page_health_handler,
-    AnnotatedScreenshotData, AnnotatedScreenshotQuery, PageHealthRequest,
+    ui_bridge_media_audit_handler, ui_bridge_media_find_handler, ui_bridge_media_snapshot_handler,
+    ui_bridge_page_health_handler, AnnotatedScreenshotData, AnnotatedScreenshotQuery,
+    PageHealthRequest,
 };
 pub use types::{
     classify_assertion_failure, classify_transport_error, recovery_hint_for, ClipboardWriteRequest,
@@ -176,11 +176,7 @@ pub use types::{
 // `use super::ipc_handler_*;`, and the expanded code references these
 // names at the call site — but the macros are also defined here so the
 // names must resolve at *definition* scope for rustc to parse them.
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-};
+use axum::{extract::State, http::StatusCode, response::Json};
 use std::sync::Arc;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -193,16 +189,13 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 // Page Navigation Handlers
 // ============================================================================
 
-
 // ============================================================================
 // Direct tab navigation moved to `page::routes()` — see `page.rs`.
 // ============================================================================
 
-
 // ============================================================================
 // Exploration Handlers
 // ============================================================================
-
 
 // ============================================================================
 // Idle Detection Handlers

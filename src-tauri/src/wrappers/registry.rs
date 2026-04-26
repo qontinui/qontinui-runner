@@ -148,13 +148,7 @@ impl WrapperRegistry {
 
     /// Returns all currently-cached wrappers.
     pub async fn get_all(&self) -> Vec<Wrapper> {
-        self.inner
-            .read()
-            .await
-            .wrappers
-            .values()
-            .cloned()
-            .collect()
+        self.inner.read().await.wrappers.values().cloned().collect()
     }
 
     /// Look up a wrapper by id.
@@ -360,9 +354,8 @@ impl WrapperRegistry {
         let path = self.root.join(INDEX_FILE);
         let tmp = self.root.join(format!("{}.tmp", INDEX_FILE));
         let snapshot = self.inner.read().await;
-        let bytes = serde_json::to_vec_pretty(&*snapshot).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let bytes = serde_json::to_vec_pretty(&*snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         std::fs::write(&tmp, &bytes)?;
         // Best-effort atomic replace.
         if let Err(e) = std::fs::rename(&tmp, &path) {
@@ -481,15 +474,14 @@ async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryE
         Ok(s.trim().to_string())
     });
 
-    let joined =
-        tokio::time::timeout(MANIFEST_ONLY_TIMEOUT, result)
-            .await
-            .map_err(|_| {
-                RegistryError::Spawn(format!(
-                    "manifest-only timed out after {:?}",
-                    MANIFEST_ONLY_TIMEOUT
-                ))
-            })?;
+    let joined = tokio::time::timeout(MANIFEST_ONLY_TIMEOUT, result)
+        .await
+        .map_err(|_| {
+            RegistryError::Spawn(format!(
+                "manifest-only timed out after {:?}",
+                MANIFEST_ONLY_TIMEOUT
+            ))
+        })?;
 
     match joined {
         Ok(Ok(stdout)) => Ok(stdout),

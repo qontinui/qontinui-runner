@@ -139,8 +139,8 @@ pub fn has_playwright_test_password() -> Result<CommandResponse, String> {
 
     // Check keychain first, then fall back to settings for backward compatibility.
     // `?` lifts anyhow::Error via From impl into AppError, then String::from converts.
-    let keychain_has = has_playwright_password()
-        .map_err(|e: anyhow::Error| String::from(AppError::from(e)))?;
+    let keychain_has =
+        has_playwright_password().map_err(|e: anyhow::Error| String::from(AppError::from(e)))?;
     let settings_has = settings::get_playwright_settings().test_password.is_some();
 
     Ok(CommandResponse {

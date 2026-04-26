@@ -295,10 +295,7 @@ async fn health(
     // response (see `mcp::ui_bridge::request::ui_bridge_request_inner`).
     // Distinguishes "Tauri shell is responsive" from "React app has actually
     // mounted past App.tsx's loading screen and is processing UI Bridge IPC".
-    let frontend_ready = state
-        .app_state
-        .frontend_ready
-        .load(Ordering::Relaxed);
+    let frontend_ready = state.app_state.frontend_ready.load(Ordering::Relaxed);
 
     let mut data = serde_json::json!({
         "status": status,
@@ -435,12 +432,8 @@ pub fn create_router(
     // dep on ApiState. The cells are pre-allocated by `main::shared_app_state`
     // construction; setting them here is a one-shot init for the lifetime of
     // the runner process.
-    let _ = app_state
-        .app_registry
-        .set(shared_app_registry.clone());
-    let _ = app_state
-        .app_dispatcher
-        .set(shared_app_dispatcher.clone());
+    let _ = app_state.app_registry.set(shared_app_registry.clone());
+    let _ = app_state.app_dispatcher.set(shared_app_dispatcher.clone());
 
     // Wrapper subsystem (Phase 1 of the wrapper-runner integration plan).
     // `create_router` is sync, so spawn the async bootstrap onto the tokio

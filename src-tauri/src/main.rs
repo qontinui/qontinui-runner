@@ -453,16 +453,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Workstream C (Move 2B): compartment wrappers around Arc<AppState> so
     // per-module plugins can migrate from `State<Arc<AppState>>` to a scoped
     // `State<<Compartment>>`. Both forms coexist during the gradual migration.
-    let bridge_compartment =
-        commands::compartments::BridgeCompartment(shared_app_state.clone());
+    let bridge_compartment = commands::compartments::BridgeCompartment(shared_app_state.clone());
     let execution_compartment =
         commands::compartments::ExecutionCompartment(shared_app_state.clone());
     let integration_compartment =
         commands::compartments::IntegrationCompartment(shared_app_state.clone());
-    let health_compartment =
-        commands::compartments::HealthCompartment(shared_app_state.clone());
-    let storage_compartment =
-        commands::compartments::StorageCompartment(shared_app_state.clone());
+    let health_compartment = commands::compartments::HealthCompartment(shared_app_state.clone());
+    let storage_compartment = commands::compartments::StorageCompartment(shared_app_state.clone());
 
     // Frontend log-sync store. Holds the most recent batches of logs the React
     // UI mirrors back into Rust state for HTTP API consumption. Created here
@@ -1164,6 +1161,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::shell_commands::list_shell_commands,
             commands::shell_commands::set_shell_command_enabled,
             commands::shell_commands::update_shell_command,
+            commands::page_spec_store::delete_page_spec,
+            commands::page_spec_store::load_user_specs,
+            commands::page_spec_store::save_page_spec,
             commands::spec_drift::scan_spec_drift,
             spec_experimentation::commands::analyze_cross_page_consistency,
             spec_experimentation::commands::analyze_spec_element_coverage,

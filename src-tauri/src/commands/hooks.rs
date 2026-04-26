@@ -572,8 +572,8 @@ async fn create_hook_impl(
     let _ = parse_trigger(&request.trigger).map_err(AppError::Raw)?;
 
     // Validate action
-    let _ = parse_action(&request.action_type, request.action_config.clone())
-        .map_err(AppError::Raw)?;
+    let _ =
+        parse_action(&request.action_type, request.action_config.clone()).map_err(AppError::Raw)?;
 
     let id = Uuid::new_v4().to_string();
 

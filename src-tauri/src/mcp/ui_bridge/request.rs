@@ -481,8 +481,8 @@ mod wrap_ipc_result_tests {
             "error": "No style guide provided or loaded.",
             "type": "design_run_audit",
         });
-        let (status, body) = wrap_ipc_result(Ok(data))
-            .expect_err("inner failure must produce Err with HTTP 400");
+        let (status, body) =
+            wrap_ipc_result(Ok(data)).expect_err("inner failure must produce Err with HTTP 400");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let inner = body.deref();
         assert!(!inner.success);
@@ -498,8 +498,7 @@ mod wrap_ipc_result_tests {
     #[test]
     fn inner_failure_without_error_field_uses_fallback_message() {
         let data = json!({"success": false});
-        let (status, body) = wrap_ipc_result(Ok(data))
-            .expect_err("inner failure must produce Err");
+        let (status, body) = wrap_ipc_result(Ok(data)).expect_err("inner failure must produce Err");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let msg = body.deref().error.as_deref().unwrap_or_default();
         assert_eq!(msg, "UI bridge call failed");
@@ -510,8 +509,7 @@ mod wrap_ipc_result_tests {
         // Some IPC responses don't include `success` at all — those should
         // be treated as healthy success (no misclassification as failure).
         let data = json!({"report": {"violations": []}});
-        let resp =
-            wrap_ipc_result(Ok(data.clone())).expect("absent success field must produce Ok");
+        let resp = wrap_ipc_result(Ok(data.clone())).expect("absent success field must produce Ok");
         let body = resp.deref();
         assert!(body.success);
         assert_eq!(body.data.as_ref().unwrap(), &data);

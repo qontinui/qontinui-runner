@@ -132,11 +132,7 @@ fn resolve_timeout(headers: &HeaderMap) -> Duration {
 /// for unknown actions — strictly we'd want a 404, but the wrapper itself
 /// will reject the unknown action with a 404 / error envelope, so this
 /// matches the user-visible behavior either way.
-async fn action_is_exclusive(
-    registry: &WrapperRegistry,
-    wrapper_id: &str,
-    action: &str,
-) -> bool {
+async fn action_is_exclusive(registry: &WrapperRegistry, wrapper_id: &str, action: &str) -> bool {
     match registry.get(wrapper_id).await {
         Some(w) => w
             .actions
@@ -190,10 +186,7 @@ pub async fn dispatch_handler(
     // hit this branch, so the order is moot for them; for exclusive
     // ones we want serialization across the spawn too, so this is fine.
     let _exclusive_guard = if exclusive {
-        let mtx = ctx
-            .exclusivity
-            .lock_for(&wrapper_id, &req.action)
-            .await;
+        let mtx = ctx.exclusivity.lock_for(&wrapper_id, &req.action).await;
         Some(mtx.lock_owned().await)
     } else {
         None
@@ -266,9 +259,7 @@ pub async fn dispatch_handler(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             Json(api_error(format!(
                 "wrapper '{}' returned {}: {}",
-                wrapper_id,
-                status,
-                parsed.to_string()
+                wrapper_id, status, parsed
             ))),
         ));
     }
@@ -278,10 +269,7 @@ pub async fn dispatch_handler(
     //   <bare value>
     // We prefer the explicit shape; fall back to the bare value so
     // wrappers that return a literal payload still work.
-    let result = parsed
-        .get("result")
-        .cloned()
-        .unwrap_or(parsed);
+    let result = parsed.get("result").cloned().unwrap_or(parsed);
     Ok(Json(ApiResponse::success(DispatchResponse { result })))
 }
 

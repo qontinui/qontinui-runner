@@ -1,0 +1,812 @@
+{
+  "version": "1.0.0",
+  "description": "Autoresearch Page — A dev-only dashboard for comparing workflow architectures with statistical A/B testing. The page allows launching parallel comparison runs across three built-in workflow architectures (Traditional, Agentic Verification, Multi-Agent Pipeline) or identical runs for repeatability testing, then displays structured metric comparisons (success_rate, iterations, duration_ms, files_changed), an AI-generated prose comparison report, and an AI recommendation with confidence score. Comparison runs are stored in the comparison_runs PostgreSQL table and served via the runner HTTP API at /comparisons and /comparison/:id. This page surfaces the research infrastructure underlying architecture selection decisions.",
+  "groups": [
+    {
+      "id": "page-structure",
+      "name": "Page Structure & Layout",
+      "description": "The Autoresearch page is a dev-only tab rendered in the main content area. It should display a header with the page title and a launch button, a list of existing comparison runs, and a detail panel for the selected run.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ar-page-heading",
+          "description": "A heading with text 'Autoresearch' or 'Architecture Research' is present at the top of the page",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading" },
+            "label": "Page heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-new-comparison-button",
+          "description": "A button labeled 'New Comparison' or 'Run Comparison' or 'Compare Architectures' is present and enabled on the page",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Compare" },
+            "label": "New comparison button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-empty-state",
+          "description": "When no comparison runs have been created, the page displays an empty state message explaining that no comparisons exist and prompting the user to start one by clicking the 'New Comparison' button",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "main" },
+            "label": "Page content area"
+          },
+          "assertionType": "semantic",
+          "precondition": "No comparison runs exist in the database",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-page-layout-semantic",
+          "description": "The page layout follows the standard runner dev-tab pattern: a compact header row with title + action buttons, a scrollable list of comparison runs on the left (or full-width), and a detail panel on the right (or below) when a run is selected. The page fills the full height of its container with overflow-auto.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "main" },
+            "label": "Page container"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "comparison-launch",
+      "name": "Comparison Launch Form",
+      "description": "The launch form or dialog allows the user to select a workflow, variation type (architecture or same), and whether to use worktree isolation, then submit to POST /comparison/start via the runner HTTP API.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ar-launch-variation-type",
+          "description": "The launch form includes a way to select the variation type: at minimum 'Architecture' (compares Traditional vs Agentic Verification vs Multi-Agent Pipeline) and 'Same' (3 identical runs for repeatability). The selected variation type determines the entries created by the backend.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "group" },
+            "label": "Variation type selector"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-launch-worktree-toggle",
+          "description": "A checkbox or toggle labeled 'Worktree isolation' or 'Use worktree' is present in the launch form. When enabled, each comparison entry runs in its own git worktree (separate branch). For architecture comparisons this defaults to enabled.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "checkbox" },
+            "label": "Worktree isolation checkbox"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-launch-submit-behavior",
+          "description": "Clicking the launch/run button submits a POST to /comparison/start with {workflow_id, variation_type, use_worktree}. The backend creates a comparison run record with status='running' and entries in state 'pending', then asynchronously launches one workflow run per entry. The UI should show the new comparison in the list immediately after launch, with status 'running' and entries showing as 'pending' or 'running'.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Run" },
+            "label": "Launch comparison button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A workflow is selected and a variation type is chosen",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-architecture-entries-semantic",
+          "description": "When the 'Architecture' variation type is selected, the backend creates exactly 3 entries: 'Traditional' (workflow_architecture=traditional), 'Agentic Verification' (workflow_architecture=agentic_verification), and 'Multi-Agent Pipeline' (workflow_architecture=multi_agent_pipeline). All three run with use_worktree=true. The launched comparison run should display all three entry labels.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "Comparison entries list"
+          },
+          "assertionType": "semantic",
+          "precondition": "Architecture variation type was selected and comparison was launched",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "comparison-list",
+      "name": "Comparison Run List",
+      "description": "The page lists recent comparison runs fetched from GET /comparisons (up to 50). Each run shows its ID (or short ID), workflow name/ID, variation type, status, and creation date.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "ar-list-items-exist",
+          "description": "When comparison runs exist, the list renders one item per comparison run. Each item is clickable/selectable to open the detail view.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "Comparison runs list"
+          },
+          "assertionType": "exists",
+          "precondition": "At least one comparison run exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-list-status-badge",
+          "description": "Each comparison run in the list displays a status badge showing its current status: 'running' (green or blue), 'comparing' (yellow — AI analysis in progress), 'completed' (blue), or 'failed' (red).",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "Comparison run list"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one comparison run exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-list-variation-type",
+          "description": "Each comparison run in the list shows its variation type ('architecture' or 'same' or 'custom'), allowing users to distinguish architecture comparison runs from repeatability tests.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "Comparison run list"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one comparison run exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-list-refresh",
+          "description": "A 'Refresh' button is present near the list. Clicking it re-fetches comparison runs from GET /comparisons and updates statuses. Running comparisons should be polled periodically (every 5-15 seconds) to show live progress.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Refresh" },
+            "label": "Refresh button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "running-comparison-detail",
+      "name": "Running Comparison Detail View",
+      "description": "When a comparison run with status 'running' is selected, the detail view shows all entries and their individual live statuses fetched from GET /comparison/:id. Entries transition from 'pending' → 'running' → 'completed'/'failed' as workflow runs progress.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "ar-running-entry-list",
+          "description": "The detail panel for a running comparison shows all entries (e.g., Traditional, Agentic Verification, Multi-Agent Pipeline) each with their current status: 'pending', 'running', 'completed', or 'failed'. Status badges use consistent color-coding.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "Comparison entries list in detail"
+          },
+          "assertionType": "exists",
+          "precondition": "A running comparison run is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-running-task-run-link",
+          "description": "Each entry that has been launched (status='running') shows a task_run_id and ideally a link to navigate to the corresponding task run in the Active or History tab.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "Entry list with task run IDs"
+          },
+          "assertionType": "semantic",
+          "precondition": "A running comparison is selected and at least one entry has been launched",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-running-auto-poll",
+          "description": "While a comparison run is selected and status is 'running', the detail view automatically polls GET /comparison/:id every 5-15 seconds to update entry statuses without requiring a manual refresh.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "main" },
+            "label": "Comparison detail panel"
+          },
+          "assertionType": "behavior",
+          "precondition": "A running comparison is selected in the detail view",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "completed-comparison-detail",
+      "name": "Completed Comparison Detail — Results Overview",
+      "description": "When a comparison run completes (status='completed'), the detail view shows the full result breakdown: per-entry results (success/fail, iteration count, duration), the AI comparison report, and the AI recommendation.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "ar-completed-entry-results",
+          "description": "Each completed comparison entry shows three result metrics: success (pass/fail indicator), iterations (number of workflow sessions), and duration in seconds or milliseconds. Failed entries show a failure indicator with no iteration/duration data, or zero values.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "table" },
+            "label": "Comparison entry results table"
+          },
+          "assertionType": "exists",
+          "precondition": "A completed comparison run is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-ai-report-section",
+          "description": "The detail view shows an 'AI Report' or 'Comparison Report' section containing a prose AI-generated analysis of the comparison results. This is the `report` field populated by the AI comparison analysis after all entries complete.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "AI comparison report section"
+          },
+          "assertionType": "exists",
+          "precondition": "A completed comparison run with a report is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-recommendation-section",
+          "description": "The detail view shows a 'Recommendation' section displaying the AI recommendation: the winning branch_name, a confidence percentage (0-100%), and the reasoning text. The recommendation is populated from the `recommendation` field of the ComparisonRun.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "AI recommendation section"
+          },
+          "assertionType": "exists",
+          "precondition": "A completed comparison run with a recommendation is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-completed-report-semantic",
+          "description": "The AI comparison report should contain the names of the compared architectures ('Traditional', 'Agentic Verification', 'Multi-Agent Pipeline') and evaluate them on the basis of success, speed (iterations + duration), and scope (files_changed). If the comparison run has variation_type='same', the report instead analyzes run-to-run variance and repeatability.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "AI comparison report"
+          },
+          "assertionType": "semantic",
+          "precondition": "A completed comparison run with a report is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "metric-analysis",
+      "name": "Structured Metric Analysis",
+      "description": "The page displays machine-readable metric comparisons across variants (StructuredComparisonReport from comparison.rs). Metrics include success_rate, iterations (lower=better), duration_ms (lower=better), and files_changed (lower=better). A winner is identified by which variant wins the most metrics, with a confidence score.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "ar-metrics-table",
+          "description": "A metrics comparison table or cards section shows the four tracked metrics: success_rate, iterations, duration_ms, and files_changed. For each metric, all variant values are shown side-by-side and the best variant is highlighted.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "table" },
+            "label": "Metrics comparison table"
+          },
+          "assertionType": "exists",
+          "precondition": "A completed comparison run is selected and at least 2 entries completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-winner-display",
+          "description": "The page prominently displays the winning variant (the one with the most 'best' metric wins) with a confidence score as a percentage. The winner is derived from the StructuredComparisonReport: it is the variant that wins the most of the 4 tracked metrics (success_rate, iterations, duration_ms, files_changed).",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Winner display area"
+          },
+          "assertionType": "exists",
+          "precondition": "A completed comparison run is selected with at least 2 entries completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-metric-delta-semantic",
+          "description": "Each metric row in the comparison table shows the delta_pct between best and worst variants. For example, if Traditional takes 5 iterations and Multi-Agent Pipeline takes 3, the delta_pct for iterations is ((5-3)/3)*100 = 67%. A high delta_pct indicates the metric is a strong differentiator between architectures.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "table" },
+            "label": "Metrics table with deltas"
+          },
+          "assertionType": "semantic",
+          "precondition": "A completed comparison with 2+ completed entries is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-p-value-info",
+          "description": "A p-value field or 'Statistical significance' indicator is shown if available. The p_value in StructuredComparisonReport is only populated when multiple trials per variant exist (requires ResearchConfig with trials_per_experiment>1). When a single-trial comparison is shown, the p-value should be absent or displayed as 'N/A — requires multiple trials'.",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Statistical analysis section"
+          },
+          "assertionType": "semantic",
+          "precondition": "A completed comparison run is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "comparison-algorithm-correctness",
+      "name": "Comparison Algorithm Correctness",
+      "description": "The winner and confidence in StructuredComparisonReport are derived by a specific algorithm: winner = variant with the most metric wins (ties broken by success_rate); confidence = winner_metric_wins / total_metrics (i.e., at most 1.0 for 4/4 metrics). An AI verification can check that winner and confidence on-page match these formulas applied to the displayed metric values.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ar-winner-formula-correctness",
+          "description": "The displayed winner should be verifiable from the metric table: count how many of the 4 metrics (success_rate, iterations, duration_ms, files_changed) each variant wins. The variant with the highest count is the winner. If two variants tie, the one with the higher success_rate wins. If the displayed winner does not match this count, the backend has a bug.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Winner and metrics area"
+          },
+          "assertionType": "semantic",
+          "precondition": "A completed comparison run with at least 2 completed entries is displayed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-confidence-formula-correctness",
+          "description": "The displayed confidence percentage should equal (number of metrics the winner wins / 4) × 100. For example, if the winner wins 3 out of 4 metrics, confidence = 75%. A confidence of 25% means the winner only won 1 of 4 metrics. Values outside this range indicate a calculation bug.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Confidence display"
+          },
+          "assertionType": "semantic",
+          "precondition": "A completed comparison run with at least 2 completed entries is displayed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-entry-count-invariant",
+          "description": "For variation_type='architecture', the comparison must always have exactly 3 entries labeled 'Traditional', 'Agentic Verification', and 'Multi-Agent Pipeline'. For variation_type='same', exactly 3 entries labeled 'Run 1', 'Run 2', 'Run 3'. A mismatch indicates a backend bug in entry creation.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "Entry list"
+          },
+          "assertionType": "semantic",
+          "precondition": "A comparison run is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-same-variation-interpretation",
+          "description": "For a 'same' variation comparison (3 identical runs), the metric analysis reveals non-determinism: if success_rate or duration_ms vary significantly between runs, the workflow has reliability issues. The page should indicate that for 'same' comparisons, the goal is repeatability — ideally all three runs should show identical success, similar iteration counts, and similar durations.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Comparison results area"
+          },
+          "assertionType": "semantic",
+          "precondition": "A completed 'same' variation comparison run is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "research-config",
+      "name": "Research Configuration (Multi-Trial)",
+      "description": "Beyond single-shot comparisons, the ResearchConfig data model supports multi-trial experiments with search dimensions, mutation strategies, and statistical acceptance criteria. The page may expose a form for configuring these advanced experiments. Key fields: name, benchmark_workflow_id, trials_per_experiment, search_dimensions (model, multi_agent_mode, max_iterations, context_tokens, workflow_architecture, custom), mutation_strategy (sequential/random_perturbation/ai_guided), acceptance_criteria (primary_metric: pass_rate/mean_iterations/mean_duration, significance_threshold).",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ar-research-config-section",
+          "description": "The page includes a section or panel for configuring multi-trial research experiments. At minimum, this includes a 'trials_per_experiment' field (number of runs per variant) and an acceptance_criteria section (primary metric to optimize, significance threshold).",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "form" },
+            "label": "Research configuration form"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-search-dimensions",
+          "description": "The research configuration allows specifying search dimensions: what parameters to vary across experiments. Options include: model (list of model IDs), multi_agent_mode (on/off), max_iterations (numeric range [min, max]), context_tokens (list of token limits), workflow_architecture (all 3 architectures), and custom (arbitrary JSON overrides). At minimum, 'workflow_architecture' and 'model' dimensions should be selectable.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "group" },
+            "label": "Search dimensions configurator"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-mutation-strategy",
+          "description": "The research config form includes a mutation_strategy selector with three options: 'Sequential' (try each dimension in order), 'Random Perturbation' (randomly vary dimensions), and 'AI-Guided' (AI selects which dimension to vary next based on results so far).",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox" },
+            "label": "Mutation strategy selector"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-p-value-requirement-semantic",
+          "description": "The p-value in StructuredComparisonReport is only calculated when each variant has multiple trial results (trials_per_experiment > 1). The page should surface this: when trials_per_experiment=1, the p-value field shows 'N/A' with a tooltip explaining 'Requires ≥2 trials per variant'. When p-value is computed, it should be displayed alongside the significance_threshold to show whether the result is statistically significant.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Statistical significance area"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "comparison-states",
+      "name": "Comparison Status Lifecycle",
+      "description": "The page correctly reflects the status progression for comparison runs: running (entries launching and executing) → comparing (all entries done, AI analysis running) → completed (full report available). Failed states are displayed with appropriate error indicators.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "ar-status-running-display",
+          "description": "A comparison in 'running' state shows a progress indicator (spinner, animation, or 'Running' badge) and displays entry-level statuses. The user can see which entries are 'pending', 'running', 'completed', or 'failed' in real time.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Comparison run status area"
+          },
+          "assertionType": "semantic",
+          "precondition": "A 'running' comparison run is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-status-completed-display",
+          "description": "A comparison in 'completed' state shows a 'Completed' badge, timestamps (created_at, completed_at), the AI report section, and the metric analysis. The completed_at timestamp is shown as a formatted date/time string.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Completed comparison detail"
+          },
+          "assertionType": "semantic",
+          "precondition": "A 'completed' comparison run is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-status-failed-display",
+          "description": "A comparison in 'failed' state shows a 'Failed' badge (red styling). Individual failed entries show their failure status. If all entries failed, the comparison is marked as failed. The user should see an indication of what went wrong if possible.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Failed comparison indicator"
+          },
+          "assertionType": "semantic",
+          "precondition": "A 'failed' comparison run is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-status-transition-behavior",
+          "description": "The comparison status lifecycle is: (1) immediately after launch: status='running', all entries='pending'; (2) after entries are launched by the backend: entries transition to 'running'; (3) as workflow runs complete: entries transition to 'completed'/'failed'; (4) when all entries are done: status transitions to 'completed' (auto-triggered by GET /comparison/:id when all_done=true); (5) if a report is generated: the report field is populated. The page should reflect each of these transitions.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Comparison detail view"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "workflow-selection",
+      "name": "Workflow Selection",
+      "description": "Before starting a comparison, the user must select which workflow to run. The backend validates that the workflow exists via GET /unified-workflows/:id before accepting a POST /comparison/start request.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ar-workflow-selector",
+          "description": "A workflow selector (dropdown, search field, or list) is present in the launch form. It should show the user's available workflows by name. The selected workflow's ID is sent as workflow_id in the POST /comparison/start request.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox" },
+            "label": "Workflow selector"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-workflow-not-found-error",
+          "description": "If the workflow is deleted after selection but before submission, the POST /comparison/start returns a 404 error. The UI should display an inline error message such as 'Workflow not found' and not leave the user in a broken state.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "alert" },
+            "label": "Error message"
+          },
+          "assertionType": "behavior",
+          "precondition": "A workflow that no longer exists is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ar-empty-workflow-error",
+          "description": "Attempting to launch a comparison run on a workflow with no steps should show an error message. The backend may return an error or the workflow runs may all fail immediately.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "alert" },
+            "label": "Empty workflow error"
+          },
+          "assertionType": "behavior",
+          "precondition": "An empty workflow is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "ar-empty",
+        "name": "No Comparisons",
+        "description": "No comparison runs have been created yet. The page shows an empty state message and the 'New Comparison' button.",
+        "elements": [{ "role": "heading" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "ar-empty-to-launch",
+            "name": "Open launch form",
+            "description": "Click the New Comparison button to open the launch form or panel",
+            "activateStates": ["ar-launch-form"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Compare" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ar-list-view",
+        "name": "Comparison Run List",
+        "description": "At least one comparison run exists. The page shows a list of runs, each with status badge and metadata.",
+        "elements": [{ "role": "list" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "ar-list-to-detail",
+            "name": "Select a comparison run",
+            "description": "Click a comparison run in the list to view its detail panel",
+            "activateStates": ["ar-detail-view"],
+            "deactivateStates": [],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ar-launch-form",
+        "name": "Launch Form Open",
+        "description": "The launch form or dialog is open, allowing the user to configure a new comparison run.",
+        "elements": [{ "role": "form" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "ar-launch-to-list",
+            "name": "Cancel launch",
+            "description": "Cancel the launch form without creating a comparison",
+            "activateStates": ["ar-list-view"],
+            "deactivateStates": ["ar-launch-form"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "ar-launch-to-running",
+            "name": "Submit comparison run",
+            "description": "Submit the form to launch a new comparison run",
+            "activateStates": ["ar-detail-view"],
+            "deactivateStates": ["ar-launch-form"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Run" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ar-detail-view",
+        "name": "Comparison Detail View",
+        "description": "A specific comparison run is selected and its detail is shown: entries, statuses, results, AI report, and metric analysis.",
+        "elements": [{ "role": "region" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "ar-detail-to-list",
+            "name": "Deselect comparison",
+            "description": "Navigate back to the list view without a selected comparison",
+            "activateStates": ["ar-list-view"],
+            "deactivateStates": ["ar-detail-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Back" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "component": "AutoresearchPage",
+    "pageUrl": "autoresearch",
+    "tags": ["dev-only", "comparison", "a-b-testing", "architectures", "statistics", "research"]
+  }
+}

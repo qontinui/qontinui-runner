@@ -1221,6 +1221,44 @@ impl SchedulerService {
             .ok_or_else(|| "Prompt run endpoint omitted session_id".to_string())
     }
 
+    /// Launch a remote agent via the ad-hoc prompts endpoint and return the
+    /// `session_id`. Same non-blocking semantics as `launch_prompt`.
+    async fn launch_remote_agent(&self, prompt: &str) -> Result<String, String> {
+        info!(
+            "Launching remote agent with prompt ({} chars)",
+            prompt.len()
+        );
+
+        let client = reqwest::Client::new();
+        let base_url = self.self_base_url();
+
+        let response = client
+            .post(format!("{}/prompts/run", base_url))
+            .json(&serde_json::json!({
+                "name": "Scheduled Remote Agent",
+                "content": prompt
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to launch remote agent: {}", e))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to launch remote agent: {}", error_text));
+        }
+
+        let response_json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        response_json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| "Remote agent run endpoint omitted session_id".to_string())
+    }
+
     /// Launch an auto-fix run via the ad-hoc prompts endpoint and return the
     /// `session_id`. Same non-blocking semantics as `launch_prompt`.
     async fn launch_auto_fix(

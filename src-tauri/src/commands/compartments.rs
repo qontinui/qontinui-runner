@@ -117,9 +117,7 @@ impl ExecutionCompartment {
         &self.0.run_cost_trackers
     }
 
-    pub fn orchestration_loops(
-        &self,
-    ) -> &crate::orchestration_loop::loop_engine::SharedLoopStates {
+    pub fn orchestration_loops(&self) -> &crate::orchestration_loop::loop_engine::SharedLoopStates {
         &self.0.orchestration_loops
     }
 
@@ -234,9 +232,7 @@ impl IntegrationCompartment {
 pub struct HealthCompartment(pub(crate) Arc<AppState>);
 
 impl HealthCompartment {
-    pub fn doctor_handle(
-        &self,
-    ) -> &tokio::sync::Mutex<Option<crate::doctor::DoctorHandle>> {
+    pub fn doctor_handle(&self) -> &tokio::sync::Mutex<Option<crate::doctor::DoctorHandle>> {
         &self.0.doctor_handle
     }
 
@@ -287,9 +283,7 @@ impl StorageCompartment {
         &self.0.video_recorder
     }
 
-    pub fn display_processor(
-        &self,
-    ) -> &Arc<tokio::sync::Mutex<crate::display::DisplayProcessor>> {
+    pub fn display_processor(&self) -> &Arc<tokio::sync::Mutex<crate::display::DisplayProcessor>> {
         &self.0.display_processor
     }
 

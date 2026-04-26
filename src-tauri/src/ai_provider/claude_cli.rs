@@ -35,6 +35,9 @@ pub(super) fn run_claude_cli(
     let effective_dir = get_effective_config_dir(settings);
     let config_dir = effective_dir.as_deref();
 
+    // Silently refresh OAuth credentials if expired before spawning the subprocess.
+    super::oauth_refresh::try_ensure_valid_credentials(config_dir);
+
     info!(
         "Running Claude CLI (mode: {:?}, program: {}, config_dir: {:?}, model_override: {:?}, prompt_len: {})",
         effective_mode, claude_program, config_dir, model_override, prompt.len()

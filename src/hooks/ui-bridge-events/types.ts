@@ -218,7 +218,9 @@ export type UIBridgeRequestType =
   // Non-consuming stub verification (N3)
   | "verify_network_stub"
   // Toast ring buffer (GET /control/toasts)
-  | "get_toast_buffer";
+  | "get_toast_buffer"
+  // Spec execution (POST /control/spec/{id}/run)
+  | "run_spec";
 
 // ============================================================
 // N1 — Compile-time exhaustiveness registry for the chained
@@ -360,7 +362,8 @@ export type DebugInspectEventTypes =
   | "get_element_tree"
   | "get_element_dom_tree"
   | "highlight_element"
-  | "get_toast_buffer";
+  | "get_toast_buffer"
+  | "run_spec";
 
 export type NetworkIdleEventTypes =
   | "get_network_requests"

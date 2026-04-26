@@ -39,7 +39,9 @@ pub async fn ui_bridge_get_bookmark_handler(
     Path(name): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Get bookmark '{}'", name);
-    wrap_ipc_result(ui_bridge_request_sync(&state, "get_bookmark", serde_json::json!({"name": name})).await)
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "get_bookmark", serde_json::json!({"name": name})).await,
+    )
 }
 
 /// Delete a bookmark by name.

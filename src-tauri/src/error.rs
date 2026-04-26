@@ -385,8 +385,7 @@ impl AppError {
 
             AppError::AuthError(msg) => UserFacingError {
                 title: "Authentication Error".to_string(),
-                message: "You are not signed in or your session has expired."
-                    .to_string(),
+                message: "You are not signed in or your session has expired.".to_string(),
                 details: Some(msg.clone()),
                 error_code: "AUTH_001".to_string(),
                 severity: ErrorSeverity::Warning,

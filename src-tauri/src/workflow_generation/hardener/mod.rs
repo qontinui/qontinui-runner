@@ -1890,6 +1890,7 @@ mod tests {
             htn_enabled: false,
             htn_state_machine_path: None,
             htn_ui_bridge_url: None,
+            auto_commit_subagents: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
         }

@@ -123,7 +123,8 @@ pub async fn get_meta_optimizer_progress(
 ) -> Result<serde_json::Value, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
     let summary =
-        crate::meta_optimizer::snapshots::get_progress_summary_async(app_state.pg_db(), cat).await?;
+        crate::meta_optimizer::snapshots::get_progress_summary_async(app_state.pg_db(), cat)
+            .await?;
     serde_json::to_value(summary).map_err(|e: serde_json::Error| String::from(AppError::from(e)))
 }
 
@@ -193,8 +194,8 @@ pub async fn get_recommendation_outcomes(
 
     let mut results = Vec::new();
     for rec in recs {
-        let mut val =
-            serde_json::to_value(&rec).map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
+        let mut val = serde_json::to_value(&rec)
+            .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
         if let Some(outcome_str) = &rec.outcome_after_apply {
             if let Ok(outcome) = serde_json::from_str::<serde_json::Value>(outcome_str) {
                 val["outcome_parsed"] = outcome;
@@ -344,10 +345,10 @@ pub async fn get_prompt_canary_status(
         .ok_or_else(|| format!("Prompt template canary not found: {}", canary_id))?;
     let evaluation = crate::meta_optimizer::canary::evaluate_prompt_canary(&canary);
 
-    let mut val =
-        serde_json::to_value(&canary).map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
-    val["evaluation"] =
-        serde_json::to_value(&evaluation).map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
+    let mut val = serde_json::to_value(&canary)
+        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
+    val["evaluation"] = serde_json::to_value(&evaluation)
+        .map_err(|e: serde_json::Error| String::from(AppError::from(e)))?;
     Ok(val)
 }
 
@@ -600,7 +601,8 @@ pub async fn refresh_model_profiles(
     app_state: State<'_, StorageCompartment>,
     days: Option<i64>,
 ) -> Result<Vec<crate::routing::model_profiles::ModelProfile>, String> {
-    crate::routing::model_profiles::refresh_all_profiles(app_state.pg_db(), days.unwrap_or(30)).await
+    crate::routing::model_profiles::refresh_all_profiles(app_state.pg_db(), days.unwrap_or(30))
+        .await
 }
 
 #[tauri::command]

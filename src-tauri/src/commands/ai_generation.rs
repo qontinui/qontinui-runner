@@ -118,7 +118,12 @@ pub async fn generate_context_with_ai(
         }
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking error: {}",
+            e
+        )))
+    })?;
 
     result
 }
@@ -211,7 +216,12 @@ pub async fn generate_api_request_with_ai(
         }
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking error: {}",
+            e
+        )))
+    })?;
 
     result
 }
@@ -305,7 +315,12 @@ pub async fn generate_task_prompt_with_ai(
         }
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking error: {}",
+            e
+        )))
+    })?;
 
     result
 }
@@ -420,7 +435,12 @@ pub async fn suggest_exploration_strategy_with_ai(
         }
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking error: {}",
+            e
+        )))
+    })?;
 
     result
 }
@@ -553,7 +573,12 @@ pub async fn generate_test_and_agentic_step(
         }
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking error: {}",
+            e
+        )))
+    })?;
 
     result
 }
@@ -668,7 +693,12 @@ pub async fn explore_flow_step(
         }
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("spawn_blocking error: {}", e))))?;
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "spawn_blocking error: {}",
+            e
+        )))
+    })?;
 
     result
 }
@@ -775,8 +805,7 @@ pub async fn generate_element_ai_description(
             success: true,
             message: Some("AI description generated successfully".to_string()),
             data: Some(
-                serde_json::to_value(&description)
-                    .map_err(|e| String::from(AppError::from(e)))?,
+                serde_json::to_value(&description).map_err(|e| String::from(AppError::from(e)))?,
             ),
         }),
         Err(e) => {

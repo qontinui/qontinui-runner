@@ -375,6 +375,7 @@ pub fn build_meta_workflow_template(
         htn_enabled: false,
         htn_ui_bridge_url: None,
         htn_state_machine_path: None,
+        auto_commit_subagents: None,
         created_at: now.clone(),
         updated_at: now,
     }
@@ -517,10 +518,7 @@ Return ONLY valid JSON matching this structure. No markdown code blocks, no expl
 ///
 /// Keeping the rules in one place ensures both paths stay in sync when the
 /// control endpoint reference evolves.
-pub fn build_spec_brief_recognition_prompt(
-    runner_api_port: u16,
-    wrapper_manifest: &str,
-) -> String {
+pub fn build_spec_brief_recognition_prompt(runner_api_port: u16, wrapper_manifest: &str) -> String {
     let mut s = format!(
         r#"
 ## Spec Generation Brief Recognition

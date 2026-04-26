@@ -273,9 +273,12 @@ pub(crate) async fn promote_session_inner(
     // 3. Take ownership of the session out of the manager. promote_to_worktree
     //    needs &mut self, but the manager hands out Arc<ClaudeSession>. Removing
     //    + try_unwrap is the only safe way to obtain exclusive ownership.
-    let session_arc = session_manager
-        .remove(session_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No active session found for session_id: {}", session_id)))?;
+    let session_arc = session_manager.remove(session_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("No active session found for session_id: {}", session_id),
+        )
+    })?;
 
     // Already-promoted check: cheap, no need to unwrap the Arc to discover this.
     if let Some(existing) = session_arc.worktree() {

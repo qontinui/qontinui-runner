@@ -423,6 +423,9 @@ export function buildPageSpecPrompt(
   if (existingSpec) {
     parts.push("You are UPDATING an existing page spec. Follow these merge rules:\n");
     parts.push(SPEC_MERGE_INSTRUCTIONS);
+    parts.push(
+      "\n**IMPORTANT:** If the existing spec has a `testing` field, preserve it exactly as-is in the output. Do not modify existing testing configs. Only add new group entries under `testing.groups` for groups newly added in this update. Do not add a `testing` section if one is not already present.\n",
+    );
     parts.push(`\n## Existing Spec\n\n\`\`\`json\n${existingSpec}\n\`\`\`\n`);
   }
 

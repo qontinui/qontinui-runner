@@ -108,10 +108,7 @@ pub async fn sm_list_baselines(
     target_scope: Option<String>,
     storage: State<'_, StorageCompartment>,
 ) -> Result<Vec<BaselineMeta>, String> {
-    storage
-        .pg_db()
-        .baseline_list(target_scope.as_deref())
-        .await
+    storage.pg_db().baseline_list(target_scope.as_deref()).await
 }
 
 /// Delete a baseline by ID.

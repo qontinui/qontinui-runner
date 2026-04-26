@@ -217,7 +217,10 @@ pub async fn sync_general_logs(
 ) -> Result<CommandResponse, String> {
     let mut store = state.write().await;
     store.general_logs = logs;
-    info!("Synced {} general logs from frontend", store.general_logs.len());
+    info!(
+        "Synced {} general logs from frontend",
+        store.general_logs.len()
+    );
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Synced {} general logs", store.general_logs.len())),
@@ -249,7 +252,10 @@ pub async fn sync_action_logs(
 ) -> Result<CommandResponse, String> {
     let mut store = state.write().await;
     store.action_logs = logs;
-    info!("Synced {} action logs from frontend", store.action_logs.len());
+    info!(
+        "Synced {} action logs from frontend",
+        store.action_logs.len()
+    );
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Synced {} action logs", store.action_logs.len())),
@@ -265,10 +271,16 @@ pub async fn sync_ai_output_logs(
 ) -> Result<CommandResponse, String> {
     let mut store = state.write().await;
     store.ai_output_logs = logs;
-    info!("Synced {} AI output logs from frontend", store.ai_output_logs.len());
+    info!(
+        "Synced {} AI output logs from frontend",
+        store.ai_output_logs.len()
+    );
     Ok(CommandResponse {
         success: true,
-        message: Some(format!("Synced {} AI output logs", store.ai_output_logs.len())),
+        message: Some(format!(
+            "Synced {} AI output logs",
+            store.ai_output_logs.len()
+        )),
         data: None,
     })
 }
@@ -313,10 +325,16 @@ pub async fn sync_project_logs(
 ) -> Result<CommandResponse, String> {
     let mut store = state.write().await;
     store.project_logs = logs;
-    info!("Synced {} project log sources from frontend", store.project_logs.len());
+    info!(
+        "Synced {} project log sources from frontend",
+        store.project_logs.len()
+    );
     Ok(CommandResponse {
         success: true,
-        message: Some(format!("Synced {} project log sources", store.project_logs.len())),
+        message: Some(format!(
+            "Synced {} project log sources",
+            store.project_logs.len()
+        )),
         data: None,
     })
 }

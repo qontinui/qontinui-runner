@@ -350,9 +350,10 @@ async fn a11y_query_impl(
 ) -> Result<serde_json::Value, AppError> {
     let mgr = state.lock().await;
 
-    let snapshot = mgr.snapshot().await.ok_or_else(|| {
-        AppError::StateError("No accessibility tree captured yet".to_string())
-    })?;
+    let snapshot = mgr
+        .snapshot()
+        .await
+        .ok_or_else(|| AppError::StateError("No accessibility tree captured yet".to_string()))?;
 
     let mut builder = mgr.query();
 

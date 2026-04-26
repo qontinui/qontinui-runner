@@ -109,10 +109,7 @@ impl CredentialStore {
     /// Quick existence probe. Defined separately so HTTP `list` callers
     /// don't have to interpret a `Some(...)` they aren't allowed to read.
     pub fn has(wrapper_id: &str, name: &str) -> bool {
-        match Self::get(wrapper_id, name) {
-            Ok(Some(_)) => true,
-            _ => false,
-        }
+        matches!(Self::get(wrapper_id, name), Ok(Some(_)))
     }
 
     /// Remove a credential. No-op if it doesn't exist.

@@ -141,9 +141,7 @@ pub fn get_local_storage_usage(
     get_local_storage_usage_impl(&state).map_err(String::from)
 }
 
-fn get_local_storage_usage_impl(
-    state: &StorageCompartment,
-) -> Result<CommandResponse, AppError> {
+fn get_local_storage_usage_impl(state: &StorageCompartment) -> Result<CommandResponse, AppError> {
     info!("Getting local storage usage");
 
     let storage =

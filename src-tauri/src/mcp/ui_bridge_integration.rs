@@ -238,8 +238,8 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                     // ExpoRouter must be checked BEFORE React (Expo projects always
                     // ship `react` as a transitive dep, which would otherwise win).
                     let has_expo = deps.get("expo").is_some() || dev_deps.get("expo").is_some();
-                    let has_expo_router = deps.get("expo-router").is_some()
-                        || dev_deps.get("expo-router").is_some();
+                    let has_expo_router =
+                        deps.get("expo-router").is_some() || dev_deps.get("expo-router").is_some();
                     if deps.get("next").is_some() || dev_deps.get("next").is_some() {
                         framework = Framework::NextJs;
                     } else if has_expo && has_expo_router {
@@ -345,8 +345,7 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
     // Detect Rust/Axum server framework from Cargo.toml (check project dir and parent).
     // Skip for React Native frameworks — RN apps host the UI Bridge HTTP server
     // in-process via `serverAdapter`, not via a sibling Rust backend.
-    let is_rn_framework =
-        framework == Framework::ExpoRouter || framework == Framework::ReactNative;
+    let is_rn_framework = framework == Framework::ExpoRouter || framework == Framework::ReactNative;
     if server_framework == ServerFramework::None && !is_rn_framework {
         for cargo_dir in &[project_path.clone(), project_path.join("..").to_path_buf()] {
             let cargo_path = cargo_dir.join("Cargo.toml");
@@ -447,11 +446,7 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
         Framework::ExpoRouter => {
             // Root layout: app/_layout.tsx (or .ts / .jsx). Take the first one
             // that exists — Expo only honors a single layout per directory.
-            for path_str in &[
-                "app/_layout.tsx",
-                "app/_layout.ts",
-                "app/_layout.jsx",
-            ] {
+            for path_str in &["app/_layout.tsx", "app/_layout.ts", "app/_layout.jsx"] {
                 if project_path.join(path_str).exists() {
                     entry_points.push(EntryPoint {
                         path: path_str.to_string(),
@@ -826,43 +821,44 @@ async fn integrate_source(
         Framework::ExpoRouter | Framework::ReactNative
     );
     if !skip_server_integration {
-    match analysis.server_framework {
-        ServerFramework::Express => {
-            integrate_express_server(&project, analysis, &mut modifications, &mut warnings).await;
-            next_steps.push(
+        match analysis.server_framework {
+            ServerFramework::Express => {
+                integrate_express_server(&project, analysis, &mut modifications, &mut warnings)
+                    .await;
+                next_steps.push(
                 "Server-side: Express relay router created. Mount it in your server with: app.use('/api/ui-bridge', uiBridgeRouter)"
                     .to_string(),
             );
-        }
-        ServerFramework::Axum => {
-            next_steps.push(
+            }
+            ServerFramework::Axum => {
+                next_steps.push(
                 "Server-side: Axum detected. Add UI Bridge relay endpoints to your Axum server. See qontinui-supervisor/src/routes/supervisor_bridge.rs for a reference Rust implementation with SSE command stream, command response handler, and control endpoints."
                     .to_string(),
             );
-        }
-        ServerFramework::Fastify => {
-            next_steps.push(
+            }
+            ServerFramework::Fastify => {
+                next_steps.push(
                 "Server-side: Fastify detected. Create relay setup with CommandRelay + createRelayHandlers from @qontinui/ui-bridge/server. Register routes manually following the Express adapter pattern."
                     .to_string(),
             );
-        }
-        ServerFramework::None => {
-            // For React (non-Next.js) apps with no server framework detected,
-            // offer the standalone server option.
-            if analysis.framework == Framework::React
-                && analysis.server_framework == ServerFramework::None
-            {
-                integrate_standalone_server(&project, &mut modifications, &mut warnings).await;
-                next_steps.push(
+            }
+            ServerFramework::None => {
+                // For React (non-Next.js) apps with no server framework detected,
+                // offer the standalone server option.
+                if analysis.framework == Framework::React
+                    && analysis.server_framework == ServerFramework::None
+                {
+                    integrate_standalone_server(&project, &mut modifications, &mut warnings).await;
+                    next_steps.push(
                     "Server-side: No server framework detected. Created a standalone UI Bridge server file. Run it with: npx tsx ui-bridge-server.ts"
                         .to_string(),
                 );
+                }
+            }
+            ServerFramework::NextJs => {
+                // Already handled in integrate_nextjs()
             }
         }
-        ServerFramework::NextJs => {
-            // Already handled in integrate_nextjs()
-        }
-    }
     } // end if !skip_server_integration
 
     // Apply file modifications first (so package.json is written before install)
@@ -1145,7 +1141,7 @@ fn derive_expo_app_info(pkg_name: &str) -> (String, String) {
         return (app_id, "Expo App".to_string());
     }
     let display = raw
-        .split(|c: char| c == '-' || c == '_')
+        .split(['-', '_'])
         .map(|seg| {
             let mut chars = seg.chars();
             match chars.next() {
@@ -1164,8 +1160,7 @@ fn derive_expo_app_info(pkg_name: &str) -> (String, String) {
 /// providers, deviceId, cloud relay are left out — they require sibling
 /// deps and runtime decisions the integrator can't make.
 fn wrap_with_provider_expo_router(content: &str, app_id: &str, app_name: &str) -> String {
-    let import_line =
-        "import { UIBridgeNativeProvider } from '@qontinui/ui-bridge-native';\n";
+    let import_line = "import { UIBridgeNativeProvider } from '@qontinui/ui-bridge-native';\n";
     let insert_pos = find_last_import_pos(content);
 
     let mut result = String::new();
@@ -1232,8 +1227,8 @@ fn wrap_self_closing_root(
     let close_search_from = pos + needle_open.len();
     let close_rel = content[close_search_from..].find("/>")?;
     let close_abs = close_search_from + close_rel + 2; // after `/>`
-    // Bail if there's a `>` (non-self-closing) before the `/>` — it's a
-    // paired tag, not self-closing.
+                                                       // Bail if there's a `>` (non-self-closing) before the `/>` — it's a
+                                                       // paired tag, not self-closing.
     if let Some(gt_rel) = content[close_search_from..close_abs - 2].find('>') {
         if gt_rel < close_rel {
             return None;
@@ -1282,7 +1277,11 @@ async fn integrate_expo_router(
         Ok(c) => {
             let pkg_name = serde_json::from_str::<serde_json::Value>(&c)
                 .ok()
-                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .and_then(|v| {
+                    v.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_default();
             derive_expo_app_info(&pkg_name)
         }
@@ -3687,10 +3686,7 @@ mod expo_router_tests {
             derive_expo_router_route("app/(tabs)/settings.tsx"),
             "/settings"
         );
-        assert_eq!(
-            derive_expo_router_route("app/(auth)/login.tsx"),
-            "/login"
-        );
+        assert_eq!(derive_expo_router_route("app/(auth)/login.tsx"), "/login");
         assert_eq!(
             derive_expo_router_route("app/(tabs)/(nested)/foo.tsx"),
             "/foo"
@@ -3707,8 +3703,14 @@ mod expo_router_tests {
 
     #[test]
     fn derive_component_name_basic() {
-        assert_eq!(derive_expo_router_component_name("app/prompts.tsx"), "PromptsPage");
-        assert_eq!(derive_expo_router_component_name("app/index.tsx"), "IndexPage");
+        assert_eq!(
+            derive_expo_router_component_name("app/prompts.tsx"),
+            "PromptsPage"
+        );
+        assert_eq!(
+            derive_expo_router_component_name("app/index.tsx"),
+            "IndexPage"
+        );
         assert_eq!(
             derive_expo_router_component_name("app/state-explorer.tsx"),
             "StateExplorerPage"
@@ -3850,7 +3852,11 @@ mod expo_router_tests {
             "expected zero modifications on already-integrated fast path, got {:?}",
             modifications
         );
-        assert!(warnings.is_empty(), "expected no warnings, got {:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {:?}",
+            warnings
+        );
         assert_eq!(next_steps.len(), 1, "expected single next_step");
         assert!(next_steps[0].contains("already integrated"));
     }
@@ -3915,7 +3921,9 @@ mod expo_router_tests {
         );
         // appId derived from package.json name.
         assert!(
-            layout_mod.new_content.contains("appId: 'expo-router-blank'"),
+            layout_mod
+                .new_content
+                .contains("appId: 'expo-router-blank'"),
             "appId should be derived from package name; layout was:\n{}",
             layout_mod.new_content
         );

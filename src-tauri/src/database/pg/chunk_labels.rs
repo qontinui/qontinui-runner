@@ -74,11 +74,7 @@ impl PgDb {
     }
 
     /// Delete a chunk label (revert to auto-derived name).
-    pub async fn delete_chunk_label(
-        &self,
-        config_id: &str,
-        chunk_id: &str,
-    ) -> Result<(), String> {
+    pub async fn delete_chunk_label(&self, config_id: &str, chunk_id: &str) -> Result<(), String> {
         let conn = self
             .pool()
             .get()

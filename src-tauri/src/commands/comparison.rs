@@ -86,9 +86,7 @@ pub async fn start_comparison(
 
     // Launch runs via local HTTP API in background
     let pg_db_for_spawn = storage.pg_db().clone();
-    let api_port = health
-        .api_port()
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let api_port = health.api_port().load(std::sync::atomic::Ordering::Relaxed);
     let comp_id = comparison_id.clone();
 
     tokio::spawn(async move {

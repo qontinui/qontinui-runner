@@ -764,12 +764,7 @@ async fn register_app(
 
     state
         .app_registry
-        .upsert(
-            app.clone(),
-            req.origin,
-            transport,
-            req.websocket_conn_id,
-        )
+        .upsert(app.clone(), req.origin, transport, req.websocket_conn_id)
         .await;
 
     debug!(

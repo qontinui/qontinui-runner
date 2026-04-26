@@ -483,10 +483,7 @@ pub async fn ui_bridge_wait_for_route_change_handler(
         .unwrap_or(5000);
     let timeout_ms = raw_timeout.clamp(100, 60_000);
     if let serde_json::Value::Object(ref mut map) = body {
-        map.insert(
-            "timeoutMs".to_string(),
-            serde_json::Value::from(timeout_ms),
-        );
+        map.insert("timeoutMs".to_string(), serde_json::Value::from(timeout_ms));
     }
 
     info!(

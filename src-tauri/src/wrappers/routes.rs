@@ -45,17 +45,12 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 fn require_wrapper_state(
     state: &Arc<ApiState>,
 ) -> Result<Arc<WrapperState>, (StatusCode, Json<ApiResponse<()>>)> {
-    state
-        .app_state
-        .wrapper_state
-        .get()
-        .cloned()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(api_error("wrappers subsystem is not initialized")),
-            )
-        })
+    state.app_state.wrapper_state.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error("wrappers subsystem is not initialized")),
+        )
+    })
 }
 
 pub fn router() -> Router<Arc<ApiState>> {
@@ -64,10 +59,7 @@ pub fn router() -> Router<Arc<ApiState>> {
         .route("/wrappers", get(list_wrappers))
         // GET + DELETE share `/wrappers/{id}` — chain on a single MethodRouter
         // to satisfy axum 0.8's "one MethodRouter per path" rule.
-        .route(
-            "/wrappers/{id}",
-            get(get_wrapper).delete(uninstall_wrapper),
-        )
+        .route("/wrappers/{id}", get(get_wrapper).delete(uninstall_wrapper))
         // Install pipeline
         .route("/wrappers/install", post(install_wrapper))
         .route("/wrappers/{id}/update", post(update_wrapper))

@@ -72,7 +72,12 @@ fn build_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|e| String::from(AppError::NetworkError(format!("failed to build HTTP client: {}", e))))
+        .map_err(|e| {
+            String::from(AppError::NetworkError(format!(
+                "failed to build HTTP client: {}",
+                e
+            )))
+        })
 }
 
 fn trim_backend_url(url: &str) -> String {
@@ -571,9 +576,7 @@ pub async fn start_web_token_flow<R: Runtime>(
         // where this command fires before the HTTP server has recorded its
         // port. The callback route lives on the same axum router, so once
         // that router is up the port matches.
-        let bound = health
-            .api_port()
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let bound = health.api_port().load(std::sync::atomic::Ordering::Relaxed);
         if bound > 0 {
             bound
         } else {

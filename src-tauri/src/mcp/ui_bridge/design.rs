@@ -241,8 +241,7 @@ mod design_audit_envelope_tests {
         // Defensive: success:false but no error field shouldn't drop the
         // failure signal — we still return HTTP 400 with a generic message.
         let data = serde_json::json!({"success": false});
-        let (status, body) =
-            wrap_ipc_result(Ok(data)).expect_err("must still flag failure as 400");
+        let (status, body) = wrap_ipc_result(Ok(data)).expect_err("must still flag failure as 400");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let msg = body.deref().error.as_deref().unwrap_or_default();
         assert_eq!(msg, "UI bridge call failed");

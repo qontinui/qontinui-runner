@@ -33,9 +33,7 @@ pub async fn get_watcher(
 
 /// List all watchers.
 #[tauri::command]
-pub async fn list_watchers(
-    storage: State<'_, StorageCompartment>,
-) -> Result<Vec<Watcher>, String> {
+pub async fn list_watchers(storage: State<'_, StorageCompartment>) -> Result<Vec<Watcher>, String> {
     storage.pg_db().list_watchers().await
 }
 

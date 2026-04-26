@@ -147,8 +147,12 @@ pub fn save_self_healing_api_key(
 ) -> Result<CommandResponse, String> {
     info!("Saving self-healing API key for provider: {}", provider);
 
-    store_self_healing_api_key(&provider, &api_key)
-        .map_err(|e| String::from(AppError::ConfigError(format!("Failed to save API key: {}", e))))?;
+    store_self_healing_api_key(&provider, &api_key).map_err(|e| {
+        String::from(AppError::ConfigError(format!(
+            "Failed to save API key: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,

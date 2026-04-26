@@ -181,14 +181,18 @@ impl ClaudeSession {
 
         // Set CLAUDE_CONFIG_DIR to the resolved account (for multi-account support)
         let ai_settings = crate::settings::get_ai_settings();
-        if let Some(config_dir) =
-            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli)
-        {
+        let effective_config_dir =
+            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+        // Silently refresh OAuth credentials if expired before spawning the subprocess.
+        crate::ai_provider::oauth_refresh::try_ensure_valid_credentials(
+            effective_config_dir.as_deref(),
+        );
+        if let Some(ref config_dir) = effective_config_dir {
             info!(
                 "Setting CLAUDE_CONFIG_DIR={} for session {}",
                 config_dir, session_id
             );
-            cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
+            cmd.env("CLAUDE_CONFIG_DIR", config_dir.as_str());
         }
 
         let mut child = cmd
@@ -374,8 +378,7 @@ impl ClaudeSession {
         let persisted_len_for_stdout = persisted_output_len.clone();
         // Worktree ID for file-registry scoping (None for unpromoted sessions).
         // Cloned here so the stdout reader thread can move its own copy.
-        let worktree_id_for_stdout: Option<String> =
-            worktree.as_ref().map(|w| w.id.clone());
+        let worktree_id_for_stdout: Option<String> = worktree.as_ref().map(|w| w.id.clone());
         // Fallback session ID for file locking when session_ctx is None (terminal sessions)
         let fallback_id_for_stdout = if session_ctx.is_none() {
             Some(session_id.to_string())
@@ -1228,7 +1231,10 @@ impl ClaudeSession {
             tauri::async_runtime::block_on(pg.get_task_output(task_run_id)).unwrap_or_default();
 
         if output_log.is_empty() {
-            info!("No conversation history to replay for session {}", session_id);
+            info!(
+                "No conversation history to replay for session {}",
+                session_id
+            );
             return Ok(None);
         }
 
@@ -1335,16 +1341,17 @@ impl ClaudeSession {
         };
 
         // 5. Read prior conversation so the new CLI can replay it.
-        let replay_prompt = match Self::build_replay_from_history(&self.session_id, session_ctx.as_ref()) {
-            Ok(prompt) => prompt,
-            Err(BuildReplayErr::NoPg) => {
-                warn!(
-                    "promote_to_worktree: no PG; respawning without replay context for {}",
-                    self.session_id
-                );
-                None
-            }
-        };
+        let replay_prompt =
+            match Self::build_replay_from_history(&self.session_id, session_ctx.as_ref()) {
+                Ok(prompt) => prompt,
+                Err(BuildReplayErr::NoPg) => {
+                    warn!(
+                        "promote_to_worktree: no PG; respawning without replay context for {}",
+                        self.session_id
+                    );
+                    None
+                }
+            };
 
         // 6. Kill the existing CLI. cwd is immutable; this is the only way to
         //    move the process into the worktree.

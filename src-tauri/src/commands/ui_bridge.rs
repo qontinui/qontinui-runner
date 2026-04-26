@@ -488,9 +488,7 @@ pub async fn ui_bridge_run_exploration(
 
     let bridge_compartment = state.inner().clone();
     let self_url = {
-        let port = health
-            .api_port()
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let port = health.api_port().load(std::sync::atomic::Ordering::Relaxed);
         format!("http://localhost:{}", port)
     };
 
@@ -646,9 +644,8 @@ pub async fn ui_bridge_run_exploration_native(
 
     let result = result?;
 
-    let result_json = serde_json::to_value(&result).map_err(|e| {
-        String::from(AppError::JsonError(e))
-    })?;
+    let result_json =
+        serde_json::to_value(&result).map_err(|e| String::from(AppError::JsonError(e)))?;
 
     Ok(CommandResponse {
         success: true,

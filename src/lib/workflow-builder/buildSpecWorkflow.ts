@@ -109,6 +109,7 @@ export interface SpecConfig {
   /** Optional state machine section — when present, buildSpecBrief will map
    *  group preconditions to state IDs for one-step navigation. */
   stateMachine?: SpecStateMachineShape;
+  testing?: unknown;
 }
 
 export interface BuildSpecWorkflowInput {

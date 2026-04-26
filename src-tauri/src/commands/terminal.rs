@@ -194,7 +194,12 @@ pub fn terminal_save_scrollback(
     let scrollback_dir = app_handle
         .path()
         .app_data_dir()
-        .map_err(|e| String::from(AppError::TauriError(format!("Failed to get app data dir: {}", e))))?
+        .map_err(|e| {
+            String::from(AppError::TauriError(format!(
+                "Failed to get app data dir: {}",
+                e
+            )))
+        })?
         .join("terminal-scrollback");
 
     std::fs::create_dir_all(&scrollback_dir).map_err(|e| {
@@ -273,7 +278,12 @@ pub fn terminal_cleanup_scrollback(
     let scrollback_dir = app_handle
         .path()
         .app_data_dir()
-        .map_err(|e| String::from(AppError::TauriError(format!("Failed to get app data dir: {}", e))))?
+        .map_err(|e| {
+            String::from(AppError::TauriError(format!(
+                "Failed to get app data dir: {}",
+                e
+            )))
+        })?
         .join("terminal-scrollback");
 
     if !scrollback_dir.exists() {

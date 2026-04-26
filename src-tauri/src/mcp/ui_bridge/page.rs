@@ -833,8 +833,7 @@ mod static_guard_hint_tests {
 
     #[test]
     fn fetch_rejection_emits_targeted_hint() {
-        let msg =
-            "Expression rejected: contains prohibited pattern (\\bfetch\\s*\\()";
+        let msg = "Expression rejected: contains prohibited pattern (\\bfetch\\s*\\()";
         let hint = static_guard_hint(msg).expect("fetch rejection must produce a hint");
         assert!(
             hint.contains("window['fet'+'ch']"),
@@ -848,8 +847,7 @@ mod static_guard_hint_tests {
 
     #[test]
     fn other_rejections_emit_generic_hint() {
-        let msg =
-            "Expression rejected: contains prohibited pattern (\\beval\\s*\\()";
+        let msg = "Expression rejected: contains prohibited pattern (\\beval\\s*\\()";
         let hint = static_guard_hint(msg).expect("eval rejection must produce a hint");
         assert!(
             hint.contains("Static-guard match"),
@@ -1448,18 +1446,14 @@ mod page_navigate_mode_tests {
 
     #[test]
     fn unknown_mode_is_rejected() {
-        assert_eq!(
-            normalize_navigate_mode(Some("spa")),
-            Err("spa".to_string())
-        );
+        assert_eq!(normalize_navigate_mode(Some("spa")), Err("spa".to_string()));
         assert_eq!(normalize_navigate_mode(Some("")), Err("".to_string()));
     }
 
     #[test]
     fn request_without_mode_deserializes_to_none() {
         // Back-compat: legacy callers pass only { "url": "..." }.
-        let req: PageNavigateRequest =
-            serde_json::from_str(r#"{"url": "/fleet"}"#).expect("parse");
+        let req: PageNavigateRequest = serde_json::from_str(r#"{"url": "/fleet"}"#).expect("parse");
         assert_eq!(req.mode, None);
     }
 

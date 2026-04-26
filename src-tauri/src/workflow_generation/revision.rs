@@ -863,6 +863,7 @@ mod tests {
             htn_enabled: false,
             htn_state_machine_path: None,
             htn_ui_bridge_url: None,
+            auto_commit_subagents: None,
             created_at: String::new(),
             updated_at: String::new(),
         }

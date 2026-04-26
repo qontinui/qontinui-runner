@@ -71,9 +71,7 @@ fn start_video_recording_impl(
 /// * `Ok(CommandResponse)` - Success with saved video path
 /// * `Err(String)` - Error if recording fails to stop
 #[tauri::command]
-pub fn stop_video_recording(
-    state: State<StorageCompartment>,
-) -> Result<CommandResponse, String> {
+pub fn stop_video_recording(state: State<StorageCompartment>) -> Result<CommandResponse, String> {
     stop_video_recording_impl(&state).map_err(String::from)
 }
 

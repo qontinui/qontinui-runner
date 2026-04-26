@@ -1687,7 +1687,11 @@ pub async fn get_workflow_run_context(
     task_run_id: String,
     state: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    match state.pg_db().get_workflow_run_context_pg(&task_run_id).await {
+    match state
+        .pg_db()
+        .get_workflow_run_context_pg(&task_run_id)
+        .await
+    {
         Ok(Some(context)) => Ok(CommandResponse {
             success: true,
             message: None,

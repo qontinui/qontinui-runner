@@ -531,7 +531,9 @@ async fn create_execution_run_impl(
     // Check authentication
     if !auth_manager.has_tokens() {
         warn!("Cannot create execution run: not authenticated");
-        return Err(AppError::Raw("Not authenticated. Please log in.".to_string()));
+        return Err(AppError::Raw(
+            "Not authenticated. Please log in.".to_string(),
+        ));
     }
 
     // Get access token
@@ -732,8 +734,8 @@ async fn upload_execution_screenshot_impl(
         .file_name("screenshot")
         .mime_str(content_type)?;
 
-    let metadata_part = reqwest::multipart::Part::text(metadata_json)
-        .mime_str("application/json")?;
+    let metadata_part =
+        reqwest::multipart::Part::text(metadata_json).mime_str("application/json")?;
 
     let form = reqwest::multipart::Form::new()
         .part("image", image_part)

@@ -216,7 +216,9 @@ async fn run_adb_command(args: &[&str]) -> Result<String, String> {
 pub async fn list_mobile_devices(
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    list_mobile_devices_impl(storage).await.map_err(String::from)
+    list_mobile_devices_impl(storage)
+        .await
+        .map_err(String::from)
 }
 
 async fn list_mobile_devices_impl(
@@ -420,9 +422,16 @@ pub async fn capture_mobile_logcat(
     output_dir: Option<String>,
     storage: State<'_, StorageCompartment>,
 ) -> Result<CommandResponse, String> {
-    capture_mobile_logcat_impl(task_run_id, device_id, lines, filter_app, output_dir, storage)
-        .await
-        .map_err(String::from)
+    capture_mobile_logcat_impl(
+        task_run_id,
+        device_id,
+        lines,
+        filter_app,
+        output_dir,
+        storage,
+    )
+    .await
+    .map_err(String::from)
 }
 
 async fn capture_mobile_logcat_impl(

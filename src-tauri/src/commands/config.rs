@@ -43,14 +43,13 @@ pub async fn load_configuration(
     info!("Loading configuration from: {}", path);
 
     // Load the configuration file
-    let config = ConfigLoader::load_from_file(&path)
-        .map_err(|e| {
-            error!("Failed to load configuration from {}: {}", path, e);
-            String::from(AppError::ConfigError(format!(
-                "Failed to load configuration: {}",
-                e
-            )))
-        })?;
+    let config = ConfigLoader::load_from_file(&path).map_err(|e| {
+        error!("Failed to load configuration from {}: {}", path, e);
+        String::from(AppError::ConfigError(format!(
+            "Failed to load configuration: {}",
+            e
+        )))
+    })?;
 
     let summary = config.summary();
 

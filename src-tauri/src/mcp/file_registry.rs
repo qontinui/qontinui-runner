@@ -124,11 +124,7 @@ async fn unregister_files(
     state
         .app_state
         .file_registry_manager
-        .unregister(
-            &req.file_paths,
-            &req.task_run_id,
-            req.worktree_id.clone(),
-        )
+        .unregister(&req.file_paths, &req.task_run_id, req.worktree_id.clone())
         .await;
 
     Ok(Json(serde_json::json!({ "success": true })))
@@ -168,11 +164,7 @@ async fn check_conflicts(
         state
             .app_state
             .file_registry_manager
-            .check_conflicts_for_files(
-                &req.file_paths,
-                &req.task_run_id,
-                req.worktree_id.clone(),
-            )
+            .check_conflicts_for_files(&req.file_paths, &req.task_run_id, req.worktree_id.clone())
             .await
     };
 

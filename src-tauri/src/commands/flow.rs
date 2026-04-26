@@ -82,7 +82,10 @@ pub async fn list_flows(state: State<'_, StorageCompartment>) -> Result<Vec<Flow
 
 /// Get a flow by ID.
 #[tauri::command]
-pub async fn get_flow(state: State<'_, StorageCompartment>, id: String) -> Result<Option<Flow>, String> {
+pub async fn get_flow(
+    state: State<'_, StorageCompartment>,
+    id: String,
+) -> Result<Option<Flow>, String> {
     let flow_json = state.pg_db().get_flow(&id).await?;
 
     if let Some(f) = flow_json {
@@ -1225,7 +1228,9 @@ pub async fn export_flow_json(
     state: State<'_, StorageCompartment>,
     flow_id: String,
 ) -> Result<String, String> {
-    export_flow_json_impl(state, flow_id).await.map_err(String::from)
+    export_flow_json_impl(state, flow_id)
+        .await
+        .map_err(String::from)
 }
 
 async fn export_flow_json_impl(
@@ -1256,7 +1261,9 @@ pub async fn export_flow_yaml(
     state: State<'_, StorageCompartment>,
     flow_id: String,
 ) -> Result<String, String> {
-    export_flow_yaml_impl(state, flow_id).await.map_err(String::from)
+    export_flow_yaml_impl(state, flow_id)
+        .await
+        .map_err(String::from)
 }
 
 async fn export_flow_yaml_impl(
@@ -1347,16 +1354,15 @@ async fn import_flow_yaml_impl(
     generate_new_id: bool,
 ) -> Result<Flow, AppError> {
     // Try to parse as FlowExport first
-    let flow_value: serde_json::Value = if let Ok(export) =
-        serde_yaml::from_str::<FlowExport>(&content)
-    {
-        export.flow
-    } else {
-        // Fall back to parsing as raw Flow
-        let yaml_value: serde_yaml::Value = serde_yaml::from_str(&content)
-            .map_err(|e| AppError::Raw(format!("Invalid YAML: {}", e)))?;
-        serde_json::to_value(yaml_value)?
-    };
+    let flow_value: serde_json::Value =
+        if let Ok(export) = serde_yaml::from_str::<FlowExport>(&content) {
+            export.flow
+        } else {
+            // Fall back to parsing as raw Flow
+            let yaml_value: serde_yaml::Value = serde_yaml::from_str(&content)
+                .map_err(|e| AppError::Raw(format!("Invalid YAML: {}", e)))?;
+            serde_json::to_value(yaml_value)?
+        };
 
     // Deserialize to Flow to validate structure
     let mut flow: Flow = serde_json::from_value(flow_value)?;
@@ -1383,7 +1389,9 @@ pub async fn export_flows_bulk(
     state: State<'_, StorageCompartment>,
     flow_ids: Vec<String>,
 ) -> Result<String, String> {
-    export_flows_bulk_impl(state, flow_ids).await.map_err(String::from)
+    export_flows_bulk_impl(state, flow_ids)
+        .await
+        .map_err(String::from)
 }
 
 async fn export_flows_bulk_impl(
@@ -1393,7 +1401,12 @@ async fn export_flows_bulk_impl(
     let mut flows = Vec::new();
 
     for flow_id in flow_ids {
-        if let Some(flow_json) = state.pg_db().get_flow(&flow_id).await.map_err(AppError::Raw)? {
+        if let Some(flow_json) = state
+            .pg_db()
+            .get_flow(&flow_id)
+            .await
+            .map_err(AppError::Raw)?
+        {
             flows.push(flow_json);
         }
     }

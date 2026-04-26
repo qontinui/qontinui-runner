@@ -549,7 +549,9 @@ pub async fn get_learning_stats_by_date_range(
 
 /// Get total count of learning outcomes.
 #[tauri::command]
-pub async fn get_learning_outcomes_count(state: State<'_, StorageCompartment>) -> Result<i64, String> {
+pub async fn get_learning_outcomes_count(
+    state: State<'_, StorageCompartment>,
+) -> Result<i64, String> {
     state.pg_db().get_learning_outcomes_count().await
 }
 
@@ -565,7 +567,10 @@ pub async fn get_recent_tasks_with_outcomes(
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(10);
-    state.pg_db().get_recent_task_runs_with_outcomes(limit).await
+    state
+        .pg_db()
+        .get_recent_task_runs_with_outcomes(limit)
+        .await
 }
 
 /// Get the current running task (if any).

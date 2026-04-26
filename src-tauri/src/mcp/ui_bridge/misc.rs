@@ -84,6 +84,33 @@ pub async fn ui_bridge_get_spec_handler(
     )
 }
 
+/// Run all assertions in a spec against the current page snapshot.
+///
+/// Forwards to the frontend SpecExecutor via IPC. Returns a
+/// `SpecExecutionResult` with per-group and per-assertion pass/fail counts.
+/// Accepts an optional `options` body (maps to `SpecExecutionOptions`) to
+/// filter by groupIds, assertionIds, severity, or category.
+pub async fn ui_bridge_run_spec_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<axum::extract::Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Running spec {}", id);
+
+    let options = body
+        .and_then(|b| b.0.get("options").cloned())
+        .unwrap_or(serde_json::Value::Null);
+
+    wrap_ipc_result(
+        ui_bridge_request_sync(
+            &state,
+            "run_spec",
+            serde_json::json!({ "specId": id, "options": options }),
+        )
+        .await,
+    )
+}
+
 // ============================================================================
 // Macro-generated IPC proxies
 // ============================================================================
@@ -131,6 +158,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/control/spec/{id}",
             get(ui_bridge_get_spec_handler),
+        )
+        .route(
+            "/ui-bridge/control/spec/{id}/run",
+            post(ui_bridge_run_spec_handler),
         )
         // Undo/Redo awareness
         .route(
@@ -187,6 +218,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     &[
         ("GET", "/ui-bridge/control/specs"),
         ("GET", "/ui-bridge/control/spec/{id}"),
+        ("POST", "/ui-bridge/control/spec/{id}/run"),
         ("GET", "/ui-bridge/control/undo-state"),
         ("POST", "/ui-bridge/control/undo"),
         ("POST", "/ui-bridge/control/redo"),

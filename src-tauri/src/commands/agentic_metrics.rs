@@ -41,7 +41,9 @@ pub async fn get_composite_score_trend(
 
 /// Manually trigger baseline recomputation.
 #[tauri::command]
-pub async fn recompute_agentic_baselines(state: State<'_, StorageCompartment>) -> Result<u32, String> {
+pub async fn recompute_agentic_baselines(
+    state: State<'_, StorageCompartment>,
+) -> Result<u32, String> {
     state.pg_db().recompute_agentic_baselines().await
 }
 
@@ -75,7 +77,10 @@ pub async fn push_agentic_scores_to_backend(
         task_run_id, target_type, target_id
     );
 
-    let scores = state.pg_db().get_agentic_scores_for_run(&task_run_id).await?;
+    let scores = state
+        .pg_db()
+        .get_agentic_scores_for_run(&task_run_id)
+        .await?;
 
     if scores.is_empty() {
         info!("No agentic scores found for task_run_id={}", task_run_id);

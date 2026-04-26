@@ -12,8 +12,8 @@
 use crate::auth::AuthManager;
 use crate::commands::compartments::StorageCompartment;
 use crate::database::pg::PgDb;
-use crate::error::AppError;
 use crate::database::TaskRun;
+use crate::error::AppError;
 use crate::findings::types::{Finding, FindingStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -818,10 +818,7 @@ impl AITaskSyncService {
             .map_err(String::from)
     }
 
-    async fn sync_task_completed_impl(
-        &self,
-        task: &TaskRun,
-    ) -> Result<AITaskResponse, AppError> {
+    async fn sync_task_completed_impl(&self, task: &TaskRun) -> Result<AITaskResponse, AppError> {
         info!("Syncing task completion: {}", task.id);
 
         let access_token = self.check_auth()?;
