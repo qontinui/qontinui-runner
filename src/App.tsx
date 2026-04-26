@@ -664,7 +664,6 @@ function RunnerTabsEnricher() {
   useEffect(() => {
     const registry = getGlobalRegistry();
     if (!registry) return;
-    // @ts-expect-error registerSnapshotEnricher exists in @qontinui/ui-bridge feat/sdk-tracker-reshape; not yet published
     const dispose = registry.registerSnapshotEnricher("runner-tabs", () => {
       const activeTabId = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
       const availableTabs = TAB_LIST.map((entry) => ({

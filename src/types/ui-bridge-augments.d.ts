@@ -8,14 +8,6 @@
 export {};
 
 // ---------------------------------------------------------------------------
-// @qontinui/ui-bridge/core — add getGlobalRegistry
-// ---------------------------------------------------------------------------
-
-declare module "@qontinui/ui-bridge/core" {
-  export function getGlobalRegistry(): unknown;
-}
-
-// ---------------------------------------------------------------------------
 // ui-bridge/ai — add parseNLAssertion and subscribeChanges on ChangeTrackerDeps
 // ---------------------------------------------------------------------------
 
