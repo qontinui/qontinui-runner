@@ -39,7 +39,7 @@ import type {
 } from "./types";
 
 const REGISTRY_FALLBACK_URL =
-  "https://raw.githubusercontent.com/qontinui/wrappers-registry/main/registry.json";
+  "https://raw.githubusercontent.com/jspinak/wrappers-registry/main/registry.json";
 
 /** Throw if the response isn't OK, surfacing the body for debugging. */
 async function ensureOk(res: Response, ctx: string): Promise<Response> {
