@@ -66,34 +66,34 @@ pub async fn merge_worktree(
         repo_path, branch_name, source_branch
     );
 
-    let result =
-        match worktree::merge_worktree(Path::new(&repo_path), &branch_name, &source_branch) {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(CommandResponse {
-                    success: false,
-                    message: Some(e),
-                    data: None,
-                });
-            }
-        };
+    let result = match worktree::merge_worktree(Path::new(&repo_path), &branch_name, &source_branch)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some(e),
+                data: None,
+            });
+        }
+    };
 
     if let Some(blocked) = result.blocked {
         // Look up owning-sessions if AppState (and PG) is reachable;
         // otherwise return the bare conflicting_files (still surfaces the
         // problem to the user even without attribution).
-        let owning_sessions: Vec<worktree::OwningSession> =
-            match app_handle.try_state::<Arc<AppState>>() {
-                Some(s) => {
-                    let app_state: Arc<AppState> = s.inner().clone();
-                    attribute_files_to_sessions_pg(&app_state.pg_db, &blocked.conflicting_files)
-                        .await
-                }
-                None => {
-                    warn!("merge_worktree: AppState unavailable, skipping session attribution");
-                    Vec::new()
-                }
-            };
+        let owning_sessions: Vec<worktree::OwningSession> = match app_handle
+            .try_state::<Arc<AppState>>()
+        {
+            Some(s) => {
+                let app_state: Arc<AppState> = s.inner().clone();
+                attribute_files_to_sessions_pg(&app_state.pg_db, &blocked.conflicting_files).await
+            }
+            None => {
+                warn!("merge_worktree: AppState unavailable, skipping session attribution");
+                Vec::new()
+            }
+        };
 
         warn!(
             "TAURI merge_worktree: blocked — {} files dirty, {} owning sessions",
@@ -153,20 +153,17 @@ pub async fn merge_worktree_force(
         repo_path, branch_name, source_branch
     );
 
-    let result = match worktree::merge_worktree_force(
-        Path::new(&repo_path),
-        &branch_name,
-        &source_branch,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(CommandResponse {
-                success: false,
-                message: Some(e),
-                data: None,
-            });
-        }
-    };
+    let result =
+        match worktree::merge_worktree_force(Path::new(&repo_path), &branch_name, &source_branch) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(CommandResponse {
+                    success: false,
+                    message: Some(e),
+                    data: None,
+                });
+            }
+        };
 
     let stash_note = result.stash_ref.as_ref().map(|s| {
         format!(

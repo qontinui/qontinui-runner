@@ -394,10 +394,9 @@ async fn attribute_files_to_sessions(
     let mut attributed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (file_path, task_run_id) in pairs {
-        let idx = *session_index.entry(task_run_id.clone()).or_insert_with(|| {
-            let next = by_session.len();
-            next
-        });
+        let idx = *session_index
+            .entry(task_run_id.clone())
+            .or_insert_with(|| by_session.len());
         let entry = by_session
             .entry(idx)
             .or_insert_with(|| (task_run_id.clone(), Vec::new()));

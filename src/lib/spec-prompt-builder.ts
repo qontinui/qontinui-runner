@@ -494,12 +494,27 @@ Key points about domain logic groups:
 
 **Output the spec as a single JSON code block** wrapped in \`\`\`json ... \`\`\` fences.
 
-**IMPORTANT: Write spec groups incrementally.** As you explore each area of the codebase, immediately write the corresponding spec group(s). Do NOT accumulate all exploration notes and write the entire spec at the end — this risks context overflow on complex pages.
-
 **Recommended workflow:**
-1. Read the page component → immediately output progress notes about page structure
-2. For each major section/feature: read the code → output progress notes → mentally compose the group
+1. Read the page component → output progress notes about page structure
+2. For each major section/feature: read the code → output progress notes
 3. After exploring the full page, output the complete JSON spec with all groups
+
+## MANDATORY: JSON Output Requirement
+
+⚠️ **You MUST end your response with a complete, valid JSON spec inside a \`\`\`json code block. This is not optional.**
+
+The progress notes you write during exploration are helpful context, but they are NOT the deliverable. The JSON code block is the deliverable.
+
+**Common failure mode to avoid:** After exploring the code and writing progress notes or Markdown tables describing the spec groups, some responses end with only a prose summary. This is WRONG. You must ALWAYS follow your exploration notes with the actual JSON spec.
+
+**Even if your response is very long, you must output the JSON.** Do not end your response without the JSON code block. If you find yourself summarizing what the spec "would contain" in prose, stop — output the JSON instead.
+
+**Checklist before ending your response:**
+- [ ] Did I output a \`\`\`json code block containing the full spec?
+- [ ] Does the JSON start with \`{\` and end with \`}\`?
+- [ ] Does it have a \`"groups"\` array with at least 5 groups?
+
+If any of those are "no", do not end your response — output the JSON now.
 
 ## Instructions
 

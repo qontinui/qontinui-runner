@@ -1,0 +1,945 @@
+{
+  "version": "1.0.0",
+  "description": "The Memory page (Observations tab, data-page-id='observations') in the qontinui-runner provides cross-session observation memory from past automation runs. It consists of two vertically stacked panels: MemoryHealthPanel (health metrics, 4 stat cards, Consolidate/Refresh controls, and a consolidation run log) and ObservationBrowser (full observation management with search, create, expand, and delete). Observations are typed artifacts — one of 6 types: decision, architecture, bugfix, pattern, learning, discovery — each with a distinct color. The backend uses PostgreSQL full-text search, content-hash deduplication (15-min window), and topic-key upsert semantics for revision history. Observations are also formatted into AI context (markdown summaries injected into session prompts). The health panel reflects the state of a memory consolidation system that groups observations into mental models and decays low-value entries.",
+  "groups": [
+    {
+      "id": "mem-page-layout",
+      "name": "Page Layout and Structure",
+      "description": "The page container uses data-page-id='observations' and stacks MemoryHealthPanel (border-b separator) above ObservationBrowser. Both sections are simultaneously visible without page-level scrolling.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "mem-health-panel-present",
+          "description": "The 'Memory Health' heading is present at the top of the page, identifying the MemoryHealthPanel section",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Memory Health" },
+            "label": "Memory Health panel heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-observation-browser-present",
+          "description": "The 'Observation Memory' heading is present below the health panel, identifying the ObservationBrowser section",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Observation Memory" },
+            "label": "Observation Memory heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-obs-subtitle",
+          "description": "The subtitle 'Cross-session knowledge from past runs' is visible in the ObservationBrowser header",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Cross-session knowledge from past runs" },
+            "label": "Observation browser subtitle"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-layout-order",
+          "description": "MemoryHealthPanel must appear above ObservationBrowser in the visual layout. The health metrics and consolidation controls should be visible at the top of the page, with the search/browse interface below them. The ObservationBrowser handles its own internal scrolling so that both panels are simultaneously visible.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Memory Health" },
+            "label": "Memory page layout"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-health-header",
+      "name": "Memory Health Panel — Header Controls",
+      "description": "The MemoryHealthPanel header row contains the 'Memory Health' title (with a brain icon), a Consolidate button for triggering manual memory consolidation, and a Refresh button to reload stats. Both buttons are always present after load.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "mem-consolidate-btn",
+          "description": "A 'Consolidate' button is present in the Memory Health panel header",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Consolidate" },
+            "label": "Consolidate button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-refresh-btn",
+          "description": "A 'Refresh' button is present in the Memory Health panel header for reloading health stats",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Refresh" },
+            "label": "Refresh button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-consolidate-behavior",
+          "description": "Clicking the Consolidate button should POST to /memory/consolidate. While the operation runs, the Consolidate button must be disabled and show a spinner. On success, a green banner appears displaying 'X models created, Y merged, Z archived' with actual numeric values. On error, a red error banner appears. After completion, the stats cards (Observations, Mental Models, Decay Queue) and the consolidation log list should reflect updated data fetched from /memory/health and /memory/consolidation-log.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Consolidate" },
+            "label": "Consolidate button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Memory Health panel has loaded successfully (no loading spinner visible)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-health-stats",
+      "name": "Memory Health — Stats Cards",
+      "description": "Four stat cards display key memory system metrics: Observations (total count), Mental Models (consolidated memory count), Decay Queue (pending decay size, highlighted amber if >50), and Last Consolidation (relative time since last run, or 'never'). Data sourced from GET /memory/health.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "mem-stat-observations",
+          "description": "A stat card labeled 'Observations' is present showing the total observation count as a large bold number",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Observations" },
+            "label": "Observations stat card label"
+          },
+          "assertionType": "exists",
+          "precondition": "Memory Health panel has loaded (no loading spinner visible)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-stat-mental-models",
+          "description": "A stat card labeled 'Mental Models' is present showing the count of consolidated memory models",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Mental Models" },
+            "label": "Mental Models stat card label"
+          },
+          "assertionType": "exists",
+          "precondition": "Memory Health panel has loaded (no loading spinner visible)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-stat-decay-queue",
+          "description": "A stat card labeled 'Decay Queue' is present showing the number of observations pending decay processing",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Decay Queue" },
+            "label": "Decay Queue stat card label"
+          },
+          "assertionType": "exists",
+          "precondition": "Memory Health panel has loaded (no loading spinner visible)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-stat-last-consolidation",
+          "description": "A stat card labeled 'Last Consolidation' is present showing when consolidation last ran",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Last Consolidation" },
+            "label": "Last Consolidation stat card label"
+          },
+          "assertionType": "exists",
+          "precondition": "Memory Health panel has loaded (no loading spinner visible)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-stats-data-integrity",
+          "description": "The four stat cards must display numerically consistent data from GET /memory/health. totalObservations and totalMentalModels must be non-negative integers shown as large bold numbers. decayQueueSize must be non-negative; the card should use an amber highlight color when decayQueueSize > 50. The Last Consolidation card shows a relative human-readable duration (e.g., '3h ago', '2d ago') when lastConsolidation is not null, or the literal string 'never' when null. No card should display 'NaN', 'undefined', or an empty string in place of a number.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Memory Health" },
+            "label": "Memory Health stats grid"
+          },
+          "assertionType": "semantic",
+          "precondition": "Memory Health panel has loaded successfully (no loading spinner visible)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-health-loading",
+      "name": "Memory Health Panel — Loading and Error States",
+      "description": "While fetching /memory/health and /memory/consolidation-log on mount, the panel shows a spinner with 'Loading memory health...' text. On API failure, a red error banner with the error message replaces the stats area.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "mem-health-loading-text",
+          "description": "During the initial data fetch, the text 'Loading memory health...' is shown alongside a loading spinner in the health panel area",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Loading memory health" },
+            "label": "Memory health loading text"
+          },
+          "assertionType": "exists",
+          "precondition": "The page has just loaded and the /memory/health API call has not yet returned",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-health-error-recovery",
+          "description": "If /memory/health returns an error, a red error banner should appear in the Memory Health panel showing the error message. The Consolidate and Refresh buttons must remain accessible after an error so the user can retry. The stats cards should not display stale or invalid data.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Memory Health" },
+            "label": "Memory Health panel"
+          },
+          "assertionType": "behavior",
+          "precondition": "The /memory/health endpoint returns an error response (network failure or 5xx)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-consolidation-log",
+      "name": "Consolidation Log — Recent Runs",
+      "description": "Below the stats grid, the health panel shows up to 10 recent consolidation entries from GET /memory/consolidation-log?max_results=10. Each entry shows relative start time, models created, observations scanned, observations archived, and an error message if the run failed. The section only appears if the log is non-empty.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "mem-consolidation-log-visible",
+          "description": "When at least one consolidation run exists, a section listing recent consolidation runs is visible in the Memory Health panel. The section heading or first entry is visible below the 4 stat cards.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "models created" },
+            "label": "Consolidation log entry"
+          },
+          "assertionType": "exists",
+          "precondition": "At least one consolidation run has been performed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-consolidation-log-entry-fields",
+          "description": "Each consolidation log entry should display at minimum: (1) relative start time (e.g., '2h ago', '3d ago'), (2) count of models created, (3) count of observations scanned, (4) count of observations archived. If the run failed, the error message should be visible inline with that entry. Entries should be ordered most-recent-first. The log shows at most 10 entries.",
+          "category": "semantic",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "models created" },
+            "label": "Consolidation log entry data"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one consolidation run exists in the log",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-browser-header",
+      "name": "Observation Browser — Header",
+      "description": "The ObservationBrowser header contains the 'Observation Memory' heading, 'Cross-session knowledge from past runs' subtitle, a '+ New' button (data-ui-element='new-observation-btn'), and a Refresh button. The create form is hidden by default.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "mem-new-btn",
+          "description": "A button containing 'New' (the '+ New' control) is present in the observation browser header for opening the create form",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "New" },
+            "label": "New observation button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-create-form-hidden-by-default",
+          "description": "On initial page load, the observation create form (containing 'Observation title...' and 'Content (markdown supported)...' inputs) must NOT be visible. The form is toggled by the '+ New' button.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Observation title..." },
+            "label": "Create form title input"
+          },
+          "assertionType": "notExists",
+          "precondition": "Page has loaded and the '+ New' button has NOT been clicked",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-new-btn-toggles-form",
+          "description": "Clicking the '+ New' button must reveal the create form containing title input, content textarea, and type dropdown. Clicking Cancel (or clicking '+ New' again) must hide the form. The form toggle must work without a page reload.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "New" },
+            "label": "New observation toggle button"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-create-form",
+      "name": "Observation Create Form",
+      "description": "When open, the create form contains a title input (aria-label: 'Observation title', placeholder: 'Observation title...'), a content textarea (aria-label: 'Observation content', placeholder: 'Content (markdown supported)...'), a type dropdown (aria-label: 'Observation type'), and Save/Cancel buttons. Save is disabled until both title and content are non-empty.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "mem-create-title-input",
+          "description": "The create form contains a title text input with placeholder 'Observation title...' and aria-label 'Observation title'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox" },
+            "label": "Observation title input"
+          },
+          "assertionType": "exists",
+          "precondition": "The '+ New' create form is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-create-type-dropdown",
+          "description": "The create form contains a type select dropdown with aria-label 'Observation type'. The available options are exactly: decision, architecture, bugfix, pattern, learning, discovery",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox" },
+            "label": "Observation type dropdown"
+          },
+          "assertionType": "exists",
+          "precondition": "The '+ New' create form is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-create-save-disabled-empty",
+          "description": "The Save button must be disabled when the title input OR the content textarea is empty. The button becomes enabled only when both fields contain at least one character. This prevents accidental submission of incomplete observations.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save" },
+            "label": "Save observation button"
+          },
+          "assertionType": "behavior",
+          "precondition": "The '+ New' create form is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-create-save-flow",
+          "description": "Clicking Save should: (1) disable the button and show 'Saving...' text, (2) POST to /observations with title, content, and selected type in the CreateObservationInput format, (3) close the create form on success, (4) refresh the observation stats bar (GET /observations/stats). If the POST fails, the button re-enables and an error is surfaced. Note: content containing <private>...</private> tags is stripped by the backend before storage — this is not a client-side feature.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save" },
+            "label": "Save observation button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Create form is open with non-empty title and content",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-type-options-complete",
+          "description": "The type dropdown must offer exactly 6 options and no others: decision, architecture, bugfix, pattern, learning, discovery. Submitting with any other type value would indicate a frontend/backend contract violation.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox" },
+            "label": "Observation type dropdown"
+          },
+          "assertionType": "semantic",
+          "precondition": "The create form is open and the type dropdown is expanded",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-stats-bar",
+      "name": "Observation Stats Bar — Type Counts",
+      "description": "When at least one observation exists, the stats bar shows a '{N} total' badge and clickable per-type count badges. The 6 types are color-coded: decision=blue, architecture=violet, bugfix=red, pattern=amber, learning=green, discovery=cyan. Clicking a type badge pre-fills and triggers a search for that type.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "mem-stats-total-count",
+          "description": "The stats bar shows a badge in the format '{N} total' reflecting the total observation count from GET /observations/stats",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "total" },
+            "label": "Total observations badge"
+          },
+          "assertionType": "exists",
+          "precondition": "At least one observation exists in the database",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-stats-bar-hidden-empty",
+          "description": "The stats bar (total badge and type count badges) must not be shown when the database contains zero observations. When the database is empty, the area between the header and the search section should contain no count badges.",
+          "category": "behavior",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "total" },
+            "label": "Stats bar total badge"
+          },
+          "assertionType": "notExists",
+          "precondition": "No observations exist in the database",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-type-badge-filter",
+          "description": "Clicking a type count badge (e.g., a badge labeled '5 decision') in the stats bar should pre-fill the search input with the type name and trigger a search. The resulting search results should contain only observations of that type. This allows quick filtering by observation category.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "decision" },
+            "label": "Decision type count badge"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one observation of type 'decision' exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-search",
+      "name": "Observation Search Interface",
+      "description": "The search row contains an input (aria-label: 'Search observations', placeholder: 'Search observations...') and a Search button. Search triggers via Enter key or button click. The button is disabled when the query is empty or a search is in progress. The backend uses PostgreSQL full-text search via GET /observations/search.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "mem-search-input",
+          "description": "A search text input with placeholder 'Search observations...' is present in the observation browser",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox" },
+            "label": "Search observations input"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-search-btn",
+          "description": "A Search button is present next to the search input",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Search" },
+            "label": "Search button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-search-btn-state",
+          "description": "The Search button must be disabled when the search input is empty (0 characters). Once at least 1 character is entered the button becomes enabled. While a search request is in-flight, the button must be disabled and show a loading spinner.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Search" },
+            "label": "Search button"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-search-results-flow",
+          "description": "Typing a query and pressing Enter (or clicking Search) should: (1) show a spinner with 'Searching...' text in the results area, (2) call GET /observations/search?q={query}&max_results=20, (3) replace the spinner with result rows matching the query. If the search returns 0 results, 'No observations found' replaces the loading spinner. Starting a new search while one is in progress cancels the previous request.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox" },
+            "label": "Search observations input"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one observation exists in the database",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-results-display",
+      "name": "Observation Results — List Display",
+      "description": "Result rows each show: a chevron icon (right=collapsed, down=expanded), a color-coded type badge, truncated title, 'rev {N}' badge if revisionCount>1, 'relevance: {N}%' if rank>0, 2-line content preview (contentPreview field), and a metadata footer with [topicKey] (if non-null) and the updatedAt date.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "mem-result-type-badge",
+          "description": "Each result row displays a color-coded type badge matching the observation's observationType. Colors: decision=blue, architecture=violet, bugfix=red, pattern=amber, learning=green, discovery=cyan. The badge text must equal the type string.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "decision" },
+            "label": "Result row type badge"
+          },
+          "assertionType": "exists",
+          "precondition": "Search has returned at least one result of type 'decision'",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-result-revision-badge",
+          "description": "Result rows where revisionCount > 1 show a 'rev {N}' badge. Rows with revisionCount = 1 must not show this badge. The revision count reflects how many times the observation has been superseded via topic-key upsert.",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "rev " },
+            "label": "Revision count badge"
+          },
+          "assertionType": "exists",
+          "precondition": "Search has returned at least one observation with revisionCount > 1",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-result-data-accuracy",
+          "description": "The data displayed in result rows must accurately reflect the API response from GET /observations/search. The title should match the observation's title field (truncated with ellipsis if needed). The content preview is the first ~300 characters of the observation content (contentPreview field). The metadata footer shows [topicKey] only when topicKey is not null, and a human-readable form of updatedAt. Showing 'null' or 'undefined' for any field is a rendering bug.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Observation Memory" },
+            "label": "Observation search results area"
+          },
+          "assertionType": "semantic",
+          "precondition": "Search has returned at least one result",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-expand-delete",
+      "name": "Observation Row — Expand and Delete",
+      "description": "Clicking a result row expands it showing full content (from GET /observations/{id}) in a <pre> block, plus: content hash (first 12 chars as 'Hash: {hash}...'), scope ('Scope: {scope}'), duplicate prevention count if >0, and a red Delete button. Only one row is expanded at a time.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "mem-row-expand-toggle",
+          "description": "Clicking a result row must toggle its expanded state. The row's chevron rotates from right-pointing (collapsed) to down-pointing (expanded). Clicking the same row again collapses it. Clicking a different row while one is expanded should collapse the first and expand the newly clicked row.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Observation Memory" },
+            "label": "Observation result rows"
+          },
+          "assertionType": "behavior",
+          "precondition": "Search has returned at least two results",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-expanded-hash-field",
+          "description": "The expanded row detail shows a 'Hash: {12chars}...' line where the hash is the first 12 characters of the SHA-256 content hash. This identifies the specific content version stored.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Hash:" },
+            "label": "Expanded observation hash"
+          },
+          "assertionType": "exists",
+          "precondition": "A result row is expanded",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-delete-btn",
+          "description": "A 'Delete' button with a Trash2 icon is visible in the expanded observation detail footer (red text color)",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Delete" },
+            "label": "Delete observation button"
+          },
+          "assertionType": "exists",
+          "precondition": "A result row is expanded",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-delete-behavior",
+          "description": "Clicking Delete must call DELETE /observations/{id}. On success: the observation row disappears from the result list, and the stats bar type count for the deleted observation's type decrements by 1. On failure, the row must remain in the list and an error must be surfaced. Deletion is a soft-delete — the observation is marked archived/deleted in the database, not hard-removed.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Delete" },
+            "label": "Delete observation button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A result row is expanded",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-empty-loading-states",
+      "name": "Empty and Loading States",
+      "description": "The observation browser has three distinct result-area states: initial (no search performed — shows BookOpen icon + 'Search to browse observations'), searching (spinner + 'Searching...'), and no-results (BookOpen icon + 'No observations found').",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "mem-initial-empty-state",
+          "description": "Before any search is performed, the results area shows 'Search to browse observations' as the primary empty-state message, with 'Observations are automatically captured from task runs and sessions' as the secondary message",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Search to browse observations" },
+            "label": "Initial empty state message"
+          },
+          "assertionType": "exists",
+          "precondition": "No search has been performed since page load",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-searching-state",
+          "description": "While a search is in progress (after pressing Search or Enter, before the response arrives), the results area shows 'Searching...' text in small muted style alongside a loading spinner",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Searching..." },
+            "label": "Search loading indicator"
+          },
+          "assertionType": "exists",
+          "precondition": "A search request is in-flight (query submitted, response not yet received)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-no-results-state",
+          "description": "When a search completes with 0 matching observations, the results area shows 'No observations found' replacing the previous empty-state or loading state message",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No observations found" },
+            "label": "No results message"
+          },
+          "assertionType": "exists",
+          "precondition": "A search has completed and the query matched zero observations",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "mem-data-model",
+      "name": "Observation Data Model — Semantic Correctness",
+      "description": "Observations are temporal knowledge artifacts with revision history and content deduplication. The UI must accurately surface these invariants. Topic-key upsert (same topic_key → increment revisionCount, snapshot old version), content-hash deduplication (same SHA-256 within 15min → blocked, duplicates_prevented increments), and scope-based organization are backend behaviors visible through the UI.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "mem-revision-semantics",
+          "description": "An observation saved with the same topic_key as an existing observation should appear as a single result row (the latest version) with revisionCount > 1 shown as 'rev {N}'. There must never be two separate result rows for the same topic_key — the history is collapsed into one entry. If multiple rows appear for the same topic_key, it indicates a backend upsert failure.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "rev " },
+            "label": "Revision indicator"
+          },
+          "assertionType": "semantic",
+          "precondition": "An observation has been revised at least once via topic-key upsert",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-dedup-counter",
+          "description": "The expanded observation detail shows 'Duplicates prevented: {N}' only when N > 0. This counter reflects how many times the backend blocked a save because the content hash matched an existing observation within the 15-minute deduplication window. When N = 0 this line should not appear.",
+          "category": "semantic",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Duplicates prevented" },
+            "label": "Duplicate prevention counter"
+          },
+          "assertionType": "semantic",
+          "precondition": "An observation has been duplicated (same content saved multiple times within 15 minutes)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "mem-type-color-consistency",
+          "description": "Observation type colors must be consistent between the create form dropdown options, the stats bar type badges, and the result row type badges. The canonical color mapping is: decision=blue, architecture=violet, bugfix=red, pattern=amber, learning=green, discovery=cyan. An architecture observation must always show with violet — if it shows blue (decision's color), the TYPE_COLORS mapping is broken.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Observation Memory" },
+            "label": "Observation browser type colors"
+          },
+          "assertionType": "semantic",
+          "precondition": "Observations of multiple types are visible in search results",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "MemoryHealthPanel + ObservationBrowser",
+    "pageUrl": "/observations",
+    "tags": ["memory", "observations", "consolidation", "knowledge", "ai-context", "search"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "memory-initial",
+        "name": "Memory Page — Initial (No Search)",
+        "description": "The page has loaded. Both panels are visible. The create form is closed. No search has been performed — the results area shows the 'Search to browse observations' empty state.",
+        "elements": [{ "textContent": "Search to browse observations" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "initial-to-create-form",
+            "name": "Open Create Observation Form",
+            "description": "Click the '+ New' button to reveal the create form",
+            "activateStates": ["memory-create-form-open"],
+            "deactivateStates": [],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "New" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "initial-to-searching",
+            "name": "Perform a Search",
+            "description": "Type a query in the search input and click Search to retrieve results",
+            "activateStates": ["memory-search-results"],
+            "deactivateStates": ["memory-initial"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "textbox" }
+              },
+              {
+                "action": "type",
+                "target": { "role": "textbox" },
+                "params": { "text": "decision" }
+              },
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Search" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "memory-create-form-open",
+        "name": "Memory Page — Create Form Open",
+        "description": "The '+ New' button has been clicked. The create form is visible above the search row, showing title input, content textarea, type dropdown, and Save/Cancel buttons.",
+        "elements": [{ "textContent": "Observation title..." }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "create-form-cancel",
+            "name": "Cancel Create Form",
+            "description": "Click Cancel to close the create form without saving",
+            "activateStates": ["memory-initial"],
+            "deactivateStates": ["memory-create-form-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "memory-search-results",
+        "name": "Memory Page — Search Results",
+        "description": "A search has completed. The results area shows either observation rows (if matches found) or 'No observations found'. The 'Search to browse observations' initial message is no longer visible.",
+        "elements": [{ "textContent": "No observations found" }, { "textContent": "relevance:" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "results-expand-row",
+            "name": "Expand an Observation Row",
+            "description": "Click a result row to expand it and show full content with Delete button",
+            "activateStates": ["memory-observation-expanded"],
+            "deactivateStates": [],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "decision" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "memory-observation-expanded",
+        "name": "Memory Page — Observation Expanded",
+        "description": "A result row is expanded showing the full content in a <pre> block, plus hash (first 12 chars), scope, duplicate prevention count (if >0), and a Delete button.",
+        "elements": [{ "textContent": "Hash:" }, { "textContent": "Scope:" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "collapse-expanded-row",
+            "name": "Collapse Expanded Row",
+            "description": "Click the expanded row header again to collapse it back to summary view",
+            "activateStates": ["memory-search-results"],
+            "deactivateStates": ["memory-observation-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Hash:" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

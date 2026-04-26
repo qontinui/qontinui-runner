@@ -99,11 +99,8 @@ pub async fn debug_builder_prompt_handler(
     // are bytes-for-bytes what the Builder would see when generating a
     // workflow from the same brief at the same instant.
     let port = runner_api_port(&state.app_state);
-    let manifest = crate::workflow_generation::wrapper_manifest::build_manifest(
-        &state.app_state,
-        port,
-    )
-    .await;
+    let manifest =
+        crate::workflow_generation::wrapper_manifest::build_manifest(&state.app_state, port).await;
 
     let manifest_len = manifest.len();
     let wrapper_count = count_wrapper_bullets(&manifest);
@@ -188,10 +185,7 @@ fn count_wrapper_bullets(manifest: &str) -> usize {
 
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
-    axum::Router::new().route(
-        "/debug/builder-prompt",
-        post(debug_builder_prompt_handler),
-    )
+    axum::Router::new().route("/debug/builder-prompt", post(debug_builder_prompt_handler))
 }
 
 #[cfg(test)]

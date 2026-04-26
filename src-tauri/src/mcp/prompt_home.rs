@@ -68,15 +68,11 @@ fn render_disclosure_section(disclosures: &[PageDisclosure]) -> String {
     out.push_str(
         "These pages contain `<details>/<summary>` (or accordion-style) disclosures whose\n",
     );
-    out.push_str(
-        "registered labels are long sentences. Free-text instructions like \"click the\n",
-    );
+    out.push_str("registered labels are long sentences. Free-text instructions like \"click the\n");
     out.push_str(
         "Advanced details toggle\" will NOT match. When the user asks to open / expand /\n",
     );
-    out.push_str(
-        "reveal / show a hidden section (e.g. \"open advanced\", \"expand details\",\n",
-    );
+    out.push_str("reveal / show a hidden section (e.g. \"open advanced\", \"expand details\",\n");
     out.push_str("\"show advanced options\"), choose ONE of the two strategies below.\n\n");
     out.push_str("Registry (one row per registered disclosure):\n\n");
     out.push_str("| page | element id | registered label (use exact substring in find queries) | what it reveals |\n");
@@ -91,9 +87,7 @@ fn render_disclosure_section(disclosures: &[PageDisclosure]) -> String {
     out.push('\n');
     out.push_str("Strategy A (preferred — direct id routing):\n");
     out.push_str("  Emit an action step whose instruction names the registered id verbatim,\n");
-    out.push_str(
-        "  e.g. `\"click element ui-bridge-advanced-disclosure\"`. NLActionExecutor\n",
-    );
+    out.push_str("  e.g. `\"click element ui-bridge-advanced-disclosure\"`. NLActionExecutor\n");
     out.push_str("  will route this directly through `/control/element/<id>/action`.\n\n");
     out.push_str("Strategy B (fallback — labelled find query):\n");
     out.push_str("  Use the **first ~6 words of the registered label** (everything before any\n");

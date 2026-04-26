@@ -1,2 +1,4 @@
-import { Tabs } from 'expo-router';
-export default function TabsLayout() { return <Tabs />; }
+import { Tabs } from "expo-router";
+export default function TabsLayout() {
+  return <Tabs />;
+}

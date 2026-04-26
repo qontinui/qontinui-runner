@@ -222,9 +222,7 @@ async fn try_ws_dispatch(
         .await
     {
         Ok(value) => Ok(Some(value)),
-        Err(DispatchError::WebSocket(
-            super::command_relay::CommandRelayError::NotConnected(_),
-        ))
+        Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::NotConnected(_)))
         | Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::Disconnected)) => {
             Err(format!(
                 "wrapper '{}' registered via websocket but is disconnected",
@@ -269,7 +267,13 @@ pub async fn dispatch_app_request(
 
     state
         .app_dispatcher
-        .dispatch_active(&state.sdk_connection, action, http_method, http_path, payload)
+        .dispatch_active(
+            &state.sdk_connection,
+            action,
+            http_method,
+            http_path,
+            payload,
+        )
         .await
         .map_err(dispatch_err_to_string)
 }
@@ -5525,10 +5529,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/control/batch-action",
             post(handle_execute_batch_action),
         )
-        .route(
-            "/ui-bridge/sdk/control/batch",
-            post(handle_control_batch),
-        )
+        .route("/ui-bridge/sdk/control/batch", post(handle_control_batch))
         // Page (additional)
         .route(
             "/ui-bridge/sdk/control/page/scroll",

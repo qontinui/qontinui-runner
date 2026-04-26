@@ -95,10 +95,15 @@ fn pick_monitor<'a>(
     descriptor: &MonitorDescriptor,
 ) -> Result<(usize, &'a tauri::Monitor), String> {
     match descriptor {
-        MonitorDescriptor::Index { index } => monitors
-            .get(*index)
-            .map(|m| (*index, m))
-            .ok_or_else(|| format!("monitor index {} out of range (have {})", index, monitors.len())),
+        MonitorDescriptor::Index { index } => {
+            monitors.get(*index).map(|m| (*index, m)).ok_or_else(|| {
+                format!(
+                    "monitor index {} out of range (have {})",
+                    index,
+                    monitors.len()
+                )
+            })
+        }
 
         MonitorDescriptor::Name { name } => monitors
             .iter()

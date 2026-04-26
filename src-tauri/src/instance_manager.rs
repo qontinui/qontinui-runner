@@ -217,11 +217,7 @@ impl InstanceManager {
         let removed_in_memory = registered.remove(id).is_some();
         drop(registered);
 
-        let removed_db = self
-            .pg_db
-            .remove_runner_instance(id)
-            .await
-            .unwrap_or(false);
+        let removed_db = self.pg_db.remove_runner_instance(id).await.unwrap_or(false);
 
         DeregisterResult {
             removed_in_memory,

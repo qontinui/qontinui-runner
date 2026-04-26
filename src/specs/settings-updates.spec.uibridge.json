@@ -1,0 +1,907 @@
+{
+  "version": "1.0.0",
+  "description": "Updates settings tab within the runner Settings panel. Allows users to check for and install application updates. The page auto-checks for updates on mount via the Tauri `check_for_updates` IPC command. It renders a permanent 'current version' card (showing the installed version and last-checked timestamp) and a conditional status card that shows one of four states: checking/idle (no card), development mode (update checking disabled), update available (with release notes and install button), or up to date. A separate error card appears if a check or install fails. An informational tip box is always visible at the bottom.",
+  "groups": [
+    {
+      "id": "upd-page-structure",
+      "name": "Page Structure",
+      "description": "The Updates tab renders a SectionHeader with a Download icon, title 'Updates', and a description line. Below it are two always-visible structural elements: the current version card and the info tip box. A third conditional card appears after a check completes.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "upd-heading-exists",
+          "description": "A heading with text 'Updates' is present as the section title",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContent": "Updates"
+            },
+            "label": "Updates section heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-description-exists",
+          "description": "A description paragraph reading 'Check for and install application updates to get the latest features and bug fixes.' is visible below the heading",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Check for and install application updates to get the latest features and bug fixes."
+            },
+            "label": "Updates section description"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-tip-box-exists",
+          "description": "A tip box is always visible with text 'Tip: Updates are checked automatically when this settings tab is opened. You can also manually check for updates using the button above.'",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Tip: Updates are checked automatically"
+            },
+            "label": "Updates tip box"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-layout-semantic",
+          "description": "The page layout has exactly two always-present sections: the current version card (top) and the tip box (bottom). A third conditional status card appears between them only after a check completes. There are no sub-tabs, no nested navigation, and no modal dialogs within this tab.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContent": "Updates"
+            },
+            "label": "Updates tab root"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-current-version-card",
+      "name": "Current Version Card",
+      "description": "A card that is always visible showing the currently installed application version and when updates were last checked. Also contains the 'Check for Updates' button.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "upd-version-display-exists",
+          "description": "An element with data-content-role='metric' and data-content-label='current version' is present, showing the installed version string (e.g., 'v0.1.0')",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "current version"
+            },
+            "label": "Current version metric"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-last-checked-exists",
+          "description": "An element with data-content-role='body-text' and data-content-label='last checked time' is present. It shows either 'Never' (if no check has run) or a human-readable timestamp of the most recent check.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "last checked time"
+            },
+            "label": "Last checked timestamp"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-check-button-exists",
+          "description": "A 'Check for Updates' button is present in the current version card",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Check for Updates"
+            },
+            "label": "Check for Updates button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-version-semantic",
+          "description": "The version string displayed in data-content-label='current version' must match the actual application version. It should appear in a 'vX.Y.Z' semver format prefixed with 'v'. The last-checked timestamp updates each time a check completes — on first load it shows 'Never', and after the auto-check on mount it shows the time of that check.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "current version"
+            },
+            "label": "Current version metric"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-check-button-interaction",
+      "name": "Check for Updates Button Interaction",
+      "description": "The 'Check for Updates' button triggers an update check via the Tauri `check_for_updates` command. During the check the button is disabled and shows a spinner. After the check completes the status card is updated and the last-checked timestamp is refreshed.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "upd-check-button-enabled-idle",
+          "description": "The 'Check for Updates' button is enabled when the status is idle (not currently checking or installing)",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Check for Updates"
+            },
+            "label": "Check for Updates button"
+          },
+          "assertionType": "enabled",
+          "precondition": "Page is in idle state (no check or install in progress)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-check-button-disabled-checking",
+          "description": "The 'Check for Updates' button is disabled while a check is in progress. The button shows a spinning RefreshCw icon alongside the label 'Checking...' to indicate an in-progress operation.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Checking..."
+            },
+            "label": "Check for Updates button (checking state)"
+          },
+          "assertionType": "behavior",
+          "precondition": "A check has been triggered but not yet completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-check-flow",
+          "description": "Clicking 'Check for Updates' invokes the Tauri `check_for_updates` command. While the command is running the button is disabled and shows a spinner icon. After completion: (a) the last-checked timestamp is updated to the current time; (b) the conditional status card appears or refreshes; (c) the button returns to its enabled 'Check for Updates' state. If the command throws an error the error card appears instead of the status card.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Check for Updates"
+            },
+            "label": "Check for Updates button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Page is in idle state",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-auto-check-on-load",
+      "name": "Automatic Check on Tab Load",
+      "description": "The UpdateSettings component automatically triggers a `check_for_updates` call via useEffect when it first mounts. The user does not need to click anything — the check runs immediately and the status card populates once it completes.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "upd-checking-state-on-load",
+          "description": "When the Updates tab is first opened, the 'Check for Updates' button immediately transitions to the 'Checking...' disabled state without any user interaction, indicating the automatic on-mount check is running.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Checking..."
+            },
+            "label": "Auto-checking button state"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Updates settings tab has just been opened for the first time in this session",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-status-card-after-auto-check",
+          "description": "After the automatic on-mount check completes, a status card appears showing one of: development mode notice, update available, or up to date. The last-checked timestamp also transitions from 'Never' to the current time. This entire flow happens without any user interaction.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "last checked time"
+            },
+            "label": "Last checked timestamp"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Updates settings tab has just been opened",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-dev-mode-state",
+      "name": "Development Mode Status Card",
+      "description": "In debug/development builds the `check_for_updates` command returns `{ available: false, development: true }`. The component renders a 'Development Mode' status card with an informational message explaining that update checking is disabled in development builds.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "upd-dev-mode-status-exists",
+          "description": "An element with data-content-role='status' and data-content-label='development mode' is visible showing the text 'Development Mode'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "development mode"
+            },
+            "label": "Development mode status"
+          },
+          "assertionType": "exists",
+          "precondition": "Running a debug/development build and a check has completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-dev-mode-message-exists",
+          "description": "The development mode card displays the message 'Update checking is disabled in development builds. Build a release version to enable automatic updates.'",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Update checking is disabled in development builds."
+            },
+            "label": "Development mode message"
+          },
+          "assertionType": "exists",
+          "precondition": "Development mode status card is shown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-dev-mode-no-install-button",
+          "description": "The development mode card does NOT show a 'Download and Install Update' button. No install action is available in development mode because `install_update` also returns a dev-mode error in debug builds.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Download and Install Update"
+            },
+            "label": "Install update button (should not exist)"
+          },
+          "assertionType": "notExists",
+          "precondition": "Development mode status card is shown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-update-available-state",
+      "name": "Update Available Status Card",
+      "description": "When `check_for_updates` returns `{ available: true, version, current_version, notes }`, the component renders an 'Update Available' card showing the new version, optional release notes, and a 'Download and Install Update' button.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "upd-available-status-exists",
+          "description": "An element with data-content-role='status' and data-content-label='update available' is visible showing 'Update Available' when a newer version exists",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "update available"
+            },
+            "label": "Update available status"
+          },
+          "assertionType": "exists",
+          "precondition": "check_for_updates returned available=true",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-available-version-text",
+          "description": "The update available card displays a description saying 'Version {version} is available for download' where {version} is the version string from the API response (e.g., 'Version 1.2.3 is available for download')",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "update version info"
+            },
+            "label": "Update version description"
+          },
+          "assertionType": "exists",
+          "precondition": "Update available card is shown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-release-notes-visible",
+          "description": "When the API response includes release notes (non-empty `notes` field), the update available card shows a 'Release Notes' section label and a scrollable container (max-h-48) displaying the notes text",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Release Notes"
+            },
+            "label": "Release notes label"
+          },
+          "assertionType": "exists",
+          "precondition": "Update available card is shown and the API response included non-empty notes",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-install-button-exists",
+          "description": "A full-width 'Download and Install Update' button is present in the update available card",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Download and Install Update"
+            },
+            "label": "Download and Install Update button"
+          },
+          "assertionType": "exists",
+          "precondition": "Update available card is shown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-restart-note-exists",
+          "description": "A note reading 'The application will restart automatically after the update is installed.' is visible below the install button",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "The application will restart automatically after the update is installed."
+            },
+            "label": "Restart note"
+          },
+          "assertionType": "exists",
+          "precondition": "Update available card is shown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-install-flow",
+      "name": "Install Update Flow",
+      "description": "Clicking 'Download and Install Update' invokes the Tauri `install_update` command, which downloads the update package and restarts the application. During install, the button is disabled and shows an 'Installing Update...' label with a spinner.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "upd-install-button-enabled",
+          "description": "The 'Download and Install Update' button is enabled when the update available card is shown and no install is in progress",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Download and Install Update"
+            },
+            "label": "Install button (enabled)"
+          },
+          "assertionType": "enabled",
+          "precondition": "Update available card is shown and status is not 'installing'",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-install-in-progress-label",
+          "description": "While install_update is running, the install button shows 'Installing Update...' with a spinner icon and is disabled. The 'Check for Updates' button in the version card is also disabled during this time.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Installing Update..."
+            },
+            "label": "Install button (installing state)"
+          },
+          "assertionType": "behavior",
+          "precondition": "User has clicked 'Download and Install Update' and the command is in progress",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-install-restart-behavior",
+          "description": "On a successful install_update response the application restarts automatically — the Rust handler calls `updater.download_and_install()` then `app_handle.restart()`. There is no post-install UI state in this component; the window closes/reopens as part of the restart. An error card is shown only if the command returns an error (e.g., in dev mode or if the download fails).",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Download and Install Update"
+            },
+            "label": "Install button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Update available card is shown and user clicks the install button",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-up-to-date-state",
+      "name": "Up to Date Status Card",
+      "description": "When `check_for_updates` returns `{ available: false }` without the development flag, the component renders an 'Up to Date' card with a green CheckCircle icon confirming the user is on the latest version.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "upd-up-to-date-status-exists",
+          "description": "An element with data-content-role='status' and data-content-label='up to date' is visible showing 'Up to Date' when no update is available",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "up to date"
+            },
+            "label": "Up to date status"
+          },
+          "assertionType": "exists",
+          "precondition": "check_for_updates returned available=false without development=true",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-up-to-date-message",
+          "description": "The up-to-date card displays the message \"You're running the latest version of Qontinui Runner.\"",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "You're running the latest version of Qontinui Runner."
+            },
+            "label": "Up to date message"
+          },
+          "assertionType": "exists",
+          "precondition": "Up to date card is shown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-up-to-date-no-install-button",
+          "description": "When the 'Up to Date' card is shown, the 'Download and Install Update' button is not present anywhere on the page — there is nothing to install",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Download and Install Update"
+            },
+            "label": "Install button (should not exist)"
+          },
+          "assertionType": "notExists",
+          "precondition": "Up to date card is shown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-error-state",
+      "name": "Error State",
+      "description": "If `check_for_updates` or `install_update` throws an exception, the component stores the error message in state and renders an error card with an AlertCircle icon and the error text. The status card is not shown when an error card is displayed.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "upd-error-status-exists",
+          "description": "An element with data-content-role='status' and data-content-label='update error' is visible showing 'Update Error' when a check or install fails",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "update error"
+            },
+            "label": "Update error status"
+          },
+          "assertionType": "exists",
+          "precondition": "check_for_updates or install_update threw an error",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-error-message-shown",
+          "description": "The error card displays the actual error message string returned by the failed command (e.g., network error, permission error). The message is rendered as-is from the JavaScript Error.message value.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "update error"
+            },
+            "label": "Update error card"
+          },
+          "assertionType": "semantic",
+          "precondition": "Error card is shown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-error-check-button-re-enabled",
+          "description": "After an error occurs, the 'Check for Updates' button returns to its enabled state so the user can retry. The error card persists until the next check is triggered.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Check for Updates"
+            },
+            "label": "Check for Updates button (post-error)"
+          },
+          "assertionType": "behavior",
+          "precondition": "An error card is displayed after a failed check",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-state-mutual-exclusion",
+      "name": "Status Card Mutual Exclusion",
+      "description": "Only one status card variant can be shown at a time. The four possible status card states (development mode, update available, up to date, and nothing) are mutually exclusive — they are driven by a single `updateInfo` nullable value and a single `error` nullable string. The error card and status card are also mutually exclusive.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "upd-only-one-status-card",
+          "description": "At most one of the following status labels is visible at any time: 'development mode', 'update available', 'up to date', 'update error'. The status cards for these states are rendered by separate conditional branches in the component — they cannot coexist. If two status labels are visible simultaneously, there is a rendering bug.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "up to date"
+            },
+            "label": "Status card area"
+          },
+          "assertionType": "semantic",
+          "precondition": "A check has completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-no-status-card-while-checking",
+          "description": "While a check is in progress (status='checking'), no status card is visible — the previous result is cleared when a new check starts. Only the current version card and tip box are shown during the checking phase.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Checking..."
+            },
+            "label": "Checking state"
+          },
+          "assertionType": "semantic",
+          "precondition": "A check has been triggered and is in progress",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "upd-ipc-data-model",
+      "name": "IPC Response Data Model",
+      "description": "The page relies on two Tauri IPC commands. Their response shapes determine which UI state is shown. Both commands behave differently in debug vs release builds, which is critical for verifying behavior in the correct build context.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "upd-check-response-shape",
+          "description": "The `check_for_updates` command returns a CommandResponse where `data` is an UpdateInfo object: `{ available: boolean, version?: string, current_version?: string, notes?: string, development?: boolean }`. In release builds: `available=true` when a newer version exists on the update server, `available=false` when current. In debug builds: `available=false, development=true` always. The UI must correctly branch on `available` and `development` flags to choose the status card variant.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataContentLabel": "current version"
+            },
+            "label": "Version card (IPC data anchor)"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "upd-install-response-shape",
+          "description": "The `install_update` command returns `{ success: true, message: 'Update installed. The application will restart.', data: { installed: true, version: string } }` on success. In debug builds it returns `{ success: false, message: 'Updates are disabled in development mode', data: { installed: false, development: true } }`. A `success: false` response from a release build should be treated as an error (shown via the error card), not as a dev-mode notice.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Download and Install Update"
+            },
+            "label": "Install button (IPC data anchor)"
+          },
+          "assertionType": "semantic",
+          "precondition": "Update available card is shown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "checking",
+        "name": "Checking for Updates",
+        "description": "An update check is in progress. The 'Check for Updates' button shows 'Checking...' and is disabled. No status card is visible.",
+        "elements": [{ "role": "button", "textContent": "Checking..." }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "checking-to-dev-mode",
+            "name": "Check completed — development mode",
+            "description": "Check returned development=true; dev mode card appears",
+            "activateStates": ["dev-mode"],
+            "deactivateStates": ["checking"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "checking-to-update-available",
+            "name": "Check completed — update available",
+            "description": "Check returned available=true; update available card appears",
+            "activateStates": ["update-available"],
+            "deactivateStates": ["checking"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "checking-to-up-to-date",
+            "name": "Check completed — up to date",
+            "description": "Check returned available=false without development flag; up to date card appears",
+            "activateStates": ["up-to-date"],
+            "deactivateStates": ["checking"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "checking-to-error",
+            "name": "Check failed",
+            "description": "Check threw an exception; error card appears",
+            "activateStates": ["error"],
+            "deactivateStates": ["checking"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "dev-mode",
+        "name": "Development Mode",
+        "description": "Update check returned development=true. Dev mode card is visible. Check button is re-enabled.",
+        "elements": [{ "dataContentLabel": "development mode" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "dev-mode-recheck",
+            "name": "Manual recheck",
+            "description": "User clicks 'Check for Updates' again",
+            "activateStates": ["checking"],
+            "deactivateStates": ["dev-mode"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Check for Updates" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "update-available",
+        "name": "Update Available",
+        "description": "An update is available. The update available card is shown with version info, optional release notes, and the install button.",
+        "elements": [{ "dataContentLabel": "update available" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "update-available-install",
+            "name": "Install update",
+            "description": "User clicks 'Download and Install Update'",
+            "activateStates": ["installing"],
+            "deactivateStates": ["update-available"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Download and Install Update" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "update-available-recheck",
+            "name": "Recheck for updates",
+            "description": "User clicks 'Check for Updates' to recheck",
+            "activateStates": ["checking"],
+            "deactivateStates": ["update-available"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Check for Updates" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "up-to-date",
+        "name": "Up to Date",
+        "description": "No update available. The up to date card is shown with a green CheckCircle icon.",
+        "elements": [{ "dataContentLabel": "up to date" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "up-to-date-recheck",
+            "name": "Recheck for updates",
+            "description": "User clicks 'Check for Updates' to run a fresh check",
+            "activateStates": ["checking"],
+            "deactivateStates": ["up-to-date"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Check for Updates" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "installing",
+        "name": "Installing Update",
+        "description": "install_update command is running. The install button shows 'Installing Update...' and is disabled. The app will restart automatically on success.",
+        "elements": [{ "role": "button", "textContent": "Installing Update..." }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "installing-to-error",
+            "name": "Install failed",
+            "description": "install_update returned an error (e.g., dev mode, download failure)",
+            "activateStates": ["error"],
+            "deactivateStates": ["installing"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "error",
+        "name": "Error",
+        "description": "A check or install command threw an error. The error card is shown with the error message. The 'Check for Updates' button is re-enabled to allow retrying.",
+        "elements": [{ "dataContentLabel": "update error" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "error-retry",
+            "name": "Retry check",
+            "description": "User clicks 'Check for Updates' to retry",
+            "activateStates": ["checking"],
+            "deactivateStates": ["error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Check for Updates" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "component": "UpdateSettings",
+    "pageUrl": "/settings?tab=updates",
+    "tags": ["settings", "updates", "tauri", "ipc", "auto-update"]
+  }
+}

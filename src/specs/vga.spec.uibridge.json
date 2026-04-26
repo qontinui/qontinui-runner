@@ -1,0 +1,1534 @@
+{
+  "version": "1.0.0",
+  "description": "Visual GUI automation page (UIBridgeStateMachinePage) — a comprehensive state machine builder and explorer backed by the UI Bridge SDK. The page hosts 8 tabs: Discovery (4-phase workflow to build a config from live exploration, recording, or static source analysis), Graph Editor (interactive ReactFlow canvas with side panels), State View, Transitions (with runtime permitted/blocked introspection), Diagram (Mermaid rendering), Pathfinding, Exploration Results (automated verification viewer), and Export. All config-dependent tabs show an empty-state message until a configuration is selected from the header dropdown. When a config is active, an ObservationsPanel above the tabs shows drift-fit scores, re-derivation controls, and the invalidation log for the observation-driven state definition pipeline.",
+  "groups": [
+    {
+      "id": "vga-page-structure",
+      "name": "Page Structure and Header",
+      "description": "The page has a persistent header with the title (dynamic: active config name, or 'UI Bridge States' when no config is selected), a config dropdown, and a Refresh button. Below the header the ObservationsPanel appears when a config is active, then an 8-tab navigation bar.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "vga-page-title-default",
+          "description": "When no configuration is selected, the page header displays the heading 'UI Bridge States'.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "UI Bridge States" },
+            "label": "Page heading (no config)"
+          },
+          "assertionType": "exists",
+          "precondition": "No configuration is selected in the dropdown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-config-dropdown-exists",
+          "description": "A config selector dropdown is present in the page header, containing 'Select configuration...' as the default empty option.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "select" },
+            "label": "Config selector dropdown"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-refresh-button-exists",
+          "description": "A 'Refresh' button is present in the page header.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Refresh" },
+            "label": "Refresh button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-config-selection-behavior",
+          "description": "Selecting a config from the dropdown loads that config (invoking sm_get_config Tauri command), updates the page heading to the config's name, shows the ObservationsPanel between the header and tab bar, and enables all config-dependent tab content areas.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "tagName": "select" },
+            "label": "Config selector dropdown"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one configuration exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-title-updates-on-config",
+          "description": "When a configuration is selected, the page heading changes from 'UI Bridge States' to the configuration's name.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading" },
+            "label": "Page heading (with config)"
+          },
+          "assertionType": "behavior",
+          "precondition": "A configuration is selected from the dropdown",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-tab-navigation",
+      "name": "8-Tab Navigation Bar",
+      "description": "The tab bar contains exactly 8 tabs: Discovery, Graph Editor, State View, Transitions, Diagram, Pathfinding, Exploration Results, Export. Tabs are registered with the UI Bridge SDK as 'sm-tab-{value}' elements. The active tab renders its content; inactive tabs are hidden (except Exploration Results, which is off-screen via absolute positioning so the SDK can still scan its severity elements).",
+      "category": "navigation",
+      "assertions": [
+        {
+          "id": "vga-tab-discovery-exists",
+          "description": "A 'Discovery' tab button is present.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Discovery" },
+            "label": "Discovery tab"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-tab-graph-exists",
+          "description": "A 'Graph Editor' tab button is present.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Graph Editor" },
+            "label": "Graph Editor tab"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-tab-all-present",
+          "description": "All 8 tab buttons are present: Discovery, Graph Editor, State View, Transitions, Diagram, Pathfinding, Exploration Results, Export.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Export" },
+            "label": "Export tab (last tab)"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-default-tab-is-discovery",
+          "description": "On initial page load (without a 'tab' query parameter), the Discovery tab is active and its content is visible.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Discovery" },
+            "label": "Discovery tab button"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-empty-states",
+      "name": "Empty States (No Config Selected)",
+      "description": "When no configuration is selected, the six config-dependent tabs (Graph Editor, State View, Transitions, Diagram, Pathfinding, Export) each show a tab-specific empty message prompting the user to select a configuration. The Discovery tab always shows its content since it is used to create configs, not depend on them.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vga-graph-empty-state",
+          "description": "When the Graph Editor tab is active and no config is selected, the message 'Select a configuration to view the state graph' is displayed.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to view the state graph" },
+            "label": "Graph empty state message"
+          },
+          "assertionType": "exists",
+          "precondition": "Graph Editor tab is active and no configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-states-empty-state",
+          "description": "When the State View tab is active and no config is selected, the message 'Select a configuration to view states' is displayed.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to view states" },
+            "label": "State View empty state message"
+          },
+          "assertionType": "exists",
+          "precondition": "State View tab is active and no configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-transitions-empty-state",
+          "description": "When the Transitions tab is active and no config is selected, the message 'Select a configuration to view transitions' is displayed.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to view transitions" },
+            "label": "Transitions empty state message"
+          },
+          "assertionType": "exists",
+          "precondition": "Transitions tab is active and no configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-export-empty-state",
+          "description": "When the Export tab is active and no config is selected, the message 'Select a configuration to export' is displayed.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to export" },
+            "label": "Export empty state message"
+          },
+          "assertionType": "exists",
+          "precondition": "Export tab is active and no configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-observations-panel",
+      "name": "Observations Panel (Drift Score and Invalidation Log)",
+      "description": "When a configuration is active, an ObservationsPanel appears between the header and tabs. It shows the latest drift fit_score (green ≥0.9, yellow 0.75–0.9, red <0.75), with 'Re-derive all' and 'Invalidate spec observations' action buttons, and an invalidation log table with columns: When, Reason, By, Fingerprints, Action. Rows within 24 h of invalidation have an active Undo button; expired rows show 'expired'.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vga-drift-score-label",
+          "description": "The ObservationsPanel shows the label 'Drift fit score'.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Drift fit score" },
+            "label": "Drift fit score label"
+          },
+          "assertionType": "exists",
+          "precondition": "A configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-re-derive-button",
+          "description": "A 'Re-derive all' button is present in the observations panel.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Re-derive all" },
+            "label": "Re-derive all button"
+          },
+          "assertionType": "exists",
+          "precondition": "A configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-invalidate-spec-button",
+          "description": "An 'Invalidate spec observations' button is present in the observations panel.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Invalidate spec observations" },
+            "label": "Invalidate spec observations button"
+          },
+          "assertionType": "exists",
+          "precondition": "A configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-invalidation-log-heading",
+          "description": "The invalidation log section has the heading 'Invalidation log'. When empty it shows 'No invalidations recorded for this spec.'",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Invalidation log" },
+            "label": "Invalidation log heading"
+          },
+          "assertionType": "exists",
+          "precondition": "A configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-re-derive-behavior",
+          "description": "Clicking 'Re-derive all' POSTs to /state-discovery/derive?window_days=90 and on success shows a toast 'Derived N states from M observations' (where N and M are the counts returned by the API). On failure shows 'Re-derive failed: {error message}'.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Re-derive all" },
+            "label": "Re-derive all button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A configuration is selected and the runner API is reachable",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-drift-score-semantics",
+          "description": "The drift fit score is displayed as a decimal number (e.g., '0.937') with color encoding: green (text-green-400) for scores ≥0.9, yellow (text-yellow-400) for 0.75–0.9, red (text-red-400) for <0.75. Below 0.9, the advisory 'observations disagree with compiled SM — consider re-deriving' appears beside the score. When no data exists, 'no drift data yet' is shown.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Drift fit score" },
+            "label": "Drift fit score display"
+          },
+          "assertionType": "semantic",
+          "precondition": "A configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-discovery-connect",
+      "name": "Discovery Tab — Phase 1: Connect",
+      "description": "The Discovery tab's first phase is a 'Connect to SDK App' card. It contains a 'Scan for Apps' button that discovers running web and desktop apps with the UI Bridge SDK installed. Discovered apps appear as a list, each with a 'Connect' button. After connection, a green success banner shows 'Connected: {appName}'. Phase 1 is hidden once co-occurrence data has been collected.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "vga-scan-button-exists",
+          "description": "A 'Scan for Apps' button is present in the Discovery tab.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Scan for Apps" },
+            "label": "Scan for Apps button"
+          },
+          "assertionType": "exists",
+          "precondition": "Discovery tab is active and no co-occurrence data has been collected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-scan-behavior",
+          "description": "Clicking 'Scan for Apps' initiates app discovery. While scanning, the button shows a spinner and is disabled. After scanning, the count of found apps appears ('N apps found'). Each discovered app shows its name, URL, framework (if known), and a 'Connect' button.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Scan for Apps" },
+            "label": "Scan for Apps button"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-connected-banner",
+          "description": "After clicking 'Connect' on a discovered app, a green banner shows 'Connected: {appName}'. The discovered apps list hides and the Explore and Record collection sub-tabs become enabled.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Connect" },
+            "label": "Connect button in app list"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one app was found in the scan",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-no-apps-hint",
+          "description": "When the scan completes and no apps are found, the hint text 'Click Scan to find apps with the UI Bridge SDK installed.' is shown.",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Click Scan to find apps with the UI Bridge SDK installed."
+            },
+            "label": "No apps hint text"
+          },
+          "assertionType": "exists",
+          "precondition": "Scan completed with zero apps found",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-discovery-collect",
+      "name": "Discovery Tab — Phase 2: Collect (Analyze, Explore, Record)",
+      "description": "Three collection sub-tabs let users provide co-occurrence data before running state discovery. 'Analyze Source' (always enabled) imports a static analysis JSON or generates one for the runner. 'Explore' and 'Record' are enabled only when connected to a live app. Explore runs automated interactions; Record captures a manual session. Both produce co-occurrence data for Phase 3.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "vga-collect-tab-analyze-exists",
+          "description": "An 'Analyze Source' sub-tab button is present in the collection section.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Analyze Source" },
+            "label": "Analyze Source sub-tab"
+          },
+          "assertionType": "exists",
+          "precondition": "Discovery tab is active and no co-occurrence data has been collected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-collect-tab-explore-disabled-when-not-connected",
+          "description": "The 'Explore' sub-tab button is disabled (opacity-40) when no app is connected.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Explore" },
+            "label": "Explore sub-tab"
+          },
+          "assertionType": "disabled",
+          "precondition": "No app is connected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-generate-for-runner-exists",
+          "description": "A 'Generate for Runner' button is present in the Analyze Source sub-tab.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Generate for Runner" },
+            "label": "Generate for Runner button"
+          },
+          "assertionType": "exists",
+          "precondition": "Analyze Source sub-tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-import-json-exists",
+          "description": "An 'Import JSON' button is present in the Analyze Source sub-tab.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Import JSON" },
+            "label": "Import JSON button"
+          },
+          "assertionType": "exists",
+          "precondition": "Analyze Source sub-tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-generate-for-runner-behavior",
+          "description": "Clicking 'Generate for Runner' invokes the sm_generate_static Tauri command against the runner project root. While running, button text changes to 'Generating...' and shows a spinner. On success, the config is imported via the 'sm-import-static' event, a success toast 'Imported static state machine: N states, M transitions' appears, and the active tab switches to Graph Editor. On failure, an error message appears below the buttons in the panel.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Generate for Runner" },
+            "label": "Generate for Runner button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Analyze Source sub-tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-explore-tab-behavior",
+          "description": "In the Explore sub-tab, the 'Start Exploration' button begins automated interaction with the connected app. Progress is shown as 'Progress: N / M interactions' and 'Current: {element}'. A 'Cancel' button appears during exploration. When complete, co-occurrence data is stored and the Phase 3 section becomes available.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Start Exploration" },
+            "label": "Start Exploration button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Explore sub-tab is active and an app is connected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-discovery-results",
+      "name": "Discovery Tab — Phase 3 & 4: Discover and Save",
+      "description": "After co-occurrence data is collected, the connect/collect panels hide and discovery controls appear. 'Discover States' runs the fingerprint-based state discovery algorithm (Tauri command ui_bridge_discover_states_from_fingerprints, with JS fallback). Results show a preview of discovered states. 'Save Configuration' (or auto-save via discover-and-save) creates a named config and switches to the Graph Editor tab.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "vga-discover-states-button",
+          "description": "After collection completes, a 'Discover States' button is visible in the discovery panel.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Discover States" },
+            "label": "Discover States button"
+          },
+          "assertionType": "exists",
+          "precondition": "Co-occurrence data has been collected (explore, record, or static import completed)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-discover-states-behavior",
+          "description": "Clicking 'Discover States' invokes ui_bridge_discover_states_from_fingerprints (Tauri) or falls back to JS-based discovery. The result is a FingerprintDiscoveryResult with an array of discovered states. After discovery, a state count preview and 'Save Configuration' input + button appear.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Discover States" },
+            "label": "Discover States button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Co-occurrence data has been collected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-save-config-behavior",
+          "description": "After discovery runs, clicking 'Save Configuration' creates a config with a user-provided name. The auto-save path names configs as '{AppName} — {Month Day, HH:MM AM/PM}'. On success, the new config is selected, all configs reload, and the active tab switches to Graph Editor.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save Configuration" },
+            "label": "Save Configuration button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Discovery has been run and returned at least one state",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-discovery-algorithm-correctness",
+          "description": "The fingerprint-based discovery algorithm groups UI elements into states by co-occurrence (elements that appear together across captures form a state). Correct output: (1) each state represents a distinct UI configuration — no two states have identical element sets; (2) all discovered elements are covered — none are dropped or duplicated across states; (3) transition data captures which action (click, type, navigate) on which element triggered each state change. If states have empty element lists or duplicate element sets, or if transitions reference nonexistent state IDs, the algorithm has a bug.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Discover States" },
+            "label": "Discovery algorithm results area"
+          },
+          "assertionType": "semantic",
+          "precondition": "Discovery has been run and returned at least one state",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-graph-editor",
+      "name": "Graph Editor Tab",
+      "description": "A ReactFlow-based interactive canvas displaying the state machine as a directed graph. When a config is loaded, states appear as nodes and transitions as edges. An 'Add Transition' FAB overlays the top-left of the canvas. Clicking a state opens the StateDetailPanel side panel on the right; clicking a transition opens the TransitionEditor. Element drag creates transitions (plain drag) or moves elements between states (Alt+drag). A pathfinding highlight overlays a color-coded traversal path on matching edges.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "vga-add-transition-button",
+          "description": "An 'Add Transition' button is present as a floating overlay in the top-left of the graph canvas when a config is loaded.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Add Transition" },
+            "label": "Add Transition FAB"
+          },
+          "assertionType": "exists",
+          "precondition": "Graph Editor tab is active and a configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-graph-state-panel-behavior",
+          "description": "Clicking a state node in the graph opens a StateDetailPanel side panel (320px wide) on the right. The panel shows a ProvenanceBadge (observed/ai-fallback/ai-generated) and an 'Invalidate observations' button above the standard state detail form. Clicking elsewhere or selecting a different node changes the selection.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Add Transition" },
+            "label": "State graph canvas area"
+          },
+          "assertionType": "behavior",
+          "precondition": "Graph Editor tab is active, a config is selected, and at least one state exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-add-transition-opens-editor",
+          "description": "Clicking 'Add Transition' clears any selected state/transition and opens the TransitionEditor side panel for creating a new transition.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Add Transition" },
+            "label": "Add Transition FAB"
+          },
+          "assertionType": "behavior",
+          "precondition": "Graph Editor tab is active and a configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-graph-data-model",
+          "description": "The state graph correctly represents the loaded config: every state appears as exactly one node; every transition appears as exactly one directed edge connecting source to target node. No orphaned edges (transitions to missing states) or phantom nodes (nodes without a corresponding state). The total node count equals the config's state count; total edge count equals the transition count.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "graphics-document" },
+            "label": "State machine graph canvas"
+          },
+          "assertionType": "semantic",
+          "precondition": "Graph Editor tab is active and a config with states and transitions is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-provenance-badge",
+      "name": "State Provenance Badge",
+      "description": "Each selected state in the graph side panel shows a ProvenanceBadge indicating its lifecycle status in the observation-driven pipeline. 'observed' (green) has real captured observations; 'ai-fallback' (yellow) was recently invalidated and is being rebuilt; 'ai-generated' (gray) has no discovery artifact match. Metadata shows observation count and age for observed, or invalidation age for ai-fallback.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vga-provenance-badge-observed",
+          "description": "When a state has provenance='observed', a green pill shows 'observed' with observation count and age metadata (e.g., 'observed · 5 obs · 2h ago').",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "observed" },
+            "label": "Observed provenance badge"
+          },
+          "assertionType": "semantic",
+          "precondition": "A state with provenance='observed' is selected in the graph",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-provenance-badge-ai-fallback",
+          "description": "When a state has provenance='ai-fallback', a yellow pill shows 'ai-fallback · invalidated {age} · rebuilding'.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ai-fallback" },
+            "label": "AI-fallback provenance badge"
+          },
+          "assertionType": "exists",
+          "precondition": "A state with provenance='ai-fallback' is selected in the graph",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-provenance-badge-ai-generated",
+          "description": "When a state has provenance='ai-generated' (or no provenance, treated as ai-generated), a gray pill shows 'ai-generated'.",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ai-generated" },
+            "label": "AI-generated provenance badge"
+          },
+          "assertionType": "exists",
+          "precondition": "A state with provenance='ai-generated' or no provenance is selected in the graph",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-state-view",
+      "name": "State View Tab",
+      "description": "The State View tab renders StateViewPanel from @qontinui/workflow-ui/state-machine, showing a list of all states with their elements, element thumbnails, and capture screenshots. Selecting a state updates the shared selectedStateId. The empty state message 'Select a configuration to view states' appears when no config is loaded.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vga-state-view-has-content",
+          "description": "When a config is selected, the State View tab displays states. Each state entry shows the state name and associated element identifiers.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "State list in State View"
+          },
+          "assertionType": "semantic",
+          "precondition": "State View tab is active and a config with at least one state is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-state-view-selection",
+          "description": "Clicking a state in the State View list selects it (updates selectedStateId). The selected state is visually highlighted. Navigating to Graph Editor should show the corresponding node selected.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "State list in State View"
+          },
+          "assertionType": "behavior",
+          "precondition": "State View tab is active and at least one state exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-transitions-tab",
+      "name": "Transitions Tab",
+      "description": "The Transitions tab renders TransitionsPanel showing the list of transitions with source/target states, action types, and runtime introspection data. When the tab opens with an active config, the runner API is queried for permitted and blocked triggers, surfacing the live state machine execution context alongside the static transition list.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vga-transitions-list-exists",
+          "description": "The Transitions tab displays a list of transitions when a config is selected. Each transition shows its source state, target state, and triggering action.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "Transitions list"
+          },
+          "assertionType": "semantic",
+          "precondition": "Transitions tab is active and a config with transitions is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-transitions-data-integrity",
+          "description": "Every transition in the list references a source state and a target state that both exist in the current config's state list. No transition should reference a state ID absent from the config — this indicates a data integrity error in the Tauri IPC layer or state deletion logic.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "list" },
+            "label": "Transitions list"
+          },
+          "assertionType": "semantic",
+          "precondition": "Transitions tab is active and a config with transitions is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-diagram-tab",
+      "name": "Diagram Tab",
+      "description": "The Diagram tab renders a Mermaid state diagram for the active config via DiagramTab from @qontinui/workflow-ui/state-machine. It shows a refresh control. When the state count exceeds ~50 (DIAGRAM_MAX_NODES), an 'unavailable' reason is displayed instead of rendering.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vga-diagram-rendered",
+          "description": "When a config with ≤50 states is selected and the Diagram tab is active, a Mermaid diagram is rendered showing the state machine.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to view the diagram" },
+            "label": "Diagram empty state message"
+          },
+          "assertionType": "notExists",
+          "precondition": "Diagram tab is active and a config with ≤50 states is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-diagram-large-config",
+          "description": "When a config has more than ~50 states, the Diagram tab shows an unavailable reason message explaining the diagram cannot be rendered due to size.",
+          "category": "behavior",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Diagram tab area"
+          },
+          "assertionType": "semantic",
+          "precondition": "Diagram tab is active and the config has more than 50 states",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-pathfinding-tab",
+      "name": "Pathfinding Tab",
+      "description": "The Pathfinding tab renders PathfindingPanel from @qontinui/workflow-ui/state-machine. Users select start and end states and compute the shortest path. Successful results are passed to the graph via onPathFound, highlighting the traversal path on Graph Editor edges.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "vga-pathfinding-empty-state",
+          "description": "When the Pathfinding tab is active and no config is selected, the message 'Select a configuration to use pathfinding' is displayed.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to use pathfinding" },
+            "label": "Pathfinding empty state message"
+          },
+          "assertionType": "exists",
+          "precondition": "Pathfinding tab is active and no configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-pathfinding-behavior",
+          "description": "The pathfinding panel lets users select source and target states. Finding a path sets highlightedPath to the result steps (or undefined when no path exists). Switching to Graph Editor should show the path edges visually highlighted.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to use pathfinding" },
+            "label": "Pathfinding panel"
+          },
+          "assertionType": "behavior",
+          "precondition": "Pathfinding tab is active and a config with at least two states and a connecting transition is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-exploration-tab",
+      "name": "Exploration Results Tab",
+      "description": "Renders StateExplorationResultsViewer. Uniquely, this tab's container uses absolute off-screen positioning (left: -9999px, 1×1px) when inactive instead of display:none, so the UI Bridge SDK can scan severity elements at any time. The viewer shows exploration run history, state coverage metrics, and discrepancy details grouped by severity (critical, warning, info) via data-testid attributes.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vga-exploration-tab-aria-label",
+          "description": "The 'Exploration Results' tab button has aria-label='exploration results navigation link or tab'.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Exploration Results" },
+            "label": "Exploration Results tab button"
+          },
+          "assertionType": "attribute",
+          "expected": "exploration results navigation link or tab",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-exploration-always-in-dom",
+          "description": "The StateExplorationResultsViewer is always present in the DOM. When the tab is inactive it is off-screen (left: -9999px, 1px × 1px) — not hidden with display:none — so the UI Bridge SDK can scan data-testid='severity-critical', 'severity-warning', 'severity-info' elements from any tab.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "idPattern": "severity-critical" },
+            "label": "Severity-critical element (always in DOM)"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-exploration-severity-elements",
+          "description": "StateExplorationResultsViewer renders severity grouping cards: data-testid='severity-critical' (critical discrepancies), 'severity-warning' (warnings), 'severity-info' (info). These are scannable at all times even when the Exploration Results tab is not active.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "idPattern": "severity-critical" },
+            "label": "Severity grouping cards"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one exploration run has been completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-exploration-dashboard-view",
+          "description": "The Exploration Results viewer defaults to Dashboard view showing summary metrics (pass rate, coverage), discrepancy counts by severity, and recent runs. View mode can switch to History (full run list) or Detail (selected run detail with states, confidence, elements, screenshots).",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Exploration results dashboard"
+          },
+          "assertionType": "semantic",
+          "precondition": "Exploration Results tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vga-export-tab",
+      "name": "Export Tab",
+      "description": "ExportPanel with heading 'Export', config summary (name, state count, transition count), and two action buttons: 'Save to File' (Tauri native dialog, writes JSON) and 'Load into Runtime' (POST /state-machine/load). Exported format is UIBridgeRuntime.from_dict() compatible.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "vga-export-heading",
+          "description": "The Export tab shows a heading 'Export'.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Export" },
+            "label": "Export panel heading"
+          },
+          "assertionType": "exists",
+          "precondition": "Export tab is active and a configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-export-config-info",
+          "description": "The export panel shows the active config name, state count ('N states'), and transition count ('M transitions').",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "states" },
+            "label": "State count in export panel"
+          },
+          "assertionType": "exists",
+          "precondition": "Export tab is active and a configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-save-to-file-exists",
+          "description": "A 'Save to File' button is present in the Export panel.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save to File" },
+            "label": "Save to File button"
+          },
+          "assertionType": "exists",
+          "precondition": "Export tab is active and a configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-load-into-runtime-exists",
+          "description": "A 'Load into Runtime' button is present in the Export panel.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Load into Runtime" },
+            "label": "Load into Runtime button"
+          },
+          "assertionType": "exists",
+          "precondition": "Export tab is active and a configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-save-to-file-behavior",
+          "description": "Clicking 'Save to File' opens a Tauri native save dialog with default filename '{config_name}_state_machine.json' and JSON filter. After a path is chosen, the config exports as JSON (buildExportConfig format, UIBridgeRuntime.from_dict() compatible) and is written to disk. Toast: 'Exported to {filePath}' on success, 'Export failed: {error}' on failure.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save to File" },
+            "label": "Save to File button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Export tab is active and a configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vga-load-into-runtime-behavior",
+          "description": "Clicking 'Load into Runtime' POSTs the config export JSON to /state-machine/load. Toast: 'State machine loaded into runtime' on success, 'Load failed: {error}' on failure. Both buttons are disabled while any export/load operation is in progress.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Load into Runtime" },
+            "label": "Load into Runtime button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Export tab is active and a configuration is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "UIBridgeStateMachinePage",
+    "pageUrl": "/?tab=state-machine",
+    "tags": ["state-machine", "vga", "ui-bridge", "discovery", "graph-editor", "exploration"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "discovery-tab",
+        "name": "Discovery Tab",
+        "description": "Discovery tab is active. Shows the 4-phase workflow for building a state machine config from a connected app or static analysis.",
+        "elements": [{ "role": "button", "textContent": "Scan for Apps" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "discovery-to-graph",
+            "name": "Switch to Graph Editor tab",
+            "description": "Click the Graph Editor tab button",
+            "activateStates": ["graph-editor-tab"],
+            "deactivateStates": ["discovery-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Graph Editor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "discovery-to-states",
+            "name": "Switch to State View tab",
+            "description": "Click the State View tab button",
+            "activateStates": ["state-view-tab"],
+            "deactivateStates": ["discovery-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "State View" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "discovery-to-transitions",
+            "name": "Switch to Transitions tab",
+            "description": "Click the Transitions tab button",
+            "activateStates": ["transitions-tab"],
+            "deactivateStates": ["discovery-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Transitions" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "discovery-to-diagram",
+            "name": "Switch to Diagram tab",
+            "description": "Click the Diagram tab button",
+            "activateStates": ["diagram-tab"],
+            "deactivateStates": ["discovery-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Diagram" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "discovery-to-pathfinding",
+            "name": "Switch to Pathfinding tab",
+            "description": "Click the Pathfinding tab button",
+            "activateStates": ["pathfinding-tab"],
+            "deactivateStates": ["discovery-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Pathfinding" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "discovery-to-exploration",
+            "name": "Switch to Exploration Results tab",
+            "description": "Click the Exploration Results tab button",
+            "activateStates": ["exploration-tab"],
+            "deactivateStates": ["discovery-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Exploration Results" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "discovery-to-export",
+            "name": "Switch to Export tab",
+            "description": "Click the Export tab button",
+            "activateStates": ["export-tab"],
+            "deactivateStates": ["discovery-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Export" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "graph-editor-tab",
+        "name": "Graph Editor Tab",
+        "description": "Graph Editor tab is active. Shows the ReactFlow state machine canvas with 'Add Transition' FAB (when a config is loaded).",
+        "elements": [{ "role": "button", "textContent": "Add Transition" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "graph-to-discovery",
+            "name": "Switch to Discovery tab",
+            "description": "Click the Discovery tab button",
+            "activateStates": ["discovery-tab"],
+            "deactivateStates": ["graph-editor-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "graph-to-states",
+            "name": "Switch to State View tab",
+            "description": "Click the State View tab button",
+            "activateStates": ["state-view-tab"],
+            "deactivateStates": ["graph-editor-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "State View" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "graph-to-transitions",
+            "name": "Switch to Transitions tab",
+            "description": "Click the Transitions tab button",
+            "activateStates": ["transitions-tab"],
+            "deactivateStates": ["graph-editor-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Transitions" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "graph-to-diagram",
+            "name": "Switch to Diagram tab",
+            "description": "Click the Diagram tab button",
+            "activateStates": ["diagram-tab"],
+            "deactivateStates": ["graph-editor-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Diagram" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "graph-to-pathfinding",
+            "name": "Switch to Pathfinding tab",
+            "description": "Click the Pathfinding tab button",
+            "activateStates": ["pathfinding-tab"],
+            "deactivateStates": ["graph-editor-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Pathfinding" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "graph-to-exploration",
+            "name": "Switch to Exploration Results tab",
+            "description": "Click the Exploration Results tab button",
+            "activateStates": ["exploration-tab"],
+            "deactivateStates": ["graph-editor-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Exploration Results" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "graph-to-export",
+            "name": "Switch to Export tab",
+            "description": "Click the Export tab button",
+            "activateStates": ["export-tab"],
+            "deactivateStates": ["graph-editor-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Export" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "state-view-tab",
+        "name": "State View Tab",
+        "description": "State View tab is active. Shows the StateViewPanel with the list of states, element thumbnails, and capture screenshots.",
+        "elements": [{ "textContent": "Select a configuration to view states" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "states-to-discovery",
+            "name": "Switch to Discovery tab",
+            "description": "Click the Discovery tab button",
+            "activateStates": ["discovery-tab"],
+            "deactivateStates": ["state-view-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "states-to-graph",
+            "name": "Switch to Graph Editor tab",
+            "description": "Click the Graph Editor tab button",
+            "activateStates": ["graph-editor-tab"],
+            "deactivateStates": ["state-view-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Graph Editor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "transitions-tab",
+        "name": "Transitions Tab",
+        "description": "Transitions tab is active. Shows TransitionsPanel with transition list and permitted/blocked trigger introspection.",
+        "elements": [{ "textContent": "Select a configuration to view transitions" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "transitions-to-graph",
+            "name": "Switch to Graph Editor tab",
+            "description": "Click the Graph Editor tab button",
+            "activateStates": ["graph-editor-tab"],
+            "deactivateStates": ["transitions-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Graph Editor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "transitions-to-discovery",
+            "name": "Switch to Discovery tab",
+            "description": "Click the Discovery tab button",
+            "activateStates": ["discovery-tab"],
+            "deactivateStates": ["transitions-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "diagram-tab",
+        "name": "Diagram Tab",
+        "description": "Diagram tab is active. Shows the DiagramTab component with Mermaid-rendered state machine visualization.",
+        "elements": [{ "textContent": "Select a configuration to view the diagram" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "diagram-to-graph",
+            "name": "Switch to Graph Editor tab",
+            "description": "Click the Graph Editor tab button",
+            "activateStates": ["graph-editor-tab"],
+            "deactivateStates": ["diagram-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Graph Editor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "diagram-to-discovery",
+            "name": "Switch to Discovery tab",
+            "description": "Click the Discovery tab button",
+            "activateStates": ["discovery-tab"],
+            "deactivateStates": ["diagram-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pathfinding-tab",
+        "name": "Pathfinding Tab",
+        "description": "Pathfinding tab is active. Shows PathfindingPanel for computing paths between states.",
+        "elements": [{ "textContent": "Select a configuration to use pathfinding" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "pathfinding-to-graph",
+            "name": "Switch to Graph Editor tab",
+            "description": "Click the Graph Editor tab to see path highlighted on canvas",
+            "activateStates": ["graph-editor-tab"],
+            "deactivateStates": ["pathfinding-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Graph Editor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "pathfinding-to-discovery",
+            "name": "Switch to Discovery tab",
+            "description": "Click the Discovery tab button",
+            "activateStates": ["discovery-tab"],
+            "deactivateStates": ["pathfinding-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "exploration-tab",
+        "name": "Exploration Results Tab",
+        "description": "Exploration Results tab is active. Shows StateExplorationResultsViewer with run history, discrepancy grouping by severity, and state detail panels.",
+        "elements": [{ "role": "button", "textContent": "Exploration Results" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "exploration-to-discovery",
+            "name": "Switch to Discovery tab",
+            "description": "Click the Discovery tab button",
+            "activateStates": ["discovery-tab"],
+            "deactivateStates": ["exploration-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "exploration-to-graph",
+            "name": "Switch to Graph Editor tab",
+            "description": "Click the Graph Editor tab button",
+            "activateStates": ["graph-editor-tab"],
+            "deactivateStates": ["exploration-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Graph Editor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "export-tab",
+        "name": "Export Tab",
+        "description": "Export tab is active. Shows ExportPanel with config summary and Save to File / Load into Runtime actions.",
+        "elements": [{ "role": "heading", "textContent": "Export" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "export-to-discovery",
+            "name": "Switch to Discovery tab",
+            "description": "Click the Discovery tab button",
+            "activateStates": ["discovery-tab"],
+            "deactivateStates": ["export-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Discovery" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "export-to-graph",
+            "name": "Switch to Graph Editor tab",
+            "description": "Click the Graph Editor tab button",
+            "activateStates": ["graph-editor-tab"],
+            "deactivateStates": ["export-tab"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Graph Editor" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,1 +1,3 @@
-export default function Files() { return null; }
+export default function Files() {
+  return null;
+}

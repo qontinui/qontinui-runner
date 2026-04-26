@@ -1,6 +1,5 @@
-import { useState } from "react";
-import { useBuildIdWatcher } from "@qontinui/ui-bridge/react";
-import { useApiBase } from "../lib/runner-api";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 /**
  * Watches for a binary swap mid-session and renders a non-blocking refresh
@@ -8,39 +7,27 @@ import { useApiBase } from "../lib/runner-api";
  * build the page was loaded from.
  *
  * Flow:
- *   1. `vite.config.ts` writes the build-id to `dist/build-id.txt` and
- *      bakes the same value into `index.html` as `<meta name="build-id">`.
- *   2. `build.rs` reads `dist/build-id.txt` and emits the same value as
- *      the `RUNNER_BUILD_ID` env baked into the binary; the `/health`
- *      handler exposes it at top-level `buildId`.
- *   3. `useBuildIdWatcher` reads the meta tag once on mount and polls
- *      `/health` for `{ buildId }`. On divergence (mid-session binary
- *      swap) it fires `onBuildIdChange` once.
- *   4. The banner offers a one-click reload that forces WebView2 to
- *      refetch the embedded index.html plus assets.
- *
- * Because Vite and cargo now read from the same on-disk source of truth,
- * a clean rebuild produces matching values — `onBuildIdChange` only fires
- * if someone swapped the exe behind the running webview.
- *
- * `useApiBase()` (rather than `getApiBase()`) is mandatory here: the
- * runner's actual port is resolved asynchronously via the `get_api_port`
- * Tauri command at startup; before that resolves, `getApiBase()` returns
- * the placeholder default `http://localhost:9876` (the *primary* runner's
- * port). On a temp/named runner that ran on a different port, the banner
- * would silently poll the primary's `/health` forever without re-subscribing
- * when the port arrived — which is exactly what manual testing surfaced.
- * `useApiBase` re-renders this component when `setApiPort` runs, the
- * `pollUrl` prop updates, and the watcher re-subscribes to the right URL.
+ *   1. `build.rs` bakes `RUNNER_BUILD_ID = <git-sha-short>-<unix-ms>` into
+ *      the binary. `vite.config.ts` independently bakes the same format
+ *      into `index.html` as `<meta name="build-id" content="...">`.
+ *   2. On mount, reads the meta tag and compares against `invoke('get_build_id')`
+ *      (exposes the binary's embedded `env!("RUNNER_BUILD_ID")`).
+ *   3. Because Vite reruns before cargo on a real rebuild, both values
+ *      diverge naturally on a binary swap; on a fresh intact install they match.
  */
 export function BuildRefreshBanner() {
-  const apiBase = useApiBase();
   const [stale, setStale] = useState(false);
-  useBuildIdWatcher({
-    pollUrl: `${apiBase}/health`,
-    pollIntervalMs: 30_000,
-    onBuildIdChange: () => setStale(true),
-  });
+
+  useEffect(() => {
+    const pageBuildId =
+      document.querySelector<HTMLMetaElement>('meta[name="build-id"]')?.content ?? null;
+    if (!pageBuildId) return;
+    invoke<string>("get_build_id")
+      .then((binaryBuildId) => {
+        if (binaryBuildId !== pageBuildId) setStale(true);
+      })
+      .catch(() => {});
+  }, []);
 
   if (!stale) return null;
 

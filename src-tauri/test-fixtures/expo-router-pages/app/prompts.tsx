@@ -1,1 +1,3 @@
-export default function Prompts() { return null; }
+export default function Prompts() {
+  return null;
+}

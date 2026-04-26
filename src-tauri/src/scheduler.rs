@@ -275,8 +275,7 @@ impl ScheduledTaskExt for ScheduledTask {
     }
 
     fn record_launch_failure(&mut self) {
-        self.consecutive_launch_failures =
-            self.consecutive_launch_failures.saturating_add(1);
+        self.consecutive_launch_failures = self.consecutive_launch_failures.saturating_add(1);
         self.modified_at = chrono::Utc::now().to_rfc3339();
     }
 

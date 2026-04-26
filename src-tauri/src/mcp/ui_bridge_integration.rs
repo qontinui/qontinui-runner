@@ -3786,38 +3786,65 @@ mod expo_router_tests {
         let mut paths: Vec<String> = pages.iter().map(|p| p.component_path.clone()).collect();
         paths.sort();
 
-        // Expected leaves (with normalized forward slashes):
-        // - app/(tabs)/index.tsx
-        // - app/(tabs)/settings.tsx
-        // - app/files/[...path].tsx
-        // - app/index.tsx
-        // - app/prompts.tsx
-        // - app/run/[id].tsx
-        // _layout.tsx files MUST NOT appear.
+        // Expected leaves (with normalized forward slashes). Covers every
+        // Expo Router pattern that appears in real projects:
+        //   - root index            (app/index.tsx)
+        //   - plain page            (app/prompts.tsx)
+        //   - hyphenated kebab name (app/state-explorer.tsx)
+        //   - modal-presentation
+        //     Stack screen          (app/connect.tsx) — modal-ness is
+        //                                              decided in _layout.tsx,
+        //                                              not at the file level.
+        //   - tabs group            (app/(tabs)/index.tsx, app/(tabs)/settings.tsx)
+        //   - auth group with
+        //     non-index routes      (app/(auth)/login.tsx)
+        //   - dynamic param         (app/run/[id].tsx)
+        //   - catch-all             (app/files/[...path].tsx)
+        // Every `_layout.tsx` (root, tabs, auth) MUST be skipped.
         let expected = vec![
+            "app/(auth)/login.tsx".to_string(),
             "app/(tabs)/index.tsx".to_string(),
             "app/(tabs)/settings.tsx".to_string(),
+            "app/connect.tsx".to_string(),
             "app/files/[...path].tsx".to_string(),
             "app/index.tsx".to_string(),
             "app/prompts.tsx".to_string(),
             "app/run/[id].tsx".to_string(),
+            "app/state-explorer.tsx".to_string(),
         ];
         assert_eq!(paths, expected, "discovered page set mismatch");
 
-        // Verify routes for representative pages.
+        // Verify routes for representative pages — including the patterns
+        // unique to qontinui-mobile (hyphenated names, auth-group routes,
+        // modal-presentation screens that are still plain files in `app/`).
         let by_path: std::collections::HashMap<&str, &PageComponent> = pages
             .iter()
             .map(|p| (p.component_path.as_str(), p))
             .collect();
         assert_eq!(by_path["app/index.tsx"].route, "/");
         assert_eq!(by_path["app/prompts.tsx"].route, "/prompts");
+        assert_eq!(by_path["app/connect.tsx"].route, "/connect");
+        assert_eq!(
+            by_path["app/state-explorer.tsx"].route, "/state-explorer",
+            "hyphenated kebab-case routes must be preserved verbatim"
+        );
         assert_eq!(by_path["app/(tabs)/settings.tsx"].route, "/settings");
         assert_eq!(by_path["app/(tabs)/index.tsx"].route, "/");
+        assert_eq!(
+            by_path["app/(auth)/login.tsx"].route, "/login",
+            "auth-group non-index routes must drop the group segment"
+        );
         assert_eq!(by_path["app/run/[id].tsx"].route, "/run/[id]");
         assert_eq!(by_path["app/files/[...path].tsx"].route, "/files/[...path]");
 
         // Verify component names for representative pages.
         assert_eq!(by_path["app/prompts.tsx"].component_name, "PromptsPage");
+        assert_eq!(by_path["app/connect.tsx"].component_name, "ConnectPage");
+        assert_eq!(
+            by_path["app/state-explorer.tsx"].component_name, "StateExplorerPage",
+            "hyphenated names must convert to PascalCase + Page suffix"
+        );
+        assert_eq!(by_path["app/(auth)/login.tsx"].component_name, "LoginPage");
         assert_eq!(
             by_path["app/files/[...path].tsx"].component_name,
             "PathPage"

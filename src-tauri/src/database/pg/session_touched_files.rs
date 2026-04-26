@@ -441,8 +441,11 @@ mod tests {
         // Expected: 3 pairs total (A+file1, A+file2, B+file1). Session C
         // touched a path we didn't query for, so it must NOT appear.
         assert_eq!(pairs.len(), 3, "got {:?}", pairs);
-        assert!(!pairs.iter().any(|(_, s)| s == &session_c),
-            "session_c touched an unrelated file and must not appear: {:?}", pairs);
+        assert!(
+            !pairs.iter().any(|(_, s)| s == &session_c),
+            "session_c touched an unrelated file and must not appear: {:?}",
+            pairs
+        );
 
         // Most-recent-first ordering: B's touch of file1 was last, so it
         // must be the first row.

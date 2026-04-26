@@ -448,7 +448,7 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
     // `tokio::time::timeout(HEARTBEAT_TIMEOUT, …)` — that would drop the
     // connection at exactly 45 s regardless of frame activity, because
     // tokio's `timeout` does not reset on inner await progress.
-    let recv_outcome = async {
+    async {
         loop {
             let next = tokio::time::timeout(HEARTBEAT_TIMEOUT, stream.next()).await;
             let msg = match next {
@@ -491,7 +491,6 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
         }
     }
     .await;
-    let _ = recv_outcome;
 
     // 6. Clean up. We reject all pending commands on disconnect so their
     //    awaiters don't have to wait for the 30s default timeout; this

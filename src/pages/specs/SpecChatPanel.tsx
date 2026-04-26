@@ -45,7 +45,12 @@ function MessageBubble({
 }: {
   role: "user" | "ai" | "system";
   content: string;
-  specActions?: Array<{ kind: FileSpecKind; label: string; onApply: () => void }>;
+  specActions?: Array<{
+    kind: FileSpecKind;
+    label: string;
+    specId?: string | null;
+    onApply: () => void;
+  }>;
 }) {
   if (role === "system") {
     return (
@@ -85,7 +90,11 @@ function MessageBubble({
             {specActions.map((action) => (
               <button
                 key={`${action.kind}-${action.label}`}
-                data-ui-id={`spec-chat-apply-${action.kind}`}
+                data-testid={
+                  action.specId
+                    ? `apply-${action.kind}-${action.specId.replace(/[:/\\]/g, "-")}`
+                    : undefined
+                }
                 onClick={action.onApply}
                 className="w-full flex items-center gap-1.5 px-2 py-1 text-[10px] font-medium rounded
                   bg-green-500/10 text-green-400 border border-green-500/20
@@ -280,6 +289,7 @@ function ChatMessageList({
             ? extractSpecJsonFromMessage(msg.content).map((extracted) => ({
                 kind: extracted.kind,
                 label: extracted.label,
+                specId: extracted.kind === "page-spec" && targetSpecId ? targetSpecId : null,
                 onApply: () => {
                   const specId =
                     targetSpecId && extracted.kind === "page-spec"

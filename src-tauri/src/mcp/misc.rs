@@ -1791,7 +1791,7 @@ async fn delete_instance(
     if !result.any() {
         return Err((
             axum::http::StatusCode::NOT_FOUND,
-            Json(ApiResponse::error(&format!(
+            Json(ApiResponse::error(format!(
                 "Instance '{}' not found in in-memory map or DB registry",
                 id
             ))),
@@ -1962,8 +1962,10 @@ struct SpawnPlacementPreviewResponse {
 async fn preview_spawn_placement_route(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(q): axum::extract::Query<SpawnPlacementPreviewQuery>,
-) -> Result<Json<ApiResponse<SpawnPlacementPreviewResponse>>, (axum::http::StatusCode, Json<serde_json::Value>)>
-{
+) -> Result<
+    Json<ApiResponse<SpawnPlacementPreviewResponse>>,
+    (axum::http::StatusCode, Json<serde_json::Value>),
+> {
     let configs = crate::settings::get_runner_instances();
     // Slot 0 is the primary; slots 1.. are configured instances.
     let total_slots = configs.len() + 1;
@@ -2084,16 +2086,18 @@ async fn preview_spawn_placement_route(
         )
     })?;
 
-    let resolved = crate::spawn_placement::resolve_to_global_physical(&state.app_handle, &placement)
-        .map_err(|e| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("failed to resolve placement: {}", e),
-                    "slot": q.slot,
-                })),
-            )
-        })?;
+    let resolved =
+        crate::spawn_placement::resolve_to_global_physical(&state.app_handle, &placement).map_err(
+            |e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("failed to resolve placement: {}", e),
+                        "slot": q.slot,
+                    })),
+                )
+            },
+        )?;
 
     Ok(Json(ApiResponse::success(SpawnPlacementPreviewResponse {
         global_x: resolved.global_x,

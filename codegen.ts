@@ -18,10 +18,7 @@ const config: CodegenConfig = {
   documents: ["src/hooks/graphql/documents.ts"],
   generates: {
     "src/generated/graphql.ts": {
-      plugins: [
-        "typescript",
-        "typescript-operations",
-      ],
+      plugins: ["typescript", "typescript-operations"],
       config: {
         // Use exact optional properties
         avoidOptionals: false,

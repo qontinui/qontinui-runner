@@ -392,12 +392,14 @@ mod tests {
         let repo_a = repo.clone();
         let repo_b = repo.clone();
 
-        let h1 = tokio::spawn(async move {
-            commit_files(&repo_a, &["c1.txt".into()], "concurrent 1").await
-        });
-        let h2 = tokio::spawn(async move {
-            commit_files(&repo_b, &["c2.txt".into()], "concurrent 2").await
-        });
+        let h1 =
+            tokio::spawn(
+                async move { commit_files(&repo_a, &["c1.txt".into()], "concurrent 1").await },
+            );
+        let h2 =
+            tokio::spawn(
+                async move { commit_files(&repo_b, &["c2.txt".into()], "concurrent 2").await },
+            );
 
         let (r1, r2) = tokio::join!(h1, h2);
         let o1 = r1.expect("task 1 join").expect("task 1 commit");
@@ -437,12 +439,10 @@ mod tests {
         let r1 = repo1.clone();
         let r2 = repo2.clone();
 
-        let h1 = tokio::spawn(async move {
-            commit_files(&r1, &["x.txt".into()], "repo1 commit").await
-        });
-        let h2 = tokio::spawn(async move {
-            commit_files(&r2, &["y.txt".into()], "repo2 commit").await
-        });
+        let h1 =
+            tokio::spawn(async move { commit_files(&r1, &["x.txt".into()], "repo1 commit").await });
+        let h2 =
+            tokio::spawn(async move { commit_files(&r2, &["y.txt".into()], "repo2 commit").await });
 
         let (res1, res2) = tokio::join!(h1, h2);
         let o1 = res1.expect("join 1").expect("commit 1");
@@ -488,7 +488,11 @@ mod tests {
 
         let result = commit_files(&repo, &["hooked.txt".into()], "should be blocked").await;
 
-        assert!(result.is_err(), "expected Err from blocked hook, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected Err from blocked hook, got {:?}",
+            result
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("commit failed") || err.contains("pre-commit"),
@@ -510,12 +514,8 @@ mod tests {
         let before = head_hash(&repo);
 
         // Path doesn't exist; git add -- <missing> will fail.
-        let result = commit_files(
-            &repo,
-            &["does-not-exist.txt".into()],
-            "should never commit",
-        )
-        .await;
+        let result =
+            commit_files(&repo, &["does-not-exist.txt".into()], "should never commit").await;
 
         assert!(result.is_err(), "expected Err, got {:?}", result);
         assert_eq!(head_hash(&repo), before, "HEAD must not advance");

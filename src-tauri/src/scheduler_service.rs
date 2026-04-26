@@ -611,10 +611,7 @@ impl SchedulerService {
                 // etc.). Treat as LaunchFailed and trigger backoff.
                 record.mark_launch_failed(Some(e.clone()));
                 launch_failed = true;
-                error!(
-                    "Scheduler: Task '{}' failed to launch: {}",
-                    task_name, e
-                );
+                error!("Scheduler: Task '{}' failed to launch: {}", task_name, e);
 
                 if auto_fix_on_failure {
                     info!(
@@ -681,10 +678,7 @@ impl SchedulerService {
         let mut task = match pg.get_scheduled_task(task_id).await {
             Ok(Some(t)) => t,
             Ok(None) => {
-                error!(
-                    "apply_launch_failure_backoff: task {} not found",
-                    task_id
-                );
+                error!("apply_launch_failure_backoff: task {} not found", task_id);
                 return;
             }
             Err(e) => {
@@ -872,7 +866,8 @@ impl SchedulerService {
                     }
                 }
 
-                self.apply_launch_failure_backoff(&task_id, &task_name).await;
+                self.apply_launch_failure_backoff(&task_id, &task_name)
+                    .await;
 
                 let mut running = self.running_tasks.write().await;
                 running.retain(|id| id != &task_id);
@@ -1917,23 +1912,21 @@ fn iter_slots_in_window(
             // Same defensive cap as the cron branch.
             while cursor <= to && out.len() < 100_000 {
                 out.push(cursor);
-                cursor = cursor + step;
+                cursor += step;
             }
             out
         }
-        ScheduleExpression::Once(iso) => {
-            match chrono::DateTime::parse_from_rfc3339(iso) {
-                Ok(dt) => {
-                    let dt_utc = dt.with_timezone(&Utc);
-                    if dt_utc > from && dt_utc <= to {
-                        vec![dt_utc]
-                    } else {
-                        Vec::new()
-                    }
+        ScheduleExpression::Once(iso) => match chrono::DateTime::parse_from_rfc3339(iso) {
+            Ok(dt) => {
+                let dt_utc = dt.with_timezone(&Utc);
+                if dt_utc > from && dt_utc <= to {
+                    vec![dt_utc]
+                } else {
+                    Vec::new()
                 }
-                Err(_) => Vec::new(),
             }
-        }
+            Err(_) => Vec::new(),
+        },
         ScheduleExpression::Condition(_) => Vec::new(),
     }
 }
@@ -2339,10 +2332,7 @@ mod tests {
     /// after `launch_remote_agent` returns.
     async fn spawn_prompts_run_mock(
         response: axum::response::Response,
-    ) -> (
-        u16,
-        Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
-    ) {
+    ) -> (u16, Arc<tokio::sync::Mutex<Option<serde_json::Value>>>) {
         use axum::{extract::State, routing::post, Router};
 
         let captured = Arc::new(tokio::sync::Mutex::new(None::<serde_json::Value>));
@@ -2358,27 +2348,19 @@ mod tests {
             axum::Json(body): axum::Json<serde_json::Value>,
         ) -> axum::response::Response {
             *captured.lock().await = Some(body);
-            response_slot
-                .lock()
-                .await
-                .take()
-                .unwrap_or_else(|| {
-                    axum::response::Response::builder()
-                        .status(500)
-                        .body(axum::body::Body::from(
-                            "mock response already consumed",
-                        ))
-                        .unwrap()
-                })
+            response_slot.lock().await.take().unwrap_or_else(|| {
+                axum::response::Response::builder()
+                    .status(500)
+                    .body(axum::body::Body::from("mock response already consumed"))
+                    .unwrap()
+            })
         }
 
         let app = Router::new()
             .route("/prompts/run", post(handler))
             .with_state((captured.clone(), response_slot));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
         tokio::spawn(async move {
@@ -2437,15 +2419,9 @@ mod tests {
         assert_eq!(body["max_turns"], 25);
         assert_eq!(body["working_directory"], "/tmp/work");
         assert_eq!(body["model"], "claude-sonnet-4-6");
-        assert_eq!(
-            body["allowed_tools"],
-            serde_json::json!(["Bash", "Read"])
-        );
+        assert_eq!(body["allowed_tools"], serde_json::json!(["Bash", "Read"]));
         assert_eq!(body["mcp_connections"][0]["name"], "filesystem");
-        assert_eq!(
-            body["mcp_connections"][0]["url"],
-            "http://example.com/mcp"
-        );
+        assert_eq!(body["mcp_connections"][0]["url"], "http://example.com/mcp");
     }
 
     #[tokio::test]
@@ -2460,16 +2436,7 @@ mod tests {
 
         let service = SchedulerService::new(None);
         let result = service
-            .launch_remote_agent(
-                "minimal",
-                "do the thing",
-                None,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-            )
+            .launch_remote_agent("minimal", "do the thing", None, None, &[], &[], None, None)
             .await;
 
         assert_eq!(result.unwrap(), "sid-456");
@@ -2586,8 +2553,14 @@ mod tests {
         let slots = iter_slots_in_window(&interval(3600), from, to);
         assert_eq!(slots.len(), 6, "expected 6 hourly slots in 6h window");
         // First slot should be from + 1h, last should be from + 6h == to.
-        assert_eq!(slots.first().copied(), Some(from + chrono::Duration::hours(1)));
-        assert_eq!(slots.last().copied(), Some(from + chrono::Duration::hours(6)));
+        assert_eq!(
+            slots.first().copied(),
+            Some(from + chrono::Duration::hours(1))
+        );
+        assert_eq!(
+            slots.last().copied(),
+            Some(from + chrono::Duration::hours(6))
+        );
     }
 
     #[test]
@@ -2611,11 +2584,8 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let to = from + chrono::Duration::minutes(390); // exactly 07:00
-        let slots = iter_slots_in_window(
-            &ScheduleExpression::Cron("0 * * * *".to_string()),
-            from,
-            to,
-        );
+        let slots =
+            iter_slots_in_window(&ScheduleExpression::Cron("0 * * * *".to_string()), from, to);
         assert_eq!(slots.len(), 7, "expected 01:00..=07:00 inclusive");
         // First slot is 01:00.
         let first = chrono::DateTime::parse_from_rfc3339("2026-01-01T01:00:00Z")
@@ -2636,11 +2606,7 @@ mod tests {
             .with_timezone(&Utc);
         let to = from + chrono::Duration::hours(2);
         let target = from + chrono::Duration::hours(1);
-        let slots = iter_slots_in_window(
-            &ScheduleExpression::Once(target.to_rfc3339()),
-            from,
-            to,
-        );
+        let slots = iter_slots_in_window(&ScheduleExpression::Once(target.to_rfc3339()), from, to);
         assert_eq!(slots, vec![target]);
     }
 
@@ -2653,30 +2619,23 @@ mod tests {
 
         // Before window.
         let before = from - chrono::Duration::hours(1);
-        assert!(iter_slots_in_window(
-            &ScheduleExpression::Once(before.to_rfc3339()),
-            from,
-            to
-        )
-        .is_empty());
+        assert!(
+            iter_slots_in_window(&ScheduleExpression::Once(before.to_rfc3339()), from, to)
+                .is_empty()
+        );
 
         // After window.
         let after = to + chrono::Duration::hours(1);
-        assert!(iter_slots_in_window(
-            &ScheduleExpression::Once(after.to_rfc3339()),
-            from,
-            to
-        )
-        .is_empty());
+        assert!(
+            iter_slots_in_window(&ScheduleExpression::Once(after.to_rfc3339()), from, to)
+                .is_empty()
+        );
 
         // Exactly at `from` is excluded (same convention as cron's
         // `after(&from)`).
-        assert!(iter_slots_in_window(
-            &ScheduleExpression::Once(from.to_rfc3339()),
-            from,
-            to
-        )
-        .is_empty());
+        assert!(
+            iter_slots_in_window(&ScheduleExpression::Once(from.to_rfc3339()), from, to).is_empty()
+        );
     }
 
     #[test]
@@ -2847,8 +2806,8 @@ mod tests {
         let normal_next = Some(now + chrono::Duration::minutes(30)); // top of next hour
         let backoff = Some(chrono::Duration::seconds(240));
 
-        let next = compute_launch_failed_next_run(normal_next, backoff, now)
-            .expect("next_run is Some");
+        let next =
+            compute_launch_failed_next_run(normal_next, backoff, now).expect("next_run is Some");
         assert_eq!(next, normal_next.unwrap());
         // Distance from now should be > backoff (cron-driven)
         assert!((next - now).num_seconds() > 240);
@@ -2866,8 +2825,8 @@ mod tests {
         let normal_next = Some(now + chrono::Duration::seconds(30));
         let backoff = Some(chrono::Duration::seconds(60));
 
-        let next = compute_launch_failed_next_run(normal_next, backoff, now)
-            .expect("next_run is Some");
+        let next =
+            compute_launch_failed_next_run(normal_next, backoff, now).expect("next_run is Some");
         assert_eq!((next - now).num_seconds(), 60);
     }
 
@@ -2997,9 +2956,6 @@ mod tests {
         // Distinct from `complete(false, _)` which yields runtime Failed.
         let mut runtime_record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
         runtime_record.complete(false, Some("runtime error".to_string()));
-        assert!(matches!(
-            runtime_record.status,
-            ScheduledTaskStatus::Failed
-        ));
+        assert!(matches!(runtime_record.status, ScheduledTaskStatus::Failed));
     }
 }

@@ -712,10 +712,8 @@ impl LoopController {
         //   None      → commit iff use_worktree
         //   Some(true)→ always commit
         //   Some(false)→ never commit
-        let should_commit = resolve_auto_commit_policy(
-            config.auto_commit_subagents,
-            config.use_worktree,
-        );
+        let should_commit =
+            resolve_auto_commit_policy(config.auto_commit_subagents, config.use_worktree);
 
         if config.auto_commit_subagents == Some(false) {
             tracing::debug!(

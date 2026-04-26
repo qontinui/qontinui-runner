@@ -1499,8 +1499,13 @@ Tell the user: "The qontinui-runner needs to be restarted manually to apply chan
         );
         for conn in &remote_mcp_connections {
             match &conn.url {
-                Some(url) => mcp_section.push_str(&format!("- **{}** (override URL: {})\n", conn.name, url)),
-                None => mcp_section.push_str(&format!("- **{}** (use runner's configured URL)\n", conn.name)),
+                Some(url) => {
+                    mcp_section.push_str(&format!("- **{}** (override URL: {})\n", conn.name, url))
+                }
+                None => mcp_section.push_str(&format!(
+                    "- **{}** (use runner's configured URL)\n",
+                    conn.name
+                )),
             }
         }
         mcp_section.push_str("\n---\n\n");

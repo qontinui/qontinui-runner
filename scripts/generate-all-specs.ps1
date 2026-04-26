@@ -67,15 +67,28 @@ function Expand-RunnerTree {
 }
 
 function Wait-ForApplyButton {
-    param([int]$MaxMins = 35, [string]$ExcludeId = "")
+    # $SpecId: the runner:xxx specId for the page being generated. When provided, looks for
+    # the specific data-testid-based button ID that SpecChatPanel now emits, so ID collisions
+    # between pages with similar description prefixes no longer cause false timeouts.
+    # Falls back to the old wildcard pattern for pages without a specId or for compatibility.
+    param([int]$MaxMins = 35, [string]$ExcludeId = "", [string]$SpecId = "")
     $maxSecs = $MaxMins * 60
     $elapsed = 0
     $interval = 20
+    # Derive the stable testid-based element ID: "apply-page-spec-runner-decision-trail"
+    $specificId = if ($SpecId) { "apply-page-spec-$($SpecId -replace '[:/\\]', '-')" } else { $null }
     while ($elapsed -lt $maxSecs) {
         Start-Sleep -Seconds $interval
         $elapsed += $interval
         $elements = Get-UIElements
-        $btn = $elements | Where-Object { $_.id -like "button-apply-as-page-spec*" -and $_.id -ne $ExcludeId } | Select-Object -First 1
+        # Prefer stable specId-based button (unique per page, no collision risk)
+        $btn = if ($specificId) {
+            $elements | Where-Object { $_.id -eq $specificId } | Select-Object -First 1
+        } else { $null }
+        # Fall back to old wildcard pattern (excludes any pre-existing button by ID)
+        if (-not $btn) {
+            $btn = $elements | Where-Object { $_.id -like "button-apply-as-page-spec*" -and $_.id -ne $ExcludeId } | Select-Object -First 1
+        }
         if ($btn) { return $btn.id }
         Log "  Waiting... ($([int]($elapsed/60))m/$MaxMins m)"
     }
@@ -210,12 +223,14 @@ for ($i = 0; $i -lt $pageBtns.Count; $i++) {
     $taskId = Get-RecentSpecTaskId
     Log "  Task ID: $taskId"
 
-    # Wait for a NEW apply button (different from any pre-existing one)
+    # Wait for a NEW apply button — use specId-based detection to avoid ID collisions
     Log "  Waiting up to $MaxMinutes min for spec (excluding: $preExistingApply)..."
-    $applyId = Wait-ForApplyButton -MaxMins $MaxMinutes -ExcludeId $preExistingApply
+    $applyId = Wait-ForApplyButton -MaxMins $MaxMinutes -ExcludeId $preExistingApply -SpecId $specId
     if (-not $applyId) {
-        Log "  ERROR: Timed out waiting for $btn (>${MaxMinutes}m)"
+        Log "  ERROR: Timed out waiting for $btn (>${MaxMinutes}m) — falling back to task output extraction"
         $failed++
+        if (-not $taskId) { $taskId = Get-RecentSpecTaskId }
+        Extract-AndSave-Spec -taskId $taskId -specId $specId
         continue
     }
 

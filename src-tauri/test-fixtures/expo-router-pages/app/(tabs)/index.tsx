@@ -1,1 +1,3 @@
-export default function TabsHome() { return null; }
+export default function TabsHome() {
+  return null;
+}

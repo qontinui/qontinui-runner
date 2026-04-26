@@ -1,0 +1,931 @@
+{
+  "version": "1.0.0",
+  "description": "Log Sources settings tab within the runner Settings panel. Provides global log source configuration shared across all projects. Contains three collapsible sections: 'AI Source Selection' (radio buttons for Dynamic/Static/Disabled modes), 'Log Sources' (list of file/glob/directory sources with enable/disable, edit, delete), and 'Profiles' (named groups of sources). Source changes are held in local state and persisted only when 'Save Changes' is clicked. Two modals are available: SourceEditor (for add/edit of individual sources with basic fields and an optional Error Monitoring subsection) and ProfileEditor (for creating named profiles that group sources). A delete confirmation modal guards destructive operations. An 'Import from Projects' button migrates per-project sources to global settings. All settings are stored via Tauri IPC (get_global_log_sources / save_global_log_sources).",
+  "groups": [
+    {
+      "id": "ls-page-structure",
+      "name": "Page Structure",
+      "description": "The Log Sources tab renders a SectionHeader followed by an action row (Import from Projects + Save Changes), then three collapsible card sections: AI Source Selection, Log Sources, and Profiles. All sections are expanded by default on load.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ls-heading-exists",
+          "description": "A heading with text 'Log Sources' is present as the section title",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Log Sources" },
+            "label": "Log Sources section heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-description-exists",
+          "description": "A description paragraph reading 'Configure global log sources shared across all projects. Use profiles to group sources for different workflows, or let AI automatically select relevant sources.' is visible below the heading",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Configure global log sources shared across all projects"
+            },
+            "label": "Log Sources description"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-three-sections-present",
+          "description": "Three collapsible card sections are rendered in order: 'AI Source Selection', 'Log Sources (N)', and 'Profiles (N)'. All three are expanded by default when the tab is first opened. Each section header is a clickable button that collapses/expands its content.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "ai source selection" },
+            "label": "Page sections container"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-loading-state",
+          "description": "While settings are loading from the Tauri backend, a spinning RefreshCw icon is shown centered in the page area. The three sections and Save Changes button are not rendered until loading completes.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "img" },
+            "label": "Loading spinner"
+          },
+          "assertionType": "behavior",
+          "precondition": "Settings are being fetched from the Tauri backend",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-action-buttons",
+      "name": "Page Action Buttons",
+      "description": "The action bar below the SectionHeader contains two buttons: 'Import from Projects' on the left and 'Save Changes' on the right. Save Changes persists all pending source/profile/settings changes via save_global_log_sources IPC. Changes are NOT auto-saved; they accumulate in local state until Save is clicked.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ls-save-button-exists",
+          "description": "A 'Save Changes' button is present in the action bar",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save Changes" },
+            "label": "Save Changes button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-import-button-exists",
+          "description": "An 'Import from Projects' button is present on the left side of the action bar",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Import from Projects" },
+            "label": "Import from Projects button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-save-persists",
+          "description": "Clicking 'Save Changes' calls the Tauri IPC command save_global_log_sources with the full current settings object. On success, the button briefly shows a spinning icon and a success log message 'Log source settings saved' is emitted. On failure, an error message is shown. The button shows a spinning icon (disabled state) during the save operation.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save Changes" },
+            "label": "Save Changes button"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-import-migrates",
+          "description": "Clicking 'Import from Projects' calls the Tauri IPC command migrate_project_sources_to_global. On success, a log message reading 'Migrated N log sources' is shown and the sources list refreshes to include the migrated entries. On failure, an error message is shown.",
+          "category": "behavior",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Import from Projects" },
+            "label": "Import from Projects button"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-ai-selection-section",
+      "name": "AI Source Selection Section",
+      "description": "The AI Source Selection section controls how the AI picks relevant log sources during workflow execution. It contains three radio button options: Dynamic (re-evaluate each verification round), Static (select once at workflow start), Disabled (use profiles or all enabled sources). The section is collapsible via its header button. The Sparkles icon accompanies the heading.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ls-ai-section-heading",
+          "description": "A heading with data-content-label 'ai source selection' and text 'AI Source Selection' is present, accompanied by a Sparkles icon",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "ai source selection" },
+            "label": "AI Source Selection heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-ai-three-modes",
+          "description": "Three radio button options are visible when the section is expanded: 'Dynamic' with description 'Re-evaluate at each verification round', 'Static' with description 'Select once at workflow start', and 'Disabled' with description 'Use profiles or all enabled sources'. Exactly one option is selected at any time.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "ai source selection" },
+            "label": "AI mode radio group"
+          },
+          "assertionType": "semantic",
+          "precondition": "AI Source Selection section is expanded",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-ai-mode-selection",
+          "description": "Clicking a radio option immediately updates the selected mode in local UI. The selected option shows a highlighted background (bg-primary/10 with border-primary/20). Changing the mode updates local state but does not persist until Save Changes is clicked.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "radio" },
+            "label": "AI mode radio buttons"
+          },
+          "assertionType": "behavior",
+          "precondition": "AI Source Selection section is expanded",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-ai-collapse-toggle",
+          "description": "Clicking the AI Source Selection section header button collapses the radio options area. A ChevronDown icon is shown when expanded; ChevronRight when collapsed. Clicking again expands it.",
+          "category": "behavior",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "ai source selection" },
+            "label": "AI Source Selection collapse toggle"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-sources-section",
+      "name": "Log Sources Section",
+      "description": "The Log Sources section lists all configured global log sources. The heading shows the count: 'Log Sources (N)'. Each source row shows a color dot, enable/disable checkbox, name, path, format/parser badges, type badge, and category badge, plus Edit and Delete icon buttons. When empty, a placeholder message is shown. An 'Add Source' button opens the SourceEditor modal.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "ls-sources-heading",
+          "description": "A heading with data-content-label 'log sources count' displays 'Log Sources (N)' where N is the current number of configured sources",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "log sources count" },
+            "label": "Log Sources count heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-add-source-button",
+          "description": "An 'Add Source' button with a Plus icon is present in the sources section header row",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Add Source" },
+            "label": "Add Source button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-sources-empty-state",
+          "description": "When no sources are configured, the section body shows the message 'No log sources configured. Add sources or import from existing projects.' in muted text",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No log sources configured" },
+            "label": "Empty sources message"
+          },
+          "assertionType": "exists",
+          "precondition": "The sources list is empty",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-source-row-structure",
+          "description": "Each source row displays: a checkbox-style toggle (filled primary color when enabled, outlined when disabled), a small color dot (using the source's color or category default color), the source name (data-content-label='source name'), the file path with optional format/parser annotations (data-content-label='source path'), a type badge (data-content-label='source type': file/glob/directory), a category badge (data-content-label='source category': one of frontend/backend/api/mobile/database/build/testing/runner/general), and Edit + Delete icon buttons. Disabled sources have 60% opacity.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "source name" },
+            "label": "Source row"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one log source is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-source-toggle-behavior",
+          "description": "Clicking the checkbox-style toggle on a source row immediately flips its enabled state in local UI. Enabled sources show a Check icon inside the filled checkbox; disabled sources show an empty outlined box. The change is held in local state and persists only after 'Save Changes' is clicked.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "source name" },
+            "label": "Source enable toggle"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least one log source is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-profiles-section",
+      "name": "Profiles Section",
+      "description": "The Profiles section lists named groups of log sources. The heading shows 'Profiles (N)'. Each profile row shows the profile name, a 'Default' badge if it is the active default, and an enabled/total source count (e.g. '3/5 sources enabled'). Row actions include 'Set Default' (only shown for non-default profiles), Edit, and Delete. When empty, a placeholder message is shown. An 'Add Profile' button opens the ProfileEditor modal.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "ls-profiles-heading",
+          "description": "A heading with data-content-label 'profiles count' displays 'Profiles (N)' where N is the current number of configured profiles",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "profiles count" },
+            "label": "Profiles count heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-profiles-empty-state",
+          "description": "When no profiles are configured, the section body shows the message 'No profiles configured. Profiles group log sources for different workflows.' in muted text",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No profiles configured" },
+            "label": "Empty profiles message"
+          },
+          "assertionType": "exists",
+          "precondition": "The profiles list is empty",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-profile-row-structure",
+          "description": "Each profile row shows: the profile name (data-content-label='profile name'), a 'Default' badge (data-content-label='default profile badge') visible only on the currently-selected default profile, and a source count metric (data-content-label='enabled sources count') formatted as 'N/M sources enabled' where N is the count of enabled sources within the profile and M is the total source count in the profile. Non-default profiles show a 'Set Default' text button. All profiles show Edit (pencil) and Delete (trash) icon buttons.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "profile name" },
+            "label": "Profile row"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one profile is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-set-default-profile",
+          "description": "Clicking 'Set Default' on a non-default profile updates default_profile_id in local state. The previously-default profile loses its 'Default' badge; the newly-selected profile gains it. The 'Set Default' button disappears from the newly-default profile row. The change persists only after 'Save Changes' is clicked.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Set Default" },
+            "label": "Set Default button"
+          },
+          "assertionType": "behavior",
+          "precondition": "At least two profiles are configured and one is the current default",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-add-source-modal",
+      "name": "Add Source Modal",
+      "description": "The SourceEditor modal opens when 'Add Source' is clicked. The modal title reads 'Add Source'. It contains required fields Name and Path, plus optional: Description, Category (select with 9 options), Type (select: File/Glob/Directory), Tail Lines (10-10000), Color, Keywords (comma-separated). An 'Error Monitoring' collapsible subsection contains Format, Parser, Timestamp Pattern, Timezone, Poll Interval, and three pattern textareas. The 'Add' submit button is disabled until Name and Path are both non-empty.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ls-add-source-modal-title",
+          "description": "When opened from 'Add Source', the modal heading reads 'Add Source'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Add Source" },
+            "label": "Add Source modal title"
+          },
+          "assertionType": "exists",
+          "precondition": "The Add Source modal is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-add-source-required-fields",
+          "description": "The modal contains 'Name *' and 'Path *' labeled inputs. The 'Add' button is disabled (opacity-50, non-interactive) when either Name or Path is empty. Once both fields have content, the button becomes enabled.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Add" },
+            "label": "Add source submit button"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Add Source modal is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-source-type-fields",
+          "description": "The Category dropdown contains 9 options: Frontend, Backend, API, Mobile, Database, Build, Testing, Runner, General. The Type dropdown contains 3 options: File, Glob, Directory. When Type is 'glob', an additional 'Glob Pattern *' input appears with hint 'Glob pattern relative to the path above (e.g. **/*.log, app-*.log)'. When Type is 'directory', a 'Pattern' input appears (not required). For 'file' type, no pattern field is shown.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Add Source" },
+            "label": "Source type and category selects"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Add Source modal is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-error-monitoring-collapsible",
+          "description": "The modal contains a collapsible 'Error Monitoring' section separated by a horizontal divider. By default it is collapsed. Clicking the section header expands it to show: Format select (Plaintext/JSON/JSONL), Parser select (Generic/Python/JavaScript/Rust), Timestamp Pattern input, Timezone input (default: 'local'), Poll Interval (ms) number input (min 500, max 60000, default 5000), Error Patterns textarea (one per line), Warning Patterns textarea (one per line), and Ignore Patterns textarea (one per line).",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Error Monitoring" },
+            "label": "Error Monitoring toggle"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Add Source modal is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-add-source-saves",
+          "description": "Clicking 'Add' appends the new source to the sources list with an auto-generated ID (format: 'source-{timestamp}-{random7chars}'). The modal closes. The source count in the section heading increments by 1. The new source appears as the last row in the sources list with enabled=true by default.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Add" },
+            "label": "Add source submit button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Add Source modal is open with valid Name and Path values",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-edit-source-modal",
+      "name": "Edit Source Modal",
+      "description": "The SourceEditor modal opens in edit mode when the pencil icon on a source row is clicked. The title reads 'Edit Source'. All fields are pre-populated with the source's current values. The submit button reads 'Update'. Saving replaces the existing source in the list without changing its position.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ls-edit-source-title",
+          "description": "When opened from the edit icon on a source row, the modal heading reads 'Edit Source' and all form fields are pre-populated with the source's existing data",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Edit Source" },
+            "label": "Edit Source modal title"
+          },
+          "assertionType": "exists",
+          "precondition": "The Edit Source modal is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-edit-source-updates",
+          "description": "Clicking 'Update' applies the edited values to the source row in-place. The modal closes. The source's position in the list does not change. Name, path, category, type, and other field changes are reflected immediately in the source row display.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Update" },
+            "label": "Update source button"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Edit Source modal is open with changes made",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-edit-cancel-closes",
+          "description": "Clicking 'Cancel' or the X button in the modal header closes the modal without applying any changes to the source",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Cancel" },
+            "label": "Cancel button in source modal"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Source Editor modal is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-add-profile-modal",
+      "name": "Add/Edit Profile Modal",
+      "description": "The ProfileEditor modal opens when 'Add Profile' or a profile's edit icon is clicked. Add mode title: 'Add Profile'; edit mode: 'Edit Profile'. Fields: Name* (required), Description (optional), and a scrollable sources checklist. Category quick-select buttons '+ frontend', '+ backend', '+ mobile' add all sources of that category without removing existing selections. The submit button ('Add' or 'Update') is disabled until Name is non-empty.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ls-add-profile-modal-title",
+          "description": "When opened from 'Add Profile', the modal heading reads 'Add Profile'. When opened from the edit icon on a profile row, it reads 'Edit Profile' with all fields pre-populated.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Add Profile" },
+            "label": "Add Profile modal title"
+          },
+          "assertionType": "exists",
+          "precondition": "The Add Profile modal is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-profile-sources-list",
+          "description": "The Sources section of the profile modal shows a scrollable list (max-height 12rem) of all configured log sources as labeled checkboxes, each showing the source name and its category in parentheses. Category quick-select buttons '+ frontend', '+ backend', '+ mobile' appear above the list; clicking one adds all sources from that category to the selection using a Set merge (no duplicates, no removal of already-selected items from other categories).",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Add Profile" },
+            "label": "Profile sources checklist"
+          },
+          "assertionType": "behavior",
+          "precondition": "The Add Profile modal is open and at least one source is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-profile-add-saves",
+          "description": "Clicking 'Add' appends the new profile with an auto-generated ID (format: 'profile-{timestamp}-{random7chars}') and ISO timestamps for created_at and updated_at. If no default_profile_id is currently set, the new profile becomes the default automatically. The modal closes and the Profiles section heading count increments.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Add" },
+            "label": "Add profile submit button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Add Profile modal is open with a valid name",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-delete-confirmation-modal",
+      "name": "Delete Confirmation Modal",
+      "description": "When the trash icon is clicked on any source row or profile row, a confirmation modal appears. The modal title reads 'Delete Source' or 'Delete Profile' respectively. The body names the item in bold and warns. Two buttons: 'Cancel' (dismisses modal, no change) and 'Delete' (red background). The change is held in local state until 'Save Changes' is clicked.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ls-delete-confirm-modal-source",
+          "description": "Clicking the trash icon on a source row opens a modal with heading 'Delete Source', the source's name bolded, and the warning 'It will also be removed from any profiles that reference it. This action cannot be undone until you save.'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Delete Source" },
+            "label": "Delete Source modal heading"
+          },
+          "assertionType": "exists",
+          "precondition": "The delete confirmation modal is open for a source",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-delete-confirm-modal-profile",
+          "description": "Clicking the trash icon on a profile row opens a modal with heading 'Delete Profile' and the profile's name bolded. No profile-reference warning is shown (only source deletions get that). Message ends: 'This action cannot be undone until you save.'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Delete Profile" },
+            "label": "Delete Profile modal heading"
+          },
+          "assertionType": "exists",
+          "precondition": "The delete confirmation modal is open for a profile",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-delete-confirm-behavior",
+          "description": "Clicking 'Delete' in the confirmation modal removes the item from the local state list and closes the modal. For source deletion, all profiles that contain that source ID have it removed from their source_ids array as well. The count in the section heading decrements. Clicking 'Cancel' closes the modal without any change.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Delete" },
+            "label": "Confirm delete button"
+          },
+          "assertionType": "behavior",
+          "precondition": "The delete confirmation modal is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-ai-selection-semantics",
+      "name": "AI Source Selection — Runtime Semantics",
+      "description": "The AI selection mode setting controls how the runner backend selects which log sources to include during workflow execution. This group specifies the expected behavior of each mode as it manifests in the UI and in workflow execution outcomes.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ls-dynamic-mode-semantics",
+          "description": "When ai_selection_mode is 'dynamic', the runner calls select_log_sources_for_context at each verification round. The selection context includes: application_name, target_platform (mobile/web/desktop), step_types (workflow/state/action/screenshot/playwright), and optional keywords. Runner logs (category='runner') are always included for GUI automation steps; Testing logs (category='testing') are always included for Playwright steps. The UI shows 'Dynamic' as the selected radio option with description 'Re-evaluate at each verification round'.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "ai source selection" },
+            "label": "AI mode selection"
+          },
+          "assertionType": "semantic",
+          "precondition": "AI Source Selection section is expanded and Dynamic is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-static-mode-semantics",
+          "description": "When ai_selection_mode is 'static', source selection is performed once at workflow start and reused for all subsequent verification rounds. The UI shows 'Static' as selected with description 'Select once at workflow start'. This mode is appropriate when log sources are unlikely to change relevance mid-workflow.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "ai source selection" },
+            "label": "Static mode option"
+          },
+          "assertionType": "semantic",
+          "precondition": "AI Source Selection section is expanded and Static is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-disabled-mode-semantics",
+          "description": "When ai_selection_mode is 'disabled', no AI-based source selection occurs. The runner falls back to: if a default_profile_id is set, use only sources in that profile (filtered to enabled=true); otherwise if include_all_when_no_profile is true, use all enabled sources; otherwise use no sources. The UI shows 'Disabled' as selected with description 'Use profiles or all enabled sources'.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "ai source selection" },
+            "label": "Disabled mode option"
+          },
+          "assertionType": "semantic",
+          "precondition": "AI Source Selection section is expanded and Disabled is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-profile-default-semantics",
+      "name": "Profile Default and Count Semantics",
+      "description": "The default profile determines which sources are active when ai_selection_mode is 'disabled' and a default is set. This group specifies the expected data-model behavior of profile default management and source count accuracy.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ls-only-one-default",
+          "description": "Exactly zero or one profile can be the default at any time. If a default_profile_id is set, exactly one profile row displays the 'Default' badge (data-content-label='default profile badge'). All other profile rows omit the badge. If default_profile_id is undefined, no rows show the badge.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "default profile badge" },
+            "label": "Default profile badge"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one profile is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-profile-source-count-accuracy",
+          "description": "The 'N/M sources enabled' metric on each profile row must accurately reflect: M = the number of source IDs in the profile's source_ids array that still exist in the global sources list (deleted sources are excluded), N = the count of those M sources that are currently marked enabled=true. When a source's toggle is changed, N updates immediately in all profile rows that reference that source.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "enabled sources count" },
+            "label": "Profile enabled sources count"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one profile and one source are configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-delete-source-removes-from-profiles",
+          "description": "When a source is deleted, its ID is immediately removed from the source_ids array of every profile that referenced it. The 'N/M sources enabled' counts on affected profile rows should decrement accordingly. This cascade removal happens in local state before any save.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "enabled sources count" },
+            "label": "Profile source count after deletion"
+          },
+          "assertionType": "semantic",
+          "precondition": "A source that belongs to at least one profile has been deleted via the confirmation modal",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ls-source-data-model",
+      "name": "Log Source Data Model",
+      "description": "Each log source is a configuration record with required fields (id, name, path, category, type) and optional error-monitoring fields. This group specifies how source data fields are rendered in the UI and what correct source configuration looks like.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ls-source-path-display",
+          "description": "In each source row, the path field (data-content-label='source path') shows the raw file path or glob string. If the source's format is not 'plaintext', a parenthetical suffix '(json)' or '(jsonl)' is appended in muted text. If the parser is not 'generic', a bracketed suffix '[python]', '[javascript]', or '[rust]' is appended in muted text after the format annotation. Both annotations are absent for plaintext/generic sources.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "source path" },
+            "label": "Source path with format/parser annotations"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one source with non-plaintext format or non-generic parser is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-source-type-semantics",
+          "description": "The type field (data-content-label='source type') determines how the runner reads the source at runtime. 'file' reads a single file at the given path. 'glob' uses the path as a base directory and the pattern field as a glob to match multiple files (e.g., **/*.log). 'directory' reads all files in a directory optionally filtered by the pattern field. The type badge displays the raw lowercase value. When type is 'glob' or 'directory', a pattern field is visible in the SourceEditor form.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "source type" },
+            "label": "Source type badge"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one source is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ls-source-category-colors",
+          "description": "The color dot on each source row uses the source's explicit color field if set; otherwise falls back to the category default: Frontend=#3b82f6, Backend=#22c55e, API=#06b6d4, Mobile=#f97316, Database=#8b5cf6, Build=#eab308, Testing=#ec4899, Runner=#f97316, General=#6b7280. The category badge (data-content-label='source category') displays the lowercase category value with CSS capitalize applied.",
+          "category": "semantic",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "source category" },
+            "label": "Source category badge"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one source is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "LogSourcesSettings",
+    "pageUrl": "/settings/log-sources",
+    "tags": ["settings", "log-sources", "runner", "ai-selection", "profiles"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "log-sources-default",
+        "name": "Log Sources (Default — all sections expanded)",
+        "description": "Default state when the Log Sources tab is first opened. All three sections (AI Source Selection, Log Sources, Profiles) are expanded. No modals are open.",
+        "elements": [
+          { "dataAttributes": { "data-content-label": "ai source selection" } },
+          { "dataAttributes": { "data-content-label": "log sources count" } }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "open-add-source-modal",
+            "name": "Open Add Source modal",
+            "description": "Click the 'Add Source' button to open the SourceEditor modal",
+            "activateStates": ["add-source-modal-open"],
+            "deactivateStates": ["log-sources-default"],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Add Source" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "open-add-profile-modal",
+            "name": "Open Add Profile modal",
+            "description": "Click the 'Add Profile' button to open the ProfileEditor modal",
+            "activateStates": ["add-profile-modal-open"],
+            "deactivateStates": ["log-sources-default"],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Add Profile" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "add-source-modal-open",
+        "name": "Add Source Modal Open",
+        "description": "The SourceEditor modal is open in add mode. The modal heading reads 'Add Source'. The form is empty.",
+        "elements": [{ "role": "heading", "textContent": "Add Source" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "close-add-source-cancel",
+            "name": "Cancel Add Source modal",
+            "description": "Click Cancel to close the modal without saving",
+            "activateStates": ["log-sources-default"],
+            "deactivateStates": ["add-source-modal-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "add-profile-modal-open",
+        "name": "Add Profile Modal Open",
+        "description": "The ProfileEditor modal is open in add mode. The modal heading reads 'Add Profile'.",
+        "elements": [{ "role": "heading", "textContent": "Add Profile" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "close-add-profile-cancel",
+            "name": "Cancel Add Profile modal",
+            "description": "Click Cancel to close the modal without saving",
+            "activateStates": ["log-sources-default"],
+            "deactivateStates": ["add-profile-modal-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "delete-confirm-modal-open",
+        "name": "Delete Confirmation Modal Open",
+        "description": "The delete confirmation modal is open, showing 'Delete Source' or 'Delete Profile' heading and the item's name in bold.",
+        "elements": [{ "role": "button", "textContent": "Delete" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "close-delete-confirm-cancel",
+            "name": "Cancel delete confirmation",
+            "description": "Click Cancel to dismiss the confirmation without deleting",
+            "activateStates": ["log-sources-default"],
+            "deactivateStates": ["delete-confirm-modal-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Cancel" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

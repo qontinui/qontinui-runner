@@ -387,7 +387,10 @@ impl AppDispatcher {
                     "[app-dispatch] {} via websocket (active) → app='{}' conn_id={:?}",
                     action, app_id, entry.websocket_conn_id
                 );
-                let response = self.command_relay.dispatch(&app_id, action, payload).await?;
+                let response = self
+                    .command_relay
+                    .dispatch(&app_id, action, payload)
+                    .await?;
                 return Ok(response.result.unwrap_or(serde_json::Value::Null));
             }
         }
@@ -533,11 +536,7 @@ mod tests {
             .dispatch_active(&sdk_conn, "noop", Method::GET, "/x", json!({}))
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, DispatchError::NotConnected),
-            "got {:?}",
-            err
-        );
+        assert!(matches!(err, DispatchError::NotConnected), "got {:?}", err);
     }
 
     #[tokio::test]

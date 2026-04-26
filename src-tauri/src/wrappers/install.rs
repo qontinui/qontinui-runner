@@ -427,13 +427,10 @@ fn promote_package_to_top(pkg_dir: &Path, dst: &Path) -> std::io::Result<()> {
             } else {
                 std::fs::copy(&from, &to)?;
                 std::fs::remove_file(&from).map_err(|inner| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "rename failed ({}); copy ok but remove failed: {}",
-                            e, inner
-                        ),
-                    )
+                    std::io::Error::other(format!(
+                        "rename failed ({}); copy ok but remove failed: {}",
+                        e, inner
+                    ))
                 })?;
             }
         }

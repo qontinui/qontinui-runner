@@ -456,8 +456,10 @@ pub(crate) fn compute_premerge_conflicts(
     // intentional — we want "what's coming in," NOT the symmetric diff
     // (which would also include destination-only commits the merge wouldn't
     // touch).
-    let diff_output =
-        run_git_command(repo_path, &["diff", "--name-only", &format!("HEAD..{}", source_branch)])?;
+    let diff_output = run_git_command(
+        repo_path,
+        &["diff", "--name-only", &format!("HEAD..{}", source_branch)],
+    )?;
     let incoming: std::collections::HashSet<String> = diff_output
         .lines()
         .filter(|l| !l.is_empty())
@@ -472,7 +474,8 @@ pub(crate) fn compute_premerge_conflicts(
 
     // (b) dirty paths in destination working tree.
     let status_output = run_git_command(repo_path, &["status", "--porcelain"])?;
-    let dirty: std::collections::HashSet<String> = parse_dirty_paths(&status_output, include_untracked);
+    let dirty: std::collections::HashSet<String> =
+        parse_dirty_paths(&status_output, include_untracked);
 
     // Intersection, sorted for determinism.
     let mut overlap: Vec<String> = incoming.intersection(&dirty).cloned().collect();
@@ -507,8 +510,8 @@ pub(crate) fn parse_dirty_paths(
         let y = xy.as_bytes()[1] as char;
 
         let is_untracked = xy == "??";
-        let is_modified_tracked = matches!(x, 'M' | 'D' | 'A' | 'R' | 'C')
-            || matches!(y, 'M' | 'D');
+        let is_modified_tracked =
+            matches!(x, 'M' | 'D' | 'A' | 'R' | 'C') || matches!(y, 'M' | 'D');
 
         if is_untracked {
             if include_untracked {
@@ -579,7 +582,10 @@ pub fn merge_worktree_force(
         args.extend(conflicting_files.iter().cloned());
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         run_git_command(repo_path, &arg_refs).map_err(|e| {
-            format!("force-merge: failed to stash dirty files (merge NOT attempted): {}", e)
+            format!(
+                "force-merge: failed to stash dirty files (merge NOT attempted): {}",
+                e
+            )
         })?;
 
         // Get the stash ref of what we just pushed (top of stack).
@@ -1184,7 +1190,10 @@ mod tests {
         assert!(dirty.contains("foo.rs"));
         assert!(dirty.contains("bar.rs"));
         assert!(dirty.contains("gone.rs"));
-        assert!(!dirty.contains("scratch.txt"), "untracked excluded by default");
+        assert!(
+            !dirty.contains("scratch.txt"),
+            "untracked excluded by default"
+        );
         assert_eq!(dirty.len(), 3);
 
         let dirty_with_untracked = parse_dirty_paths(porcelain, true);
@@ -1197,7 +1206,10 @@ mod tests {
         // Rename: porcelain shows "R  old -> new" — we want the new path.
         let porcelain = "R  old.rs -> new.rs\n";
         let dirty = parse_dirty_paths(porcelain, true);
-        assert!(dirty.contains("new.rs"), "renamed-to path must be in dirty set");
+        assert!(
+            dirty.contains("new.rs"),
+            "renamed-to path must be in dirty set"
+        );
         assert!(!dirty.contains("old.rs"));
     }
 
@@ -1219,7 +1231,10 @@ mod tests {
         );
         // Sibling edit still present — guard didn't touch it.
         let foo_now = fs::read_to_string(repo.join("foo.rs")).unwrap();
-        assert!(foo_now.contains("SIBLING"), "sibling edit must survive guard");
+        assert!(
+            foo_now.contains("SIBLING"),
+            "sibling edit must survive guard"
+        );
     }
 
     #[test]
@@ -1262,9 +1277,12 @@ mod tests {
         // Sibling has dirty edits to foo.rs (which the branch also touched).
         fs::write(repo.join("foo.rs"), "// SIBLING'S uncommitted edit\n").unwrap();
 
-        let result =
-            merge_worktree_force(&repo, &branch, "main").expect("merge_worktree_force");
-        assert!(result.merge.success, "force-merge must succeed: {:?}", result);
+        let result = merge_worktree_force(&repo, &branch, "main").expect("merge_worktree_force");
+        assert!(
+            result.merge.success,
+            "force-merge must succeed: {:?}",
+            result
+        );
         assert!(
             result.stash_ref.is_some(),
             "stash_ref must be populated when there were files to stash"
