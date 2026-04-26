@@ -190,7 +190,9 @@ pub async fn install(
         if pm_owned == "pnpm" {
             cmd.arg("--node-linker=hoisted");
         }
-        let output = cmd.output().map_err(|e| format!("spawn {}: {}", pm_owned, e))?;
+        let output = cmd
+            .output()
+            .map_err(|e| format!("spawn {}: {}", pm_owned, e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(format!(
@@ -427,7 +429,10 @@ fn promote_package_to_top(pkg_dir: &Path, dst: &Path) -> std::io::Result<()> {
                 std::fs::remove_file(&from).map_err(|inner| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("rename failed ({}); copy ok but remove failed: {}", e, inner),
+                        format!(
+                            "rename failed ({}); copy ok but remove failed: {}",
+                            e, inner
+                        ),
                     )
                 })?;
             }

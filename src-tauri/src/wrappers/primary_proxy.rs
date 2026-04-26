@@ -147,9 +147,8 @@ async fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, ProxyErr
         .map_err(|e| ProxyError::other(format!("Failed to parse primary response: {}", e)))?;
 
     if api.success {
-        api.data.ok_or_else(|| {
-            ProxyError::other("primary response missing `data` field".to_string())
-        })
+        api.data
+            .ok_or_else(|| ProxyError::other("primary response missing `data` field".to_string()))
     } else {
         Err(ProxyError::other(
             api.error.unwrap_or_else(|| "Unknown error".to_string()),
@@ -220,9 +219,8 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
         .map_err(|e| ProxyError::other(format!("Failed to parse primary response: {}", e)))?;
 
     if api.success {
-        api.data.ok_or_else(|| {
-            ProxyError::other("primary response missing `data` field".to_string())
-        })
+        api.data
+            .ok_or_else(|| ProxyError::other("primary response missing `data` field".to_string()))
     } else {
         Err(ProxyError::other(
             api.error.unwrap_or_else(|| "Unknown error".to_string()),
@@ -356,11 +354,7 @@ struct SetCredentialBody<'a> {
 }
 
 /// Proxy: `PUT /wrappers/{id}/credentials/{name}`. Returns `"set"`.
-pub async fn set_credential(
-    id: &str,
-    name: &str,
-    value: &str,
-) -> Result<String, ProxyError> {
+pub async fn set_credential(id: &str, name: &str, value: &str) -> Result<String, ProxyError> {
     let url = format!("{}/wrappers/{}/credentials/{}", base_url(), id, name);
     let body = SetCredentialBody { value };
     put_json::<String, _>(&url, &body).await

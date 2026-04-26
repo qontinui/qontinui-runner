@@ -189,11 +189,7 @@ fn fetch_tools(base: &str) -> Vec<ToolEntry> {
                 .filter(|v| !v.is_null())
                 .unwrap_or_else(|| json!({ "type": "object" }));
 
-            let name = format!(
-                "wrapper_{}__{}",
-                wrapper_id,
-                sanitize_action_id(&action_id)
-            );
+            let name = format!("wrapper_{}__{}", wrapper_id, sanitize_action_id(&action_id));
             let full_desc = if description.is_empty() {
                 format!("{} action: {}", display_name, action_id)
             } else {
