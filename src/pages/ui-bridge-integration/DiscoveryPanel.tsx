@@ -679,9 +679,13 @@ function RegisteredAppCard({
 }) {
   const [removing, setRemoving] = useState(false);
   // Click-through uses the base URL as the "project path" proxy — matches the
-  // scan cards' behavior (they pass project path into onSelectApp).
-  const selectTarget = app.url;
-  const clickable = !!onSelect && !!selectTarget;
+  // scan cards' behavior (they pass project path into onSelectApp). Wrapper
+  // (websocket-transport) apps have no reachable HTTP base URL, so click-
+  // through is suppressed for them — there is no project to navigate to.
+  const isWrapper = app.transport === "websocket";
+  const hasRealUrl = !!app.url && !app.url.startsWith("ws://runner/");
+  const selectTarget = isWrapper ? "" : app.url;
+  const clickable = !isWrapper && !!onSelect && !!selectTarget;
 
   const handleDeregister = useCallback(
     async (e: ReactMouseEvent) => {
@@ -743,7 +747,13 @@ function RegisteredAppCard({
           </span>
         </div>
         <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
-          <span className="truncate">{app.url}</span>
+          <span className="truncate">
+            {isWrapper && !hasRealUrl ? (
+              <span className="italic text-muted-foreground/70">(wrapper — no URL)</span>
+            ) : (
+              app.url
+            )}
+          </span>
           {app.version && <span>v{app.version}</span>}
         </div>
         <div className="mt-0.5 text-[10px] text-muted-foreground/60 truncate">
