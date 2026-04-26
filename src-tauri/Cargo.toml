@@ -173,6 +173,10 @@ path = "src/bin/mock_claude_cli.rs"
 name = "export_schemas"
 path = "src/bin/export_schemas.rs"
 
+[[bin]]
+name = "wrappers_mcp"
+path = "src/bin/wrappers_mcp.rs"
+
 [lints.rust]
 dead_code = "allow"
 unused_variables = "allow"

@@ -222,6 +222,30 @@ npm run tauri build
 # Linux:   src-tauri/target/release/bundle/appimage/
 ```
 
+## Wrapper MCP server (Claude CLI)
+
+The runner ships a small stdio MCP server (`wrappers_mcp`) that exposes every
+installed wrapper action as a tool to a [Claude CLI](https://docs.anthropic.com/en/docs/agents/claude-code/) session.
+Tool names follow `wrapper_<wrapperId>__<actionId>` (dashes in the action id are
+replaced with underscores). Each tool call is forwarded to the runner's
+`POST /wrappers/<id>/dispatch` endpoint over HTTP on `127.0.0.1`.
+
+```bash
+# Build
+cargo build --release --bin wrappers_mcp
+
+# Register with the claude CLI (one-time)
+claude mcp add qontinui-wrappers -- "$(pwd)/src-tauri/target/release/wrappers_mcp"
+
+# Optional: point at a non-default runner port
+QONTINUI_RUNNER_API_PORT=9876 claude mcp add qontinui-wrappers -- "$(pwd)/src-tauri/target/release/wrappers_mcp"
+```
+
+After registration, every `claude` session has access to the wrapper actions
+as tools (e.g. `wrapper_v0__create_component`). The MCP server connects to
+the runner on demand at startup; if the runner is not running, the server
+starts with an empty tool list and logs the failure to stderr.
+
 ## Configuration Format
 
 Qontinui Runner uses JSON configurations created by qontinui-web or written manually:
