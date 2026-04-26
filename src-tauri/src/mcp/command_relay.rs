@@ -36,6 +36,13 @@ use super::ws_relay::{WsConnectionManager, WsOutboundError};
 /// enough that wedged wrappers don't accumulate forever.
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Sentinel prefix on the `error` field of a `CommandResponse` that
+/// `reject_by_conn` synthesizes. The dispatch await branch recognizes this
+/// prefix and maps the synthesized response onto `CommandRelayError::Displaced`
+/// (instead of the generic `WrapperError`) so callers can distinguish
+/// displacement from a real wrapper-side failure.
+const DISPLACED_ERROR_PREFIX: &str = "__qbridge_displaced__:";
+
 /// Result payload returned from a successful `dispatch` call.
 ///
 /// Mirrors the shape of the `{type:"response", success, result, error}` frame
@@ -70,6 +77,14 @@ pub enum CommandRelayError {
     #[error("wrapper WebSocket disconnected before command was delivered")]
     Disconnected,
 
+    /// A new tab registered with the same `app_id` and took over the routing
+    /// slot, so the wrapper this command was sent to is no longer the active
+    /// target. Surfaced synchronously on register-time displacement so the
+    /// caller doesn't have to wait for the 30s default timeout to discover
+    /// the in-flight command will never resolve.
+    #[error("command displaced by new tab connection: {0}")]
+    Displaced(String),
+
     /// JSON serialization failure — should only happen if `payload` is
     /// non-serializable (it's a `serde_json::Value`, so this is rare but
     /// kept as a distinct variant for diagnostics).
@@ -98,9 +113,21 @@ struct CommandFrame<'a> {
     timestamp: i64,
 }
 
+/// Per-pending-command bookkeeping.
+///
+/// Keying on `command_id` alone wasn't enough once we wanted graceful
+/// register-time displacement — the cleanup paths needed to know which
+/// connection a pending command was routed to so they could reject only
+/// the ones tied to the disappearing conn, not every other app's pending
+/// commands too.
+struct PendingEntry {
+    conn_id: u64,
+    sender: oneshot::Sender<CommandResponse>,
+}
+
 /// CommandRelay — the pending-command state machine.
 pub struct CommandRelay {
-    pending: Mutex<HashMap<String, oneshot::Sender<CommandResponse>>>,
+    pending: Mutex<HashMap<String, PendingEntry>>,
     ws: Arc<WsConnectionManager>,
     timeout: Duration,
 }
@@ -143,7 +170,13 @@ impl CommandRelay {
         // ludicrously fast response could race the insertion.
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(command_id.clone(), tx);
+            pending.insert(
+                command_id.clone(),
+                PendingEntry {
+                    conn_id,
+                    sender: tx,
+                },
+            );
         }
 
         // Send the outbound frame. If this fails, drop the pending entry so
@@ -173,7 +206,11 @@ impl CommandRelay {
                     let msg = response.error.clone().unwrap_or_else(|| {
                         "wrapper returned success=false without an error message".to_string()
                     });
-                    Err(CommandRelayError::WrapperError(msg))
+                    if let Some(reason) = msg.strip_prefix(DISPLACED_ERROR_PREFIX) {
+                        Err(CommandRelayError::Displaced(reason.to_string()))
+                    } else {
+                        Err(CommandRelayError::WrapperError(msg))
+                    }
                 }
             }
             Ok(Err(_recv_err)) => {
@@ -191,29 +228,59 @@ impl CommandRelay {
     /// Called by the WS receive loop when a `{type:"response"}` frame arrives.
     /// Returns `true` if a pending command matched the `command_id`.
     pub async fn resolve(&self, response: CommandResponse) -> bool {
-        let sender = {
+        let entry = {
             let mut pending = self.pending.lock().await;
             pending.remove(&response.command_id)
         };
-        match sender {
-            Some(tx) => tx.send(response).is_ok(),
+        match entry {
+            Some(entry) => entry.sender.send(response).is_ok(),
             None => false,
         }
     }
 
-    /// Reject all pending commands for a given connection. Called when the
-    /// WS relay removes a `conn_id` (close/error). Without this, `dispatch`
-    /// callers would only learn about the disconnect via the 30s timeout.
+    /// Reject every pending command tied to `conn_id`, resolving each
+    /// dispatch caller's `rx.await` with a `Displaced(reason)` response so
+    /// they fail fast instead of waiting for the 30s timeout.
     ///
-    /// Because the `pending` map does not carry per-command `conn_id` (the
-    /// command's wrapper is identified by `app_id` and looked up at send
-    /// time), this helper simply drops all senders — which causes every
-    /// outstanding `rx.await` to return `RecvError` and the caller to see
-    /// `CommandRelayError::Disconnected`. This is the conservative choice:
-    /// if the last-tab-wins invariant changes later we can route per-app.
-    pub async fn reject_all_on_disconnect(&self) {
-        let mut pending = self.pending.lock().await;
-        pending.clear();
+    /// Used in two places:
+    /// - `WsConnectionManager::register` displacement path, where a new tab
+    ///   for the same `app_id` takes the routing slot from an older one.
+    /// - The disconnect cleanup path in `ws_relay::drive_connection`, where
+    ///   a wrapper's socket closes (with `reason = "wrapper disconnected"`).
+    ///
+    /// Returns the number of pending commands that were rejected, mostly for
+    /// diagnostics and tests.
+    pub async fn reject_by_conn(&self, conn_id: u64, reason: &str) -> usize {
+        // Drain matching entries under the lock, then resolve their oneshots
+        // outside the lock — `tx.send` only consumes the sender (no .await),
+        // but doing it inside the critical section adds work other dispatch
+        // callers would block on.
+        let drained: Vec<(String, PendingEntry)> = {
+            let mut pending = self.pending.lock().await;
+            let keys: Vec<String> = pending
+                .iter()
+                .filter(|(_, e)| e.conn_id == conn_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| pending.remove(&k).map(|v| (k, v)))
+                .collect()
+        };
+        let count = drained.len();
+        for (command_id, entry) in drained {
+            // Surface as a normal CommandResponse with success=false; the
+            // dispatch await branch maps this to CommandRelayError::Displaced
+            // via the new `displaced_reason` field encoded in `error`. We use
+            // a stable sentinel prefix the dispatcher recognizes so callers
+            // can distinguish displacement from generic wrapper errors.
+            let _ = entry.sender.send(CommandResponse {
+                command_id,
+                success: false,
+                result: None,
+                error: Some(format!("{}{}", DISPLACED_ERROR_PREFIX, reason)),
+            });
+        }
+        count
     }
 
     /// Number of commands awaiting a response. For diagnostics / tests.
@@ -347,5 +414,78 @@ mod tests {
         let err = relay.dispatch("gone", "noop", json!({})).await.unwrap_err();
         assert!(matches!(err, CommandRelayError::Disconnected));
         assert_eq!(relay.pending_count().await, 0);
+    }
+
+    /// reject_by_conn finishes any in-flight dispatch keyed to that conn_id
+    /// with `CommandRelayError::Displaced`, leaves dispatches for other
+    /// conns alone, and returns the count it actually rejected.
+    #[tokio::test]
+    async fn reject_by_conn_translates_into_displaced_error() {
+        let ws = WsConnectionManager::new();
+        let (conn_a, mut outbound_a) = ws.test_register("app-a").await;
+        let (conn_b, mut outbound_b) = ws.test_register("app-b").await;
+        // Long timeout — we want this to resolve via reject_by_conn, not the
+        // per-command timer.
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(60));
+
+        let relay_a = relay.clone();
+        let dispatch_a = tokio::spawn(async move {
+            relay_a.dispatch("app-a", "snapshot", json!({})).await
+        });
+        let relay_b = relay.clone();
+        let dispatch_b = tokio::spawn(async move {
+            relay_b.dispatch("app-b", "snapshot", json!({})).await
+        });
+
+        // Drain the outbound frames so the dispatch send paths don't stall.
+        let _ = outbound_a.recv().await.expect("frame for app-a");
+        let _ = outbound_b.recv().await.expect("frame for app-b");
+
+        // Reject only conn_a's pending command. app-b's dispatch must keep
+        // waiting (we resolve it explicitly below to clean up the test).
+        let rejected = relay.reject_by_conn(conn_a, "test displacement").await;
+        assert_eq!(rejected, 1);
+
+        let result_a = dispatch_a.await.unwrap();
+        match result_a {
+            Err(CommandRelayError::Displaced(reason)) => {
+                assert!(reason.contains("test displacement"), "got reason: {}", reason);
+            }
+            other => panic!("expected Displaced for app-a, got {:?}", other),
+        }
+
+        // app-b's dispatch is still pending. Resolve it normally.
+        let frame_b_id_extracted = {
+            // We already consumed the frame via outbound_b.recv() above, so
+            // peek the pending map for conn_b's command_id.
+            let pending = relay.pending.lock().await;
+            pending
+                .iter()
+                .find_map(|(k, v)| if v.conn_id == conn_b { Some(k.clone()) } else { None })
+                .expect("app-b should still have a pending command")
+        };
+        relay
+            .resolve(CommandResponse {
+                command_id: frame_b_id_extracted,
+                success: true,
+                result: Some(json!({"ok": true})),
+                error: None,
+            })
+            .await;
+        let result_b = dispatch_b.await.unwrap();
+        assert!(result_b.is_ok(), "app-b dispatch must succeed");
+    }
+
+    /// reject_by_conn is the cleanup primitive for the disconnect path too.
+    /// The failure mode is Displaced rather than the previous bulk-clear-
+    /// triggered Disconnected, but the caller behavior — fail-fast instead
+    /// of waiting for the 30s timeout — is the same.
+    #[tokio::test]
+    async fn reject_by_conn_with_no_matches_returns_zero() {
+        let ws = WsConnectionManager::new();
+        let relay = CommandRelay::new(ws);
+        // No registrations, no pending — rejecting any conn id is a no-op.
+        let rejected = relay.reject_by_conn(999, "nothing here").await;
+        assert_eq!(rejected, 0);
     }
 }

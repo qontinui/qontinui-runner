@@ -349,6 +349,21 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
             "[ws-relay] last-tab-wins: app '{}' displaced conn {} with conn {}",
             register.app_id, prev, conn_id
         );
+        // Graceful displacement: any commands the runner had in flight to the
+        // displaced conn now fail synchronously with `CommandRelayError::
+        // Displaced` instead of waiting for the 30s default timeout. The old
+        // socket itself stays open until the wrapper drops it — wrappers that
+        // want to stay alive for diagnostics can; new commands route to the
+        // new conn either way.
+        let rejected = relay
+            .reject_by_conn(prev, "displaced by new tab connection")
+            .await;
+        if rejected > 0 {
+            debug!(
+                "[ws-relay] rejected {} in-flight command(s) on displaced conn {}",
+                rejected, prev
+            );
+        }
     }
 
     // 3. Mirror into the app registry so discovery / list endpoints see it.
@@ -492,13 +507,16 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
     }
     .await;
 
-    // 6. Clean up. We reject all pending commands on disconnect so their
-    //    awaiters don't have to wait for the 30s default timeout; this
-    //    mirrors the TS relay's behavior on tab close.
+    // 6. Clean up. Reject pending commands routed to this specific conn so
+    //    their awaiters don't have to wait for the 30s default timeout. We
+    //    key on conn_id (not app_id) so a sibling tab that displaced this
+    //    conn but is still healthy keeps its in-flight commands.
     ws_manager.remove(conn_id).await;
     registry.remove(&register.app_id).await;
     uninstall_ws_sdk_connection(&state.sdk_connection, &synthetic_url, prior_active).await;
-    relay.reject_all_on_disconnect().await;
+    relay
+        .reject_by_conn(conn_id, "wrapper disconnected")
+        .await;
     send_task.abort();
     info!(
         "[ws-relay] app '{}' disconnected (conn_id={})",
