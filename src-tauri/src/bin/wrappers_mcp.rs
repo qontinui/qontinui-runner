@@ -7,8 +7,11 @@
 //!
 //! Backend: makes blocking HTTP calls to `<base>/wrappers/...`. The base URL
 //! is resolved (in order):
-//!   1. `QONTINUI_RUNNER_PRIMARY_URL` — full URL, used verbatim (cross-host
-//!      escape hatch, not officially supported).
+//!   1. `QONTINUI_RUNNER_PRIMARY_URL` — full URL, **validated to be loopback
+//!      HTTP only**: `http://(127.0.0.1|localhost):<port>` with no path,
+//!      query, fragment, or userinfo. Anything else logs a warning and is
+//!      ignored so a poisoned env can't redirect dispatch (and credentials)
+//!      to an attacker-controlled host.
 //!   2. `QONTINUI_PRIMARY_PORT` — port only; URL is `http://127.0.0.1:<port>`.
 //!      Matches the runner's primary-discovery convention (see
 //!      `crate::instance::primary_port`).
@@ -385,13 +388,50 @@ fn handle_request(
     }
 }
 
+/// Validates that a `QONTINUI_RUNNER_PRIMARY_URL` value points at the local
+/// machine over HTTP. Rejects anything that isn't `http://127.0.0.1:<port>`
+/// or `http://localhost:<port>` (with an optional trailing slash) so a
+/// poisoned env can't redirect dispatch traffic — including credentials
+/// — to an attacker-controlled host. The MCP server is meant for
+/// loopback IPC, so this is a tightening, not a feature loss.
+fn validate_loopback_http_url(url: &str) -> bool {
+    let rest = match url.strip_prefix("http://") {
+        Some(r) => r,
+        None => return false,
+    };
+    // Strip a single optional trailing slash; reject any further path / query.
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    if rest.contains('/') || rest.contains('?') || rest.contains('#') || rest.contains('@') {
+        return false;
+    }
+    // Host:port split. Port is required (otherwise we'd hit :80 implicitly,
+    // which isn't where the runner lives).
+    let (host, port) = match rest.rsplit_once(':') {
+        Some(p) => p,
+        None => return false,
+    };
+    if !matches!(host, "127.0.0.1" | "localhost") {
+        return false;
+    }
+    port.parse::<u16>().is_ok() && !port.is_empty()
+}
+
 /// Resolves the primary runner's base URL. Precedence: `QONTINUI_RUNNER_PRIMARY_URL`
-/// (full URL) > `QONTINUI_PRIMARY_PORT` (port) > `QONTINUI_RUNNER_API_PORT` (port,
-/// back-compat) > `http://127.0.0.1:9876`.
+/// (full URL, validated to be loopback HTTP only) > `QONTINUI_PRIMARY_PORT`
+/// (port) > `QONTINUI_RUNNER_API_PORT` (port, back-compat) >
+/// `http://127.0.0.1:9876`.
+///
+/// `QONTINUI_RUNNER_PRIMARY_URL` is rejected if it isn't
+/// `http://(127.0.0.1|localhost):<port>` — see `validate_loopback_http_url`.
 fn primary_base_url() -> String {
     if let Ok(url) = std::env::var("QONTINUI_RUNNER_PRIMARY_URL") {
         if !url.is_empty() {
-            return url;
+            if validate_loopback_http_url(&url) {
+                return url;
+            }
+            eprintln!(
+                "[wrappers-mcp] WARNING: ignoring QONTINUI_RUNNER_PRIMARY_URL={url:?} — must be http://(127.0.0.1|localhost):<port>; falling back to next env source",
+            );
         }
     }
     if let Ok(port) = std::env::var("QONTINUI_PRIMARY_PORT") {
@@ -493,6 +533,26 @@ mod tests {
         let v = rpc_error(Some(json!(2)), -32601, "nope");
         assert_eq!(v["error"]["code"], -32601);
         assert_eq!(v["error"]["message"], "nope");
+    }
+
+    #[test]
+    fn loopback_url_validation_accepts_loopback() {
+        assert!(validate_loopback_http_url("http://127.0.0.1:9876"));
+        assert!(validate_loopback_http_url("http://127.0.0.1:9876/"));
+        assert!(validate_loopback_http_url("http://localhost:1"));
+        assert!(validate_loopback_http_url("http://localhost:65535"));
+    }
+
+    #[test]
+    fn loopback_url_validation_rejects_non_loopback() {
+        assert!(!validate_loopback_http_url("http://192.168.1.5:9876"));
+        assert!(!validate_loopback_http_url("http://example.com:9876"));
+        assert!(!validate_loopback_http_url("https://127.0.0.1:9876"));
+        assert!(!validate_loopback_http_url("http://127.0.0.1:9876/api"));
+        assert!(!validate_loopback_http_url("http://user@127.0.0.1:9876"));
+        assert!(!validate_loopback_http_url("http://127.0.0.1"));
+        assert!(!validate_loopback_http_url("http://127.0.0.1:99999"));
+        assert!(!validate_loopback_http_url(""));
     }
 
     #[test]

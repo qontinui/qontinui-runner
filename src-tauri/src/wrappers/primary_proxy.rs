@@ -424,7 +424,12 @@ pub async fn dispatch(
 /// - Connection / parse failures (no upstream status) → 503 with the
 ///   "primary runner is not reachable" message that matches the
 ///   `require_wrapper_state` shape.
-/// - Non-success upstream HTTP statuses → 502 BAD_GATEWAY.
+/// - Upstream HTTP 4xx (client error from primary) → forwarded as-is so
+///   the secondary's caller sees the same status the primary returned.
+///   A primary-side `400 BAD_REQUEST` for a malformed `InstallRequest`
+///   stays a 400 instead of becoming a confusing 502.
+/// - Upstream HTTP 5xx → 502 BAD_GATEWAY (the secondary failed to get
+///   a useful response from the primary).
 pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
     match e {
         ProxyError::NotFound(msg) => (StatusCode::NOT_FOUND, AxumJson(api_error(msg))),
@@ -439,8 +444,18 @@ pub fn into_http(e: ProxyError) -> (StatusCode, AxumJson<McpApiResponse<()>>) {
             ))),
         ),
         ProxyError::Other {
-            status: Some(_),
+            status: Some(s),
             message,
-        } => (StatusCode::BAD_GATEWAY, AxumJson(api_error(message))),
+        } => {
+            // 4xx upstream is the caller's fault — pass it through so the
+            // status describes the underlying problem. Reserve 502 for
+            // genuine upstream failures (5xx, parse errors).
+            let mapped = if s.is_client_error() {
+                s
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (mapped, AxumJson(api_error(message)))
+        }
     }
 }

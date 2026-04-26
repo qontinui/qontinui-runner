@@ -253,8 +253,8 @@ claude mcp add qontinui-wrappers -- "$(pwd)/src-tauri/target/release/wrappers_mc
 QONTINUI_PRIMARY_PORT=9878 \
   claude mcp add qontinui-wrappers -- "$(pwd)/src-tauri/target/release/wrappers_mcp"
 
-# Cross-host (escape hatch — not officially supported)
-QONTINUI_RUNNER_PRIMARY_URL=http://192.168.1.5:9876 \
+# Override base URL (loopback only — http://(127.0.0.1|localhost):<port>)
+QONTINUI_RUNNER_PRIMARY_URL=http://localhost:9878 \
   claude mcp add qontinui-wrappers -- "$(pwd)/src-tauri/target/release/wrappers_mcp"
 ```
 
