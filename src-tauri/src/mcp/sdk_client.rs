@@ -26,8 +26,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use super::app_dispatch::DispatchError;
 use super::app_registry::AppTransport;
-use super::command_relay::CommandRelayError;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
 
@@ -166,27 +166,38 @@ pub struct ConnectResponse {
 // Core Client
 // =============================================================================
 
-/// If the currently-active SDK connection corresponds to an app registered
-/// over the `/ui-bridge/ws` transport, dispatch the command via the
-/// CommandRelay and return the response. Returns `Ok(None)` when no such
-/// registration exists (caller should fall back to the HTTP `sdk_request`
-/// path). Returns `Err(String)` only when a WS dispatch was attempted and
-/// failed — HTTP fallback is not safe in that case because the wrapper has
-/// taken ownership of the app.
+/// Map a `DispatchError` to the legacy `String` error type that handler
+/// glue (`Json({success:false, error})`) and IPC-fallback `match` arms
+/// were written against. Centralized here so the handler signature for
+/// `dispatch_app_request` (and friends) stays `Result<_, String>`.
+fn dispatch_err_to_string(err: DispatchError) -> String {
+    match err {
+        DispatchError::NotConnected => "No active SDK app connection".to_string(),
+        DispatchError::NotResponsive(msg) => msg,
+        // For HttpStatus we previously surfaced just the SDK's `error` field
+        // (the dispatcher's HTTP arm puts that in `body` when the app
+        // returned `{success:false, error:"..."}`). Keep that exact shape.
+        DispatchError::HttpStatus { body, .. } => body,
+        other => other.to_user_message(),
+    }
+}
+
+/// Backward-compatible tri-state probe: `Ok(Some(value))` when the active
+/// SDK app is registered over WebSocket and the relay returned a result;
+/// `Ok(None)` when there is no active connection or it is registered as
+/// HTTP (caller should fall through to the HTTP arm); `Err(msg)` when a WS
+/// dispatch was attempted but failed — HTTP fallback is *not* safe in that
+/// case because the wrapper has taken ownership of the app.
 ///
-/// Phase 1 wires this on two routes:
-/// - `POST /ui-bridge/sdk/control/component/:id/action/:actionId`
-/// - `GET  /ui-bridge/sdk/control/snapshot`
-///
-/// Additional routes can be retrofitted by calling this helper before
-/// falling through to `sdk_request`.
+/// Now a thin shim over `AppDispatcher::dispatch`. Eight in-file callers
+/// still rely on the tri-state shape (they synthesize derived responses
+/// from `getControlSnapshot` for WS apps before falling through to the
+/// dedicated HTTP endpoint).
 async fn try_ws_dispatch(
     state: &Arc<ApiState>,
     action: &str,
     payload: serde_json::Value,
 ) -> Result<Option<serde_json::Value>, String> {
-    // Read the active connection's app_id WITHOUT holding the lock for the
-    // duration of the dispatch — CommandRelay::dispatch awaits the wrapper.
     let app_id = {
         let guard = state.sdk_connection.lock().await;
         match guard.active_connection() {
@@ -203,31 +214,33 @@ async fn try_ws_dispatch(
         return Ok(None);
     }
 
+    // For the WS arm, `dispatch` ignores http_method/http_path entirely —
+    // pass placeholders so the call type-checks.
     match state
-        .ws_command_relay
-        .dispatch(&app_id, action, payload)
+        .app_dispatcher
+        .dispatch(&app_id, action, Method::GET, "/", payload)
         .await
     {
-        Ok(response) => Ok(Some(response.result.unwrap_or(serde_json::Value::Null))),
-        Err(CommandRelayError::NotConnected(_)) | Err(CommandRelayError::Disconnected) => {
-            // The wrapper's socket is gone — surface as an error rather than
-            // silently falling back to HTTP (which would hit an app that
-            // doesn't actually serve HTTP).
+        Ok(value) => Ok(Some(value)),
+        Err(DispatchError::WebSocket(
+            super::command_relay::CommandRelayError::NotConnected(_),
+        ))
+        | Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::Disconnected)) => {
             Err(format!(
                 "wrapper '{}' registered via websocket but is disconnected",
                 app_id
             ))
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(dispatch_err_to_string(e)),
     }
 }
 
-/// Single entry point for routing an app-targeted request: tries the active
-/// SDK app's WebSocket transport first (via `try_ws_dispatch`), then falls
-/// back to its HTTP transport (via `sdk_request`, which preserves the
-/// responsiveness cache). `Err` on either arm is surfaced unmodified —
-/// callers that want to chain an IPC fallback can match on Err and call
-/// `ui_bridge_request_sync` themselves.
+/// Single entry point for routing an app-targeted request: delegates to
+/// `AppDispatcher::dispatch_active`, which picks WebSocket or HTTP based on
+/// the active app's registered transport and preserves the 10s
+/// responsiveness cache for HTTP-transport apps. Errors are flattened to
+/// `String` for backward compatibility — handler call sites have not
+/// changed and still pattern-match on a `Result<Value, String>`.
 pub async fn dispatch_app_request(
     state: &Arc<ApiState>,
     action: &str,
@@ -236,147 +249,53 @@ pub async fn dispatch_app_request(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    match try_ws_dispatch(state, action, ws_payload).await? {
-        Some(data) => Ok(data),
-        None => sdk_request(state, http_method, http_path, http_body).await,
-    }
+    // The legacy split fed `ws_payload` to the WS arm and `http_body` to
+    // the HTTP arm. Most call sites pass identical bodies; when they
+    // differ, prefer `http_body` for the HTTP path to mirror legacy
+    // behavior. `dispatch_active` chooses the transport, so we pick the
+    // correct payload up-front.
+    let payload = {
+        let guard = state.sdk_connection.lock().await;
+        let app_id = guard.active_connection().map(|c| c.app_info.app_id.clone());
+        drop(guard);
+        match app_id {
+            Some(id) => match state.app_registry.get(&id).await.map(|e| e.transport) {
+                Some(AppTransport::Websocket) => ws_payload,
+                _ => http_body.unwrap_or(serde_json::Value::Null),
+            },
+            None => http_body.unwrap_or(serde_json::Value::Null),
+        }
+    };
+
+    state
+        .app_dispatcher
+        .dispatch_active(&state.sdk_connection, action, http_method, http_path, payload)
+        .await
+        .map_err(dispatch_err_to_string)
 }
 
 /// Send an HTTP request to the connected SDK app.
 ///
-/// Before making the request, checks if the SDK app is responsive (cached for
-/// 10 seconds). If the app reports `responsive: false` (no active browser tab),
-/// returns an error immediately so handlers can fall back to IPC.
+/// Thin wrapper around `AppDispatcher::dispatch_active_http` kept for
+/// proxy handlers that target a raw URL path the wrapper SDK does not
+/// relay (`/health`, `/capabilities`, `/auto/...`, etc.). Responsiveness
+/// cache + URL routing live in the dispatcher.
 pub async fn sdk_request(
     state: &Arc<ApiState>,
     method: Method,
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    // 1. Read connection info and check cached responsiveness
-    let (app_url, base_path, client) = {
-        let conn_guard = state.sdk_connection.lock().await;
-        let conn = conn_guard
-            .active_connection()
-            .ok_or_else(|| "No active SDK app connection".to_string())?;
-
-        // If we recently checked and the app is not responsive, fail fast
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let cache_age = now_ms - conn_guard.active_responsive_checked_at;
-        if cache_age < 10_000 && conn_guard.active_responsive == Some(false) {
-            return Err("SDK app is not responsive (no active browser tab)".to_string());
-        }
-
-        (
-            conn.app_url.clone(),
-            conn.base_path.clone(),
-            conn.client.clone(),
+    state
+        .app_dispatcher
+        .dispatch_active_http(
+            &state.sdk_connection,
+            method,
+            path,
+            body.unwrap_or(serde_json::Value::Null),
         )
-    };
-    // Mutex released — safe to make HTTP requests
-
-    // 2. Refresh responsiveness cache if stale (>10s or never checked)
-    {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let conn_guard = state.sdk_connection.lock().await;
-        let cache_age = now_ms - conn_guard.active_responsive_checked_at;
-        if cache_age >= 10_000 {
-            // Drop the lock before making HTTP request
-            drop(conn_guard);
-
-            let health_url = format!("{}{}/health", app_url, base_path);
-            let responsive = match client
-                .get(&health_url)
-                .timeout(std::time::Duration::from_secs(2))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|h| h.get("data")?.get("responsive")?.as_bool())
-                    .unwrap_or(true),
-                _ => true, // Assume responsive if health check fails
-            };
-
-            // Re-acquire lock to update cache
-            let mut conn_guard = state.sdk_connection.lock().await;
-            conn_guard.active_responsive = Some(responsive);
-            conn_guard.active_responsive_checked_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-
-            if !responsive {
-                debug!("SDK app at {} is not responsive, skipping", app_url);
-                return Err("SDK app is not responsive (no active browser tab)".to_string());
-            }
-        }
-    }
-
-    // 3. Make the actual SDK request
-    let url = format!("{}{}{}", app_url, base_path, path);
-    debug!(url = %url, method = %method, "SDK request");
-
-    let mut request = client.request(method.clone(), &url);
-
-    if let Some(body) = body {
-        request = request.json(&body);
-    }
-
-    let response = request.send().await.map_err(|e| {
-        format!(
-            "Failed to reach SDK app at {}: {}",
-            url,
-            if e.is_timeout() {
-                "Request timed out".to_string()
-            } else if e.is_connect() {
-                "Connection refused — app may have stopped".to_string()
-            } else {
-                e.to_string()
-            }
-        )
-    })?;
-
-    let status = response.status();
-    let response_text = response
-        .text()
         .await
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
-
-    // Try to parse as JSON
-    let json: serde_json::Value = serde_json::from_str(&response_text).map_err(|_| {
-        if !status.is_success() {
-            format!("SDK app returned HTTP {}: {}", status, response_text)
-        } else {
-            format!(
-                "SDK app returned non-JSON response: {}",
-                &response_text[..response_text.len().min(200)]
-            )
-        }
-    })?;
-
-    // Check if the response has a success field
-    if let Some(success) = json.get("success").and_then(|v| v.as_bool()) {
-        if !success {
-            let error = json
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown error from SDK app");
-            return Err(error.to_string());
-        }
-    } else if !status.is_success() {
-        return Err(format!("SDK app returned HTTP {}", status));
-    }
-
-    Ok(json)
+        .map_err(dispatch_err_to_string)
 }
 
 // =============================================================================
@@ -6231,16 +6150,20 @@ mod tests {
         );
     }
 
-    /// Every action name passed to `dispatch_app_request` (or the legacy
-    /// `try_ws_dispatch` it wraps) must be a valid camelCase identifier. The
-    /// wrapper SDK's `HandlerRegistry` keys on the action string verbatim —
-    /// a typo or empty string fails silently with NO_HANDLER at runtime.
-    /// Catching it at compile-test time is cheap insurance.
+    /// Every action name passed to `dispatch_app_request` (or the
+    /// snapshot-synthesis tri-state shim `try_ws_dispatch` that still wraps
+    /// `AppDispatcher::dispatch` for a handful of derived-response handlers)
+    /// must be a valid camelCase identifier. The wrapper SDK's
+    /// `HandlerRegistry` keys on the action string verbatim — a typo or
+    /// empty string fails silently with NO_HANDLER at runtime. Catching it
+    /// at compile-test time is cheap insurance.
     ///
     /// The dispatch round-trip itself (frame format, payload preservation,
-    /// response decoding) is covered by `app_dispatch::tests::websocket_path_round_trips`,
-    /// which exercises the same `CommandRelay::dispatch` code path
-    /// `try_ws_dispatch` delegates to.
+    /// response decoding) is covered by
+    /// `app_dispatch::tests::websocket_path_round_trips` and
+    /// `app_dispatch::tests::dispatch_active_routes_websocket_via_relay`,
+    /// which exercise the same `CommandRelay::dispatch` code path both
+    /// helpers ultimately delegate to.
     #[test]
     fn ws_dispatch_action_names_are_well_formed() {
         let src = include_str!("sdk_client.rs");
