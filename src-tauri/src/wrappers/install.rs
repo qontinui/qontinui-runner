@@ -25,7 +25,10 @@ use super::manager::WrapperManager;
 use super::registry::{scan_one, WrapperRegistry};
 
 /// Body for `POST /wrappers/install`.
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` is implemented so secondary runners can re-emit the request
+/// to the primary via [`super::primary_proxy::install_wrapper`].
+#[derive(Debug, Deserialize, Serialize)]
 pub struct InstallRequest {
     pub package: String,
     #[serde(default)]
@@ -33,7 +36,10 @@ pub struct InstallRequest {
 }
 
 /// Successful install response.
-#[derive(Debug, Serialize)]
+///
+/// `Deserialize` is implemented so secondary runners can parse the
+/// primary's response when proxying install/update.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InstallResponse {
     pub id: String,
     pub package: String,

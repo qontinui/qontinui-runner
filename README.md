@@ -222,7 +222,19 @@ npm run tauri build
 # Linux:   src-tauri/target/release/bundle/appimage/
 ```
 
-## Wrapper MCP server (Claude CLI)
+## Wrappers
+
+The wrapper subsystem (install, list, dispatch, credentials) is **owned by the primary runner**.
+Secondary runners (those launched with `QONTINUI_INSTANCE_NAME` set, typically by the supervisor)
+do not bootstrap a local wrapper registry — their `/wrappers/*` HTTP routes proxy through the
+primary at `http://127.0.0.1:$QONTINUI_PRIMARY_PORT`. This means installing a wrapper once on the
+primary makes it visible to every runner, and the install-time filesystem watcher only runs in
+one place.
+
+If a secondary cannot reach the primary, `/wrappers/*` returns
+`503 { error: "primary runner is not reachable; install wrappers from the primary's UI" }`.
+
+### Wrapper MCP server (Claude CLI)
 
 The runner ships a small stdio MCP server (`wrappers_mcp`) that exposes every
 installed wrapper action as a tool to a [Claude CLI](https://docs.anthropic.com/en/docs/agents/claude-code/) session.
@@ -234,11 +246,16 @@ replaced with underscores). Each tool call is forwarded to the runner's
 # Build
 cargo build --release --bin wrappers_mcp
 
-# Register with the claude CLI (one-time)
+# Default — primary on localhost:9876
 claude mcp add qontinui-wrappers -- "$(pwd)/src-tauri/target/release/wrappers_mcp"
 
-# Optional: point at a non-default runner port
-QONTINUI_RUNNER_API_PORT=9876 claude mcp add qontinui-wrappers -- "$(pwd)/src-tauri/target/release/wrappers_mcp"
+# Non-default port (matches QONTINUI_PRIMARY_PORT used elsewhere in the runner)
+QONTINUI_PRIMARY_PORT=9878 \
+  claude mcp add qontinui-wrappers -- "$(pwd)/src-tauri/target/release/wrappers_mcp"
+
+# Cross-host (escape hatch — not officially supported)
+QONTINUI_RUNNER_PRIMARY_URL=http://192.168.1.5:9876 \
+  claude mcp add qontinui-wrappers -- "$(pwd)/src-tauri/target/release/wrappers_mcp"
 ```
 
 After registration, every `claude` session has access to the wrapper actions

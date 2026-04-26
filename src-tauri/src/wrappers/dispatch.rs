@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::manager::WrapperManager;
+use super::primary_proxy::{self, into_http as proxy_error_to_http};
 use super::registry::WrapperRegistry;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -55,7 +56,11 @@ pub struct DispatchRequest {
 }
 
 /// Successful dispatch response. Mirrors the wrapper's own envelope.
-#[derive(Debug, Serialize)]
+///
+/// `Deserialize` is implemented so secondary runners can parse the
+/// primary's dispatch response when proxying via
+/// [`super::primary_proxy::dispatch`].
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DispatchResponse {
     pub result: serde_json::Value,
 }
@@ -151,6 +156,22 @@ pub async fn dispatch_handler(
     headers: HeaderMap,
     Json(req): Json<DispatchRequest>,
 ) -> Result<Json<ApiResponse<DispatchResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        // Resolve the per-call timeout once, here, and forward both the
+        // value (as the X-Wrapper-Dispatch-Timeout header) and the same
+        // Duration to the proxy fn so its reqwest client uses a network
+        // timeout that won't preempt the primary's per-call dispatch.
+        let timeout = resolve_timeout(&headers);
+        let body = serde_json::json!({
+            "action": req.action,
+            "params": req.params,
+        });
+        let resp = primary_proxy::dispatch(&wrapper_id, &body, timeout)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success(resp)));
+    }
+
     let ctx = match state
         .app_state
         .wrapper_state

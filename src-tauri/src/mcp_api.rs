@@ -440,12 +440,22 @@ pub fn create_router(
     // runtime. The registry's filesystem scan + file watcher startup happen
     // on the spawned task. Until the OnceCell is populated `/wrappers/*`
     // returns 503 — `routes::require_wrapper_state` already handles that.
-    {
+    //
+    // Primary-only ownership (wrapper-primary-migration plan, Phase 1.2):
+    // secondaries do not bootstrap a local WrapperState. Their `/wrappers/*`
+    // handlers proxy to the primary via `wrappers::primary_proxy`. Skipping
+    // the bootstrap on secondaries eliminates the cross-runner `notify`
+    // watcher / `pnpm install` contention (`os error 32`).
+    if !crate::process_capture::primary_proxy::is_secondary() {
         let cell = app_state.wrapper_state.clone();
         tokio::spawn(async move {
             let ws = crate::wrappers::WrapperState::new_default().await;
             let _ = cell.set(ws);
         });
+    } else {
+        tracing::info!(
+            "wrappers: secondary instance — skipping local WrapperState bootstrap (proxying to primary)"
+        );
     }
 
     let api_state = Arc::new(ApiState {

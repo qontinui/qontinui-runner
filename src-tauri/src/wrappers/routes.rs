@@ -36,6 +36,7 @@ use super::credentials::CredentialStore;
 use super::dispatch::dispatch_handler;
 use super::install::{install, uninstall, update, InstallError, InstallRequest, InstallResponse};
 use super::manager::WrapperStatus;
+use super::primary_proxy::{self, into_http as proxy_error_to_http};
 use super::registry::Wrapper;
 use super::WrapperState;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -84,6 +85,12 @@ pub fn router() -> Router<Arc<ApiState>> {
 async fn list_wrappers(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<Wrapper>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let wrappers = primary_proxy::list_wrappers()
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success(wrappers)));
+    }
     let ws = require_wrapper_state(&state)?;
     Ok(Json(ApiResponse::success(ws.registry.get_all().await)))
 }
@@ -92,6 +99,12 @@ async fn get_wrapper(
     State(state): State<Arc<ApiState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<Wrapper>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let wrapper = primary_proxy::get_wrapper(&id)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success(wrapper)));
+    }
     let ws = require_wrapper_state(&state)?;
     match ws.registry.get(&id).await {
         Some(w) => Ok(Json(ApiResponse::success(w))),
@@ -110,6 +123,12 @@ async fn install_wrapper(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<InstallRequest>,
 ) -> Result<Json<ApiResponse<InstallResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let resp = primary_proxy::install_wrapper(&req)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success(resp)));
+    }
     let ws = require_wrapper_state(&state)?;
     match install(&ws.registry, &req.package, req.version.as_deref()).await {
         Ok(resp) => Ok(Json(ApiResponse::success(resp))),
@@ -122,8 +141,14 @@ async fn update_wrapper(
     AxumPath(id): AxumPath<String>,
     body: Option<Json<UpdateRequest>>,
 ) -> Result<Json<ApiResponse<InstallResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let ws = require_wrapper_state(&state)?;
     let version = body.and_then(|Json(b)| b.version);
+    if primary_proxy::is_secondary() {
+        let resp = primary_proxy::update_wrapper(&id, version.as_deref())
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success(resp)));
+    }
+    let ws = require_wrapper_state(&state)?;
     match update(&ws.registry, &ws.manager, &id, version.as_deref()).await {
         Ok(resp) => Ok(Json(ApiResponse::success(resp))),
         Err(e) => Err(install_error_to_http(e)),
@@ -134,6 +159,12 @@ async fn uninstall_wrapper(
     State(state): State<Arc<ApiState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let _ = primary_proxy::uninstall_wrapper(&id)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success("uninstalled")));
+    }
     let ws = require_wrapper_state(&state)?;
     match uninstall(&ws.registry, &ws.manager, &id).await {
         Ok(()) => Ok(Json(ApiResponse::success("uninstalled"))),
@@ -169,6 +200,12 @@ async fn start_wrapper(
     State(state): State<Arc<ApiState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<StartedResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let port = primary_proxy::start_wrapper(&id)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success(StartedResponse { port })));
+    }
     let ws = require_wrapper_state(&state)?;
     match ws.manager.spawn(&id).await {
         Ok(port) => Ok(Json(ApiResponse::success(StartedResponse { port }))),
@@ -183,6 +220,12 @@ async fn stop_wrapper(
     State(state): State<Arc<ApiState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let _ = primary_proxy::stop_wrapper(&id)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success("stopped")));
+    }
     let ws = require_wrapper_state(&state)?;
     match ws.manager.stop(&id).await {
         Ok(()) => Ok(Json(ApiResponse::success("stopped"))),
@@ -197,6 +240,12 @@ async fn wrapper_status(
     State(state): State<Arc<ApiState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<WrapperStatus>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let status = primary_proxy::wrapper_status(&id)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success(status)));
+    }
     let ws = require_wrapper_state(&state)?;
     Ok(Json(ApiResponse::success(ws.manager.status(&id).await)))
 }
@@ -222,7 +271,15 @@ struct CredentialDescriptor {
 async fn list_credentials(
     State(state): State<Arc<ApiState>>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<ApiResponse<Vec<CredentialDescriptor>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let descriptors = primary_proxy::list_credentials(&id)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success(serde_json::Value::Array(
+            descriptors,
+        ))));
+    }
     let ws = require_wrapper_state(&state)?;
     let wrapper = ws.registry.get(&id).await.ok_or_else(|| {
         (
@@ -242,7 +299,16 @@ async fn list_credentials(
             secret: spec.secret,
         })
         .collect();
-    Ok(Json(ApiResponse::success(descriptors)))
+    let value = serde_json::to_value(descriptors).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "failed to serialize credential descriptors: {}",
+                e
+            ))),
+        )
+    })?;
+    Ok(Json(ApiResponse::success(value)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +321,12 @@ async fn set_credential(
     AxumPath((id, name)): AxumPath<(String, String)>,
     Json(req): Json<SetCredentialRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let _ = primary_proxy::set_credential(&id, &name, &req.value)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success("set")));
+    }
     let ws = require_wrapper_state(&state)?;
     if ws.registry.get(&id).await.is_none() {
         return Err((
@@ -283,6 +355,12 @@ async fn delete_credential(
     State(state): State<Arc<ApiState>>,
     AxumPath((id, name)): AxumPath<(String, String)>,
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let _ = primary_proxy::delete_credential(&id, &name)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success("deleted")));
+    }
     let ws = require_wrapper_state(&state)?;
     if ws.registry.get(&id).await.is_none() {
         return Err((

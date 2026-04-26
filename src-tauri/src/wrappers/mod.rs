@@ -29,6 +29,7 @@ pub mod dispatch;
 pub mod install;
 pub mod manager;
 pub mod manifest;
+pub mod primary_proxy;
 pub mod registry;
 pub mod routes;
 

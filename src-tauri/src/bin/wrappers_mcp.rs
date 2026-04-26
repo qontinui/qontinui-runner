@@ -5,8 +5,16 @@
 //! logging goes to STDERR — stdout is reserved for protocol traffic and a
 //! single stray byte breaks the framing.
 //!
-//! Backend: makes blocking HTTP calls to `http://127.0.0.1:<port>/wrappers/...`
-//! where `<port>` comes from the `QONTINUI_RUNNER_API_PORT` env (default 9876).
+//! Backend: makes blocking HTTP calls to `<base>/wrappers/...`. The base URL
+//! is resolved (in order):
+//!   1. `QONTINUI_RUNNER_PRIMARY_URL` — full URL, used verbatim (cross-host
+//!      escape hatch, not officially supported).
+//!   2. `QONTINUI_PRIMARY_PORT` — port only; URL is `http://127.0.0.1:<port>`.
+//!      Matches the runner's primary-discovery convention (see
+//!      `crate::instance::primary_port`).
+//!   3. `QONTINUI_RUNNER_API_PORT` — port only; kept for back-compat with
+//!      pre-primary-ownership setups.
+//!   4. Default `http://127.0.0.1:9876`.
 //!
 //! Tool name format: `wrapper_<wrapperId>__<actionId_underscored>`. Dashes in
 //! the action id are replaced with underscores so the name is a legal MCP
@@ -381,11 +389,32 @@ fn handle_request(
     }
 }
 
+/// Resolves the primary runner's base URL. Precedence: `QONTINUI_RUNNER_PRIMARY_URL`
+/// (full URL) > `QONTINUI_PRIMARY_PORT` (port) > `QONTINUI_RUNNER_API_PORT` (port,
+/// back-compat) > `http://127.0.0.1:9876`.
+fn primary_base_url() -> String {
+    if let Ok(url) = std::env::var("QONTINUI_RUNNER_PRIMARY_URL") {
+        if !url.is_empty() {
+            return url;
+        }
+    }
+    if let Ok(port) = std::env::var("QONTINUI_PRIMARY_PORT") {
+        if !port.is_empty() {
+            return format!("http://127.0.0.1:{}", port);
+        }
+    }
+    if let Ok(port) = std::env::var("QONTINUI_RUNNER_API_PORT") {
+        if !port.is_empty() {
+            return format!("http://127.0.0.1:{}", port);
+        }
+    }
+    "http://127.0.0.1:9876".to_string()
+}
+
 fn main() {
     eprintln!("[wrappers-mcp] starting (version {})", SERVER_VERSION);
 
-    let port = std::env::var("QONTINUI_RUNNER_API_PORT").unwrap_or_else(|_| "9876".to_string());
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = primary_base_url();
     eprintln!("[wrappers-mcp] runner base: {}", base);
 
     let tools = fetch_tools(&base);

@@ -49,7 +49,7 @@ const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Lifecycle state of a managed wrapper subprocess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WrapperState {
     /// No subprocess is running.
@@ -61,7 +61,7 @@ pub enum WrapperState {
 }
 
 /// Snapshot of a wrapper's runtime state suitable for `GET /wrappers/:id/status`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WrapperStatus {
     pub id: String,
     pub state: WrapperState,
