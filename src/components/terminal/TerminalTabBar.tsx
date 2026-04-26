@@ -6,6 +6,7 @@ import type { AccountUsageInfo } from "./useSessionManager";
 import { LaunchMenu } from "./LaunchMenu";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { WrapperToolsBadge } from "@/components/wrappers/WrapperToolsBadge";
+import { ReviewBadge } from "./ReviewBadge";
 
 interface TerminalTabBarProps {
   tabs: TerminalTab[];
@@ -553,6 +554,17 @@ export function TerminalTabBar({
               {/* Unread indicator */}
               {hasUnread && <span className="w-1.5 h-1.5 rounded-full bg-[#f7768e] shrink-0" />}
 
+              {/* Phase 3 review verdict badge — next to the existing per-tab
+                  controls cluster. Renders nothing when no review row
+                  exists for the session. */}
+              <span
+                className="shrink-0"
+                data-testid="terminal-tab-controls"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <ReviewBadge sessionId={tab.id} />
+              </span>
+
               {/* Close button */}
               <span
                 role="button"
@@ -673,6 +685,9 @@ export function TerminalTabBar({
                             )}
                             {/* Duration in dropdown */}
                             {tabDuration && <DurationBadge duration={tabDuration} state={state} />}
+                            {/* Phase 3 review verdict badge — same data
+                                surface as the per-tab header. */}
+                            <ReviewBadge sessionId={tab.id} />
                           </div>
                           <div className="flex items-center gap-2 text-[10px] text-[#565f89] mt-0.5">
                             {tab.pid && <span>PID {tab.pid}</span>}

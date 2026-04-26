@@ -3955,3 +3955,164 @@ CREATE TABLE IF NOT EXISTS chunk_labels (
     PRIMARY KEY (config_id, chunk_id)
 );
 CREATE INDEX IF NOT EXISTS idx_chunk_labels_config ON chunk_labels(config_id);
+
+-- -----------------------------------------------------------------------------
+-- Productivity stack: plans + tasks (migration v28)
+-- -----------------------------------------------------------------------------
+-- Decomposed plan rows. Populated by /decompose-plan with the SHA-256 of the
+-- plan's markdown contents at decomposition time. The Coordinator refuses to
+-- schedule tasks whose plan_version_hash no longer matches.
+CREATE TABLE IF NOT EXISTS plans (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    markdown_path   TEXT NOT NULL,
+    version_hash    TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'draft',
+    title           TEXT,
+    summary         TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_path ON plans(markdown_path);
+CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status);
+
+-- Per-task rows decomposed from a plan. expected_file_claims drive the in-memory
+-- UpcomingFileRegistry. assigned_session_id references task_runs.id (TEXT) —
+-- kept as TEXT here because task_runs.id is not a UUID column.
+CREATE TABLE IF NOT EXISTS tasks (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id                 UUID NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    plan_version_hash       TEXT NOT NULL,
+    phase_name              TEXT NOT NULL,
+    sequence_in_phase       INTEGER NOT NULL,
+    description             TEXT NOT NULL,
+    expected_file_claims    TEXT[] NOT NULL DEFAULT '{}',
+    expected_dirs           TEXT[] NOT NULL DEFAULT '{}',
+    depends_on              UUID[] NOT NULL DEFAULT '{}',
+    status                  TEXT NOT NULL DEFAULT 'pending',
+    assigned_session_id     TEXT,
+    started_at              TIMESTAMPTZ,
+    completed_at            TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    notes                   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_assigned_session
+    ON tasks(assigned_session_id) WHERE assigned_session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_phase
+    ON tasks(plan_id, phase_name, sequence_in_phase);
+
+-- -----------------------------------------------------------------------------
+-- Productivity stack: coordinator_decisions + coordinator_leader (migration v29)
+-- -----------------------------------------------------------------------------
+-- Every decision the Coordinator makes — including no-ops — is written here.
+-- The dashboard's Decision Log panel renders the last N rows chronologically,
+-- filterable by rule + action. `auto_acted = false` rows that target an
+-- escalation-eligible action populate the Escalations panel until resolved.
+CREATE TABLE IF NOT EXISTS coordinator_decisions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id      TEXT NOT NULL,
+    iteration       BIGINT NOT NULL,
+    rule            TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    target_id       TEXT,
+    reasoning       TEXT NOT NULL,
+    auto_acted      BOOLEAN NOT NULL,
+    resolved        BOOLEAN NOT NULL DEFAULT FALSE,
+    resolution      TEXT,
+    resolved_at     TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cd_session ON coordinator_decisions(session_id);
+CREATE INDEX IF NOT EXISTS idx_cd_created ON coordinator_decisions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cd_rule_action ON coordinator_decisions(rule, action);
+CREATE INDEX IF NOT EXISTS idx_cd_open_escalations
+    ON coordinator_decisions(created_at DESC)
+    WHERE resolved = FALSE AND auto_acted = FALSE
+      AND action IN ('escalate', 'kill-session', 'force-promote-to-worktree');
+
+-- Single-row leader-lease table. Only one /coordinate session may run at a
+-- time. `id BOOLEAN PRIMARY KEY DEFAULT TRUE` constrains the row count to 1.
+CREATE TABLE IF NOT EXISTS coordinator_leader (
+    id              BOOLEAN PRIMARY KEY DEFAULT TRUE
+                    CHECK (id = TRUE),
+    instance_id     TEXT NOT NULL,
+    leased_until    TIMESTAMPTZ NOT NULL,
+    acquired_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    renewed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- -----------------------------------------------------------------------------
+-- Productivity stack: productivity_knowledge + session_file_snapshots
+-- (migration v30)
+-- -----------------------------------------------------------------------------
+-- Cross-session "what I learned about <area>" notes emitted by
+-- /summarize-session. Uses BYTEA embeddings (1536 bytes = 384 × f32 LE) per
+-- the existing convention since pgvector is not installed. FTS path uses the
+-- GIN index below; vector path decodes BYTEA in Rust and ranks by cosine
+-- similarity.
+CREATE TABLE IF NOT EXISTS productivity_knowledge (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id         UUID REFERENCES tasks(id) ON DELETE SET NULL,
+    session_id      TEXT,
+    area            TEXT NOT NULL,
+    summary         TEXT NOT NULL,
+    body            TEXT NOT NULL,
+    embedding       BYTEA,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pk_area ON productivity_knowledge(area);
+CREATE INDEX IF NOT EXISTS idx_pk_task ON productivity_knowledge(task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_pk_session ON productivity_knowledge(session_id) WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_pk_created ON productivity_knowledge(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pk_fts
+    ON productivity_knowledge USING GIN (to_tsvector('english', area || ' ' || summary || ' ' || body));
+
+-- Per-session pre-edit file snapshots backing /rewind-session.
+-- snapshot_blob_path is the on-disk path of the blob (kept out of PG to keep
+-- the table slim per memory pressure guidance); blob_sha256 is the
+-- content-addressed hash for restore-time verification.
+CREATE TABLE IF NOT EXISTS session_file_snapshots (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id          TEXT NOT NULL,
+    file_path           TEXT NOT NULL,
+    snapshot_blob_path  TEXT NOT NULL,
+    blob_sha256         TEXT NOT NULL,
+    captured_before     BOOLEAN NOT NULL,
+    taken_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sfs_session ON session_file_snapshots(session_id);
+CREATE INDEX IF NOT EXISTS idx_sfs_session_file ON session_file_snapshots(session_id, file_path);
+
+-- Reviews — verdicts emitted by `/auto-review` reviewer agents over worker
+-- sessions' tasks. Multiple rows per task are allowed (re-review trail);
+-- the latest by `created_at` is operative. `user_decision`/`user_decided_at`
+-- record the user's approve/reject vote on medium-confidence recommendations
+-- (§4 Rule D's auto-merge gate band: confidence in [0.7, 0.85)).
+CREATE TABLE IF NOT EXISTS reviews (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id                 UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    reviewer_session_id     TEXT NOT NULL,
+    reviewed_session_id     TEXT NOT NULL,
+    verdict                 TEXT NOT NULL,
+    confidence              DOUBLE PRECISION NOT NULL,
+    reasoning               TEXT NOT NULL,
+    diff_summary            JSONB,
+    test_results            JSONB,
+    user_decision           TEXT,
+    user_decided_at         TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_task
+    ON reviews(task_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_reviewed_session
+    ON reviews(reviewed_session_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_verdict
+    ON reviews(verdict);
+CREATE INDEX IF NOT EXISTS idx_reviews_pending_recommendations
+    ON reviews(created_at DESC)
+    WHERE verdict = 'approved'
+      AND confidence >= 0.7
+      AND confidence < 0.85
+      AND user_decision IS NULL;

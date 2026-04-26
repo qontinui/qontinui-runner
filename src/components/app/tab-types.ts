@@ -97,7 +97,8 @@ export type MainTabId =
   | "online-learning"
   | "dag-workflow-editor"
   | "project-explainer"
-  | "wrappers";
+  | "wrappers"
+  | "productivity";
 
 const VALID_TAB_IDS: MainTabId[] = [
   "prompt-home",
@@ -197,6 +198,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "dag-workflow-editor",
   "project-explainer",
   "wrappers",
+  "productivity",
 ];
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
@@ -307,6 +309,7 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   "dag-workflow-editor": "DAG Workflow Editor",
   "project-explainer": "Project Explainer",
   wrappers: "Wrappers",
+  productivity: "Productivity",
 };
 
 /**
@@ -338,6 +341,7 @@ const NAV_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
   "processes",
   "terminal",
   "wrappers",
+  "productivity",
 ]);
 
 /**

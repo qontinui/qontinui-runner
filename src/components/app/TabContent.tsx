@@ -50,6 +50,7 @@ import { ActiveDashboardPage } from "@/components/active-dashboard";
 import { HistoryTab } from "@/components/HistoryTab";
 import { ExecuteTab } from "@/components/ExecuteTab";
 import { WorkflowQueueTab } from "@/components/workflow-queue";
+import { ProductivityPage } from "@/components/productivity";
 import { ExecutionReport } from "@/components/findings";
 import { StateExplorerTab } from "@/components/state-explorer";
 import { TestResultsTab } from "@/components/test-results";
@@ -311,6 +312,18 @@ export function TabContent({
             description="Queue and manage multiple workflow executions"
           />
           <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
+        </div>
+      );
+
+    case "productivity":
+      return (
+        <div data-page-id="productivity" className="h-full flex flex-col">
+          <PageRegistration
+            id="productivity"
+            name="Productivity"
+            description="Plan/task board, coordinator dashboard, and knowledge browser"
+          />
+          <ProductivityPage />
         </div>
       );
 

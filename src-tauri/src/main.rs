@@ -412,6 +412,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         doctor_handle: TokioMutex::new(None),        // Initialized in setup()
         url_lock_manager: Arc::new(crate::executor::UrlLockManager::new()),
         file_registry_manager: Arc::new(crate::executor::FileRegistryManager::new()),
+        upcoming_file_registry: Arc::new(
+            crate::executor::upcoming_file_registry::UpcomingFileRegistry::new(),
+        ),
         file_lock_manager: Arc::new(crate::executor::FileLockManager::new()),
         ui_bridge_failure_tracker:
             crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
@@ -1100,6 +1103,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             process_capture::commands::start_managed_process,
             process_capture::commands::stop_all_managed_processes,
             process_capture::commands::stop_managed_process,
+            commands::productivity::acknowledge_advisory,
+            commands::productivity::approve_recommendation,
+            commands::productivity::archive_plan,
+            commands::productivity::check_path_claims,
+            commands::productivity::get_coordinator_decisions,
+            commands::productivity::get_escalations,
+            commands::productivity::get_plan_recommendations,
+            commands::productivity::get_plan_tasks,
+            commands::productivity::get_recommendations,
+            commands::productivity::get_reflection,
+            commands::productivity::get_task_detail,
+            commands::productivity::get_upcoming_claims,
+            commands::productivity::list_plans,
+            commands::productivity::list_plans_filtered,
+            commands::productivity::reject_recommendation,
+            commands::productivity::resolve_escalation,
+            commands::productivity::search_knowledge,
+            commands::productivity::unarchive_plan,
             commands::project_logs::append_project_log,
             commands::project_logs::delete_project_config,
             commands::project_logs::get_project_directories,
@@ -1573,6 +1594,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 crash_dump_app_state.crash_dumps.scan_on_startup(&dir).await;
             });
 
+            // Rehydrate the productivity-stack upcoming-file registry from
+            // PG. The registry is in-memory, so without this any Coordinator
+            // / dispatcher lookups in the first few seconds after restart
+            // would miss claims attached to non-terminal tasks. See
+            // productivity-stack plan §3 "Persistence".
+            {
+                let upcoming_state: Arc<AppState> =
+                    app.state::<Arc<AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    upcoming_state
+                        .upcoming_file_registry
+                        .rehydrate_from_pg(&upcoming_state.pg_db)
+                        .await;
+                });
+            }
+
             // Clear runner log files from previous session
             executor::FileLogger::clear_logs();
             dom_capture::DomCaptureLogger::clear_captures();
@@ -2028,6 +2065,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             memory::scheduler::start_memory_scheduler(
                 scheduler_pg,
                 memory::scheduler::MemorySchedulerConfig::default(),
+            );
+
+            // Start the productivity-stack session-file-snapshot pruner.
+            // 24h interval; 7-day retention. See
+            // `database/pg/session_file_snapshots.rs::SNAPSHOT_RETENTION_DAYS`.
+            info!("Starting session-file-snapshot pruner");
+            let snapshot_pruner_pg = app.state::<Arc<AppState>>().inner().pg_db.clone();
+            crate::database::pg::session_file_snapshots::start_session_snapshot_pruner(
+                snapshot_pruner_pg,
             );
 
             // Start dreamer (formal reasoning) scheduler in background

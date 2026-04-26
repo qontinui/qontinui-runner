@@ -65,6 +65,10 @@ import { TerminalPageProvider } from "./components/terminal/TerminalPageContext"
 import { ReorganizeDialog, type ReorganizePlan } from "./components/terminal/ReorganizeDialog";
 import { PerformanceOverlay, GiantSCCFixture } from "./components/dev";
 import { CommandPalette } from "./components/unified-search/CommandPalette";
+import {
+  KnowledgeBrowser,
+  useKnowledgeBrowserHotkey,
+} from "./components/productivity/KnowledgeBrowser";
 import { PromptExecutionProvider } from "./components/prompt-home/PromptExecutionContext";
 import { PromptAutomationOverlay } from "./components/prompt-home/PromptAutomationOverlay";
 import { useTaskRuns } from "./hooks/useAiData";
@@ -600,10 +604,20 @@ function AppContent() {
           <PerformanceOverlay position="bottom-right" />
           <GiantSCCFixture />
           <CommandPalette />
+          <GlobalKnowledgeBrowser />
         </div>
       </RenderLogWrapper>
     </ProfilerWrapper>
   );
+}
+
+/**
+ * Global Ctrl+Shift+K trigger for the knowledge browser modal. Mounted
+ * at the AppContent root so the hotkey works from any tab.
+ */
+function GlobalKnowledgeBrowser() {
+  const [open, setOpen] = useKnowledgeBrowserHotkey();
+  return <KnowledgeBrowser mode="modal" open={open} onClose={() => setOpen(false)} />;
 }
 
 function AppWithTutorials() {

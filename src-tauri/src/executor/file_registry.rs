@@ -427,7 +427,7 @@ pub struct FileRegistryInfo {
 ///
 /// Converts backslashes to forward slashes and lowercases on Windows
 /// for case-insensitive matching.
-fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     // Windows paths are case-insensitive
     #[cfg(target_os = "windows")]

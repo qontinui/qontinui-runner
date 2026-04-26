@@ -1200,11 +1200,12 @@
       {
         "id": "active-terminals",
         "name": "Active Terminal Workspace",
-        "description": "The primary state of the terminal page. Shows the tab bar with open terminal sessions, a zone grid with one or more terminal instances, the zone status bar with action buttons (Sessions, Generate, Analyze, Findings), the page tab bar, and optional file conflict banner. The right panel and session sidebar are hidden.",
+        "description": "The primary state of the terminal page. Shows the tab bar with open terminal sessions, a zone grid with one or more terminal instances, the zone status bar with action buttons (Sessions, Generate, Analyze, Findings), the page tab bar, and optional file conflict banner. The right panel and session sidebar are hidden. Per-tab indicators include the productivity-stack ReviewBadge (`terminal-tab.review-badge`) which surfaces the latest /auto-review verdict for the tab's session — empty when no review row exists, otherwise an icon + confidence + tooltip per plan §6.",
         "elements": [
           { "role": "tablist" },
           { "role": "button", "textContent": "+" },
-          { "role": "button", "textContent": "Sessions" }
+          { "role": "button", "textContent": "Sessions" },
+          { "uiBridgeId": "terminal-tab.review-badge", "optional": true }
         ],
         "isInitial": false,
         "transitions": [

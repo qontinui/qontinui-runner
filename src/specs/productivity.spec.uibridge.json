@@ -1,0 +1,191 @@
+{
+  "version": "1.0.0",
+  "id": "runner:productivity",
+  "description": "Productivity page — top-level tab housing the plan/task board (Phase 1+5, live), the coordinator dashboard (Phase 2+5, live), and the knowledge browser (Phase 4, live). The plan/task board has three columns: a plans list with a 'Show archived' toggle (left, 25%), tasks for the selected plan grouped by phase with a collapsible Reflection panel above (middle, 50%), and a task detail panel (right, 25%). The coordinator dashboard stacks five panels: a 'Coordinator suggests next plan' card (top), the Phase-3 recommendations queue, an LLM-driven Advisories list, the open-escalations list, and a chronological decision log. A top bar selector switches between the three sub-views.",
+  "metadata": {
+    "component": "ProductivityPage",
+    "pageId": "productivity",
+    "pageUrl": "/productivity",
+    "tags": ["runner", "productivity", "plans", "tasks", "phase-1"]
+  },
+  "groups": [
+    {
+      "id": "productivity-shell",
+      "name": "Productivity Shell",
+      "description": "The page renders a top bar with three view tabs (Plans & Tasks, Coordinator, Knowledge) and a content area below. Phase 1: only the Plans & Tasks view is wired up; the other two render a 'coming in later phase' placeholder.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "productivity-shell-header",
+          "description": "The page shows a 'Productivity' heading at the top",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Productivity" },
+            "label": "Productivity page heading"
+          },
+          "enabled": true
+        },
+        {
+          "id": "productivity-shell-tab-plans",
+          "description": "The top bar shows a 'Plans & Tasks' sub-view tab",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Plans & Tasks" },
+            "label": "Plans sub-view tab"
+          },
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "productivity-plans",
+        "name": "Plans & Tasks View",
+        "description": "The Plans & Tasks sub-view is active. The three-column board is visible with a plans list on the left, a task list in the middle, and a task detail panel on the right. This is the default sub-view on page load.",
+        "elements": [
+          { "dataAttributes": { "page-id": "productivity-plans" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.plan-list" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.task-list" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.task-detail" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.task-claims" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.task-deps" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.show-archived-toggle" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.reflection-panel" } }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "plans-to-coordinator",
+            "name": "Switch to Coordinator view",
+            "activateStates": ["productivity-coordinator"],
+            "deactivateStates": ["productivity-plans"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" } },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "plans-to-knowledge",
+            "name": "Switch to Knowledge view",
+            "activateStates": ["productivity-knowledge"],
+            "deactivateStates": ["productivity-plans"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-knowledge" } },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "productivity-coordinator",
+        "name": "Coordinator View",
+        "description": "The Coordinator sub-view is active. Phase 2 (live): renders the CoordinatorDashboard with three stacked panels — a Phase-3-stub Recommendations queue, an Escalations list (open destructive recommendations the agent flagged advisory-only), and a chronological Decision log of the last 200 coordinator_decisions rows filterable by rule and action.",
+        "elements": [
+          { "dataAttributes": { "page-id": "productivity-coordinator" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendations" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.coord-escalations" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.coord-escalations-refresh" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.coord-escalation-card" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.coord-decision-log" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.coord-decision-log-rule-filter" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.coord-decision-log-action-filter" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.coord-decision-log-refresh" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendations" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.coord-advisories" } }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "coordinator-to-plans",
+            "name": "Back to Plans view",
+            "activateStates": ["productivity-plans"],
+            "deactivateStates": ["productivity-coordinator"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-plans" } },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "coordinator-to-knowledge",
+            "name": "Switch to Knowledge view",
+            "activateStates": ["productivity-knowledge"],
+            "deactivateStates": ["productivity-coordinator"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-knowledge" } },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "productivity-knowledge",
+        "name": "Knowledge View",
+        "description": "The Knowledge sub-view is active. Phase 4 (live): renders the inline KnowledgeBrowser with an FTS search input, an area-filter dropdown, a submit button, and a results list. Each result row is a clickable disclosure that expands to show the body markdown.",
+        "elements": [
+          { "dataAttributes": { "page-id": "productivity-knowledge" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-browser" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-search-input" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-area-filter" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-search-submit" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-results" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-result-row" } }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "knowledge-to-plans",
+            "name": "Back to Plans view",
+            "activateStates": ["productivity-plans"],
+            "deactivateStates": ["productivity-knowledge"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-plans" } },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "knowledge-to-coordinator",
+            "name": "Switch to Coordinator view",
+            "activateStates": ["productivity-coordinator"],
+            "deactivateStates": ["productivity-knowledge"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" } },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

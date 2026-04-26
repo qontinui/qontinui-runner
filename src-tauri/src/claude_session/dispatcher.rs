@@ -461,6 +461,29 @@ fn auto_register_file(
                         let _ = event_broadcast.send(acquired_data);
                     }
 
+                    // Productivity stack §2 / Phase 4 / §9 Q5: capture a
+                    // pre-edit snapshot the first time this session
+                    // touches this path. Skips the work entirely if a
+                    // snapshot already exists for the (session, path)
+                    // pair, so a session that edits the same file twice
+                    // only writes one blob (the pre-first-edit one,
+                    // which is the rollback target).
+                    //
+                    // Runs synchronously inside the block_on so the
+                    // snapshot is on disk + recorded in PG BEFORE
+                    // Claude Code's stdout reader unblocks and the edit
+                    // proceeds. Errors are logged at warn-level and do
+                    // not block the edit (snapshots are advisory; a
+                    // missing snapshot just means /rewind-session
+                    // can't roll back this file).
+                    capture_pre_edit_snapshot(
+                        &handle,
+                        &pg_db,
+                        &task_run_id,
+                        &file_path_clone,
+                    )
+                    .await;
+
                     waited
                 })
             });
@@ -489,6 +512,71 @@ fn auto_register_file(
                         "session_touched_files: record_file_touched failed for task_run='{}' file='{}': {}",
                         task_run_id_touch, file_path_touch, e
                     );
+                }
+            });
+
+            // Productivity-stack §3 wiring: after the active registry is
+            // updated, peek the in-memory UpcomingFileRegistry for any
+            // *future* claims on this path. If the claimer's owning task
+            // is assigned to a session OTHER than this one, surface a
+            // `file-claim-foreign` event so the Coordinator dashboard can
+            // warn "session S is editing future-claim path P ahead of
+            // schedule". Advisory-only — does not block the edit.
+            //
+            // Cheap: one hashmap read on the registry plus, per claimer
+            // not owned by us, one PG row read. Runs in its own task so
+            // the path stays off the stdout reader thread. AppState is
+            // re-fetched at task entry rather than captured to keep the
+            // Send bound on the spawn closure simple.
+            let file_path_upc = file_path.clone();
+            let task_run_id_upc = task_run_id.clone();
+            let pg_db_upc = pg_db.clone();
+            let upcoming_registry = app_state.upcoming_file_registry.clone();
+            let handle_upc = app_handle.clone();
+            rt.spawn(async move {
+                let claimers = upcoming_registry.claimers_for_path(&file_path_upc).await;
+                if claimers.is_empty() {
+                    return;
+                }
+                let mut foreign: Vec<serde_json::Value> = Vec::new();
+                for c in &claimers {
+                    // The claim's task may be assigned to this session
+                    // (an *expected* edit) or to no one / another session
+                    // (a *foreign* edit ahead of schedule). Look up the
+                    // task once per claimer; the registry is small per
+                    // path so the fan-out is minimal.
+                    let assigned_session = match pg_db_upc.get_task_by_id(&c.task_id).await {
+                        Ok(Some(t)) => t.assigned_session_id,
+                        Ok(None) => None,
+                        Err(e) => {
+                            warn!(
+                                "upcoming-claim lookup failed for task {}: {}",
+                                c.task_id, e
+                            );
+                            None
+                        }
+                    };
+                    let is_ours = assigned_session
+                        .as_deref()
+                        .map(|s| s == task_run_id_upc.as_str())
+                        .unwrap_or(false);
+                    if !is_ours {
+                        foreign.push(serde_json::json!({
+                            "plan_id": c.plan_id,
+                            "task_id": c.task_id,
+                            "path": c.path,
+                            "assigned_session_id": assigned_session,
+                        }));
+                    }
+                }
+                if !foreign.is_empty() {
+                    let payload = serde_json::json!({
+                        "type": "file-claim-foreign",
+                        "file_path": file_path_upc,
+                        "editing_session_id": task_run_id_upc,
+                        "claimers": foreign,
+                    });
+                    let _ = handle_upc.emit("file-claim-foreign", &payload);
                 }
             });
 
@@ -535,6 +623,139 @@ fn auto_register_file(
             );
         }
     }
+}
+
+/// Capture a pre-edit snapshot of `file_path` for `task_run_id`. Called by
+/// `auto_register_file` once per (session, path) pair from inside the
+/// `block_on` that holds the file lock — so the on-disk + PG state is
+/// committed before Claude Code's stdout reader unblocks and the edit
+/// proceeds.
+///
+/// Behaviour:
+/// - Cheap pre-check via `has_pre_edit_snapshot`: if a pre-edit snapshot
+///   already exists for this pair we exit immediately. This handles the
+///   "session edits the same file twice" case (only the first snapshot
+///   is the rollback target; subsequent edits would otherwise overwrite
+///   the rollback blob).
+/// - If the source file doesn't exist (e.g. Claude Code is creating a
+///   brand-new file via Write), skip — there's nothing to snapshot, and
+///   `/rewind-session` simply leaves the file alone if no snapshot row
+///   exists.
+/// - Otherwise compute sha256, copy bytes to
+///   `<runner_data_dir>/session_snapshots/<session_id>/<sha256>.blob`,
+///   and insert the metadata row.
+///
+/// All errors are logged at warn-level — snapshots are advisory and a
+/// failure here MUST NOT block the edit (per Phase 4 §10 mitigation).
+async fn capture_pre_edit_snapshot(
+    app_handle: &tauri::AppHandle,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    session_id: &str,
+    file_path: &str,
+) {
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+
+    // 1. Cheap pre-check: skip duplicate snapshots within the same session.
+    match pg_db.has_pre_edit_snapshot(session_id, file_path).await {
+        Ok(true) => {
+            trace!(
+                "capture_pre_edit_snapshot: snapshot already exists for session={}, path={} — skipping",
+                session_id,
+                file_path
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            warn!(
+                "capture_pre_edit_snapshot: has_pre_edit_snapshot lookup failed (session={}, path={}): {} — assuming none and proceeding",
+                session_id, file_path, e
+            );
+        }
+    }
+
+    // 2. Read the source file. ENOENT means Claude Code is creating a new
+    //    file; nothing to snapshot. All other errors are logged.
+    let bytes = match std::fs::read(file_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            trace!(
+                "capture_pre_edit_snapshot: source file does not exist (session={}, path={}) — likely new-file Write; skipping snapshot",
+                session_id, file_path
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "capture_pre_edit_snapshot: failed to read '{}' (session={}): {} — edit proceeds without snapshot",
+                file_path, session_id, e
+            );
+            return;
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let sha = format!("{:x}", hasher.finalize());
+
+    // 3. Compute the on-disk blob destination under runner_data_dir.
+    let blob_dir: PathBuf = match app_handle.path().app_data_dir() {
+        Ok(base) => base
+            .join("session_snapshots")
+            .join(session_id),
+        Err(e) => {
+            warn!(
+                "capture_pre_edit_snapshot: app_data_dir() failed (session={}): {} — skipping",
+                session_id, e
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&blob_dir) {
+        warn!(
+            "capture_pre_edit_snapshot: create_dir_all('{}') failed (session={}): {} — skipping",
+            blob_dir.display(),
+            session_id,
+            e
+        );
+        return;
+    }
+    let blob_path = blob_dir.join(format!("{}.blob", sha));
+
+    // 4. Write the blob (idempotent — content-addressed by sha256).
+    if !blob_path.exists() {
+        if let Err(e) = std::fs::write(&blob_path, &bytes) {
+            warn!(
+                "capture_pre_edit_snapshot: write blob '{}' failed (session={}): {} — skipping",
+                blob_path.display(),
+                session_id,
+                e
+            );
+            return;
+        }
+    }
+
+    // 5. Insert PG metadata row.
+    let blob_path_str = blob_path.to_string_lossy().to_string();
+    if let Err(e) = pg_db
+        .insert_snapshot(session_id, file_path, &blob_path_str, &sha, true)
+        .await
+    {
+        warn!(
+            "capture_pre_edit_snapshot: insert_snapshot failed (session={}, path={}): {} — blob orphaned but harmless",
+            session_id, file_path, e
+        );
+        return;
+    }
+
+    debug!(
+        "capture_pre_edit_snapshot: captured {} bytes for session={}, path={} (sha={})",
+        bytes.len(),
+        session_id,
+        file_path,
+        &sha[..8.min(sha.len())]
+    );
 }
 
 /// Shorten a file path to just the filename or last two components.

@@ -19,6 +19,10 @@ const PAGE_TO_TAB: Record<string, MainTabId> = {
   "workflow-queue": "workflow-queue",
   terminal: "terminal",
   "orchestration-loop": "orchestration-loop",
+  productivity: "productivity",
+  "productivity-plans": "productivity",
+  "productivity-coordinator": "productivity",
+  "productivity-knowledge": "productivity",
   // Observe
   runs: "runs",
   "run-recap": "run-recap",
@@ -149,14 +153,34 @@ export function useAppNavigation(): UseAppNavigationReturn {
     }
   }, [isApiReady]);
 
+  // When a `productivity-*` alias is requested, the main tab is `productivity`
+  // but the sub-view (plans/coordinator/knowledge) needs to be surfaced to the
+  // Productivity page. Dispatch a window event the page listens for. Pattern
+  // mirrors the Settings `defaultTab` flow but goes via an event because the
+  // PAGE_TO_TAB map collapses all three aliases into a single tab id.
+  const dispatchProductivitySubView = useCallback((page: string) => {
+    if (page === "productivity-plans" || page === "productivity") {
+      window.dispatchEvent(new CustomEvent("productivity-set-view", { detail: { view: "plans" } }));
+    } else if (page === "productivity-coordinator") {
+      window.dispatchEvent(
+        new CustomEvent("productivity-set-view", { detail: { view: "coordinator" } }),
+      );
+    } else if (page === "productivity-knowledge") {
+      window.dispatchEvent(
+        new CustomEvent("productivity-set-view", { detail: { view: "knowledge" } }),
+      );
+    }
+  }, []);
+
   useEffect(() => {
     registerNavigate((page: string) => {
       const tabId = PAGE_TO_TAB[page];
       if (tabId) {
         setActiveTab(tabId);
+        dispatchProductivitySubView(page);
       }
     });
-  }, [registerNavigate]);
+  }, [registerNavigate, dispatchProductivitySubView]);
 
   useEffect(() => {
     const handler = (e: WindowEventMap["ui-bridge-navigate"]) => {
@@ -164,6 +188,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
       const tabId = PAGE_TO_TAB[page];
       if (tabId) {
         setActiveTab(tabId);
+        dispatchProductivitySubView(page);
       }
     };
     // Direct tab setter (bypasses PAGE_TO_TAB for navigate_tab endpoint)
@@ -176,7 +201,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
       window.removeEventListener("ui-bridge-navigate", handler);
       window.removeEventListener("ui-bridge-set-tab", directHandler as EventListener);
     };
-  }, []);
+  }, [dispatchProductivitySubView]);
 
   // Tauri-native listener for the `ui-bridge:activate-tab` event emitted by
   // `POST /ui-bridge/control/activate-tab/{tab_id}`. This is intentionally
@@ -221,6 +246,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
           if (page === "state-machine") {
             setTimeout(() => window.dispatchEvent(new Event("sm-show-exploration")), 200);
           }
+          dispatchProductivitySubView(page);
         } else {
           console.warn(`[APP] Unknown page for navigation: ${page}`);
         }
@@ -234,7 +260,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         unlisten();
       }
     };
-  }, []);
+  }, [dispatchProductivitySubView]);
 
   useEffect(() => {
     const handleNavigateToErrorMonitor = (
@@ -318,6 +344,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         const tabId = PAGE_TO_TAB[path];
         if (tabId) {
           setActiveTab(tabId);
+          dispatchProductivitySubView(path);
         } else {
           // Fall back: try using the path directly as a tab ID
           setActiveTab(path as MainTabId);
@@ -332,7 +359,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         delete g2.navigateHandler;
       }
     };
-  }, [setActiveTab]);
+  }, [setActiveTab, dispatchProductivitySubView]);
 
   return {
     activeTab,
