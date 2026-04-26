@@ -344,6 +344,16 @@ impl SetupExecutor {
                                 output.len()
                             );
                             // Persist AI output to chunks for the /output endpoint
+                            // and increment sessions_count: this branch fires when a
+                            // response-mode AI prompt step completes successfully, which
+                            // is exactly an AI session for accounting purposes. Without
+                            // the bump, tasks whose only AI work runs in setup (e.g.
+                            // unified-workflow generation: "Define acceptance criteria"
+                            // + "Generate workflow from description") sit at
+                            // `sessions_count == 0` while idle in the verification phase
+                            // and are auto-failed by the zombie sweep's
+                            // `ZERO_SESSION_AUTO_STOP` heuristic — see
+                            // `proj_issue_zombie_sweep_completed_sessions.md`.
                             if !output.is_empty() {
                                 let formatted = format!(
                                     "\n--- AI Setup Output ({}) ---\n{}\n",
@@ -352,10 +362,24 @@ impl SetupExecutor {
                                 if let Err(e) = self
                                     .app_state
                                     .pg_db
-                                    .append_task_output_ex(execution_id, &formatted, false, false)
+                                    .append_task_output_ex(execution_id, &formatted, true, false)
                                     .await
                                 {
                                     warn!("PG append_task_output_ex failed: {}", e);
+                                }
+                            } else {
+                                // Even with empty output, the AI session DID run —
+                                // increment so the sweep doesn't reap us.
+                                if let Err(e) = self
+                                    .app_state
+                                    .pg_db
+                                    .append_task_output_ex(execution_id, "", true, false)
+                                    .await
+                                {
+                                    warn!(
+                                        "PG append_task_output_ex (session increment) failed: {}",
+                                        e
+                                    );
                                 }
                             }
                             // Save completion checkpoint
