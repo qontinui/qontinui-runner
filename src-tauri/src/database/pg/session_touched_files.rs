@@ -83,6 +83,46 @@ impl PgDb {
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
+    /// Reverse lookup of [`get_files_touched`]: given a list of file paths,
+    /// return every `(file_path, task_run_id)` pair that recently touched any
+    /// of those files. Ordered most-recent first by `recorded_at`.
+    ///
+    /// Used by Phase F's pre-merge guard (`worktree::merge_worktree`) to
+    /// surface which sibling sessions own the dirty files in a destination
+    /// checkout when a worktree merge would silently overwrite them. Returns
+    /// one row per `(file, session)` pair — callers dedup if they want
+    /// per-file or per-session views.
+    pub async fn get_sessions_for_files(
+        &self,
+        file_paths: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT file_path, task_run_id
+                   FROM session_touched_files
+                   WHERE file_path = ANY($1)
+                   ORDER BY recorded_at DESC, file_path ASC"#,
+                &[&file_paths],
+            )
+            .await
+            .map_err(|e| format!("PG get_sessions_for_files: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect())
+    }
+
     /// Delete every recorded file row for `task_run_id`. Returns the number
     /// of rows removed. Phase C/D will call this after a successful commit
     /// to keep the table from growing unboundedly across long-lived runs.
@@ -355,6 +395,71 @@ mod tests {
         );
 
         let _ = db.clear_files_touched(&task_run_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn get_sessions_for_files_returns_owners_most_recent_first() {
+        let db = PgDb::new_blocking_for_test();
+        let session_a = unique_task_run_id("rev-a");
+        let session_b = unique_task_run_id("rev-b");
+        let session_c = unique_task_run_id("rev-c");
+        let _ = db.clear_files_touched(&session_a).await;
+        let _ = db.clear_files_touched(&session_b).await;
+        let _ = db.clear_files_touched(&session_c).await;
+
+        // Use unique paths per test run so concurrent runs don't collide on
+        // shared rows from other sessions in the same PG instance.
+        let file1 = format!("/repo/rev-{}-1.rs", session_a);
+        let file2 = format!("/repo/rev-{}-2.rs", session_a);
+        let other = format!("/repo/rev-{}-other.rs", session_a);
+
+        // Session A touches file1 first, then file2. Session B touches file1
+        // later (so B is the most-recent owner of file1). Session C touches
+        // an unrelated file we won't query for.
+        db.record_file_touched(&session_a, &file1, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        db.record_file_touched(&session_a, &file2, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        db.record_file_touched(&session_b, &file1, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        db.record_file_touched(&session_c, &other, None)
+            .await
+            .unwrap();
+
+        let pairs = db
+            .get_sessions_for_files(&[file1.clone(), file2.clone()])
+            .await
+            .expect("get_sessions_for_files");
+
+        // Expected: 3 pairs total (A+file1, A+file2, B+file1). Session C
+        // touched a path we didn't query for, so it must NOT appear.
+        assert_eq!(pairs.len(), 3, "got {:?}", pairs);
+        assert!(!pairs.iter().any(|(_, s)| s == &session_c),
+            "session_c touched an unrelated file and must not appear: {:?}", pairs);
+
+        // Most-recent-first ordering: B's touch of file1 was last, so it
+        // must be the first row.
+        assert_eq!(
+            pairs[0],
+            (file1.clone(), session_b.clone()),
+            "most-recent owner of file1 must be session_b: {:?}",
+            pairs
+        );
+
+        // Empty input must short-circuit to empty output without erroring.
+        let empty = db.get_sessions_for_files(&[]).await.expect("empty input");
+        assert!(empty.is_empty());
+
+        let _ = db.clear_files_touched(&session_a).await;
+        let _ = db.clear_files_touched(&session_b).await;
+        let _ = db.clear_files_touched(&session_c).await;
     }
 
     #[tokio::test]

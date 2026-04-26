@@ -123,6 +123,35 @@ pub struct MergeResult {
     pub conflicts: Vec<String>,
     /// Human-readable summary.
     pub summary: String,
+    /// Phase F pre-merge guard: when populated, the merge was REFUSED because
+    /// the destination working tree had uncommitted edits that the merge
+    /// would silently overwrite. The merge was not attempted. `success` is
+    /// always `false` when this is `Some`. `conflicts` is empty (those are
+    /// merge-time conflicts, a different concept).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub blocked: Option<MergeBlockedDetails>,
+}
+
+/// Phase F: structured payload for "would clobber sibling work" outcomes.
+/// Surfaced to the API so callers can show a "force merge?" UI with the
+/// list of files at risk and which sessions own them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeBlockedDetails {
+    /// Files modified in destination AND about to change in the merge.
+    pub conflicting_files: Vec<String>,
+    /// Sessions known to have touched any of those files, deduped by
+    /// `task_run_id` and ordered most-recent first. May contain a synthetic
+    /// `task_run_id == "(unknown)"` entry for files that are dirty but not
+    /// tracked by the per-session file-set tracker (manual edits, sessions
+    /// from before Phase A).
+    pub owning_sessions: Vec<OwningSession>,
+}
+
+/// Phase F: one session's slice of the conflicting-files set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwningSession {
+    pub task_run_id: String,
+    pub touched_files: Vec<String>,
 }
 
 // =============================================================================
@@ -291,6 +320,15 @@ pub fn remove_worktree(
 ///
 /// This performs a fast-forward merge if possible, otherwise a regular merge.
 /// Returns conflict information if the merge can't auto-resolve.
+///
+/// Phase F pre-merge guard: BEFORE running `git merge`, this function computes
+/// the intersection of (a) files that the merge would change and (b) files
+/// the destination working tree has uncommitted edits to. If non-empty, the
+/// merge is REFUSED and a [`MergeBlockedDetails`] payload is returned so the
+/// caller can surface which sibling sessions own the at-risk work.
+///
+/// Use [`merge_worktree_force`] to bypass the guard (it stashes the dirty
+/// changes first so the user has an explicit recovery path).
 pub fn merge_worktree(
     repo_path: &Path,
     branch_name: &str,
@@ -310,13 +348,39 @@ pub fn merge_worktree(
         ));
     }
 
-    // Check if there are uncommitted changes
-    let status = run_git_command(repo_path, &["status", "--porcelain"])?;
-    if !status.trim().is_empty() {
-        return Err(
-            "Working directory has uncommitted changes. Commit or stash them before merging."
-                .to_string(),
+    // Phase F: structured pre-merge guard. Compute "what would change" ∩
+    // "what is currently dirty in destination" and refuse the merge if the
+    // intersection is non-empty. Old behaviour ("just refuse if anything is
+    // dirty") was unsafe because it gave callers no way to distinguish "your
+    // sibling will lose work" from "you have an unrelated stray edit".
+    let conflicting_files = compute_premerge_conflicts(repo_path, branch_name, true)?;
+    if !conflicting_files.is_empty() {
+        warn!(
+            "WORKTREE: pre-merge guard blocked merge of '{}' into '{}' — \
+             {} dirty file(s) would be overwritten",
+            branch_name,
+            source_branch,
+            conflicting_files.len()
         );
+        return Ok(MergeResult {
+            success: false,
+            merge_commit: None,
+            conflicts: vec![],
+            summary: format!(
+                "Merge blocked: {} file(s) in '{}' have uncommitted changes that would be overwritten. \
+                 Commit/stash them, or call force-merge to auto-stash.",
+                conflicting_files.len(),
+                source_branch,
+            ),
+            blocked: Some(MergeBlockedDetails {
+                conflicting_files,
+                // owning_sessions is populated by the caller (HTTP handler /
+                // Tauri command) which has access to PgDb. The pure-git layer
+                // can't reach the DB, and we don't want to make this fn async
+                // just for a best-effort attribution lookup.
+                owning_sessions: Vec::new(),
+            }),
+        });
     }
 
     // Try the merge
@@ -335,6 +399,7 @@ pub fn merge_worktree(
                     source_branch,
                     output.trim()
                 ),
+                blocked: None,
             })
         }
         Err(e) => {
@@ -357,12 +422,252 @@ pub fn merge_worktree(
                     conflicts,
                     summary: "Merge conflicts detected. Merge aborted. Use AI merge to resolve."
                         .to_string(),
+                    blocked: None,
                 })
             } else {
                 Err(format!("Merge failed: {}", e))
             }
         }
     }
+}
+
+/// Phase F: compute the pre-merge conflict set for [`merge_worktree`].
+///
+/// Returns the intersection of:
+///   - files that would change in `git merge <source_branch>` against
+///     `repo_path`'s current HEAD (`git diff --name-only HEAD..<branch>`)
+///   - files dirty in `repo_path`'s working tree right now
+///     (`git status --porcelain` parsed for modified-tracked, plus optionally
+///     untracked when `include_untracked` is true)
+///
+/// "Modified tracked" means the porcelain entry has `M` or `D` in either the
+/// index or working-tree column. This catches `M `, ` M`, `MM`, `AM`, ` D`,
+/// `D `, etc. — anything where the user has staged or unstaged content git
+/// would refuse to clobber. Untracked entries (`??`) are added when
+/// `include_untracked` is set; that's the safer default since the pre-merge
+/// check is exactly the place to catch "scratch file the user hasn't added
+/// yet that the merge will overwrite".
+pub(crate) fn compute_premerge_conflicts(
+    repo_path: &Path,
+    source_branch: &str,
+    include_untracked: bool,
+) -> Result<Vec<String>, String> {
+    // (a) files the merge would change. Two-dot `HEAD..<branch>` is
+    // intentional — we want "what's coming in," NOT the symmetric diff
+    // (which would also include destination-only commits the merge wouldn't
+    // touch).
+    let diff_output =
+        run_git_command(repo_path, &["diff", "--name-only", &format!("HEAD..{}", source_branch)])?;
+    let incoming: std::collections::HashSet<String> = diff_output
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+
+    if incoming.is_empty() {
+        // Nothing's coming in (already merged, or empty branch). Can't
+        // possibly clobber anything.
+        return Ok(Vec::new());
+    }
+
+    // (b) dirty paths in destination working tree.
+    let status_output = run_git_command(repo_path, &["status", "--porcelain"])?;
+    let dirty: std::collections::HashSet<String> = parse_dirty_paths(&status_output, include_untracked);
+
+    // Intersection, sorted for determinism.
+    let mut overlap: Vec<String> = incoming.intersection(&dirty).cloned().collect();
+    overlap.sort();
+    Ok(overlap)
+}
+
+/// Parse `git status --porcelain` (v1) output into a set of dirty paths.
+///
+/// Porcelain v1 lines are `XY <space> <path>` where X is index status and Y
+/// is working-tree status (e.g. ` M file`, `MM file`, `?? file`). We treat as
+/// dirty:
+///   - any entry whose X or Y is `M` (modified) or `D` (deleted)
+///   - any entry whose X is `A` (added/staged-new) — those are uncommitted edits
+///   - untracked (`??`) when `include_untracked` is true
+///
+/// Renames (`R old -> new`) are normalised to the new path; the index has
+/// already moved on so the new name is what would collide with the merge.
+pub(crate) fn parse_dirty_paths(
+    porcelain: &str,
+    include_untracked: bool,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in porcelain.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let xy = &line[..2];
+        let rest = &line[3..]; // skip "XY "
+
+        let x = xy.as_bytes()[0] as char;
+        let y = xy.as_bytes()[1] as char;
+
+        let is_untracked = xy == "??";
+        let is_modified_tracked = matches!(x, 'M' | 'D' | 'A' | 'R' | 'C')
+            || matches!(y, 'M' | 'D');
+
+        if is_untracked {
+            if include_untracked {
+                out.insert(rest.to_string());
+            }
+            continue;
+        }
+
+        if !is_modified_tracked {
+            continue;
+        }
+
+        // Renames look like "R  old -> new". Take the new name; that's the
+        // path that lives in the working tree post-rename.
+        let path = if let Some(idx) = rest.find(" -> ") {
+            rest[idx + 4..].to_string()
+        } else {
+            rest.to_string()
+        };
+        out.insert(path);
+    }
+    out
+}
+
+/// Phase F force-merge: stash the conflicting destination changes, then run
+/// the merge. Returns the stash ref so the user has a recovery path.
+///
+/// If there's nothing to stash (the guard would have allowed the merge
+/// anyway), this still works — it's just a no-op stash and a normal merge.
+pub fn merge_worktree_force(
+    repo_path: &Path,
+    branch_name: &str,
+    source_branch: &str,
+) -> Result<ForceMergeResult, String> {
+    info!(
+        "WORKTREE: force-merging '{}' into '{}' (auto-stashing dirty overlap)",
+        branch_name, source_branch
+    );
+
+    let current = get_current_branch(repo_path)?;
+    if current != source_branch {
+        return Err(format!(
+            "Not on source branch '{}' (currently on '{}'). Switch to the source branch first.",
+            source_branch, current
+        ));
+    }
+
+    // Recompute the conflict set from scratch — caller may have raced with
+    // the user, and we want the stash to actually capture what's dirty.
+    let conflicting_files = compute_premerge_conflicts(repo_path, branch_name, true)?;
+
+    let stash_ref = if conflicting_files.is_empty() {
+        None
+    } else {
+        let stash_msg = format!("auto-stash before force-merge of {}", branch_name);
+        // `stash push --include-untracked -m <msg> -- <files>` is the most
+        // surgical form: only the listed paths are stashed. We don't want
+        // to wholesale-stash the user's working tree because it may contain
+        // unrelated work we don't need to disturb.
+        let mut args: Vec<String> = vec![
+            "stash".into(),
+            "push".into(),
+            "--include-untracked".into(),
+            "-m".into(),
+            stash_msg.clone(),
+            "--".into(),
+        ];
+        args.extend(conflicting_files.iter().cloned());
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_git_command(repo_path, &arg_refs).map_err(|e| {
+            format!("force-merge: failed to stash dirty files (merge NOT attempted): {}", e)
+        })?;
+
+        // Get the stash ref of what we just pushed (top of stack).
+        let stash_list = run_git_command(repo_path, &["stash", "list", "-n", "1"])?;
+        // First line looks like: stash@{0}: On main: auto-stash before...
+        let stash_ref = stash_list
+            .lines()
+            .next()
+            .and_then(|l| l.split(':').next())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "stash@{0}".to_string());
+        info!(
+            "WORKTREE: force-merge stashed {} file(s) as {}",
+            conflicting_files.len(),
+            stash_ref
+        );
+        Some(stash_ref)
+    };
+
+    // Now do the actual merge. We don't call `merge_worktree` here because
+    // the guard would re-fire (it doesn't know we just stashed) — go
+    // directly to the git layer.
+    let merge_result = run_git_command_with_status(repo_path, &["merge", branch_name, "--no-edit"]);
+
+    match merge_result {
+        Ok(output) => {
+            let merge_commit = get_head_commit(repo_path).unwrap_or_default();
+            Ok(ForceMergeResult {
+                merge: MergeResult {
+                    success: true,
+                    merge_commit: Some(merge_commit),
+                    conflicts: vec![],
+                    summary: format!(
+                        "Merged '{}' into '{}': {}",
+                        branch_name,
+                        source_branch,
+                        output.trim()
+                    ),
+                    blocked: None,
+                },
+                stash_ref,
+                stashed_files: conflicting_files,
+            })
+        }
+        Err(e) => {
+            // Real merge conflicts after the stash; surface them but keep
+            // the stash_ref so the user can recover.
+            let conflict_output =
+                run_git_command(repo_path, &["diff", "--name-only", "--diff-filter=U"])
+                    .unwrap_or_default();
+            let conflicts: Vec<String> = conflict_output
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| l.to_string())
+                .collect();
+
+            if !conflicts.is_empty() {
+                let _ = run_git_command(repo_path, &["merge", "--abort"]);
+                Ok(ForceMergeResult {
+                    merge: MergeResult {
+                        success: false,
+                        merge_commit: None,
+                        conflicts,
+                        summary: "Merge conflicts detected after stash. Merge aborted. \
+                                  Stash preserved — restore with `git stash pop`."
+                            .to_string(),
+                        blocked: None,
+                    },
+                    stash_ref,
+                    stashed_files: conflicting_files,
+                })
+            } else {
+                Err(format!("Force-merge failed: {}", e))
+            }
+        }
+    }
+}
+
+/// Result of a force-merge: the underlying merge plus stash bookkeeping so
+/// the user knows where their dirty changes went.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForceMergeResult {
+    pub merge: MergeResult,
+    /// Stash ref the dirty files were saved to (e.g. `stash@{0}`), or
+    /// `None` if there was nothing to stash.
+    pub stash_ref: Option<String>,
+    /// The exact files that were stashed before the merge.
+    pub stashed_files: Vec<String>,
 }
 
 /// Get a summary of changes in a worktree branch compared to its source.
@@ -451,6 +756,7 @@ pub fn start_merge_with_conflicts(
                 merge_commit: Some(merge_commit),
                 conflicts: vec![],
                 summary: format!("Clean merge: {}", output.trim()),
+                blocked: None,
             })
         }
         Err(_) => {
@@ -471,6 +777,7 @@ pub fn start_merge_with_conflicts(
                 conflicts,
                 summary: "Merge has conflicts. Files contain conflict markers for resolution."
                     .to_string(),
+                blocked: None,
             })
         }
     }
@@ -805,6 +1112,8 @@ fn run_git_command_with_status(repo_path: &Path, args: &[&str]) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_worktree_status_roundtrip() {
@@ -814,5 +1123,172 @@ mod tests {
         assert_eq!(WorktreeStatus::from_str("removed"), WorktreeStatus::Removed);
         assert_eq!(WorktreeStatus::from_str("failed"), WorktreeStatus::Failed);
         assert_eq!(WorktreeStatus::from_str("unknown"), WorktreeStatus::Active);
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase F pre-merge guard tests
+    //
+    // Mirrors the harness pattern from auto_commit.rs::tests — temp git repo
+    // with one initial commit, then drive scenarios via plain `git` calls.
+    // ------------------------------------------------------------------------
+
+    fn run(cwd: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn git {:?}: {}", args, e));
+        assert!(
+            out.status.success(),
+            "git {:?} in {:?} failed:\nstdout: {}\nstderr: {}",
+            args,
+            cwd,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// Build a repo with main + an initial committed `foo.rs`. Then create a
+    /// branch `feat-x` that modifies `foo.rs`. Returns to main with a clean
+    /// tree. The caller dirties or doesn't dirty `foo.rs` to drive the
+    /// guard scenarios.
+    fn init_repo_with_branch() -> (TempDir, PathBuf, String) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().canonicalize().expect("canonicalize");
+
+        run(&path, &["init", "-q", "-b", "main"]);
+        run(&path, &["config", "user.email", "test@example.com"]);
+        run(&path, &["config", "user.name", "Test User"]);
+        run(&path, &["config", "commit.gpgsign", "false"]);
+
+        // Initial commit: foo.rs and bar.rs live on main.
+        fs::write(path.join("foo.rs"), "// main version of foo\n").unwrap();
+        fs::write(path.join("bar.rs"), "// main version of bar\n").unwrap();
+        run(&path, &["add", "."]);
+        run(&path, &["commit", "-q", "-m", "init"]);
+
+        // Branch off and modify foo.rs there. Return to main clean.
+        run(&path, &["checkout", "-q", "-b", "feat-x"]);
+        fs::write(path.join("foo.rs"), "// branch version of foo\n").unwrap();
+        run(&path, &["commit", "-q", "-am", "feat-x: change foo"]);
+        run(&path, &["checkout", "-q", "main"]);
+
+        (dir, path, "feat-x".to_string())
+    }
+
+    #[test]
+    fn test_parse_dirty_paths_modified_tracked() {
+        let porcelain = " M foo.rs\nMM bar.rs\n?? scratch.txt\n D gone.rs\n";
+        let dirty = parse_dirty_paths(porcelain, false);
+        assert!(dirty.contains("foo.rs"));
+        assert!(dirty.contains("bar.rs"));
+        assert!(dirty.contains("gone.rs"));
+        assert!(!dirty.contains("scratch.txt"), "untracked excluded by default");
+        assert_eq!(dirty.len(), 3);
+
+        let dirty_with_untracked = parse_dirty_paths(porcelain, true);
+        assert!(dirty_with_untracked.contains("scratch.txt"));
+        assert_eq!(dirty_with_untracked.len(), 4);
+    }
+
+    #[test]
+    fn test_parse_dirty_paths_renames() {
+        // Rename: porcelain shows "R  old -> new" — we want the new path.
+        let porcelain = "R  old.rs -> new.rs\n";
+        let dirty = parse_dirty_paths(porcelain, true);
+        assert!(dirty.contains("new.rs"), "renamed-to path must be in dirty set");
+        assert!(!dirty.contains("old.rs"));
+    }
+
+    #[test]
+    fn test_premerge_guard_blocks_when_dirty_overlaps() {
+        let (_dir, repo, branch) = init_repo_with_branch();
+
+        // Dirty foo.rs on main. Branch also touched foo.rs => overlap.
+        fs::write(repo.join("foo.rs"), "// SIBLING'S uncommitted edit\n").unwrap();
+
+        let result = merge_worktree(&repo, &branch, "main").expect("merge_worktree");
+        assert!(!result.success, "merge must be refused");
+        assert_eq!(result.merge_commit, None);
+        let blocked = result.blocked.expect("blocked details must be populated");
+        assert!(
+            blocked.conflicting_files.iter().any(|f| f == "foo.rs"),
+            "foo.rs must be in conflicting_files: {:?}",
+            blocked.conflicting_files
+        );
+        // Sibling edit still present — guard didn't touch it.
+        let foo_now = fs::read_to_string(repo.join("foo.rs")).unwrap();
+        assert!(foo_now.contains("SIBLING"), "sibling edit must survive guard");
+    }
+
+    #[test]
+    fn test_premerge_guard_allows_unrelated_dirty() {
+        let (_dir, repo, branch) = init_repo_with_branch();
+
+        // Dirty bar.rs on main — branch only touched foo.rs. No overlap, so
+        // merge should proceed normally (this is the load-bearing
+        // "we don't break the happy path" assertion).
+        fs::write(repo.join("bar.rs"), "// unrelated dirty edit\n").unwrap();
+
+        let result = merge_worktree(&repo, &branch, "main").expect("merge_worktree");
+        assert!(
+            result.success,
+            "merge must succeed when dirty file doesn't overlap incoming changes; got: {:?}",
+            result
+        );
+        assert!(result.blocked.is_none());
+        // bar.rs still dirty (we didn't touch it).
+        let bar_now = fs::read_to_string(repo.join("bar.rs")).unwrap();
+        assert!(bar_now.contains("unrelated"));
+        // foo.rs got the branch's version.
+        let foo_now = fs::read_to_string(repo.join("foo.rs")).unwrap();
+        assert!(foo_now.contains("branch version"));
+    }
+
+    #[test]
+    fn test_premerge_guard_allows_clean_destination() {
+        let (_dir, repo, branch) = init_repo_with_branch();
+        // No dirty files at all — the canonical happy path.
+        let result = merge_worktree(&repo, &branch, "main").expect("merge_worktree");
+        assert!(result.success);
+        assert!(result.blocked.is_none());
+    }
+
+    #[test]
+    fn test_force_merge_stashes_then_merges() {
+        let (_dir, repo, branch) = init_repo_with_branch();
+
+        // Sibling has dirty edits to foo.rs (which the branch also touched).
+        fs::write(repo.join("foo.rs"), "// SIBLING'S uncommitted edit\n").unwrap();
+
+        let result =
+            merge_worktree_force(&repo, &branch, "main").expect("merge_worktree_force");
+        assert!(result.merge.success, "force-merge must succeed: {:?}", result);
+        assert!(
+            result.stash_ref.is_some(),
+            "stash_ref must be populated when there were files to stash"
+        );
+        assert!(
+            result.stashed_files.iter().any(|f| f == "foo.rs"),
+            "foo.rs must be in stashed_files: {:?}",
+            result.stashed_files
+        );
+
+        // foo.rs is now the branch version (merge applied), sibling work is
+        // safe in the stash.
+        let foo_after = fs::read_to_string(repo.join("foo.rs")).unwrap();
+        assert!(
+            foo_after.contains("branch version"),
+            "foo.rs should have branch's content after force-merge: {}",
+            foo_after
+        );
+        // Verify stash contains the sibling work.
+        let stash_show = run(&repo, &["stash", "show", "-p"]);
+        assert!(
+            stash_show.contains("SIBLING") || stash_show.contains("uncommitted"),
+            "stash must contain the sibling's edit: {}",
+            stash_show
+        );
     }
 }

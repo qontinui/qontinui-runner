@@ -117,7 +117,6 @@ macro_rules! row_to_workflow {
             htn_enabled: $r.htn_enabled,
             htn_ui_bridge_url: non_empty($r.htn_ui_bridge_url),
             htn_state_machine_path: non_empty($r.htn_state_machine_path),
-            auto_commit_subagents: None,
         }
     }};
 }

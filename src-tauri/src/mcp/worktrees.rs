@@ -117,8 +117,13 @@ pub async fn get_worktree_diff_handler(
 }
 
 /// POST /worktrees/merge — Merge a worktree branch back into its source.
+///
+/// Phase F: returns HTTP 409 with a structured `MergeBlockedDetails` payload
+/// when the destination working tree has uncommitted edits that the merge
+/// would overwrite. Callers should show a "force merge" prompt and, if the
+/// user confirms, call `POST /worktrees/merge-force`.
 pub async fn merge_worktree_handler(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Json(request): Json<MergeWorktreeRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let repo_path = Path::new(&request.repo_path);
@@ -127,6 +132,33 @@ pub async fn merge_worktree_handler(
     let result = worktree::merge_worktree(repo_path, &request.branch_name, &request.source_branch)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
+    // Phase F: pre-merge guard fired — destination has dirty overlap.
+    // 409 Conflict semantically: the resource state prevents the operation.
+    if let Some(blocked) = result.blocked {
+        let owning_sessions =
+            attribute_files_to_sessions(&state.app_state.pg_db, &blocked.conflicting_files).await;
+        info!(
+            "WORKTREE: pre-merge guard blocked merge of {} into {} ({} files, {} sessions)",
+            request.branch_name,
+            request.source_branch,
+            blocked.conflicting_files.len(),
+            owning_sessions.len()
+        );
+        // Use the typed `hint` slot on ApiResponse (sibling to `error`) to
+        // carry the structured payload — keeps the envelope shape consistent
+        // with other handlers, and clients can inspect `hint.status ==
+        // "blocked"` to dispatch on the new failure mode.
+        let hint = json!({
+            "status": "blocked",
+            "conflicting_files": blocked.conflicting_files,
+            "owning_sessions": owning_sessions,
+            "recovery_hint": "Call POST /worktrees/merge-force to auto-stash dirty files and merge.",
+        });
+        let mut resp: ApiResponse<()> = api_error(result.summary.clone());
+        resp.hint = Some(hint);
+        return Err((StatusCode::CONFLICT, Json(resp)));
+    }
+
     if result.success {
         info!(
             "WORKTREE: Merge successful: {} into {}",
@@ -134,6 +166,7 @@ pub async fn merge_worktree_handler(
         );
         return Ok(Json(ApiResponse::success(json!({
             "success": true,
+            "status": "merged",
             "merge_commit": result.merge_commit,
             "summary": result.summary,
         }))));
@@ -279,6 +312,125 @@ pub async fn compare_worktrees_handler(
     }))))
 }
 
+/// POST /worktrees/merge-force — Force-merge a worktree branch, auto-stashing
+/// any dirty destination files first. The stash ref is returned so the user
+/// can recover their work with `git stash pop <ref>`.
+///
+/// Use after a regular `/worktrees/merge` returned 409 with `status:
+/// "blocked"` AND the user has confirmed they want to proceed despite the
+/// risk of clobbering sibling work.
+pub async fn merge_worktree_force_handler(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<MergeWorktreeRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let repo_path = Path::new(&request.repo_path);
+
+    let result =
+        worktree::merge_worktree_force(repo_path, &request.branch_name, &request.source_branch)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    if result.merge.success {
+        info!(
+            "WORKTREE: force-merge succeeded: {} into {} (stashed {} file(s) as {:?})",
+            request.branch_name,
+            request.source_branch,
+            result.stashed_files.len(),
+            result.stash_ref,
+        );
+        let stash_note = result.stash_ref.as_ref().map(|s| {
+            format!(
+                "Your dirty changes were stashed before merge. Recover with: git stash pop {}",
+                s
+            )
+        });
+        return Ok(Json(ApiResponse::success(json!({
+            "success": true,
+            "status": "merged",
+            "merge_commit": result.merge.merge_commit,
+            "summary": result.merge.summary,
+            "stash_ref": result.stash_ref,
+            "stashed_files": result.stashed_files,
+            "stash_note": stash_note,
+        }))));
+    }
+
+    // Real merge conflicts (after stash). Stash is preserved; surface the ref.
+    Ok(Json(ApiResponse::success(json!({
+        "success": false,
+        "status": "conflicted",
+        "conflicts": result.merge.conflicts,
+        "summary": result.merge.summary,
+        "stash_ref": result.stash_ref,
+        "stashed_files": result.stashed_files,
+    }))))
+}
+
+/// Phase F: best-effort attribution of a list of conflicting files to the
+/// sessions that touched them. Looks up `session_touched_files` in PG and
+/// groups by `task_run_id`. Files with no DB record (manual edits, sessions
+/// from before Phase A) are bucketed under a synthetic `"(unknown)"`
+/// task_run_id so the UI still surfaces them.
+async fn attribute_files_to_sessions(
+    pg_db: &crate::database::pg::PgDb,
+    conflicting_files: &[String],
+) -> Vec<worktree::OwningSession> {
+    use std::collections::BTreeMap;
+
+    // Most-recent-first ordering from PG; we dedup by task_run_id and keep
+    // each session's full subset of touched files.
+    let pairs = match pg_db.get_sessions_for_files(conflicting_files).await {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            tracing::warn!("attribute_files_to_sessions: PG lookup failed: {}", e);
+            Vec::new()
+        }
+    };
+
+    // (task_run_id, position-in-pairs-list) → set of files. position
+    // preserves most-recent-first ordering when we emit.
+    let mut by_session: BTreeMap<usize, (String, Vec<String>)> = BTreeMap::new();
+    let mut session_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut attributed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (file_path, task_run_id) in pairs {
+        let idx = *session_index.entry(task_run_id.clone()).or_insert_with(|| {
+            let next = by_session.len();
+            next
+        });
+        let entry = by_session
+            .entry(idx)
+            .or_insert_with(|| (task_run_id.clone(), Vec::new()));
+        if !entry.1.contains(&file_path) {
+            entry.1.push(file_path.clone());
+        }
+        attributed.insert(file_path);
+    }
+
+    let mut sessions: Vec<worktree::OwningSession> = by_session
+        .into_values()
+        .map(|(task_run_id, touched_files)| worktree::OwningSession {
+            task_run_id,
+            touched_files,
+        })
+        .collect();
+
+    // Files dirty in destination but with no PG record — bucket as "(unknown)".
+    let orphans: Vec<String> = conflicting_files
+        .iter()
+        .filter(|f| !attributed.contains(*f))
+        .cloned()
+        .collect();
+    if !orphans.is_empty() {
+        sessions.push(worktree::OwningSession {
+            task_run_id: "(unknown)".to_string(),
+            touched_files: orphans,
+        });
+    }
+
+    sessions
+}
+
 // =============================================================================
 // Routes
 // =============================================================================
@@ -289,6 +441,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/worktrees", get(list_worktrees_handler))
         .route("/worktrees/diff", post(get_worktree_diff_handler))
         .route("/worktrees/merge", post(merge_worktree_handler))
+        .route("/worktrees/merge-force", post(merge_worktree_force_handler))
         .route("/worktrees/remove", post(remove_worktree_handler))
         .route("/worktrees/compare", post(compare_worktrees_handler))
 }

@@ -375,7 +375,6 @@ pub fn build_meta_workflow_template(
         htn_enabled: false,
         htn_ui_bridge_url: None,
         htn_state_machine_path: None,
-        auto_commit_subagents: None,
         created_at: now.clone(),
         updated_at: now,
     }
