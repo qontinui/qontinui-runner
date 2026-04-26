@@ -6,10 +6,107 @@
 
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+
+/// A registered UI Bridge `disclosure` (a `<details>/<summary>` or accordion-
+/// style hidden panel) on a runner page.
+///
+/// Disclosures hide secondary controls behind a click target. Their registered
+/// `label` is often a long descriptive sentence (e.g. "Advanced: per-stage
+/// controls — pick specific pages…"), which means free-text NL planner
+/// instructions like "click the Advanced details toggle" rarely match the
+/// label and the ai/find decomposer can mis-classify the element type.
+///
+/// The planner prompt embeds this table verbatim so the AI can:
+/// 1. Refer to the disclosure by `id` (NLActionExecutor will route directly
+///    via `/control/element/<id>/action {action: "click"}`), or
+/// 2. Emit a `find` query that uses the registered label substring exactly.
+///
+/// **To add a new disclosure here:** find the matching `useUIElement({ type:
+/// "disclosure", … })` call in `src/lib/ui-bridge/pages/<page>-registrations.tsx`
+/// and copy `id` + `label` verbatim. `summary` is a short human-readable hint
+/// for the planner (≤ ~80 chars). `page_canonical` must match the `page-…`
+/// state id used elsewhere in this prompt's page list.
+#[derive(Debug, Clone, Copy)]
+pub struct PageDisclosure {
+    /// Canonical `page-…` state id (must match the page list above in the prompt).
+    pub page_canonical: &'static str,
+    /// Registered element id — what NLActionExecutor will use for direct routing.
+    pub element_id: &'static str,
+    /// Verbatim registered `label` from the `useUIElement` call.
+    pub registered_label: &'static str,
+    /// Short human-readable hint describing what opens when the disclosure expands.
+    pub summary: &'static str,
+}
+
+/// Authoritative list of disclosure widgets registered across the runner UI.
+///
+/// Mirrors `useUIElement({ type: "disclosure", … })` calls in
+/// `qontinui-runner/src/lib/ui-bridge/pages/*-registrations.tsx`.
+///
+/// See `PageDisclosure` doc comment for the procedure when adding entries.
+pub const PAGE_DISCLOSURES: &[PageDisclosure] = &[PageDisclosure {
+    page_canonical: "page-config-ui-bridge",
+    element_id: "ui-bridge-advanced-disclosure",
+    registered_label:
+        "Advanced: per-stage controls — pick specific pages, toggle specs / tutorials / videos, inspect each stage",
+    summary: "Reveals per-stage controls (analyze, install SDK, discover pages, generate registrations/specs/tutorials/videos)",
+}];
+
+/// Render the disclosure registry as a Markdown section to embed into the
+/// system prompt. Designed for crisp, low-token consumption by the AI.
+fn render_disclosure_section(disclosures: &[PageDisclosure]) -> String {
+    if disclosures.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(2048);
+    out.push_str("\n=== Disclosure widgets (hidden panels behind a click target) ===\n");
+    out.push_str(
+        "These pages contain `<details>/<summary>` (or accordion-style) disclosures whose\n",
+    );
+    out.push_str(
+        "registered labels are long sentences. Free-text instructions like \"click the\n",
+    );
+    out.push_str(
+        "Advanced details toggle\" will NOT match. When the user asks to open / expand /\n",
+    );
+    out.push_str(
+        "reveal / show a hidden section (e.g. \"open advanced\", \"expand details\",\n",
+    );
+    out.push_str("\"show advanced options\"), choose ONE of the two strategies below.\n\n");
+    out.push_str("Registry (one row per registered disclosure):\n\n");
+    out.push_str("| page | element id | registered label (use exact substring in find queries) | what it reveals |\n");
+    out.push_str("|------|------------|----------------------------------------------------------|------------------|\n");
+    for d in disclosures {
+        let _ = writeln!(
+            out,
+            "| {} | `{}` | {} | {} |",
+            d.page_canonical, d.element_id, d.registered_label, d.summary
+        );
+    }
+    out.push('\n');
+    out.push_str("Strategy A (preferred — direct id routing):\n");
+    out.push_str("  Emit an action step whose instruction names the registered id verbatim,\n");
+    out.push_str(
+        "  e.g. `\"click element ui-bridge-advanced-disclosure\"`. NLActionExecutor\n",
+    );
+    out.push_str("  will route this directly through `/control/element/<id>/action`.\n\n");
+    out.push_str("Strategy B (fallback — labelled find query):\n");
+    out.push_str("  Use the **first ~6 words of the registered label** (everything before any\n");
+    out.push_str(
+        "  em-dash / colon clause) so the ai/find decomposer matches by label substring.\n",
+    );
+    out.push_str("  Example for `ui-bridge-advanced-disclosure`: instruction =\n");
+    out.push_str("  `\"click the Advanced per-stage controls disclosure\"`.\n\n");
+    out.push_str("DO NOT write generic verbiage like \"the Advanced details toggle\", \"the\n");
+    out.push_str("expand button\", or \"the show-more switch\" — none of these match the\n");
+    out.push_str("registered labels and the decomposer will mis-classify the element type.\n");
+    out
+}
 
 const SYSTEM_PROMPT_BASE: &str = r#"You are the Qontinui Runner's intent planner. Given a user's request, plan a sequence of UI actions to accomplish it.
 
@@ -85,7 +182,9 @@ To integrate a project with UI Bridge and/or generate documentation/tutorials fo
   - Generate Project Explainer — hierarchical navigable docs
 
 Typical action sequence when the user wants to integrate a project:
-  1. action: "click the Advanced details toggle to open the advanced panel"
+  1. action: "click element ui-bridge-advanced-disclosure" — opens the Advanced
+     per-stage controls panel via direct id routing (see Disclosure widgets
+     section below for the rationale)
   2. action: "type '<PROJECT PATH>' in the project path input"
   3. action: "click the Analyze button in the advanced panel"
   4. action: "check the 'Generate <X>' checkbox" — once per requested generation type
@@ -111,6 +210,12 @@ Rules:
 - When a page element catalog is provided below, prefer the exact labels from
   the catalog when naming buttons/inputs in action instructions. Do not invent
   generic names if a real one is listed.
+- When the user asks to open / expand / reveal / show a hidden section
+  ("open advanced", "expand details", "show options", "click the Advanced
+  details toggle", etc.), consult the Disclosure widgets registry below.
+  For any disclosure on the active page, prefer the registered element id
+  (Strategy A) over loose verb-noun text. This applies generically to every
+  registered disclosure, not just the Advanced panel.
 "#;
 
 const CATALOG_HEADER: &str = r#"
@@ -201,7 +306,11 @@ pub async fn plan_intent_handler(
         .filter(|c| !c.is_empty())
         .map(|c| format!("{}{}\n", CATALOG_HEADER, c))
         .unwrap_or_default();
-    let system_prompt = format!("{}{}{}", SYSTEM_PROMPT_BASE, suffix, catalog_section);
+    let disclosure_section = render_disclosure_section(PAGE_DISCLOSURES);
+    let system_prompt = format!(
+        "{}{}{}{}",
+        SYSTEM_PROMPT_BASE, suffix, disclosure_section, catalog_section
+    );
     let full_prompt = format!("{}\n\nUser request: {}", system_prompt, request.prompt);
 
     // Run through the configured AI provider (Claude CLI, Claude API, Gemini, etc.)
@@ -265,4 +374,117 @@ pub async fn plan_intent_handler(
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
     axum::Router::new().route("/prompt-home/plan", post(plan_intent_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every disclosure entry must reference a `page-…` id present in the
+    /// page list embedded in `SYSTEM_PROMPT_BASE`. If this fails, either the
+    /// registry has a typo or the page list lost an entry — fix whichever
+    /// drifted.
+    #[test]
+    fn disclosure_pages_exist_in_system_prompt() {
+        for d in PAGE_DISCLOSURES {
+            assert!(
+                SYSTEM_PROMPT_BASE.contains(d.page_canonical),
+                "PAGE_DISCLOSURES entry {} references unknown page {}",
+                d.element_id,
+                d.page_canonical
+            );
+        }
+    }
+
+    /// Disclosure ids must be globally unique inside this registry (the
+    /// `(page, id)` tuple is also unique, but a single id should never appear
+    /// twice across pages either — it would imply a registration collision).
+    #[test]
+    fn disclosure_ids_are_unique() {
+        let mut seen: Vec<&str> = Vec::with_capacity(PAGE_DISCLOSURES.len());
+        for d in PAGE_DISCLOSURES {
+            assert!(
+                !seen.contains(&d.element_id),
+                "duplicate disclosure id {}",
+                d.element_id
+            );
+            seen.push(d.element_id);
+        }
+    }
+
+    /// The seed entry must be present — this is the disclosure that originally
+    /// motivated the registry. If it's removed, the integration workflow in
+    /// `SYSTEM_PROMPT_BASE` must also be updated, hence the assertion.
+    #[test]
+    fn seed_disclosure_present() {
+        let seed = PAGE_DISCLOSURES
+            .iter()
+            .find(|d| d.element_id == "ui-bridge-advanced-disclosure")
+            .expect("ui-bridge-advanced-disclosure missing from PAGE_DISCLOSURES");
+        assert_eq!(seed.page_canonical, "page-config-ui-bridge");
+        assert!(
+            seed.registered_label
+                .starts_with("Advanced: per-stage controls"),
+            "registered label drifted from useUIBridgeIntegrationPageRegistrations: {}",
+            seed.registered_label
+        );
+    }
+
+    /// The rendered disclosure section must mention the seed id, the column
+    /// headers, and both routing strategies. This guards against silent
+    /// regressions in `render_disclosure_section`.
+    #[test]
+    fn rendered_section_mentions_seed_and_strategies() {
+        let section = render_disclosure_section(PAGE_DISCLOSURES);
+        assert!(section.contains("ui-bridge-advanced-disclosure"));
+        assert!(section.contains("Strategy A"));
+        assert!(section.contains("Strategy B"));
+        assert!(section.contains("Disclosure widgets"));
+        assert!(section.contains("page-config-ui-bridge"));
+    }
+
+    /// Empty input must produce empty output (so an empty registry doesn't
+    /// emit a ghost section header into the prompt).
+    #[test]
+    fn empty_registry_renders_empty_string() {
+        let section = render_disclosure_section(&[]);
+        assert!(section.is_empty());
+    }
+
+    /// The integration workflow paragraph must use the registered id directly
+    /// rather than the loose phrase that originally caused ai/find to mis-
+    /// classify the element. Guards against the "Home-page planner registry
+    /// drifts from real tabs" memory entry's failure mode.
+    #[test]
+    fn integration_workflow_uses_registered_id() {
+        assert!(
+            SYSTEM_PROMPT_BASE.contains("click element ui-bridge-advanced-disclosure"),
+            "integration workflow lost the direct-id routing instruction"
+        );
+        // The exact failing instruction from the bug report must not appear
+        // as a planner *directive*. It can still appear as a quoted user-input
+        // example in the Rules section (because we want the planner to
+        // recognise that phrasing and translate it). Distinguish by checking
+        // the integration-workflow paragraph specifically.
+        let workflow_section = SYSTEM_PROMPT_BASE
+            .split("=== Integration workflow on page-config-ui-bridge ===")
+            .nth(1)
+            .and_then(|s| s.split("Pick only the checkboxes").next())
+            .expect("integration workflow section missing");
+        assert!(
+            !workflow_section.contains("click the Advanced details toggle"),
+            "integration workflow regressed to loose verb-noun phrasing that \
+             does not match the registered disclosure label"
+        );
+    }
+
+    /// The generic disclosure rule must appear in the Rules block so the
+    /// planner applies the strategy to future disclosures, not just the seed.
+    #[test]
+    fn rules_mention_generic_disclosure_handling() {
+        assert!(
+            SYSTEM_PROMPT_BASE.contains("Disclosure widgets registry"),
+            "generic disclosure rule missing from Rules block"
+        );
+    }
 }
