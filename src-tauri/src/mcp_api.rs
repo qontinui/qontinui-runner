@@ -1422,6 +1422,7 @@ pub fn create_router(
         .merge(crate::mcp::file_browser::routes())
         .merge(crate::mcp::file_registry::routes())
         .merge(crate::mcp::findings_api::routes())
+        .merge(crate::mcp::debug_builder_prompt::routes())
         .merge(crate::mcp::generation_rules_api::routes())
         .merge(crate::mcp::meta_optimizer_api::routes())
         .merge(crate::mcp::generator_eval::routes())

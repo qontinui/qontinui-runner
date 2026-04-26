@@ -43,6 +43,7 @@ pub mod configs;
 pub mod constraints_api;
 pub mod container_status;
 pub mod contexts;
+pub mod debug_builder_prompt;
 pub mod decision_trail_api;
 pub mod development_intelligence;
 pub mod discovery;

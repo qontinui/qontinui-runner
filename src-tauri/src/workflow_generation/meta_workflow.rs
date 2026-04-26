@@ -625,7 +625,13 @@ Notice `ui_bridge_target` is a STRING containing JSON — NOT an object. The `Ex
 }
 
 /// Build the prompt for the builder agent that generates the initial workflow JSON.
-fn build_builder_prompt(
+///
+/// Visibility note: exposed as `pub` so the `mcp::debug_builder_prompt`
+/// endpoint can assemble a real prompt (without invoking the LLM) for
+/// observability. The only other caller is `build_meta_workflow_template`
+/// in this module — making this `pub` does not widen the surface in any
+/// problematic way (no behavior change for existing callers).
+pub fn build_builder_prompt(
     description: &str,
     schema_context: &str,
     resolved_contexts: &str,
@@ -694,13 +700,20 @@ fn build_builder_prompt(
         };
         // Phase B1: build the wrapper manifest at the call site so the
         // recognition prompt can advertise live WS-registered apps. This
-        // path is sync but the manifest fetch is async, hence block_on.
-        // When `app_state` is `None` (legacy callers, tests, bootstrap
-        // paths), the helper short-circuits to "" and the recognition
-        // prompt skips the manifest section entirely.
+        // function is sync but the manifest fetch is async, and we may be
+        // called from a tokio task (e.g. `generate_unified_workflow_async_handler`).
+        // A naked `Handle::current().block_on(...)` panics with
+        // "Cannot start a runtime from within a runtime"; `block_in_place`
+        // tells the multi-thread runtime to move the current task off the
+        // worker thread for the duration of the closure, which makes the
+        // nested `block_on` safe. When `app_state` is `None` (legacy
+        // callers, tests, bootstrap paths), the helper short-circuits to
+        // "" and the recognition prompt skips the manifest section.
         let wrapper_manifest = match app_state {
-            Some(s) => tokio::runtime::Handle::current().block_on(async {
-                super::wrapper_manifest::build_manifest(s, brief_runner_port).await
+            Some(s) => tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    super::wrapper_manifest::build_manifest(s, brief_runner_port).await
+                })
             }),
             None => String::new(),
         };

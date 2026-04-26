@@ -2430,13 +2430,18 @@ fn run_builder_agent(
         };
         // Phase B1: build the wrapper manifest at the call site so the
         // recognition prompt can advertise live WS-registered apps. This
-        // path is sync (run_builder_agent is sync) but the manifest fetch
-        // is async, hence block_on. When `app_state` is `None`, the
-        // helper short-circuits to "" and the recognition prompt skips
-        // the manifest section entirely.
+        // function is sync. Production calls reach here via `generate_workflow`
+        // which is wrapped in `tokio::task::spawn_blocking`, so the inner
+        // `block_on` is normally safe. We still wrap in `block_in_place`
+        // defensively so synchronous-from-async callers (debug endpoints,
+        // tests) don't panic with "Cannot start a runtime from within a
+        // runtime". When `app_state` is `None`, the helper short-circuits
+        // to "" and the recognition prompt skips the manifest section.
         let wrapper_manifest = match app_state {
-            Some(s) => tokio::runtime::Handle::current().block_on(async {
-                super::wrapper_manifest::build_manifest(s, runner_port).await
+            Some(s) => tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    super::wrapper_manifest::build_manifest(s, runner_port).await
+                })
             }),
             None => String::new(),
         };
