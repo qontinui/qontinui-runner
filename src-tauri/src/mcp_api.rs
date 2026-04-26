@@ -305,8 +305,6 @@ async fn health(
         "ready": last_pong > 0,
         "responsive": responsive,
         "frontendReady": frontend_ready,
-        "sdkFeatures": crate::sdk_features::SDK_FEATURES,
-        "sdkFeaturesDocUrl": crate::sdk_features::SDK_FEATURE_DOC_URL,
         "lastHeartbeat": last_pong,
         "heartbeatAgeMs": pong_age_ms,
         "uptimeSeconds": uptime_secs,
@@ -364,6 +362,13 @@ async fn health(
         "derived_status": derived_status,
         "ui_error": ui_error_json,
         "recent_crash": recent_crash_json,
+        // SDK feature inventory baked at compile time. Surfaced top-level
+        // (sibling to `data` and `uiBridge`) to match the supervisor's `/health`
+        // shape so test drivers can probe a single endpoint to discover the
+        // bundled `@qontinui/ui-bridge` capabilities without parsing the inner
+        // `data` envelope. See `crate::sdk_features`.
+        "sdkFeatures": crate::sdk_features::SDK_FEATURES,
+        "sdkFeaturesDocUrl": crate::sdk_features::SDK_FEATURE_DOC_URL,
         "timestamp": now_ms,
     }))
 }

@@ -5,9 +5,10 @@
 //! the staleness detection only works if this list mirrors the SDK's
 //! actual capabilities at build time.
 //!
-//! Surfaced on `/health` as the `sdkFeatures` array. Test drivers compare
-//! against the features they need; an absent feature means the binary
-//! predates that feature's SDK release.
+//! Surfaced on `/health` as the top-level `sdkFeatures` array (sibling to
+//! `data`, `uiBridge`, `timestamp` — matching the supervisor's `/health`
+//! envelope). Test drivers compare against the features they need; an
+//! absent feature means the binary predates that feature's SDK release.
 
 pub const SDK_FEATURES: &[&str] = &[
     "softNavigate",
