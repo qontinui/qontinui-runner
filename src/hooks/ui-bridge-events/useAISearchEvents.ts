@@ -25,11 +25,30 @@ export function useAISearchEvents(
       switch (type) {
         case "ai_search": {
           const { SearchEngine } = await import("@qontinui/ui-bridge/ai");
-          // Use discover() for fresh elements with up-to-date visibility state
-          // (currentBridge.elements is memoized and may have stale DOM refs)
-          const discovered = await currentBridge.discover({ includeHidden: true });
+          // Source elements from the registry — same rationale as `ai_find`
+          // below. `discover()`'s DOM scan misses `useUIElement`-registered
+          // elements that don't match its interactive heuristics, producing
+          // a smaller element set than `/control/snapshot`. Read directly
+          // from `currentBridge.registry` so ai_search matches the snapshot
+          // path's element population exactly.
+          const registry = (
+            currentBridge as unknown as {
+              registry?: {
+                getAllElements: () => Array<unknown>;
+              } | null;
+            }
+          ).registry;
+          // `engine.updateElements` accepts `(DiscoveredElement | RegisteredElement)[]`.
+          // The registry returns RegisteredElement[]; cast through the engine's
+          // own parameter type to keep the boundary explicit. Falls back to an
+          // empty array if the registry isn't yet populated (rare race during
+          // very early page-load) — `find()` returns `found:false` rather than
+          // throwing, which is the correct behaviour.
+          const registryElements = (registry?.getAllElements?.() ?? []) as Parameters<
+            InstanceType<typeof SearchEngine>["updateElements"]
+          >[0];
           const engine = new SearchEngine({ includeHidden: true });
-          engine.updateElements(discovered.elements);
+          engine.updateElements(registryElements);
           const criteria = payload.params ?? payload.body ?? {};
           const results = engine.search(criteria as Parameters<typeof engine.search>[0]);
           await sendResponse({
@@ -44,9 +63,48 @@ export function useAISearchEvents(
 
         case "ai_find": {
           const { SearchEngine, find: aiFindFn } = await import("@qontinui/ui-bridge/ai");
-          const discovered = await currentBridge.discover({ includeHidden: true });
+          // Source elements from the registry, not from `currentBridge.discover()`.
+          //
+          // `discover()` runs `executor.find()` which performs its own DOM scan
+          // through the action-executor's discovery cache. That cache is built
+          // by walking the live DOM and filtering by interactive selectors,
+          // which systematically misses `useUIElement`-registered elements
+          // whose host nodes don't match the heuristic (e.g. disclosure
+          // toggles, custom interactive divs). On this page, that produced 117
+          // elements via `discover()` while `/control/snapshot` reported 193 —
+          // the same divergence between snapshot and ai/find that previous
+          // commits had been chasing. The registry is the canonical source of
+          // truth for snapshots; routing ai/find through the same source
+          // unifies the two paths so `useUIElement` registrations are visible
+          // to find() too.
+          //
+          // We bind to `currentBridge.registry` (the React-context registry,
+          // returned from `useUIBridge` via `bridge.registry`). After the
+          // ui-bridge `globalThis`-keyed singleton fix, `bridge.registry` and
+          // `getGlobalRegistry()` are guaranteed to be the same instance, so
+          // either accessor would work — we use `currentBridge.registry` here
+          // because the surrounding handler already accesses bridge state
+          // through the same reference (see `wait_for_element_registered`
+          // below) and reading the React-context registry avoids the
+          // import-time dependency on the singleton being initialised.
+          const registry = (
+            currentBridge as unknown as {
+              registry?: {
+                getAllElements: () => Array<unknown>;
+              } | null;
+            }
+          ).registry;
+          // `engine.updateElements` accepts `(DiscoveredElement | RegisteredElement)[]`.
+          // The registry returns RegisteredElement[]; cast through the engine's
+          // own parameter type to keep the boundary explicit. Falls back to an
+          // empty array if the registry isn't yet populated (rare race during
+          // very early page-load) — `find()` returns `found:false` rather than
+          // throwing, which is the correct behaviour.
+          const registryElements = (registry?.getAllElements?.() ?? []) as Parameters<
+            InstanceType<typeof SearchEngine>["updateElements"]
+          >[0];
           const engine = new SearchEngine({ includeHidden: true });
-          engine.updateElements(discovered.elements);
+          engine.updateElements(registryElements);
 
           const query = (payload.params?.query as string) ?? "";
           const context = payload.params?.context as Record<string, unknown> | undefined;
