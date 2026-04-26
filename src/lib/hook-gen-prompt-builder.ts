@@ -6,6 +6,8 @@
  * hook files for route awareness, page context, state machine, etc.
  */
 
+import { isReactNativeFramework } from "./page-analysis-prompt-builder";
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -286,6 +288,58 @@ usePageContext(pageInfo);
 \`\`\`
 `.trim();
 
+const RN_EXPO_GUIDANCE = `
+### React Native + Expo Router Integration
+
+This is a React Native / Expo Router project. **DOM APIs are not available** —
+no \`document\`, no \`window.addEventListener\`, no \`getBoundingClientRect\`.
+Element measurement is asynchronous via \`measureInWindow\`. The native SDK
+(\`@qontinui/ui-bridge-native\`) handles measurement for you through the
+\`bridgeProps\` object returned by \`useUIElement\`; the integrator just spreads
+it onto the host component along with \`ref\` and \`onLayout\`.
+
+For route awareness, use Expo Router hooks (NOT \`react-router-dom\`, NOT
+\`next/navigation\`):
+
+\`\`\`tsx
+import { usePathname, useSegments, useLocalSearchParams } from 'expo-router';
+import { useRouteAwareness } from '@qontinui/ui-bridge-native';
+
+const pathname = usePathname();
+const segments = useSegments();
+const params = useLocalSearchParams();
+
+useRouteAwareness({
+  pattern: pathname,
+  params: params as Record<string, string>,
+  routeStack: segments,
+});
+\`\`\`
+
+For page context, map Expo Router file-based routes to semantic names:
+
+\`\`\`tsx
+// app/connect.tsx          → "/connect"
+// app/(tabs)/prompts.tsx   → "/(tabs)/prompts"
+// app/runner/[id].tsx      → "/runner/:id"
+const pathname = usePathname();
+const pageInfo = useMemo(() => {
+  if (pathname === '/connect') return { name: 'Connect', section: 'onboarding' };
+  // ... map routes to semantic names
+  return { name: pathname, section: 'unknown' };
+}, [pathname]);
+
+usePageContext(pageInfo);
+\`\`\`
+
+**Modal-presentation \`Stack.Screen\`s are still pages** — register them with
+\`usePageContext\` just like normal screens.
+
+**Imports:** Use \`@qontinui/ui-bridge-native\` (NOT \`@qontinui/ui-bridge/react\`)
+for all hooks in an Expo / React Native project. Types still come from
+\`@qontinui/ui-bridge\`.
+`.trim();
+
 // =============================================================================
 // Category-specific prompt sections
 // =============================================================================
@@ -423,6 +477,332 @@ Generate: An \`intents.ts\` file with intent definitions. Each intent should hav
 - A clear, descriptive \`id\` (e.g., "create-new-project")
 - A human-readable \`name\`
 - A detailed \`description\` of the steps involved
+- \`params\` for any inputs the intent accepts
+- \`tags\` for discoverability
+
+Intents are registered via the API at startup, not as React hooks.
+`.trim(),
+};
+
+// =============================================================================
+// React Native / Expo Router category overrides
+// =============================================================================
+//
+// These replace (not append to) the web-flavored category instructions when
+// the project is detected as `react_native` or `expo_router`. The web text
+// references DOM-only constructs (`document.title`, `addEventListener`,
+// `getBoundingClientRect`) and component patterns (`<input>`, `<form>`) that
+// don't exist in React Native, so a straight append would actively mislead
+// the AI. Each branch below mirrors the structure of its web counterpart and
+// includes at least one concrete code snippet so the AI has a worked example
+// to follow.
+
+const RN_CATEGORY_INSTRUCTIONS: Record<HookCategory, string> = {
+  "route-awareness": `
+### Route Awareness (\`useRouteAwareness\`) — React Native / Expo Router
+
+Look for:
+- The \`app/\` directory structure (Expo Router uses file-based routing)
+- Route group folders like \`app/(tabs)/\`, \`app/(auth)/\`
+- Dynamic segment files like \`app/[id].tsx\`, \`app/posts/[slug].tsx\`
+- \`<Stack.Screen>\` and \`<Tabs.Screen>\` declarations
+- Existing usage of \`usePathname\`, \`useSegments\`, \`useLocalSearchParams\`
+
+Generate: A single \`useRouteAwareness()\` call in a top-level component
+(typically \`app/_layout.tsx\` or a child of the \`UIBridgeProvider\`) that
+provides the full route info from \`expo-router\` hooks.
+
+\`\`\`tsx
+import { usePathname, useSegments, useLocalSearchParams } from 'expo-router';
+import { useRouteAwareness } from '@qontinui/ui-bridge-native';
+
+const pathname = usePathname();
+const segments = useSegments();
+const params = useLocalSearchParams();
+
+useRouteAwareness({
+  pattern: pathname,
+  params: params as Record<string, string>,
+  routeStack: segments,
+});
+\`\`\`
+
+**Do NOT use** \`useLocation()\` (that's react-router-dom) or
+\`next/navigation\` hooks — they don't exist in Expo.
+`.trim(),
+
+  "page-context": `
+### Page Context (\`usePageContext\`) — React Native / Expo Router
+
+Look for:
+- All files under \`app/\` and the routes they correspond to
+- File-based route conventions:
+  - \`app/foo.tsx\` → route \`/foo\`
+  - \`app/(tabs)/bar.tsx\` → route \`/(tabs)/bar\` (group prefix is part of the path)
+  - \`app/[id].tsx\` → dynamic route \`/:id\`
+  - \`app/index.tsx\` → \`/\`
+- Modal-presentation \`<Stack.Screen options={{ presentation: 'modal' }} />\`
+  declarations — these are still distinct pages, not state-machine modals.
+- Section grouping implied by route group folders (e.g., \`(tabs)\` is the
+  main app, \`(auth)\` is the auth flow).
+
+Generate: A \`usePageContext()\` call that derives the page name and section
+from \`usePathname()\`. Use a \`useMemo\` keyed on \`pathname\` with a mapping
+of every real route the app exposes — not guessed routes.
+
+\`\`\`tsx
+import { usePathname } from 'expo-router';
+import { usePageContext } from '@qontinui/ui-bridge-native';
+
+const pathname = usePathname();
+const pageInfo = useMemo(() => {
+  if (pathname === '/connect') return { name: 'Connect', section: 'onboarding' };
+  if (pathname === '/(tabs)/prompts') return { name: 'Prompts', section: 'tabs' };
+  // ... cover every screen file you found in app/
+  return { name: pathname, section: 'unknown' };
+}, [pathname]);
+
+usePageContext(pageInfo);
+\`\`\`
+
+There is no \`document.title\` in React Native — derive everything from the
+file-based routes you found in \`app/\`.
+`.trim(),
+
+  "state-machine": `
+### State Machine (\`useUIState\`, \`useUITransition\`, \`useUIStateGroup\`) — React Native / Expo Router
+
+Look for:
+- \`<Modal visible={…}>\` from \`react-native\` or any third-party modal lib
+- Bottom-sheet / drawer libraries (\`@gorhom/bottom-sheet\`, \`react-native-modal\`)
+- \`<Tabs>\` / \`<Tabs.Screen>\` from Expo Router (each tab is a page, not a state —
+  use \`usePageContext\` for those; only register a state group if there's
+  app-level UI gating)
+- Authentication states (logged-in vs logged-out gates around \`<Slot />\` or
+  \`<Stack />\` in \`app/_layout.tsx\`)
+- Boolean state variables controlling visibility (\`isOpen\`, \`showSheet\`,
+  \`isExpanded\`) and conditional rendering driven by them
+
+For each detected UI state, follow the same pattern as the web guide:
+- \`useUIState()\` with a meaningful ID, \`activeWhen\` referencing the real state
+- \`blocking: true\` for full-screen modals and bottom sheets that block
+  interaction with the underlying screen
+- \`group\` for related states (e.g., wizard steps in onboarding)
+
+\`\`\`tsx
+const [sheetOpen, setSheetOpen] = useState(false);
+
+useUIState({
+  id: 'filter-sheet',
+  name: 'Filter Bottom Sheet',
+  activeWhen: () => sheetOpen,
+  blocking: true,
+});
+\`\`\`
+
+Use \`useUITransition()\` to connect states (e.g., "open-filter-sheet" from
+the list page to the filter-sheet state). Use \`useUIStateGroup()\` with
+\`exclusive: true\` for wizard steps or radio-style state sets.
+`.trim(),
+
+  components: `
+### Component Actions (\`useUIElement\` and \`useUIComponent\`) — React Native / Expo Router
+
+The native SDK uses **\`useUIElement\`** for individual interactive elements
+and **\`useUIComponent\`** for screens that should expose a higher-level
+action surface. Both come from \`@qontinui/ui-bridge-native\`.
+
+**RN measurement gotcha:** there is no \`getBoundingClientRect\` on RN host
+components. Layout is async and goes through \`measureInWindow\`. The SDK
+handles this for you via the \`bridgeProps\` object — you just need to spread
+\`bridgeProps\` onto the host component along with \`ref\` and \`onLayout\`. Do
+NOT try to call \`measureInWindow\` yourself, and do NOT emit any web
+measurement code (\`getBoundingClientRect\`, \`offsetTop\`, etc.).
+
+#### Pressable / Touchable
+
+Wrap with \`useUIElement({type: 'button', label: '…'})\`. The keys to attach
+are \`ref\`, \`onLayout\`, and the spread of \`bridgeProps\`:
+
+\`\`\`tsx
+import { Pressable, Text } from 'react-native';
+import { useUIElement } from '@qontinui/ui-bridge-native';
+
+function CreateButton({ onPress }: { onPress: () => void }) {
+  const { ref, onLayout, bridgeProps } = useUIElement({
+    id: 'prompts-create-button',
+    type: 'button',
+    label: 'Create prompt',
+  });
+  return (
+    <Pressable ref={ref} onLayout={onLayout} {...bridgeProps} onPress={onPress}>
+      <Text>Create</Text>
+    </Pressable>
+  );
+}
+\`\`\`
+
+#### TextInput
+
+\`useUIElement({type: 'input', label: '…'})\`. \`value\` and \`onChangeText\`
+stay on the \`<TextInput>\` itself; \`bridgeProps\` carries only the bridge
+metadata.
+
+\`\`\`tsx
+import { TextInput } from 'react-native';
+import { useUIElement } from '@qontinui/ui-bridge-native';
+
+function SearchInput({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const { ref, onLayout, bridgeProps } = useUIElement({
+    id: 'prompts-search-input',
+    type: 'input',
+    label: 'Search prompts',
+  });
+  return (
+    <TextInput
+      ref={ref}
+      onLayout={onLayout}
+      {...bridgeProps}
+      value={value}
+      onChangeText={onChange}
+      placeholder="Search…"
+    />
+  );
+}
+\`\`\`
+
+#### FlatList items
+
+Register each rendered item with a deterministic ID derived from the model
+(e.g., the row's \`.id\` field) inside \`renderItem\`. Do NOT use the array
+index — IDs must be stable across re-orders and pagination.
+
+\`\`\`tsx
+<FlatList
+  data={prompts}
+  keyExtractor={(p) => p.id}
+  renderItem={({ item }) => <PromptRow id={\`prompt-row-\${item.id}\`} prompt={item} />}
+/>
+\`\`\`
+
+…where \`PromptRow\` calls \`useUIElement\` with the passed-in \`id\`.
+
+#### Prefer \`useUIComponent\` for whole screens
+
+For screens with form state plus multiple actions, **prefer a single
+\`useUIComponent\`** over many per-element registrations. The \`actions\` map
+should expose semantic verbs (\`refresh\`, \`submit\`, \`select-item({id})\`)
+that wrap the same handlers the buttons do, so an automation agent can
+drive the screen with one HTTP call instead of fighting per-button IDs.
+
+\`\`\`tsx
+import { useUIComponent } from '@qontinui/ui-bridge-native';
+
+function PromptsScreen() {
+  const [query, setQuery] = useState('');
+  const { data, refetch } = usePrompts();
+
+  useUIComponent({
+    id: 'prompts-screen',
+    name: 'Prompts',
+    state: () => ({ query, count: data?.length ?? 0 }),
+    actions: [
+      { id: 'refresh', label: 'Refresh', handler: () => refetch() },
+      {
+        id: 'select-item',
+        label: 'Open prompt',
+        handler: ({ id }: { id: string }) => router.push(\`/prompts/\${id}\`),
+      },
+      { id: 'set-query', label: 'Set search query', handler: ({ q }: { q: string }) => setQuery(q) },
+    ],
+  });
+
+  // ...render UI
+}
+\`\`\`
+
+Use \`useUIElement\` for things the screen-level component can't model (e.g.,
+the heading text the test framework wants to assert on, or a single primary
+CTA). Use \`useUIComponent\` for the screen's full action surface.
+`.trim(),
+
+  "keyboard-shortcuts": `
+### Keyboard Shortcuts (\`useKeyboardShortcuts\`) — React Native / Expo Router
+
+Mobile apps **typically do not have keyboard shortcuts** — touch is the
+primary input. Skip this category for mobile-only screens unless you find
+explicit hardware-keyboard handling in source. Specifically:
+
+- Look for \`Keyboard.addListener(...)\` from \`react-native\`
+- Look for \`HardwareBackPressEventHandler\` / \`BackHandler.addEventListener\`
+- Look for any third-party hardware keyboard libraries
+- iPad / Android-with-keyboard apps may declare key commands via
+  \`react-native-key-command\` or similar
+
+If you find none of the above, **do not generate a \`useKeyboardShortcuts\`
+call** — emit a one-line note explaining there are no keyboard shortcuts to
+register and skip this category. Do NOT fabricate shortcuts.
+
+Do NOT emit web event-listener code (\`addEventListener('keydown', ...)\`) —
+that's a no-op in React Native.
+`.trim(),
+
+  "undo-redo": `
+### Undo/Redo (\`useUndoRedo\`) — React Native / Expo Router
+
+Same as the web guidance: only generate this if the app has an actual
+undo/redo system. Look for:
+- A history stack in Redux / Zustand / Jotai / Recoil store
+- An \`undo()\` / \`redo()\` function in a hook or store
+- \`canUndo\` / \`canRedo\` boolean state
+- Common RN libraries: \`zundo\` (Zustand middleware), \`redux-undo\`
+
+If found, wire \`useUndoRedo\` from \`@qontinui/ui-bridge-native\` to the
+store's undo functions exactly as you would on web. **Do not generate a
+stub.**
+`.trim(),
+
+  annotations: `
+### Element Annotations (\`useUIAnnotation\`) — React Native / Expo Router
+
+Look for:
+- Key interactive elements where the React tree alone (component name +
+  props) doesn't convey purpose
+- Components with non-obvious validation or behavior (e.g., a \`<TextInput>\`
+  that auto-formats currency)
+- Navigation elements with specific roles (the primary CTA on a screen, a
+  destructive-action button hidden behind a long press)
+- Custom-drawn elements (\`Skia\`, \`Reanimated\` views) that don't have an
+  obvious role in the React tree
+
+Generate \`useUIAnnotation()\` calls for important elements, providing:
+- \`description\`: what the element is
+- \`purpose\`: why it exists and what it does
+- \`tags\`: searchable categories
+- \`relatedElements\`: IDs of related UI elements
+
+**Be selective.** Only annotate elements where the annotation adds value
+beyond what the React tree already communicates. Don't annotate every
+element. (The web guidance talks about "what the DOM already
+communicates" — the same principle applies, just substitute "React tree.")
+`.trim(),
+
+  intents: `
+### Intents (\`registerIntent\`) — React Native / Expo Router
+
+Same as the web guidance — intents describe named composite user actions,
+not framework specifics. Look for:
+- Multi-step user workflows that span screens (sign-up flow, create-prompt,
+  configure-runner)
+- Actions that span multiple navigation transitions
+- Common user goals involving several taps/screens
+
+Generate an \`intents.ts\` file with intent definitions. Each intent
+should have:
+- A clear, descriptive \`id\` (e.g., "create-new-prompt")
+- A human-readable \`name\`
+- A detailed \`description\` of the steps involved (mention the screens it
+  navigates through)
 - \`params\` for any inputs the intent accepts
 - \`tags\` for discoverability
 
@@ -580,9 +960,15 @@ export function buildHookGenPrompt(
   lines.push(EXPLORATION_INSTRUCTIONS);
   lines.push("");
 
-  // Framework-specific guidance
+  // Framework-specific guidance.
+  // RN / Expo Router gets a dedicated branch with native imports and
+  // measurement guidance; web frameworks fall through to the existing
+  // Next.js / React Router blocks.
+  const isRN = isReactNativeFramework(analysis.framework);
   const fw = analysis.framework.toLowerCase();
-  if (fw === "nextjs" || fw === "next_js") {
+  if (isRN) {
+    lines.push(RN_EXPO_GUIDANCE);
+  } else if (fw === "nextjs" || fw === "next_js") {
     lines.push(NEXTJS_GUIDANCE);
   } else if (fw === "react") {
     lines.push(REACT_ROUTER_GUIDANCE);
@@ -593,11 +979,14 @@ export function buildHookGenPrompt(
   lines.push(HOOK_API_REFERENCE);
   lines.push("");
 
-  // Category-specific instructions (only for selected categories)
+  // Category-specific instructions (only for selected categories).
+  // RN / Expo projects use an RN-flavored variant of every category that
+  // replaces (not appends to) the web/DOM text — see RN_CATEGORY_INSTRUCTIONS.
+  const categoryInstructions = isRN ? RN_CATEGORY_INSTRUCTIONS : CATEGORY_INSTRUCTIONS;
   lines.push("## Categories to Generate");
   lines.push("");
   for (const cat of categories) {
-    lines.push(CATEGORY_INSTRUCTIONS[cat]);
+    lines.push(categoryInstructions[cat]);
     lines.push("");
   }
 
