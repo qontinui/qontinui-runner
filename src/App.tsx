@@ -74,6 +74,8 @@ import { autoPopulateCtr, getGlobalCtr } from "@qontinui/ui-bridge/ctr";
 import { getGlobalRegistry } from "@qontinui/ui-bridge";
 
 import { instanceStorage } from "@/lib/instance-storage";
+import { ACTIVE_TAB_STORAGE_KEY, TAB_LIST } from "@/components/app/tab-types";
+import { toTabCanonical } from "@/hooks/ui-bridge-events/utils";
 
 import {
   NavigationProvider,
@@ -646,6 +648,45 @@ function CtrAutoPopulator() {
 }
 
 /**
+ * Registers a pluggable snapshot enricher that contributes the runner's
+ * tab metadata (`availableTabs`, `tabActivation`) to every UI Bridge
+ * snapshot. These fields describe a runner-shell feature and are not
+ * part of the SDK's canonical snapshot schema, so they live here rather
+ * than in the registry's built-in tracker enrichers (which Phase 1 of
+ * the SDK Tracker Reshape moved into the SDK).
+ *
+ * Reads the active tab from `instanceStorage` fresh on each snapshot —
+ * do NOT capture `activeTabId` outside the closure. Fallback matches
+ * the `tabs_list` IPC handler ("prompt-home" — the first tab the runner
+ * shell selects on launch).
+ */
+function RunnerTabsEnricher() {
+  useEffect(() => {
+    const registry = getGlobalRegistry();
+    if (!registry) return;
+    // @ts-expect-error registerSnapshotEnricher exists in @qontinui/ui-bridge feat/sdk-tracker-reshape; not yet published
+    const dispose = registry.registerSnapshotEnricher("runner-tabs", () => {
+      const activeTabId = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
+      const availableTabs = TAB_LIST.map((entry) => ({
+        id: entry.id,
+        label: entry.label,
+        canonical: toTabCanonical(entry.id),
+        active: entry.id === activeTabId,
+      }));
+      const tabActivation = {
+        description: "Switch tabs without a UI click",
+        method: "POST",
+        path: "/ui-bridge/control/tab/activate",
+        bodyExample: { tabId: "<one of availableTabs[].id>" },
+      };
+      return { availableTabs, tabActivation };
+    });
+    return dispose;
+  }, []);
+  return null;
+}
+
+/**
  * Fetches the list of Tauri event channel names emitted by the runner
  * backend (from GET /ui-bridge/sdk/tauri-event-names) and registers them
  * with the change-tracking subsystem so the change buffer subscribes to
@@ -743,6 +784,7 @@ export default function App() {
         <SpecExecutionHandler />
         <BundledSpecsLoader />
         <CtrAutoPopulator />
+        <RunnerTabsEnricher />
         <TauriEventNamesLoader />
         {/*
           Auto-register every interactive element in the runner app so that

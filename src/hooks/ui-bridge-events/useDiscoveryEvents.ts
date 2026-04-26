@@ -1,9 +1,9 @@
 import { useCallback } from "react";
 import type { BridgeSnapshot } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
-import { getUIBridgeGlobal, toTabCanonical } from "./utils";
+import { getUIBridgeGlobal } from "./utils";
 import { createLogger } from "@/lib/logger";
-import { ACTIVE_TAB_STORAGE_KEY, TAB_LIST } from "@/components/app/tab-types";
+import { ACTIVE_TAB_STORAGE_KEY } from "@/components/app/tab-types";
 import { instanceStorage } from "@/lib/instance-storage";
 
 const logger = createLogger("UIBridgeDiscoveryEvents");
@@ -175,6 +175,14 @@ export function useDiscoveryEvents(
           // The runner mounts UI Bridge HTTP routes under /ui-bridge/* so
           // override the snapshot's default componentActionBasePath prefix
           // to produce URLs callers can hit directly.
+          //
+          // Snapshot enrichment (the seven canonical tracker fields — page,
+          // modalStack, toasts, relationships, dragDrop, undoRedo, shortcuts)
+          // is now handled by the registry's `setEnrichers` slot, wired in
+          // `UIBridgeProviderInit` (see SDK Tracker Reshape Phase 1). The
+          // runner-specific `availableTabs` + `tabActivation` fields are
+          // added via the pluggable enricher registered by `RunnerTabsEnricher`
+          // in `App.tsx` (Phase 3).
           const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync(50, {
             componentBasePath: "/ui-bridge/control/component",
             // F1 — supply the runner's active-tab provider so cross-tab
@@ -189,102 +197,14 @@ export function useDiscoveryEvents(
           });
           logger.debug(`get_snapshot: snapshot created (${snapshot.elements.length} elements)`);
 
-          // Enrich with page context, modals, and toasts from trackers if available.
-          // Each enrichment is wrapped individually so one failure doesn't break the snapshot.
-          const uiBridgeGlobal = getUIBridgeGlobal();
-          const elementPairs = currentBridge.elements.map((e) => ({
-            id: e.id,
-            element: e.element,
-          }));
-
-          // Safe getter: catches errors from any individual enrichment
-          const safeGet = <T>(fn: () => T): T | undefined => {
-            try {
-              return fn();
-            } catch (e) {
-              console.warn("[UIBridgeEventHandler] Enrichment failed:", e);
-              return undefined;
-            }
-          };
-
-          const navTracker = uiBridgeGlobal?.navigationTracker as
-            | { getSnapshotPageContext: () => unknown }
-            | undefined;
-          const modalDet = uiBridgeGlobal?.modalDetector as
-            | { getSnapshotModalContext: () => unknown }
-            | undefined;
-          const toastCap = uiBridgeGlobal?.toastCapture as
-            | { getSnapshotToastContext: () => unknown }
-            | undefined;
-          const relTracker = uiBridgeGlobal?.relationshipTracker as
-            | {
-                getSnapshotRelationshipContext: (
-                  elements?: Array<{ id: string; element: Element }>,
-                ) => unknown;
-              }
-            | undefined;
-          const dndDetector = uiBridgeGlobal?.dragDropDetector as
-            | {
-                getSnapshotDragDropContext: (
-                  elements?: Array<{ id: string; element: Element }>,
-                ) => unknown;
-              }
-            | undefined;
-          const undoTracker = uiBridgeGlobal?.undoTracker as
-            | { getSnapshotUndoContext: () => unknown }
-            | undefined;
-          const shortcutTracker = uiBridgeGlobal?.shortcutTracker as
-            | { getSnapshotShortcutContext: () => unknown }
-            | undefined;
-
-          logger.debug("get_snapshot: enriching...");
-          // Resolve the active tab once so `availableTabs` can flag which entry
-          // matches and the `getActiveTab` callback above stays the source of
-          // truth (instanceStorage + initial-tab fallback).
-          const activeTabId = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
-          // Canonical alias derived via the shared `toTabCanonical` helper
-          // (utils.ts) so the playbook + tabs_list + this snapshot
-          // enrichment all speak the same shape.
-          const availableTabs = TAB_LIST.map((entry) => ({
-            id: entry.id,
-            label: entry.label,
-            canonical: toTabCanonical(entry.id),
-            active: entry.id === activeTabId,
-          }));
-          // Static documentation hint — same on every snapshot, regardless of
-          // whether the current page has tabs registered. Lets tooling/agents
-          // discover the activation endpoint without reading external docs.
-          const tabActivation = {
-            description: "Switch tabs without a UI click",
-            method: "POST",
-            path: "/ui-bridge/control/tab/activate",
-            bodyExample: { tabId: "<one of availableTabs[].id>" },
-          };
-          const enrichedSnapshot = {
-            ...snapshot,
-            page: safeGet(() => navTracker?.getSnapshotPageContext()),
-            modalStack: safeGet(() => modalDet?.getSnapshotModalContext()),
-            toasts: safeGet(() => toastCap?.getSnapshotToastContext()),
-            relationships: safeGet(() => relTracker?.getSnapshotRelationshipContext(elementPairs)),
-            dragDrop: safeGet(() => dndDetector?.getSnapshotDragDropContext(elementPairs)),
-            undoRedo: safeGet(() => undoTracker?.getSnapshotUndoContext()),
-            shortcuts: safeGet(() => shortcutTracker?.getSnapshotShortcutContext()),
-            availableTabs,
-            tabActivation,
-          };
-
-          const response = {
+          await sendResponse({
             requestId,
             type,
             success: true,
-            data: enrichedSnapshot,
+            data: snapshot,
             timestamp: Date.now(),
-          };
-
-          await sendResponse(response);
-          logger.debug(
-            `get_snapshot: response sent (${enrichedSnapshot.elements.length} elements)`,
-          );
+          });
+          logger.debug(`get_snapshot: response sent (${snapshot.elements.length} elements)`);
           return true;
         }
 
