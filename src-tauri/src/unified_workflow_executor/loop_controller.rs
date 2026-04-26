@@ -1269,6 +1269,7 @@ impl LoopController {
                     strict_cwd: config.strict_cwd,
                     tool_tags: config.tool_tags.clone(),
                     use_worktree: false,
+                    auto_commit_subagents: config.auto_commit_subagents,
                     worktree_path: config.worktree_path.clone(),
                     worktree_branch: config.worktree_branch.clone(),
                     workflow_architecture: config.workflow_architecture.clone(),
@@ -1701,6 +1702,12 @@ impl LoopController {
                     );
                 }
             }
+
+            // Phase C: auto-commit sub-agent file-set on successful terminal
+            // state. Runs BEFORE mark_task_completed so all session context is
+            // still live (file registry locks not yet released, PG state still
+            // marked running). Best-effort — never fails the workflow.
+            self.auto_commit_on_success(&config).await;
 
             self.mark_task_completed(&config.execution_id, Some(&config.workflow_id))
                 .await;

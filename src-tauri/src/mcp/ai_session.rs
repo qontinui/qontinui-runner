@@ -189,6 +189,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/sessions/{session_id}/promote-to-worktree",
             post(promote_session_to_worktree_handler),
         )
+        .route(
+            "/sessions/{session_id}/commit-progress",
+            post(commit_session_progress_handler),
+        )
 }
 
 // ============================================================================
@@ -387,6 +391,244 @@ pub(crate) async fn promote_session_inner(
         worktree_path: info.path.to_string_lossy().to_string(),
         branch_name: info.branch,
     })
+}
+
+// ============================================================================
+// Commit Progress (Phase D)
+// ============================================================================
+
+/// Response from a successful (or no-op) `commit_session_progress_inner` call.
+///
+/// Mirrors `PromoteToWorktreeResponse` in shape: returned by both the MCP HTTP
+/// handler (`POST /sessions/{id}/commit-progress`) and the Tauri command
+/// (`commit_session_progress`). `commit_hash` is `None` when nothing actually
+/// landed (empty file-set, or files matched HEAD exactly).
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitProgressResponse {
+    /// New HEAD SHA on success; `None` when no commit was created (empty
+    /// tracker, or staging produced no diff vs HEAD).
+    pub commit_hash: Option<String>,
+    /// Number of files in the tracker at commit time. May be 0 when nothing
+    /// was tracked.
+    pub file_count: usize,
+    /// Branch HEAD pointed at in `cwd` at commit time. Worktree branch if the
+    /// session was promoted, else the user's current branch.
+    pub branch: String,
+    /// The commit message that was used (or would have been, on no-op).
+    pub message: String,
+}
+
+/// MCP HTTP handler: commit a session's accumulated file-set to its cwd's
+/// current branch.
+///
+/// `POST /sessions/{session_id}/commit-progress`
+///
+/// Looks up the live session via `SessionManager`, reads its tracked file-set
+/// from PG (`session_touched_files`), runs `auto_commit::commit_files` against
+/// the session's cwd (worktree path if promoted, repo root otherwise), and on
+/// success clears the tracker so the next call only sees freshly-touched
+/// files.
+///
+/// Status codes:
+/// - 200 — commit succeeded (may be a no-op with `commit_hash: None`)
+/// - 404 — no live session for that id
+/// - 500 — git/branch lookup failed, commit failed, or PG unavailable
+pub async fn commit_session_progress_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<ApiResponse<CommitProgressResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: commit_session_progress requested for session_id={}",
+        session_id
+    );
+
+    commit_session_progress_inner(&state.app_handle, &session_id)
+        .await
+        .map(|resp| Json(ApiResponse::success(resp)))
+        .map_err(|(status, message)| (status, Json(api_error(message))))
+}
+
+/// Shared implementation behind the MCP handler and the Tauri command.
+///
+/// Returns `(StatusCode, error_message)` on failure so each frontend can map
+/// it to its native response shape.
+///
+/// Behaviour:
+/// 1. Resolve `SessionManager` and the session's cwd (worktree path if
+///    promoted, else `current_project_path()`).
+/// 2. Read tracked files from PG. Empty list short-circuits to a successful
+///    no-op (`commit_hash: None`, `file_count: 0`).
+/// 3. Build a default commit message: `"session-progress({id}): {N} files at
+///    {RFC3339-ts}"`.
+/// 4. Compute the current HEAD branch name via `git rev-parse --abbrev-ref
+///    HEAD` (so the response can show "Committed to {branch}").
+/// 5. Call `auto_commit::commit_files`. On success or no-op, clear the
+///    tracker. On error, leave the tracker so a retry can see the same
+///    file-set.
+pub(crate) async fn commit_session_progress_inner(
+    app_handle: &tauri::AppHandle,
+    session_id: &str,
+) -> Result<CommitProgressResponse, (StatusCode, String)> {
+    use crate::auto_commit::{commit_files, CommitOutcome};
+    use crate::claude_session::manager::SessionManager;
+    use crate::commands::AppState;
+
+    // 1. Resolve the SessionManager from Tauri's managed state.
+    let session_manager: Arc<SessionManager> = app_handle
+        .try_state::<Arc<SessionManager>>()
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SessionManager not available".to_string(),
+            )
+        })?
+        .inner()
+        .clone();
+
+    // 2. Resolve AppState (for pg_db). Available everywhere the runner is
+    //    fully initialised; failure here is an internal error.
+    let app_state: Arc<AppState> = app_handle
+        .try_state::<Arc<AppState>>()
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AppState not available".to_string(),
+            )
+        })?
+        .inner()
+        .clone();
+
+    // 3. Look up the live session. We only need a read view, so the Arc clone
+    //    is enough — no `try_unwrap` dance needed (unlike promote, which
+    //    requires `&mut self`).
+    let session = session_manager.get(session_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("No active session for session_id: {}", session_id),
+        )
+    })?;
+
+    // 4. Determine cwd. Promoted sessions commit to the worktree branch;
+    //    un-promoted sessions commit to whatever HEAD the runner's repo root
+    //    is pointing at (the user's current branch).
+    let cwd: std::path::PathBuf = if let Some(wt) = session.worktree() {
+        wt.path.clone()
+    } else {
+        let repo = crate::mcp::shared::current_project_path().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "No project path available".to_string(),
+        ))?;
+        std::path::PathBuf::from(repo)
+    };
+
+    // 5. Read the tracker. The session's session_id IS the task_run_id for
+    //    live PTYs in this runner (see Phase 4 worktree-promotion notes).
+    let pg = app_state.pg_db.clone();
+    let files = pg.get_files_touched(session_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read touched-files tracker: {}", e),
+        )
+    })?;
+
+    // 6. Resolve the current HEAD branch in cwd. Used both for the response
+    //    and for log/UI clarity. `--abbrev-ref HEAD` returns "HEAD" on
+    //    detached-HEAD, which is fine — we surface it as-is.
+    let branch = crate::worktree::run_git_command(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read current branch in {}: {}", cwd.display(), e),
+            )
+        })?;
+
+    // 7. Build the default commit message. Includes the session id so users
+    //    browsing `git log` can identify which session produced which commit.
+    //    (ClaudeSession doesn't currently expose a separate "display name" —
+    //    `session_id` is what the chat UI uses as the stable handle, and is
+    //    what task_runs.task_name was created from at spawn time.)
+    let message = format!(
+        "session-progress({}): {} files at {}",
+        session_id,
+        files.len(),
+        chrono::Utc::now().to_rfc3339(),
+    );
+
+    // 8. Empty tracker → no-op success. Skip the commit_files call entirely
+    //    so we don't spam logs with "auto_commit: empty file list".
+    if files.is_empty() {
+        info!(
+            "commit_session_progress: session {} has no tracked files; returning no-op",
+            session_id
+        );
+        return Ok(CommitProgressResponse {
+            commit_hash: None,
+            file_count: 0,
+            branch,
+            message,
+        });
+    }
+
+    // 9. Run the commit. On success or no-op, clear the tracker (best-effort:
+    //    a PG failure here doesn't roll back the commit — we just warn).
+    match commit_files(&cwd, &files, &message).await {
+        Ok(CommitOutcome::Committed { hash }) => {
+            if let Err(e) = pg.clear_files_touched(session_id).await {
+                warn!(
+                    "commit_session_progress: clear_files_touched failed for {} after commit: {}",
+                    session_id, e
+                );
+            }
+            info!(
+                "commit_session_progress: session {} -> {} ({} files, branch={})",
+                session_id,
+                hash,
+                files.len(),
+                branch
+            );
+            Ok(CommitProgressResponse {
+                commit_hash: Some(hash),
+                file_count: files.len(),
+                branch,
+                message,
+            })
+        }
+        Ok(CommitOutcome::NothingToCommit) => {
+            // Files matched HEAD — clear so the tracker doesn't carry stale
+            // entries forever. (If the user re-edits the same path later,
+            // the dispatcher will re-register it.)
+            if let Err(e) = pg.clear_files_touched(session_id).await {
+                warn!(
+                    "commit_session_progress: clear_files_touched failed for {} after no-op: {}",
+                    session_id, e
+                );
+            }
+            info!(
+                "commit_session_progress: session {} no-op ({} tracked files matched HEAD)",
+                session_id,
+                files.len()
+            );
+            Ok(CommitProgressResponse {
+                commit_hash: None,
+                file_count: files.len(),
+                branch,
+                message,
+            })
+        }
+        Err(e) => {
+            warn!(
+                "commit_session_progress: commit_files failed for {} in {}: {}",
+                session_id,
+                cwd.display(),
+                e
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("commit failed: {}", e),
+            ))
+        }
+    }
 }
 
 // ============================================================================

@@ -688,6 +688,148 @@ impl LoopController {
             config.use_worktree = false;
         }
     }
+
+    /// Phase C: Auto-commit files touched by the sub-agent on successful
+    /// terminal state.
+    ///
+    /// Reads the file-set from `session_touched_files` (populated by the
+    /// dispatcher's auto-register on every Edit/Write tool call), filters by
+    /// the workflow's `auto_commit_subagents` policy, and invokes the
+    /// per-cwd-serialized [`auto_commit::commit_files`] helper against the
+    /// worktree path.
+    ///
+    /// Policy semantics for `auto_commit_subagents`:
+    /// - `Some(true)`  — commit after success regardless of worktree state.
+    /// - `Some(false)` — never commit, even with a worktree.
+    /// - `None`        — commit if and only if the workflow uses a worktree.
+    ///
+    /// This is **best-effort durability**: any failure is logged at `warn!`
+    /// and swallowed. Workflow success > commit success. The tracker is
+    /// cleared on `Committed` and `NothingToCommit` outcomes; on `Err` it is
+    /// preserved so a future inspect/retry path can see the file-set.
+    pub(crate) async fn auto_commit_on_success(&self, config: &LoopConfig) {
+        // Resolve the policy:
+        //   None      → commit iff use_worktree
+        //   Some(true)→ always commit
+        //   Some(false)→ never commit
+        let should_commit = resolve_auto_commit_policy(
+            config.auto_commit_subagents,
+            config.use_worktree,
+        );
+
+        if config.auto_commit_subagents == Some(false) {
+            tracing::debug!(
+                workflow_id = %config.workflow_id,
+                execution_id = %config.execution_id,
+                "auto_commit_on_success: explicit opt-out, skipping"
+            );
+            return;
+        }
+
+        if !should_commit {
+            tracing::debug!(
+                workflow_id = %config.workflow_id,
+                execution_id = %config.execution_id,
+                use_worktree = config.use_worktree,
+                "auto_commit_on_success: not a worktree workflow and no explicit opt-in, skipping"
+            );
+            return;
+        }
+
+        // Determine the cwd for the commit. Inside a worktree, prefer
+        // `worktree_path`; otherwise fall back to `project_path`. If neither is
+        // set, we cannot proceed.
+        let cwd_str = match config
+            .worktree_path
+            .as_deref()
+            .or(config.project_path.as_deref())
+        {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    execution_id = %config.execution_id,
+                    "auto_commit_on_success: no worktree_path or project_path; skipping"
+                );
+                return;
+            }
+        };
+        let cwd = std::path::PathBuf::from(cwd_str);
+
+        // Pull the file-set the dispatcher recorded for this task_run_id.
+        let pg = &self.app_state.pg_db;
+        let files = match pg.get_files_touched(&config.execution_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = %config.execution_id,
+                    error = %e,
+                    "auto_commit_on_success: get_files_touched failed; skipping"
+                );
+                return;
+            }
+        };
+
+        if files.is_empty() {
+            tracing::info!(
+                execution_id = %config.execution_id,
+                "auto_commit_on_success: no files touched, skipping commit"
+            );
+            return;
+        }
+
+        let short_id: String = config.execution_id.chars().take(8).collect();
+        let message = format!(
+            "auto(workflow:{}:{}): {} files",
+            config.workflow_name,
+            short_id,
+            files.len()
+        );
+
+        match crate::auto_commit::commit_files(&cwd, &files, &message).await {
+            Ok(crate::auto_commit::CommitOutcome::Committed { hash }) => {
+                tracing::info!(
+                    execution_id = %config.execution_id,
+                    hash = %hash,
+                    file_count = files.len(),
+                    cwd = %cwd.display(),
+                    "auto_commit_on_success: committed sub-agent file-set"
+                );
+                if let Err(e) = pg.clear_files_touched(&config.execution_id).await {
+                    tracing::warn!(
+                        execution_id = %config.execution_id,
+                        error = %e,
+                        "auto_commit_on_success: clear_files_touched failed after commit"
+                    );
+                }
+            }
+            Ok(crate::auto_commit::CommitOutcome::NothingToCommit) => {
+                tracing::info!(
+                    execution_id = %config.execution_id,
+                    file_count = files.len(),
+                    cwd = %cwd.display(),
+                    "auto_commit_on_success: no diff, skipping commit (clearing tracker)"
+                );
+                // Files match HEAD already; the tracker would just stay stale.
+                if let Err(e) = pg.clear_files_touched(&config.execution_id).await {
+                    tracing::warn!(
+                        execution_id = %config.execution_id,
+                        error = %e,
+                        "auto_commit_on_success: clear_files_touched failed after no-op"
+                    );
+                }
+            }
+            Err(e) => {
+                // Never propagate — workflow success state must win.
+                tracing::warn!(
+                    execution_id = %config.execution_id,
+                    file_count = files.len(),
+                    cwd = %cwd.display(),
+                    error = %e,
+                    "auto_commit_on_success: auto-commit failed (workflow success preserved, tracker preserved for inspection)"
+                );
+            }
+        }
+    }
 }
 
 /// Auto-capture significant task findings as persistent observations.
@@ -794,5 +936,50 @@ async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id:
     match pg.save_observation(&input).await {
         Ok(id) => info!("Auto-captured task observation {} for {}", id, execution_id),
         Err(e) => warn!("Failed to auto-capture observation: {}", e),
+    }
+}
+
+// =============================================================================
+// Phase C: auto-commit policy resolver
+// =============================================================================
+
+/// Decide whether the workflow's terminal-state hook should auto-commit the
+/// sub-agent's file-set.
+///
+/// Pure function so the policy can be unit-tested without mocking
+/// `LoopController` (which is heavy with tauri/AppHandle dependencies).
+///
+/// - `Some(true)`  → always commit (caller still needs files non-empty).
+/// - `Some(false)` → never commit, even with worktree.
+/// - `None`        → commit iff the workflow uses a worktree.
+fn resolve_auto_commit_policy(opt_in: Option<bool>, use_worktree: bool) -> bool {
+    match opt_in {
+        Some(v) => v,
+        None => use_worktree,
+    }
+}
+
+#[cfg(test)]
+mod auto_commit_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_true_always_commits() {
+        assert!(resolve_auto_commit_policy(Some(true), false));
+        assert!(resolve_auto_commit_policy(Some(true), true));
+    }
+
+    #[test]
+    fn explicit_false_never_commits() {
+        assert!(!resolve_auto_commit_policy(Some(false), false));
+        assert!(!resolve_auto_commit_policy(Some(false), true));
+    }
+
+    #[test]
+    fn none_defaults_to_worktree_state() {
+        // No worktree → no commit by default.
+        assert!(!resolve_auto_commit_policy(None, false));
+        // With worktree → commit by default.
+        assert!(resolve_auto_commit_policy(None, true));
     }
 }

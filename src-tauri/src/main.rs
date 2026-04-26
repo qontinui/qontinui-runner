@@ -18,6 +18,7 @@ mod ai_workflows;
 pub mod api_config;
 mod api_request;
 mod auth;
+mod auto_commit;
 mod backup;
 mod check_executor;
 mod check_generation;
@@ -614,6 +615,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_generation::generate_test_and_agentic_step,
             commands::ai_generation::suggest_exploration_strategy_with_ai,
             commands::ai_session::close_ai_session,
+            commands::ai_session::commit_session_progress,
             commands::ai_session::create_ai_session,
             commands::ai_session::generate_workflow_from_session,
             commands::ai_session::get_ai_output,

@@ -9,6 +9,7 @@ import {
   Pin,
   Tag,
   GitBranch,
+  GitCommit,
   Loader2,
   CheckCircle2,
 } from "lucide-react";
@@ -19,6 +20,17 @@ interface PromoteToWorktreeData {
   worktree_id: string;
   worktree_path: string;
   branch_name: string;
+}
+
+interface CommitProgressData {
+  /** New HEAD SHA on success; null when no commit was created (empty or no-diff). */
+  commit_hash: string | null;
+  /** Number of files in the tracker at commit time (may be 0). */
+  file_count: number;
+  /** Branch HEAD pointed at in the session's cwd at commit time. */
+  branch: string;
+  /** The auto-generated commit message that was used. */
+  message: string;
 }
 
 interface SessionCardProps {
@@ -187,6 +199,61 @@ export function SessionCard({
     [canPromote, promoteState.kind, session.sessionId, onAfterPromote],
   );
 
+  // ── Commit progress state ───────────────────────────────────────────────
+  // Commits the session's tracked file-set (PG `session_touched_files`) to
+  // whatever branch the session's cwd has checked out — worktree branch if
+  // promoted, user's current branch if not. No automatic state changes — the
+  // session is left running, the parent doesn't refresh.
+  const [commitState, setCommitState] = useState<
+    | { kind: "idle" }
+    | { kind: "loading" }
+    | { kind: "success"; data: CommitProgressData }
+    | { kind: "error"; message: string }
+  >({ kind: "idle" });
+
+  // Same predicate as canPromote: committing requires a live session in this
+  // runner. A non-promoted session committing to the user's current branch is
+  // the explicit, correct behavior.
+  const canCommit =
+    session.liveStatus === "active-in-zone" ||
+    session.liveStatus === "needs-input" ||
+    session.liveStatus === "frozen";
+
+  const handleCommit = useCallback(
+    async (e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (!canCommit || commitState.kind === "loading") return;
+      setCommitState({ kind: "loading" });
+      try {
+        const result = await invoke<CommandResponse>("commit_session_progress", {
+          taskRunId: session.sessionId,
+        });
+        if (result.success && result.data) {
+          const data = result.data as CommitProgressData;
+          setCommitState({ kind: "success", data });
+          // Auto-clear the success badge after ~6s. Unlike promote we don't
+          // need to refresh the parent — the session itself didn't change.
+          setTimeout(() => {
+            setCommitState((prev) => (prev.kind === "success" ? { kind: "idle" } : prev));
+          }, 6000);
+        } else {
+          const msg = result.message ?? "Commit failed";
+          setCommitState({ kind: "error", message: msg });
+          setTimeout(() => {
+            setCommitState((prev) => (prev.kind === "error" ? { kind: "idle" } : prev));
+          }, 8000);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setCommitState({ kind: "error", message: msg });
+        setTimeout(() => {
+          setCommitState((prev) => (prev.kind === "error" ? { kind: "idle" } : prev));
+        }, 8000);
+      }
+    },
+    [canCommit, commitState.kind, session.sessionId],
+  );
+
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -340,6 +407,41 @@ export function SessionCard({
             </span>
           </div>
         )}
+
+        {/* Commit-progress status */}
+        {commitState.kind === "loading" && (
+          <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#7aa2f7]/80">
+            <Loader2 className="w-3 h-3 animate-spin" />
+            <span>Committing session progress…</span>
+          </div>
+        )}
+        {commitState.kind === "success" && (
+          <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#9ece6a]/90">
+            <CheckCircle2 className="w-3 h-3 shrink-0" />
+            <span className="truncate">
+              {commitState.data.commit_hash ? (
+                <>
+                  Committed {commitState.data.file_count} file
+                  {commitState.data.file_count === 1 ? "" : "s"} to{" "}
+                  <span className="font-mono">{commitState.data.branch}</span>{" "}
+                  <span className="font-mono text-[#7aa2f7]/80">
+                    ({commitState.data.commit_hash.slice(0, 7)})
+                  </span>
+                </>
+              ) : (
+                "No changes to commit"
+              )}
+            </span>
+          </div>
+        )}
+        {commitState.kind === "error" && (
+          <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#f7768e]/90">
+            <AlertTriangle className="w-3 h-3 shrink-0" />
+            <span className="truncate" title={commitState.message}>
+              Commit failed: {commitState.message}
+            </span>
+          </div>
+        )}
       </button>
 
       {/* Quick action buttons — visible on hover */}
@@ -365,6 +467,20 @@ export function SessionCard({
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
             ) : (
               <GitBranch className="w-3.5 h-3.5" />
+            )}
+          </button>
+        )}
+        {canCommit && (
+          <button
+            onClick={handleCommit}
+            disabled={commitState.kind === "loading"}
+            className="p-1 rounded text-[#565f89] hover:text-[#9ece6a] hover:bg-[#9ece6a]/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Commit Progress (commits this session's edits to the current branch)"
+          >
+            {commitState.kind === "loading" ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <GitCommit className="w-3.5 h-3.5" />
             )}
           </button>
         )}
@@ -462,6 +578,23 @@ export function SessionCard({
                     <GitBranch className="w-3 h-3 text-[#7aa2f7]" />
                   )}
                   Promote to Worktree
+                </button>
+              )}
+              {canCommit && (
+                <button
+                  onClick={(e) => {
+                    setContextMenu(null);
+                    void handleCommit(e);
+                  }}
+                  disabled={commitState.kind === "loading"}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
+                >
+                  {commitState.kind === "loading" ? (
+                    <Loader2 className="w-3 h-3 text-[#9ece6a] animate-spin" />
+                  ) : (
+                    <GitCommit className="w-3 h-3 text-[#9ece6a]" />
+                  )}
+                  Commit Progress
                 </button>
               )}
               <div className="my-1 h-px bg-[#2a2d3d]" />

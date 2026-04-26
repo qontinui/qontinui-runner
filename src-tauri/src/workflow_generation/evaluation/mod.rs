@@ -1011,6 +1011,7 @@ mod url_invariant_tests {
             acceptance_criteria: None,
             multi_agent_mode: true,
             use_worktree: false,
+            auto_commit_subagents: None,
             strict_cwd: false,
             tool_tags: vec![],
             workflow_architecture: None,

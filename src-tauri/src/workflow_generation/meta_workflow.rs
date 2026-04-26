@@ -362,6 +362,7 @@ pub fn build_meta_workflow_template(
         strict_cwd: false,
         tool_tags: Vec::new(),
         use_worktree: false,
+        auto_commit_subagents: None,
         model_overrides: std::collections::HashMap::new(),
         enforce_token_budget: false,
         rollback_policy: None,

@@ -230,6 +230,7 @@ impl StepHandler for WorkflowRefHandler {
             strict_cwd: false,
             tool_tags: Vec::new(),
             use_worktree: false,
+            auto_commit_subagents: None,
             worktree_path: None,
             worktree_branch: None,
             workflow_architecture: None,

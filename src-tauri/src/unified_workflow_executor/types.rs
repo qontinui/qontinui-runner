@@ -404,6 +404,11 @@ pub struct LoopConfig {
     pub tool_tags: Vec<String>,
     /// Run the workflow in an isolated git worktree.
     pub use_worktree: bool,
+    /// Auto-commit files touched by sub-agents on successful terminal state.
+    /// `Some(true)` always commits, `Some(false)` never commits, `None` commits
+    /// iff the workflow uses a worktree. See `qontinui_types::workflow` for
+    /// full Phase C semantics.
+    pub auto_commit_subagents: Option<bool>,
     /// Worktree path (set at runtime, not user-configurable).
     pub worktree_path: Option<String>,
     /// Worktree branch name (set at runtime).
@@ -497,6 +502,7 @@ impl LoopConfig {
             strict_cwd: workflow.strict_cwd || crate::settings::get_path_settings().strict_mode,
             tool_tags: workflow.tool_tags.clone(),
             use_worktree: workflow.use_worktree,
+            auto_commit_subagents: workflow.auto_commit_subagents,
             worktree_path: None,
             worktree_branch: None,
             workflow_architecture: workflow.workflow_architecture.clone(),

@@ -109,6 +109,7 @@ macro_rules! row_to_workflow {
             flow_control_json: non_empty($r.flow_control_json),
             phase_timeouts_json: non_empty($r.phase_timeouts_json),
             use_worktree: false,
+            auto_commit_subagents: None,
             targeted_error_ids: vec![],
             security_profile: None, // TODO: read from DB once column is added
             max_fix_attempts: 3,

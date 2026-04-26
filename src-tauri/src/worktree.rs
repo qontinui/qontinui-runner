@@ -770,7 +770,7 @@ fn get_head_commit(repo_path: &Path) -> Result<String, String> {
     Ok(output.trim().to_string())
 }
 
-fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(repo_path)

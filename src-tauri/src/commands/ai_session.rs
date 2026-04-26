@@ -976,6 +976,66 @@ pub async fn promote_session_to_worktree(
     }
 }
 
+/// Commit a running session's accumulated file-set to its cwd's current branch.
+///
+/// The Tauri-facing sibling of `POST /sessions/{id}/commit-progress`. Both
+/// routes funnel through `crate::mcp::ai_session::commit_session_progress_inner`
+/// so behaviour stays in lockstep.
+///
+/// Behaviour summary (full details in `commit_session_progress_inner`):
+/// - The session must be live in this runner. cwd is the worktree path if the
+///   session was promoted via `promote_session_to_worktree`, otherwise the
+///   runner's repo root (so the commit lands on whatever branch the user
+///   currently has checked out).
+/// - The file-set comes from PG `session_touched_files` (populated by the
+///   dispatcher for every Edit/Write tool call).
+/// - Empty tracker → success with `commit_hash: null`. Files matching HEAD →
+///   success with `commit_hash: null`. Anything else → success with the new
+///   HEAD SHA. The tracker is cleared on success (or no-op); on failure it's
+///   left so a retry can see the same file-set.
+///
+/// On success returns the new commit hash (or null), file count, branch
+/// name, and the auto-generated commit message in `data`. On failure returns
+/// `success: false` with the error message; no parent refresh is needed
+/// because committing doesn't mutate session state the chat UI cares about.
+#[tauri::command]
+pub async fn commit_session_progress(
+    app: tauri::AppHandle,
+    task_run_id: String,
+) -> Result<CommandResponse, String> {
+    info!("commit_session_progress: task_run_id={}", task_run_id);
+
+    match crate::mcp::ai_session::commit_session_progress_inner(&app, &task_run_id).await {
+        Ok(resp) => Ok(CommandResponse {
+            success: true,
+            message: Some(match &resp.commit_hash {
+                Some(hash) => format!(
+                    "Committed {} file(s) to {} ({})",
+                    resp.file_count,
+                    resp.branch,
+                    &hash[..hash.len().min(7)]
+                ),
+                None => format!(
+                    "No changes to commit (tracked {} file(s) on {})",
+                    resp.file_count, resp.branch
+                ),
+            }),
+            data: Some(serde_json::json!({
+                "task_run_id": task_run_id,
+                "commit_hash": resp.commit_hash,
+                "file_count": resp.file_count,
+                "branch": resp.branch,
+                "message": resp.message,
+            })),
+        }),
+        Err((status, message)) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("[{}] {}", status.as_u16(), message)),
+            data: None,
+        }),
+    }
+}
+
 /// Resume interrupted AI sessions on startup.
 ///
 /// Queries for task runs with status='running' and workflow_type='chat'
@@ -1423,6 +1483,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             get_ai_output,
             generate_workflow_from_session,
             promote_session_to_worktree,
+            commit_session_progress,
         ])
         .build()
 }
