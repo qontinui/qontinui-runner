@@ -26,6 +26,8 @@ import type {
   CreateScheduledTaskRequest,
   ScheduleConditions,
   RepositoryWatch,
+  CatchUpPolicy,
+  McpConnectionRef,
 } from "../../types/scheduler";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
@@ -40,6 +42,54 @@ interface RepositoryWatchWithId extends RepositoryWatch {
   _formId: string;
 }
 
+interface McpConnectionRefWithId extends McpConnectionRef {
+  _formId: string;
+}
+
+const REMOTE_AGENT_DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"];
+
+const REMOTE_AGENT_AVAILABLE_TOOLS = [
+  "Bash",
+  "Read",
+  "Write",
+  "Edit",
+  "Glob",
+  "Grep",
+  "WebFetch",
+  "WebSearch",
+  "Task",
+];
+
+const REMOTE_AGENT_MODEL_PRESETS = [
+  { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (default)" },
+  { value: "claude-opus-4-7", label: "Claude Opus 4.7" },
+  { value: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
+];
+
+const REMOTE_AGENT_MODEL_CUSTOM_SENTINEL = "__custom__";
+
+const CATCH_UP_POLICY_OPTIONS: ReadonlyArray<{
+  value: CatchUpPolicy;
+  label: string;
+  hint: string;
+}> = [
+  {
+    value: "run_once",
+    label: "Run once after returning",
+    hint: "Collapse missed slots into a single catch-up run",
+  },
+  {
+    value: "run",
+    label: "Run all missed slots",
+    hint: "Execute one run for every slot that was missed",
+  },
+  {
+    value: "skip",
+    label: "Skip and log",
+    hint: "Record missed slots without running them",
+  },
+];
+
 interface SchedulerTaskFormProps {
   task?: ScheduledTask;
   /** Pre-fill form fields from an AI-generated or external request (for new tasks only) */
@@ -50,7 +100,7 @@ interface SchedulerTaskFormProps {
 }
 
 type ScheduleType = "once" | "cron" | "interval" | "condition";
-type TaskType = "workflow" | "prompt" | "autofix";
+type TaskType = "workflow" | "prompt" | "autofix" | "remote_agent";
 
 const CRON_PRESETS = [
   { label: "Every minute (testing)", value: "* * * * *" },
@@ -131,6 +181,8 @@ export function SchedulerTaskForm({
         return "prompt";
       case "AutoFix":
         return "autofix";
+      case "RemoteAgent":
+        return "remote_agent";
       default:
         return "workflow";
     }
@@ -163,6 +215,55 @@ export function SchedulerTaskForm({
   const [forceRun, setForceRun] = useState(
     initTask?.task_type === "AutoFix" ? initTask.force_run : false,
   );
+
+  // RemoteAgent state
+  const initRemoteAgent = initTask?.task_type === "RemoteAgent" ? initTask : undefined;
+  const [agentPrompt, setAgentPrompt] = useState(initRemoteAgent?.prompt ?? "");
+  const [agentWorkingDirectory, setAgentWorkingDirectory] = useState(
+    initRemoteAgent?.working_directory ?? "",
+  );
+  const initialModel = initRemoteAgent?.model ?? "";
+  const initialModelIsPreset =
+    initialModel === "" || REMOTE_AGENT_MODEL_PRESETS.some((p) => p.value === initialModel);
+  const [agentModelSelect, setAgentModelSelect] = useState<string>(() => {
+    if (!initialModel) return "claude-sonnet-4-6";
+    return initialModelIsPreset ? initialModel : REMOTE_AGENT_MODEL_CUSTOM_SENTINEL;
+  });
+  const [agentModelCustom, setAgentModelCustom] = useState<string>(
+    initialModelIsPreset ? "" : initialModel,
+  );
+  const [agentAllowedTools, setAgentAllowedTools] = useState<string[]>(() => {
+    const fromInit = initRemoteAgent?.allowed_tools;
+    if (fromInit && fromInit.length > 0) return [...fromInit];
+    return [...REMOTE_AGENT_DEFAULT_TOOLS];
+  });
+  const [agentMaxTurns, setAgentMaxTurns] = useState<string>(
+    initRemoteAgent?.max_turns !== undefined && initRemoteAgent?.max_turns !== null
+      ? String(initRemoteAgent.max_turns)
+      : "50",
+  );
+  const [agentTimeoutSeconds, setAgentTimeoutSeconds] = useState<string>(
+    initRemoteAgent?.timeout_seconds !== undefined && initRemoteAgent?.timeout_seconds !== null
+      ? String(initRemoteAgent.timeout_seconds)
+      : "600",
+  );
+  const [agentMcpConnections, setAgentMcpConnections] = useState<McpConnectionRefWithId[]>(() => {
+    const fromInit = initRemoteAgent?.mcp_connections;
+    if (!fromInit || fromInit.length === 0) return [];
+    return fromInit.map((c) => ({
+      name: c.name,
+      url: c.url ?? null,
+      _formId: crypto.randomUUID(),
+    }));
+  });
+  const [agentAdvancedOpen, setAgentAdvancedOpen] = useState(false);
+
+  // Catch-up policy state
+  const initCatchUpPolicy: CatchUpPolicy =
+    task?.catchUpPolicy ?? prefill?.catchUpPolicy ?? "run_once";
+  const [catchUpPolicy, setCatchUpPolicy] = useState<CatchUpPolicy>(initCatchUpPolicy);
+  const initCatchUpGrace = task?.catchUpGraceSeconds ?? prefill?.catchUpGraceSeconds ?? 300;
+  const [catchUpGraceSeconds, setCatchUpGraceSeconds] = useState<number>(initCatchUpGrace);
 
   // Conditions state
   const initConditions = task?.conditions ?? prefill?.conditions;
@@ -327,6 +428,30 @@ export function SchedulerTaskForm({
           check_findings: checkFindings,
           force_run: forceRun,
         };
+      case "remote_agent": {
+        const resolvedModel =
+          agentModelSelect === REMOTE_AGENT_MODEL_CUSTOM_SENTINEL
+            ? agentModelCustom.trim() || undefined
+            : agentModelSelect || undefined;
+        const parsedMaxTurns = agentMaxTurns ? parseInt(agentMaxTurns, 10) : NaN;
+        const parsedTimeout = agentTimeoutSeconds ? parseInt(agentTimeoutSeconds, 10) : NaN;
+        const cleanedMcp: McpConnectionRef[] = agentMcpConnections
+          .filter((c) => c.name.trim() !== "")
+          .map(({ _formId: _, url, name }) => ({
+            name: name.trim(),
+            url: url && url.trim() !== "" ? url.trim() : null,
+          }));
+        return {
+          task_type: "RemoteAgent",
+          prompt: agentPrompt,
+          working_directory: agentWorkingDirectory.trim() || null,
+          allowed_tools: agentAllowedTools,
+          model: resolvedModel ?? null,
+          mcp_connections: cleanedMcp,
+          max_turns: Number.isFinite(parsedMaxTurns) ? parsedMaxTurns : null,
+          timeout_seconds: Number.isFinite(parsedTimeout) ? parsedTimeout : null,
+        };
+      }
     }
   };
 
@@ -407,6 +532,8 @@ export function SchedulerTaskForm({
       skipIfCompleted: skipIfCompleted,
       autoFixOnFailure: autoFixOnFailure,
       successCriteria: successCriteria || undefined,
+      catchUpPolicy: catchUpPolicy,
+      catchUpGraceSeconds: catchUpGraceSeconds,
     });
   };
 
@@ -423,7 +550,38 @@ export function SchedulerTaskForm({
         return promptId.trim() !== "";
       case "autofix":
         return true;
+      case "remote_agent":
+        if (!agentPrompt.trim()) return false;
+        if (agentModelSelect === REMOTE_AGENT_MODEL_CUSTOM_SENTINEL && !agentModelCustom.trim()) {
+          return false;
+        }
+        return true;
     }
+  };
+
+  const toggleAllowedTool = (tool: string) => {
+    setAgentAllowedTools((prev) =>
+      prev.includes(tool) ? prev.filter((t) => t !== tool) : [...prev, tool],
+    );
+  };
+
+  const addMcpConnection = () => {
+    setAgentMcpConnections((prev) => [
+      ...prev,
+      { name: "", url: null, _formId: crypto.randomUUID() },
+    ]);
+  };
+
+  const removeMcpConnection = (index: number) => {
+    setAgentMcpConnections((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const updateMcpConnection = (index: number, field: "name" | "url", value: string) => {
+    setAgentMcpConnections((prev) =>
+      prev.map((c, i) =>
+        i === index ? { ...c, [field]: field === "url" ? value || null : value } : c,
+      ),
+    );
   };
 
   return (
@@ -582,6 +740,49 @@ export function SchedulerTaskForm({
             </div>
           </div>
         )}
+
+        {/* Catch-up policy: applies to all time-based schedule types. Hidden for
+            condition-based schedules where the concept doesn't apply. */}
+        {scheduleType !== "condition" && (
+          <div className="space-y-2">
+            <label htmlFor="catch-up-policy" className="block text-sm font-medium mb-1">
+              If the runner was down
+            </label>
+            <select
+              id="catch-up-policy"
+              value={catchUpPolicy}
+              onChange={(e) => setCatchUpPolicy(e.target.value as CatchUpPolicy)}
+              className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+            >
+              {CATCH_UP_POLICY_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-muted-foreground">
+              {CATCH_UP_POLICY_OPTIONS.find((o) => o.value === catchUpPolicy)?.hint ?? ""}
+            </p>
+            <div className="flex items-center gap-2 pt-1">
+              <label htmlFor="catch-up-grace" className="text-xs text-muted-foreground">
+                Grace window
+              </label>
+              <input
+                id="catch-up-grace"
+                type="number"
+                value={catchUpGraceSeconds}
+                onChange={(e) =>
+                  setCatchUpGraceSeconds(Math.max(0, parseInt(e.target.value, 10) || 0))
+                }
+                min={0}
+                className="w-24 px-2 py-1 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+              />
+              <span className="text-xs text-muted-foreground">
+                seconds (slots within this window are not treated as missed)
+              </span>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Task Type */}
@@ -617,6 +818,16 @@ export function SchedulerTaskForm({
               className="text-primary"
             />
             <span className="text-sm">Auto-Fix</span>
+          </label>
+          <label className="flex items-center gap-2" title="Run a remote AI agent prompt">
+            <input
+              type="radio"
+              name="taskType"
+              checked={taskType === "remote_agent"}
+              onChange={() => setTaskType("remote_agent")}
+              className="text-primary"
+            />
+            <span className="text-sm">Remote agent</span>
           </label>
         </div>
 
@@ -836,6 +1047,183 @@ export function SchedulerTaskForm({
               />
               <span className="text-sm">Force run even if no findings</span>
             </label>
+          </div>
+        )}
+
+        {taskType === "remote_agent" && (
+          <div className="space-y-3">
+            <div>
+              <label htmlFor="agent-prompt" className="block text-sm font-medium mb-1">
+                Prompt *
+              </label>
+              <textarea
+                id="agent-prompt"
+                value={agentPrompt}
+                onChange={(e) => setAgentPrompt(e.target.value)}
+                placeholder="Describe what you want the remote agent to do..."
+                rows={5}
+                required={taskType === "remote_agent"}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 resize-y text-sm"
+              />
+            </div>
+            <div>
+              <label htmlFor="agent-working-directory" className="block text-sm font-medium mb-1">
+                Working directory
+              </label>
+              <input
+                id="agent-working-directory"
+                type="text"
+                value={agentWorkingDirectory}
+                onChange={(e) => setAgentWorkingDirectory(e.target.value)}
+                placeholder="Leave blank for the runner's project root"
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
+              />
+            </div>
+            <div>
+              <label htmlFor="agent-model" className="block text-sm font-medium mb-1">
+                Model
+              </label>
+              <select
+                id="agent-model"
+                value={agentModelSelect}
+                onChange={(e) => setAgentModelSelect(e.target.value)}
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+              >
+                {REMOTE_AGENT_MODEL_PRESETS.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+                <option value={REMOTE_AGENT_MODEL_CUSTOM_SENTINEL}>(custom)</option>
+              </select>
+              {agentModelSelect === REMOTE_AGENT_MODEL_CUSTOM_SENTINEL && (
+                <input
+                  type="text"
+                  value={agentModelCustom}
+                  onChange={(e) => setAgentModelCustom(e.target.value)}
+                  placeholder="Enter a model identifier"
+                  className="mt-2 w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 text-sm"
+                />
+              )}
+            </div>
+            <div>
+              <span className="block text-sm font-medium mb-1">Allowed tools</span>
+              <div className="flex flex-wrap gap-2">
+                {REMOTE_AGENT_AVAILABLE_TOOLS.map((tool) => {
+                  const checked = agentAllowedTools.includes(tool);
+                  return (
+                    <label
+                      key={tool}
+                      className={`flex items-center gap-1.5 px-2 py-1 rounded border text-xs cursor-pointer transition-colors ${
+                        checked
+                          ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/40"
+                          : "bg-background text-muted-foreground border-border hover:border-primary/50"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleAllowedTool(tool)}
+                        className="sr-only"
+                      />
+                      <span>{tool}</span>
+                    </label>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                Defaults: {REMOTE_AGENT_DEFAULT_TOOLS.join(", ")}
+              </p>
+            </div>
+
+            <div className="border border-border rounded-lg">
+              <button
+                type="button"
+                onClick={() => setAgentAdvancedOpen(!agentAdvancedOpen)}
+                className="w-full flex items-center justify-between px-3 py-2 text-sm hover:bg-muted/40 transition-colors"
+                aria-expanded={agentAdvancedOpen}
+              >
+                <span>Advanced</span>
+                <ChevronDown
+                  className={`w-4 h-4 text-muted-foreground transition-transform ${
+                    agentAdvancedOpen ? "rotate-180" : ""
+                  }`}
+                />
+              </button>
+              {agentAdvancedOpen && (
+                <div className="px-3 pb-3 pt-1 space-y-3 border-t border-border">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <label htmlFor="agent-max-turns" className="text-sm">
+                      Max turns
+                    </label>
+                    <input
+                      id="agent-max-turns"
+                      type="number"
+                      value={agentMaxTurns}
+                      onChange={(e) => setAgentMaxTurns(e.target.value)}
+                      min={1}
+                      className="w-24 px-2 py-1 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+                    />
+                    <label htmlFor="agent-timeout" className="text-sm">
+                      Timeout (seconds)
+                    </label>
+                    <input
+                      id="agent-timeout"
+                      type="number"
+                      value={agentTimeoutSeconds}
+                      onChange={(e) => setAgentTimeoutSeconds(e.target.value)}
+                      min={1}
+                      className="w-28 px-2 py-1 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <span className="block text-sm font-medium">MCP connections</span>
+                    {agentMcpConnections.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">
+                        Inherit the runner's existing MCP config when empty.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {agentMcpConnections.map((conn, idx) => (
+                          <div key={conn._formId} className="flex items-center gap-2">
+                            <input
+                              type="text"
+                              value={conn.name}
+                              onChange={(e) => updateMcpConnection(idx, "name", e.target.value)}
+                              placeholder="MCP server name"
+                              className="flex-1 px-3 py-1.5 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+                            />
+                            <input
+                              type="text"
+                              value={conn.url ?? ""}
+                              onChange={(e) => updateMcpConnection(idx, "url", e.target.value)}
+                              placeholder="URL (optional)"
+                              className="flex-1 px-3 py-1.5 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => removeMcpConnection(idx)}
+                              className={`p-2 rounded ${getAccentColors("red").text} hover:${getAccentColors("red").bg} transition-colors`}
+                              title="Remove MCP connection"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={addMcpConnection}
+                      className="flex items-center gap-1 text-sm text-primary hover:text-primary/80 transition-colors"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Add MCP connection
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>

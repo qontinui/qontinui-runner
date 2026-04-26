@@ -7,15 +7,41 @@
 use crate::commands::AppState;
 use crate::database::pg::PgDb;
 use crate::scheduler::{
-    compute_next_run, condition_status_default, ConditionStatus, RepositoryWatch, ScheduledTask,
-    ScheduledTaskExt, ScheduledTaskStatus, ScheduledTaskType, TaskExecutionRecord,
-    TaskExecutionRecordExt,
+    compute_next_run, condition_status_default, CatchUpPolicy, ConditionStatus, RepositoryWatch,
+    ScheduleExpression, ScheduledTask, ScheduledTaskExt, ScheduledTaskStatus, ScheduledTaskType,
+    TaskExecutionRecord, TaskExecutionRecordExt,
 };
+use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
+
+// ============================================================================
+// Catch-up context (Phase B)
+// ============================================================================
+
+/// Context threaded through the dispatch path when an execution is launched
+/// by the missed-run reconciler rather than the normal scheduler tick.
+///
+/// When `Some(_)`, [`SchedulerService::execute_task`] (and its async
+/// launch-and-poll helper) stamp `scheduled_for` and `catch_up_run` on the
+/// resulting [`TaskExecutionRecord`] at insert time, so reconciled rows are
+/// distinguishable from regular runs in `scheduler_history`.
+#[derive(Debug, Clone)]
+pub struct CatchUpContext {
+    /// Originally-scheduled slot this execution is "covering" — distinct
+    /// from the actual `started_at` (now). Stored in UTC.
+    pub scheduled_for: DateTime<Utc>,
+}
+
+impl CatchUpContext {
+    fn apply(&self, record: &mut TaskExecutionRecord) {
+        record.scheduled_for = Some(self.scheduled_for.to_rfc3339());
+        record.catch_up_run = true;
+    }
+}
 
 // ============================================================================
 // Scheduler Service
@@ -87,6 +113,13 @@ impl SchedulerService {
             error!("Failed to update next run times: {}", e);
         }
 
+        // Phase B: reconcile missed runs from while the runner was down.
+        // Errors here must NOT block startup — log and continue so the
+        // normal tick loop still fires.
+        if let Err(e) = self.clone().reconcile_missed_runs().await {
+            error!("Scheduler reconciler failed (non-fatal): {}", e);
+        }
+
         while !self.stop_signal.load(Ordering::SeqCst) {
             // tick() checks enabled status internally to avoid double-loading state
             self.clone().tick().await;
@@ -122,8 +155,12 @@ impl SchedulerService {
         Ok(())
     }
 
-    /// Check and execute due tasks
-    async fn tick(self: Arc<Self>) {
+    /// Check and execute due tasks.
+    ///
+    /// Public so external triggers (Phase F.1 wake-from-web deep-link handler,
+    /// Phase B missed-run reconciler) can fire an immediate cycle without
+    /// waiting for the next `check_interval_secs` heartbeat.
+    pub async fn tick(self: Arc<Self>) {
         let pg = match self.pg() {
             Ok(pg) => pg,
             Err(e) => {
@@ -341,6 +378,17 @@ impl SchedulerService {
     /// long-running tasks — async tasks must hand off to a spawned poller
     /// so the next tick can fire on schedule.
     async fn execute_task(self: Arc<Self>, task: ScheduledTask) {
+        self.execute_task_with_context(task, None).await
+    }
+
+    /// Like [`execute_task`] but with an optional [`CatchUpContext`] that
+    /// gets stamped onto the resulting [`TaskExecutionRecord`] at insert
+    /// time. Used by the Phase B missed-run reconciler.
+    async fn execute_task_with_context(
+        self: Arc<Self>,
+        task: ScheduledTask,
+        catch_up: Option<CatchUpContext>,
+    ) {
         let task_id = task.id.clone();
         let task_name = task.name.clone();
         let auto_fix_on_failure = task.auto_fix_on_failure;
@@ -366,6 +414,7 @@ impl SchedulerService {
                         task_id,
                         task_name,
                         auto_fix_on_failure,
+                        catch_up,
                         Box::pin(async move {
                             self.launch_unified_workflow(&workflow_id, monitor_index)
                                 .await
@@ -385,6 +434,7 @@ impl SchedulerService {
                         task_id,
                         task_name,
                         auto_fix_on_failure,
+                        catch_up,
                         Box::pin(async move { self.launch_prompt(&prompt_id, max_sessions).await }),
                     )
                     .await;
@@ -401,9 +451,52 @@ impl SchedulerService {
                         task_id,
                         task_name,
                         auto_fix_on_failure,
+                        catch_up,
                         Box::pin(
                             async move { self.launch_auto_fix(check_findings, force_run).await },
                         ),
+                    )
+                    .await;
+                return;
+            }
+            ScheduledTaskType::RemoteAgent {
+                prompt,
+                working_directory,
+                allowed_tools,
+                model,
+                mcp_connections,
+                max_turns,
+                timeout_seconds,
+            } => {
+                // Clone every field out of the variant so the future can be
+                // 'static — same shape `launch_prompt`/`launch_auto_fix` use.
+                let prompt = prompt.clone();
+                let working_directory = working_directory.clone();
+                let allowed_tools = allowed_tools.clone();
+                let model = model.clone();
+                let mcp_connections = mcp_connections.clone();
+                let max_turns = *max_turns;
+                let timeout_seconds = *timeout_seconds;
+                let task_name_for_launch = task_name.clone();
+                self.clone()
+                    .launch_and_poll(
+                        task_id,
+                        task_name,
+                        auto_fix_on_failure,
+                        catch_up,
+                        Box::pin(async move {
+                            self.launch_remote_agent(
+                                &task_name_for_launch,
+                                &prompt,
+                                working_directory.as_deref(),
+                                model.as_deref(),
+                                &allowed_tools,
+                                &mcp_connections,
+                                max_turns,
+                                timeout_seconds,
+                            )
+                            .await
+                        }),
                     )
                     .await;
                 return;
@@ -413,6 +506,9 @@ impl SchedulerService {
 
         // === Sync (launch-blocks-until-complete) paths ===
         let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+        if let Some(ref ctx) = catch_up {
+            ctx.apply(&mut record);
+        }
 
         let result = match &task.task {
             ScheduledTaskType::Workflow {
@@ -441,7 +537,9 @@ impl SchedulerService {
             }
             // Async task types are handled by the launch_and_poll branch above
             // and return early; the compiler still needs them in this match.
-            ScheduledTaskType::Prompt { .. } | ScheduledTaskType::AutoFix { .. } => unreachable!(
+            ScheduledTaskType::Prompt { .. }
+            | ScheduledTaskType::AutoFix { .. }
+            | ScheduledTaskType::RemoteAgent { .. } => unreachable!(
                 "Async task types must be handled by the launch_and_poll dispatch above"
             ),
         };
@@ -457,6 +555,22 @@ impl SchedulerService {
     }
 
     /// Shared post-processing for synchronous task-type executions.
+    ///
+    /// Phase C semantics:
+    /// - `Err(_)` is treated as a **launch failure** — the synchronous
+    ///   launchers (`execute_workflow`, `execute_watcher`) only return
+    ///   `Err(_)` when the start path itself fails (HTTP error, config
+    ///   load failure, watcher-not-found, etc.), all of which happen
+    ///   before any runtime work. We mark the record `LaunchFailed`,
+    ///   bump `consecutive_launch_failures`, and push `next_run` out by
+    ///   the exponential backoff (capped at 24h).
+    /// - `Ok((false, _))` is a runtime failure (the task started but
+    ///   reported failure) — recorded as `Failed`, schedule untouched,
+    ///   `auto_fix_on_failure` fires as before.
+    /// - `Ok((_, _))` resets the launch-failure counter (a task that
+    ///   *did* launch cleanly clears the streak even if the runtime
+    ///   reports failure — the start path worked, the streak is
+    ///   specifically "couldn't even start").
     async fn finalize_sync_execution(
         &self,
         task_id: &str,
@@ -465,6 +579,7 @@ impl SchedulerService {
         record: &mut TaskExecutionRecord,
         result: Result<(bool, Option<String>), String>,
     ) {
+        let mut launch_failed = false;
         match result {
             Ok((success, session_id)) => {
                 record.session_id = session_id;
@@ -473,6 +588,12 @@ impl SchedulerService {
                     "Scheduler: Task '{}' completed (success: {})",
                     task_name, success
                 );
+
+                // The launch path returned Ok — clear any prior backoff
+                // streak. We do this whether or not the runtime
+                // succeeded; backoff is for "couldn't even start," not
+                // "started but failed."
+                self.clear_launch_failure_counter(task_id).await;
 
                 if !success && auto_fix_on_failure {
                     info!(
@@ -485,8 +606,15 @@ impl SchedulerService {
                 }
             }
             Err(e) => {
-                record.complete(false, Some(e.clone()));
-                error!("Scheduler: Task '{}' failed: {}", task_name, e);
+                // Sync launchers only produce Err on pre-runtime failures
+                // (HTTP errors, load_config failure, missing watcher,
+                // etc.). Treat as LaunchFailed and trigger backoff.
+                record.mark_launch_failed(Some(e.clone()));
+                launch_failed = true;
+                error!(
+                    "Scheduler: Task '{}' failed to launch: {}",
+                    task_name, e
+                );
 
                 if auto_fix_on_failure {
                     info!(
@@ -514,11 +642,135 @@ impl SchedulerService {
             error!("PG not configured, cannot record execution for {}", task_id);
         }
 
-        self.update_task_next_run_db(task_id).await;
+        if launch_failed {
+            self.apply_launch_failure_backoff(task_id, task_name).await;
+        } else {
+            self.update_task_next_run_db(task_id).await;
+        }
 
         {
             let mut running = self.running_tasks.write().await;
             running.retain(|id| id != task_id);
+        }
+    }
+
+    /// Compute and persist the launch-failure backoff for a task.
+    ///
+    /// Loads the latest task row from PG, increments the in-memory
+    /// `consecutive_launch_failures`, computes the backoff via
+    /// [`ScheduledTaskExt::launch_failure_backoff`], and pushes
+    /// `next_run` to `max(normal_next_run, now + backoff)`. The "max"
+    /// guarantees a small backoff (e.g. 60s) doesn't pull a cron's
+    /// natural fire time *earlier* than it would otherwise be.
+    ///
+    /// The counter is persisted via [`PgDb::update_task_launch_failure_counter`]
+    /// and `next_run` via [`PgDb::update_task_next_run`] — separate writes
+    /// so a transient PG error on one doesn't roll back the other.
+    async fn apply_launch_failure_backoff(&self, task_id: &str, task_name: &str) {
+        let pg = match self.pg() {
+            Ok(pg) => pg,
+            Err(e) => {
+                error!(
+                    "apply_launch_failure_backoff: PG unavailable for {}: {}",
+                    task_id, e
+                );
+                return;
+            }
+        };
+
+        let mut task = match pg.get_scheduled_task(task_id).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                error!(
+                    "apply_launch_failure_backoff: task {} not found",
+                    task_id
+                );
+                return;
+            }
+            Err(e) => {
+                error!(
+                    "apply_launch_failure_backoff: failed to load task {}: {}",
+                    task_id, e
+                );
+                return;
+            }
+        };
+
+        task.record_launch_failure();
+        let failures = task.consecutive_launch_failures;
+        let backoff = task.launch_failure_backoff();
+
+        let now = Utc::now();
+        let normal_next = compute_next_run(&task.schedule, now);
+        let next_run = compute_launch_failed_next_run(normal_next, backoff, now);
+        let backoff_seconds = backoff.map(|d| d.num_seconds()).unwrap_or(0);
+        warn!(
+            task_id = %task_id,
+            task_name = %task_name,
+            failures = failures,
+            backoff_seconds = backoff_seconds,
+            next_run = ?next_run,
+            "scheduler launch failed; backing off"
+        );
+
+        if let Err(e) = pg
+            .update_task_launch_failure_counter(task_id, failures)
+            .await
+        {
+            error!(
+                "Failed to persist launch_failure counter for {}: {}",
+                task_id, e
+            );
+        }
+
+        let next_run_str = next_run.map(|dt| dt.to_rfc3339());
+        if let Err(e) = pg
+            .update_task_next_run(task_id, next_run_str.as_deref())
+            .await
+        {
+            error!("Failed to update next_run after launch failure: {}", e);
+        }
+    }
+
+    /// Reset the launch-failure counter for a task (no-op if already 0).
+    /// Called the first time a task's launch path returns `Ok(...)` — i.e.
+    /// the underlying session/run started cleanly. Runtime failures during
+    /// execution are not counted as launch failures, so this also runs on
+    /// `Ok((false, _))` (a started-but-failed sync task).
+    async fn clear_launch_failure_counter(&self, task_id: &str) {
+        let pg = match self.pg() {
+            Ok(pg) => pg,
+            Err(_) => return,
+        };
+
+        // Skip the write if the counter is already zero — avoids needless
+        // PG round-trips on every successful launch.
+        match pg.get_scheduled_task(task_id).await {
+            Ok(Some(t)) => {
+                if t.consecutive_launch_failures == 0 {
+                    return;
+                }
+            }
+            Ok(None) => return,
+            Err(e) => {
+                warn!(
+                    "clear_launch_failure_counter: failed to load task {}: {}",
+                    task_id, e
+                );
+                return;
+            }
+        }
+
+        info!(
+            task_id = %task_id,
+            "scheduler launch succeeded; resetting failure counter"
+        );
+
+        if let Err(e) = pg.update_task_launch_failure_counter(task_id, 0).await {
+            warn!(
+                "Failed to reset launch_failure counter for {}: {}",
+                task_id, e
+            );
         }
     }
 
@@ -541,11 +793,15 @@ impl SchedulerService {
         task_id: String,
         task_name: String,
         auto_fix_on_failure: bool,
+        catch_up: Option<CatchUpContext>,
         launch_fut: std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
         >,
     ) {
         let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+        if let Some(ref ctx) = catch_up {
+            ctx.apply(&mut record);
+        }
         let execution_id = record.execution_id.clone();
 
         let launch = launch_fut.await;
@@ -570,6 +826,12 @@ impl SchedulerService {
                     }
                 }
 
+                // The launch HTTP call returned Ok with a session/run id —
+                // the task is now actually running. Clear any prior
+                // launch-failure streak before kicking off the poller.
+                // Phase C: this is "first successful start" per the plan.
+                self.clear_launch_failure_counter(&task_id).await;
+
                 let service = self.clone();
                 tokio::spawn(async move {
                     service
@@ -585,7 +847,11 @@ impl SchedulerService {
                 });
             }
             Err(e) => {
-                record.complete(false, Some(e.clone()));
+                // The launch path itself failed (HTTP error, missing
+                // session_id in response, prompt-resolve failure, etc.) —
+                // this is a LaunchFailed, not a runtime Failed. Mark
+                // accordingly so the backoff path fires.
+                record.mark_launch_failed(Some(e.clone()));
                 error!("Scheduler: task '{}' failed to launch: {}", task_name, e);
 
                 if auto_fix_on_failure {
@@ -606,7 +872,7 @@ impl SchedulerService {
                     }
                 }
 
-                self.update_task_next_run_db(&task_id).await;
+                self.apply_launch_failure_backoff(&task_id, &task_name).await;
 
                 let mut running = self.running_tasks.write().await;
                 running.retain(|id| id != &task_id);
@@ -1020,6 +1286,160 @@ After making fixes, run tests if applicable to verify the fixes work."#
             .ok_or_else(|| "Auto-fix run endpoint omitted session_id".to_string())
     }
 
+    /// Launch a `RemoteAgent` scheduled task via the runner's existing
+    /// ad-hoc `POST /prompts/run` surface.
+    ///
+    /// `RemoteAgent` is "an arbitrary Claude prompt as a scheduled task" —
+    /// no separate Claude CLI plumbing is needed. We forward the user's
+    /// prompt + tuning knobs to `/prompts/run`'s ad-hoc mode (mode 2:
+    /// `name + content`). The endpoint returns a `session_id` that doubles
+    /// as a `task_run_id`; the same `launch_and_poll` machinery used by
+    /// `Prompt`/`AutoFix` then takes over for completion polling.
+    ///
+    /// The new `RunPromptRequest` knobs are mapped as follows:
+    /// - `working_directory` → `--working-directory` flag on the spawn
+    ///   wrapper, becomes the spawned Claude CLI's CWD
+    /// - `model` → `--model` (Claude CLI native flag)
+    /// - `allowed_tools` → `--allowed-tools` (Claude CLI native flag)
+    /// - `max_turns` → `--max-turns` (Claude CLI native flag)
+    /// - `mcp_connections` → injected as a header section in the prompt
+    ///   (per-call MCP-config merging is not yet wired; tracked as Phase D
+    ///   follow-up in `tmp_scheduler_reliability_plan.md`)
+    ///
+    /// Defaults follow the plan: `max_turns = 50`, `timeout_seconds = 600`.
+    /// Failures are returned as `Result::Err` so the existing
+    /// `launch_and_poll` failure path can convert them into a `Failed`
+    /// `scheduler_history` row (Phase C will route these to `LaunchFailed`).
+    #[allow(clippy::too_many_arguments)]
+    async fn launch_remote_agent(
+        &self,
+        task_name: &str,
+        prompt: &str,
+        working_directory: Option<&str>,
+        model: Option<&str>,
+        allowed_tools: &[String],
+        mcp_connections: &[qontinui_types::scheduler::McpConnectionRef],
+        max_turns: Option<u32>,
+        timeout_seconds: Option<u64>,
+    ) -> Result<String, String> {
+        info!(
+            "Launching RemoteAgent task '{}' (model: {:?}, max_turns: {:?}, timeout: {:?}s)",
+            task_name, model, max_turns, timeout_seconds
+        );
+
+        let client = reqwest::Client::new();
+        let base_url = self.self_base_url();
+
+        // Plan defaults (see tmp_scheduler_reliability_plan.md, Phase D §5).
+        let effective_max_turns = max_turns.unwrap_or(50);
+        let effective_timeout = timeout_seconds.unwrap_or(600);
+
+        let mut request_body = serde_json::json!({
+            "name": format!("scheduled-remote-agent-{}", task_name),
+            "content": prompt,
+            "display_prompt": format!("Scheduler: RemoteAgent ({})", task_name),
+            "timeout_seconds": effective_timeout,
+            "max_sessions": 1,
+            "max_turns": effective_max_turns,
+        });
+
+        if let Some(wd) = working_directory {
+            request_body["working_directory"] = serde_json::json!(wd);
+        }
+        if let Some(m) = model {
+            request_body["model"] = serde_json::json!(m);
+        }
+        if !allowed_tools.is_empty() {
+            request_body["allowed_tools"] = serde_json::json!(allowed_tools);
+        }
+        if !mcp_connections.is_empty() {
+            request_body["mcp_connections"] = serde_json::json!(mcp_connections);
+        }
+
+        let response = client
+            .post(format!("{}/prompts/run", base_url))
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to launch RemoteAgent: {}", e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "RemoteAgent /prompts/run returned HTTP {}: {}",
+                status, error_text
+            ));
+        }
+
+        let response_json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse RemoteAgent response: {}", e))?;
+
+        // The /prompts/run handler wraps the body in
+        // `{ "success": bool, "data": { ... } }` (see ApiResponse). We accept
+        // either a top-level `session_id` or `data.session_id` so the
+        // contract is the same as `launch_auto_fix`'s `Value::get` path.
+        let session_id_opt = response_json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                response_json
+                    .get("data")
+                    .and_then(|d| d.get("session_id"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(String::from);
+
+        match session_id_opt {
+            Some(sid) => {
+                info!(
+                    "RemoteAgent task '{}' launched with session_id={}",
+                    task_name, sid
+                );
+
+                // 30s no-activity guard (Phase D §5 + plan §4 hand-off note).
+                // Fire-and-forget: only logs a warning if no `task_runs` row
+                // appears for `sid` within 30s. The existing
+                // `poll_task_run_to_completion` poller will then surface
+                // the missing row as a failure via its
+                // `task_run {} disappeared from DB` branch.
+                if let Some(pg_db) = &self.pg_db {
+                    let pg = pg_db.clone();
+                    let sid_for_check = sid.clone();
+                    let task_name_for_check = task_name.to_string();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                        match pg.get_task_run(&sid_for_check).await {
+                            Ok(Some(_)) => {
+                                // Activity recorded — nothing to do.
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    "RemoteAgent task '{}' (session_id={}) shows no task_runs activity within 30s of launch — possible silent spawn hang",
+                                    task_name_for_check, sid_for_check
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "RemoteAgent task '{}' (session_id={}) 30s activity check failed to query task_runs: {}",
+                                    task_name_for_check, sid_for_check, e
+                                );
+                            }
+                        }
+                    });
+                }
+
+                Ok(sid)
+            }
+            None => Err(format!(
+                "RemoteAgent /prompts/run omitted session_id; response={}",
+                response_json
+            )),
+        }
+    }
+
     /// Check if a specific task is currently running
     pub async fn is_task_running(&self, task_id: &str) -> bool {
         let running = self.running_tasks.read().await;
@@ -1154,6 +1574,34 @@ After making fixes, run tests if applicable to verify the fixes work."#
     // ========================================================================
     // Condition Checking
     // ========================================================================
+}
+
+/// Combine the schedule's natural next-run time with a launch-failure
+/// backoff, returning whichever is *later* (Phase C).
+///
+/// Pure function so the launch-failure rescheduling logic can be tested
+/// without a database. The math:
+/// - If the schedule has no future slot (e.g., a one-shot `Once` already
+///   in the past) and there is a backoff, schedule purely from `now +
+///   backoff`.
+/// - If the schedule has a future slot but no backoff (i.e. the failure
+///   counter is zero — should not happen on the LaunchFailed path, but
+///   defended for clarity), keep the natural slot.
+/// - If both are present, return `max(normal_next, now + backoff)` so a
+///   small backoff (e.g. 60s) doesn't pull a cron's natural fire time
+///   *earlier* than it would otherwise be.
+fn compute_launch_failed_next_run(
+    normal_next: Option<DateTime<Utc>>,
+    backoff: Option<chrono::Duration>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let backoff_next = backoff.map(|d| now + d);
+    match (normal_next, backoff_next) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 /// Parse a human-friendly lookback window string (e.g., "15 minutes", "1 hour", "30 seconds")
@@ -1344,6 +1792,364 @@ impl SchedulerService {
 }
 
 // ============================================================================
+// Phase B — Missed-run reconciler
+// ============================================================================
+
+/// One reconciler-issued action for a single missed slot.
+///
+/// Returned by [`plan_catch_up_actions`] — extracted as a pure data type so
+/// the policy logic can be unit-tested without a database or HTTP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatchUpAction {
+    /// Enqueue a catch-up execution for the given slot.
+    Enqueue { scheduled_for: DateTime<Utc> },
+    /// Insert a `MissedRunnerDown` history row for the given slot, no
+    /// dispatch.
+    Skip { scheduled_for: DateTime<Utc> },
+}
+
+/// Apply a [`CatchUpPolicy`] to a list of missed slots and return the
+/// concrete actions to take.
+///
+/// The input is expected to be in chronological order (oldest first). For
+/// `RunOnce` we collapse to the most recent slot, matching the documented
+/// "the latest missed run wins" semantics.
+fn plan_catch_up_actions(
+    missed_slots: &[DateTime<Utc>],
+    policy: CatchUpPolicy,
+) -> Vec<CatchUpAction> {
+    if missed_slots.is_empty() {
+        return Vec::new();
+    }
+
+    match policy {
+        CatchUpPolicy::Run => missed_slots
+            .iter()
+            .map(|slot| CatchUpAction::Enqueue {
+                scheduled_for: *slot,
+            })
+            .collect(),
+        CatchUpPolicy::RunOnce => {
+            // Last slot in chronological order is the most recent. Use that
+            // as the representative scheduled_for so history reflects "we
+            // covered up through this slot".
+            let latest = *missed_slots.last().expect("non-empty checked above");
+            vec![CatchUpAction::Enqueue {
+                scheduled_for: latest,
+            }]
+        }
+        CatchUpPolicy::Skip => missed_slots
+            .iter()
+            .map(|slot| CatchUpAction::Skip {
+                scheduled_for: *slot,
+            })
+            .collect(),
+    }
+}
+
+/// Yield all expected fire times within the closed interval `[from, to]`
+/// for the given schedule expression.
+///
+/// - `Cron`: uses [`cron::Schedule::after(&from)`] to seek strictly past
+///   `from`, then takes while `t <= to`. Times are returned in `Utc`,
+///   matching the runner's convention (see [`compute_next_run`]).
+/// - `Interval(secs)`: synthesises slots at `from + secs`, `from + 2*secs`,
+///   …, while each is `<= to`.
+/// - `Once(iso)`: returns the single parsed timestamp if it lies in
+///   `[from, to]`, else empty.
+/// - `Condition(_)`: condition-based scheduling has no time slots, so
+///   returns empty.
+///
+/// The cron crate's `after(&from)` excludes `from` itself, which is what
+/// we want — the reconciler treats the last successful run's scheduled
+/// timestamp as already-handled and only catches up *future* slots from
+/// that point.
+fn iter_slots_in_window(
+    schedule: &ScheduleExpression,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
+    if to <= from {
+        return Vec::new();
+    }
+
+    match schedule {
+        ScheduleExpression::Cron(cron_expr) => {
+            use cron::Schedule;
+            use std::str::FromStr;
+
+            // Match the same 5/6/7-field normalization as `compute_next_run`
+            // so the reconciler agrees with the live scheduler about what a
+            // slot is.
+            let normalized = if cron_expr.split_whitespace().count() == 5 {
+                format!("0 {}", cron_expr)
+            } else {
+                cron_expr.clone()
+            };
+
+            match Schedule::from_str(&normalized) {
+                Ok(schedule) => schedule
+                    .after(&from)
+                    .take_while(|t| *t <= to)
+                    // Hard cap to avoid pathological loops with sub-second
+                    // crons; matching the spec's grace-window semantics any
+                    // expression that would emit > 100k slots is almost
+                    // certainly malformed for our use case.
+                    .take(100_000)
+                    .collect(),
+                Err(e) => {
+                    warn!(
+                        "iter_slots_in_window: invalid cron '{}': {}; returning no slots",
+                        cron_expr, e
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        ScheduleExpression::Interval(secs) => {
+            let secs = *secs;
+            if secs == 0 {
+                return Vec::new();
+            }
+            let step = chrono::Duration::seconds(secs as i64);
+            let mut out = Vec::new();
+            let mut cursor = from + step;
+            // Same defensive cap as the cron branch.
+            while cursor <= to && out.len() < 100_000 {
+                out.push(cursor);
+                cursor = cursor + step;
+            }
+            out
+        }
+        ScheduleExpression::Once(iso) => {
+            match chrono::DateTime::parse_from_rfc3339(iso) {
+                Ok(dt) => {
+                    let dt_utc = dt.with_timezone(&Utc);
+                    if dt_utc > from && dt_utc <= to {
+                        vec![dt_utc]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(_) => Vec::new(),
+            }
+        }
+        ScheduleExpression::Condition(_) => Vec::new(),
+    }
+}
+
+impl SchedulerService {
+    /// Phase B — reconcile missed runs at scheduler startup.
+    ///
+    /// For each enabled task:
+    /// 1. Look up the last successful run's `scheduled_for` (or `started_at`
+    ///    as a fallback for legacy rows). If none, fall back to the task's
+    ///    `created_at`.
+    /// 2. Compute candidate slots in the window `[lookback_start, now -
+    ///    catch_up_grace_seconds]` from the task's schedule expression.
+    /// 3. Diff candidates against `scheduler_history.scheduled_for` to find
+    ///    slots that have no matching history row.
+    /// 4. Apply the task's [`CatchUpPolicy`] (Run / RunOnce / Skip) and
+    ///    either enqueue executions (with `catch_up_run=true` and
+    ///    `scheduled_for` stamped) or insert `MissedRunnerDown` history
+    ///    rows.
+    ///
+    /// Errors per-task are logged and swallowed so one broken task can't
+    /// block the entire fleet from reconciling.
+    pub async fn reconcile_missed_runs(self: Arc<Self>) -> Result<(), String> {
+        let pg = self.pg()?;
+
+        let settings = match pg.get_scheduler_settings().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Scheduler reconciler: skipping (failed to load settings): {}",
+                    e
+                );
+                return Ok(());
+            }
+        };
+
+        if !settings.enabled {
+            info!("Scheduler reconciler: scheduler disabled, skipping");
+            return Ok(());
+        }
+
+        let tasks = pg
+            .get_all_scheduled_tasks()
+            .await
+            .map_err(|e| format!("reconcile_missed_runs: load tasks: {}", e))?;
+
+        let now = Utc::now();
+
+        for task in tasks {
+            if !task.enabled {
+                continue;
+            }
+            // Condition-only schedules have no time slots; nothing to
+            // reconcile.
+            if matches!(task.schedule, ScheduleExpression::Condition(_)) {
+                continue;
+            }
+
+            if let Err(e) = self.clone().reconcile_task(&task, now).await {
+                error!(
+                    "Scheduler reconciler: task '{}' (id={}) failed: {}",
+                    task.name, task.id, e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reconcile a single task. Extracted so per-task errors don't kill the
+    /// fleet-level loop.
+    async fn reconcile_task(
+        self: Arc<Self>,
+        task: &ScheduledTask,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let pg = self.pg()?;
+
+        let grace = chrono::Duration::seconds(task.catch_up_grace_seconds as i64);
+        let window_end = now - grace;
+
+        // Lookback start: the most recent successful run's scheduled_for
+        // (preferred) or started_at (fallback for legacy rows). If no
+        // success yet, fall back to created_at.
+        let lookback_start = match self.last_successful_run_anchor(&task.id).await {
+            Ok(Some(dt)) => dt,
+            Ok(None) => match chrono::DateTime::parse_from_rfc3339(&task.created_at) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(e) => {
+                    return Err(format!(
+                        "task created_at '{}' is not RFC3339: {}",
+                        task.created_at, e
+                    ));
+                }
+            },
+            Err(e) => return Err(format!("last_successful_run_anchor: {}", e)),
+        };
+
+        if window_end <= lookback_start {
+            // Either the grace window covers everything since the last
+            // success, or the task is brand-new. Nothing to reconcile.
+            return Ok(());
+        }
+
+        let candidates = iter_slots_in_window(&task.schedule, lookback_start, window_end);
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let missed = pg
+            .find_missed_slots(&task.id, &candidates)
+            .await
+            .map_err(|e| format!("find_missed_slots: {}", e))?;
+
+        if missed.is_empty() {
+            return Ok(());
+        }
+
+        let actions = plan_catch_up_actions(&missed, task.catch_up_policy);
+        let policy = task.catch_up_policy;
+
+        info!(
+            task_id = %task.id,
+            slot_count = missed.len(),
+            policy = ?policy,
+            "scheduler reconciler: catch-up enqueued"
+        );
+
+        for action in actions {
+            match action {
+                CatchUpAction::Enqueue { scheduled_for } => {
+                    let ctx = CatchUpContext { scheduled_for };
+                    // Spawn the execution in the background so the
+                    // reconciler doesn't block on long-running work.
+                    let svc = self.clone();
+                    let task_clone = task.clone();
+                    tokio::spawn(async move {
+                        svc.execute_task_with_context(task_clone, Some(ctx)).await;
+                    });
+                }
+                CatchUpAction::Skip { scheduled_for } => {
+                    if let Err(e) = self
+                        .insert_missed_runner_down(&task.id, scheduled_for, now)
+                        .await
+                    {
+                        error!(
+                            "Scheduler reconciler: failed to insert MissedRunnerDown row \
+                             for task {} slot {}: {}",
+                            task.id, scheduled_for, e
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find the most recent successful execution's `scheduled_for` (preferred)
+    /// or `started_at` (fallback) timestamp for the given task. Returns
+    /// `None` if the task has no successful runs yet.
+    async fn last_successful_run_anchor(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, String> {
+        let pg = self.pg()?;
+        // Pull a generous batch and pick the most recent successful one.
+        // The reconciler only runs at startup (or via explicit invocation),
+        // so the cost is not on the hot path.
+        let history = pg.get_execution_history(task_id, 100).await?;
+
+        for record in history {
+            if !record.success {
+                continue;
+            }
+            // Prefer scheduled_for (the original slot), fall back to
+            // started_at for legacy rows that pre-date the v12 migration.
+            if let Some(ref s) = record.scheduled_for {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                    return Ok(Some(dt.with_timezone(&Utc)));
+                }
+            }
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&record.started_at) {
+                return Ok(Some(dt.with_timezone(&Utc)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Insert a `MissedRunnerDown` history row for a slot the reconciler
+    /// has decided to skip (per [`CatchUpPolicy::Skip`]). Both `started_at`
+    /// and `ended_at` are set to `now` so the row sorts naturally with
+    /// other start-time-ordered queries.
+    async fn insert_missed_runner_down(
+        &self,
+        task_id: &str,
+        scheduled_for: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let pg = self.pg()?;
+        let now_iso = now.to_rfc3339();
+
+        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+        record.started_at = now_iso.clone();
+        record.ended_at = Some(now_iso);
+        record.status = ScheduledTaskStatus::MissedRunnerDown;
+        record.success = false;
+        record.scheduled_for = Some(scheduled_for.to_rfc3339());
+        record.catch_up_run = true;
+
+        pg.insert_execution_record(task_id, &record).await
+    }
+}
+
+// ============================================================================
 // File System Helpers
 // ============================================================================
 
@@ -1508,5 +2314,692 @@ mod tests {
         // Should be running
         assert!(service.is_task_running("test-task").await);
         assert!(!service.is_task_running("other-task").await);
+    }
+
+    // ========================================================================
+    // Phase D — RemoteAgent dispatcher tests (launch_remote_agent)
+    //
+    // These exercise the HTTP boundary only — we never actually spawn Claude.
+    // A tiny axum mock listens on a random port; QONTINUI_PORT is set so
+    // `self_base_url()` (env-only path; AppState is None in tests) targets
+    // it. Each test asserts the shape of the request body and the
+    // success/error mapping of the response.
+    //
+    // Tests are serialized via a process-wide mutex because they all
+    // mutate the QONTINUI_PORT env var.
+    // ========================================================================
+
+    /// Serialize env-mutating tests. `Mutex<()>` is fine — we only need
+    /// mutual exclusion, not data sharing.
+    static REMOTE_AGENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Spin up a tiny axum mock on a random localhost port that captures
+    /// the most recent `/prompts/run` body and replies with `response`.
+    /// Returns `(port, captured_body)` so the test can assert on the body
+    /// after `launch_remote_agent` returns.
+    async fn spawn_prompts_run_mock(
+        response: axum::response::Response,
+    ) -> (
+        u16,
+        Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    ) {
+        use axum::{extract::State, routing::post, Router};
+
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<serde_json::Value>));
+        // The axum response is consumed once, so we wrap it in an Option +
+        // Mutex and take() it on the first request.
+        let response_slot = Arc::new(tokio::sync::Mutex::new(Some(response)));
+
+        async fn handler(
+            State((captured, response_slot)): State<(
+                Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+                Arc<tokio::sync::Mutex<Option<axum::response::Response>>>,
+            )>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            *captured.lock().await = Some(body);
+            response_slot
+                .lock()
+                .await
+                .take()
+                .unwrap_or_else(|| {
+                    axum::response::Response::builder()
+                        .status(500)
+                        .body(axum::body::Body::from(
+                            "mock response already consumed",
+                        ))
+                        .unwrap()
+                })
+        }
+
+        let app = Router::new()
+            .route("/prompts/run", post(handler))
+            .with_state((captured.clone(), response_slot));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Best-effort wait for the listener to be accepting.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        (port, captured)
+    }
+
+    fn ok_response(body: serde_json::Value) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_launch_remote_agent_posts_full_body_when_all_fields_set() {
+        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+
+        let (port, captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
+            "session_id": "sid-123"
+        })))
+        .await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+
+        let service = SchedulerService::new(None);
+        let mcp_conns = vec![qontinui_types::scheduler::McpConnectionRef {
+            name: "filesystem".to_string(),
+            url: Some("http://example.com/mcp".to_string()),
+        }];
+        let result = service
+            .launch_remote_agent(
+                "nightly-cleanup",
+                "List files in cwd.",
+                Some("/tmp/work"),
+                Some("claude-sonnet-4-6"),
+                &["Bash".to_string(), "Read".to_string()],
+                &mcp_conns,
+                Some(25),
+                Some(120),
+            )
+            .await;
+
+        assert_eq!(result.unwrap(), "sid-123");
+
+        let body = captured.lock().await.clone().expect("no body captured");
+        assert_eq!(body["name"], "scheduled-remote-agent-nightly-cleanup");
+        assert_eq!(body["content"], "List files in cwd.");
+        assert_eq!(body["max_sessions"], 1);
+        assert_eq!(body["timeout_seconds"], 120);
+        assert_eq!(body["max_turns"], 25);
+        assert_eq!(body["working_directory"], "/tmp/work");
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(
+            body["allowed_tools"],
+            serde_json::json!(["Bash", "Read"])
+        );
+        assert_eq!(body["mcp_connections"][0]["name"], "filesystem");
+        assert_eq!(
+            body["mcp_connections"][0]["url"],
+            "http://example.com/mcp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_launch_remote_agent_omits_optional_fields_when_none() {
+        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+
+        let (port, captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
+            "session_id": "sid-456"
+        })))
+        .await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+
+        let service = SchedulerService::new(None);
+        let result = service
+            .launch_remote_agent(
+                "minimal",
+                "do the thing",
+                None,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(result.unwrap(), "sid-456");
+
+        let body = captured.lock().await.clone().expect("no body captured");
+        // Required fields present.
+        assert_eq!(body["name"], "scheduled-remote-agent-minimal");
+        assert_eq!(body["content"], "do the thing");
+        assert_eq!(body["max_sessions"], 1);
+        // Plan defaults.
+        assert_eq!(body["timeout_seconds"], 600);
+        assert_eq!(body["max_turns"], 50);
+        // Optional fields omitted entirely.
+        assert!(body.get("working_directory").is_none());
+        assert!(body.get("model").is_none());
+        assert!(body.get("allowed_tools").is_none());
+        assert!(body.get("mcp_connections").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_launch_remote_agent_extracts_session_id_from_data_envelope() {
+        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+
+        // /prompts/run wraps successful responses in
+        // `{ "success": true, "data": { ... } }`.
+        let (port, _captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
+            "success": true,
+            "data": { "session_id": "wrapped-sid", "task_run_id": "wrapped-sid" }
+        })))
+        .await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+
+        let service = SchedulerService::new(None);
+        let result = service
+            .launch_remote_agent("e", "p", None, None, &[], &[], None, None)
+            .await;
+
+        assert_eq!(result.unwrap(), "wrapped-sid");
+    }
+
+    #[tokio::test]
+    async fn test_launch_remote_agent_500_returns_err() {
+        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+
+        let err_resp = axum::response::Response::builder()
+            .status(500)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&serde_json::json!({"error": "boom"})).unwrap(),
+            ))
+            .unwrap();
+        let (port, _captured) = spawn_prompts_run_mock(err_resp).await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+
+        let service = SchedulerService::new(None);
+        let result = service
+            .launch_remote_agent("e", "p", None, None, &[], &[], None, None)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("HTTP 500"),
+            "expected HTTP 500 error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_launch_remote_agent_missing_session_id_returns_err() {
+        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+
+        // 200 OK but no session_id anywhere.
+        let (port, _captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
+            "ok": true,
+            "data": { "task_run_id": "x" }
+        })))
+        .await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+
+        let service = SchedulerService::new(None);
+        let result = service
+            .launch_remote_agent("e", "p", None, None, &[], &[], None, None)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("omitted session_id"),
+            "expected missing-session_id error, got: {}",
+            err
+        );
+    }
+
+    // ========================================================================
+    // Phase B — Missed-run reconciler tests
+    //
+    // These exercise the pure helpers (`iter_slots_in_window`,
+    // `plan_catch_up_actions`) which carry the policy logic. The DB-driven
+    // `reconcile_missed_runs` orchestration is integration-tested via the
+    // existing live-PG harness (`new_blocking_for_test`); see the
+    // `proj_pg_dual_schema_runner_public.md` memory entry for fixture setup.
+    // ========================================================================
+
+    /// Build an `Interval` schedule for the given seconds.
+    fn interval(secs: u64) -> ScheduleExpression {
+        ScheduleExpression::Interval(secs)
+    }
+
+    #[test]
+    fn reconciler_iter_slots_interval_basic() {
+        // 1h interval, 6h window → 6 slots.
+        let now = Utc::now();
+        let from = now - chrono::Duration::hours(6);
+        let to = now;
+        let slots = iter_slots_in_window(&interval(3600), from, to);
+        assert_eq!(slots.len(), 6, "expected 6 hourly slots in 6h window");
+        // First slot should be from + 1h, last should be from + 6h == to.
+        assert_eq!(slots.first().copied(), Some(from + chrono::Duration::hours(1)));
+        assert_eq!(slots.last().copied(), Some(from + chrono::Duration::hours(6)));
+    }
+
+    #[test]
+    fn reconciler_iter_slots_interval_empty_window() {
+        // to <= from → empty.
+        let now = Utc::now();
+        let slots = iter_slots_in_window(&interval(60), now, now);
+        assert!(slots.is_empty());
+
+        let slots = iter_slots_in_window(&interval(60), now, now - chrono::Duration::seconds(1));
+        assert!(slots.is_empty());
+    }
+
+    #[test]
+    fn reconciler_iter_slots_cron_5_field_normalized() {
+        // Hourly at minute 0. From 00:30 to 07:00 (390 min later) the
+        // top-of-hour slots strictly after `from` and `<= to` are
+        // 01:00..=07:00 = 7 slots. The window-end is inclusive, matching
+        // the doc-comment's `[from, to]` semantics.
+        let from = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let to = from + chrono::Duration::minutes(390); // exactly 07:00
+        let slots = iter_slots_in_window(
+            &ScheduleExpression::Cron("0 * * * *".to_string()),
+            from,
+            to,
+        );
+        assert_eq!(slots.len(), 7, "expected 01:00..=07:00 inclusive");
+        // First slot is 01:00.
+        let first = chrono::DateTime::parse_from_rfc3339("2026-01-01T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(slots[0], first);
+        // Last slot is exactly 07:00 (== to).
+        let last = chrono::DateTime::parse_from_rfc3339("2026-01-01T07:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(slots.last().copied(), Some(last));
+    }
+
+    #[test]
+    fn reconciler_iter_slots_once_inside_window() {
+        let from = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let to = from + chrono::Duration::hours(2);
+        let target = from + chrono::Duration::hours(1);
+        let slots = iter_slots_in_window(
+            &ScheduleExpression::Once(target.to_rfc3339()),
+            from,
+            to,
+        );
+        assert_eq!(slots, vec![target]);
+    }
+
+    #[test]
+    fn reconciler_iter_slots_once_outside_window_returns_empty() {
+        let from = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let to = from + chrono::Duration::hours(2);
+
+        // Before window.
+        let before = from - chrono::Duration::hours(1);
+        assert!(iter_slots_in_window(
+            &ScheduleExpression::Once(before.to_rfc3339()),
+            from,
+            to
+        )
+        .is_empty());
+
+        // After window.
+        let after = to + chrono::Duration::hours(1);
+        assert!(iter_slots_in_window(
+            &ScheduleExpression::Once(after.to_rfc3339()),
+            from,
+            to
+        )
+        .is_empty());
+
+        // Exactly at `from` is excluded (same convention as cron's
+        // `after(&from)`).
+        assert!(iter_slots_in_window(
+            &ScheduleExpression::Once(from.to_rfc3339()),
+            from,
+            to
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn reconciler_iter_slots_condition_returns_empty() {
+        use crate::scheduler::ConditionScheduleConfig;
+        let now = Utc::now();
+        let slots = iter_slots_in_window(
+            &ScheduleExpression::Condition(ConditionScheduleConfig::default()),
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert!(slots.is_empty());
+    }
+
+    /// Build six hourly slots ending at `now` for a task that's been down
+    /// for 6h, used as a fixture by the policy tests.
+    fn six_hourly_missed_slots() -> Vec<DateTime<Utc>> {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        (1..=6)
+            .map(|h| now - chrono::Duration::hours(7 - h as i64))
+            .collect()
+    }
+
+    #[test]
+    fn reconciler_policy_run_once_collapses_to_latest() {
+        let missed = six_hourly_missed_slots();
+        let actions = plan_catch_up_actions(&missed, CatchUpPolicy::RunOnce);
+        assert_eq!(actions.len(), 1, "RunOnce must collapse to one enqueue");
+        match &actions[0] {
+            CatchUpAction::Enqueue { scheduled_for } => {
+                assert_eq!(*scheduled_for, *missed.last().unwrap());
+            }
+            other => panic!("expected Enqueue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reconciler_policy_run_enqueues_all() {
+        let missed = six_hourly_missed_slots();
+        let actions = plan_catch_up_actions(&missed, CatchUpPolicy::Run);
+        assert_eq!(actions.len(), 6);
+        for (i, action) in actions.iter().enumerate() {
+            match action {
+                CatchUpAction::Enqueue { scheduled_for } => {
+                    assert_eq!(*scheduled_for, missed[i]);
+                }
+                other => panic!("expected Enqueue, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn reconciler_policy_skip_inserts_missed_runner_down() {
+        let missed = six_hourly_missed_slots();
+        let actions = plan_catch_up_actions(&missed, CatchUpPolicy::Skip);
+        assert_eq!(actions.len(), 6);
+        for (i, action) in actions.iter().enumerate() {
+            match action {
+                CatchUpAction::Skip { scheduled_for } => {
+                    assert_eq!(*scheduled_for, missed[i]);
+                }
+                other => panic!("expected Skip, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn reconciler_policy_empty_missed_yields_no_actions() {
+        let actions = plan_catch_up_actions(&[], CatchUpPolicy::Run);
+        assert!(actions.is_empty());
+        let actions = plan_catch_up_actions(&[], CatchUpPolicy::RunOnce);
+        assert!(actions.is_empty());
+        let actions = plan_catch_up_actions(&[], CatchUpPolicy::Skip);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn reconciler_grace_window_excludes_recent_slots() {
+        // Simulate the reconciler's window computation: window_end =
+        // now - grace. A slot 4 minutes ago should fall *after* window_end
+        // (i.e. excluded) given a 5-minute grace, while 6 minutes ago is
+        // before window_end (included).
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let grace = chrono::Duration::seconds(300);
+        let window_end = now - grace; // = 11:55:00
+
+        // The lookback start needs to bracket both candidates strictly.
+        let lookback_start = now - chrono::Duration::hours(1);
+
+        // Use a 1-minute interval so the window emits slots at every minute
+        // inside (lookback_start, window_end]. The "4 minutes ago" slot
+        // (11:56) should be absent; the "6 minutes ago" slot (11:54)
+        // should be present.
+        let slots = iter_slots_in_window(&interval(60), lookback_start, window_end);
+
+        let four_min_ago = now - chrono::Duration::minutes(4);
+        let six_min_ago = now - chrono::Duration::minutes(6);
+
+        assert!(
+            !slots.contains(&four_min_ago),
+            "slot 4 minutes ago must NOT be in [start, now-grace]"
+        );
+        assert!(
+            slots.contains(&six_min_ago),
+            "slot 6 minutes ago MUST be in [start, now-grace]"
+        );
+    }
+
+    #[test]
+    fn reconciler_first_time_task_window_starts_at_created_at() {
+        // For a task with no successful runs, the lookback start is
+        // `created_at`. Verify the slot iterator yields slots strictly after
+        // `created_at` (not at it) so we don't double-count the initial
+        // tick. This is enforced by `cron::Schedule::after(&from)` and the
+        // interval branch's `from + step` initialiser — assert here so a
+        // future refactor can't silently break the contract.
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-04-26T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let now = created_at + chrono::Duration::hours(3);
+        let grace = chrono::Duration::seconds(300);
+        let window_end = now - grace;
+
+        let slots = iter_slots_in_window(&interval(3600), created_at, window_end);
+        // 3h - 5min = 2h55min. With hourly slots from created_at + 1h, we
+        // get slots at +1h, +2h. (+3h would land at exactly `now`, which is
+        // past window_end.)
+        assert_eq!(slots.len(), 2);
+        assert!(slots.iter().all(|s| *s > created_at));
+        assert!(slots.iter().all(|s| *s <= window_end));
+    }
+
+    // ========================================================================
+    // Phase C — Failure-aware rescheduling tests
+    //
+    // The DB-driven `apply_launch_failure_backoff` orchestration is
+    // covered indirectly by the integration harness (a live PG via
+    // `new_blocking_for_test`). The pure `compute_launch_failed_next_run`
+    // helper plus `ScheduledTaskExt::{record_launch_failure,
+    // launch_failure_backoff, reset_launch_failures}` carry the actual
+    // policy and are unit-tested here without a database.
+    // ========================================================================
+
+    use crate::scheduler::{schedule_expression_default, scheduled_task_type_default};
+
+    fn fixture_task(base_backoff: u32) -> ScheduledTask {
+        let mut task = ScheduledTask::new(
+            "Phase C fixture".to_string(),
+            None,
+            schedule_expression_default(),
+            scheduled_task_type_default(),
+        );
+        task.launch_failure_backoff_seconds = base_backoff;
+        task
+    }
+
+    #[test]
+    fn launch_fail_compute_next_run_picks_backoff_when_later() {
+        // Cron is hourly; backoff is 240s (4 min). The hourly cron will
+        // fire much later than `now + 4min`, so the cron wins.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let normal_next = Some(now + chrono::Duration::minutes(30)); // top of next hour
+        let backoff = Some(chrono::Duration::seconds(240));
+
+        let next = compute_launch_failed_next_run(normal_next, backoff, now)
+            .expect("next_run is Some");
+        assert_eq!(next, normal_next.unwrap());
+        // Distance from now should be > backoff (cron-driven)
+        assert!((next - now).num_seconds() > 240);
+    }
+
+    #[test]
+    fn launch_fail_compute_next_run_picks_backoff_when_earlier_normal() {
+        // Cron's natural fire is in 30s; backoff is 60s. Backoff wins —
+        // we never want to *pull in* the schedule earlier than it would
+        // naturally be, but we do want to push it back to at least
+        // `now + backoff`.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let normal_next = Some(now + chrono::Duration::seconds(30));
+        let backoff = Some(chrono::Duration::seconds(60));
+
+        let next = compute_launch_failed_next_run(normal_next, backoff, now)
+            .expect("next_run is Some");
+        assert_eq!((next - now).num_seconds(), 60);
+    }
+
+    #[test]
+    fn launch_fail_compute_next_run_no_normal_uses_backoff() {
+        // `Once` schedule already fired → normal_next = None. With a
+        // backoff present we still set a future fire time to preserve
+        // any one-shot retry semantics.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let next = compute_launch_failed_next_run(None, Some(chrono::Duration::seconds(120)), now)
+            .expect("next_run is Some");
+        assert_eq!((next - now).num_seconds(), 120);
+    }
+
+    #[test]
+    fn launch_fail_compute_next_run_no_normal_no_backoff_yields_none() {
+        let now = Utc::now();
+        assert!(compute_launch_failed_next_run(None, None, now).is_none());
+    }
+
+    #[test]
+    fn launch_fail_compute_next_run_no_backoff_keeps_normal() {
+        // Defensive case: `launch_failure_backoff()` returned None even
+        // though we're on the LaunchFailed path (e.g., misconfigured
+        // base of 0). Don't lose the normal schedule.
+        let now = Utc::now();
+        let normal = Some(now + chrono::Duration::hours(1));
+        let next = compute_launch_failed_next_run(normal, None, now).expect("next_run is Some");
+        assert_eq!(next, normal.unwrap());
+    }
+
+    #[test]
+    fn launch_fail_three_consecutive_pushes_next_run_by_240s() {
+        // Plan check: 3 consecutive launch failures → backoff = 60 *
+        // 2^(3-1) = 240s. With a far-future cron's normal next run, the
+        // backoff is the floor; with no schedule (Once already fired),
+        // it's also exactly 240s. Use an Interval(7200) (2h) so the
+        // backoff path exercised here is the "backoff < normal_next"
+        // case — next_run distance from now must be ~7200s, NOT 240s.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut task = fixture_task(60);
+        task.schedule = ScheduleExpression::Interval(7200);
+
+        // Simulate three consecutive launch failures.
+        task.record_launch_failure();
+        task.record_launch_failure();
+        task.record_launch_failure();
+        assert_eq!(task.consecutive_launch_failures, 3);
+
+        let backoff = task.launch_failure_backoff().expect("backoff present");
+        assert_eq!(backoff.num_seconds(), 240);
+
+        let normal_next = compute_next_run(&task.schedule, now);
+        let next = compute_launch_failed_next_run(normal_next, Some(backoff), now)
+            .expect("next_run is Some");
+        // Cron/interval far-future wins, not the 240s backoff.
+        assert_eq!((next - now).num_seconds(), 7200);
+    }
+
+    #[test]
+    fn launch_fail_three_consecutive_with_short_schedule_uses_backoff() {
+        // Same 3-failure scenario but with a 30s interval — backoff is
+        // 240s, normal_next is 30s away → backoff wins.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut task = fixture_task(60);
+        task.schedule = ScheduleExpression::Interval(30);
+
+        task.record_launch_failure();
+        task.record_launch_failure();
+        task.record_launch_failure();
+
+        let backoff = task.launch_failure_backoff().expect("backoff present");
+        let normal_next = compute_next_run(&task.schedule, now);
+        let next = compute_launch_failed_next_run(normal_next, Some(backoff), now)
+            .expect("next_run is Some");
+
+        // 240s backoff overrides the 30s natural cadence.
+        assert_eq!((next - now).num_seconds(), 240);
+    }
+
+    #[test]
+    fn launch_fail_then_success_then_fail_resets_streak() {
+        // The "failure → success → failure" resilience pattern from the
+        // plan: after a successful start the counter is zeroed, so the
+        // next failure starts the sequence over from base (60s), not
+        // from 480s as it would if we kept counting.
+        let mut task = fixture_task(60);
+
+        // 3 failures
+        for _ in 0..3 {
+            task.record_launch_failure();
+        }
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 240);
+
+        // Success — counter reset.
+        task.reset_launch_failures();
+        assert!(task.launch_failure_backoff().is_none());
+
+        // Next failure starts the sequence over.
+        task.record_launch_failure();
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 60);
+    }
+
+    #[test]
+    fn launch_fail_records_carry_status_through_execution_record() {
+        // `mark_launch_failed` must set status to LaunchFailed (distinct
+        // from runtime Failed). This is what drives the backoff trigger
+        // in `finalize_sync_execution` and `launch_and_poll`.
+        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+        record.mark_launch_failed(Some("workflow file missing".to_string()));
+        assert!(matches!(record.status, ScheduledTaskStatus::LaunchFailed));
+        assert!(!record.success);
+        assert_eq!(
+            record.error_message.as_deref(),
+            Some("workflow file missing")
+        );
+        assert!(record.ended_at.is_some());
+
+        // Distinct from `complete(false, _)` which yields runtime Failed.
+        let mut runtime_record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+        runtime_record.complete(false, Some("runtime error".to_string()));
+        assert!(matches!(
+            runtime_record.status,
+            ScheduledTaskStatus::Failed
+        ));
     }
 }

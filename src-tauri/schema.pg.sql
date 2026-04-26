@@ -1470,6 +1470,25 @@ CREATE TABLE IF NOT EXISTS worktrees (
 CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
 CREATE INDEX IF NOT EXISTS idx_worktrees_task_run ON worktrees(task_run_id);
 
+-- Session Touched Files (Commit Progress Phase A)
+-- Append-only durable record of every file path each session/sub-agent edits
+-- over its lifetime. Distinct from FileRegistryManager (which holds transient
+-- Active locks released on completion). Used by Phase C/D commit logic to
+-- enumerate exactly the files this agent touched at commit time.
+-- PRIMARY KEY (task_run_id, file_path) makes second touch an UPSERT that
+-- refreshes recorded_at; row count reflects unique files, not edit count.
+CREATE TABLE IF NOT EXISTS session_touched_files (
+    task_run_id TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    worktree_id TEXT,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (task_run_id, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_session_touched_files_task_run
+    ON session_touched_files(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_session_touched_files_recorded_at
+    ON session_touched_files(recorded_at);
+
 -- Workflow Constraint Results
 CREATE TABLE IF NOT EXISTS workflow_constraint_results (
     id BIGSERIAL PRIMARY KEY,
@@ -1649,6 +1668,14 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     condition_status TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_enabled ON scheduled_tasks(enabled);
+
+-- Phase A (scheduler reliability) additive columns. Idempotent via
+-- ADD COLUMN IF NOT EXISTS so legacy installs self-heal on next startup
+-- per proj_pg_schema_drift_audit.md.
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS catch_up_policy TEXT NOT NULL DEFAULT 'run_once';
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS catch_up_grace_seconds INTEGER NOT NULL DEFAULT 300;
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS consecutive_launch_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS launch_failure_backoff_seconds INTEGER NOT NULL DEFAULT 60;
 
 -- Active Workflows (checkpoint storage)
 CREATE TABLE IF NOT EXISTS active_workflows (
@@ -2949,6 +2976,16 @@ CREATE TABLE IF NOT EXISTS scheduler_history (
 CREATE INDEX IF NOT EXISTS idx_scheduler_history_task_id ON scheduler_history(task_id);
 CREATE INDEX IF NOT EXISTS idx_scheduler_history_started_at ON scheduler_history(started_at);
 CREATE INDEX IF NOT EXISTS idx_scheduler_history_status ON scheduler_history(status);
+
+-- Phase A (scheduler reliability) additive columns. `scheduled_for` is
+-- the originally-scheduled slot (distinct from `started_at`, the actual
+-- launch time) and is consumed by the missed-run reconciler in Phase B.
+-- `catch_up_run` flags executions that came from the catch-up reconciler
+-- rather than the normal scheduling tick. NULL `scheduled_for` is allowed
+-- for backward compatibility with rows written before this column existed.
+ALTER TABLE scheduler_history ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ;
+ALTER TABLE scheduler_history ADD COLUMN IF NOT EXISTS catch_up_run BOOLEAN NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS idx_scheduler_history_task_scheduled_for ON scheduler_history(task_id, scheduled_for);
 
 -- Workflow Triggers (event-driven workflow execution)
 CREATE TABLE IF NOT EXISTS workflow_triggers (

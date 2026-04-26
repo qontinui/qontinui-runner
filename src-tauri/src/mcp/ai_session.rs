@@ -25,6 +25,7 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::prompts;
 use crate::safe_lock::safe_lock_or_recover;
 use crate::settings;
+use qontinui_types::scheduler::McpConnectionRef;
 
 // Re-export AiSessionContext from the canonical location
 pub use crate::execution_context::AiSessionContext;
@@ -123,6 +124,34 @@ pub struct RunPromptRequest {
     /// Whether to auto-detect and include relevant contexts (default: false)
     #[serde(default)]
     pub auto_include_contexts: Option<bool>,
+
+    // RemoteAgent / scheduler ad-hoc options (Phase D — scheduler reliability plan).
+    // These plumb through to the Claude CLI invocation inside
+    // spawn-independent-claude.py via --working-directory / --model /
+    // --allowed-tools / --max-turns flags. `mcp_connections` is captured into
+    // the prompt header for now (no MCP-config-merge wiring yet — see Phase D
+    // notes in tmp_scheduler_reliability_plan.md).
+    /// Working directory for the spawned Claude CLI session.
+    /// `None` = runner's project root (default behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    /// Optional model override (e.g. "claude-sonnet-4-6", "sonnet", "opus").
+    /// `None` = Claude CLI default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Comma/space-separated tool allow-list passed via `--allowed-tools`.
+    /// `None` = inherit Claude CLI default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    /// Hard cap on Claude turns (`--max-turns`). `None` = no flag (CLI
+    /// default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    /// MCP connection refs (resolved against runner's MCP config at dispatch
+    /// time). For Phase D this is documented in the prompt header — actual
+    /// per-call MCP-config merging is not yet wired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_connections: Option<Vec<McpConnectionRef>>,
 }
 
 /// Response from running a prompt
@@ -1010,6 +1039,20 @@ pub async fn run_prompt(
         }
     }
 
+    // RemoteAgent / scheduler ad-hoc knobs (Phase D — scheduler reliability
+    // plan). Captured before mutation so they can be plumbed into the
+    // spawn-independent-claude.py invocation below. Each is forwarded as an
+    // optional CLI flag the Python wrapper passes verbatim to `claude`.
+    let remote_working_directory = request.working_directory.clone();
+    let remote_model = request.model.clone();
+    let remote_allowed_tools = request
+        .allowed_tools
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .map(|tools| tools.join(","));
+    let remote_max_turns = request.max_turns;
+    let remote_mcp_connections = request.mcp_connections.clone().unwrap_or_default();
+
     // Collect images for analysis if provided
     let image_paths = request.image_paths.unwrap_or_default();
     let video_paths = request.video_paths.unwrap_or_default();
@@ -1199,6 +1242,25 @@ Tell the user: "The qontinui-runner needs to be restarted manually to apply chan
     };
 
     enhanced_prompt = format!("{}{}", runner_context, enhanced_prompt);
+
+    // RemoteAgent: surface declared MCP connection refs in the prompt
+    // header. Phase D does not yet merge these into a per-call MCP config
+    // file; the runner inherits whatever MCP config the user has registered.
+    // The header documents the requested connections so the agent (and any
+    // log readers) can verify the right MCP servers are available.
+    if !remote_mcp_connections.is_empty() {
+        let mut mcp_section = String::from(
+            "## Requested MCP Connections\n\nThis scheduled task declared the following MCP connection refs. They are resolved at dispatch time against the runner's existing MCP config; per-call overrides are not yet wired.\n\n",
+        );
+        for conn in &remote_mcp_connections {
+            match &conn.url {
+                Some(url) => mcp_section.push_str(&format!("- **{}** (override URL: {})\n", conn.name, url)),
+                None => mcp_section.push_str(&format!("- **{}** (use runner's configured URL)\n", conn.name)),
+            }
+        }
+        mcp_section.push_str("\n---\n\n");
+        enhanced_prompt = format!("{}{}", mcp_section, enhanced_prompt);
+    }
 
     // Inject Multi-Step Task Guide context (user override takes precedence)
     let multi_step_guide = context::get_multi_step_guide();
@@ -1409,6 +1471,10 @@ If your task requires running visual automation, use the Runner API to execute w
         );
 
         let prompt_name_for_state = prompt_name.clone();
+        let remote_working_directory_for_spawn = remote_working_directory.clone();
+        let remote_model_for_spawn = remote_model.clone();
+        let remote_allowed_tools_for_spawn = remote_allowed_tools.clone();
+        let remote_max_turns_for_spawn = remote_max_turns;
         let result = tokio::task::spawn_blocking(move || {
             let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
             let spawn_script = scripts_path.join("spawn-independent-claude.py");
@@ -1453,19 +1519,42 @@ If your task requires running visual automation, use the Runner API to execute w
             info!("MCP API: State file created: {:?}", state_file);
             info!("MCP API: Prompt file created: {:?}", prompt_file);
 
+            // Build base CLI args. New RemoteAgent knobs (--working-directory,
+            // --model, --allowed-tools, --max-turns) are appended below when
+            // set. The Python wrapper forwards each verbatim to `claude`.
+            //
+            // We hold the formatted strings (max_turns_str) in this scope so
+            // their `OsStr` borrow stays valid until spawn_python_with_console
+            // returns.
+            let max_turns_str = remote_max_turns_for_spawn.map(|n| n.to_string());
+
+            let mut spawn_args: Vec<&std::ffi::OsStr> = vec![
+                spawn_script.as_os_str(),
+                std::ffi::OsStr::new("--file"),
+                prompt_file.as_os_str(),
+                std::ffi::OsStr::new("--session-id"),
+                std::ffi::OsStr::new(&session_id),
+            ];
+            if let Some(ref wd) = remote_working_directory_for_spawn {
+                spawn_args.push(std::ffi::OsStr::new("--working-directory"));
+                spawn_args.push(std::ffi::OsStr::new(wd.as_str()));
+            }
+            if let Some(ref m) = remote_model_for_spawn {
+                spawn_args.push(std::ffi::OsStr::new("--model"));
+                spawn_args.push(std::ffi::OsStr::new(m.as_str()));
+            }
+            if let Some(ref tools) = remote_allowed_tools_for_spawn {
+                spawn_args.push(std::ffi::OsStr::new("--allowed-tools"));
+                spawn_args.push(std::ffi::OsStr::new(tools.as_str()));
+            }
+            if let Some(ref mt) = max_turns_str {
+                spawn_args.push(std::ffi::OsStr::new("--max-turns"));
+                spawn_args.push(std::ffi::OsStr::new(mt.as_str()));
+            }
+
             // Spawn Claude independently using the spawn script
             // Use spawn_python_with_console to ensure Claude CLI gets a console window
-            let spawn_result = spawn_python_with_console(
-                "python",
-                &[
-                    spawn_script.as_os_str(),
-                    std::ffi::OsStr::new("--file"),
-                    prompt_file.as_os_str(),
-                    std::ffi::OsStr::new("--session-id"),
-                    std::ffi::OsStr::new(&session_id),
-                ],
-                &workspace_root,
-            );
+            let spawn_result = spawn_python_with_console("python", &spawn_args, &workspace_root);
 
             match spawn_result {
                 Ok(child) => {

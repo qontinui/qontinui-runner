@@ -59,6 +59,7 @@ pub mod reflection;
 pub mod restate;
 pub mod scheduler;
 pub mod security_audit;
+pub mod session_touched_files;
 pub mod settings;
 pub mod skills;
 pub mod spec_experimentation;
@@ -1460,6 +1461,19 @@ impl PgDb {
             )",
             "CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status)",
             "CREATE INDEX IF NOT EXISTS idx_worktrees_task_run ON worktrees(task_run_id)",
+            // Session Touched Files (Commit Progress Phase A)
+            // Append-only record of every file each task_run touches. Distinct
+            // from FileRegistryManager (transient Active locks). Survives lock
+            // release so Phase C/D commit logic can enumerate touched files.
+            "CREATE TABLE IF NOT EXISTS session_touched_files (
+                task_run_id TEXT NOT NULL,
+                file_path   TEXT NOT NULL,
+                worktree_id TEXT,
+                recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (task_run_id, file_path)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_session_touched_files_task_run ON session_touched_files(task_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_session_touched_files_recorded_at ON session_touched_files(recorded_at)",
             // Workflow Constraint Results
             "CREATE TABLE IF NOT EXISTS workflow_constraint_results (
                 id              BIGSERIAL PRIMARY KEY,
@@ -2235,6 +2249,17 @@ impl PgDb {
                 auto_fix_session_id TEXT
             )",
             "CREATE INDEX IF NOT EXISTS idx_scheduler_history_task ON scheduler_history(task_id)",
+            // Phase A (scheduler reliability) additive columns. Match the
+            // canonical schema.pg.sql block under the scheduled_tasks /
+            // scheduler_history CREATE TABLE IF NOT EXISTS statements.
+            // Idempotent via ADD COLUMN IF NOT EXISTS.
+            "ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS catch_up_policy TEXT NOT NULL DEFAULT 'run_once'",
+            "ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS catch_up_grace_seconds INTEGER NOT NULL DEFAULT 300",
+            "ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS consecutive_launch_failures INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS launch_failure_backoff_seconds INTEGER NOT NULL DEFAULT 60",
+            "ALTER TABLE scheduler_history ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ",
+            "ALTER TABLE scheduler_history ADD COLUMN IF NOT EXISTS catch_up_run BOOLEAN NOT NULL DEFAULT false",
+            "CREATE INDEX IF NOT EXISTS idx_scheduler_history_task_scheduled_for ON scheduler_history(task_id, scheduled_for)",
             // Restate durable execution tables
             "CREATE TABLE IF NOT EXISTS restate_workflow_executions (
                 execution_id          TEXT PRIMARY KEY,  -- soft FK to task_runs; canonical FK in schema.pg.sql

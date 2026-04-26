@@ -236,6 +236,9 @@ Schedule types (pick the best fit):
 Task type (use Workflow if workflows are selected):
 - {"task_type":"Workflow","workflow_name":"<name>","workflow_id":"<id>"}
 - {"task_type":"AutoFix","check_findings":true,"force_run":false}
+- {"task_type":"RemoteAgent","prompt":"<full instruction>","allowed_tools":["Bash","Read","Write","Edit","Glob","Grep"],"max_turns":50,"timeout_seconds":600,"mcp_connections":[]}
+
+Use RemoteAgent when no workflow is selected and the user describes an ad-hoc AI task (e.g., "summarize my email", "review recent commits", "draft a report"). Set the prompt to a concrete, self-contained instruction the agent can act on. Include working_directory only if the user mentions a specific project path.
 
 Conditions (optional, include when user mentions idle/inactivity):
 - {"requireIdle":{"enabled":true}} — wait for runner to be idle
@@ -562,6 +565,7 @@ Only output the JSON array, nothing else.`;
                     {task.request.task.task_type}
                     {task.request.task.task_type === "Workflow" &&
                       `: ${task.request.task.workflow_name}`}
+                    {task.request.task.task_type === "RemoteAgent" && ": ad-hoc agent prompt"}
                   </span>
                   {task.request.conditions?.requireIdle?.enabled && (
                     <span className="px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">

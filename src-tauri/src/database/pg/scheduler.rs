@@ -5,8 +5,8 @@
 
 use super::PgDb;
 use crate::scheduler::{
-    scheduled_task_type_default, ConditionScheduleConfig, ScheduleExpression, ScheduledTask,
-    ScheduledTaskStatus, ScheduledTaskType, SchedulerSettings, TaskExecutionRecord,
+    scheduled_task_type_default, CatchUpPolicy, ConditionScheduleConfig, ScheduleExpression,
+    ScheduledTask, ScheduledTaskStatus, ScheduledTaskType, SchedulerSettings, TaskExecutionRecord,
 };
 use chrono::{DateTime, Utc};
 use tracing::warn;
@@ -16,12 +16,50 @@ use tracing::warn;
 // ============================================================================
 
 /// Column list for SELECT queries on scheduled_tasks.
+///
+/// Order matters — `row_to_scheduled_task` indexes by position. The trailing
+/// four columns (`catch_up_policy`, `catch_up_grace_seconds`,
+/// `consecutive_launch_failures`, `launch_failure_backoff_seconds`) were
+/// added by the v12 (Phase A) additive migration in `schema.pg.sql` and
+/// self-heal on next runner restart per
+/// `proj_pg_schema_drift_audit.md`.
 const SELECT_TASK_COLS: &str = r#"
     id, name, description, enabled,
     schedule_type, schedule_value, task_config,
     skip_if_completed, auto_fix_on_failure, success_criteria,
-    created_at, modified_at, next_run, last_run_id
+    created_at, modified_at, next_run, last_run_id,
+    catch_up_policy, catch_up_grace_seconds,
+    consecutive_launch_failures, launch_failure_backoff_seconds
 "#;
+
+/// Parse a `catch_up_policy` text value from the DB into the typed enum.
+/// Falls back to [`CatchUpPolicy::default`] for unknown / null values so
+/// rows written before this column existed still load.
+fn parse_catch_up_policy(raw: &str) -> CatchUpPolicy {
+    match raw {
+        "run" => CatchUpPolicy::Run,
+        "skip" => CatchUpPolicy::Skip,
+        "run_once" => CatchUpPolicy::RunOnce,
+        other => {
+            warn!(
+                "Unknown catch_up_policy value '{}'; defaulting to RunOnce",
+                other
+            );
+            CatchUpPolicy::default()
+        }
+    }
+}
+
+/// Render a [`CatchUpPolicy`] as the snake_case discriminator string used
+/// for the TEXT column. Mirrors the `#[serde(rename_all = "snake_case")]`
+/// on the type so DB and JSON wire-format stay aligned.
+fn catch_up_policy_to_str(policy: CatchUpPolicy) -> &'static str {
+    match policy {
+        CatchUpPolicy::Run => "run",
+        CatchUpPolicy::Skip => "skip",
+        CatchUpPolicy::RunOnce => "run_once",
+    }
+}
 
 /// Map a tokio_postgres Row to a ScheduledTask.
 fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
@@ -70,6 +108,10 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
     let created: DateTime<Utc> = row.get(10);
     let modified: DateTime<Utc> = row.get(11);
     let next: Option<DateTime<Utc>> = row.get(12);
+    let catch_up_policy_raw: String = row.get(14);
+    let catch_up_grace_seconds: i32 = row.get(15);
+    let consecutive_launch_failures: i32 = row.get(16);
+    let launch_failure_backoff_seconds: i32 = row.get(17);
 
     ScheduledTask {
         id: row.get(0),
@@ -87,6 +129,13 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
         last_run: None,
         conditions: None,
         condition_status: None,
+        catch_up_policy: parse_catch_up_policy(&catch_up_policy_raw),
+        // INTEGER columns surface as i32; clamp negatives to 0 defensively
+        // (NOT NULL DEFAULT in schema, but drift audits remind us that
+        // pre-migration rows can carry surprising values).
+        catch_up_grace_seconds: catch_up_grace_seconds.max(0) as u32,
+        consecutive_launch_failures: consecutive_launch_failures.max(0) as u32,
+        launch_failure_backoff_seconds: launch_failure_backoff_seconds.max(0) as u32,
     }
 }
 
@@ -108,20 +157,20 @@ fn schedule_to_parts(schedule: &ScheduleExpression) -> (&'static str, String) {
 /// `started_at` and `ended_at` are TIMESTAMPTZ in the live DB (migrated
 /// from TEXT by v10). Read as `DateTime<Utc>` and format to ISO 8601 so
 /// the JSON-serialised struct stays backwards-compatible.
+///
+/// `scheduled_for` (column 9) and `catch_up_run` (column 10) were added
+/// by the v12 (Phase A) additive migration. `scheduled_for` is nullable
+/// for backward compatibility with rows written before the column
+/// existed; `catch_up_run` is NOT NULL DEFAULT false in the schema so
+/// pre-existing rows surface as `false` here.
 fn row_to_execution_record(row: &tokio_postgres::Row) -> TaskExecutionRecord {
     let status_str: String = row.get(4);
-    let status = match status_str.as_str() {
-        "pending" => ScheduledTaskStatus::Pending,
-        "running" => ScheduledTaskStatus::Running,
-        "completed" => ScheduledTaskStatus::Completed,
-        "failed" => ScheduledTaskStatus::Failed,
-        "skipped" => ScheduledTaskStatus::Skipped,
-        "cancelled" => ScheduledTaskStatus::Cancelled,
-        _ => ScheduledTaskStatus::Failed,
-    };
+    let status = parse_status(&status_str);
 
     let started: DateTime<Utc> = row.get(2);
     let ended: Option<DateTime<Utc>> = row.get(3);
+    let scheduled_for: Option<DateTime<Utc>> = row.get(9);
+    let catch_up_run: bool = row.get(10);
 
     TaskExecutionRecord {
         execution_id: row.get(0),
@@ -133,6 +182,40 @@ fn row_to_execution_record(row: &tokio_postgres::Row) -> TaskExecutionRecord {
         error_message: row.get(6),
         triggered_auto_fix: row.get(7),
         auto_fix_session_id: row.get(8),
+        scheduled_for: scheduled_for.map(|dt| dt.to_rfc3339()),
+        catch_up_run,
+    }
+}
+
+/// Parse the TEXT status column into the typed enum, mapping unknown
+/// strings to `Failed` as a defensive default.
+fn parse_status(raw: &str) -> ScheduledTaskStatus {
+    match raw {
+        "pending" => ScheduledTaskStatus::Pending,
+        "running" => ScheduledTaskStatus::Running,
+        "completed" => ScheduledTaskStatus::Completed,
+        "failed" => ScheduledTaskStatus::Failed,
+        "launch_failed" => ScheduledTaskStatus::LaunchFailed,
+        "skipped" => ScheduledTaskStatus::Skipped,
+        "cancelled" => ScheduledTaskStatus::Cancelled,
+        "missed_runner_down" => ScheduledTaskStatus::MissedRunnerDown,
+        _ => ScheduledTaskStatus::Failed,
+    }
+}
+
+/// Render a [`ScheduledTaskStatus`] as the snake_case discriminator string
+/// stored in the TEXT `status` column. Mirrors `#[serde(rename_all =
+/// "snake_case")]` on the enum.
+fn status_to_str(status: &ScheduledTaskStatus) -> &'static str {
+    match status {
+        ScheduledTaskStatus::Pending => "pending",
+        ScheduledTaskStatus::Running => "running",
+        ScheduledTaskStatus::Completed => "completed",
+        ScheduledTaskStatus::Failed => "failed",
+        ScheduledTaskStatus::LaunchFailed => "launch_failed",
+        ScheduledTaskStatus::Skipped => "skipped",
+        ScheduledTaskStatus::Cancelled => "cancelled",
+        ScheduledTaskStatus::MissedRunnerDown => "missed_runner_down",
     }
 }
 
@@ -196,6 +279,16 @@ impl PgDb {
         let task_config = serde_json::to_string(&task.task)
             .map_err(|e| format!("Serialize task_config: {}", e))?;
         let last_run_id = task.last_run.as_ref().map(|r| r.execution_id.clone());
+        let catch_up_policy_str = catch_up_policy_to_str(task.catch_up_policy).to_string();
+        // Cast u32 → i32 for PG INTEGER columns. Schema defaults are well
+        // under 2^31, so saturating is a safety belt rather than an
+        // expected path.
+        let catch_up_grace_seconds_i32: i32 =
+            task.catch_up_grace_seconds.min(i32::MAX as u32) as i32;
+        let consecutive_launch_failures_i32: i32 =
+            task.consecutive_launch_failures.min(i32::MAX as u32) as i32;
+        let launch_failure_backoff_seconds_i32: i32 =
+            task.launch_failure_backoff_seconds.min(i32::MAX as u32) as i32;
 
         conn.execute(
             r#"
@@ -203,8 +296,11 @@ impl PgDb {
                 (id, name, description, enabled,
                  schedule_type, schedule_value, task_config,
                  skip_if_completed, auto_fix_on_failure, success_criteria,
-                 created_at, modified_at, next_run, last_run_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 created_at, modified_at, next_run, last_run_id,
+                 catch_up_policy, catch_up_grace_seconds,
+                 consecutive_launch_failures, launch_failure_backoff_seconds)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $13, $14, $15, $16, $17, $18)
             "#,
             &[
                 &task.id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -230,6 +326,10 @@ impl PgDb {
                     .as_deref()
                     .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
                 &last_run_id,
+                &catch_up_policy_str,
+                &catch_up_grace_seconds_i32,
+                &consecutive_launch_failures_i32,
+                &launch_failure_backoff_seconds_i32,
             ],
         )
         .await
@@ -249,6 +349,13 @@ impl PgDb {
         let task_config = serde_json::to_string(&task.task)
             .map_err(|e| format!("Serialize task_config: {}", e))?;
         let last_run_id = task.last_run.as_ref().map(|r| r.execution_id.clone());
+        let catch_up_policy_str = catch_up_policy_to_str(task.catch_up_policy).to_string();
+        let catch_up_grace_seconds_i32: i32 =
+            task.catch_up_grace_seconds.min(i32::MAX as u32) as i32;
+        let consecutive_launch_failures_i32: i32 =
+            task.consecutive_launch_failures.min(i32::MAX as u32) as i32;
+        let launch_failure_backoff_seconds_i32: i32 =
+            task.launch_failure_backoff_seconds.min(i32::MAX as u32) as i32;
 
         conn.execute(
             r#"
@@ -264,8 +371,12 @@ impl PgDb {
                 success_criteria = $9,
                 modified_at = $10,
                 next_run = $11,
-                last_run_id = $12
-            WHERE id = $13
+                last_run_id = $12,
+                catch_up_policy = $13,
+                catch_up_grace_seconds = $14,
+                consecutive_launch_failures = $15,
+                launch_failure_backoff_seconds = $16
+            WHERE id = $17
             "#,
             &[
                 &task.name as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -286,6 +397,10 @@ impl PgDb {
                     .as_deref()
                     .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
                 &last_run_id,
+                &catch_up_policy_str,
+                &catch_up_grace_seconds_i32,
+                &consecutive_launch_failures_i32,
+                &launch_failure_backoff_seconds_i32,
                 &task.id,
             ],
         )
@@ -363,6 +478,43 @@ impl PgDb {
         Ok(())
     }
 
+    /// Persist `consecutive_launch_failures` for a task without rewriting
+    /// the rest of the row. Used by the Phase C launch-failure path to
+    /// bump the counter on `LaunchFailed` and to zero it on the first
+    /// successful launch. Other columns (especially `next_run`) are
+    /// updated separately so callers can sequence the writes
+    /// independently and one transient PG error doesn't roll back the
+    /// reschedule.
+    pub async fn update_task_launch_failure_counter(
+        &self,
+        task_id: &str,
+        consecutive_launch_failures: u32,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let now = Utc::now();
+        let counter_i32: i32 = consecutive_launch_failures.min(i32::MAX as u32) as i32;
+        conn.execute(
+            "UPDATE scheduled_tasks SET consecutive_launch_failures = $1, modified_at = $2 WHERE id = $3",
+            &[
+                &counter_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
+                &now as &(dyn tokio_postgres::types::ToSql + Sync),
+                &task_id,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "PG update_task_launch_failure_counter for {}: {}",
+                task_id, e
+            )
+        })?;
+        Ok(())
+    }
+
     /// Set or clear the condition_status JSON on a task.
     pub async fn update_task_condition_status(
         &self,
@@ -406,14 +558,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let status = match &record.status {
-            ScheduledTaskStatus::Pending => "pending",
-            ScheduledTaskStatus::Running => "running",
-            ScheduledTaskStatus::Completed => "completed",
-            ScheduledTaskStatus::Failed => "failed",
-            ScheduledTaskStatus::Skipped => "skipped",
-            ScheduledTaskStatus::Cancelled => "cancelled",
-        };
+        let status = status_to_str(&record.status).to_string();
 
         // Parse ISO 8601 strings back to DateTime<Utc> for the TIMESTAMPTZ
         // columns. The struct stores strings for JSON serialisation but the
@@ -426,14 +571,21 @@ impl PgDb {
             .ended_at
             .as_deref()
             .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+        // `scheduled_for` is optional and nullable — the column was added
+        // by v12 (Phase A) and pre-existing records will write `NULL`.
+        let scheduled_for: Option<DateTime<Utc>> = record
+            .scheduled_for
+            .as_deref()
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok());
 
         conn.execute(
             r#"
             INSERT INTO scheduler_history
                 (execution_id, task_id, session_id, started_at, ended_at,
                  status, success, error_message,
-                 triggered_auto_fix, auto_fix_session_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 triggered_auto_fix, auto_fix_session_id,
+                 scheduled_for, catch_up_run)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
             &[
                 &record.execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -441,11 +593,13 @@ impl PgDb {
                 &record.session_id,
                 &started,
                 &ended,
-                &status.to_string(),
+                &status,
                 &record.success,
                 &record.error_message,
                 &record.triggered_auto_fix,
                 &record.auto_fix_session_id,
+                &scheduled_for,
+                &record.catch_up_run,
             ],
         )
         .await
@@ -472,17 +626,20 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let status = match &record.status {
-            ScheduledTaskStatus::Pending => "pending",
-            ScheduledTaskStatus::Running => "running",
-            ScheduledTaskStatus::Completed => "completed",
-            ScheduledTaskStatus::Failed => "failed",
-            ScheduledTaskStatus::Skipped => "skipped",
-            ScheduledTaskStatus::Cancelled => "cancelled",
-        };
+        let status = status_to_str(&record.status).to_string();
 
         let ended: Option<DateTime<Utc>> = record
             .ended_at
+            .as_deref()
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+
+        // `scheduled_for` and `catch_up_run` are launch-time properties
+        // (set on INSERT). On UPDATE we COALESCE so callers that *do*
+        // supply them can backfill historical rows, while callers that
+        // leave them as the struct default (`None` / `false`) won't clobber
+        // values written at insert.
+        let scheduled_for: Option<DateTime<Utc>> = record
+            .scheduled_for
             .as_deref()
             .and_then(|s| s.parse::<DateTime<Utc>>().ok());
 
@@ -495,24 +652,91 @@ impl PgDb {
                 error_message = $5,
                 triggered_auto_fix = $6,
                 auto_fix_session_id = $7,
-                session_id = COALESCE($8, session_id)
+                session_id = COALESCE($8, session_id),
+                scheduled_for = COALESCE($9, scheduled_for),
+                catch_up_run = catch_up_run OR $10
             WHERE execution_id = $1
             "#,
             &[
                 &execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
                 &ended,
-                &status.to_string(),
+                &status,
                 &record.success,
                 &record.error_message,
                 &record.triggered_auto_fix,
                 &record.auto_fix_session_id,
                 &record.session_id,
+                &scheduled_for,
+                &record.catch_up_run,
             ],
         )
         .await
         .map_err(|e| format!("PG update_execution_record: {}", e))?;
 
         Ok(())
+    }
+
+    /// Returns the candidate slots that have **no** matching
+    /// `scheduler_history` row for the given task — i.e. the slots the
+    /// catch-up reconciler should act on.
+    ///
+    /// The DB only returns timestamps that *do* match, and we diff against
+    /// the supplied candidates client-side so the order/cardinality of the
+    /// caller's input is preserved.
+    ///
+    /// NULL `scheduled_for` rows (legacy data written before the v12
+    /// migration) deliberately do **not** match anything: they're recorded
+    /// without a known slot, so we can't suppress catch-up on their behalf.
+    /// The `WHERE scheduled_for = ANY($2)` predicate already excludes NULLs
+    /// because SQL equality with NULL yields NULL (not true), so this falls
+    /// out for free — but it's worth calling out.
+    ///
+    /// All timestamps round-trip as TIMESTAMPTZ, so the caller may pass
+    /// either UTC or any other offset; PostgreSQL normalizes internally.
+    pub async fn find_missed_slots(
+        &self,
+        task_id: &str,
+        candidate_slots: &[chrono::DateTime<chrono::Utc>],
+    ) -> Result<Vec<chrono::DateTime<chrono::Utc>>, String> {
+        if candidate_slots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Pass the candidate slot list as a TIMESTAMPTZ[] parameter and let
+        // PG do the matching. Never string-interpolate timestamps.
+        let candidates_vec: Vec<DateTime<Utc>> = candidate_slots.to_vec();
+        let rows = conn
+            .query(
+                r#"
+                SELECT DISTINCT scheduled_for
+                FROM scheduler_history
+                WHERE task_id = $1
+                  AND scheduled_for = ANY($2::timestamptz[])
+                "#,
+                &[&task_id, &candidates_vec],
+            )
+            .await
+            .map_err(|e| format!("PG find_missed_slots {}: {}", task_id, e))?;
+
+        // Collect the slots that *did* have history rows.
+        let matched: std::collections::HashSet<DateTime<Utc>> = rows
+            .iter()
+            .filter_map(|r| r.get::<_, Option<DateTime<Utc>>>(0))
+            .collect();
+
+        // Return the candidates that are *not* in the matched set, preserving
+        // input order so the most-recent slot ends up last.
+        Ok(candidate_slots
+            .iter()
+            .filter(|slot| !matched.contains(slot))
+            .copied()
+            .collect())
     }
 
     /// Get execution history for a task, most recent first, limited to `limit` rows.
@@ -532,7 +756,8 @@ impl PgDb {
                 r#"
                 SELECT execution_id, session_id, started_at, ended_at,
                        status, success, error_message,
-                       triggered_auto_fix, auto_fix_session_id
+                       triggered_auto_fix, auto_fix_session_id,
+                       scheduled_for, catch_up_run
                 FROM scheduler_history
                 WHERE task_id = $1
                 ORDER BY started_at DESC

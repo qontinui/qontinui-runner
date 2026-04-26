@@ -30,6 +30,8 @@ export type {
   SchedulerStatus,
   CreateScheduledTaskRequest,
   UpdateScheduledTaskRequest,
+  CatchUpPolicy,
+  McpConnectionRef,
 } from "@qontinui/shared-types/scheduler";
 
 // =============================================================================

@@ -18,6 +18,10 @@ interface IncludeSummaryStepData {
   enabled: boolean;
 }
 
+interface AutostartStatusData {
+  enabled: boolean;
+}
+
 interface GeneralSettingsProps {
   onLog: LogFunction;
 }
@@ -27,6 +31,12 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
     auto_load_last_config: false,
   });
   const [includeSummaryStep, setIncludeSummaryStep] = useState<boolean>(true);
+  // Phase F.1 — "Launch on system startup" toggle. Backed by
+  // `tauri-plugin-autostart`'s registry/LaunchAgent/.desktop write through the
+  // `get_autostart_enabled` / `set_autostart_enabled` Tauri commands. Durable
+  // solution for overnight scheduled tasks: the OS auto-starts the runner at
+  // login, so scheduled tasks fire even if the user closed the runner.
+  const [autostartEnabled, setAutostartEnabled] = useState<boolean>(false);
 
   const loadAppSettings = async () => {
     try {
@@ -54,10 +64,22 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
     }
   };
 
+  const loadAutostartEnabled = async () => {
+    try {
+      const result = await invoke<TauriResult<AutostartStatusData>>("get_autostart_enabled");
+      if (result && result.success && result.data) {
+        setAutostartEnabled(result.data.enabled);
+      }
+    } catch (err) {
+      console.error("Failed to load autostart setting:", err);
+    }
+  };
+
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- async init from Tauri backend
     loadAppSettings();
     loadIncludeSummaryStep();
+    loadAutostartEnabled();
   }, []);
 
   const handleToggleAutoLoad = async () => {
@@ -87,6 +109,34 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         ...prev,
         auto_load_last_config: !newValue,
       }));
+    }
+  };
+
+  const handleToggleAutostart = async () => {
+    const newValue = !autostartEnabled;
+    setAutostartEnabled(newValue);
+
+    try {
+      const result = await invoke<TauriResult<AutostartStatusData>>("set_autostart_enabled", {
+        enabled: newValue,
+      });
+      if (result && result.success && result.data) {
+        // Reconcile against actual OS state — the registry/LaunchAgent write
+        // can succeed-but-not-stick on hardened systems, so we believe the
+        // post-toggle `is_enabled` readback over the optimistic update.
+        setAutostartEnabled(result.data.enabled);
+        onLog(
+          "success",
+          `Launch on system startup ${result.data.enabled ? "enabled" : "disabled"}`,
+        );
+      } else {
+        onLog("error", "Failed to save launch-on-startup setting");
+        setAutostartEnabled(!newValue);
+      }
+    } catch (err) {
+      console.error("Failed to save autostart setting:", err);
+      onLog("error", `Failed to save launch-on-startup setting: ${err}`);
+      setAutostartEnabled(!newValue);
     }
   };
 
@@ -140,6 +190,28 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
               <span
                 className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
                   appSettings.auto_load_last_config ? "translate-x-4" : "translate-x-1"
+                }`}
+              />
+            </button>
+          </label>
+
+          <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Launch on System Startup</div>
+              <div className="text-xs text-muted-foreground">
+                Auto-start the runner at user login so scheduled tasks fire reliably without leaving
+                the runner manually open.
+              </div>
+            </div>
+            <button
+              onClick={handleToggleAutostart}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                autostartEnabled ? "bg-primary" : "bg-muted"
+              }`}
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  autostartEnabled ? "translate-x-4" : "translate-x-1"
                 }`}
               />
             </button>

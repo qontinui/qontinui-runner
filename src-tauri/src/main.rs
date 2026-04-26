@@ -151,6 +151,7 @@ mod verification;
 mod vga;
 mod video_recorder;
 mod vision;
+mod wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
 mod window_manager;
 mod workflow;
 mod workflow_event_bus;
@@ -477,7 +478,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = tauri::Builder::default();
 
     if !is_secondary_instance {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // When a second instance is launched, focus the existing window
             if let Some(window) =
                 app.get_webview_window(qontinui_runner_lib::get_main_window_label())
@@ -485,6 +486,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = window.unminimize();
                 let _ = window.set_focus();
             }
+            // Phase F.1 — single-instance plugin's `deep-link` feature flag
+            // forwards `qontinui://...` URLs from the secondary launch's argv
+            // to the running primary so the wake handler runs in the live
+            // process instead of starting a duplicate runner.
+            wake_handler::handle_args_from_secondary_instance(app.clone(), &args);
         }));
     }
 
@@ -506,6 +512,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        // Phase F.1 — Wake-from-web custom URL scheme (`qontinui://wake?...`)
+        // and launch-on-system-startup toggle. Deep-link plugin must come
+        // before `.setup(...)` so `app.deep_link().on_open_url(...)` is
+        // available in the setup closure. Autostart's MacosLauncher kind is
+        // platform-conditional but the API is identical on Windows/Linux.
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(ui_bridge_plugin::init())
         // All other in-app Tauri commands are registered via the central
         // `generate_handler!` below rather than per-module plugins.
@@ -639,6 +655,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::logout,
             commands::auth::refresh_token,
             commands::auth::send_device_heartbeat,
+            commands::autostart::get_autostart_enabled,
+            commands::autostart::set_autostart_enabled,
             mcp::backend_relay::commands::get_cloud_relay_settings,
             mcp::backend_relay::commands::get_cloud_relay_status,
             mcp::backend_relay::commands::save_cloud_relay_settings,
@@ -1360,6 +1378,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // for any future migration that updates the frontend invoke sites.
         .setup(|app| {
             info!("Tauri application setup starting");
+
+            // Phase F.1 — register the deep-link `on_open_url` callback so
+            // `qontinui://wake?intent=...` URLs delivered by the OS (cold
+            // start) or forwarded by the single-instance plugin (warm start)
+            // route into the wake handler, which fires an immediate scheduler
+            // tick.
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let app_handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    let urls: Vec<String> =
+                        event.urls().into_iter().map(|u| u.to_string()).collect();
+                    wake_handler::handle_deep_link_urls(app_handle.clone(), urls);
+                });
+            }
 
             let server_mode = std::env::var("QONTINUI_SERVER_MODE")
                 .map(|v| v == "1" || v.to_lowercase() == "true")

@@ -407,6 +407,7 @@ fn auto_register_file(
     if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
         let lock_manager = app_state.file_lock_manager.clone();
         let registry = app_state.file_registry_manager.clone();
+        let pg_db = app_state.pg_db.clone();
         let event_broadcast = app_state.event_broadcast.clone();
         let handle = app_handle.clone();
         let file_path_clone = file_path.clone();
@@ -462,6 +463,33 @@ fn auto_register_file(
 
                     waited
                 })
+            });
+
+            // Also durably record the touched file in PG (Commit Progress
+            // Phase A). Distinct from the advisory registry below: registry
+            // entries are released when the agent finishes, but
+            // session_touched_files is append-only so commit-time logic
+            // (Phases C/D) can still enumerate every file the agent edited.
+            // Fire-and-forget — never blocks the stdout reader, never
+            // propagates errors. PG INSERTs are sub-millisecond locally.
+            let pg_db_touch = pg_db.clone();
+            let file_path_touch = file_path.clone();
+            let task_run_id_touch = task_run_id.clone();
+            let worktree_id_touch = worktree_id.map(|s| s.to_string());
+            rt.spawn(async move {
+                if let Err(e) = pg_db_touch
+                    .record_file_touched(
+                        &task_run_id_touch,
+                        &file_path_touch,
+                        worktree_id_touch.as_deref(),
+                    )
+                    .await
+                {
+                    warn!(
+                        "session_touched_files: record_file_touched failed for task_run='{}' file='{}': {}",
+                        task_run_id_touch, file_path_touch, e
+                    );
+                }
             });
 
             // Also register in the advisory registry (non-blocking, fire-and-forget)

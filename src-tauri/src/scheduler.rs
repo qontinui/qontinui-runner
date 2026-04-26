@@ -73,6 +73,12 @@ pub trait TaskExecutionRecordExt: Sized {
     /// Mark execution as completed, setting `ended_at`, `success`,
     /// `error_message`, and `status` accordingly.
     fn complete(&mut self, success: bool, error_message: Option<String>);
+    /// Mark execution as having failed before it could even start
+    /// (workflow file missing, prompt resolve failure, etc.). Sets status
+    /// to [`ScheduledTaskStatus::LaunchFailed`] — distinct from
+    /// [`Self::complete(false, _)`] which marks a runtime `Failed`.
+    /// Backoff/reschedule policy lives in Phase C.
+    fn mark_launch_failed(&mut self, error_message: Option<String>);
     /// Mark that auto-fix was triggered for this execution, recording the
     /// auto-fix session id.
     fn mark_auto_fix_triggered(&mut self, session_id: String);
@@ -95,6 +101,8 @@ impl TaskExecutionRecordExt for TaskExecutionRecord {
             error_message: None,
             triggered_auto_fix: false,
             auto_fix_session_id: None,
+            scheduled_for: None,
+            catch_up_run: false,
         }
     }
 
@@ -107,6 +115,13 @@ impl TaskExecutionRecordExt for TaskExecutionRecord {
         } else {
             ScheduledTaskStatus::Failed
         };
+    }
+
+    fn mark_launch_failed(&mut self, error_message: Option<String>) {
+        self.ended_at = Some(chrono::Utc::now().to_rfc3339());
+        self.success = false;
+        self.error_message = error_message;
+        self.status = ScheduledTaskStatus::LaunchFailed;
     }
 
     fn mark_auto_fix_triggered(&mut self, session_id: String) {
@@ -148,6 +163,31 @@ pub trait ScheduledTaskExt: Sized {
     fn is_rearm_ready(&self) -> bool;
     /// Update the `modified_at` timestamp to "now".
     fn touch(&mut self);
+    /// Increment [`consecutive_launch_failures`] by 1 (saturating). Called
+    /// each time a task's *launch* fails (see
+    /// [`ScheduledTaskStatus::LaunchFailed`]) — runtime failures must not
+    /// touch this counter.
+    fn record_launch_failure(&mut self);
+    /// Reset [`consecutive_launch_failures`] to 0. Called the first time
+    /// a task's launch path returns `Ok` (i.e. as soon as the underlying
+    /// session/run started cleanly). Runtime failures during execution are
+    /// *not* counted as launch failures, so the counter stays zero through
+    /// them.
+    fn reset_launch_failures(&mut self);
+    /// Compute the launch-failure backoff duration based on
+    /// [`consecutive_launch_failures`] and the configured *base*
+    /// [`launch_failure_backoff_seconds`].
+    ///
+    /// Returns `Some(min(base * 2^(failures - 1), 86_400s))` when one or
+    /// more launch failures have been recorded; `None` when the counter is
+    /// zero (no backoff is owed). The 24-hour cap matches the plan's
+    /// `min(..., 86400)` rule.
+    ///
+    /// Math is saturating to keep large counters / bases safe (e.g. a base
+    /// of 1 with 64 consecutive failures would otherwise overflow the
+    /// `u32` shift). The cap is applied after saturation, so the result
+    /// is always well within `i64::MAX` seconds.
+    fn launch_failure_backoff(&self) -> Option<chrono::Duration>;
 }
 
 impl ScheduledTaskExt for ScheduledTask {
@@ -174,6 +214,10 @@ impl ScheduledTaskExt for ScheduledTask {
             next_run: None,
             conditions: None,
             condition_status: None,
+            catch_up_policy: CatchUpPolicy::default(),
+            catch_up_grace_seconds: 300,
+            consecutive_launch_failures: 0,
+            launch_failure_backoff_seconds: 60,
         }
     }
 
@@ -228,6 +272,42 @@ impl ScheduledTaskExt for ScheduledTask {
 
     fn touch(&mut self) {
         self.modified_at = chrono::Utc::now().to_rfc3339();
+    }
+
+    fn record_launch_failure(&mut self) {
+        self.consecutive_launch_failures =
+            self.consecutive_launch_failures.saturating_add(1);
+        self.modified_at = chrono::Utc::now().to_rfc3339();
+    }
+
+    fn reset_launch_failures(&mut self) {
+        if self.consecutive_launch_failures != 0 {
+            self.consecutive_launch_failures = 0;
+            self.modified_at = chrono::Utc::now().to_rfc3339();
+        }
+    }
+
+    fn launch_failure_backoff(&self) -> Option<chrono::Duration> {
+        const MAX_BACKOFF_SECS: u64 = 86_400; // 24h cap
+        let failures = self.consecutive_launch_failures;
+        if failures == 0 {
+            return None;
+        }
+        let base = self.launch_failure_backoff_seconds as u64;
+        // Defensive: a 0 base would freeze backoff at zero forever and
+        // make the LaunchFailed path indistinguishable from "schedule
+        // normally." Treat as "no backoff" rather than synthesising one.
+        if base == 0 {
+            return None;
+        }
+        // Compute base * 2^(failures - 1) with saturating semantics.
+        // Using u32 for the shift amount keeps us inside `<<` rules; we
+        // cap the exponent at 63 first so the shift can't UB.
+        let exponent = (failures - 1).min(63) as u32;
+        let multiplier: u64 = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
+        let raw = base.saturating_mul(multiplier);
+        let capped = raw.min(MAX_BACKOFF_SECS);
+        Some(chrono::Duration::seconds(capped as i64))
     }
 }
 
@@ -328,6 +408,126 @@ mod tests {
         let now = chrono::Utc::now();
         let next = compute_next_run(&schedule, now);
         assert!(next.is_none());
+    }
+
+    /// Build a default ScheduledTask suitable for backoff tests.
+    fn backoff_test_task(base: u32) -> ScheduledTask {
+        let mut task = ScheduledTask::new(
+            "Backoff Test".to_string(),
+            None,
+            schedule_expression_default(),
+            scheduled_task_type_default(),
+        );
+        task.launch_failure_backoff_seconds = base;
+        task
+    }
+
+    #[test]
+    fn test_launch_failure_backoff_zero_failures_returns_none() {
+        let task = backoff_test_task(60);
+        assert_eq!(task.consecutive_launch_failures, 0);
+        assert!(task.launch_failure_backoff().is_none());
+    }
+
+    #[test]
+    fn test_launch_failure_backoff_base_60_progression() {
+        // Phase C plan: base 60 → 1 failure = 60s, 2 = 120s, 3 = 240s,
+        // 11 = 61_440s, 12+ = capped at 86_400s.
+        let mut task = backoff_test_task(60);
+
+        let cases: &[(u32, i64)] = &[
+            (1, 60),
+            (2, 120),
+            (3, 240),
+            (4, 480),
+            (5, 960),
+            (10, 30_720),
+            (11, 61_440),
+            (12, 86_400),
+            (13, 86_400),
+            (50, 86_400),
+        ];
+        for (failures, expected_secs) in cases {
+            task.consecutive_launch_failures = *failures;
+            let backoff = task.launch_failure_backoff().expect("backoff present");
+            assert_eq!(
+                backoff.num_seconds(),
+                *expected_secs,
+                "base 60, {} failures should yield {}s",
+                failures,
+                expected_secs
+            );
+        }
+    }
+
+    #[test]
+    fn test_launch_failure_backoff_base_30_scales_correctly() {
+        // Confirm scaling holds for non-default bases.
+        let mut task = backoff_test_task(30);
+        task.consecutive_launch_failures = 1;
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 30);
+        task.consecutive_launch_failures = 2;
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 60);
+        task.consecutive_launch_failures = 3;
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 120);
+        task.consecutive_launch_failures = 12;
+        // 30 * 2^11 = 61_440 — still under the cap
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 61_440);
+        task.consecutive_launch_failures = 13;
+        // 30 * 2^12 = 122_880 — capped at 86_400
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 86_400);
+    }
+
+    #[test]
+    fn test_launch_failure_backoff_zero_base_returns_none() {
+        // A misconfigured base of 0 is treated as "no backoff" rather
+        // than as a perpetual zero-delay loop.
+        let mut task = backoff_test_task(0);
+        task.consecutive_launch_failures = 5;
+        assert!(task.launch_failure_backoff().is_none());
+    }
+
+    #[test]
+    fn test_launch_failure_backoff_huge_failures_does_not_overflow() {
+        // u32::MAX failures with a small base must not panic and must
+        // saturate at the 24h cap.
+        let mut task = backoff_test_task(1);
+        task.consecutive_launch_failures = u32::MAX;
+        let backoff = task.launch_failure_backoff().expect("backoff present");
+        assert_eq!(backoff.num_seconds(), 86_400);
+    }
+
+    #[test]
+    fn test_record_and_reset_launch_failures_round_trip() {
+        let mut task = backoff_test_task(60);
+        assert_eq!(task.consecutive_launch_failures, 0);
+        assert!(task.launch_failure_backoff().is_none());
+
+        task.record_launch_failure();
+        assert_eq!(task.consecutive_launch_failures, 1);
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 60);
+
+        task.record_launch_failure();
+        assert_eq!(task.consecutive_launch_failures, 2);
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 120);
+
+        task.reset_launch_failures();
+        assert_eq!(task.consecutive_launch_failures, 0);
+        assert!(task.launch_failure_backoff().is_none());
+
+        // After reset, the next failure starts the sequence over from 60s,
+        // not from 240s. This is the "failure → success → failure"
+        // resilience pattern from the plan.
+        task.record_launch_failure();
+        assert_eq!(task.launch_failure_backoff().unwrap().num_seconds(), 60);
+    }
+
+    #[test]
+    fn test_record_launch_failure_saturates_at_u32_max() {
+        let mut task = backoff_test_task(60);
+        task.consecutive_launch_failures = u32::MAX;
+        task.record_launch_failure();
+        assert_eq!(task.consecutive_launch_failures, u32::MAX);
     }
 
     #[test]

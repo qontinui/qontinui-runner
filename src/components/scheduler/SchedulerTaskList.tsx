@@ -15,6 +15,7 @@ import {
   XCircle,
   SkipForward,
   Loader2,
+  AlertTriangle,
 } from "lucide-react";
 import type { ScheduledTask } from "../../types/scheduler";
 import { getAccentColors, getStatusColors } from "@/design-system";
@@ -25,6 +26,26 @@ import {
   getTimeUntilNextRun,
   isTaskRunning,
 } from "../../types/scheduler";
+
+function formatBackoffSeconds(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)} h`;
+  return `${Math.round(seconds / 86400)} d`;
+}
+
+/**
+ * Mirrors the runner's launch-failure backoff math in
+ * `scheduler_service.rs`: `min(base * 2^(failures - 1), 86400)`.
+ */
+function computeEffectiveBackoff(task: ScheduledTask): number {
+  const base = task.launchFailureBackoffSeconds ?? 60;
+  const failures = task.consecutiveLaunchFailures ?? 0;
+  if (failures <= 0) return base;
+  const exp = Math.min(failures - 1, 30);
+  const computed = base * Math.pow(2, exp);
+  return Math.min(computed, 86400);
+}
 
 interface SchedulerTaskListProps {
   tasks: ScheduledTask[];
@@ -70,6 +91,10 @@ export function SchedulerTaskList({
         return <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />;
       case "skipped":
         return <SkipForward className={`w-4 h-4 ${getStatusColors("warning").icon}`} />;
+      case "launch_failed":
+        return <AlertTriangle className={`w-4 h-4 ${getAccentColors("orange").text}`} />;
+      case "missed_runner_down":
+        return <Clock className={`w-4 h-4 ${getAccentColors("slate").text}`} />;
       default:
         return <Clock className="w-4 h-4 text-muted-foreground" />;
     }
@@ -81,6 +106,12 @@ export function SchedulerTaskList({
         const isSelected = selectedTask?.id === task.id;
         const running = isTaskRunning(task);
         const timeUntil = getTimeUntilNextRun(task);
+        const failures = task.consecutiveLaunchFailures ?? 0;
+        const hasLaunchFailures = failures > 0;
+        const backoffSeconds = hasLaunchFailures ? computeEffectiveBackoff(task) : 0;
+        const backoffTooltip = hasLaunchFailures
+          ? `Waiting ${formatBackoffSeconds(backoffSeconds)} before retry due to ${failures} launch failure${failures > 1 ? "s" : ""}`
+          : undefined;
 
         return (
           <div
@@ -119,6 +150,15 @@ export function SchedulerTaskList({
                       Auto-Fix
                     </span>
                   )}
+                  {hasLaunchFailures && (
+                    <span
+                      className={`flex items-center gap-1 px-2 py-0.5 text-xs ${getAccentColors("orange").bg} ${getAccentColors("orange").text} rounded`}
+                      title={backoffTooltip}
+                    >
+                      <AlertTriangle className="w-3 h-3" />
+                      {failures} launch failure{failures > 1 ? "s" : ""}
+                    </span>
+                  )}
                 </div>
                 <div className="mt-1 text-sm text-muted-foreground">
                   {describeTaskType(task.task)}
@@ -126,7 +166,16 @@ export function SchedulerTaskList({
                 <div className="mt-1 flex items-center gap-4 text-xs text-muted-foreground">
                   <span>{describeSchedule(task.schedule)}</span>
                   {timeUntil && task.enabled && (
-                    <span className="text-primary">Next: {timeUntil}</span>
+                    <span
+                      className={
+                        hasLaunchFailures ? getAccentColors("orange").text : "text-primary"
+                      }
+                      title={backoffTooltip}
+                    >
+                      Next: {timeUntil === "Overdue" ? "Overdue" : `in ${timeUntil}`}
+                      {hasLaunchFailures &&
+                        ` (after ${failures} failure${failures > 1 ? "s" : ""})`}
+                    </span>
                   )}
                 </div>
                 {task.description && (

@@ -159,6 +159,7 @@ pub mod ai_generation; // AI generation for builder tabs (context, api request, 
 pub mod ai_session; // Interactive AI session commands (send message, interrupt, get state)
 pub mod ai_settings;
 pub mod auth;
+pub mod autostart; // Phase F.1 — launch-on-system-startup toggle (tauri-plugin-autostart wrapper)
 pub mod backup; // Comprehensive backup and restore
 pub mod checkpoint_browser; // Orchestrator checkpoint browser (time-travel debugging)
 pub mod checkpoints;

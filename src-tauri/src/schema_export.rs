@@ -96,6 +96,11 @@ pub fn export_all_schemas() -> Value {
     add!("ScheduledTaskStatus", qs::ScheduledTaskStatus);
     add!("TaskExecutionRecord", qs::TaskExecutionRecord);
     add!("ScheduledTask", qs::ScheduledTask);
+    // Phase A (scheduler reliability) types: explicit top-level entries so
+    // they get their own per-type TS / Python files (rather than being
+    // inlined as anonymous defs inside ScheduledTask / ScheduledTaskType).
+    add!("CatchUpPolicy", qs::CatchUpPolicy);
+    add!("McpConnectionRef", qs::McpConnectionRef);
     add!("SchedulerSettings", qs::SchedulerSettings);
     add!("SchedulerStatus", qs::SchedulerStatus);
     add!("NextTaskInfo", qs::NextTaskInfo);
@@ -611,7 +616,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 409, "Expected 409 schema entries");
+        assert_eq!(obj.len(), 411, "Expected 411 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
