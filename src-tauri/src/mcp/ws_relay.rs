@@ -410,6 +410,8 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
 
     // 5. Fan out: one task drains outbound_rx → sink with periodic pings,
     //    the current task reads inbound frames.
+    let send_app_id = register.app_id.clone();
+    let send_registry = registry.clone();
     let send_task = tokio::spawn(async move {
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -429,6 +431,13 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
                     if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                         break;
                     }
+                    // Refresh registry liveness so list_live() doesn't drop us
+                    // after REGISTRATION_TTL_MS (30s) just because we haven't
+                    // re-`upsert`-ed. The inbound recv loop also refreshes on
+                    // every frame; this branch covers the case where the
+                    // wrapper is quiet and we're the only thing keeping the
+                    // socket warm.
+                    let _ = send_registry.touch(&send_app_id).await;
                 }
             }
         }
@@ -437,9 +446,16 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
 
     let recv_app_id = register.app_id.clone();
     let recv_relay = relay.clone();
-    let recv_outcome = tokio::time::timeout(HEARTBEAT_TIMEOUT, async {
-        // We manually gate on HEARTBEAT_TIMEOUT between frames — reset the
-        // timer whenever the wrapper says *anything* (data, pong, ping).
+    let recv_registry = registry.clone();
+    // The recv loop runs for the lifetime of the WebSocket. Per-frame
+    // liveness is enforced by the inner `tokio::time::timeout` on each
+    // `stream.next()` call below — if no frame (data, pong, ping) arrives
+    // within HEARTBEAT_TIMEOUT, that inner timeout fires and we break out
+    // cleanly. We deliberately do NOT wrap the whole loop in an outer
+    // `tokio::time::timeout(HEARTBEAT_TIMEOUT, …)` — that would drop the
+    // connection at exactly 45 s regardless of frame activity, because
+    // tokio's `timeout` does not reset on inner await progress.
+    let recv_outcome = async {
         loop {
             let next = tokio::time::timeout(HEARTBEAT_TIMEOUT, stream.next()).await;
             let msg = match next {
@@ -459,6 +475,14 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
                 }
             };
 
+            // Any inbound frame (text/binary/ping/pong) means the wrapper is
+            // alive — refresh registry liveness so list_live() keeps returning
+            // this app past REGISTRATION_TTL_MS. We skip refresh on Close so
+            // a closing tab doesn't briefly look fresh during teardown.
+            if !matches!(msg, Message::Close(_)) {
+                let _ = recv_registry.touch(&recv_app_id).await;
+            }
+
             match msg {
                 Message::Text(text) => {
                     handle_inbound_text(&recv_app_id, &recv_relay, text.as_str()).await;
@@ -472,10 +496,8 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
                 Message::Close(_) => break,
             }
         }
-    })
+    }
     .await;
-    // Outer timeout is a belt-and-suspenders guard around the inner per-frame
-    // timeout; either triggering means the loop is done.
     let _ = recv_outcome;
 
     // 6. Clean up. We reject all pending commands on disconnect so their

@@ -97,6 +97,22 @@ impl AppRegistry {
         w.remove(app_id).is_some()
     }
 
+    /// Lightweight liveness refresh — bumps `last_seen_ms` to "now" without
+    /// requiring the caller to provide a full `DiscoveredApp`. Intended for
+    /// the WS relay's hot path (every inbound frame and every outbound
+    /// heartbeat tick) where cloning the `DiscoveredApp` for `upsert` would
+    /// be wasteful. Returns `true` if an entry exists for `app_id`.
+    pub async fn touch(&self, app_id: &str) -> bool {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut w = self.inner.write().await;
+        if let Some(entry) = w.get_mut(app_id) {
+            entry.last_seen_ms = now;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Look up an entry by app_id (regardless of freshness). Returns a clone
     /// so callers can inspect the transport without holding the lock.
     pub async fn get(&self, app_id: &str) -> Option<RegisteredApp> {
@@ -225,6 +241,48 @@ mod tests {
             let mut w = reg.inner.write().await;
             w.get_mut("a1").unwrap().last_seen_ms -= REGISTRATION_TTL_MS + 1;
         }
+        assert!(reg.list_live().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn touch_refreshes_last_seen_ms() {
+        let reg = AppRegistry::new();
+        reg.upsert(sample_app("a1"), None, AppTransport::Websocket, Some(1))
+            .await;
+        // Backdate so the entry is "stale" and would be filtered by list_live().
+        {
+            let mut w = reg.inner.write().await;
+            w.get_mut("a1").unwrap().last_seen_ms -= REGISTRATION_TTL_MS + 1;
+        }
+        assert!(
+            reg.list_live().await.is_empty(),
+            "precondition: backdated entry should not be live"
+        );
+
+        let refreshed = reg.touch("a1").await;
+        assert!(refreshed, "touch must return true for known app_id");
+
+        let live = reg.list_live().await;
+        assert_eq!(live.len(), 1, "touched entry should be live again");
+        assert_eq!(live[0].app.app_id, "a1");
+
+        // last_seen_ms should now be very close to "now".
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            now - live[0].last_seen_ms < 1_000,
+            "touch should set last_seen_ms close to now (delta={}ms)",
+            now - live[0].last_seen_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_returns_false_for_unknown_app() {
+        let reg = AppRegistry::new();
+        assert!(
+            !reg.touch("nope").await,
+            "touch on empty registry must return false"
+        );
+        // Sanity: registry is still empty (touch doesn't create entries).
         assert!(reg.list_live().await.is_empty());
     }
 }
