@@ -12,6 +12,7 @@ $BASE = "http://localhost:9876/ui-bridge"
 $RUNNER_API = "http://localhost:9876"
 $SPEC_DIR = "$env:APPDATA\com.qontinui.runner\user-specs"
 $logFile = "$PSScriptRoot\spec-gen.log"
+$UTF8_NO_BOM = New-Object System.Text.UTF8Encoding $false  # WriteAllText default adds BOM; Rust serde_json rejects BOM
 
 New-Item -ItemType Directory -Force -Path $SPEC_DIR | Out-Null
 "" | Out-File $logFile -Force
@@ -118,9 +119,9 @@ function Extract-AndSave-Spec {
             $null = $json | ConvertFrom-Json  # validate
             $safeName = $specId -replace ':', '_'
             $path = "$SPEC_DIR\$safeName.json"
-            # Use .NET writer directly — PowerShell 5.1's Set-Content -Encoding UTF8 adds a BOM,
-            # which causes Rust's serde_json to reject the file silently.
-            [System.IO.File]::WriteAllText($path, $json, [System.Text.Encoding]::UTF8)
+            # Use .NET writer with explicit no-BOM encoding — PowerShell 5.1's Set-Content -Encoding UTF8
+            # and [System.Text.Encoding]::UTF8 both add a BOM, which serde_json rejects silently.
+            [System.IO.File]::WriteAllText($path, $json, $UTF8_NO_BOM)
             Log "  Saved $specId to disk ($($json.Length) chars)"
         } else {
             Log "  WARNING: No JSON block found in task output for $specId"
