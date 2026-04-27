@@ -317,7 +317,7 @@
     {
       "id": "ss-custom-actions-policy",
       "name": "Custom Policy Editor — Actions Section",
-      "description": "The Actions sub-section controls L6 action governance. It contains a 'Block destructive commands' toggle (boolean) and a 'Blocked command patterns (regex, one per line)' textarea (id: security-blocked-commands) with placeholder '^\s*sudo\\b\\n^\s*su\\b'. Command patterns are regex strings matched against command invocations before execution.",
+      "description": "The Actions sub-section controls L6 action governance. It contains a 'Block destructive commands' toggle (boolean) and a 'Blocked command patterns (regex, one per line)' textarea (id: security-blocked-commands) with placeholder '^\\s*sudo\\b\\n^\\s*su\\b'. Command patterns are regex strings matched against command invocations before execution.",
       "category": "interaction",
       "assertions": [
         {
