@@ -796,17 +796,25 @@ impl Default for DebugSettings {
 /// headless) can enable web integration independently of headless-window
 /// behavior. Env vars `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN`
 /// still work as runtime-only overrides for headless deploys.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+///
+/// Defaults are tuned for a fresh install to be visible to the qontinui-web
+/// `/connect` flow without any manual configuration: `enabled = true` and
+/// `backend_url` points at the dev backend in debug builds (`http://localhost:8000`)
+/// or the production backend in release builds (`https://api.qontinui.io`).
+/// `runner_token` still defaults to empty — it must be granted by the user
+/// through the OAuth-style `start_web_token_flow`. The runner UI surfaces a
+/// "needs authorization" banner whenever `enabled && runner_token.is_empty()`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebIntegrationSettings {
     /// Master toggle. When false, the runner does not register, heartbeat, or emit events.
-    #[serde(default)]
+    #[serde(default = "default_web_integration_enabled")]
     pub enabled: bool,
 
     /// API base — the FastAPI backend that serves `/api/v1/*`. In a unified
     /// production deployment this is also the origin that serves the web SPA.
     /// Example: `https://api.qontinui.io` or `http://127.0.0.1:8000`.
     /// No trailing slash required.
-    #[serde(default)]
+    #[serde(default = "default_web_integration_backend_url")]
     pub backend_url: String,
 
     /// Optional override for the Next.js web frontend origin — the host that
@@ -821,6 +829,97 @@ pub struct WebIntegrationSettings {
     /// Stored plaintext — acceptable since the settings file is user-local.
     #[serde(default)]
     pub runner_token: String,
+}
+
+/// Default for [`WebIntegrationSettings::enabled`] — `true` so a fresh install
+/// is connected to its backend out of the box. The user can opt out via
+/// Settings → Web Integration; we still respect that choice when set.
+fn default_web_integration_enabled() -> bool {
+    true
+}
+
+/// Default for [`WebIntegrationSettings::backend_url`] — the dev backend in
+/// debug builds, the production backend in release builds. We pick this at
+/// compile time via `cfg(debug_assertions)` to match how other defaults in
+/// this codebase distinguish dev vs prod (see `dev_services.rs`).
+///
+/// The user can override either value via Settings → Web Integration; the
+/// override is persisted to `settings.json` and survives upgrades.
+pub(crate) fn default_web_integration_backend_url() -> String {
+    if cfg!(debug_assertions) {
+        "http://localhost:8000".to_string()
+    } else {
+        "https://api.qontinui.io".to_string()
+    }
+}
+
+impl Default for WebIntegrationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_web_integration_enabled(),
+            backend_url: default_web_integration_backend_url(),
+            web_base_url: None,
+            runner_token: String::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod web_integration_default_tests {
+    use super::*;
+
+    /// A fresh install (no persisted settings) must default to:
+    ///   - enabled: true
+    ///   - backend_url: dev or prod URL depending on build profile
+    ///   - runner_token: empty (token requires user OAuth consent)
+    ///   - web_base_url: None
+    ///
+    /// This locks in the "fresh install is connected by default" contract:
+    /// when these defaults change, the `/connect` flow on the mobile app
+    /// breaks and the in-runner authorization banner stops appearing.
+    #[test]
+    fn default_is_enabled_with_environment_appropriate_backend_url() {
+        let s = WebIntegrationSettings::default();
+        assert!(
+            s.enabled,
+            "fresh install must default to enabled — disabled fresh installs are invisible to /connect"
+        );
+        assert!(
+            s.runner_token.is_empty(),
+            "runner_token must default to empty — token comes from user OAuth consent only"
+        );
+        assert_eq!(s.web_base_url, None);
+
+        if cfg!(debug_assertions) {
+            assert_eq!(s.backend_url, "http://localhost:8000");
+        } else {
+            assert_eq!(s.backend_url, "https://api.qontinui.io");
+        }
+    }
+
+    /// An empty JSON object must deserialize to the same defaults as
+    /// `WebIntegrationSettings::default()`. This guarantees that a runner
+    /// upgrading from a settings.json missing the `web_integration` key —
+    /// or with `web_integration: {}` — also picks up the new defaults.
+    #[test]
+    fn deserializes_empty_object_to_default() {
+        let parsed: WebIntegrationSettings =
+            serde_json::from_str("{}").expect("empty object must deserialize");
+        assert_eq!(parsed, WebIntegrationSettings::default());
+    }
+
+    /// User-provided values must take precedence over the new defaults —
+    /// this is the upgrade-safety contract. A user who explicitly disabled
+    /// web integration before the default flipped to `true` keeps their
+    /// `enabled: false`. Same for a custom backend URL.
+    #[test]
+    fn explicit_user_values_override_defaults() {
+        let parsed: WebIntegrationSettings =
+            serde_json::from_str(r#"{"enabled": false, "backend_url": "http://my-backend:9999"}"#)
+                .expect("must deserialize");
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.backend_url, "http://my-backend:9999");
+    }
 }
 
 // ============================================================================

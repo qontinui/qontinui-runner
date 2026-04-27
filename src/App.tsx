@@ -50,6 +50,7 @@ import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration
 
 import { ToastContainer } from "./components/ToastContainer";
 import { BuildRefreshBanner } from "./components/BuildRefreshBanner";
+import { WebIntegrationAuthBanner } from "./components/WebIntegrationAuthBanner";
 import { ApprovalDialog } from "./components/dag-workflow-editor";
 import StatusIndicator from "./components/StatusIndicator";
 import ActionDetailModal from "./components/ActionDetailModal";
@@ -443,6 +444,15 @@ function AppContent() {
           showLogSourcePicker={showLogSourcePicker}
           executionActive={execution.executionActive}
         />
+        {/*
+          Top-of-app banner that surfaces "this runner needs to be authorized
+          with qontinui-web" for fresh installs. Mounted inside UIBridgeProvider
+          (via App > UIBridgeProvider > AppContent) so its useUIElement
+          registrations land on the live registry. Mounted after the
+          auth/setup gates above so we don't show it on the login or
+          first-run wizard screens.
+        */}
+        <WebIntegrationAuthBanner />
         <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
           <StatusIndicator
             pythonStatus={execution.pythonStatus}
