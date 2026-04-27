@@ -136,9 +136,20 @@ pub async fn install(
     let root = registry.root().to_path_buf();
     std::fs::create_dir_all(&root)?;
 
-    // Stage in a temp slot so a failed install doesn't leave a half-good
-    // canonical directory behind.
-    let stage = root.join(format!(".install-{}", short_random()));
+    // Stage OUTSIDE the wrappers root so the registry's `notify` watcher
+    // doesn't fire on every pnpm write and race the post-install rename.
+    // On Windows the watcher's directory enumeration locks files briefly,
+    // and pnpm's atomic operations on the same paths return
+    // `os error 32: process cannot access the file because it is being
+    // used by another process`. Staging in a sibling directory (same
+    // volume — the rename below stays atomic) sidesteps the contention
+    // entirely.
+    let stage_root = root
+        .parent()
+        .map(|p| p.join("wrappers-staging"))
+        .unwrap_or_else(|| std::env::temp_dir().join("qontinui-wrappers-staging"));
+    std::fs::create_dir_all(&stage_root)?;
+    let stage = stage_root.join(format!("install-{}", short_random()));
     if stage.exists() {
         // Highly unlikely (random suffix) but tidy up if it does.
         let _ = std::fs::remove_dir_all(&stage);
