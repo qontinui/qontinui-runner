@@ -2,8 +2,8 @@
 
 use std::future::Future;
 use tokio_postgres::{
-    Client, Error, Row, RowStream, Statement, ToStatement, Transaction,
     types::{BorrowToSql, ToSql},
+    Client, Error, Row, RowStream, Statement, ToStatement, Transaction,
 };
 /// Abstraction over multiple types of asynchronous clients.
 /// This allows you to use tokio_postgres clients and transactions interchangeably.
