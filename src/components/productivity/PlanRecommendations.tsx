@@ -42,7 +42,7 @@ export function PlanRecommendations() {
 
   const openPlan = useCallback((planId: string) => {
     // The ProductivityPage listens for both events.
-    window.dispatchEvent(new CustomEvent("productivity-set-view", { detail: "plans" }));
+    window.dispatchEvent(new CustomEvent("productivity-set-view", { detail: { view: "plans" } }));
     window.dispatchEvent(
       new CustomEvent("productivity-select-plan", {
         detail: { planId },

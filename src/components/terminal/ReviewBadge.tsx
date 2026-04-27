@@ -32,12 +32,14 @@ interface ReviewBadgeProps {
  *  order to switch to the Coordinator view with the recommendation pre-
  *  selected. The Productivity tab subscribes via a window event listener. */
 function openRecommendationsQueue(reviewId: string) {
-  // First nudge the Productivity tab into the coordinator sub-view.
-  window.dispatchEvent(new CustomEvent("productivity-set-view", { detail: "coordinator" }));
+  // Nudge the Productivity tab into the coordinator sub-view. The listener
+  // in ProductivityPage reads detail.view, so this must be a wrapper object —
+  // `useAppNavigation` follows the same convention.
+  window.dispatchEvent(
+    new CustomEvent("productivity-set-view", { detail: { view: "coordinator" } }),
+  );
   // Then ship a separate event with the review id so the Recommendations
-  // panel can scroll/highlight that row. Two events instead of one nested
-  // detail object so older listeners that only know about
-  // `productivity-set-view` continue working.
+  // panel can scroll/highlight that row.
   window.dispatchEvent(
     new CustomEvent("productivity-select-recommendation", {
       detail: { reviewId },

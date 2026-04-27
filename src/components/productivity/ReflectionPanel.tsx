@@ -113,7 +113,9 @@ export function ReflectionPanel({ planId, plan }: ReflectionPanelProps) {
   const handleKnowledgeClick = useCallback((area: string) => {
     // Switch to the knowledge sub-view and pre-filter to the area. The
     // ProductivityPage / KnowledgeBrowser listen for these events.
-    window.dispatchEvent(new CustomEvent("productivity-set-view", { detail: "knowledge" }));
+    window.dispatchEvent(
+      new CustomEvent("productivity-set-view", { detail: { view: "knowledge" } }),
+    );
     window.dispatchEvent(
       new CustomEvent("productivity-knowledge-filter", {
         detail: { area },

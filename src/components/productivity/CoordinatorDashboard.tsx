@@ -214,7 +214,7 @@ function RecommendationsPanel({
                         // both events.
                         window.dispatchEvent(
                           new CustomEvent("productivity-set-view", {
-                            detail: "plans",
+                            detail: { view: "plans" },
                           }),
                         );
                         window.dispatchEvent(
