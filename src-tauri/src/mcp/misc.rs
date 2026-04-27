@@ -2218,19 +2218,18 @@ async fn lookup_temp_spawn_placement(
     };
 
     let placement = placements[resolved_index].clone();
-    let resolved = crate::spawn_placement::resolve_to_global_physical(
-        &state.app_handle,
-        &placement,
-    )
-    .map_err(|e| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("failed to resolve placement: {}", e),
-                "index": q.index,
-            })),
-        )
-    })?;
+    let resolved =
+        crate::spawn_placement::resolve_to_global_physical(&state.app_handle, &placement).map_err(
+            |e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("failed to resolve placement: {}", e),
+                        "index": q.index,
+                    })),
+                )
+            },
+        )?;
 
     Ok(Json(ApiResponse::success(SpawnPlacementPreviewResponse {
         global_x: resolved.global_x,
@@ -2279,10 +2278,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/spawn-placement/temps",
             get(list_temp_spawn_placements).put(replace_temp_spawn_placements),
         )
-        .route(
-            "/spawn-placement/temp",
-            get(lookup_temp_spawn_placement),
-        )
+        .route("/spawn-placement/temp", get(lookup_temp_spawn_placement))
         .route("/tool-version", get(get_tool_version))
         .route("/load-config", post(load_config))
         .route("/load-last-config", post(load_last_config))
