@@ -44,6 +44,48 @@ impl ProcessCaptureManager {
 
     /// Start a managed process by ID.
     pub async fn start_process(&self, id: &str) -> Result<(), String> {
+        // Pre-flight: read health_port + state under a brief read lock so the
+        // async port cleanup below doesn't hold the manager's write lock.
+        let (health_port, current_state) = {
+            let processes = self.processes.read().await;
+            let target = processes
+                .get(id)
+                .ok_or_else(|| format!("Process '{}' not found", id))?;
+            (target.config.health_port, target.runtime.state)
+        };
+
+        // Mirror the state-check in `ManagedProcess::start` so the port cleanup
+        // below can't kill our own running process.
+        if !matches!(
+            current_state,
+            ProcessState::Stopped | ProcessState::Failed | ProcessState::Building
+        ) {
+            return Err(format!(
+                "Process '{}' is in state {}, cannot start",
+                id,
+                current_state.as_str()
+            ));
+        }
+
+        // If the health port is already bound (e.g. an orphaned dev server from
+        // a previous session), reclaim it before spawning. Symmetric with
+        // stop_process, which also kills lingering port owners.
+        if let Some(port) = health_port {
+            if health::is_port_in_use(port) {
+                warn!(
+                    "Port {} is bound by another process before starting '{}'; killing port owner",
+                    port, id
+                );
+                health::kill_port_process(port).await;
+                if !health::wait_for_port_free(port, Duration::from_secs(5)).await {
+                    return Err(format!(
+                        "Port {} still in use after attempting to free it; cannot start process '{}'",
+                        port, id
+                    ));
+                }
+            }
+        }
+
         // Take the process out to start it (need mutable access)
         let mut processes = self.processes.write().await;
 

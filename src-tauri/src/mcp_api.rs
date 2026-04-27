@@ -1735,7 +1735,12 @@ fn try_bind_port(port: u16) -> Result<std::net::TcpListener, std::io::Error> {
     )?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
-    socket.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+    // Bind loopback only: all consumers (Claude Code, supervisor, web frontend) are
+    // co-located with the runner. Loopback traffic bypasses Windows Firewall, so
+    // every uniquely-renamed `qontinui-runner-<id>.exe` copy avoids triggering a
+    // first-run permission prompt. Also reduces attack surface — the API is never
+    // exposed to LAN.
+    socket.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())?;
     socket.listen(1024)?;
     Ok(socket.into())
 }
