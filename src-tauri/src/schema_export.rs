@@ -28,9 +28,9 @@ pub fn export_all_schemas() -> Value {
         accessibility as qa, ai_workflows as qaw, app_events as qae, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn, geometry as qg,
         mcp_config as qmc, orchestration_config as qoc, process_management as qpm, rag as qr,
-        scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
-        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
-        worker_output as qwo, workflow as qw, workflow_step as qws,
+        runner as qrn, scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr,
+        terminal as qtm, ticket_system as qts, tree_events as qte, ui_bridge as qub,
+        verification as qv, worker_output as qwo, workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -598,6 +598,12 @@ pub fn export_all_schemas() -> Value {
     add!("VectorSearchResult", qr::VectorSearchResult);
     add!("ExportResult", qr::ExportResult);
 
+    // ── qontinui-types: runner (canonical Runner entity) ──
+    add!("Runner", qrn::Runner);
+    add!("RunnerStatus", qrn::RunnerStatus);
+    add!("RunnerUiError", qrn::RunnerUiError);
+    add!("RunnerCrash", qrn::RunnerCrash);
+
     Value::Object(m)
 }
 
@@ -621,7 +627,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 411, "Expected 411 schema entries");
+        assert_eq!(obj.len(), 420, "Expected 420 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
