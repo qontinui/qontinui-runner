@@ -44,11 +44,11 @@ sudo systemctl restart rathole        # after editing server.toml
 
 ## Alternatives if you don't want OCI
 
-| Host         | Cost       | Notes                                         |
-|--------------|------------|-----------------------------------------------|
-| Hetzner CX22 | €4/mo      | 20TB egress included, flat pricing            |
-| Fly.io       | ~free small| Global edge, pay-per-use                      |
-| AWS t4g.nano | $3/mo VM   | **$0.09/GB egress** — watch out for bills     |
+| Host         | Cost        | Notes                                     |
+| ------------ | ----------- | ----------------------------------------- |
+| Hetzner CX22 | €4/mo       | 20TB egress included, flat pricing        |
+| Fly.io       | ~free small | Global edge, pay-per-use                  |
+| AWS t4g.nano | $3/mo VM    | **$0.09/GB egress** — watch out for bills |
 
 The script is distro-agnostic — just pass server.toml to `sudo bash` on any
 systemd Linux host and it'll work.

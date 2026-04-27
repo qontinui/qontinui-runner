@@ -29,7 +29,9 @@ const dryRun = args.includes("--dry-run");
 const follow = args.includes("--follow");
 
 if (!planFile) {
-  console.error("Usage: npx tsx scripts/run-plan-implementation.ts <plan-file.md> [--port 9876] [--dry-run] [--follow]");
+  console.error(
+    "Usage: npx tsx scripts/run-plan-implementation.ts <plan-file.md> [--port 9876] [--dry-run] [--follow]",
+  );
   process.exit(1);
 }
 
@@ -62,7 +64,8 @@ interface PlanPhase {
   tasks: PlanTask[];
 }
 
-const SKIP_SECTIONS = /^\s*#{1,3}\s+(goal|context|background|reference|validation|appendix|notes|prerequisites?|requirements?|current|what is|how\s)/i;
+const SKIP_SECTIONS =
+  /^\s*#{1,3}\s+(goal|context|background|reference|validation|appendix|notes|prerequisites?|requirements?|current|what is|how\s)/i;
 
 function parsePlan(text: string): PlanPhase[] {
   const lines = text.split("\n");
@@ -166,7 +169,12 @@ function parsePlan(text: string): PlanPhase[] {
     }
 
     // ── Continuation text → append to phase description ─────────────────
-    if (currentPhase && trimmed.length > 0 && !trimmed.startsWith("#") && !trimmed.startsWith("```")) {
+    if (
+      currentPhase &&
+      trimmed.length > 0 &&
+      !trimmed.startsWith("#") &&
+      !trimmed.startsWith("```")
+    ) {
       if (currentPhase.description === currentPhase.name) {
         currentPhase.description = trimmed;
       } else if (currentPhase.description.length < 500) {
@@ -265,7 +273,8 @@ function makeCompileCheck(stageLabel: string) {
     name: `${stageLabel}: Compile Check`,
     mode: "check",
     check_type: "typecheck",
-    command: "npx tsc --noEmit 2>&1 | tail -5; cargo check --manifest-path src-tauri/Cargo.toml 2>&1 | tail -5",
+    command:
+      "npx tsc --noEmit 2>&1 | tail -5; cargo check --manifest-path src-tauri/Cargo.toml 2>&1 | tail -5",
     fail_on_error: true,
   };
 }
@@ -283,7 +292,9 @@ function buildWorkflow(phases: PlanPhase[]) {
       description: `Implement all tasks for phase: ${phase.name}`,
       setup_steps: [],
       verification_steps: [makeCompileCheck(`Phase ${i + 1} Implement`)],
-      agentic_steps: [makePromptStep("agentic", `Implement: ${phase.name}`, buildImplementPrompt(phase, i))],
+      agentic_steps: [
+        makePromptStep("agentic", `Implement: ${phase.name}`, buildImplementPrompt(phase, i)),
+      ],
       completion_steps: [],
       max_iterations: 15,
     });
@@ -294,7 +305,9 @@ function buildWorkflow(phases: PlanPhase[]) {
       description: `Review implementation for phase: ${phase.name}`,
       setup_steps: [],
       verification_steps: [makeCompileCheck(`Phase ${i + 1} Review`)],
-      agentic_steps: [makePromptStep("agentic", `Review: ${phase.name}`, buildReviewPrompt(phase, i))],
+      agentic_steps: [
+        makePromptStep("agentic", `Review: ${phase.name}`, buildReviewPrompt(phase, i)),
+      ],
       completion_steps: [],
       max_iterations: 6,
     });
@@ -305,7 +318,9 @@ function buildWorkflow(phases: PlanPhase[]) {
       description: `Find and fix remaining issues for phase: ${phase.name}`,
       setup_steps: [],
       verification_steps: [makeCompileCheck(`Phase ${i + 1} Next Steps`)],
-      agentic_steps: [makePromptStep("agentic", `Next Steps: ${phase.name}`, buildNextStepsPrompt(phase, i))],
+      agentic_steps: [
+        makePromptStep("agentic", `Next Steps: ${phase.name}`, buildNextStepsPrompt(phase, i)),
+      ],
       completion_steps: [],
       max_iterations: 6,
     });
@@ -319,8 +334,11 @@ function buildWorkflow(phases: PlanPhase[]) {
     verification_steps: [],
     agentic_steps: [],
     completion_steps: [
-      makePromptStep("completion", "Commit Changes",
-        "## Commit Changes\n\nAll implementation phases are complete. Run `git status` and `git diff --stat`, stage relevant files (exclude .env, credentials), and commit with `feat: <summary>`. Do NOT include AI attribution."),
+      makePromptStep(
+        "completion",
+        "Commit Changes",
+        "## Commit Changes\n\nAll implementation phases are complete. Run `git status` and `git diff --stat`, stage relevant files (exclude .env, credentials), and commit with `feat: <summary>`. Do NOT include AI attribution.",
+      ),
     ],
     max_iterations: 1,
   });
@@ -335,8 +353,11 @@ function buildWorkflow(phases: PlanPhase[]) {
     verification_steps: [],
     agentic_steps: [],
     completion_steps: [
-      makePromptStep("completion", "Summary",
-        "Summarize what was accomplished across all phases. List files changed, features implemented, and any remaining issues."),
+      makePromptStep(
+        "completion",
+        "Summary",
+        "Summarize what was accomplished across all phases. List files changed, features implemented, and any remaining issues.",
+      ),
     ],
     max_iterations: 15,
     stages,
@@ -417,10 +438,13 @@ async function followProgress(taskRunId: string): Promise<void> {
             const run = summaryData?.data ?? summaryData;
             const sessions = run.sessions_count ?? 0;
             const cost = run.total_cost_usd != null ? `$${run.total_cost_usd.toFixed(2)}` : "n/a";
-            const tokens = run.total_tokens != null ? `${Math.round(run.total_tokens / 1000)}k` : "n/a";
+            const tokens =
+              run.total_tokens != null ? `${Math.round(run.total_tokens / 1000)}k` : "n/a";
             console.error(`  Sessions: ${sessions}, Tokens: ${tokens}, Cost: ${cost}`);
           }
-        } catch { /* non-fatal */ }
+        } catch {
+          /* non-fatal */
+        }
         break;
       }
     } catch (err) {
@@ -444,7 +468,9 @@ if (phases.length === 0) {
   process.exit(1);
 }
 
-console.error(`Parsed: ${phases.length} phases, ${phases.reduce((s, p) => s + p.tasks.length, 0)} tasks`);
+console.error(
+  `Parsed: ${phases.length} phases, ${phases.reduce((s, p) => s + p.tasks.length, 0)} tasks`,
+);
 for (const p of phases) {
   console.error(`  Phase: ${p.name} (${p.tasks.length} tasks)`);
 }
@@ -474,9 +500,8 @@ if (!response.ok) {
 }
 
 const result = await response.json();
-const taskRunId = result?.data?.loop_result?.task_run_id
-  ?? result?.data?.task_run_id
-  ?? result?.task_run_id;
+const taskRunId =
+  result?.data?.loop_result?.task_run_id ?? result?.data?.task_run_id ?? result?.task_run_id;
 
 console.error("Workflow started successfully.");
 if (taskRunId) {

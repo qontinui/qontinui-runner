@@ -1,0 +1,1294 @@
+{
+  "version": "1.0.0",
+  "description": "The Visual Dashboard (accessible via the 'active' tab in runner navigation) is the real-time monitoring hub for workflow execution in qontinui-runner. It provides: a top ControlBar (h-14) showing the running task name, workflow stage indicator pills, and playback controls (pause/resume/stop/auto-continue); a dynamic widget content area with a 65% active / 35% summary-stack split that supports 14 activity types (gui_automation, ai_conversation, verification, findings, shell_command, api_request, script, workflow_ref, mcp_call, execution_timeline, flow_execution, canvas, trace_viewer, playwright); a bottom status bar (h-10) with elapsed-time metric, current-activity label, orchestrator-agent badge, and connection-health indicator. Overlays include: a completion summary auto-dismissing after 15 s, a breakpoint inspector panel for paused executions, a human approval dialog, and an ActiveRunsBar multi-run switcher that appears when two or more concurrent runs are active. Keyboard shortcuts (?, Ctrl+1-8, Ctrl+R, Escape) are available throughout.",
+  "groups": [
+    {
+      "id": "vd-page-structure",
+      "name": "Page Structure — Fixed Bars and Content Area",
+      "description": "The dashboard has a fixed vertical layout: ControlBar at the top (always visible), a flex-1 DashboardLayout content area in the middle, and BottomBar at the bottom (always visible). An optional OrchestrationLoopBanner and TopPatternsWidget may appear between the ControlBar and the content area when orchestration is active.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "vd-structure-task-name-present",
+          "description": "The element with data-content-label='task name' is present in the ControlBar, confirming the top bar has rendered",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "task name" },
+            "label": "Task name label in control bar"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-structure-elapsed-time-present",
+          "description": "The element with data-content-label='elapsed time' is present in the BottomBar, confirming the bottom bar has rendered",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "elapsed time" },
+            "label": "Elapsed time metric in bottom bar"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-structure-connection-status-present",
+          "description": "The element with data-content-label='connection status' is always present in the BottomBar",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "connection status" },
+            "label": "Connection status badge"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-structure-layout-split",
+          "description": "When a workflow is running with at least two activity types detected, the content area displays a 65/35 split: the active widget occupies the left ~65% and compact summary widget cards stack on the right ~35%. Both zones are visible simultaneously without scrolling.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Dashboard content area"
+          },
+          "assertionType": "semantic",
+          "precondition": "A workflow is running with at least two detected activity types",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-idle-state",
+      "name": "Idle State — No Active Workflow",
+      "description": "When no workflow is running, the content area shows the IdleState component: a workflow icon, 'No Active Workflow' heading, a subtitle, and optional 'Run Last Workflow ({name})' / 'View Last Run ({name})' buttons when a previous run exists.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "vd-idle-heading",
+          "description": "A heading with text 'No Active Workflow' is displayed in the content area",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "No Active Workflow" },
+            "label": "Idle state heading"
+          },
+          "assertionType": "exists",
+          "precondition": "No workflow is running or queued",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-idle-run-last-button",
+          "description": "A 'Run Last Workflow' button (label contains 'Run Last Workflow') is visible when at least one prior workflow exists",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Run Last Workflow" },
+            "label": "Run Last Workflow button"
+          },
+          "assertionType": "exists",
+          "precondition": "Dashboard is idle and at least one workflow has previously been run",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-idle-hidden-when-running",
+          "description": "The 'No Active Workflow' heading is NOT visible when a workflow is running — the widget area replaces it",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "No Active Workflow" },
+            "label": "Idle state heading (should be absent)"
+          },
+          "assertionType": "notExists",
+          "precondition": "A workflow is currently running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-idle-run-last-behavior",
+          "description": "Clicking 'Run Last Workflow' starts a new execution of the most recently run workflow. The dashboard transitions from idle (shows 'No Active Workflow') to running (shows task name in ControlBar and widget area with live activity). The onRunLastWorkflow callback is invoked which triggers the runner execution pipeline.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Run Last Workflow" },
+            "label": "Run Last Workflow button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Dashboard is idle and Run Last Workflow button is visible",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-control-bar-task-phase",
+      "name": "Control Bar — Task Name and Phase",
+      "description": "The left section of the ControlBar shows the running workflow's task name (data-content-label='task name', truncated if too long). For simple (non-orchestrated) workflows a phase badge reflects setup/verification/ai_work/idle phases with matching color coding. A 'RUNNING' fallback label appears when the task is executing but no specific phase is detected.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vd-ctrl-task-name-shows-when-running",
+          "description": "The task name element (data-content-label='task name') displays the running workflow's name — not an empty string, placeholder, or raw ID",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "task name" },
+            "label": "Task name label"
+          },
+          "assertionType": "exists",
+          "precondition": "A workflow is currently running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-ctrl-task-name-content",
+          "description": "The task name element contains the actual human-readable workflow name stored in the runner database, matching the name shown in the Execute page when the run was started.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "task name" },
+            "label": "Task name label"
+          },
+          "assertionType": "semantic",
+          "precondition": "A workflow is currently running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-ctrl-phase-badge-simple",
+          "description": "For non-orchestrated workflows, a phase badge is visible in the ControlBar center showing the current phase. Valid phase text values: 'setup', 'verification', 'ai_work'. A fallback 'RUNNING' badge is shown when the task is executing but a phase cannot be determined.",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "activity type" },
+            "label": "Activity/phase badge in control bar"
+          },
+          "assertionType": "semantic",
+          "precondition": "A non-orchestrated workflow is running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-orchestrated-stages",
+      "name": "Control Bar — Orchestrated Workflow Stage Pills",
+      "description": "For multi-stage orchestrated workflows the ControlBar center shows four stage pill badges in order: Setup → Agentic ↔ Verification → Completion. Each badge has data-content-label='{stage} stage'. The currently active stage glows via an animate-phase-glow CSS animation. Optional step-count sub-labels (completed/total) appear inside each pill. An iteration counter badge shows 'Iteration X/Y' or 'Iteration X' when iterating.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vd-stages-setup-pill",
+          "description": "A badge with data-content-label='setup stage' is present when an orchestrated workflow is running",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "setup stage" },
+            "label": "Setup stage pill"
+          },
+          "assertionType": "exists",
+          "precondition": "An orchestrated (multi-stage) workflow is running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-stages-agentic-pill",
+          "description": "A badge with data-content-label='agentic stage' is present when an orchestrated workflow is running",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "agentic stage" },
+            "label": "Agentic stage pill"
+          },
+          "assertionType": "exists",
+          "precondition": "An orchestrated (multi-stage) workflow is running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-stages-active-glow",
+          "description": "Exactly one stage pill is visually highlighted (glow animation, brighter color) at any given time — the one matching the workflow's current stage. The other three pills remain dim/inactive. Stage pill labels are: 'setup stage', 'agentic stage', 'verification stage', 'completion stage'.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "agentic stage" },
+            "label": "Stage pill group"
+          },
+          "assertionType": "semantic",
+          "precondition": "An orchestrated workflow is running in the Agentic stage",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-stages-iteration-counter",
+          "description": "When a workflow iterates between Agentic and Verification phases an iteration counter badge is shown with format 'Iteration X/Y' (bounded, e.g. 'Iteration 2/5') or 'Iteration X' (unbounded). The X value increments after each Agentic→Verification→Agentic cycle. The counter is absent when the workflow has only completed its first iteration without looping.",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Iteration" },
+            "label": "Iteration counter badge"
+          },
+          "assertionType": "semantic",
+          "precondition": "An orchestrated workflow has completed at least one Agentic/Verification cycle",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-playback-controls",
+      "name": "Control Bar — Playback Controls",
+      "description": "The right section of the ControlBar contains three controls: a combined Play/Pause toggle (icon switches based on state), a Stop button, and an Auto-Continue toggle. The Stop button is disabled when status is 'idle'. The Play/Pause button is disabled when status is 'idle'. The Auto-Continue toggle shows an orange icon when enabled and a muted icon when disabled.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "vd-playback-stop-button",
+          "description": "A Stop button (role=button, textContent contains 'Stop' or square-icon) is present in the ControlBar",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Stop" },
+            "label": "Stop execution button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-playback-stop-disabled-idle",
+          "description": "The Stop button is in a disabled state when the dashboard is idle (no workflow running)",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Stop" },
+            "label": "Stop button"
+          },
+          "assertionType": "disabled",
+          "precondition": "Dashboard is idle — no workflow running or queued",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-playback-pause-suspends-execution",
+          "description": "Clicking Pause while a workflow is running suspends execution via the Tauri IPC command 'pause_execution'. The button icon switches from Pause to Play. The BottomBar activity-type label stops updating. The task status visible via GET /status reflects 'paused'. No data is lost — resuming continues from the same position.",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Pause" },
+            "label": "Pause button (visible when running)"
+          },
+          "assertionType": "behavior",
+          "precondition": "A workflow is actively running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-playback-stop-ends-execution",
+          "description": "Clicking Stop while a workflow is running terminates all active execution types (GUI automation via 'stop_execution' IPC, flow execution via 'cancel_flow_execution' IPC). The dashboard transitions to idle or shows the CompletionSummary overlay. The Stop button returns to disabled state after execution ends.",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Stop" },
+            "label": "Stop button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A workflow is currently running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-playback-auto-continue-state",
+          "description": "The Auto-Continue toggle button reflects its state visually: enabled = orange accent color with title 'Auto-continue enabled - workflow resumes on restart'; disabled = muted color with title 'Auto-continue disabled'. A loading spinner replaces the icon while the toggle is being applied.",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Auto-continue toggle"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-bottom-bar",
+      "name": "Bottom Bar — Real-Time Status Metrics",
+      "description": "The BottomBar (h-10, always visible) provides three sections: left = elapsed time metric; center = orchestrator-agent badge (when orchestrated) + current activity-type label (when running); right = data-freshness metric + connection-status badge. All metrics update in real time during execution.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vd-bottom-elapsed-time-format",
+          "description": "The elapsed time metric (data-content-label='elapsed time') displays a human-readable duration since workflow start. Format: 'Xs' for <1 min, 'Xm Ys' for <1 hour, 'Xh Xm' for ≥1 hour. Value updates in real-time while the workflow is running.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "elapsed time" },
+            "label": "Elapsed time metric"
+          },
+          "assertionType": "semantic",
+          "precondition": "A workflow is running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-bottom-connection-connected",
+          "description": "The connection status badge (data-content-label='connection status') shows a Wifi icon with latency in ms (e.g. '42ms') or 'Connected' in green when connected. It shows a WifiOff icon with 'Disconnected' in red when the runner API is unreachable. The badge updates as connection state changes.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "connection status" },
+            "label": "Connection status badge"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-bottom-data-freshness",
+          "description": "The data freshness metric (data-content-label='data freshness') shows '{N}s ago' reflecting how long ago the last successful fetch completed. When N > 10 the text turns amber to signal stale data. The value resets to '0s ago' after each successful poll.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "data freshness" },
+            "label": "Data freshness metric"
+          },
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-bottom-activity-type-label",
+          "description": "During execution the center section shows the current activity in format '{activityType}: {currentAction}' (e.g., 'GUI Automation: clicking button'). Element has data-content-label='activity type'. Fallbacks: 'Processing...' when no specific action is available, 'Waiting for action...' when paused between steps. The label is absent when the dashboard is idle.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "activity type" },
+            "label": "Activity type label"
+          },
+          "assertionType": "semantic",
+          "precondition": "A workflow is currently running with detected activities",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-bottom-orchestrator-agent-badge",
+          "description": "For orchestrated runs the center section shows an orchestrator-agent badge (data-content-label='orchestrator agent') with agent type name and matching icon+color: planning = orange Lightbulb, verification = purple CheckSquare, knowledge = green BookOpen, orchestrator = blue Cog, worker = gray Bot. The badge updates as the active agent changes during orchestration.",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "orchestrator agent" },
+            "label": "Orchestrator agent badge"
+          },
+          "assertionType": "semantic",
+          "precondition": "An orchestrated workflow is running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-widget-layout",
+      "name": "Dynamic Widget Layout",
+      "description": "The DashboardLayout content area assigns detected activities to widgets. The primary (active) widget occupies ~65% width on the left with a 2px accent border matching the activity type's color; secondary widgets stack compactly in ~35% on the right. Clicking a compact widget promotes it to the primary position. Each activity type has a distinct accent color: gui_automation=blue, ai_conversation=green, verification=teal, findings=amber, shell_command=slate, api_request=orange, script=indigo, workflow_ref=pink, mcp_call=violet, execution_timeline=cyan, flow_execution=emerald, canvas=rose, trace_viewer=sky.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "vd-widget-ai-conversation-present",
+          "description": "When an AI conversation activity is detected, an 'AI Conversation' widget appears in the layout (either as active or summary)",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "AI Conversation" },
+            "label": "AI Conversation widget header"
+          },
+          "assertionType": "exists",
+          "precondition": "A workflow with AI conversation activity is running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-widget-active-accent-border",
+          "description": "The active (full-width) widget container has a 2px solid border whose color corresponds to its activity type's accent color (e.g., green for ai_conversation, teal for verification). When the workflow is running, the border has a glow ring animation (ring-2 + ring-opacity CSS). Only one widget has this accent border at a time.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Active widget container"
+          },
+          "assertionType": "semantic",
+          "precondition": "A workflow is running with at least one detected activity",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-widget-click-promotes",
+          "description": "Clicking a compact summary widget card on the right side promotes it to the full-width active position. The previously active widget moves to the compact stack. The transition is immediate. The Ctrl+1-8 keyboard shortcuts perform the same promotion by widget position.",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Compact summary widget card"
+          },
+          "assertionType": "behavior",
+          "precondition": "A workflow is running with at least two detected activity types",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-widget-execution-timeline-priority",
+          "description": "When an execution_timeline activity type is detected, its widget is automatically placed in the active (primary) position regardless of which widget was previously active. The execution_timeline widget has the highest display priority among all 14 activity types.",
+          "category": "semantic",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Execution Timeline" },
+            "label": "Execution Timeline widget"
+          },
+          "assertionType": "semantic",
+          "precondition": "A workflow is running and an execution_timeline activity is detected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-completion-summary",
+      "name": "Completion Summary Overlay",
+      "description": "When a workflow transitions from running to finished (completed or failed), a CompletionSummary overlay appears over the dashboard. The overlay shows: a header with success (green, checkmark, 'Workflow Completed') or failure (red, X, 'Workflow Failed') theme; a stats grid with duration, step counts (total/passed/failed), and success-rate percentage; a progress bar; and a Dismiss button. Auto-dismisses after 15 s. Escape also dismisses.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "vd-completion-success-heading",
+          "description": "After a successful run, the overlay shows a heading 'Workflow Completed'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Workflow Completed" },
+            "label": "Workflow Completed heading"
+          },
+          "assertionType": "exists",
+          "precondition": "A workflow just completed successfully and the overlay is visible",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-completion-failed-heading",
+          "description": "After a failed run, the overlay shows a heading 'Workflow Failed'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "Workflow Failed" },
+            "label": "Workflow Failed heading"
+          },
+          "assertionType": "exists",
+          "precondition": "A workflow just failed and the overlay is visible",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-completion-dismiss-button",
+          "description": "A 'Dismiss' button is present on the completion overlay",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Dismiss" },
+            "label": "Dismiss button"
+          },
+          "assertionType": "exists",
+          "precondition": "Completion summary overlay is visible",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-completion-stats-grid",
+          "description": "The overlay stats grid shows: Duration formatted as 'Xh Xm Xs'; Steps as '{total} total' with '{passed} passed' and '{failed} failed' sub-labels; Success Rate as '{N}%' color-coded (green ≥ 80%, amber ≥ 50%, red < 50%); a progress bar whose filled width equals the success-rate percentage.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Success Rate" },
+            "label": "Completion stats grid"
+          },
+          "assertionType": "semantic",
+          "precondition": "Completion summary overlay is visible",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-completion-dismiss-behavior",
+          "description": "Clicking 'Dismiss' or pressing Escape closes the overlay immediately. The overlay also closes automatically after 15 s without interaction. After dismissal the dashboard returns to idle state (shows 'No Active Workflow').",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Dismiss" },
+            "label": "Dismiss button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Completion summary overlay is visible",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-breakpoint-indicator",
+      "name": "Control Bar — Breakpoint Pause Indicator",
+      "description": "When a workflow step with breakpoint:true completes, execution suspends. The ControlBar shows an amber 'Breakpoint' badge with animate-phase-glow animation, the step name (data-content-label='breakpoint step'), an 'Inspect' button (blue, eye icon), and a 'Resume' button (green, play icon). These controls are absent when no breakpoint is active.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "vd-bp-badge-visible",
+          "description": "An amber 'Breakpoint' text badge with animated glow (animate-phase-glow) is visible in the ControlBar center section when execution is paused at a breakpoint",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Breakpoint" },
+            "label": "Breakpoint badge"
+          },
+          "assertionType": "exists",
+          "precondition": "A workflow is paused at a breakpoint (snapshot status='waiting')",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-bp-step-name-shown",
+          "description": "The element with data-content-label='breakpoint step' is visible and contains the name of the step where the breakpoint fired, displayed in monospace font",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "breakpoint step" },
+            "label": "Breakpoint step name"
+          },
+          "assertionType": "exists",
+          "precondition": "A workflow is paused at a breakpoint",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-bp-inspect-button",
+          "description": "An 'Inspect' button is visible alongside the breakpoint badge. Clicking it opens the BreakpointInspector side panel (384px wide, right-anchored) showing the captured snapshot: variables tree, last screenshot thumbnail, pending steps list, and freshness indicator. Opening the inspector does NOT resume execution.",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Inspect" },
+            "label": "Inspect button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A workflow is paused at a breakpoint and the inspector panel is not yet open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-bp-resume-button",
+          "description": "A 'Resume' button is visible alongside the breakpoint badge. Clicking it sends POST /task-runs/{id}/breakpoints/{snapshotId}/resume to the runner API, returns the workflow to running state, and removes the breakpoint indicator from the ControlBar.",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Resume" },
+            "label": "Resume from breakpoint button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A workflow is paused at a breakpoint",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-bp-no-indicator-when-running",
+          "description": "The Breakpoint badge, Inspect button, and step-name label are NOT visible when no breakpoint is active",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Breakpoint" },
+            "label": "Breakpoint badge (should be absent)"
+          },
+          "assertionType": "notExists",
+          "precondition": "A workflow is running normally without hitting a breakpoint",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-breakpoint-inspector",
+      "name": "Breakpoint Inspector Panel",
+      "description": "The BreakpointInspector is a 384px-wide overlay panel anchored to the right side of the screen (full height, z-40). It opens when the user clicks Inspect. Content: 'Breakpoint Inspector' heading + close button (aria-label='Close inspector'); an info bar with step index (amber badge 'Step N'), step name, phase badge, and optional iteration; a freshness indicator ('Ns ago', amber if 10-30 min, red if >30 min); a Variables collapsible tree; a Pending Steps list; and an optional Last Screenshot thumbnail.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "vd-inspector-heading",
+          "description": "The heading 'Breakpoint Inspector' is visible when the panel is open",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Breakpoint Inspector" },
+            "label": "Inspector panel heading"
+          },
+          "assertionType": "exists",
+          "precondition": "Inspector panel is open (user clicked Inspect)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-inspector-close-button",
+          "description": "A close button with accessible name 'Close inspector' is present in the inspector header",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Close inspector" },
+            "label": "Close inspector button"
+          },
+          "assertionType": "exists",
+          "precondition": "Inspector panel is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-inspector-variables-section",
+          "description": "A 'Variables' section is visible in the inspector showing a collapsible tree built from the snapshot's variables_json. Top-level keys are auto-expanded (depth < 2). Object nodes show {N} child count; array nodes show [N] count; leaf values appear in monospace.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Variables" },
+            "label": "Variables section heading"
+          },
+          "assertionType": "semantic",
+          "precondition": "Inspector panel is open and the snapshot contains variable data",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-inspector-freshness-indicator",
+          "description": "A freshness timestamp shows how long ago the breakpoint snapshot was captured. Color-coding: green text for < 10 min ('3m ago'), amber + AlertTriangle icon for 10-30 min ('15m ago (stale)'), red for > 30 min ('35m ago (expired)'). This warns that resuming from a stale snapshot may reflect outdated application state.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ago" },
+            "label": "Freshness timestamp"
+          },
+          "assertionType": "semantic",
+          "precondition": "Inspector panel is open with a valid snapshot",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-approval-dialog",
+      "name": "Human Approval Dialog",
+      "description": "When a workflow step requires human approval the ApprovalDialog overlay appears on top of the running dashboard. It shows 'Approval Required' header, context about the pending action (summary, modified files, optional diff), a comment textarea, and three action buttons: Approve (resumes workflow), Reject (continues to next iteration), Abort Workflow (terminates run). The dashboard remains visible behind the semi-transparent backdrop.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "vd-approval-required-heading",
+          "description": "The text 'Approval Required' appears in the dialog when the approval overlay is open",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Approval Required" },
+            "label": "Approval Required heading"
+          },
+          "assertionType": "exists",
+          "precondition": "A workflow is paused awaiting human approval",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-approval-approve-button",
+          "description": "An 'Approve' button is present in the dialog",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Approve" },
+            "label": "Approve button"
+          },
+          "assertionType": "exists",
+          "precondition": "Approval dialog is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-approval-resolution-behavior",
+          "description": "Clicking Approve resumes the workflow (execution continues from the step after the approval gate). Clicking Reject continues to the next iteration without applying the pending action. Clicking 'Abort Workflow' terminates the run. In all cases the dialog closes and the dashboard refreshes its execution state from the runner API.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Approve" },
+            "label": "Approve button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Approval dialog is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-multi-run-switcher",
+      "name": "Multi-Run Switcher (ActiveRunsBar)",
+      "description": "When two or more concurrent workflow runs are active, the ActiveRunsBar appears at the bottom-right of the dashboard (above the BottomBar). Each run has a card showing its name and status. Clicking a card switches the main dashboard to that run's view. A 'New Run' button navigates to the Execute page.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "vd-multirun-hidden-single",
+          "description": "The multi-run switcher is not visible when only one workflow run is active",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Active Runs" },
+            "label": "Active runs bar heading"
+          },
+          "assertionType": "notExists",
+          "precondition": "Only one workflow is running",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-multirun-new-run-button",
+          "description": "When multiple runs are active, a 'New Run' button is visible in the ActiveRunsBar",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "New Run" },
+            "label": "New Run button"
+          },
+          "assertionType": "exists",
+          "precondition": "Multiple concurrent workflow runs are active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-multirun-switch-behavior",
+          "description": "Clicking a run card in the ActiveRunsBar switches the main dashboard view to that run's execution context. The task name in the ControlBar updates to the selected run's name. Widget data and phase indicators refresh to show that run's current state.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Run card in ActiveRunsBar"
+          },
+          "assertionType": "behavior",
+          "precondition": "Multiple concurrent runs are active and the ActiveRunsBar is visible",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "vd-keyboard-shortcuts",
+      "name": "Keyboard Shortcuts",
+      "description": "The dashboard supports: '?' opens the ShortcutsModal (lists all bindings); Ctrl+1-8 promotes a summary widget to active by position; Ctrl+R (Cmd+R) triggers a data refresh (GET /status); Escape closes open overlays (completion summary, shortcuts modal).",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "vd-shortcuts-modal-opens",
+          "description": "Pressing the '?' key (no modifiers) opens the ShortcutsModal dialog. The modal lists: '? — Toggle shortcuts modal', 'Ctrl+1...8 — Switch widget by position', 'Ctrl+R — Refresh data'. The modal closes on Escape or a second '?' press.",
+          "category": "interaction",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Keyboard Shortcuts" },
+            "label": "Keyboard Shortcuts modal heading"
+          },
+          "assertionType": "behavior",
+          "precondition": "No modal overlay is currently open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-ctrl-r-refreshes",
+          "description": "Pressing Ctrl+R (Cmd+R) triggers a data refresh equivalent to calling GET /status. The data-freshness metric resets to '0s ago' after the fetch completes.",
+          "category": "interaction",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "data freshness" },
+            "label": "Data freshness (refreshed by Ctrl+R)"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "vd-ctrl-n-switches-widget",
+          "description": "Pressing Ctrl+1 through Ctrl+8 promotes the Nth compact summary widget (1 = topmost) to the full-width active position, identical to clicking that widget card. Ctrl+1 through Ctrl+8 are the complete set — Ctrl+9 and above are no-ops.",
+          "category": "behavior",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Widget layout container"
+          },
+          "assertionType": "behavior",
+          "precondition": "A workflow is running with at least two summary widgets visible",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "idle",
+        "name": "Idle — No Active Workflow",
+        "description": "No workflow is running. The IdleState component shows 'No Active Workflow' heading and optional action buttons.",
+        "elements": [{ "textContent": "No Active Workflow" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "idle-to-running",
+            "name": "Start a workflow via Run Last Workflow button",
+            "activateStates": ["running"],
+            "deactivateStates": ["idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Run Last Workflow" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "running",
+        "name": "Running — Workflow Executing",
+        "description": "A workflow is actively executing. ControlBar shows task name, phase/stage indicators, and a Pause button (not Play). BottomBar activity-type label updates in real time.",
+        "elements": [
+          { "role": "button", "textContent": "Stop" },
+          { "dataContentLabel": "activity type" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "running-to-paused",
+            "name": "Pause workflow execution",
+            "activateStates": ["paused"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Pause" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "running-to-idle-stop",
+            "name": "Stop workflow via Stop button",
+            "activateStates": ["idle"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stop" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "running-to-completion",
+            "name": "Workflow finishes (automatic — no user action)",
+            "activateStates": ["completion-overlay"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "running-to-approval",
+            "name": "Workflow pauses for human approval (automatic)",
+            "activateStates": ["approval-dialog"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": []
+          },
+          {
+            "id": "running-to-breakpoint",
+            "name": "Workflow pauses at a breakpoint step (automatic)",
+            "activateStates": ["breakpoint-paused"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "running-to-shortcuts",
+            "name": "Open keyboard shortcuts modal",
+            "activateStates": ["shortcuts-modal"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "keyboard",
+                "params": { "keys": ["?"] },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "paused",
+        "name": "Paused — User Paused Execution",
+        "description": "Workflow is suspended. ControlBar shows a Play (resume) button instead of Pause. Activity-type label in BottomBar stops updating.",
+        "elements": [
+          { "role": "button", "accessibleName": "Play" },
+          { "role": "button", "textContent": "Stop" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "paused-to-running",
+            "name": "Resume workflow execution",
+            "activateStates": ["running"],
+            "deactivateStates": ["paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Play" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "paused-to-idle-stop",
+            "name": "Stop the workflow while paused",
+            "activateStates": ["idle"],
+            "deactivateStates": ["paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stop" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "breakpoint-paused",
+        "name": "Breakpoint Paused",
+        "description": "Execution is suspended at a breakpoint step. ControlBar shows the amber Breakpoint badge, step name, Inspect button, and Resume button.",
+        "elements": [
+          { "textContent": "Breakpoint" },
+          { "role": "button", "textContent": "Resume" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "bp-resume",
+            "name": "Resume execution from breakpoint",
+            "activateStates": ["running"],
+            "deactivateStates": ["breakpoint-paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Resume" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "bp-open-inspector",
+            "name": "Open Breakpoint Inspector panel",
+            "activateStates": ["breakpoint-inspector-open"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Inspect" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "breakpoint-inspector-open",
+        "name": "Breakpoint Inspector Panel Open",
+        "description": "The 384px BreakpointInspector side panel is visible on the right of the screen. Dashboard remains visible behind it.",
+        "elements": [
+          { "textContent": "Breakpoint Inspector" },
+          { "role": "button", "textContent": "Close inspector" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "inspector-close",
+            "name": "Close the inspector panel",
+            "activateStates": [],
+            "deactivateStates": ["breakpoint-inspector-open"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Close inspector" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "inspector-resume",
+            "name": "Resume execution while inspector is open",
+            "activateStates": ["running"],
+            "deactivateStates": ["breakpoint-inspector-open", "breakpoint-paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Resume" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "completion-overlay",
+        "name": "Completion Summary Overlay",
+        "description": "CompletionSummary overlay visible after workflow finishes. Shows 'Workflow Completed' or 'Workflow Failed' heading, stats grid, and Dismiss button. Auto-dismisses in 15 s.",
+        "elements": [
+          { "role": "button", "textContent": "Dismiss" },
+          { "textContent": "Workflow Completed" },
+          { "textContent": "Workflow Failed" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "completion-dismiss",
+            "name": "Dismiss the completion overlay",
+            "activateStates": ["idle"],
+            "deactivateStates": ["completion-overlay"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Dismiss" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "approval-dialog",
+        "name": "Approval Dialog Overlay",
+        "description": "ApprovalDialog modal visible when a workflow step requests human approval. Shows 'Approval Required', context, comment textarea, Approve / Reject / Abort Workflow buttons. Dashboard visible behind the backdrop.",
+        "elements": [
+          { "textContent": "Approval Required" },
+          { "role": "button", "textContent": "Approve" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "approval-approve",
+            "name": "Approve — resume workflow",
+            "activateStates": ["running"],
+            "deactivateStates": ["approval-dialog"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Approve" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "approval-reject",
+            "name": "Reject — continue to next iteration",
+            "activateStates": ["running"],
+            "deactivateStates": ["approval-dialog"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Reject" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "approval-abort",
+            "name": "Abort workflow from approval dialog",
+            "activateStates": ["idle"],
+            "deactivateStates": ["approval-dialog"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Abort Workflow" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "shortcuts-modal",
+        "name": "Keyboard Shortcuts Modal",
+        "description": "ShortcutsModal dialog listing available keyboard shortcuts overlays the dashboard. Dashboard remains visible.",
+        "elements": [{ "textContent": "Keyboard Shortcuts" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "shortcuts-close-escape",
+            "name": "Close shortcuts modal via Escape",
+            "activateStates": [],
+            "deactivateStates": ["shortcuts-modal"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "keyboard",
+                "params": { "keys": ["Escape"] },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "component": "ActiveDashboardPage",
+    "pageUrl": "#active",
+    "elementSource": "sdk",
+    "tags": [
+      "visual-dashboard",
+      "active-dashboard",
+      "monitoring",
+      "real-time",
+      "widgets",
+      "runner",
+      "execution",
+      "multi-run",
+      "breakpoints",
+      "tier-1"
+    ],
+    "specType": "mixed"
+  }
+}

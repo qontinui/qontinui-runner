@@ -118,7 +118,9 @@ function Extract-AndSave-Spec {
             $null = $json | ConvertFrom-Json  # validate
             $safeName = $specId -replace ':', '_'
             $path = "$SPEC_DIR\$safeName.json"
-            Set-Content -Path $path -Value $json -Encoding UTF8
+            # Use .NET writer directly — PowerShell 5.1's Set-Content -Encoding UTF8 adds a BOM,
+            # which causes Rust's serde_json to reject the file silently.
+            [System.IO.File]::WriteAllText($path, $json, [System.Text.Encoding]::UTF8)
             Log "  Saved $specId to disk ($($json.Length) chars)"
         } else {
             Log "  WARNING: No JSON block found in task output for $specId"
@@ -223,11 +225,11 @@ for ($i = 0; $i -lt $pageBtns.Count; $i++) {
     $taskId = Get-RecentSpecTaskId
     Log "  Task ID: $taskId"
 
-    # Wait for a NEW apply button — use specId-based detection to avoid ID collisions
+    # Wait for a NEW apply button - use specId-based detection to avoid ID collisions
     Log "  Waiting up to $MaxMinutes min for spec (excluding: $preExistingApply)..."
     $applyId = Wait-ForApplyButton -MaxMins $MaxMinutes -ExcludeId $preExistingApply -SpecId $specId
     if (-not $applyId) {
-        Log "  ERROR: Timed out waiting for $btn (>${MaxMinutes}m) — falling back to task output extraction"
+        Log "  ERROR: Timed out waiting for $btn (>${MaxMinutes}m) - falling back to task output extraction"
         $failed++
         if (-not $taskId) { $taskId = Get-RecentSpecTaskId }
         Extract-AndSave-Spec -taskId $taskId -specId $specId

@@ -509,10 +509,13 @@ The progress notes you write during exploration are helpful context, but they ar
 
 **Even if your response is very long, you must output the JSON.** Do not end your response without the JSON code block. If you find yourself summarizing what the spec "would contain" in prose, stop — output the JSON instead.
 
+**Do NOT use file-write tools.** Do not write the spec to any file (e.g. \`src/specs/\`). The only valid output is the JSON code block in your chat response. Writing to a file means the spec is never applied — the runner reads the JSON from your response, not from disk.
+
 **Checklist before ending your response:**
 - [ ] Did I output a \`\`\`json code block containing the full spec?
 - [ ] Does the JSON start with \`{\` and end with \`}\`?
 - [ ] Does it have a \`"groups"\` array with at least 5 groups?
+- [ ] Did I avoid writing to any file? (output only, no Write/Edit tool calls for the spec)
 
 If any of those are "no", do not end your response — output the JSON now.
 

@@ -127,10 +127,7 @@ function extractRouteTable(src) {
     });
   }
   // Sort by action, then path, for stable output.
-  rows.sort(
-    (a, b) =>
-      a.action.localeCompare(b.action) || a.path.localeCompare(b.path),
-  );
+  rows.sort((a, b) => a.action.localeCompare(b.action) || a.path.localeCompare(b.path));
   return rows;
 }
 
@@ -140,9 +137,7 @@ function renderRouteTable(rows) {
   lines.push("| --- | --- | --- |");
   for (const r of rows) {
     const desc = r.desc ? ` — ${r.desc}` : "";
-    lines.push(
-      `| \`${r.action}\` | \`${r.method} ${r.path}\`${desc} | \`${r.handler}\` |`,
-    );
+    lines.push(`| \`${r.action}\` | \`${r.method} ${r.path}\`${desc} | \`${r.handler}\` |`);
   }
   return lines.join("\n") + "\n";
 }
@@ -171,11 +166,7 @@ function replaceAutoSection(existing, replacement) {
     // No existing markers — append at the end of the file with a blank line.
     return existing.replace(/\s*$/, "\n\n") + replacement + "\n";
   }
-  return (
-    existing.slice(0, startIdx) +
-    replacement +
-    existing.slice(endIdx + END.length)
-  );
+  return existing.slice(0, startIdx) + replacement + existing.slice(endIdx + END.length);
 }
 
 const argEmit = process.argv.indexOf("--emit-doc");
@@ -184,9 +175,7 @@ if (argEmit !== -1 || argCheck !== -1) {
   const idx = argEmit !== -1 ? argEmit : argCheck;
   const docPath = process.argv[idx + 1];
   if (!docPath) {
-    console.error(
-      `fatal: ${process.argv[idx]} requires a path argument (target markdown file)`,
-    );
+    console.error(`fatal: ${process.argv[idx]} requires a path argument (target markdown file)`);
     process.exit(2);
   }
   const rows = extractRouteTable(readFile(sdkClientPath));
@@ -247,13 +236,9 @@ console.log(
 );
 
 if (missing.length > 0) {
-  console.error(
-    "\nERROR: runner dispatches actions the wrapper SDK has no handler for:",
-  );
+  console.error("\nERROR: runner dispatches actions the wrapper SDK has no handler for:");
   for (const a of missing) console.error(`  - ${a}`);
-  console.error(
-    "\nA WS-transport wrapper will fail with NO_HANDLER for these actions.",
-  );
+  console.error("\nA WS-transport wrapper will fail with NO_HANDLER for these actions.");
   console.error(
     "Either add the handler in ui-bridge/packages/ui-bridge/src/server/relay-handlers.ts,",
   );

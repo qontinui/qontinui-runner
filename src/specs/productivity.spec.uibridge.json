@@ -49,7 +49,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" }
+            },
             "label": "Coordinator sub-view tab"
           },
           "enabled": true
@@ -75,7 +77,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.open-knowledge-modal" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.open-knowledge-modal" }
+            },
             "label": "Open knowledge modal button"
           },
           "enabled": true
@@ -346,7 +350,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.show-archived-toggle" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.show-archived-toggle" }
+            },
             "label": "Show-archived toggle"
           },
           "enabled": true
@@ -410,7 +416,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendations" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendations" }
+            },
             "label": "Plan recommendations card"
           },
           "precondition": "The Coordinator sub-view is active.",
@@ -424,7 +432,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendations" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendations" }
+            },
             "label": "Recommendations queue panel"
           },
           "precondition": "The Coordinator sub-view is active.",
@@ -503,7 +513,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-search-input" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.knowledge-search-input" }
+            },
             "label": "Knowledge search input"
           },
           "precondition": "The Knowledge sub-view is active or the modal is open.",
@@ -517,7 +529,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-area-filter" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.knowledge-area-filter" }
+            },
             "label": "Knowledge area filter"
           },
           "precondition": "The Knowledge sub-view is active or the modal is open.",
@@ -531,7 +545,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-search-submit" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.knowledge-search-submit" }
+            },
             "label": "Knowledge search submit"
           },
           "precondition": "The Knowledge sub-view is active or the modal is open.",
@@ -573,7 +589,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.knowledge-result-row" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.knowledge-result-row" }
+            },
             "label": "Knowledge result row"
           },
           "precondition": "A search has returned at least one result.",
@@ -638,7 +656,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendations" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendations" }
+            },
             "label": "Recommendations queue — confidence band"
           },
           "precondition": "The Coordinator sub-view is active and at least one recommendation is queued.",
@@ -652,7 +672,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-card" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-card" }
+            },
             "label": "Recommendation card verdict"
           },
           "precondition": "At least one recommendation is queued.",
@@ -717,7 +739,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-escalation-card" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-escalation-card" }
+            },
             "label": "Escalation card resolve buttons"
           },
           "precondition": "At least one escalation is open.",
@@ -731,7 +755,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-advisory-card" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-advisory-card" }
+            },
             "label": "Advisory acknowledge action"
           },
           "precondition": "At least one advisory is unread.",
@@ -810,7 +836,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.reflection-top-knowledge" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.reflection-top-knowledge" }
+            },
             "label": "Reflection top-knowledge section"
           },
           "precondition": "Reflection data has loaded.",
@@ -824,7 +852,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.reflection-review-trail" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.reflection-review-trail" }
+            },
             "label": "Reflection review-trail section"
           },
           "precondition": "Reflection data has loaded.",
@@ -848,7 +878,9 @@
           "expected": 8,
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-bridge-id='productivity.coord-decision-log-rule-filter'] option" },
+            "criteria": {
+              "selector": "[data-ui-bridge-id='productivity.coord-decision-log-rule-filter'] option"
+            },
             "label": "Rule filter options"
           },
           "precondition": "The Coordinator sub-view is active.",
@@ -863,7 +895,9 @@
           "expected": 12,
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-bridge-id='productivity.coord-decision-log-action-filter'] option" },
+            "criteria": {
+              "selector": "[data-ui-bridge-id='productivity.coord-decision-log-action-filter'] option"
+            },
             "label": "Action filter options"
           },
           "precondition": "The Coordinator sub-view is active.",
@@ -905,7 +939,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-decision-log-refresh" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-decision-log-refresh" }
+            },
             "label": "Decision log refresh"
           },
           "precondition": "The Coordinator sub-view is active.",
@@ -928,7 +964,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-approve" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-approve" }
+            },
             "label": "Recommendation approve button"
           },
           "precondition": "At least one recommendation is queued.",
@@ -942,7 +980,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-reject" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-reject" }
+            },
             "label": "Recommendation reject button"
           },
           "precondition": "At least one recommendation is queued.",
@@ -956,7 +996,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-open-task" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-open-task" }
+            },
             "label": "Recommendation open-task button"
           },
           "precondition": "At least one recommendation is queued.",
@@ -970,7 +1012,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-approve" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-approve" }
+            },
             "label": "Recommendation approve flow"
           },
           "precondition": "At least one recommendation is queued.",
@@ -984,7 +1028,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-card" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendation-card" }
+            },
             "label": "Recommendation highlight on deep-link"
           },
           "precondition": "A productivity-select-recommendation event has been dispatched with a queued reviewId.",
@@ -1023,7 +1069,9 @@
           "expected": "[0.7, 0.85)",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendations" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.coord-recommendations" }
+            },
             "label": "Empty recommendations state"
           },
           "precondition": "No recommendations are queued.",
@@ -1090,7 +1138,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" }
+            },
             "label": "Coordinator tab"
           },
           "enabled": true
@@ -1103,7 +1153,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.show-archived-toggle" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.show-archived-toggle" }
+            },
             "label": "Show-archived toggle flow"
           },
           "enabled": true
@@ -1116,7 +1168,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.open-knowledge-modal" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.open-knowledge-modal" }
+            },
             "label": "Knowledge hotkey trigger"
           },
           "enabled": true
@@ -1179,7 +1233,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendations" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendations" }
+            },
             "label": "Plan recommendations card"
           },
           "precondition": "The Coordinator sub-view is active.",
@@ -1193,7 +1249,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendations" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendations" }
+            },
             "label": "Plan recommendation row cap"
           },
           "precondition": "At least one plan candidate exists.",
@@ -1208,7 +1266,9 @@
           "expected": "/decompose-plan",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendations" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendations" }
+            },
             "label": "Plan recommendations empty state"
           },
           "precondition": "No plan candidates exist.",
@@ -1222,7 +1282,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendation-card" } },
+            "criteria": {
+              "dataAttributes": { "ui-bridge-id": "productivity.plan-recommendation-card" }
+            },
             "label": "Plan recommendation open-plan flow"
           },
           "precondition": "At least one plan candidate exists.",
@@ -1261,7 +1323,9 @@
             "process": [
               {
                 "action": "click",
-                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" } },
+                "target": {
+                  "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" }
+                },
                 "waitAfter": { "type": "idle", "timeout": 2000 }
               }
             ]
@@ -1275,7 +1339,9 @@
             "process": [
               {
                 "action": "click",
-                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-knowledge" } },
+                "target": {
+                  "dataAttributes": { "ui-bridge-id": "productivity.view-tab-knowledge" }
+                },
                 "waitAfter": { "type": "idle", "timeout": 2000 }
               }
             ]
@@ -1289,7 +1355,9 @@
             "process": [
               {
                 "action": "click",
-                "target": { "dataAttributes": { "ui-bridge-id": "productivity.open-knowledge-modal" } },
+                "target": {
+                  "dataAttributes": { "ui-bridge-id": "productivity.open-knowledge-modal" }
+                },
                 "waitAfter": { "type": "idle", "timeout": 1000 }
               }
             ]
@@ -1345,7 +1413,9 @@
             "process": [
               {
                 "action": "click",
-                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-knowledge" } },
+                "target": {
+                  "dataAttributes": { "ui-bridge-id": "productivity.view-tab-knowledge" }
+                },
                 "waitAfter": { "type": "idle", "timeout": 2000 }
               }
             ]
@@ -1359,7 +1429,9 @@
             "process": [
               {
                 "action": "click",
-                "target": { "dataAttributes": { "ui-bridge-id": "productivity.open-knowledge-modal" } },
+                "target": {
+                  "dataAttributes": { "ui-bridge-id": "productivity.open-knowledge-modal" }
+                },
                 "waitAfter": { "type": "idle", "timeout": 1000 }
               }
             ]
@@ -1404,7 +1476,9 @@
             "process": [
               {
                 "action": "click",
-                "target": { "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" } },
+                "target": {
+                  "dataAttributes": { "ui-bridge-id": "productivity.view-tab-coordinator" }
+                },
                 "waitAfter": { "type": "idle", "timeout": 2000 }
               }
             ]

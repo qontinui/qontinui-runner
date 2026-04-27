@@ -100,6 +100,74 @@ export interface SpecStateMachineShape {
   states: SpecStateShape[];
 }
 
+export interface TestFixture {
+  type: "localStorage" | "apiMock" | "tauriEvent" | string;
+  key?: string;
+  value?: unknown;
+  endpoint?: string;
+  method?: string;
+  response?: unknown;
+  event?: string;
+  payload?: unknown;
+  delayMs?: number;
+}
+
+export interface TestScenarioStep {
+  type: "navigate" | "componentAction" | "wait" | "assert" | "sendKeys" | string;
+  url?: string;
+  componentId?: string;
+  actionId?: string;
+  params?: Record<string, unknown>;
+  condition?: string;
+  target?: { type?: string; criteria?: Record<string, unknown> };
+  timeoutMs?: number;
+  assertionId?: string;
+  keys?: string[];
+}
+
+export interface TestScenario {
+  id: string;
+  name: string;
+  description?: string;
+  groupIds?: string[];
+  difficulty?: "easy" | "medium" | "hard" | string;
+  hardnessReason?: string;
+  fixtures?: TestFixture[];
+  steps?: TestScenarioStep[];
+  teardown?: TestScenarioStep[];
+  requiresRealBackend?: boolean;
+  hasTiming?: boolean;
+  retryStrategy?: { maxAttempts: number; delayMs: number };
+}
+
+export interface TestingGroupConfig {
+  scenarios?: TestScenario[];
+  asyncStrategies?: Record<
+    string,
+    { timeoutMs: number; pollIntervalMs: number; description: string }
+  >;
+  beforeEach?: TestScenarioStep[];
+  afterEach?: TestScenarioStep[];
+  requiresInfrastructure?: {
+    pty?: boolean;
+    fileSystem?: boolean;
+    claudeAPI?: boolean;
+    llmBackend?: boolean;
+    runnerBackend?: boolean;
+    tauriEvents?: boolean;
+  };
+  automationCoverage?: number;
+  manualAssertions?: string[];
+  flakyAssertions?: string[];
+  notes?: string;
+}
+
+export interface SpecTesting {
+  defaultTimeoutMs?: number;
+  defaultPollIntervalMs?: number;
+  groups?: Record<string, TestingGroupConfig>;
+}
+
 export interface SpecConfig {
   version: string;
   description?: string;
@@ -109,7 +177,7 @@ export interface SpecConfig {
   /** Optional state machine section — when present, buildSpecBrief will map
    *  group preconditions to state IDs for one-step navigation. */
   stateMachine?: SpecStateMachineShape;
-  testing?: unknown;
+  testing?: SpecTesting;
 }
 
 export interface BuildSpecWorkflowInput {
@@ -288,6 +356,128 @@ function buildSetupActionStep(
   }
 }
 
+/** Convert a TestScenarioStep into a UI Bridge setup step, or null for non-actionable types. */
+function buildTestActionStep(
+  groupName: string,
+  step: TestScenarioStep,
+  elementSource: string,
+): VerificationStep | null {
+  const snapshotTarget = elementSource === "external" ? "sdk" : "control";
+  switch (step.type) {
+    case "navigate":
+      return {
+        id: crypto.randomUUID(),
+        type: "ui_bridge",
+        phase: "setup",
+        name: `${groupName}: Navigate to ${step.url}`,
+        ui_bridge_action: "navigate",
+        ui_bridge_url: step.url || "",
+        ui_bridge_snapshot_target: snapshotTarget,
+      } as unknown as VerificationStep;
+    case "componentAction":
+      return {
+        id: crypto.randomUUID(),
+        type: "ui_bridge",
+        phase: "setup",
+        name: `${groupName}: ${step.actionId} on ${step.componentId}`,
+        ui_bridge_action: "component_action",
+        ui_bridge_target: JSON.stringify({
+          componentId: step.componentId,
+          actionId: step.actionId,
+          params: step.params ?? {},
+        }),
+        ui_bridge_snapshot_target: snapshotTarget,
+      } as unknown as VerificationStep;
+    case "wait":
+      return {
+        id: crypto.randomUUID(),
+        type: "ui_bridge",
+        phase: "setup",
+        name: `${groupName}: Wait for ${step.condition ?? "element"}`,
+        ui_bridge_action: "wait_for_element",
+        ui_bridge_target: JSON.stringify({
+          criteria: step.target?.criteria ?? {},
+          timeout: step.timeoutMs ?? 5000,
+        }),
+        ui_bridge_snapshot_target: snapshotTarget,
+      } as unknown as VerificationStep;
+    case "sendKeys":
+      return {
+        id: crypto.randomUUID(),
+        type: "ui_bridge",
+        phase: "setup",
+        name: `${groupName}: Send keys [${(step.keys ?? []).join(", ")}]`,
+        ui_bridge_action: "element_action",
+        ui_bridge_target: JSON.stringify({
+          action: "sendKeys",
+          criteria: step.target?.criteria ?? {},
+          params: { keys: step.keys ?? [] },
+        }),
+        ui_bridge_snapshot_target: snapshotTarget,
+      } as unknown as VerificationStep;
+    default:
+      return null;
+  }
+}
+
+/** Build a prompt step summarising a test scenario so the AI executor knows the test intent. */
+function buildTestScenarioPromptStep(
+  scenario: TestScenario,
+  groupTestingConfig: TestingGroupConfig,
+): PromptStep {
+  const stepLines = (scenario.steps ?? []).map((s, i) => {
+    switch (s.type) {
+      case "navigate":
+        return `  ${i + 1}. Navigate to ${s.url}`;
+      case "componentAction":
+        return `  ${i + 1}. Component action: ${s.actionId} on ${s.componentId}`;
+      case "wait":
+        return `  ${i + 1}. Wait for ${s.condition ?? "element"} (timeout: ${s.timeoutMs ?? 5000}ms)`;
+      case "assert":
+        return `  ${i + 1}. Assert: ${s.assertionId}`;
+      case "sendKeys":
+        return `  ${i + 1}. Send keys: [${(s.keys ?? []).join(", ")}]`;
+      default:
+        return `  ${i + 1}. ${s.type}`;
+    }
+  });
+
+  const fixtureLines = (scenario.fixtures ?? []).map((f) => {
+    if (f.type === "localStorage")
+      return `  • localStorage["${f.key}"] = ${JSON.stringify(f.value)}`;
+    if (f.type === "apiMock")
+      return `  • Mock ${f.method ?? "GET"} ${f.endpoint} → ${JSON.stringify(f.response)}`;
+    if (f.type === "tauriEvent")
+      return `  • Emit Tauri event "${f.event}"${f.delayMs ? ` after ${f.delayMs}ms` : ""}`;
+    return `  • ${f.type}`;
+  });
+
+  const infraRequired = Object.entries(groupTestingConfig.requiresInfrastructure ?? {})
+    .filter(([, v]) => v)
+    .map(([k]) => k);
+
+  const lines = [
+    `Test scenario: ${scenario.name}`,
+    scenario.description ? `\n${scenario.description}` : "",
+    `\nDifficulty: ${scenario.difficulty ?? "medium"}`,
+    scenario.hardnessReason ? `\nNote: ${scenario.hardnessReason}` : "",
+    infraRequired.length > 0 ? `\nRequired infrastructure: ${infraRequired.join(", ")}` : "",
+    fixtureLines.length > 0 ? `\n\nFixtures:\n${fixtureLines.join("\n")}` : "",
+    stepLines.length > 0 ? `\n\nSteps:\n${stepLines.join("\n")}` : "",
+    scenario.retryStrategy
+      ? `\n\nRetry: up to ${scenario.retryStrategy.maxAttempts} attempts, ${scenario.retryStrategy.delayMs}ms delay`
+      : "",
+  ].filter(Boolean);
+
+  return {
+    id: crypto.randomUUID(),
+    type: "prompt",
+    phase: "setup",
+    name: `Scenario: ${scenario.name}`,
+    content: lines.join(""),
+  };
+}
+
 /**
  * Build a complete UnifiedWorkflow from a SpecConfig.
  *
@@ -369,6 +559,46 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     }
   }
 
+  // ── Testing scenarios from spec.testing ──────────────────────────────
+  if (specConfig.testing?.groups) {
+    for (const group of selectedGroups) {
+      const groupTestingConfig = specConfig.testing.groups[group.id];
+      if (!groupTestingConfig) continue;
+
+      // beforeEach setup actions
+      for (const action of groupTestingConfig.beforeEach ?? []) {
+        const step = buildTestActionStep(group.name, action, elementSource);
+        if (step) setupSteps.push(step);
+      }
+
+      // Each scenario: generate a prompt step describing the full scenario flow,
+      // plus deterministic UI Bridge steps for navigable/actionable step types
+      for (const scenario of groupTestingConfig.scenarios ?? []) {
+        // Prompt step summarising the scenario intent
+        setupSteps.push(buildTestScenarioPromptStep(scenario, groupTestingConfig));
+
+        // Concrete UI Bridge steps for deterministic scenario steps
+        for (const step of scenario.steps ?? []) {
+          if (step.type === "assert") continue; // handled by existing verification steps
+          const builtStep = buildTestActionStep(group.name, step, elementSource);
+          if (builtStep) setupSteps.push(builtStep);
+        }
+
+        // Teardown steps
+        for (const action of scenario.teardown ?? []) {
+          const step = buildTestActionStep(group.name, action, elementSource);
+          if (step) setupSteps.push(step);
+        }
+      }
+
+      // afterEach cleanup actions
+      for (const action of groupTestingConfig.afterEach ?? []) {
+        const step = buildTestActionStep(group.name, action, elementSource);
+        if (step) setupSteps.push(step);
+      }
+    }
+  }
+
   // ── Regression checks from known issues ─────────────────────────────
   if (includeRegressionChecks && knownIssues.length > 0) {
     for (const issue of knownIssues) {
@@ -427,20 +657,37 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     0,
   );
 
+  const testingGroupCount = specConfig.testing?.groups
+    ? Object.keys(specConfig.testing.groups).filter(
+        (gid) => selectedGroupIds == null || selectedGroupIds.has(gid),
+      ).length
+    : 0;
+
   const name =
     workflowName || `Spec Verification${pageUrl ? ` — ${new URL(pageUrl).hostname}` : ""}`;
+
+  const description = [
+    `Auto-generated from spec configuration.`,
+    `${selectedGroups.length} groups selected with ${totalAssertions} total assertions.`,
+    testingGroupCount > 0 ? `Includes testing scenarios for ${testingGroupCount} group(s).` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const tags = ["spec", "auto-generated", "live-page"];
+  if (testingGroupCount > 0) tags.push("testing-scenarios");
 
   return {
     id: crypto.randomUUID(),
     name,
-    description: `Auto-generated from spec configuration. ${selectedGroups.length} groups selected with ${totalAssertions} total assertions.`,
+    description,
     setupSteps: setupSteps,
     verificationSteps: verificationSteps,
     agenticSteps: agenticSteps,
     completionSteps: completionSteps,
     maxIterations: maxIterations,
     category: "spec-generated",
-    tags: ["spec", "auto-generated", "live-page"],
+    tags,
     createdAt: now,
     modified_at: now,
     ...DEFAULT_WORKFLOW_FLAGS,

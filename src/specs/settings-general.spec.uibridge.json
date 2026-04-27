@@ -475,11 +475,6 @@
       "source": "manual"
     }
   ],
-  "metadata": {
-    "component": "GeneralSettings",
-    "pageUrl": "/settings?tab=general",
-    "tags": ["settings", "general", "startup", "autostart", "workflow-builder", "toggle"]
-  },
   "stateMachine": {
     "states": [
       {
@@ -494,5 +489,260 @@
         "transitions": []
       }
     ]
+  },
+  "testing": {
+    "defaultTimeoutMs": 5000,
+    "defaultPollIntervalMs": 200,
+    "groups": {
+      "gen-autoload-behavior": {
+        "scenarios": [
+          {
+            "id": "autoload-toggle-optimistic-update",
+            "name": "Auto-load toggle: optimistic update and success log",
+            "description": "Click the Auto-load Last Configuration toggle, verify the visual state flips immediately (optimistic), then confirm save_auto_load_last_config completes and a success message appears in the status log",
+            "groupIds": ["gen-autoload-behavior"],
+            "difficulty": "medium",
+            "steps": [
+              { "type": "navigate", "url": "/settings?tab=general" },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": {
+                  "type": "search",
+                  "criteria": { "textContent": "Auto-load Last Configuration on Startup" }
+                },
+                "timeoutMs": 5000
+              },
+              {
+                "type": "componentAction",
+                "componentId": "autoload-toggle",
+                "actionId": "click",
+                "params": {}
+              },
+              { "type": "assert", "assertionId": "gen-autoload-toggle-behavior" }
+            ],
+            "teardown": [],
+            "requiresRealBackend": true,
+            "hasTiming": true,
+            "retryStrategy": { "maxAttempts": 2, "delayMs": 500 }
+          }
+        ],
+        "asyncStrategies": {
+          "waitForSaveAutoLoad": {
+            "timeoutMs": 5000,
+            "pollIntervalMs": 200,
+            "description": "Waiting for save_auto_load_last_config Tauri command to complete and status log to update"
+          }
+        },
+        "requiresInfrastructure": {
+          "pty": false,
+          "fileSystem": false,
+          "claudeAPI": false,
+          "llmBackend": false,
+          "runnerBackend": true,
+          "tauriEvents": false
+        },
+        "automationCoverage": 75,
+        "notes": "Optimistic update happens synchronously on click; the async aspect is waiting for the Tauri command response and status log confirmation. The rollback path (backend failure) is hard to automate without mocking the Tauri command."
+      },
+      "gen-autostart-behavior": {
+        "scenarios": [
+          {
+            "id": "autostart-toggle-os-reconciliation",
+            "name": "Launch on System Startup toggle: OS state reconciliation",
+            "description": "Click the Launch on System Startup toggle and verify the UI reconciles against the actual OS autostart state returned by set_autostart_enabled rather than trusting the optimistic value",
+            "groupIds": ["gen-autostart-behavior"],
+            "difficulty": "hard",
+            "hardnessReason": "Writing to the OS autostart mechanism (Windows Registry HKCU\\Run, macOS LaunchAgent, Linux .desktop) may require elevated permissions; silent OS write failures on hardened systems cause the toggle to self-correct to a value that cannot be predicted in advance without querying the OS",
+            "steps": [
+              { "type": "navigate", "url": "/settings?tab=general" },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": {
+                  "type": "search",
+                  "criteria": { "textContent": "Launch on System Startup" }
+                },
+                "timeoutMs": 5000
+              },
+              {
+                "type": "componentAction",
+                "componentId": "autostart-toggle",
+                "actionId": "click",
+                "params": {}
+              },
+              { "type": "assert", "assertionId": "gen-autostart-toggle-behavior" }
+            ],
+            "teardown": [],
+            "requiresRealBackend": true,
+            "hasTiming": true,
+            "retryStrategy": { "maxAttempts": 1, "delayMs": 0 }
+          }
+        ],
+        "asyncStrategies": {
+          "waitForOsWrite": {
+            "timeoutMs": 8000,
+            "pollIntervalMs": 300,
+            "description": "Waiting for set_autostart_enabled Tauri command to write to the OS and return the actual enabled state via is_enabled() from tauri-plugin-autostart"
+          }
+        },
+        "requiresInfrastructure": {
+          "pty": false,
+          "fileSystem": true,
+          "claudeAPI": false,
+          "llmBackend": false,
+          "runnerBackend": true,
+          "tauriEvents": true
+        },
+        "automationCoverage": 55,
+        "manualAssertions": [
+          "Actual OS registry entry presence must be verified outside the UI (e.g., regedit on Windows, launchctl on macOS)",
+          "Silent OS write failure causing toggle self-correction is hard to trigger reliably in CI without deliberate infrastructure to reject the registry write"
+        ],
+        "notes": "This toggle is uniquely difficult because the final UI state is determined by the OS, not by the click. The reconciliation path (optimistic value != OS actual value) requires simulating a registry write failure, which is not automatable via UI Bridge alone."
+      },
+      "gen-summary-step-behavior": {
+        "scenarios": [
+          {
+            "id": "summary-step-toggle-and-persist",
+            "name": "Include AI Summary toggle: optimistic update and persistence",
+            "description": "Click the Include AI Summary in New Workflows toggle, verify immediate visual state inversion, confirm save_include_summary_step_by_default completes, and verify the status log shows the expected enabled/disabled message",
+            "groupIds": ["gen-summary-step-behavior"],
+            "difficulty": "medium",
+            "steps": [
+              { "type": "navigate", "url": "/settings?tab=general" },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": {
+                  "type": "search",
+                  "criteria": { "textContent": "Include AI Summary in New Workflows" }
+                },
+                "timeoutMs": 5000
+              },
+              {
+                "type": "componentAction",
+                "componentId": "include-summary-step-toggle",
+                "actionId": "click",
+                "params": {}
+              },
+              { "type": "assert", "assertionId": "gen-summary-step-toggle-behavior" }
+            ],
+            "teardown": [],
+            "requiresRealBackend": true,
+            "hasTiming": true,
+            "retryStrategy": { "maxAttempts": 2, "delayMs": 500 }
+          },
+          {
+            "id": "summary-step-default-on-before-load",
+            "name": "Include AI Summary defaults to ON before backend resolves",
+            "description": "Immediately after navigating to the General tab, verify the Include AI Summary toggle renders as ON (true) before get_include_summary_step_by_default responds, confirming the React component initializes with includeSummaryStep=true",
+            "groupIds": ["gen-summary-step-behavior"],
+            "difficulty": "hard",
+            "hardnessReason": "Requires observing the toggle within the narrow window between component mount and the async Tauri IPC response, which races the snapshot against the mount event and is timing-sensitive",
+            "steps": [
+              { "type": "navigate", "url": "/settings?tab=general" },
+              { "type": "assert", "assertionId": "gen-summary-step-default-on" }
+            ],
+            "teardown": [],
+            "requiresRealBackend": false,
+            "hasTiming": true,
+            "retryStrategy": { "maxAttempts": 3, "delayMs": 100 }
+          }
+        ],
+        "asyncStrategies": {
+          "waitForSaveSummaryStep": {
+            "timeoutMs": 5000,
+            "pollIntervalMs": 200,
+            "description": "Waiting for save_include_summary_step_by_default Tauri command to complete and status log to update with the enabled/disabled confirmation"
+          }
+        },
+        "requiresInfrastructure": {
+          "pty": false,
+          "fileSystem": false,
+          "claudeAPI": false,
+          "llmBackend": false,
+          "runnerBackend": true,
+          "tauriEvents": false
+        },
+        "automationCoverage": 80,
+        "notes": "The default-ON scenario exercises a subtle initialization path: the component renders with includeSummaryStep=true before any backend data is received. In practice the IPC calls resolve quickly, so catching the pre-load state requires racing the snapshot against the mount event."
+      },
+      "gen-settings-persistence": {
+        "scenarios": [
+          {
+            "id": "settings-load-on-mount",
+            "name": "All three settings load asynchronously on mount",
+            "description": "Navigate to the General settings tab and verify all three toggles settle to their backend-persisted values after the three independent Tauri commands (get_auto_load_last_config, get_include_summary_step_by_default, get_autostart_enabled) resolve",
+            "groupIds": ["gen-settings-persistence"],
+            "difficulty": "medium",
+            "steps": [
+              { "type": "navigate", "url": "/settings?tab=general" },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": {
+                  "type": "search",
+                  "criteria": { "textContent": "Auto-load Last Configuration on Startup" }
+                },
+                "timeoutMs": 5000
+              },
+              { "type": "assert", "assertionId": "gen-settings-load-on-mount" },
+              { "type": "assert", "assertionId": "gen-toggle-visual-state" }
+            ],
+            "teardown": [],
+            "requiresRealBackend": true,
+            "hasTiming": true,
+            "retryStrategy": { "maxAttempts": 2, "delayMs": 500 }
+          },
+          {
+            "id": "no-save-button-present",
+            "name": "Confirm no Save button exists on General tab",
+            "description": "Verify that no Save or Apply button is rendered on the General settings tab — each toggle auto-saves independently and there is no batch save action",
+            "groupIds": ["gen-settings-persistence"],
+            "difficulty": "easy",
+            "steps": [
+              { "type": "navigate", "url": "/settings?tab=general" },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": { "type": "search", "criteria": { "textContent": "General" } },
+                "timeoutMs": 5000
+              },
+              { "type": "assert", "assertionId": "gen-no-save-button" }
+            ],
+            "teardown": [],
+            "requiresRealBackend": false,
+            "hasTiming": false,
+            "retryStrategy": { "maxAttempts": 2, "delayMs": 500 }
+          }
+        ],
+        "asyncStrategies": {
+          "waitForAllSettingsLoaded": {
+            "timeoutMs": 5000,
+            "pollIntervalMs": 200,
+            "description": "Waiting for all three independent Tauri IPC calls (get_auto_load_last_config, get_include_summary_step_by_default, get_autostart_enabled) to complete and toggle states to stabilize — no loading spinner is shown, so poll by element presence"
+          }
+        },
+        "requiresInfrastructure": {
+          "pty": false,
+          "fileSystem": false,
+          "claudeAPI": false,
+          "llmBackend": false,
+          "runnerBackend": true,
+          "tauriEvents": false
+        },
+        "automationCoverage": 70,
+        "manualAssertions": [
+          "Optimistic rollback on backend failure cannot be automated without mocking Tauri commands — verify manually by simulating a command error and confirming the toggle reverts"
+        ],
+        "notes": "The three IPC calls fire in parallel on mount with no guaranteed order and no loading indicator. Poll by element presence to detect when the page has settled. The rollback path (backend returns error) requires Tauri command mocking which is not available via UI Bridge."
+      }
+    }
+  },
+  "metadata": {
+    "component": "GeneralSettings",
+    "pageUrl": "/settings?tab=general",
+    "tags": ["settings", "general", "startup", "autostart", "workflow-builder", "toggle"]
   }
 }

@@ -1,0 +1,1379 @@
+{
+  "version": "1.0.0",
+  "description": "The AI Provider settings page configures how the runner connects to AI for automation analysis. It supports four providers: Claude Code CLI (subscription-based, recommended), Claude API (direct per-token billing), Gemini CLI (Google CLI with OAuth or API key), and Gemini API (direct Gemini billing). Each provider has a conditionally rendered configuration section. The page also manages auto-refine video escalation defaults, interactive session mode, connection testing, and circuit breaker health status. Settings are persisted via Tauri IPC to the OS keychain (API keys) and runner config store.",
+  "groups": [
+    {
+      "id": "ai-page-structure",
+      "name": "Page Structure and Header",
+      "description": "The AI Provider settings page renders a scrollable column with a Bot icon, heading, description, and tutorial link. A loading spinner is shown while the initial get_ai_settings Tauri command is in flight.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ai-page-title",
+          "description": "The page heading 'AI Provider' is displayed at the top of the settings panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "textContent": "AI Provider" },
+            "label": "AI Provider heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-page-description",
+          "description": "The page shows a description containing 'Configure how the runner connects to AI for automation analysis and assistance'",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Configure how the runner connects to AI" },
+            "label": "AI Provider description text"
+          },
+          "assertionType": "containsText",
+          "expected": "Configure how the runner connects to AI",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-loading-state",
+          "description": "When the page first loads, an element with data-content-label='loading ai settings' is shown while settings are fetched. After loading completes, it is replaced by the settings form with the provider radio buttons visible.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "loading ai settings" },
+            "label": "Loading state container"
+          },
+          "assertionType": "behavior",
+          "precondition": "Page is navigating to AI settings for the first time",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-provider-selection",
+      "name": "Provider Selection",
+      "description": "A radio button group with four mutually exclusive provider options. Selecting a provider immediately shows that provider's configuration section and hides the others. Each option includes a label and short description of the billing model.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ai-provider-claude-cli-radio",
+          "description": "Radio button with id 'provider-claude_cli' labeled 'Claude Code CLI (Recommended)' is present with description 'Uses your Claude Code subscription - no per-token cost'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "radio", "idPattern": "provider-claude_cli" },
+            "label": "Claude CLI radio button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-provider-claude-api-radio",
+          "description": "Radio button with id 'provider-claude_api' labeled 'Claude API' is present with description 'Direct API access with per-token billing'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "radio", "idPattern": "provider-claude_api" },
+            "label": "Claude API radio button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-provider-gemini-cli-radio",
+          "description": "Radio button with id 'provider-gemini_cli' labeled 'Gemini CLI' is present with description mentioning OAuth or API key and free tier",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "radio", "idPattern": "provider-gemini_cli" },
+            "label": "Gemini CLI radio button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-provider-gemini-api-radio",
+          "description": "Radio button with id 'provider-gemini_api' labeled 'Gemini API' is present with description 'Direct Gemini API access with per-token billing'",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "radio", "idPattern": "provider-gemini_api" },
+            "label": "Gemini API radio button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-provider-section-switch",
+          "description": "Clicking a provider radio button hides the previously selected provider's configuration section and shows the newly selected one. For example, clicking 'Claude API' hides the Claude CLI section (execution mode dropdown, account list) and reveals the Claude API section (model dropdown, API key input).",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "radio", "idPattern": "provider-claude_api" },
+            "label": "Claude API radio button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Settings page has loaded with claude_cli provider selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-provider-health",
+      "name": "Provider Health Status (Circuit Breakers)",
+      "description": "When one or more providers have had activity since the runner started, a health status row appears showing a badge per active provider. Each badge reflects its circuit breaker state. This section is absent on a fresh runner with no AI activity.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "ai-health-status-badges",
+          "description": "The health status section is only rendered when at least one provider has had circuit breaker activity. When visible, each provider badge shows its state: Closed (green, CheckCircle2 icon) = healthy; HalfOpen (yellow, Activity icon) = recovering; Open (red, AlertTriangle icon) = blocked after repeated failures.",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Closed" },
+            "label": "Closed circuit breaker badge"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one AI provider has been used since runner started",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-health-reset-behavior",
+          "description": "When a provider's circuit breaker is in the Open state, a reset button (RotateCcw icon) appears next to its badge. Clicking it calls reset_provider_circuit with the provider key. After reset the badge returns to Closed state. The button is not shown for Closed or HalfOpen states.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Open" },
+            "label": "Open circuit breaker badge area"
+          },
+          "assertionType": "behavior",
+          "precondition": "A provider's circuit breaker is in Open state",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-health-realtime-updates",
+          "description": "Circuit breaker badges update in real time without a page refresh by listening to the 'circuit-breaker-change' Tauri event. When a provider's state changes during workflow execution, the corresponding badge updates immediately.",
+          "category": "semantic",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Closed" },
+            "label": "Circuit breaker status badge"
+          },
+          "assertionType": "semantic",
+          "precondition": "Health status section is visible",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-claude-cli-section",
+      "name": "Claude CLI Provider Configuration",
+      "description": "Visible only when claude_cli provider is selected. Contains authentication status banner, execution mode dropdown, optional custom executable path, Claude account management, selection mode, and timeout input.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ai-claude-cli-section-visible",
+          "description": "The Claude CLI configuration section — identified by the execution mode dropdown with id 'claude-cli-execution-mode' — is visible when claude_cli is selected and hidden for all other providers",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox", "idPattern": "claude-cli-execution-mode" },
+            "label": "Claude CLI execution mode dropdown"
+          },
+          "assertionType": "visible",
+          "precondition": "claude_cli provider radio button is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-cli-auth-banner-semantic",
+          "description": "An authentication status banner is displayed at the top of the Claude CLI section. Three possible states: (1) Authenticated — ShieldCheck icon, green accent, shows subscription_type and minutes/hours until expiry; (2) Expired — AlertTriangle icon, red accent, text 'Authentication expired — workflows will fail'; (3) No credentials — neutral styling, text 'No credentials found'. Data comes from the check_claude_cli_auth Tauri command.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Authenticated" },
+            "label": "Auth status banner (authenticated state)"
+          },
+          "assertionType": "semantic",
+          "precondition": "claude_cli provider is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-cli-reauth-button",
+          "description": "A 'Re-authenticate' button is visible in the auth banner when auth is expired or credentials are missing. Clicking it calls refresh_claude_cli_auth which opens the browser-based Claude login flow. The button is absent when credentials are valid and not expired.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Re-authenticate" },
+            "label": "Re-authenticate button"
+          },
+          "assertionType": "behavior",
+          "precondition": "claude_cli provider is selected and auth is expired or missing",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-cli-execution-mode-options",
+          "description": "Execution mode dropdown (id 'claude-cli-execution-mode') contains exactly four options: Auto-detect/auto (Recommended), Windows Native/windows_native, WSL/wsl, Native Unix/native",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox", "idPattern": "claude-cli-execution-mode" },
+            "label": "Claude CLI execution mode dropdown"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-cli-timeout-input",
+          "description": "Timeout number input (id 'claude-cli-timeout') is present with min=60, max=3600 and help text 'Maximum time to wait for Claude Code to respond (60-3600 seconds).'",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "spinbutton", "idPattern": "claude-cli-timeout" },
+            "label": "Claude CLI timeout input"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-claude-cli-accounts",
+      "name": "Claude CLI Account Management",
+      "description": "Manages multiple Claude config directories for rate-limit failover. Users can add directories via file picker, auto-detect them, check usage quotas, switch active accounts, configure per-account launch commands, and choose between Manual and Least Usage selection modes.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ai-claude-cli-accounts-empty-state",
+          "description": "When no Claude config directories are configured, the account list area shows a centered message: 'No accounts configured. Add directories or use Auto-Detect.'",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No accounts configured" },
+            "label": "Empty accounts state message"
+          },
+          "assertionType": "exists",
+          "precondition": "claude_cli provider is selected and no account directories are configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-cli-add-dir-button",
+          "description": "An 'Add Directory' button with Plus icon is present. Clicking it opens a native OS file picker for selecting a Claude config directory, adds the selected path to the list, and calls save_claude_config_dirs.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Add Directory" },
+            "label": "Add Directory button"
+          },
+          "assertionType": "exists",
+          "precondition": "claude_cli provider is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-cli-auto-detect-behavior",
+          "description": "Clicking 'Auto-Detect' calls discover_claude_config_dirs and merges discovered directories with any already configured. During detection the button is disabled and shows a pulsing FolderSearch icon and text 'Detecting...'. After completion, newly found directories appear as account cards.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Auto-Detect" },
+            "label": "Auto-Detect button"
+          },
+          "assertionType": "behavior",
+          "precondition": "claude_cli provider is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-cli-check-usage-button",
+          "description": "'Check Usage' button (RefreshCw icon) is visible only when at least one account directory exists. Clicking it calls check_accounts_usage and populates usage bars and quota details (utilization %, reset date, days remaining) on each account card.",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Check Usage" },
+            "label": "Check Usage button"
+          },
+          "assertionType": "exists",
+          "precondition": "claude_cli provider is selected and at least one account directory is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-cli-account-cards-semantic",
+          "description": "Each configured account renders as a card showing: directory name (truncated), status badges (Active=blue, Rate-limited=red, Auto-selected=green in least_usage mode, Selected=primary in manual mode), an optional usage bar (green < 50%, yellow 50-80%, red >= 80% utilization), a per-account launch command text input, and a 'Switch' button (ArrowRightLeft icon) when multiple accounts exist and the account is not currently active. The currently active account has a green ring highlight.",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Active" },
+            "label": "Active account badge on account card"
+          },
+          "assertionType": "semantic",
+          "precondition": "claude_cli provider is selected and at least one account directory is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-cli-selection-mode-behavior",
+          "description": "When two or more account directories are configured, a two-button grid appears for selection mode: 'Manual' (user picks account via radio button, shows custom config dir input below) and 'Least Usage' (runner auto-selects account with lowest utilization and fails over on rate limit, hides per-account radios, shows Auto-selected badge on best account). Switching modes updates account_selection_mode in settings.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Least Usage" },
+            "label": "Least Usage selection mode button"
+          },
+          "assertionType": "behavior",
+          "precondition": "claude_cli provider is selected and at least two account directories are configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-claude-api-section",
+      "name": "Claude API Provider Configuration",
+      "description": "Visible only when claude_api provider is selected. Manages Claude API key storage in the OS keychain, model selection from four Claude model options, max tokens limit, and displays a per-token cost warning.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ai-claude-api-section-visible",
+          "description": "The Claude API configuration section — identified by the model dropdown with id 'claude-api-model' — is visible when claude_api is selected",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox", "idPattern": "claude-api-model" },
+            "label": "Claude API model dropdown"
+          },
+          "assertionType": "visible",
+          "precondition": "claude_api provider radio button is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-api-key-configured-status",
+          "description": "When a Claude API key exists in the OS keychain, the password input is replaced by a read-only element with data-content-label='claude api key configured' showing 'API key configured securely'. A red 'Delete' button appears alongside it to remove the key.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "claude api key configured" },
+            "label": "Claude API key configured status"
+          },
+          "assertionType": "exists",
+          "precondition": "claude_api provider is selected and a Claude API key exists in the keychain",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-api-key-save-behavior",
+          "description": "When no key exists, a password input (id 'claude-api-key', placeholder 'sk-ant-...') is shown with an eye/eye-off toggle and 'Save Key' button. 'Save Key' is disabled when input is empty. Clicking it calls save_ai_api_key_command(provider='claude_api', apiKey). On success, the input is replaced by the 'API key configured securely' status element.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save Key" },
+            "label": "Claude API Save Key button"
+          },
+          "assertionType": "behavior",
+          "precondition": "claude_api provider is selected and no API key exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-api-model-select",
+          "description": "Model dropdown (id 'claude-api-model') offers: claude-sonnet-4-20250514 (Claude Sonnet 4, marked Recommended), claude-opus-4-20250514 (Claude Opus 4), claude-3-5-sonnet-20241022 (Claude 3.5 Sonnet), claude-3-opus-20240229 (Claude 3 Opus)",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox", "idPattern": "claude-api-model" },
+            "label": "Claude API model dropdown"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-claude-api-cost-warning",
+          "description": "A yellow-accented warning box is displayed informing users that Claude API incurs per-token costs and recommending Claude Code CLI with subscription for unlimited usage",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "per-token costs" },
+            "label": "Claude API cost warning"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-gemini-cli-section",
+      "name": "Gemini CLI Provider Configuration",
+      "description": "Visible only when gemini_cli provider is selected. Configures authentication method (OAuth for Google account free tier, or API key), model selection from five Gemini models, execution mode, and timeout. Includes an npm install tip.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ai-gemini-cli-section-visible",
+          "description": "The Gemini CLI configuration section — identified by the model dropdown with id 'gemini-cli-model' — is visible when gemini_cli is selected",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox", "idPattern": "gemini-cli-model" },
+            "label": "Gemini CLI model dropdown"
+          },
+          "assertionType": "visible",
+          "precondition": "gemini_cli provider radio button is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-gemini-cli-auth-oauth-radio",
+          "description": "Radio button with id 'gemini-auth-oauth' labeled 'OAuth (Google Account)' is present, with description showing free tier limits: 60 req/min, 1000 req/day",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "radio", "idPattern": "gemini-auth-oauth" },
+            "label": "Gemini OAuth auth method radio"
+          },
+          "assertionType": "exists",
+          "precondition": "gemini_cli provider is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-gemini-cli-auth-api-key-radio",
+          "description": "Radio button with id 'gemini-auth-api_key' labeled 'API Key' is present, with description mentioning 100 req/day free tier",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "radio", "idPattern": "gemini-auth-api_key" },
+            "label": "Gemini API key auth method radio"
+          },
+          "assertionType": "exists",
+          "precondition": "gemini_cli provider is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-gemini-cli-model-select",
+          "description": "Model dropdown (id 'gemini-cli-model') offers five options: gemini-3-flash-preview (Fast/Cheap), gemini-3-pro-preview, gemini-2.5-flash, gemini-2.5-pro, gemini-2.0-flash",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox", "idPattern": "gemini-cli-model" },
+            "label": "Gemini CLI model dropdown"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-gemini-cli-install-tip",
+          "description": "A blue-accented info box is displayed with the text: 'Tip: Install Gemini CLI with: npm install -g @google/gemini-cli'",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "npm install -g @google/gemini-cli" },
+            "label": "Gemini CLI install tip"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-gemini-api-section",
+      "name": "Gemini API Provider Configuration",
+      "description": "Visible only when gemini_api provider is selected. Manages Gemini API key in the OS keychain, model selection, max output tokens, and temperature (creativity). Includes a cost savings note comparing Gemini Flash to Claude for simple tasks.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ai-gemini-api-section-visible",
+          "description": "The Gemini API configuration section — identified by the model dropdown with id 'gemini-api-model' — is visible when gemini_api is selected",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox", "idPattern": "gemini-api-model" },
+            "label": "Gemini API model dropdown"
+          },
+          "assertionType": "visible",
+          "precondition": "gemini_api provider radio button is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-gemini-api-key-configured-status",
+          "description": "When a Gemini API key exists in the OS keychain, the input is replaced by an element with data-content-label='gemini api key configured' and a red 'Delete' button",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "dataContentLabel": "gemini api key configured" },
+            "label": "Gemini API key configured status"
+          },
+          "assertionType": "exists",
+          "precondition": "gemini_api provider is selected and a Gemini API key exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-gemini-api-key-save-behavior",
+          "description": "When no Gemini API key exists, a password input (id 'gemini-api-key', placeholder 'AIza...') is shown with show/hide toggle and 'Save Key' button. The button is disabled when input is empty. Saving calls save_ai_api_key_command(provider='gemini_api', apiKey). On success the input becomes the configured status element.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save Key" },
+            "label": "Gemini API Save Key button"
+          },
+          "assertionType": "behavior",
+          "precondition": "gemini_api provider is selected and no Gemini API key exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-gemini-api-temperature-input",
+          "description": "Temperature number input (id 'gemini-api-temperature', min=0, max=2, step=0.1) is present with help text 'Controls randomness (0 = deterministic, 2 = very creative).'",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "spinbutton", "idPattern": "gemini-api-temperature" },
+            "label": "Temperature input"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-gemini-api-cost-savings-note",
+          "description": "A green-accented box is displayed with heading 'Cost Savings' noting that Gemini Flash is significantly cheaper than Claude for simple tasks",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Cost Savings" },
+            "label": "Gemini API cost savings note"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-auto-refine-defaults",
+      "name": "Auto-Refine Defaults",
+      "description": "Global setting controlling how many failed AI analysis iterations occur before the system escalates to include video frames in the prompt. Setting 0 disables video escalation entirely. Applies as the default for new scripts across all providers.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ai-auto-refine-iterations-label",
+          "description": "Label 'Include Video After Iterations' is present in the auto-refine card section, alongside a Video icon in the section heading",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Include Video After Iterations" },
+            "label": "Include Video After Iterations label"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-auto-refine-iterations-input",
+          "description": "Number input (id 'auto-refine-iterations') is present with min=0, max=20 and help text explaining that 0 means never include video",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "spinbutton", "idPattern": "auto-refine-iterations" },
+            "label": "Auto-refine iterations input"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-auto-refine-validation",
+          "description": "The iterations input clamps values to the 0-20 range. Entering a value below 0 results in 0; entering a value above 20 results in 20. Setting to 0 means video frames are never included in AI analysis prompts.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "spinbutton", "idPattern": "auto-refine-iterations" },
+            "label": "Auto-refine iterations input"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-auto-refine-video-warning",
+          "description": "A yellow-accented warning box is present stating that video frames use significantly more tokens than screenshots and are only recommended for complex failures",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Video frames use significantly more tokens" },
+            "label": "Video token usage warning"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-session-mode",
+      "name": "Session Mode Configuration",
+      "description": "A toggle controlling whether AI CLI sessions use interactive (bidirectional, multi-turn, message queuing) or one-shot (inline) execution mode. Affects how the runner communicates with the AI CLI during workflow execution.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ai-interactive-sessions-toggle-exists",
+          "description": "A pill-shaped toggle button with id 'interactive-sessions-toggle' is present in the Session Mode card, labeled 'Interactive Sessions'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "idPattern": "interactive-sessions-toggle" },
+            "label": "Interactive sessions toggle"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-interactive-sessions-toggle-behavior",
+          "description": "Clicking the toggle switches it between enabled (primary color, knob slid right) and disabled (muted color, knob slid left). The visual state accurately reflects the interactive_sessions_enabled setting value. Toggling does not auto-save — the change takes effect after clicking 'Save AI Settings'.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "idPattern": "interactive-sessions-toggle" },
+            "label": "Interactive sessions toggle"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-session-mode-info-box",
+          "description": "An info box below the toggle explains that interactive mode provides richer AI sessions with message queuing and multi-turn conversations, and advises disabling for stability issues or preference for simpler one-shot execution",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "message queuing" },
+            "label": "Session mode info box"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-test-connection",
+      "name": "Test Connection",
+      "description": "A card allowing users to verify the current provider configuration is functional before saving. Calls test_ai_connection Tauri command and displays a success or failure result with the backend's message.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ai-test-connection-button-exists",
+          "description": "A primary 'Test Connection' button with Play icon is present in the Test Connection card",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Test Connection" },
+            "label": "Test Connection button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-test-connection-disabled-no-key",
+          "description": "The Test Connection button is disabled when an API-based provider (claude_api or gemini_api) is selected but no API key has been saved to the keychain",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Test Connection" },
+            "label": "Test Connection button"
+          },
+          "assertionType": "disabled",
+          "precondition": "claude_api or gemini_api provider is selected and no API key is configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-test-connection-behavior",
+          "description": "Clicking 'Test Connection' calls the test_ai_connection Tauri command. During testing: button shows a spinner and 'Testing...' text and is disabled. After completion: a result section appears — success shows a green check-circle icon with the backend's success message; failure shows a red x-circle with the error message. The result section is absent before any test is run.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Test Connection" },
+            "label": "Test Connection button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Settings page is loaded with a provider configured",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-save-settings",
+      "name": "Save Settings",
+      "description": "The Save button at the bottom of the page persists all AI settings. It calls save_ai_settings for Claude provider fields and save_gemini_settings for Gemini fields. Provides animated feedback for saving, success, and error states.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "ai-save-button-exists",
+          "description": "A primary 'Save AI Settings' button with Bot icon is present at the bottom of the page",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save AI Settings" },
+            "label": "Save AI Settings button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-save-behavior",
+          "description": "Clicking 'Save AI Settings' calls save_ai_settings (with provider, execution_mode, custom_path, timeout_seconds, config_dir, account_selection_mode, model, max_tokens, auto_refine_video_after_iterations, interactive_sessions_enabled) and — for Gemini providers — also save_gemini_settings (execution_mode, custom_path, timeout_seconds, auth_method, model, max_output_tokens, temperature). During save the button shows a spinner and 'Saving...' text.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save AI Settings" },
+            "label": "Save AI Settings button"
+          },
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-save-success-feedback",
+          "description": "After a successful save, a green success banner appears with text 'Settings saved successfully!' and auto-dismisses after 3000ms. The save button briefly shows a check icon and 'Saved!' text before returning to its default state.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Settings saved successfully" },
+            "label": "Save success banner"
+          },
+          "assertionType": "behavior",
+          "precondition": "Save operation completed successfully",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-save-error-feedback",
+          "description": "If the save operation fails, a red error banner appears at the top of the page with the error message from the Tauri command response. The banner has a dismiss button (X icon). The save button returns to its default state.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save AI Settings" },
+            "label": "Save AI Settings button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Save operation has failed with an error",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "ai-loading",
+        "name": "Loading",
+        "description": "Initial state while get_ai_settings Tauri command is in flight. The spinner with data-content-label='loading ai settings' is visible; the settings form is not yet rendered.",
+        "elements": [{ "dataContentLabel": "loading ai settings" }],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-claude-cli",
+            "name": "Load completes — claude_cli provider saved",
+            "description": "Settings load finishes with claude_cli as the saved provider",
+            "activateStates": ["ai-provider-claude-cli"],
+            "deactivateStates": ["ai-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "radio", "idPattern": "provider-claude_cli" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-claude-api",
+            "name": "Load completes — claude_api provider saved",
+            "description": "Settings load finishes with claude_api as the saved provider",
+            "activateStates": ["ai-provider-claude-api"],
+            "deactivateStates": ["ai-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "combobox", "idPattern": "claude-api-model" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-gemini-cli",
+            "name": "Load completes — gemini_cli provider saved",
+            "description": "Settings load finishes with gemini_cli as the saved provider",
+            "activateStates": ["ai-provider-gemini-cli"],
+            "deactivateStates": ["ai-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "combobox", "idPattern": "gemini-cli-model" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-gemini-api",
+            "name": "Load completes — gemini_api provider saved",
+            "description": "Settings load finishes with gemini_api as the saved provider",
+            "activateStates": ["ai-provider-gemini-api"],
+            "deactivateStates": ["ai-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "role": "combobox", "idPattern": "gemini-api-model" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ai-provider-claude-cli",
+        "name": "Claude CLI Provider Selected",
+        "description": "Claude Code CLI is the active provider. The Claude CLI configuration section (auth banner, execution mode, accounts, timeout) is visible. All other provider sections are hidden.",
+        "elements": [{ "role": "combobox", "idPattern": "claude-cli-execution-mode" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "claude-cli-to-claude-api",
+            "name": "Switch to Claude API",
+            "description": "Click the Claude API radio button",
+            "activateStates": ["ai-provider-claude-api"],
+            "deactivateStates": ["ai-provider-claude-cli"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-claude_api" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "claude-cli-to-gemini-cli",
+            "name": "Switch to Gemini CLI",
+            "description": "Click the Gemini CLI radio button",
+            "activateStates": ["ai-provider-gemini-cli"],
+            "deactivateStates": ["ai-provider-claude-cli"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-gemini_cli" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "claude-cli-to-gemini-api",
+            "name": "Switch to Gemini API",
+            "description": "Click the Gemini API radio button",
+            "activateStates": ["ai-provider-gemini-api"],
+            "deactivateStates": ["ai-provider-claude-cli"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-gemini_api" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ai-provider-claude-api",
+        "name": "Claude API Provider Selected",
+        "description": "Claude API (direct billing) is the active provider. API key management, model dropdown, and max tokens input are visible. Claude CLI section is hidden.",
+        "elements": [{ "role": "combobox", "idPattern": "claude-api-model" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "claude-api-to-claude-cli",
+            "name": "Switch to Claude CLI",
+            "description": "Click the Claude CLI radio button",
+            "activateStates": ["ai-provider-claude-cli"],
+            "deactivateStates": ["ai-provider-claude-api"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-claude_cli" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "claude-api-to-gemini-cli",
+            "name": "Switch to Gemini CLI",
+            "description": "Click the Gemini CLI radio button",
+            "activateStates": ["ai-provider-gemini-cli"],
+            "deactivateStates": ["ai-provider-claude-api"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-gemini_cli" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "claude-api-to-gemini-api",
+            "name": "Switch to Gemini API",
+            "description": "Click the Gemini API radio button",
+            "activateStates": ["ai-provider-gemini-api"],
+            "deactivateStates": ["ai-provider-claude-api"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-gemini_api" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ai-provider-gemini-cli",
+        "name": "Gemini CLI Provider Selected",
+        "description": "Gemini CLI is the active provider. Auth method radios, model dropdown, execution mode, and timeout are visible. All other provider sections are hidden.",
+        "elements": [{ "role": "combobox", "idPattern": "gemini-cli-model" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "gemini-cli-to-claude-cli",
+            "name": "Switch to Claude CLI",
+            "description": "Click the Claude CLI radio button",
+            "activateStates": ["ai-provider-claude-cli"],
+            "deactivateStates": ["ai-provider-gemini-cli"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-claude_cli" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "gemini-cli-to-claude-api",
+            "name": "Switch to Claude API",
+            "description": "Click the Claude API radio button",
+            "activateStates": ["ai-provider-claude-api"],
+            "deactivateStates": ["ai-provider-gemini-cli"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-claude_api" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "gemini-cli-to-gemini-api",
+            "name": "Switch to Gemini API",
+            "description": "Click the Gemini API radio button",
+            "activateStates": ["ai-provider-gemini-api"],
+            "deactivateStates": ["ai-provider-gemini-cli"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-gemini_api" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ai-provider-gemini-api",
+        "name": "Gemini API Provider Selected",
+        "description": "Gemini API (direct billing) is the active provider. API key management, model dropdown, max output tokens, and temperature inputs are visible. All other provider sections are hidden.",
+        "elements": [{ "role": "combobox", "idPattern": "gemini-api-model" }],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "gemini-api-to-claude-cli",
+            "name": "Switch to Claude CLI",
+            "description": "Click the Claude CLI radio button",
+            "activateStates": ["ai-provider-claude-cli"],
+            "deactivateStates": ["ai-provider-gemini-api"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-claude_cli" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "gemini-api-to-claude-api",
+            "name": "Switch to Claude API",
+            "description": "Click the Claude API radio button",
+            "activateStates": ["ai-provider-claude-api"],
+            "deactivateStates": ["ai-provider-gemini-api"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-claude_api" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "gemini-api-to-gemini-cli",
+            "name": "Switch to Gemini CLI",
+            "description": "Click the Gemini CLI radio button",
+            "activateStates": ["ai-provider-gemini-cli"],
+            "deactivateStates": ["ai-provider-gemini-api"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "radio", "idPattern": "provider-gemini_cli" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "testing": {
+    "defaultTimeoutMs": 5000,
+    "defaultPollIntervalMs": 200,
+    "groups": {
+      "ai-provider-selection": {
+        "scenarios": [
+          {
+            "id": "provider-switch-cli-to-api",
+            "name": "Switch from Claude CLI to Claude API",
+            "description": "Verify selecting Claude API hides the Claude CLI section and shows the Claude API section",
+            "groupIds": ["ai-provider-selection"],
+            "difficulty": "easy",
+            "steps": [
+              { "type": "navigate", "url": "/settings" },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": {
+                  "type": "search",
+                  "criteria": { "role": "radio", "idPattern": "provider-claude_cli" }
+                },
+                "timeoutMs": 5000
+              },
+              {
+                "type": "componentAction",
+                "componentId": "ai-settings-panel",
+                "actionId": "click",
+                "params": {}
+              },
+              { "type": "assert", "assertionId": "ai-claude-api-section-visible" }
+            ],
+            "teardown": [],
+            "requiresRealBackend": true,
+            "hasTiming": false,
+            "retryStrategy": { "maxAttempts": 2, "delayMs": 500 }
+          }
+        ],
+        "requiresInfrastructure": {
+          "pty": false,
+          "fileSystem": false,
+          "claudeAPI": false,
+          "llmBackend": false,
+          "runnerBackend": true,
+          "tauriEvents": false
+        },
+        "automationCoverage": 80,
+        "notes": "Provider switch is pure UI state — no Tauri calls until Save is clicked"
+      },
+      "ai-test-connection": {
+        "scenarios": [
+          {
+            "id": "test-connection-flow",
+            "name": "Test AI connection and observe result",
+            "description": "Click Test Connection, wait for result, verify result section appears with success or failure message",
+            "groupIds": ["ai-test-connection"],
+            "difficulty": "hard",
+            "hardnessReason": "Requires a real working AI provider installation and credentials",
+            "steps": [
+              { "type": "navigate", "url": "/settings" },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": {
+                  "type": "search",
+                  "criteria": { "role": "button", "textContent": "Test Connection" }
+                },
+                "timeoutMs": 5000
+              },
+              {
+                "type": "componentAction",
+                "componentId": "test-connection-button",
+                "actionId": "click",
+                "params": {}
+              },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": { "type": "search", "criteria": { "textContent": "Testing..." } },
+                "timeoutMs": 3000
+              },
+              { "type": "assert", "assertionId": "ai-test-connection-behavior" }
+            ],
+            "teardown": [],
+            "requiresRealBackend": true,
+            "hasTiming": true,
+            "retryStrategy": { "maxAttempts": 1, "delayMs": 0 }
+          }
+        ],
+        "asyncStrategies": {
+          "waitForTestResult": {
+            "timeoutMs": 30000,
+            "pollIntervalMs": 500,
+            "description": "Waiting for test_ai_connection Tauri command to return"
+          }
+        },
+        "requiresInfrastructure": {
+          "pty": false,
+          "fileSystem": false,
+          "claudeAPI": true,
+          "llmBackend": false,
+          "runnerBackend": true,
+          "tauriEvents": true
+        },
+        "automationCoverage": 60,
+        "manualAssertions": ["Success message content varies per provider and model"],
+        "notes": "Full test requires working provider installation; mark as infrastructure-dependent"
+      },
+      "ai-save-settings": {
+        "scenarios": [
+          {
+            "id": "save-settings-success",
+            "name": "Save settings and verify success banner",
+            "description": "Click Save AI Settings and verify the success banner appears then auto-dismisses",
+            "groupIds": ["ai-save-settings"],
+            "difficulty": "medium",
+            "steps": [
+              { "type": "navigate", "url": "/settings" },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": {
+                  "type": "search",
+                  "criteria": { "role": "button", "textContent": "Save AI Settings" }
+                },
+                "timeoutMs": 5000
+              },
+              {
+                "type": "componentAction",
+                "componentId": "save-ai-settings-button",
+                "actionId": "click",
+                "params": {}
+              },
+              {
+                "type": "wait",
+                "condition": "element",
+                "target": {
+                  "type": "search",
+                  "criteria": { "textContent": "Settings saved successfully" }
+                },
+                "timeoutMs": 5000
+              },
+              { "type": "assert", "assertionId": "ai-save-success-feedback" }
+            ],
+            "teardown": [],
+            "requiresRealBackend": true,
+            "hasTiming": true,
+            "retryStrategy": { "maxAttempts": 2, "delayMs": 1000 }
+          }
+        ],
+        "asyncStrategies": {
+          "waitForSave": {
+            "timeoutMs": 5000,
+            "pollIntervalMs": 200,
+            "description": "Waiting for save_ai_settings Tauri command to complete and success banner to appear"
+          }
+        },
+        "requiresInfrastructure": {
+          "pty": false,
+          "fileSystem": false,
+          "claudeAPI": false,
+          "llmBackend": false,
+          "runnerBackend": true,
+          "tauriEvents": false
+        },
+        "automationCoverage": 85,
+        "notes": "Requires runner backend for Tauri IPC; settings must round-trip correctly through save and load"
+      }
+    }
+  },
+  "metadata": {
+    "component": "AiSettings",
+    "pageUrl": "/settings/ai",
+    "tags": [
+      "settings",
+      "ai",
+      "provider",
+      "claude",
+      "gemini",
+      "api-key",
+      "circuit-breaker",
+      "configuration"
+    ]
+  }
+}
