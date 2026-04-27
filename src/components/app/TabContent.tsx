@@ -61,6 +61,7 @@ import { TraceViewerPage } from "@/components/run-dashboard/TraceViewerPage";
 import { RunActionsTab } from "@/components/run-logs/RunActionsTab";
 import { RunImageRecognitionTab } from "@/components/run-logs/RunImageRecognitionTab";
 import { AiDataViewerTab } from "@/components/run-logs/AiDataViewerTab";
+import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { RunRecapTab } from "@/components/run-recap";
 import { CategoryManager } from "@/components/findings/CategoryManager";
 import { HooksManagerPanel } from "@/components/hooks";
@@ -620,23 +621,25 @@ export function TabContent({
               icon={Bot}
               onNavigateToActive={() => setActiveTab("active")}
             >
-              <AiTab
-                aiOutputLines={aiOutputLogs}
-                onClearAiOutput={clearAiOutputLogs}
-                onAddAiOutputLine={(line) =>
-                  addAiOutputLog(
-                    line.line,
-                    line.source,
-                    line.actionId,
-                    line.taskRunId,
-                    line.sessionId,
-                    line.sessionName,
-                    line.phase,
-                    line.phaseIteration,
-                  )
-                }
-                onNavigateToLibrary={() => setActiveTab("library")}
-              />
+              <ErrorBoundary componentName="AiTab">
+                <AiTab
+                  aiOutputLines={aiOutputLogs}
+                  onClearAiOutput={clearAiOutputLogs}
+                  onAddAiOutputLine={(line) =>
+                    addAiOutputLog(
+                      line.line,
+                      line.source,
+                      line.actionId,
+                      line.taskRunId,
+                      line.sessionId,
+                      line.sessionName,
+                      line.phase,
+                      line.phaseIteration,
+                    )
+                  }
+                  onNavigateToLibrary={() => setActiveTab("library")}
+                />
+              </ErrorBoundary>
             </RunPageLayout>
           </RunSelectionProvider>
         </div>
@@ -672,7 +675,9 @@ export function TabContent({
               onNavigateToActive={() => setActiveTab("active")}
             >
               <div className="h-full overflow-hidden">
-                <AiDataViewerTab />
+                <ErrorBoundary componentName="AiDataViewerTab">
+                  <AiDataViewerTab />
+                </ErrorBoundary>
               </div>
             </RunPageLayout>
           </RunSelectionProvider>
@@ -699,23 +704,25 @@ export function TabContent({
     case "ai":
       return (
         <div data-page-id="ai" className="h-full overflow-hidden">
-          <AiTab
-            aiOutputLines={aiOutputLogs}
-            onClearAiOutput={clearAiOutputLogs}
-            onAddAiOutputLine={(line) =>
-              addAiOutputLog(
-                line.line,
-                line.source,
-                line.actionId,
-                line.taskRunId,
-                line.sessionId,
-                line.sessionName,
-                line.phase,
-                line.phaseIteration,
-              )
-            }
-            onNavigateToLibrary={() => setActiveTab("library")}
-          />
+          <ErrorBoundary componentName="AiTab">
+            <AiTab
+              aiOutputLines={aiOutputLogs}
+              onClearAiOutput={clearAiOutputLogs}
+              onAddAiOutputLine={(line) =>
+                addAiOutputLog(
+                  line.line,
+                  line.source,
+                  line.actionId,
+                  line.taskRunId,
+                  line.sessionId,
+                  line.sessionName,
+                  line.phase,
+                  line.phaseIteration,
+                )
+              }
+              onNavigateToLibrary={() => setActiveTab("library")}
+            />
+          </ErrorBoundary>
         </div>
       );
 
@@ -843,10 +850,12 @@ export function TabContent({
             name="Workflow Builder"
             description="Build and edit multi-step automation workflows with AI assistance"
           />
-          <WorkflowBuilderTab
-            editWorkflowId={editWorkflowId}
-            onNavigateToActive={() => setActiveTab("active")}
-          />
+          <ErrorBoundary componentName="WorkflowBuilderTab">
+            <WorkflowBuilderTab
+              editWorkflowId={editWorkflowId}
+              onNavigateToActive={() => setActiveTab("active")}
+            />
+          </ErrorBoundary>
         </div>
       );
 
@@ -1200,7 +1209,9 @@ export function TabContent({
             name="Help"
             description="Tutorials, documentation, and getting started guides"
           />
-          <HelpTab />
+          <ErrorBoundary componentName="HelpTab">
+            <HelpTab />
+          </ErrorBoundary>
         </div>
       );
 
