@@ -90,6 +90,7 @@ pub mod worktrees;
 pub mod wsv_disagreements;
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 // ============================================================================
@@ -1228,6 +1229,11 @@ static GLOBAL_PG_DB: OnceLock<Arc<PgDb>> = OnceLock::new();
 /// PostgreSQL connection pool backed by deadpool-postgres.
 pub struct PgDb {
     pool: deadpool_postgres::Pool,
+    /// The connection URL passed to `PgDb::new`. Stashed so the bootstrap
+    /// timeout helpers can open a fresh `tokio_postgres` connection (bypassing
+    /// the deadpool, which itself may be wedged) to dump `pg_stat_activity`
+    /// when a bootstrap stage hangs.
+    pg_url: String,
 }
 
 impl PgDb {
@@ -1271,8 +1277,23 @@ impl PgDb {
         let mgr =
             deadpool_postgres::Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
 
+        // max_size lowered from 16 -> 8: keep the pool's idle-connection
+        // footprint small so a force-killed runner that left orphaned PG
+        // backends doesn't leave 16 zombie sessions blocking advisory locks
+        // for the next runner.
+        //
+        // Do NOT add `.recycle_timeout(Some(_))` here — `Pool::builder`'s
+        // timeout setters require a tokio runtime to be entered for their
+        // timer machinery (deadpool 0.12 panics with "Timeouts require a
+        // runtime" otherwise). The PG bootstrap is called from a synchronous
+        // `rt.block_on(PgDb::new(...))` in `main.rs`, which builds its own
+        // single-threaded runtime for the bootstrap. That runtime IS active
+        // during the await inside `block_on`, but the `Pool::builder` chain
+        // runs synchronously before the first `.await`, so the timer
+        // registration races with runtime entry and panics.
+        // See: src/main.rs:285 for the calling context.
         let pool = deadpool_postgres::Pool::builder(mgr)
-            .max_size(16)
+            .max_size(8)
             .post_create(deadpool_postgres::Hook::async_fn(|conn, _| {
                 Box::pin(async move {
                     conn.simple_query("SET search_path TO runner, public")
@@ -1306,13 +1327,187 @@ impl PgDb {
         .await
         .map_err(|e| format!("Failed to bootstrap runner schema/extension: {}", e))?;
 
-        info!("PostgreSQL connected (deadpool, max_size=16, schema=runner)");
+        info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 
-        let db = Self { pool };
-        db.apply_canonical_schema().await?;
-        db.ensure_tables().await;
-        db.run_migrations().await?;
+        let db = Self {
+            pool,
+            pg_url: database_url.to_string(),
+        };
+        info!("PG bootstrap: applying canonical schema...");
+        db.apply_canonical_schema_with_timeout().await?;
+        info!("PG bootstrap: canonical schema applied");
+        info!("PG bootstrap: ensuring tables...");
+        db.ensure_tables_with_timeout().await;
+        info!("PG bootstrap: tables ensured");
+        info!("PG bootstrap: running migrations...");
+        db.run_migrations_with_timeout().await?;
+        info!("PG bootstrap: migrations complete");
         Ok(db)
+    }
+
+    /// Open a fresh `tokio_postgres` connection (bypassing the deadpool) and
+    /// dump `pg_stat_activity` for the current database. Used by the
+    /// bootstrap timeout helpers to surface blocking sessions when a stage
+    /// hangs. The deadpool itself may be wedged (waiting on a connection
+    /// recycle that's blocked on a lock), so we deliberately make a fresh
+    /// connection on each invocation.
+    async fn dump_pg_stat_activity_on_hang(&self, stage: &str) {
+        error!(
+            "PG bootstrap stage '{}' is hanging — dumping pg_stat_activity for blocking sessions",
+            stage
+        );
+        let pg_config: tokio_postgres::Config = match self.pg_url.parse() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                error!(
+                    "Cannot dump pg_stat_activity: invalid PG URL ({}); stage='{}'",
+                    e, stage
+                );
+                return;
+            }
+        };
+        // Bound the diagnostic itself so a totally unreachable PG doesn't
+        // wedge the panic path too.
+        let connect_fut = pg_config.connect(tokio_postgres::NoTls);
+        let (client, connection) =
+            match tokio::time::timeout(Duration::from_secs(5), connect_fut).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    error!(
+                        "Cannot dump pg_stat_activity: fresh connect failed ({}); stage='{}'",
+                        e, stage
+                    );
+                    return;
+                }
+                Err(_) => {
+                    error!(
+                    "Cannot dump pg_stat_activity: fresh connect timed out after 5s; stage='{}'",
+                    stage
+                );
+                    return;
+                }
+            };
+        // Drive the connection actor in the background. It'll exit when
+        // `client` is dropped at end of scope.
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                warn!("pg_stat_activity diagnostic connection error: {}", e);
+            }
+        });
+
+        const STAT_QUERY: &str = "SELECT pid, usename, application_name, state, \
+            wait_event_type, wait_event, query_start, \
+            EXTRACT(epoch FROM (now() - query_start))::float8 AS elapsed_secs, \
+            left(query, 500) AS query_preview \
+            FROM pg_stat_activity \
+            WHERE datname = current_database() \
+              AND state != 'idle' \
+              AND pid != pg_backend_pid() \
+            ORDER BY query_start ASC NULLS LAST";
+
+        let query_fut = client.query(STAT_QUERY, &[]);
+        let rows = match tokio::time::timeout(Duration::from_secs(5), query_fut).await {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                error!("pg_stat_activity query failed: {}; stage='{}'", e, stage);
+                return;
+            }
+            Err(_) => {
+                error!(
+                    "pg_stat_activity query timed out after 5s; stage='{}'",
+                    stage
+                );
+                return;
+            }
+        };
+
+        if rows.is_empty() {
+            error!(
+                "pg_stat_activity dump for stage='{}': no non-idle sessions \
+                 in current database other than this diagnostic — \
+                 the hang may be on the client side, not a server-side lock",
+                stage
+            );
+            return;
+        }
+        error!(
+            "pg_stat_activity dump for stage='{}': {} non-idle session(s)",
+            stage,
+            rows.len()
+        );
+        for row in &rows {
+            let pid: i32 = row.try_get("pid").unwrap_or(-1);
+            let usename: Option<String> = row.try_get("usename").ok();
+            let application_name: Option<String> = row.try_get("application_name").ok();
+            let state: Option<String> = row.try_get("state").ok();
+            let wait_event_type: Option<String> = row.try_get("wait_event_type").ok();
+            let wait_event: Option<String> = row.try_get("wait_event").ok();
+            let elapsed_secs: Option<f64> = row.try_get("elapsed_secs").ok();
+            let query_preview: Option<String> = row.try_get("query_preview").ok();
+            error!(
+                "  pg_stat_activity: pid={} user={:?} app={:?} state={:?} \
+                 wait={:?}/{:?} elapsed_secs={:?} query={:?}",
+                pid,
+                usename.as_deref().unwrap_or(""),
+                application_name.as_deref().unwrap_or(""),
+                state.as_deref().unwrap_or(""),
+                wait_event_type.as_deref().unwrap_or(""),
+                wait_event.as_deref().unwrap_or(""),
+                elapsed_secs,
+                query_preview.as_deref().unwrap_or("")
+            );
+        }
+    }
+
+    /// Wrap `apply_canonical_schema` in a 30s timeout. On timeout, dump
+    /// `pg_stat_activity` and panic with a descriptive message — the
+    /// runner's panic handler writes `runner-last-panic.txt` and the
+    /// supervisor surfaces it.
+    async fn apply_canonical_schema_with_timeout(&self) -> Result<(), String> {
+        match tokio::time::timeout(Duration::from_secs(30), self.apply_canonical_schema()).await {
+            Ok(res) => res,
+            Err(_) => {
+                self.dump_pg_stat_activity_on_hang("apply_canonical_schema")
+                    .await;
+                panic!(
+                    "PG bootstrap stage 'apply_canonical_schema' timed out after 30s — \
+                     see preceding pg_stat_activity dump for blocking sessions"
+                );
+            }
+        }
+    }
+
+    /// Wrap `ensure_tables` in a 30s timeout. `ensure_tables` returns `()`
+    /// (warns on individual statement failures, does not propagate errors),
+    /// so the timeout wrapper keeps the same `()` return: it either succeeds
+    /// or panics with a descriptive message. This makes a wedged ensure_tables
+    /// fail fast instead of getting silently dropped on the floor.
+    async fn ensure_tables_with_timeout(&self) {
+        match tokio::time::timeout(Duration::from_secs(30), self.ensure_tables()).await {
+            Ok(()) => {}
+            Err(_) => {
+                self.dump_pg_stat_activity_on_hang("ensure_tables").await;
+                panic!(
+                    "PG bootstrap stage 'ensure_tables' timed out after 30s — \
+                     see preceding pg_stat_activity dump for blocking sessions"
+                );
+            }
+        }
+    }
+
+    /// Wrap `run_migrations` in a 30s timeout. On timeout, dump
+    /// `pg_stat_activity` and panic with a descriptive message.
+    async fn run_migrations_with_timeout(&self) -> Result<(), String> {
+        match tokio::time::timeout(Duration::from_secs(30), self.run_migrations()).await {
+            Ok(res) => res,
+            Err(_) => {
+                self.dump_pg_stat_activity_on_hang("run_migrations").await;
+                panic!(
+                    "PG bootstrap stage 'run_migrations' timed out after 30s — \
+                     see preceding pg_stat_activity dump for blocking sessions"
+                );
+            }
+        }
     }
 
     /// Apply the canonical schema from `schema.pg.sql` (the Clorinde source
@@ -2925,7 +3120,10 @@ impl PgDb {
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
             .expect("noop pool creation should not fail (no connection attempted)");
-        std::sync::Arc::new(Self { pool })
+        std::sync::Arc::new(Self {
+            pool,
+            pg_url: "postgres://__noop_test_host_that_does_not_exist__/noop".to_string(),
+        })
     }
 }
 
