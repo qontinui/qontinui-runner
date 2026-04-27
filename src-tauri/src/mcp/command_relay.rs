@@ -429,13 +429,11 @@ mod tests {
         let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(60));
 
         let relay_a = relay.clone();
-        let dispatch_a = tokio::spawn(async move {
-            relay_a.dispatch("app-a", "snapshot", json!({})).await
-        });
+        let dispatch_a =
+            tokio::spawn(async move { relay_a.dispatch("app-a", "snapshot", json!({})).await });
         let relay_b = relay.clone();
-        let dispatch_b = tokio::spawn(async move {
-            relay_b.dispatch("app-b", "snapshot", json!({})).await
-        });
+        let dispatch_b =
+            tokio::spawn(async move { relay_b.dispatch("app-b", "snapshot", json!({})).await });
 
         // Drain the outbound frames so the dispatch send paths don't stall.
         let _ = outbound_a.recv().await.expect("frame for app-a");
@@ -449,7 +447,11 @@ mod tests {
         let result_a = dispatch_a.await.unwrap();
         match result_a {
             Err(CommandRelayError::Displaced(reason)) => {
-                assert!(reason.contains("test displacement"), "got reason: {}", reason);
+                assert!(
+                    reason.contains("test displacement"),
+                    "got reason: {}",
+                    reason
+                );
             }
             other => panic!("expected Displaced for app-a, got {:?}", other),
         }
@@ -461,7 +463,13 @@ mod tests {
             let pending = relay.pending.lock().await;
             pending
                 .iter()
-                .find_map(|(k, v)| if v.conn_id == conn_b { Some(k.clone()) } else { None })
+                .find_map(|(k, v)| {
+                    if v.conn_id == conn_b {
+                        Some(k.clone())
+                    } else {
+                        None
+                    }
+                })
                 .expect("app-b should still have a pending command")
         };
         relay

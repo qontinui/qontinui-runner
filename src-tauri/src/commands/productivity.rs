@@ -90,10 +90,7 @@ pub async fn list_plans_filtered(
 
 /// Archive a plan: status → 'abandoned'. Returns true on update.
 #[tauri::command]
-pub async fn archive_plan(
-    app_handle: tauri::AppHandle,
-    plan_id: String,
-) -> Result<bool, String> {
+pub async fn archive_plan(app_handle: tauri::AppHandle, plan_id: String) -> Result<bool, String> {
     let app_state = require_app_state(&app_handle)?;
     app_state.pg_db.archive_plan(&plan_id).await
 }
@@ -101,10 +98,7 @@ pub async fn archive_plan(
 /// Restore an archived plan to a live status. Flips to `decomposed` if
 /// the plan has tasks, otherwise to `vetted`.
 #[tauri::command]
-pub async fn unarchive_plan(
-    app_handle: tauri::AppHandle,
-    plan_id: String,
-) -> Result<bool, String> {
+pub async fn unarchive_plan(app_handle: tauri::AppHandle, plan_id: String) -> Result<bool, String> {
     let app_state = require_app_state(&app_handle)?;
     app_state.pg_db.unarchive_plan(&plan_id).await
 }
@@ -170,7 +164,12 @@ pub async fn get_upcoming_claims(
 ) -> Result<Vec<UpcomingClaim>, String> {
     let app_state = require_app_state(&app_handle)?;
     Ok(match plan_id {
-        Some(pid) => app_state.upcoming_file_registry.snapshot_for_plan(&pid).await,
+        Some(pid) => {
+            app_state
+                .upcoming_file_registry
+                .snapshot_for_plan(&pid)
+                .await
+        }
         None => app_state.upcoming_file_registry.snapshot().await,
     })
 }
@@ -226,11 +225,7 @@ pub async fn get_coordinator_decisions(
     let app_state = require_app_state(&app_handle)?;
     app_state
         .pg_db
-        .list_recent_coordinator_decisions(
-            limit,
-            rule_filter.as_deref(),
-            action_filter.as_deref(),
-        )
+        .list_recent_coordinator_decisions(limit, rule_filter.as_deref(), action_filter.as_deref())
         .await
 }
 

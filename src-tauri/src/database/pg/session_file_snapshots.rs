@@ -168,10 +168,7 @@ impl PgDb {
     /// do not abort — the PG row delete succeeds either way to prevent
     /// the table from accumulating dangling rows. The on-disk blob is
     /// best-effort cleanup.
-    pub async fn prune_snapshots_older_than(
-        &self,
-        days: i32,
-    ) -> Result<(usize, usize), String> {
+    pub async fn prune_snapshots_older_than(&self, days: i32) -> Result<(usize, usize), String> {
         if days <= 0 {
             return Err("prune_snapshots_older_than: days must be positive".to_string());
         }
@@ -217,8 +214,8 @@ impl PgDb {
             }
         }
 
-        let deleted = conn
-            .execute(
+        let deleted =
+            conn.execute(
                 r#"
                 DELETE FROM session_file_snapshots
                 WHERE taken_at < NOW() - ($1 || ' days')::interval
@@ -226,8 +223,7 @@ impl PgDb {
                 &[&days.to_string()],
             )
             .await
-            .map_err(|e| format!("Failed to delete old snapshots: {}", e))?
-            as usize;
+            .map_err(|e| format!("Failed to delete old snapshots: {}", e))? as usize;
 
         if deleted > 0 || blobs_deleted > 0 {
             info!(

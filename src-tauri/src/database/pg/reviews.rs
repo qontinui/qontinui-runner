@@ -135,10 +135,7 @@ impl PgDb {
         if !is_valid_verdict(input.verdict) {
             return Err(InsertReviewError::InvalidVerdict(input.verdict.to_string()));
         }
-        if !input.confidence.is_finite()
-            || input.confidence < 0.0
-            || input.confidence > 1.0
-        {
+        if !input.confidence.is_finite() || input.confidence < 0.0 || input.confidence > 1.0 {
             return Err(InsertReviewError::InvalidConfidence(input.confidence));
         }
 
@@ -191,10 +188,7 @@ impl PgDb {
 
         let row = conn
             .query_opt(
-                &format!(
-                    "SELECT {} FROM reviews WHERE id = $1::uuid",
-                    SELECT_COLS
-                ),
+                &format!("SELECT {} FROM reviews WHERE id = $1::uuid", SELECT_COLS),
                 &[&review_id],
             )
             .await

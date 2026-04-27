@@ -131,10 +131,7 @@ impl PgDb {
     }
 
     /// Look up a knowledge row by its UUID.
-    pub async fn get_knowledge_by_id(
-        &self,
-        id: &str,
-    ) -> Result<Option<KnowledgeRow>, String> {
+    pub async fn get_knowledge_by_id(&self, id: &str) -> Result<Option<KnowledgeRow>, String> {
         let conn = self
             .pool()
             .get()

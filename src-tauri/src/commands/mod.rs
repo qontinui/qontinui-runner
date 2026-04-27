@@ -312,8 +312,7 @@ pub struct AppState {
     /// the Coordinator alongside `file_registry_manager`. Advisory only —
     /// claims do not block sessions, but overlapping claims surface as
     /// expand-and-warn events. See productivity-stack plan §3.
-    pub upcoming_file_registry:
-        Arc<crate::executor::upcoming_file_registry::UpcomingFileRegistry>,
+    pub upcoming_file_registry: Arc<crate::executor::upcoming_file_registry::UpcomingFileRegistry>,
     /// Exclusive per-file lock manager. When a session edits a file, other
     /// sessions trying to edit the same file block until the lock is released.
     /// This prevents concurrent edits deterministically (no AI judgment needed).

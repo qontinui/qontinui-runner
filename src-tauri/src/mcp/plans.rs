@@ -107,10 +107,7 @@ async fn decompose_plan(
             if dep >= req.tasks.len() {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!(
-                        "task[{}].depends_on_indices[{}] is out of range",
-                        i, dep
-                    ),
+                    format!("task[{}].depends_on_indices[{}] is out of range", i, dep),
                 ));
             }
             if dep == i {
@@ -171,17 +168,14 @@ async fn decompose_plan(
 
     // 2. Replace tasks for this plan. The cascade-on-delete also removes
     //    any review/snapshot rows once those tables exist (later phases).
-    txn.execute(
-        "DELETE FROM tasks WHERE plan_id = $1::uuid",
-        &[&plan_id],
-    )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("delete prior tasks failed: {}", e),
-        )
-    })?;
+    txn.execute("DELETE FROM tasks WHERE plan_id = $1::uuid", &[&plan_id])
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("delete prior tasks failed: {}", e),
+            )
+        })?;
 
     // 3. Insert tasks in two passes so depends_on_indices can be resolved
     //    against the previously-allocated UUIDs.
@@ -289,7 +283,12 @@ async fn decompose_plan(
         let task_id = &allocated_ids[i];
         if !t.expected_file_claims.is_empty() {
             registry
-                .add_task_claims(&plan_id, task_id, &plan_version_hash, &t.expected_file_claims)
+                .add_task_claims(
+                    &plan_id,
+                    task_id,
+                    &plan_version_hash,
+                    &t.expected_file_claims,
+                )
                 .await;
             total_claims += t.expected_file_claims.len();
         }

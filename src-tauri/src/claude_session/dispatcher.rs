@@ -476,13 +476,8 @@ fn auto_register_file(
                     // not block the edit (snapshots are advisory; a
                     // missing snapshot just means /rewind-session
                     // can't roll back this file).
-                    capture_pre_edit_snapshot(
-                        &handle,
-                        &pg_db,
-                        &task_run_id,
-                        &file_path_clone,
-                    )
-                    .await;
+                    capture_pre_edit_snapshot(&handle, &pg_db, &task_run_id, &file_path_clone)
+                        .await;
 
                     waited
                 })
@@ -549,10 +544,7 @@ fn auto_register_file(
                         Ok(Some(t)) => t.assigned_session_id,
                         Ok(None) => None,
                         Err(e) => {
-                            warn!(
-                                "upcoming-claim lookup failed for task {}: {}",
-                                c.task_id, e
-                            );
+                            warn!("upcoming-claim lookup failed for task {}: {}", c.task_id, e);
                             None
                         }
                     };
@@ -701,9 +693,7 @@ async fn capture_pre_edit_snapshot(
 
     // 3. Compute the on-disk blob destination under runner_data_dir.
     let blob_dir: PathBuf = match app_handle.path().app_data_dir() {
-        Ok(base) => base
-            .join("session_snapshots")
-            .join(session_id),
+        Ok(base) => base.join("session_snapshots").join(session_id),
         Err(e) => {
             warn!(
                 "capture_pre_edit_snapshot: app_data_dir() failed (session={}): {} — skipping",

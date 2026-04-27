@@ -105,30 +105,22 @@ async fn get_coordinator_state(
         None => Vec::new(),
     };
 
-    let open_escalations = app
-        .pg_db
-        .list_open_escalations()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("list_open_escalations: {}", e),
-            )
-        })?;
+    let open_escalations = app.pg_db.list_open_escalations().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list_open_escalations: {}", e),
+        )
+    })?;
 
     // One hour lookback gives Rule D sufficient slack across slow Coordinator
     // iterations without flooding the agent with stale verdicts. Cap at 50
     // rows (matches /reviews/recent default).
-    let recent_reviews = app
-        .pg_db
-        .list_recent_reviews(3600, 50)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("list_recent_reviews: {}", e),
-            )
-        })?;
+    let recent_reviews = app.pg_db.list_recent_reviews(3600, 50).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list_recent_reviews: {}", e),
+        )
+    })?;
 
     Ok(Json(CoordinatorStateSnapshot {
         tasks,
@@ -431,11 +423,7 @@ async fn apply_auto_act(
                 let prompt = format!(
                     "Reviewer feedback for task {} (verdict={}, confidence={:.2}):\n\n{}\n\n\
                      Coordinator note: {}\n\nPlease address the items above and resume work.",
-                    task_id,
-                    review.verdict,
-                    review.confidence,
-                    review.reasoning,
-                    reasoning,
+                    task_id, review.verdict, review.confidence, review.reasoning, reasoning,
                 );
                 send_message_to_worker(state, &review.reviewed_session_id, &prompt).await;
             } else {

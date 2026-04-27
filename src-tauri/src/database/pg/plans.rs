@@ -234,7 +234,11 @@ impl PgDb {
             .map_err(|e| format!("Failed to count tasks for plan: {}", e))?
             .get(0);
 
-        let target = if task_count > 0 { "decomposed" } else { "vetted" };
+        let target = if task_count > 0 {
+            "decomposed"
+        } else {
+            "vetted"
+        };
         self.update_plan_status(plan_id, target).await
     }
 

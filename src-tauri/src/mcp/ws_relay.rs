@@ -514,9 +514,7 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
     ws_manager.remove(conn_id).await;
     registry.remove(&register.app_id).await;
     uninstall_ws_sdk_connection(&state.sdk_connection, &synthetic_url, prior_active).await;
-    relay
-        .reject_by_conn(conn_id, "wrapper disconnected")
-        .await;
+    relay.reject_by_conn(conn_id, "wrapper disconnected").await;
     send_task.abort();
     info!(
         "[ws-relay] app '{}' disconnected (conn_id={})",
