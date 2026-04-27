@@ -1750,7 +1750,9 @@ pub async fn start_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let emitter = app_handle.clone();
     let api_ready_flag = app_state.clone();
+    info!("MCP API server: building router via create_router...");
     let router = create_router(app_state, rag_state, app_handle, instance_manager);
+    info!("MCP API server: create_router returned, entering bind loop");
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
     // This can happen on Windows when previous process crashes leave orphaned sockets
@@ -1758,6 +1760,7 @@ pub async fn start_server(
     let mut last_error = None;
 
     for try_port in ports_to_try {
+        info!("MCP API server: try_bind_port({})...", try_port);
         match try_bind_port(try_port) {
             Ok(std_listener) => {
                 let listener = tokio::net::TcpListener::from_std(std_listener)?;

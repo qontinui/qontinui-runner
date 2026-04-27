@@ -1464,13 +1464,13 @@ impl PgDb {
     /// runner's panic handler writes `runner-last-panic.txt` and the
     /// supervisor surfaces it.
     async fn apply_canonical_schema_with_timeout(&self) -> Result<(), String> {
-        match tokio::time::timeout(Duration::from_secs(30), self.apply_canonical_schema()).await {
+        match tokio::time::timeout(Duration::from_secs(120), self.apply_canonical_schema()).await {
             Ok(res) => res,
             Err(_) => {
                 self.dump_pg_stat_activity_on_hang("apply_canonical_schema")
                     .await;
                 panic!(
-                    "PG bootstrap stage 'apply_canonical_schema' timed out after 30s — \
+                    "PG bootstrap stage 'apply_canonical_schema' timed out after 120s — \
                      see preceding pg_stat_activity dump for blocking sessions"
                 );
             }
@@ -1483,12 +1483,12 @@ impl PgDb {
     /// or panics with a descriptive message. This makes a wedged ensure_tables
     /// fail fast instead of getting silently dropped on the floor.
     async fn ensure_tables_with_timeout(&self) {
-        match tokio::time::timeout(Duration::from_secs(30), self.ensure_tables()).await {
+        match tokio::time::timeout(Duration::from_secs(120), self.ensure_tables()).await {
             Ok(()) => {}
             Err(_) => {
                 self.dump_pg_stat_activity_on_hang("ensure_tables").await;
                 panic!(
-                    "PG bootstrap stage 'ensure_tables' timed out after 30s — \
+                    "PG bootstrap stage 'ensure_tables' timed out after 120s — \
                      see preceding pg_stat_activity dump for blocking sessions"
                 );
             }
@@ -1498,12 +1498,12 @@ impl PgDb {
     /// Wrap `run_migrations` in a 30s timeout. On timeout, dump
     /// `pg_stat_activity` and panic with a descriptive message.
     async fn run_migrations_with_timeout(&self) -> Result<(), String> {
-        match tokio::time::timeout(Duration::from_secs(30), self.run_migrations()).await {
+        match tokio::time::timeout(Duration::from_secs(120), self.run_migrations()).await {
             Ok(res) => res,
             Err(_) => {
                 self.dump_pg_stat_activity_on_hang("run_migrations").await;
                 panic!(
-                    "PG bootstrap stage 'run_migrations' timed out after 30s — \
+                    "PG bootstrap stage 'run_migrations' timed out after 120s — \
                      see preceding pg_stat_activity dump for blocking sessions"
                 );
             }
@@ -1525,6 +1525,24 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error during canonical schema apply: {}", e))?;
+
+        // Cap how long each statement will wait for a table-level lock. Without
+        // this, a CREATE INDEX / ALTER TABLE blocked by a long-running
+        // transaction on the same relation will sit in a `Lock`/`relation` wait
+        // for the full per-statement timeout (20s) and burn the bootstrap's
+        // 30s stage budget on a few stuck statements. With lock_timeout=5s,
+        // a contested statement fails fast with `error: canceling statement
+        // due to lock timeout`, which the loop below catches and warns on,
+        // letting subsequent independent statements proceed. Mirrors the
+        // recovery posture documented in proj_runner_pg_bootstrap_diagnostics:
+        // we want the runner to come up even when the web backend has leaked
+        // an idle-in-transaction session blocking one specific table.
+        if let Err(e) = conn.execute("SET lock_timeout = '5s'", &[]).await {
+            warn!(
+                "Failed to set lock_timeout for canonical schema apply (proceeding without): {}",
+                e
+            );
+        }
 
         // Split schema.pg.sql into individual statements and execute each on
         // its own. `batch_execute` wraps the whole string in an implicit
