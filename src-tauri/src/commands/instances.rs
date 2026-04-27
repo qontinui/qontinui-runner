@@ -222,6 +222,35 @@ pub async fn stop_runner_instance(
     })
 }
 
+/// Get the current list of temp-runner spawn placements. Distinct from
+/// `runner_instances[i].spawn_placement` — the supervisor uses these
+/// when spawning temp runners via `POST /runners/spawn-test`.
+#[tauri::command]
+pub async fn get_temp_spawn_placements() -> Result<Vec<SpawnPlacement>, String> {
+    Ok(settings::get_temp_spawn_placements())
+}
+
+/// Replace the temp-runner spawn placement list. Each placement is
+/// validated by attempting to resolve it against the live monitor list
+/// (a smoke test — invalid placements are rejected before persistence).
+/// Returns the persisted list on success.
+#[tauri::command]
+pub async fn set_temp_spawn_placements(
+    app: tauri::AppHandle,
+    placements: Vec<SpawnPlacement>,
+) -> Result<Vec<SpawnPlacement>, String> {
+    // Smoke-test each placement against the live monitor layout. This
+    // mirrors the validation other placement-handling commands do
+    // implicitly via `preview_spawn_placement`.
+    for (idx, placement) in placements.iter().enumerate() {
+        resolve_to_global_physical(&app, placement)
+            .map_err(|e| format!("placement[{}] failed to resolve: {}", idx, e))?;
+    }
+    settings::save_temp_spawn_placements(placements.clone())?;
+    info!("Saved {} temp spawn placement(s)", placements.len());
+    Ok(placements)
+}
+
 /// Get identity info about this runner instance: whether it's secondary and what primary it proxies to.
 #[tauri::command]
 pub async fn get_runner_identity(
@@ -257,6 +286,8 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             get_runner_identity,
             preview_spawn_placement,
             list_monitors_for_placement,
+            get_temp_spawn_placements,
+            set_temp_spawn_placements,
         ])
         .build()
 }

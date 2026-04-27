@@ -2111,6 +2111,139 @@ async fn preview_spawn_placement_route(
     })))
 }
 
+// ─── Temp spawn-placement endpoints ─────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct TempPlacementsListResponse {
+    placements: Vec<crate::settings::SpawnPlacement>,
+    count: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct TempPlacementsReplaceRequest {
+    placements: Vec<crate::settings::SpawnPlacement>,
+}
+
+/// `GET /spawn-placement/temps`
+///
+/// List the currently-configured temp-runner spawn placements. Used by the
+/// supervisor's spawn-test path and the runner's own settings UI.
+async fn list_temp_spawn_placements() -> Json<ApiResponse<TempPlacementsListResponse>> {
+    let placements = crate::settings::get_temp_spawn_placements();
+    let count = placements.len();
+    Json(ApiResponse::success(TempPlacementsListResponse {
+        placements,
+        count,
+    }))
+}
+
+/// `PUT /spawn-placement/temps`
+///
+/// Replace the temp-runner spawn placement list. Returns the persisted list
+/// in the same shape as `GET /spawn-placement/temps`.
+async fn replace_temp_spawn_placements(
+    Json(body): Json<TempPlacementsReplaceRequest>,
+) -> Result<
+    Json<ApiResponse<TempPlacementsListResponse>>,
+    (axum::http::StatusCode, Json<serde_json::Value>),
+> {
+    crate::settings::save_temp_spawn_placements(body.placements.clone()).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("failed to save temp placements: {}", e),
+            })),
+        )
+    })?;
+    let placements = crate::settings::get_temp_spawn_placements();
+    let count = placements.len();
+    Ok(Json(ApiResponse::success(TempPlacementsListResponse {
+        placements,
+        count,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct TempPlacementLookupQuery {
+    /// 0-based index into the temp placement list. Round-robin'd via
+    /// `index % len` when `overflow=wrap`.
+    index: usize,
+    /// Behavior when `index >= len`. `wrap` (default if missing) rotates;
+    /// `default` (or anything else) returns 404.
+    #[serde(default)]
+    overflow: Option<String>,
+}
+
+/// `GET /spawn-placement/temp?index=N&overflow=wrap`
+///
+/// Supervisor-facing lookup. Returns the resolved placement at index N (or
+/// `N % len` when overflow=wrap is in effect). 404s when the list is empty
+/// or N is out of range and overflow is not "wrap".
+async fn lookup_temp_spawn_placement(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(q): axum::extract::Query<TempPlacementLookupQuery>,
+) -> Result<
+    Json<ApiResponse<SpawnPlacementPreviewResponse>>,
+    (axum::http::StatusCode, Json<serde_json::Value>),
+> {
+    let placements = crate::settings::get_temp_spawn_placements();
+    if placements.is_empty() {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no temp placements configured",
+            })),
+        ));
+    }
+
+    let len = placements.len();
+    let resolved_index = if q.index < len {
+        q.index
+    } else {
+        // index >= len: branch on overflow. Default behavior (overflow
+        // missing) is "wrap" per the supervisor contract.
+        match q.overflow.as_deref() {
+            None | Some("wrap") => q.index % len,
+            _ => {
+                return Err((
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "index out of range",
+                        "index": q.index,
+                        "max_index": len - 1,
+                    })),
+                ));
+            }
+        }
+    };
+
+    let placement = placements[resolved_index].clone();
+    let resolved = crate::spawn_placement::resolve_to_global_physical(
+        &state.app_handle,
+        &placement,
+    )
+    .map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("failed to resolve placement: {}", e),
+                "index": q.index,
+            })),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(SpawnPlacementPreviewResponse {
+        global_x: resolved.global_x,
+        global_y: resolved.global_y,
+        width: resolved.width,
+        height: resolved.height,
+        monitor_label: resolved.monitor_label,
+        slot_index: resolved_index,
+        slot_label: format!("temp[{}]", resolved_index),
+        source: "temp",
+    })))
+}
+
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{delete, get, post};
     axum::Router::new()
@@ -2141,6 +2274,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/spawn-placement/preview",
             get(preview_spawn_placement_route),
+        )
+        .route(
+            "/spawn-placement/temps",
+            get(list_temp_spawn_placements).put(replace_temp_spawn_placements),
+        )
+        .route(
+            "/spawn-placement/temp",
+            get(lookup_temp_spawn_placement),
         )
         .route("/tool-version", get(get_tool_version))
         .route("/load-config", post(load_config))

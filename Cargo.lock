@@ -6111,7 +6111,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "schemars 1.2.1",

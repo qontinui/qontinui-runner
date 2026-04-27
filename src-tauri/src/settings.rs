@@ -1095,6 +1095,13 @@ pub struct Settings {
     /// Configured runner instances for multi-instance dev workflows
     #[serde(default)]
     pub runner_instances: Vec<RunnerInstanceConfig>,
+    /// Temp-runner spawn placements. Distinct from per-named-instance placements
+    /// in `runner_instances[i].spawn_placement` — these only apply to runners the
+    /// supervisor spawns via `POST /runners/spawn-test`. Round-robin'd across the
+    /// list at supervisor request time. Empty = supervisor falls back to OS
+    /// default placement (current pre-feature behavior).
+    #[serde(default)]
+    pub temp_spawn_placements: Vec<SpawnPlacement>,
     /// Custom desktop ports to scan for UI Bridge endpoints (merged with defaults).
     #[serde(default)]
     pub discovery_ports: Vec<u16>,
@@ -1859,6 +1866,21 @@ pub fn save_runner_instance(config: RunnerInstanceConfig) -> Result<(), String> 
 /// Delete a runner instance configuration by ID.
 pub fn delete_runner_instance(id: &str) -> Result<(), String> {
     crate::config_facade::delete_runner_instance(id)
+}
+
+// ============================================================================
+// Temp Spawn Placement Helpers
+// ============================================================================
+
+/// Get the list of temp-runner spawn placements (used by the supervisor when
+/// spawning temp runners via `POST /runners/spawn-test`).
+pub fn get_temp_spawn_placements() -> Vec<SpawnPlacement> {
+    crate::config_facade::get_temp_spawn_placements()
+}
+
+/// Replace the temp-runner spawn placement list with the supplied list.
+pub fn save_temp_spawn_placements(placements: Vec<SpawnPlacement>) -> Result<(), String> {
+    crate::config_facade::save_temp_spawn_placements(placements)
 }
 
 // ============================================================================

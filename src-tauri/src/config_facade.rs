@@ -33,7 +33,7 @@ use crate::settings::{
     CloudRelaySettings, DebugSettings, ExecutionVariablesSettings, GlobalLogSource,
     GlobalLogSourceSettings, LogSourceAiSelectionMode, LogSourceCategory, MobileSettings,
     PathSettings, PlaywrightSettings, RunnerInstanceConfig, SelfHealingSettings, Settings,
-    TunnelSettings, VariableSource, WorldStateVerifierSettings,
+    SpawnPlacement, TunnelSettings, VariableSource, WorldStateVerifierSettings,
 };
 
 // ============================================================================
@@ -1028,6 +1028,25 @@ pub fn save_runner_instance(config: RunnerInstanceConfig) -> Result<(), String> 
 pub fn delete_runner_instance(id: &str) -> Result<(), String> {
     let mut settings = load_settings();
     settings.runner_instances.retain(|i| i.id != id);
+    save_settings(&settings)
+}
+
+// ============================================================================
+// Temp Spawn Placement CRUD Helpers
+// ============================================================================
+
+/// Get the list of temp-runner spawn placements. Used by the supervisor when
+/// spawning temp runners — separate from per-named-instance placements stored
+/// in `runner_instances[i].spawn_placement`.
+pub fn get_temp_spawn_placements() -> Vec<SpawnPlacement> {
+    load_settings().temp_spawn_placements
+}
+
+/// Replace the temp-runner spawn placement list with the supplied list.
+/// Returns the persisted list on success.
+pub fn save_temp_spawn_placements(placements: Vec<SpawnPlacement>) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.temp_spawn_placements = placements;
     save_settings(&settings)
 }
 

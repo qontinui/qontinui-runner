@@ -658,6 +658,207 @@ function SpawnBanner({ slots }: SpawnBannerProps) {
 }
 
 // ---------------------------------------------------------------------------
+// Sub-component: TempPlacementsSection
+// Edits the runner-wide list the supervisor consumes for temp runners.
+// ---------------------------------------------------------------------------
+
+interface TempPlacementsSectionProps {
+  monitors: MonitorEntry[];
+  onLog: LogFunction;
+}
+
+interface TempSlotPreview {
+  index: number;
+  preview: ResolvedPlacement | null;
+  error: string | null;
+}
+
+function TempPlacementsSection({ monitors, onLog }: TempPlacementsSectionProps) {
+  const [drafts, setDrafts] = useState<PlacementDraft[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [savedJson, setSavedJson] = useState<string>("[]");
+  const [previewSlots, setPreviewSlots] = useState<TempSlotPreview[]>([]);
+  const saveTimerRef = useRef<number | null>(null);
+
+  const loadTemps = useCallback(async () => {
+    try {
+      const list = await invoke<SpawnPlacement[]>("get_temp_spawn_placements");
+      const newDrafts = list.map((p) => {
+        const d = placementToDraft(p);
+        d.enabled = true;
+        return d;
+      });
+      setDrafts(newDrafts);
+      setSavedJson(JSON.stringify(list));
+      setLoading(false);
+    } catch (err) {
+      onLog("error", `Failed to load temp placements: ${err}`);
+      setLoading(false);
+    }
+  }, [onLog]);
+
+  useEffect(() => {
+    void loadTemps();
+  }, [loadTemps]);
+
+  // Compute current placements from drafts (skip drafts that don't resolve
+  // to a valid placement — e.g. mid-edit blank X/Y).
+  const currentPlacements = useMemo<SpawnPlacement[]>(() => {
+    const out: SpawnPlacement[] = [];
+    for (const d of drafts) {
+      const p = draftToPlacement({ ...d, enabled: true });
+      if (p) out.push(p);
+    }
+    return out;
+  }, [drafts]);
+
+  // Refresh the live preview banner whenever the placements change.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const slots: TempSlotPreview[] = [];
+      for (let i = 0; i < currentPlacements.length; i++) {
+        try {
+          const resolved = await invoke<ResolvedPlacement>("preview_spawn_placement", {
+            placement: currentPlacements[i],
+          });
+          if (cancelled) return;
+          slots.push({ index: i, preview: resolved, error: null });
+        } catch (err) {
+          if (cancelled) return;
+          slots.push({ index: i, preview: null, error: String(err) });
+        }
+      }
+      if (!cancelled) setPreviewSlots(slots);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentPlacements]);
+
+  // Debounced auto-save: 500ms after the user stops editing.
+  useEffect(() => {
+    if (loading) return;
+    const placements = currentPlacements;
+    const json = JSON.stringify(placements);
+    if (json === savedJson) return; // nothing to do
+    if (saveTimerRef.current != null) {
+      window.clearTimeout(saveTimerRef.current);
+    }
+    saveTimerRef.current = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const persisted = await invoke<SpawnPlacement[]>("set_temp_spawn_placements", {
+            placements,
+          });
+          setSavedJson(JSON.stringify(persisted));
+          onLog("success", `Temp placements saved (${persisted.length})`);
+        } catch (err) {
+          onLog("error", `Failed to save temp placements: ${err}`);
+        }
+      })();
+    }, 500);
+    return () => {
+      if (saveTimerRef.current != null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+    };
+  }, [currentPlacements, savedJson, loading, onLog]);
+
+  const handleAdd = () => {
+    setDrafts((prev) => [...prev, { ...DEFAULT_DRAFT, enabled: true }]);
+  };
+
+  const handleRemove = (idx: number) => {
+    setDrafts((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const handleChange = (idx: number, next: PlacementDraft) => {
+    // Force enabled=true: this section is exclusively temp placements;
+    // there's no "no placement" state for an entry — Remove instead.
+    setDrafts((prev) => prev.map((d, i) => (i === idx ? { ...next, enabled: true } : d)));
+  };
+
+  return (
+    <div className="space-y-2 p-3 rounded-lg border border-border bg-card">
+      <div>
+        <h3 className="text-sm font-semibold">Temp Runner Placements</h3>
+        <p className="text-[11px] text-muted-foreground mt-0.5">
+          Spawned via <code className="text-[10px]">POST /runners/spawn-test</code> from the
+          supervisor. Round-robin's across this list. Empty = OS default placement.
+        </p>
+      </div>
+
+      {loading && <p className="text-xs text-muted-foreground">Loading...</p>}
+
+      {!loading && drafts.length === 0 && (
+        <p className="text-xs text-muted-foreground">
+          No temp placements configured. The supervisor will use OS default placement when spawning
+          temp runners.
+        </p>
+      )}
+
+      <div className="space-y-2">
+        {drafts.map((draft, idx) => (
+          <div key={idx} className="p-2 rounded border border-border/60 bg-background/30 relative">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs font-medium">Temp slot {idx}</span>
+              <button
+                onClick={() => handleRemove(idx)}
+                className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
+                title="Remove this placement"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <PlacementEditor
+              draft={draft}
+              onChange={(next) => handleChange(idx, next)}
+              monitors={monitors}
+              onLog={onLog}
+            />
+          </div>
+        ))}
+      </div>
+
+      <button
+        onClick={handleAdd}
+        className="flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded border border-border hover:bg-accent transition-colors"
+      >
+        <Plus className="w-3.5 h-3.5" />
+        Add temp placement
+      </button>
+
+      {previewSlots.length > 0 && (
+        <div className="mt-2 p-2 rounded border border-border/60 bg-muted/30 font-mono text-[11px] space-y-0.5">
+          <div className="text-xs font-semibold mb-1 font-sans">
+            Round-robin order (supervisor consumes):
+          </div>
+          {previewSlots.map((slot) => (
+            <div key={slot.index} className="flex flex-wrap gap-x-2">
+              <span className="text-muted-foreground shrink-0">Slot {slot.index}:</span>
+              <span className="ml-auto text-right">
+                {slot.error ? (
+                  <span className="text-destructive">{slot.error}</span>
+                ) : slot.preview ? (
+                  <span>
+                    → global ({slot.preview.global_x}, {slot.preview.global_y}) {slot.preview.width}
+                    ×{slot.preview.height} on {slot.preview.monitor_label}
+                  </span>
+                ) : (
+                  <span className="text-muted-foreground">resolving...</span>
+                )}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -964,6 +1165,10 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
         description="Launch additional runner instances on different ports for concurrent AI workflow automation."
         icon={<Monitor />}
       />
+
+      {/* Temp runner placements (supervisor-consumed list, distinct from
+          per-named-instance placements below) */}
+      <TempPlacementsSection monitors={monitors} onLog={onLog} />
 
       {/* Banner */}
       <SpawnBanner slots={bannerSlots} />
