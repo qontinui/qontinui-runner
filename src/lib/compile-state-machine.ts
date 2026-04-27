@@ -175,9 +175,26 @@ export type CompilationResult =
     };
 
 /**
+ * A single (specId, config) input to the compiler. The `specId` is the
+ * stable identifier from `spec-registry.ts:328 getAllSpecs()` and is used
+ * to scope per-spec invariants such as element uniqueness.
+ */
+export interface SpecCompilerInput {
+  specId: string;
+  config: SpecConfig;
+}
+
+/**
  * Compile all spec stateMachine sections into a single runtime state machine.
  *
- * @param specs               Authored spec configs.
+ * Element uniqueness is enforced **per-spec** — the same element across two
+ * specs is allowed; the same element across two states within one spec is a
+ * quarantine. The disambiguator is the registry-provided `specId` (see
+ * `spec-registry.ts:328 getAllSpecs()`).
+ *
+ * @param inputs              Authored specs paired with their stable
+ *                            registry `specId`. The `specId` scopes the
+ *                            element-uniqueness check.
  * @param discoveryArtifact   Optional output of `/state-discovery/derive`.
  *                            When provided, states whose element-set
  *                            overlaps a cluster with sufficient support
@@ -187,7 +204,7 @@ export type CompilationResult =
  *                            `INVALIDATION_WINDOW_HOURS` force `ai-fallback`.
  */
 export function compileStateMachineFromSpecs(
-  specs: SpecConfig[],
+  inputs: SpecCompilerInput[],
   discoveryArtifact?: DiscoveryArtifact,
   invalidationState?: InvalidationState,
 ): CompilationResult {
@@ -195,6 +212,9 @@ export function compileStateMachineFromSpecs(
   const allStates: StateDefinitionWithProvenance[] = [];
   const allTransitions: TransitionDefinition[] = [];
   const seenStateIds = new Set<string>();
+  // Track which spec each compiled state belongs to so the uniqueness
+  // check can bucket per-spec rather than globally.
+  const stateToSpec = new Map<string, string>();
   const provenanceCounts: Record<StateProvenance, number> = {
     "ai-generated": 0,
     observed: 0,
@@ -202,7 +222,12 @@ export function compileStateMachineFromSpecs(
   };
   let specsProcessed = 0;
 
-  for (const spec of specs) {
+  // Bare SpecConfig list, used by orphan-reference checks and preserved
+  // on the quarantine record for offline inspection.
+  const specs: SpecConfig[] = inputs.map((i) => i.config);
+
+  for (const input of inputs) {
+    const spec = input.config;
     if (!spec.stateMachine?.states?.length) continue;
     specsProcessed++;
 
@@ -213,6 +238,7 @@ export function compileStateMachineFromSpecs(
         continue;
       }
       seenStateIds.add(specState.id);
+      stateToSpec.set(specState.id, input.specId);
 
       // Compile base state then decide its provenance.
       const baseState = convertState(specState);
@@ -255,17 +281,22 @@ export function compileStateMachineFromSpecs(
     }
   }
 
-  // Cross-state element uniqueness. Observed/ai-fallback collisions still
+  // Per-spec element uniqueness. Observed/ai-fallback collisions still
   // throw (authoritative claims that disagree = hard bug). Any remaining
-  // cross-state duplicates — even the ai-generated ones that used to only
-  // log a warning-per-duplicate — now quarantine the whole compilation.
+  // intra-spec cross-state duplicates — even the ai-generated ones that
+  // used to only log a warning-per-duplicate — now quarantine the whole
+  // compilation.
+  //
+  // Note the per-spec scoping: the same "Save" button on TasksPage and
+  // ChecksPage is fine because they live in different specs; only two
+  // states inside the SAME spec claiming the same element collide.
   //
   // Rationale: per-duplicate warnings were drowned out (48+ per snapshot
   // in testing) and downstream consumers still trusted the partial output.
   // VGA training + runtime state inference both require the
   // one-state-per-element invariant, so producing any result at all
   // when the invariant is violated is worse than producing nothing.
-  const conflicts = collectElementCollisions(allStates);
+  const conflicts = collectElementCollisions(allStates, stateToSpec);
 
   const stats: CompilationStats = {
     specsProcessed,
@@ -579,28 +610,43 @@ function artifactElementsToQueries(elements: string[]): ElementQuery[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Collect every cross-state element collision. Observed/ai-fallback
- * double-claims throw immediately (authoritative sources disagreeing is a
- * hard bug); every other duplicate is returned as a conflict. The caller
- * uses the returned list to decide whether to quarantine the compilation.
+ * Collect every intra-spec cross-state element collision. The bucket key
+ * combines the owning spec's `specId` with the element key, so two specs
+ * that legitimately reuse the same element (e.g. a "Save" button on both
+ * TasksPage and ChecksPage) do NOT collide. Only two states inside the
+ * SAME spec sharing an element produce a conflict.
+ *
+ * Observed/ai-fallback double-claims still throw immediately (authoritative
+ * sources disagreeing is a hard bug); every other duplicate is returned as
+ * a conflict. The caller uses the returned list to decide whether to
+ * quarantine the compilation.
  */
 function collectElementCollisions(
   states: StateDefinitionWithProvenance[],
+  stateToSpec: Map<string, string>,
 ): ElementCollisionConflict[] {
-  // Map element-key → array of {stateId, provenance}.
+  // Map `${specId}::${elementKey}` → array of {stateId, provenance}.
+  // Per-spec scoping is the whole point of this function — see doc above.
   const seen = new Map<string, Array<{ stateId: string; provenance: StateProvenance }>>();
   for (const state of states) {
+    const specId = stateToSpec.get(state.id);
+    // States without a registered specId would be a programmer error
+    // upstream — fall back to a synthetic bucket so we still detect
+    // duplicates among the orphans rather than silently merging them
+    // with another spec's elements.
+    const scope = specId ?? `__unscoped__:${state.id}`;
     for (const el of state.requiredElements) {
       const key = elementQueryKey(el);
       if (!key) continue;
-      const bucket = seen.get(key) ?? [];
+      const scopedKey = `${scope}::${key}`;
+      const bucket = seen.get(scopedKey) ?? [];
       bucket.push({ stateId: state.id, provenance: state.provenance });
-      seen.set(key, bucket);
+      seen.set(scopedKey, bucket);
     }
   }
 
   const conflicts: ElementCollisionConflict[] = [];
-  for (const [key, bucket] of seen.entries()) {
+  for (const [scopedKey, bucket] of seen.entries()) {
     if (bucket.length < 2) continue;
     // Deduplicate by stateId — multiple copies of the same element
     // criteria in a single state are fine; cross-state duplicates are not.
@@ -610,6 +656,12 @@ function collectElementCollisions(
     }
     if (byState.size < 2) continue;
 
+    // Strip the `${specId}::` prefix when surfacing the element key so
+    // callers and quarantine consumers see the same key shape they did
+    // before per-spec scoping.
+    const sepIdx = scopedKey.indexOf("::");
+    const elementKey = sepIdx >= 0 ? scopedKey.slice(sepIdx + 2) : scopedKey;
+
     const observedOrFallback = [...byState.entries()].filter(
       ([, p]) => p === "observed" || p === "ai-fallback",
     );
@@ -617,11 +669,11 @@ function collectElementCollisions(
       const stateList = observedOrFallback.map(([id, p]) => `${id} (${p})`).join(", ");
       throw new Error(
         `[compile-state-machine] one-state-per-element invariant violated: ` +
-          `element "${key}" is claimed by multiple observed/ai-fallback states: ${stateList}`,
+          `element "${elementKey}" is claimed by multiple observed/ai-fallback states: ${stateList}`,
       );
     }
     conflicts.push({
-      elementKey: key,
+      elementKey,
       states: [...byState.entries()].map(([stateId, provenance]) => ({ stateId, provenance })),
     });
   }

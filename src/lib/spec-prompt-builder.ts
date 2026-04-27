@@ -599,9 +599,62 @@ Each transition is a **process** — an ordered sequence of actions.
   - \`params\`: action-specific parameters (e.g., \`{ "text": "search query" }\` for type)
   - \`waitAfter\`: optional wait after this action
 
-### Rules
+### CRITICAL RULE: Per-state element uniqueness
 
-- **Elements must not overlap** between states in the same spec
+Each element listed under a state's \`elements\` array MUST appear in **at most one state** of this spec. Elements are state-discriminating identifiers — what makes the runtime engine and the VGA visual grounder say "we are in state X right now". Repeating an element across states breaks that signal.
+
+**If an element is visible in every state of this page (page header, persistent toolbar button, persistent sidebar item) DO NOT include it in any state's \`elements\` array.** Page-persistent elements are not state-discriminating and don't belong here.
+
+#### Bad (page header reused across states — quarantines compilation)
+
+\`\`\`json
+{
+  "states": [
+    {
+      "id": "list-empty",
+      "elements": [
+        { "textContent": "Tasks" },
+        { "textContent": "No tasks yet" }
+      ]
+    },
+    {
+      "id": "list-populated",
+      "elements": [
+        { "textContent": "Tasks" },
+        { "role": "row" }
+      ]
+    }
+  ]
+}
+\`\`\`
+
+In the example above, \`{ "textContent": "Tasks" }\` is the page header — it is visible in every state. Listing it under both \`list-empty\` and \`list-populated\` is a duplicate that will quarantine the spec.
+
+#### Good (page header omitted — only state-discriminating elements remain)
+
+\`\`\`json
+{
+  "states": [
+    {
+      "id": "list-empty",
+      "elements": [
+        { "textContent": "No tasks yet" }
+      ]
+    },
+    {
+      "id": "list-populated",
+      "elements": [
+        { "role": "row" }
+      ]
+    }
+  ]
+}
+\`\`\`
+
+A spec compilation is **quarantined** (engine not registered) if any element appears in two or more states of the same spec. Cross-spec duplicates (e.g. a "Save" button on Tasks page AND on Checks page) are allowed — the runtime distinguishes them by route.
+
+### Other rules
+
 - **Transitions are processes** — use multi-step action sequences for complex transitions (open dropdown → select option → confirm)
 - **Set staysVisible: true** for transitions that open modals, overlays, or panels where the background stays visible
 - **Do NOT include cross-page navigation** — sidebar/menu navigation belongs in a separate sidebar spec

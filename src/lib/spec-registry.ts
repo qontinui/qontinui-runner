@@ -88,8 +88,6 @@ import runnerShellCommandBuilderSpec from "../specs/shell-command-builder.spec.u
 import runnerSidebarSpec from "../specs/sidebar.spec.uibridge.json";
 import runnerSkillsSpec from "../specs/skills.spec.uibridge.json";
 import runnerSpecsSpec from "../specs/specs.spec.uibridge.json";
-import runnerSpecsPageMixedSpec from "../specs/specs-page-mixed.spec.uibridge.json";
-import runnerSpecsPageSpec from "../specs/specs-page.spec.uibridge.json";
 import runnerStateMachineSpec from "../specs/state-machine.spec.uibridge.json";
 import runnerStepBuildersSpec from "../specs/step-builders.spec.uibridge.json";
 import runnerTaskBuilderSpec from "../specs/task-builder.spec.uibridge.json";
@@ -307,8 +305,6 @@ const ALL_SPECS: RawSpec[] = [
   { specId: "runner:sidebar", appName: "Qontinui Runner", json: runnerSidebarSpec },
   { specId: "runner:skills", appName: "Qontinui Runner", json: runnerSkillsSpec },
   { specId: "runner:specs", appName: "Qontinui Runner", json: runnerSpecsSpec },
-  { specId: "runner:specs-page-mixed", appName: "Qontinui Runner", json: runnerSpecsPageMixedSpec },
-  { specId: "runner:specs-page", appName: "Qontinui Runner", json: runnerSpecsPageSpec },
   { specId: "runner:state-machine", appName: "Qontinui Runner", json: runnerStateMachineSpec },
   { specId: "runner:step-builders", appName: "Qontinui Runner", json: runnerStepBuildersSpec },
   { specId: "runner:task-builder", appName: "Qontinui Runner", json: runnerTaskBuilderSpec },

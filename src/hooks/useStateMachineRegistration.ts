@@ -422,8 +422,11 @@ export function useStateMachineRegistration(): void {
       // No persisted config — auto-compile from bundled specs so the engine
       // is always available (enables prompt-home navigation, loadStateMachine, etc.)
       try {
-        const allSpecs = getAllSpecs().map((s) => s.config as SpecConfig);
-        const result = compileStateMachineFromSpecs(allSpecs);
+        const inputs = getAllSpecs().map((s) => ({
+          specId: s.specId,
+          config: s.config as SpecConfig,
+        }));
+        const result = compileStateMachineFromSpecs(inputs);
         if (!result.compiled) {
           // Quarantined — do NOT register a partial engine. Persist the
           // record so the conflict can be inspected offline.

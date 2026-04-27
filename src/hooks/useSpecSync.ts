@@ -354,12 +354,12 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
     // Merge specs from prop with any that were updated during this sync batch.
     // React state may not have flushed yet, so updatedSpecsRef ensures we compile
     // with the freshest versions.
-    const allSpecs = specsRef.current.map((s) => {
+    const inputs = specsRef.current.map((s) => {
       const updated = updatedSpecsRef.current.get(s.specId);
-      return updated ?? (s.config as SpecConfig);
+      return { specId: s.specId, config: updated ?? (s.config as SpecConfig) };
     });
     try {
-      const result = compileStateMachineFromSpecs(allSpecs);
+      const result = compileStateMachineFromSpecs(inputs);
 
       if (!result.compiled) {
         // Quarantined — surface to the user via warnings and persist the

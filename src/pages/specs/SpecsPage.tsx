@@ -538,8 +538,11 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
 
   // Compile all specs' stateMachine sections into a runtime state machine
   const handleCompileStateMachine = useCallback(() => {
-    const allSpecs = state.specs.map((s) => s.config as SpecConfig);
-    const compilation = compileStateMachineFromSpecs(allSpecs);
+    const inputs = state.specs.map((s) => ({
+      specId: s.specId,
+      config: s.config as SpecConfig,
+    }));
+    const compilation = compileStateMachineFromSpecs(inputs);
 
     if (!compilation.compiled) {
       // Quarantined — persist the record and refuse to load into the engine.
