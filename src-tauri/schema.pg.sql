@@ -3698,7 +3698,14 @@ CREATE TABLE IF NOT EXISTS learned_patterns (
 );
 CREATE INDEX IF NOT EXISTS idx_learned_patterns_confidence ON learned_patterns(confidence DESC);
 CREATE INDEX IF NOT EXISTS idx_learned_patterns_workflow ON learned_patterns(workflow_name);
-CREATE INDEX IF NOT EXISTS idx_learned_patterns_keywords_gin ON learned_patterns USING GIN(trigger_keywords);
+-- CONCURRENTLY for the GIN index: GIN builds on text[] columns are CPU-heavy
+-- and would otherwise hold ACCESS SHARE lock on the table for the duration,
+-- conflicting with concurrent runner-startup CREATE INDEX attempts. CONCURRENTLY
+-- uses SHARE UPDATE EXCLUSIVE (which conflicts only with itself), so 21 racing
+-- runner spawns serialize cleanly and 20 of them skip via IF NOT EXISTS once
+-- the first completes the build. Without CONCURRENTLY, all 21 acquire SHARE
+-- and stall indefinitely in the "initializing" phase against each other.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_learned_patterns_keywords_gin ON learned_patterns USING GIN(trigger_keywords);
 
 -- Ticket system integration (external ticket provider mapping)
 CREATE TABLE IF NOT EXISTS ticket_task_mapping (

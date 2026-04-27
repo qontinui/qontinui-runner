@@ -1552,32 +1552,58 @@ impl PgDb {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // Per-statement timeout: long-running CREATE INDEX / ALTER TABLE on
+        // busy tables can sit in the "initializing" phase for hours when 21
+        // racing runner startups all try to acquire SHARE on the same table.
+        // We don't want one bad statement to wedge the entire bootstrap; the
+        // stage-level 30s timeout (in apply_canonical_schema_with_timeout)
+        // would fire and panic the runner instead of soldiering on. With
+        // per-statement timeouts, a single hanging DDL gets logged + skipped
+        // and the rest of the schema still applies. 20s is enough for any
+        // legitimate CREATE TABLE / ALTER on a populated runner DB; CREATE
+        // INDEX CONCURRENTLY for the only known slow case (the GIN index)
+        // serializes against itself so subsequent runners hit the
+        // IF NOT EXISTS skip path.
+        const PER_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
         let mut applied = 0usize;
         let mut failed = 0usize;
+        let mut timed_out = 0usize;
         for raw in schema_no_comments.split(';') {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            if let Err(e) = conn.execute(trimmed, &[]).await {
-                failed += 1;
-                let first_line = trimmed.lines().next().unwrap_or(trimmed);
-                let detail = match e.as_db_error() {
-                    Some(db) => format!("[{}] {}", db.code().code(), db.message()),
-                    None => format!("{}", e),
-                };
-                warn!(
-                    "Canonical schema statement failed (drift, non-fatal): {} — stmt: {}",
-                    detail,
-                    first_line.chars().take(120).collect::<String>()
-                );
-            } else {
-                applied += 1;
+            let first_line = trimmed.lines().next().unwrap_or(trimmed).to_string();
+            let preview: String = first_line.chars().take(120).collect();
+
+            match tokio::time::timeout(PER_STATEMENT_TIMEOUT, conn.execute(trimmed, &[])).await {
+                Ok(Ok(_)) => {
+                    applied += 1;
+                }
+                Ok(Err(e)) => {
+                    failed += 1;
+                    let detail = match e.as_db_error() {
+                        Some(db) => format!("[{}] {}", db.code().code(), db.message()),
+                        None => format!("{}", e),
+                    };
+                    warn!(
+                        "Canonical schema statement failed (drift, non-fatal): {} — stmt: {}",
+                        detail, preview
+                    );
+                }
+                Err(_) => {
+                    timed_out += 1;
+                    warn!(
+                        "Canonical schema statement timed out after {}s (skipping, non-fatal): {}",
+                        PER_STATEMENT_TIMEOUT.as_secs(),
+                        preview
+                    );
+                }
             }
         }
         info!(
-            "Canonical schema applied from schema.pg.sql ({} statements applied, {} skipped due to drift)",
-            applied, failed
+            "Canonical schema applied from schema.pg.sql ({} applied, {} drift-skipped, {} timed-out)",
+            applied, failed, timed_out
         );
         Ok(())
     }
