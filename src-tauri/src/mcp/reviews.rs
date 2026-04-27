@@ -57,10 +57,7 @@ async fn post_review(
     Json(req): Json<InsertReviewRequest>,
 ) -> Result<(StatusCode, Json<InsertReviewResponse>), (StatusCode, String)> {
     if req.task_id.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "task_id is required".to_string(),
-        ));
+        return Err((StatusCode::BAD_REQUEST, "task_id is required".to_string()));
     }
     if req.reviewer_session_id.trim().is_empty() || req.reviewed_session_id.trim().is_empty() {
         return Err((
@@ -69,10 +66,7 @@ async fn post_review(
         ));
     }
     if req.reasoning.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "reasoning is required".to_string(),
-        ));
+        return Err((StatusCode::BAD_REQUEST, "reasoning is required".to_string()));
     }
 
     let input = InsertReviewInput {
@@ -131,7 +125,10 @@ async fn post_review(
         warn!("Failed to emit review-completed event: {}", e);
     }
 
-    Ok((StatusCode::CREATED, Json(InsertReviewResponse { review: row })))
+    Ok((
+        StatusCode::CREATED,
+        Json(InsertReviewResponse { review: row }),
+    ))
 }
 
 // =============================================================================
@@ -218,7 +215,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/reviews", post(post_review))
         .route("/reviews/recent", get(get_recent_reviews))
         .route(
-            "/sessions/:id/latest-review",
+            "/sessions/{id}/latest-review",
             get(get_latest_review_for_session),
         )
 }

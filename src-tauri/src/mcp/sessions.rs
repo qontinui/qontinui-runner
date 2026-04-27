@@ -267,9 +267,12 @@ async fn send_message(
     // out immediately, false when the worker was Processing and the
     // message was queued. Surface that as `queued` so callers can match
     // the Tauri command's behaviour.
-    let sent_immediately = session
-        .send_user_message(&req.message)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("send_user_message failed: {}", e)))?;
+    let sent_immediately = session.send_user_message(&req.message).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("send_user_message failed: {}", e),
+        )
+    })?;
 
     Ok(Json(SendMessageResponse {
         task_run_id: id,
@@ -379,7 +382,7 @@ async fn get_transcript(
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/sessions/spawn", post(spawn_session))
-        .route("/sessions/:id/message", post(send_message))
-        .route("/sessions/:id/touched-files", get(get_touched_files))
-        .route("/sessions/:id/transcript", get(get_transcript))
+        .route("/sessions/{id}/message", post(send_message))
+        .route("/sessions/{id}/touched-files", get(get_touched_files))
+        .route("/sessions/{id}/transcript", get(get_transcript))
 }

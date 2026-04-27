@@ -288,10 +288,8 @@ pub async fn compute_plan_recommendations(
         .into_iter()
         .filter_map(|r| r.get::<_, Option<String>>(0))
         .collect();
-    let idle_session_count: i64 = live_sessions
-        .iter()
-        .filter(|s| !busy.contains(*s))
-        .count() as i64;
+    let idle_session_count: i64 =
+        live_sessions.iter().filter(|s| !busy.contains(*s)).count() as i64;
 
     // Live (non-archived) plans only — we never recommend a `done` or
     // `abandoned` plan as the next thing to start.
@@ -356,9 +354,10 @@ pub async fn compute_plan_recommendations(
 
     // Rank: ready desc, then unconflicting desc.
     candidates.sort_by(|a, b| {
-        b.ready_task_count
-            .cmp(&a.ready_task_count)
-            .then_with(|| b.unconflicting_claim_count.cmp(&a.unconflicting_claim_count))
+        b.ready_task_count.cmp(&a.ready_task_count).then_with(|| {
+            b.unconflicting_claim_count
+                .cmp(&a.unconflicting_claim_count)
+        })
     });
     candidates.truncate(3);
 
@@ -388,7 +387,7 @@ async fn plan_recommendations_handler(
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route(
-            "/productivity/reflection/:plan_id",
+            "/productivity/reflection/{plan_id}",
             get(get_reflection_handler),
         )
         .route(
