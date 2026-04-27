@@ -1175,24 +1175,21 @@ pub async fn ui_bridge_tab_activate_handler(
     let tab_id = match validate_tab_id(&request.tab_id) {
         Ok(id) => id,
         Err(known) => {
-            let body = serde_json::json!({
-                "success": false,
-                "error": "unknown_tab",
-                "data": {
-                    "error": "unknown_tab",
-                    "tabId": request.tab_id,
-                    "knownTabs": known,
-                }
+            // Build a `data` payload whose shape matches the cheatsheet —
+            // `{ knownTabs: [...], tabId: "<rejected>" }`. The cheatsheet
+            // promises `knownTabs` is reachable from the response, and
+            // callers disambiguate via inline help when `unknown_tab`
+            // surfaces. We bypass `api_error(..)` because that helper
+            // doesn't carry a `data` payload.
+            let data_payload = serde_json::json!({
+                "knownTabs": known,
+                "tabId": request.tab_id,
             });
-            // We need the `knownTabs` payload in the body, so bypass the
-            // `api_error(..)` helper and craft the envelope manually. The
-            // outer `ApiResponse<serde_json::Value>` keeps the route's error
-            // type uniform with the success path.
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ApiResponse {
                     success: false,
-                    data: Some(body),
+                    data: Some(data_payload),
                     error: Some(format!("unknown_tab: \"{}\"", request.tab_id)),
                     error_detail: None,
                     hint: None,

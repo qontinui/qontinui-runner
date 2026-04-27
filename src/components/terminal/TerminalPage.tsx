@@ -112,7 +112,16 @@ function TerminalPageInner({
         id: "list-terminals",
         label: "List Terminals",
         description: "Return [{id, title, isAlive}] for every currently mounted terminal tab.",
-        handler: () => tabs.map((t) => ({ id: t.id, title: t.title, isAlive: t.isAlive })),
+        // Coerce isAlive to a strict boolean so the field is always present in
+        // the response payload — `undefined` values would otherwise be dropped
+        // by JSON.stringify on the IPC boundary, leaving callers without the
+        // PTY-liveness signal the cheatsheet promises.
+        handler: () =>
+          tabs.map((t) => ({
+            id: t.id,
+            title: t.title,
+            isAlive: Boolean(t.isAlive),
+          })),
       },
     ],
   });

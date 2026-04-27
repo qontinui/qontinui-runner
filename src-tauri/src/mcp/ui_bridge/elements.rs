@@ -479,28 +479,69 @@ pub async fn ui_bridge_execute_action_handler(
     Path(id): Path<String>,
     Query(query): Query<ActionQueryParams>,
     headers: HeaderMap,
-    body: Result<Json<UIBridgeActionRequest>, axum::extract::rejection::JsonRejection>,
+    body_bytes: axum::body::Bytes,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Custom body extraction so JSON-parse errors come back with an actionable
-    // hint instead of the raw serde_json message. The most common trip is a
-    // Windows path in `params.value` (e.g. `D:\foo\bar`) where a single
-    // backslash is an invalid JSON escape — agents keep hitting this and the
-    // serde message alone ("invalid escape at line 1 column 42") doesn't
-    // point at the fix.
-    let request = match body {
-        Ok(Json(req)) => req,
-        Err(rej) => {
-            let raw = format!("{}", rej);
-            let lower = raw.to_lowercase();
-            let hint = if lower.contains("invalid escape") || lower.contains("control character") {
-                format!(
-                    "{}. Hint: if a field value contains a Windows path, escape each backslash as `\\\\` in the JSON body — or send the body from a file with `curl --data-binary @file.json` to bypass shell re-escaping. Forward slashes also work: `D:/qontinui-root/...`.",
-                    raw
-                )
+    // hint instead of the raw serde_json message. We sidestep axum's
+    // `Json<UIBridgeActionRequest>` extractor and parse the bytes ourselves
+    // for two reasons:
+    //
+    //   1. Windows paths in `params.value` (e.g. `D:\foo\bar`) where a single
+    //      backslash is an invalid JSON escape — agents keep hitting this and
+    //      the serde message alone ("invalid escape at line 1 column 42")
+    //      doesn't point at the fix.
+    //
+    //   2. Bytes that are *almost* UTF-8 (e.g. a Windows-1252-encoded em-dash
+    //      `0x97` slipping through a Git-Bash/cmd.exe shell pipeline). The
+    //      raw `Json<>` extractor surfaces the cryptic
+    //      `text: invalid unicode code point at line 1 column N` from
+    //      `serde_json::Error::InvalidUnicodeCodePoint`. Manual parsing
+    //      lets us fall back to `String::from_utf8_lossy` and retry so a
+    //      stray byte doesn't break the whole "type" action.
+    let request: UIBridgeActionRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(req) => req,
+        Err(first_err) => {
+            // First retry: bytes may be valid JSON whose string contents
+            // contain non-UTF-8 (e.g. Windows-1252 em-dash 0x97). Lossy
+            // decode, then re-parse from the re-encoded UTF-8 string.
+            let lossy = String::from_utf8_lossy(&body_bytes);
+            // Only retry when from_utf8_lossy actually substituted something
+            // (i.e. the bytes weren't valid UTF-8 to begin with). If they
+            // were valid UTF-8, the second parse would yield the same error.
+            let did_substitute = std::str::from_utf8(&body_bytes).is_err();
+            if did_substitute {
+                if let Ok(req) = serde_json::from_str::<UIBridgeActionRequest>(&lossy) {
+                    info!(
+                        "UI Bridge API: execute_action body had non-UTF-8 bytes; \
+                         recovered via lossy decode (substituted U+FFFD)"
+                    );
+                    req
+                } else {
+                    let hint = format!(
+                        "Failed to parse the request body as JSON: {}. \
+                         Hint: the body contains bytes that are not valid UTF-8 — \
+                         set your shell to UTF-8 (e.g. `chcp 65001` on Windows cmd, \
+                         or pipe the body via `curl --data-binary @file.json` from a \
+                         UTF-8-encoded file).",
+                        first_err
+                    );
+                    return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(hint))));
+                }
             } else {
-                raw
-            };
-            return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(hint))));
+                let raw = format!("Failed to parse the request body as JSON: {}", first_err);
+                let lower = raw.to_lowercase();
+                let hint = if lower.contains("invalid escape")
+                    || lower.contains("control character")
+                {
+                    format!(
+                        "{}. Hint: if a field value contains a Windows path, escape each backslash as `\\\\` in the JSON body — or send the body from a file with `curl --data-binary @file.json` to bypass shell re-escaping. Forward slashes also work: `D:/qontinui-root/...`.",
+                        raw
+                    )
+                } else {
+                    raw
+                };
+                return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(hint))));
+            }
         }
     };
 
