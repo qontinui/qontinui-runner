@@ -250,7 +250,7 @@ async fn relay_loop(
 
                 // Send runner_info immediately. The backend uses this to
                 // upsert the `runners` row and replies with `connected`
-                // carrying the runner_id (and optionally a dispatch_secret).
+                // carrying the runner_id.
                 if let Err(e) = send_runner_info(&api_state, &write).await {
                     warn!("Failed to send runner_info: {}", e);
                     consecutive_quick_disconnects += 1;
@@ -417,7 +417,7 @@ async fn handle_inbound<S>(
                     info!("Relay inbound message: type={}", msg_type);
 
                     // Special-case the `connected` handshake reply so we can
-                    // capture runner_id + dispatch_secret on the shared state.
+                    // capture runner_id on the shared state.
                     if msg_type == "connected" {
                         handle_connected_message(&api_state, &data).await;
                         continue;
@@ -465,10 +465,8 @@ async fn handle_inbound<S>(
 /// shape is:
 ///
 /// ```json
-/// {"type": "connected", "runner_id": "<uuid>", "dispatch_secret": "..."}
+/// {"type": "connected", "runner_id": "<uuid>"}
 /// ```
-///
-/// `dispatch_secret` is optional (older deployments may omit it).
 async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
     let sm_state = match api_state.app_state.current_server_mode().await {
         Some(s) => s,
@@ -495,12 +493,6 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
                     rid_str, e
                 );
             }
-        }
-    }
-
-    if let Some(secret) = data.get("dispatch_secret").and_then(|v| v.as_str()) {
-        if !secret.is_empty() {
-            sm_state.set_dispatch_secret(secret.to_string()).await;
         }
     }
 }
@@ -1592,12 +1584,15 @@ fn handle_terminal_buffer(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
     }
 }
 
-/// Tauri commands for the WS relay.
+/// Internal helpers for managing the WS relay lifecycle.
+///
+/// The relay was historically called the "cloud relay"; the function names
+/// preserve that prefix because they're used from `mcp_api::start_server`
+/// and from the auth refresh flow. They drive the unified runner WS at
+/// `/api/v1/runners/ws`, not a separate cloud-relay path.
 pub mod commands {
     use super::*;
     use std::sync::OnceLock;
-    use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-    use tauri::Runtime;
 
     /// Global relay state (managed outside Tauri state for simplicity).
     static RELAY_STATE: OnceLock<tokio::sync::Mutex<Option<Arc<BackendRelayState>>>> =
@@ -1646,63 +1641,5 @@ pub mod commands {
         if let Some(ref relay) = *guard {
             relay.kick();
         }
-    }
-
-    /// Stop the relay (ends the WS task gracefully).
-    #[tauri::command]
-    pub async fn stop_cloud_relay() -> Result<String, String> {
-        let mut holder = get_relay_holder().lock().await;
-        if let Some(relay) = holder.take() {
-            relay.stop().await;
-            Ok("Runner WS relay stopped".to_string())
-        } else {
-            Ok("Runner WS relay was not running".to_string())
-        }
-    }
-
-    /// Manually start the relay. The relay also auto-starts at runner
-    /// boot, so this is mainly useful after a `stop_cloud_relay`.
-    #[tauri::command]
-    pub async fn start_cloud_relay(
-        state: tauri::State<'_, Arc<ApiState>>,
-    ) -> Result<String, String> {
-        auto_start_cloud_relay(state.inner().clone()).await;
-        Ok("Runner WS relay started".to_string())
-    }
-
-    /// Internal status helper (used by both the Tauri command and the
-    /// HTTP `cloud_relay_status` endpoint).
-    pub async fn get_cloud_relay_status_internal() -> serde_json::Value {
-        let settings = crate::settings::load_settings();
-        let holder = get_relay_holder().lock().await;
-
-        let is_running = if let Some(ref relay) = *holder {
-            let handle_guard = relay.task_handle.lock().await;
-            handle_guard.as_ref().is_some_and(|h| !h.is_finished())
-        } else {
-            false
-        };
-
-        serde_json::json!({
-            "enabled": settings.web_integration.enabled,
-            "backend_url": settings.web_integration.backend_url,
-            "is_running": is_running,
-        })
-    }
-
-    #[tauri::command]
-    pub async fn get_cloud_relay_status() -> Result<serde_json::Value, String> {
-        Ok(get_cloud_relay_status_internal().await)
-    }
-
-    /// Build the Tauri plugin that registers this module's command handlers.
-    pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-        PluginBuilder::new("qontinui_backend_relay_commands")
-            .invoke_handler(tauri::generate_handler![
-                start_cloud_relay,
-                stop_cloud_relay,
-                get_cloud_relay_status,
-            ])
-            .build()
     }
 }

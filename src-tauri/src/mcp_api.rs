@@ -514,7 +514,7 @@ pub fn create_router(
     });
 
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
-    // `State<'_, Arc<ApiState>>` (e.g. start_cloud_relay) can resolve it.
+    // `State<'_, Arc<ApiState>>` can resolve it.
     app_handle.manage(api_state.clone());
 
     // Spawn the background sweeper that evicts stale phone-home registrations.
@@ -1507,7 +1507,6 @@ pub fn create_router(
         .merge(crate::mcp::ui_bridge::routes())
         .merge(crate::mcp::ui_bridge_integration::routes())
         .merge(crate::mcp::unified_workflows::routes())
-        .merge(crate::mcp::workflows_dispatch::routes())
         .merge(crate::mcp::auth_callback::routes())
         .merge(crate::mcp::verification_tests::routes())
         .merge(crate::mcp::websocket::routes())
@@ -1529,13 +1528,6 @@ pub fn create_router(
         .merge(crate::mcp::hitl::routes())
         .merge(crate::mcp::streaming::routes())
         .merge(crate::vga::routes())
-        .route("/cloud-relay/start", post(cloud_relay_start))
-        .route("/cloud-relay/status", get(cloud_relay_status))
-        .route("/cloud-relay/login", post(cloud_relay_login))
-        .route(
-            "/cloud-relay/poll-devices",
-            get(cloud_relay_poll_devices_diagnostic),
-        )
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))
@@ -1544,184 +1536,6 @@ pub fn create_router(
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
         .layer(axum::Extension(graphql_schema))
         .with_state(api_state)
-}
-
-/// HTTP endpoint to manually start the cloud relay
-async fn cloud_relay_start(
-    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
-) -> axum::Json<serde_json::Value> {
-    crate::mcp::backend_relay::commands::auto_start_cloud_relay(state).await;
-    axum::Json(serde_json::json!({"status": "started"}))
-}
-
-/// HTTP endpoint to login and refresh stored auth tokens, then restart relay
-async fn cloud_relay_login(
-    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
-    axum::Json(body): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
-    let email = body["email"].as_str().unwrap_or_default().to_string();
-    let password = body["password"].as_str().unwrap_or_default().to_string();
-
-    if email.is_empty() || password.is_empty() {
-        return axum::Json(serde_json::json!({"error": "email and password required"}));
-    }
-
-    match crate::commands::auth::login(email, password).await {
-        Ok(resp) => {
-            // Kick any running relay so it re-reads tokens on next iteration.
-            // Handles the case where auto_connect=false (auto_start below bails
-            // out early but a running relay still needs to pick up fresh tokens).
-            crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-            // Also ensure the relay is started if it wasn't already.
-            crate::mcp::backend_relay::commands::auto_start_cloud_relay(state).await;
-            axum::Json(serde_json::json!({
-                "status": "logged_in",
-                "user": resp.user.email,
-            }))
-        }
-        Err(e) => axum::Json(serde_json::json!({"error": e})),
-    }
-}
-
-/// HTTP endpoint to check cloud relay status
-async fn cloud_relay_status() -> axum::Json<serde_json::Value> {
-    let status = crate::mcp::backend_relay::commands::get_cloud_relay_status_internal().await;
-    axum::Json(status)
-}
-
-/// Diagnostic: manually run one cloud device poll cycle and report what happens.
-async fn cloud_relay_poll_devices_diagnostic(
-    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
-) -> axum::Json<serde_json::Value> {
-    let mut steps: Vec<serde_json::Value> = Vec::new();
-
-    // Step 1: Read settings
-    let cloud_settings = crate::config_facade::get_setting::<crate::settings::CloudRelaySettings>();
-    steps.push(serde_json::json!({
-        "step": "settings",
-        "device_bridge_enabled": cloud_settings.device_bridge_enabled,
-        "backend_url": cloud_settings.backend_url,
-        "poll_secs": cloud_settings.cloud_registry_poll_secs,
-    }));
-    if !cloud_settings.device_bridge_enabled {
-        steps.push(serde_json::json!({"step": "ABORT", "reason": "device_bridge_enabled=false"}));
-        return axum::Json(serde_json::json!({"steps": steps}));
-    }
-
-    // Step 2: Get auth token
-    let token = match crate::auth::AuthManager::new().get_access_token() {
-        Ok(t) => {
-            steps.push(serde_json::json!({
-                "step": "auth_token",
-                "status": "ok",
-                "token_len": t.len(),
-                "token_prefix": &t[..20.min(t.len())],
-            }));
-            t
-        }
-        Err(e) => {
-            steps.push(serde_json::json!({
-                "step": "auth_token",
-                "status": "FAILED",
-                "error": e.to_string(),
-            }));
-            return axum::Json(serde_json::json!({"steps": steps}));
-        }
-    };
-
-    // Step 3: Poll available-devices
-    let poller = crate::mcp::discovery::cloud_registry::CloudRegistryPoller::new(
-        cloud_settings.backend_url.clone(),
-        cloud_settings.cloud_registry_poll_secs,
-    );
-    match poller.poll(&token).await {
-        Ok(devices) => {
-            steps.push(serde_json::json!({
-                "step": "poll",
-                "status": "ok",
-                "device_count": devices.len(),
-                "devices": devices.iter().map(|d| serde_json::json!({
-                    "device_id": d.device_id,
-                    "platform": d.platform,
-                    "display_name": d.display_name,
-                })).collect::<Vec<_>>(),
-            }));
-
-            // Step 4: Try to open tunnel for first device
-            // Use localhost for the tunnel WS — the runner is on the same
-            // machine as the backend, no need to go through the Cloudflare tunnel
-            // which may reject WS upgrades from non-browser clients (403).
-            if let Some(device) = devices.first() {
-                let local_backend = crate::api_config::get_api_base_url();
-                let cloud_transport =
-                    crate::mcp::transport::cloud::CloudTransport::new(local_backend);
-                match cloud_transport.open_tunnel(&device.device_id, &token).await {
-                    Ok(port) => {
-                        steps.push(serde_json::json!({
-                            "step": "tunnel",
-                            "status": "ok",
-                            "local_port": port,
-                            "device_id": device.device_id,
-                        }));
-
-                        // Step 5: Register in PhysicalDeviceRegistry
-                        let now = chrono::Utc::now().timestamp_millis();
-                        let info = crate::mcp::physical_device::PhysicalDeviceInfo {
-                            id: device.device_id.clone(),
-                            os: crate::mcp::transport::DeviceOs::Android,
-                            device_kind: "physical".to_string(),
-                            model: None,
-                            app_id: None,
-                            ui_bridge_version: None,
-                            first_seen_at: now,
-                            pairing_token: None,
-                        };
-                        let transport = crate::mcp::physical_device::ActiveTransport {
-                            kind: crate::mcp::transport::TransportKind::Cloud,
-                            proxy_url: format!("http://127.0.0.1:{}", port),
-                            established_at: now,
-                            last_healthy_at: now,
-                            fail_count: 0,
-                        };
-                        state
-                            .physical_device_registry
-                            .register(info, transport)
-                            .await;
-                        steps.push(serde_json::json!({
-                            "step": "register",
-                            "status": "ok",
-                            "device_id": device.device_id,
-                            "proxy_url": format!("http://127.0.0.1:{}", port),
-                        }));
-                    }
-                    Err(e) => {
-                        steps.push(serde_json::json!({
-                            "step": "tunnel",
-                            "status": "FAILED",
-                            "error": e.to_string(),
-                            "device_id": device.device_id,
-                        }));
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            steps.push(serde_json::json!({
-                "step": "poll",
-                "status": "FAILED",
-                "error": e.to_string(),
-            }));
-        }
-    }
-
-    // Final: report registry state
-    let devices = state.physical_device_registry.list_all().await;
-    steps.push(serde_json::json!({
-        "step": "final_registry",
-        "device_count": devices.len(),
-    }));
-
-    axum::Json(serde_json::json!({"steps": steps}))
 }
 
 /// Try to bind to a port with SO_REUSEADDR

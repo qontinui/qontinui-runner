@@ -53,16 +53,13 @@ export type MainTabId =
   | "triggers"
   | "tasks"
   | "settings"
-  | "settings-account"
   | "settings-ai"
   | "settings-agentic"
   | "settings-self-healing"
   | "settings-world-state-verifier"
   | "settings-playwright"
   | "settings-mobile"
-  | "settings-cloud-relay"
   | "settings-discovery"
-  | "settings-web-integration"
   | "settings-backend-connection"
   | "settings-mcp"
   | "settings-log-sources"
@@ -154,16 +151,13 @@ const VALID_TAB_IDS: MainTabId[] = [
   "triggers",
   "tasks",
   "settings",
-  "settings-account",
   "settings-ai",
   "settings-agentic",
   "settings-self-healing",
   "settings-world-state-verifier",
   "settings-playwright",
   "settings-mobile",
-  "settings-cloud-relay",
   "settings-discovery",
-  "settings-web-integration",
   "settings-backend-connection",
   "settings-mcp",
   "settings-log-sources",
@@ -266,16 +260,13 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   triggers: "Triggers",
   tasks: "Scheduler",
   settings: "Settings",
-  "settings-account": "Account Settings",
   "settings-ai": "AI Settings",
   "settings-agentic": "Agentic Settings",
   "settings-self-healing": "Self-Healing Settings",
   "settings-world-state-verifier": "World State Verifier Settings",
   "settings-playwright": "Playwright Settings",
   "settings-mobile": "Mobile Settings",
-  "settings-cloud-relay": "Cloud Relay Settings",
   "settings-discovery": "Discovery Settings",
-  "settings-web-integration": "Web Integration Settings",
   "settings-backend-connection": "Backend Connection Settings",
   "settings-mcp": "MCP Settings",
   "settings-log-sources": "Log Sources Settings",

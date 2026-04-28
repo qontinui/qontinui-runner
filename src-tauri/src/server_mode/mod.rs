@@ -1,12 +1,11 @@
-//! Web-backend integration state (Phase 3 — unified runner architecture).
+//! Web-backend integration state.
 //!
-//! In Phase 3, the runner ↔ qontinui-web channel collapsed from three parallel
-//! paths (HTTP register/heartbeat + dual WebSocket clients) into a single
-//! outbound WebSocket to `WS /api/v1/runners/ws`. This module holds the
-//! shared *runtime state* of that connection — runner_id/dispatch_secret
-//! returned in the handshake response, last heartbeat timestamp, last
-//! registration error — so other subsystems (`commands::web_integration`,
-//! `mcp::workflows_dispatch`) can read it without owning the WS task itself.
+//! The runner ↔ qontinui-web channel is a single outbound WebSocket to
+//! `WS /api/v1/runners/ws`. This module holds the shared *runtime state*
+//! of that connection — runner_id returned in the handshake response,
+//! last heartbeat timestamp, last registration error — so other
+//! subsystems (`commands::web_integration`) can read it without owning
+//! the WS task itself.
 //!
 //! The WS task lives in [`crate::mcp::backend_relay`]. It updates the fields
 //! on this struct via the `set_*` helpers as the connection lifecycle
@@ -79,9 +78,6 @@ impl ServerModeConfig {
 ///
 /// - `runner_id` is set once when the backend's `connected` message arrives
 ///   following the runner's first `runner_info` send.
-/// - `dispatch_secret` is set if the backend includes one in the `connected`
-///   payload (forward-compatibility — older deployments may omit it; the
-///   runner falls back to verifying its plain `runner_token` for dispatch).
 /// - `last_heartbeat_at` is updated each time the relay successfully writes
 ///   a `heartbeat` message.
 /// - `connection_error` records the latest connect/handshake failure (e.g.
@@ -91,16 +87,10 @@ impl ServerModeConfig {
 /// is called, the relay observes the flag on its next iteration and exits;
 /// the caller then drops the state and (optionally) builds a new one with
 /// fresh settings.
-///
-/// `dispatch_secret` is a machine-to-machine credential web uses when it
-/// dispatches workflows to the runner — distinct from `config.runner_token`
-/// which the runner uses to authenticate *to* web. The runner accepts either
-/// value as a bearer on `/api/workflows/run`.
 #[derive(Debug, Clone)]
 pub struct ServerModeState {
     pub config: ServerModeConfig,
     runner_id: Arc<RwLock<Option<Uuid>>>,
-    dispatch_secret: Arc<RwLock<Option<String>>>,
     /// ISO-8601 timestamp of the last heartbeat write. Refreshed by the WS
     /// relay each time it successfully sends a `heartbeat` message.
     last_heartbeat_at: Arc<RwLock<Option<String>>>,
@@ -121,7 +111,6 @@ impl ServerModeState {
         Self {
             config,
             runner_id: Arc::new(RwLock::new(None)),
-            dispatch_secret: Arc::new(RwLock::new(None)),
             last_heartbeat_at: Arc::new(RwLock::new(None)),
             connection_error: Arc::new(RwLock::new(None)),
             ws_connected: Arc::new(AtomicBool::new(false)),
@@ -139,20 +128,6 @@ impl ServerModeState {
     pub async fn set_runner_id(&self, id: Uuid) {
         let mut guard = self.runner_id.write().await;
         *guard = Some(id);
-    }
-
-    /// Current dispatch_secret (if the WS handshake provided one). Returns
-    /// `None` until the first `connected` message has been received and
-    /// only when the backend included a secret in it.
-    pub async fn dispatch_secret(&self) -> Option<String> {
-        self.dispatch_secret.read().await.clone()
-    }
-
-    /// Set the dispatch_secret. Called from the WS relay when the backend
-    /// sends the `connected` message with a `dispatch_secret` field.
-    pub async fn set_dispatch_secret(&self, secret: String) {
-        let mut guard = self.dispatch_secret.write().await;
-        *guard = Some(secret);
     }
 
     /// Timestamp (ISO-8601) of the last successful heartbeat write.

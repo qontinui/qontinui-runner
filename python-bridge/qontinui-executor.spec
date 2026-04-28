@@ -51,8 +51,6 @@ hidden_imports = [
     'action_definitions',
     'event_emitter',
     'executor_wrapper',
-    'websocket_client',
-    'websocket_config',
     'services',
     'services.unified_data_collector',
     'services.screenshot_service',

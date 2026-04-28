@@ -91,8 +91,6 @@ except ImportError as _web_import_err:
     WebExtractionService = None  # type: ignore[assignment,misc]
     logger.warning(f"WebExtractionService unavailable: {_web_import_err}")
 
-from websocket_handler import WebSocketHandler  # noqa: E402
-
 
 class ExtractionExecutor:
     """
@@ -115,11 +113,6 @@ class ExtractionExecutor:
         # Initialize EventManager for emitting events
         self.event_manager = EventManager()
 
-        # Initialize WebSocketHandler for streaming to web backend
-        self.websocket_handler = WebSocketHandler(
-            emit_log_fn=self.event_manager.emit_log, on_command_fn=self._handle_websocket_command
-        )
-
         # Extraction services (lazy initialized)
         self._web_extraction_service: WebExtractionService | None = None
         self._vision_extraction_service: VisionExtractionService | None = None
@@ -130,16 +123,11 @@ class ExtractionExecutor:
 
         logger.info("Extraction executor initialized")
 
-    def _handle_websocket_command(self, command: dict[str, Any]) -> None:
-        """Handle commands received via WebSocket."""
-        logger.warning("WebSocket commands not supported in extraction executor")
-
     def _get_web_extraction_service(self) -> WebExtractionService:
         """Get or create the web extraction service."""
         if self._web_extraction_service is None:
             self._web_extraction_service = WebExtractionService(
                 event_manager=self.event_manager,
-                websocket_handler=self.websocket_handler,
             )
         return self._web_extraction_service
 
@@ -211,12 +199,6 @@ class ExtractionExecutor:
                 return self._handle_list_extractions()
             elif cmd_name == "run_vision_extraction":
                 return self._handle_run_vision_extraction(params)
-            elif cmd_name == "ws_configure":
-                return self._handle_ws_configure(params)
-            elif cmd_name == "ws_connect":
-                return self._handle_ws_connect()
-            elif cmd_name == "ws_disconnect":
-                return self._handle_ws_disconnect()
             elif cmd_name == "discover_states_from_fingerprints":
                 return self._handle_discover_states_from_fingerprints(params)
             else:
@@ -413,52 +395,6 @@ class ExtractionExecutor:
         except Exception as e:
             logger.error(f"Failed to run vision extraction: {e}")
             self.event_manager.emit_log("error", f"Failed to run vision extraction: {e}")
-            return {"success": False, "error": str(e)}
-
-    def _handle_ws_configure(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle ws_configure command."""
-        try:
-            enabled = params.get("enabled", True)
-            api_url = params.get("api_url", "")
-            jwt_token = params.get("jwt_token", "")
-            project_id = params.get("project_id")
-            runner_name = params.get("runner_name")
-
-            self.websocket_handler.configure(
-                enabled=enabled,
-                api_url=api_url,
-                token=jwt_token,
-                project_id=project_id,
-                runner_name=runner_name,
-            )
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"Failed to configure WebSocket: {e}")
-            return {"success": False, "error": str(e)}
-
-    def _handle_ws_connect(self) -> dict[str, Any]:
-        """Handle ws_connect command - runs in background to avoid blocking pings."""
-        import threading
-
-        def _connect_in_background():
-            try:
-                success = self.websocket_handler.connect()
-                if not success:
-                    logger.error("WebSocket background connect failed")
-            except Exception as e:
-                logger.error(f"Failed to connect WebSocket: {e}")
-
-        thread = threading.Thread(target=_connect_in_background, daemon=True)
-        thread.start()
-        return {"success": True}
-
-    def _handle_ws_disconnect(self) -> dict[str, Any]:
-        """Handle ws_disconnect command."""
-        try:
-            self.websocket_handler.disconnect()
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"Failed to disconnect WebSocket: {e}")
             return {"success": False, "error": str(e)}
 
     def _handle_discover_states_from_fingerprints(self, params: dict[str, Any]) -> dict[str, Any]:

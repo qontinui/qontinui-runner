@@ -457,8 +457,8 @@ impl AppState {
     ///
     /// Returns a cloned `Option<ServerModeState>` under a read lock, so the
     /// caller does not hold the lock while awaiting downstream HTTP work.
-    /// Callers that need to inspect state fields (runner_id, dispatch_secret)
-    /// should use this helper rather than locking directly — the inner
+    /// Callers that need to inspect state fields (runner_id) should use
+    /// this helper rather than locking directly — the inner
     /// `ServerModeState` already shares its data via `Arc<RwLock<...>>`, so
     /// the clone is cheap.
     pub async fn current_server_mode(&self) -> Option<crate::server_mode::ServerModeState> {

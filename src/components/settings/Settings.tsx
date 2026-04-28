@@ -65,14 +65,10 @@ const STORAGE_KEY = "qontinui-settings-active-tab";
 /**
  * Canonical list of settings sub-tabs.
  *
- * Phase 3 collapse: the legacy "Account" panel (`AuthConnectionSettings`,
- * which managed the user-JWT WebSocket and project picker) and the
- * "Cloud Relay" panel (which managed the same connection under a
- * different name) are gone. The runner ↔ web channel is now a single
- * outbound WebSocket driven entirely by `WebIntegrationSettings`. The
- * panel id is `backend-connection` to reflect the unified scope, but
- * we still mount `WebIntegrationSettings` underneath until the next UX
- * pass.
+ * The runner ↔ web channel is a single outbound WebSocket driven by
+ * `WebIntegrationSettings`. The panel id is `backend-connection` to
+ * reflect the unified scope, but we still mount `WebIntegrationSettings`
+ * underneath until the next UX pass.
  */
 const SETTINGS_TABS = [
   { id: "backend-connection", label: "Backend Connection" },
@@ -100,20 +96,8 @@ const SETTINGS_TABS = [
 
 const VALID_TABS = SETTINGS_TABS.map((t) => t.id);
 
-/**
- * Migrate legacy stored tab ids to their Phase 3 replacements. Without
- * this, a user whose last-active tab was "account" / "cloud-relay" /
- * "web-integration" would land on a missing tab id and fall through to
- * the default.
- */
 function migrateStoredTab(stored: string | null): SettingsTab {
   if (!stored) return "backend-connection";
-  if (stored === "connection" || stored === "account" || stored === "cloud-relay") {
-    return "backend-connection";
-  }
-  if (stored === "web-integration") {
-    return "backend-connection";
-  }
   if ((VALID_TABS as readonly string[]).includes(stored)) {
     return stored as SettingsTab;
   }

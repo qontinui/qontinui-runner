@@ -4,7 +4,6 @@ Qontinui Executor - Main Entry Point
 
 This module composes specialized modules following the Single Responsibility Principle:
 - event_manager.py: Event handling and emission
-- websocket_handler.py: WebSocket client communication
 - capture_manager.py: Screenshot and video capture
 - training_export.py: Training data export coordination
 - executor_core.py: Core configuration loading and initialization
@@ -85,7 +84,6 @@ from event_translator import EventTranslator  # noqa: E402
 from execution_tree import ExecutionNode, ExecutionTree  # noqa: E402
 from executor_core import ExecutorCore  # noqa: E402
 from training_export import TrainingExportCoordinator  # noqa: E402
-from websocket_handler import WebSocketHandler  # noqa: E402
 
 # TestResultsHandler module may not exist; import gracefully
 try:
@@ -217,12 +215,6 @@ class QontinuiExecutor:
 
         # Initialize EventManager first (other modules depend on it)
         self.event_manager = EventManager()
-
-        # Initialize WebSocketHandler with command handler
-        self.websocket_handler = WebSocketHandler(
-            emit_log_fn=self.event_manager.emit_log,
-            on_command_fn=self._handle_websocket_command,
-        )
 
         # Initialize TestResultsHandler for QA dashboard submission
         if TestResultsHandler is not None:
@@ -393,85 +385,8 @@ class QontinuiExecutor:
         self.event_manager.emit_log("info", "Auto-reloaded persisted state machine")
 
     def _emit_event_wrapper(self, event_type: str, data: dict[str, Any]):
-        """
-        Wrapper for EventTranslator to emit events.
-
-        Also forwards automation events to WebSocket if enabled.
-        """
-        # Forward to event manager
+        """Wrapper for EventTranslator to emit events."""
         self.event_manager.emit_event_wrapper(event_type, data)
-
-        # Forward to WebSocket if enabled
-        if self.websocket_handler.is_enabled():
-            self._forward_to_websocket(event_type, data)
-
-    def _forward_to_websocket(self, event_type: str, data: dict[str, Any]):
-        """Forward events to WebSocket backend."""
-        import sys
-
-        print(f"[FWD_TO_WS] Called: event_type={event_type}", file=sys.stderr, flush=True)
-        # Handle image recognition events
-        if event_type == "image_recognition":
-            screenshot_base64 = data.get("screenshot_base64")
-            if screenshot_base64:
-                metadata = {
-                    "event_type": "image_recognition",
-                    "image_id": data.get("image_id"),
-                    "state_name": data.get("state_name"),
-                    "found": data.get("found"),
-                    "confidence": data.get("confidence"),
-                    "threshold": data.get("threshold"),
-                    "match_location": data.get("match_location"),
-                    "action_type": "find_image",
-                }
-                self.websocket_handler.send_screenshot(
-                    image=screenshot_base64,
-                    name=f"match_{data.get('image_id', 'unknown')}_{int(time.time())}",
-                    metadata=metadata,
-                )
-
-            self.websocket_handler.send_log(
-                level="info" if data.get("found") else "debug",
-                message=f"Image recognition: {data.get('image_id')} - {'found' if data.get('found') else 'not found'}",
-                log_data={
-                    "event_type": "image_recognition",
-                    "image_id": data.get("image_id"),
-                    "found": data.get("found"),
-                    "confidence": data.get("confidence"),
-                },
-            )
-            return
-
-        # Handle other automation events
-        level_map = {
-            "action_started": "info",
-            "action_completed": "info",
-            "action_execution": "info",
-            "match_found": "info",
-            "screenshot_taken": "debug",
-            "log": data.get("level", "info"),
-        }
-        level = level_map.get(event_type, "info")
-
-        # Create message based on event type
-        if event_type == "action_started":
-            message = f"Action started: {data.get('action_type', 'unknown')}"
-        elif event_type == "action_completed":
-            success = data.get("success", True)
-            action_type = data.get("action_type", "unknown")
-            message = f"Action {'completed' if success else 'failed'}: {action_type}"
-            if not success:
-                level = "error"
-        elif event_type == "action_execution":
-            message = f"Executed: {data.get('action_type', 'unknown')}"
-        elif event_type == "match_found":
-            message = f"Match found: {data.get('image_id', 'unknown')}"
-        else:
-            message = data.get("message", f"Event: {event_type}")
-
-        self.websocket_handler.send_log(
-            level=level, message=message, log_data={"event_type": event_type, **data}
-        )
 
     def _get_current_hierarchy(self) -> dict[str, Any]:
         """Get current execution hierarchy from execution tree."""
@@ -990,28 +905,6 @@ class QontinuiExecutor:
             capture_session_id = f"exec-{workflow_id}-{int(time.time())}"
             self._start_input_capture_for_execution(capture_session_id)
 
-        # Start WebSocket session if enabled or if it was configured (for auto-reconnect)
-        # Call start_session even if currently disconnected - it will attempt to reconnect
-        ws_is_enabled = self.websocket_handler.is_enabled()
-        ws_config = self.websocket_handler.ws_config
-        ws_config_exists = ws_config is not None
-        ws_config_enabled = ws_config.enabled if ws_config is not None else False
-        self.event_manager.emit_log(
-            "debug",
-            f"[WS_SESSION_CHECK] is_enabled={ws_is_enabled}, ws_config_exists={ws_config_exists}, ws_config.enabled={ws_config_enabled}, ws_enabled={self.websocket_handler.ws_enabled}",
-        )
-        if ws_is_enabled or (ws_config_exists and ws_config_enabled):
-            self.event_manager.emit_log("info", "[WS_SESSION_CHECK] Starting WebSocket session...")
-            result = self.websocket_handler.start_session(config_snapshot=self.config)
-            self.event_manager.emit_log(
-                "info", f"[WS_SESSION_CHECK] start_session result: {result}"
-            )
-        else:
-            self.event_manager.emit_log(
-                "warning",
-                "[WS_SESSION_CHECK] WebSocket session NOT started - conditions not met",
-            )
-
         # Start execution in background thread
         thread = threading.Thread(target=self._run_workflow, args=(workflow_id,), daemon=True)
         thread.start()
@@ -1093,10 +986,6 @@ class QontinuiExecutor:
                 },
             )
 
-            # End WebSocket session
-            if self.websocket_handler.is_enabled():
-                self.websocket_handler.end_session(status="completed" if success else "failed")
-
             # Complete test run for QA dashboard
             if test_run_id and self.test_results_handler.is_enabled():
                 execution_duration = time.time() - execution_start_time
@@ -1117,10 +1006,6 @@ class QontinuiExecutor:
                     "error": str(e),
                 },
             )
-
-            # End WebSocket session with error
-            if self.websocket_handler.is_enabled():
-                self.websocket_handler.end_session(status="failed", error=str(e))
 
             # Complete test run with failure
             if test_run_id and self.test_results_handler.is_enabled():
@@ -1263,112 +1148,6 @@ class QontinuiExecutor:
                 self.event_manager.emit_tree_event("workflow_failed", nav_node, None)
 
             return {"success": False, "error": str(e)}
-
-    def _handle_websocket_command(self, message: dict[str, Any]) -> None:
-        """
-        Handle incoming command from WebSocket backend.
-
-        This is called when the backend sends a command to the runner.
-        Commands from the web frontend are forwarded through the backend's
-        Redis pub/sub system to the runner's WebSocket connection.
-
-        Args:
-            message: Command message with format:
-                     {"type": "command", "command": "...", "params": {...}}
-        """
-        import sys
-
-        print(
-            f"[info    ] EXECUTOR: Received WebSocket command: {message}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-        try:
-            command_name = message.get("command")
-            params = message.get("params", {})
-
-            if not command_name:
-                print(
-                    "[error   ] EXECUTOR: No command name in message",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return
-
-            # Route the command through our normal command handler
-            # by constructing a command dict that handle_command expects
-            command_dict = {
-                "command": command_name,
-                "params": params,
-            }
-
-            print(
-                f"[info    ] EXECUTOR: Routing to handle_command: {command_name}",
-                file=sys.stderr,
-                flush=True,
-            )
-            result = self.handle_command(command_dict)
-            print(
-                f"[info    ] EXECUTOR: Command result: {result}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-            # Send result back through WebSocket to frontend
-            if self.websocket_handler and self.websocket_handler.is_connected:
-                import json
-
-                response_message = {
-                    "type": "command_response",
-                    "data": {
-                        "command": command_name,
-                        "result": result,
-                    },
-                }
-                self.websocket_handler.send_message(json.dumps(response_message))
-                print(
-                    "[info    ] EXECUTOR: Sent command response via WebSocket",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                print(
-                    "[warning ] EXECUTOR: WebSocket not connected, cannot send response",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-        except Exception as e:
-            print(
-                f"[error   ] EXECUTOR: Error handling WebSocket command: {e}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-            print(
-                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-            # Send error response back through WebSocket
-            if self.websocket_handler and self.websocket_handler.is_connected:
-                import json
-
-                error_response = {
-                    "type": "command_response",
-                    "data": {
-                        "command": message.get("command", "unknown"),
-                        "result": {"success": False, "error": str(e)},
-                    },
-                }
-                self.websocket_handler.send_message(json.dumps(error_response))
-                print(
-                    "[info    ] EXECUTOR: Sent error response via WebSocket",
-                    file=sys.stderr,
-                    flush=True,
-                )
 
     def handle_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Handle command from Rust bridge."""
@@ -1549,88 +1328,6 @@ class QontinuiExecutor:
                 "is_monitoring": is_monitoring,
                 "events_count": events_count,
                 "session_id": self._input_capture_session_id,
-            }
-
-        elif cmd_type == "ws_configure":
-            # Direct stderr output for debugging (use [info] format so Rust logs at info level)
-            import sys
-
-            print(
-                "[info    ] WS_DEBUG: ws_configure received! NEW CODE IS RUNNING!",
-                file=sys.stderr,
-                flush=True,
-            )
-            enabled = params.get("enabled", False)
-            api_url = params.get("api_url", "")
-            token = params.get("jwt_token", "")
-            project_id = params.get("project_id")
-            runner_name = params.get("runner_name")
-            runner_port = params.get("runner_port")
-            print(
-                f"[info    ] WS_DEBUG: enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, runner_port={runner_port}, token_len={len(token) if token else 0}",
-                file=sys.stderr,
-                flush=True,
-            )
-            self.event_manager.emit_log(
-                "info",
-                f"[WS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, runner_port={runner_port}, token_len={len(token) if token else 0}",
-            )
-            success = self.websocket_handler.configure(
-                enabled, api_url, token, project_id, runner_name, runner_port
-            )
-            print(
-                f"[info    ] WS_DEBUG: configure result: success={success}",
-                file=sys.stderr,
-                flush=True,
-            )
-            self.event_manager.emit_log("info", f"[WS_CONFIGURE] Result: success={success}")
-            return {"success": success}
-
-        elif cmd_type == "ws_connect":
-            import sys
-            import threading
-
-            print("[info    ] WS_DEBUG: ws_connect received!", file=sys.stderr, flush=True)
-
-            # Run connection in background thread to avoid blocking the command loop.
-            # A blocking ws_connect prevents the executor from responding to health
-            # check pings, causing Rust to declare the executor unresponsive.
-            def _connect_in_background():
-                success = self.websocket_handler.connect()
-                print(
-                    f"[info    ] WS_DEBUG: ws_connect result: success={success}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                self.event_manager.emit_log(
-                    "info" if success else "error",
-                    f"[WS_CONNECT] Background connect result: success={success}",
-                )
-
-            thread = threading.Thread(target=_connect_in_background, daemon=True)
-            thread.start()
-            return {"success": True}
-
-        elif cmd_type == "ws_disconnect":
-            self.websocket_handler.disconnect()
-            return {"success": True}
-
-        elif cmd_type == "ws_start_session":
-            config_snapshot = params.get("config_snapshot")
-            success = self.websocket_handler.start_session(config_snapshot)
-            return {"success": success}
-
-        elif cmd_type == "ws_end_session":
-            status = params.get("status", "completed")
-            error = params.get("error")
-            success = self.websocket_handler.end_session(status, error)
-            return {"success": success}
-
-        elif cmd_type == "ws_status":
-            return {
-                "success": True,
-                "enabled": self.websocket_handler.is_enabled(),
-                "connected": self.websocket_handler.is_connected,
             }
 
         # Test Results Handler commands (for QA Dashboard)
@@ -2339,7 +2036,6 @@ class QontinuiExecutor:
         if self._web_extraction_service is None:
             self._web_extraction_service = WebExtractionService(
                 event_manager=self.event_manager,
-                websocket_handler=self.websocket_handler,
             )
         return self._web_extraction_service  # type: ignore[no-any-return]
 
@@ -3962,17 +3658,6 @@ class QontinuiExecutor:
                     f"Starting remote workflow execution via execute-inline: {workflow.get('name', 'Unknown')}",
                 )
 
-                # Notify via WebSocket that execution has started
-                if self.websocket_handler and self.websocket_handler.is_connected:
-                    execution_event = {
-                        "type": "execution_started",
-                        "data": {
-                            "execution_id": execution_id,
-                            "workflow_name": workflow.get("name", "Unknown"),
-                        },
-                    }
-                    self.websocket_handler.send_message(json.dumps(execution_event))
-
                 # Forward to the local Rust MCP API's execute-inline endpoint
                 resp = requests.post(
                     f"{self._get_runner_api_base()}/unified-workflows/execute-inline",
@@ -4000,17 +3685,6 @@ class QontinuiExecutor:
                         "error",
                         f"Remote workflow execution failed ({resp.status_code}): {resp.text[:500]}",
                     )
-
-                # Notify via WebSocket that execution has finished
-                if self.websocket_handler and self.websocket_handler.is_connected:
-                    completion_event = {
-                        "type": "execution_completed",
-                        "data": {
-                            "execution_id": execution_id,
-                            "success": resp.ok,
-                        },
-                    }
-                    self.websocket_handler.send_message(json.dumps(completion_event))
 
             except Exception as e:
                 self.event_manager.emit_log("error", f"Remote workflow execution failed: {e}")

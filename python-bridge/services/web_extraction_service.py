@@ -68,17 +68,14 @@ class WebExtractionService:
     def __init__(
         self,
         event_manager: Any = None,
-        websocket_handler: Any = None,
     ) -> None:
         """
         Initialize the web extraction service.
 
         Args:
             event_manager: EventManager for emitting events to Rust bridge.
-            websocket_handler: WebSocketHandler for streaming to web backend.
         """
         self.event_manager = event_manager
-        self.websocket_handler = websocket_handler
 
         # Storage directory for extractions
         self.extractions_dir = Path.home() / ".qontinui" / "extraction"
@@ -670,13 +667,9 @@ class WebExtractionService:
         if self.event_manager:
             self.event_manager.emit_event_wrapper(event_type, data)
 
-        # Forward to websocket (web backend)
-        if self.websocket_handler and self.websocket_handler.is_connected:
-            await self._send_to_websocket(event_type, data)
-
     async def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
         """
-        Emit an event to both Rust bridge and websocket.
+        Emit an event to the Rust bridge.
 
         Args:
             event_type: Type of event
@@ -685,27 +678,6 @@ class WebExtractionService:
         # Use emit_event_wrapper since event_type is a string, not an EventType enum
         if self.event_manager:
             self.event_manager.emit_event_wrapper(event_type, data)
-
-        if self.websocket_handler and self.websocket_handler.is_connected:
-            await self._send_to_websocket(event_type, data)
-
-    async def _send_to_websocket(self, event_type: str, data: dict[str, Any]) -> None:
-        """
-        Send data to websocket handler.
-
-        Args:
-            event_type: Type of event
-            data: Event data
-        """
-        try:
-            message = {
-                "type": event_type,
-                "data": data,
-                "timestamp": utc_now().isoformat(),
-            }
-            self.websocket_handler.send_message(json.dumps(message))
-        except Exception as e:
-            logger.warning(f"Failed to send websocket message: {e}")
 
     async def stop_extraction(self) -> dict[str, Any]:
         """

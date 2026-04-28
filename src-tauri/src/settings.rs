@@ -926,7 +926,14 @@ mod web_integration_default_tests {
 // Cloud Relay Settings
 // ============================================================================
 
-/// Cloud relay settings for remote mobile access via backend WebSocket
+// TODO: `CloudRelaySettings` is now only used by the cloud device-bridge
+// poller in `mcp::discovery::cloud_registry` / `mcp::transport::cloud`
+// (mobile-tunnel feature). The runner ↔ web channel is driven entirely by
+// `WebIntegrationSettings`. If the device-bridge feature is retired, drop
+// this struct and inline a minimal `mobile_tunnel` settings object.
+/// Cloud relay settings — retained for the cloud device-bridge poller used
+/// by the mobile-tunnel feature. The runner ↔ web channel is driven by
+/// `WebIntegrationSettings`, not this struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudRelaySettings {
     /// Whether cloud relay is enabled

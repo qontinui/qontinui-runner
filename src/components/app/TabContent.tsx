@@ -946,16 +946,13 @@ export function TabContent({
       );
 
     case "settings":
-    case "settings-account":
     case "settings-ai":
     case "settings-agentic":
     case "settings-self-healing":
     case "settings-world-state-verifier":
     case "settings-playwright":
     case "settings-mobile":
-    case "settings-cloud-relay":
     case "settings-discovery":
-    case "settings-web-integration":
     case "settings-backend-connection":
     case "settings-mcp":
     case "settings-log-sources":
@@ -967,21 +964,15 @@ export function TabContent({
     case "settings-debug":
     case "settings-security":
     case "settings-updates": {
-      // Phase 3 — `account`, `cloud-relay`, and `web-integration` are all
-      // legacy ids for the runner ↔ web channel; they all collapse to the
-      // unified `backend-connection` tab.
       const settingsTabMap: Record<string, string> = {
         settings: "backend-connection",
-        "settings-account": "backend-connection",
         "settings-ai": "ai",
         "settings-agentic": "agentic",
         "settings-self-healing": "self-healing",
         "settings-world-state-verifier": "world-state-verifier",
         "settings-playwright": "playwright",
         "settings-mobile": "mobile",
-        "settings-cloud-relay": "backend-connection",
         "settings-discovery": "discovery",
-        "settings-web-integration": "backend-connection",
         "settings-backend-connection": "backend-connection",
         "settings-mcp": "mcp",
         "settings-log-sources": "log-sources",
