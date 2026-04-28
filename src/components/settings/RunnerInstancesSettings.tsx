@@ -609,55 +609,6 @@ function InstanceRow({
 }
 
 // ---------------------------------------------------------------------------
-// Sub-component: SpawnBanner
-// Lists the round-robin order the supervisor will hit.
-// ---------------------------------------------------------------------------
-
-interface BannerSlot {
-  index: number;
-  label: string;
-  preview: ResolvedPlacement | null;
-  error: string | null;
-  hasPlacement: boolean;
-}
-
-interface SpawnBannerProps {
-  slots: BannerSlot[];
-}
-
-function SpawnBanner({ slots }: SpawnBannerProps) {
-  if (slots.length === 0) return null;
-  return (
-    <div className="p-3 rounded-lg border border-border bg-muted/30 font-mono text-[11px] space-y-0.5">
-      <div className="text-xs font-semibold mb-1 font-sans">
-        Temp runner placement (round-robin):
-      </div>
-      {slots.map((slot) => (
-        <div key={slot.index} className="flex flex-wrap gap-x-2">
-          <span className="text-muted-foreground shrink-0">Slot {slot.index}</span>
-          <span className="truncate">{slot.label}:</span>
-          <span className="ml-auto text-right">
-            {slot.error ? (
-              <span className="text-destructive">{slot.error}</span>
-            ) : slot.preview ? (
-              <span>
-                → global ({slot.preview.global_x}, {slot.preview.global_y}) {slot.preview.width}×
-                {slot.preview.height} on {slot.preview.monitor_label}
-              </span>
-            ) : (
-              <span className="text-muted-foreground">no placement</span>
-            )}
-          </span>
-        </div>
-      ))}
-      <div className="text-[10px] text-muted-foreground pt-1 font-sans">
-        The supervisor's spawn-test endpoint cycles through enabled placements in this order.
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Sub-component: TempPlacementsSection
 // Edits the runner-wide list the supervisor consumes for temp runners.
 // ---------------------------------------------------------------------------
@@ -867,7 +818,6 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
   const [loading, setLoading] = useState(true);
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
   const [monitors, setMonitors] = useState<MonitorEntry[]>([]);
-  const [bannerSlots, setBannerSlots] = useState<BannerSlot[]>([]);
 
   // New instance form
   const [showAddForm, setShowAddForm] = useState(false);
@@ -940,62 +890,6 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
     }
   }, [onLog]);
 
-  // Build banner slots. Slot 0 = primary runner (this one). Configured
-  // instances follow in port order.
-  const refreshBannerSlots = useCallback(async () => {
-    const configured = instances
-      .filter((i) => i.source !== "registered")
-      .slice()
-      .sort((a, b) => a.port - b.port);
-
-    const slots: BannerSlot[] = [];
-    slots.push({
-      index: 0,
-      label: "(primary)",
-      preview: null,
-      error: null,
-      hasPlacement: false,
-    });
-
-    for (let i = 0; i < configured.length; i++) {
-      const inst = configured[i];
-      const slotIdx = i + 1;
-      const labelBase = `(named "${inst.name}")`;
-      if (!inst.spawn_placement) {
-        slots.push({
-          index: slotIdx,
-          label: labelBase,
-          preview: null,
-          error: null,
-          hasPlacement: false,
-        });
-        continue;
-      }
-      try {
-        const resolved = await invoke<ResolvedPlacement>("preview_spawn_placement", {
-          placement: inst.spawn_placement,
-        });
-        slots.push({
-          index: slotIdx,
-          label: labelBase,
-          preview: resolved,
-          error: null,
-          hasPlacement: true,
-        });
-      } catch (err) {
-        slots.push({
-          index: slotIdx,
-          label: labelBase,
-          preview: null,
-          error: String(err),
-          hasPlacement: true,
-        });
-      }
-    }
-
-    setBannerSlots(slots);
-  }, [instances]);
-
   useEffect(() => {
     let cancelled = false;
     void Promise.resolve().then(() => {
@@ -1014,10 +908,6 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
       unlisten.then((fn) => fn());
     };
   }, [loadInstances, loadMonitors]);
-
-  useEffect(() => {
-    void refreshBannerSlots();
-  }, [refreshBannerSlots]);
 
   // Auto-suggest next available port
   useEffect(() => {
@@ -1169,9 +1059,6 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
       {/* Temp runner placements (supervisor-consumed list, distinct from
           per-named-instance placements below) */}
       <TempPlacementsSection monitors={monitors} onLog={onLog} />
-
-      {/* Banner */}
-      <SpawnBanner slots={bannerSlots} />
 
       {/* Instance list */}
       <div className="space-y-2">
