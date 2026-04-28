@@ -123,11 +123,77 @@ impl WrapperRegistry {
         if let Err(e) = registry.load_index().await {
             warn!("wrappers: failed to load index: {}", e);
         }
+        // Self-heal: prune any wrapper directories left behind by a previous
+        // install that crashed mid-promote (broken symlinks, dirs missing
+        // `dist/index-node.js`, etc.). Done BEFORE the file watcher starts
+        // so removal isn't blocked by our own handles. If a broken dir is
+        // *still* locked at this point — by another process holding it,
+        // antimalware indexing, etc. — we log the failure and move on; the
+        // user can clear it manually. Without this pass, broken dirs from
+        // pre-fix install crashes wedge subsequent installs forever.
+        registry.prune_orphans().await;
         // Initial fs rescan to reconcile the cache with reality.
         if let Err(e) = registry.rescan_all().await {
             warn!("wrappers: initial rescan_all failed: {}", e);
         }
         registry
+    }
+
+    /// Walk the wrappers root and delete any subdirectory whose contents
+    /// don't match a runnable wrapper (no `dist/index-node.js` and no
+    /// `package.json`). These are leftovers from interrupted installs.
+    async fn prune_orphans(&self) {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Only consider directories, skip dotfiles/staging leftovers
+            // (the install pipeline keeps those outside this root now,
+            // but old `.install-*` entries from the pre-fix install code
+            // path may still be here).
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if !path.is_dir() {
+                continue;
+            }
+            let entry_path = path.join("dist").join("index-node.js");
+            let pkg_path = path.join("package.json");
+            // A healthy wrapper has BOTH the entry script and a manifest.
+            // Anything else is junk we want gone.
+            let healthy = entry_path.is_file() && pkg_path.is_file();
+            if healthy {
+                continue;
+            }
+            // Stale `.install-*` from the pre-fix code path — definitely
+            // safe to delete unconditionally.
+            let is_stale_staging = name.starts_with(".install-");
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    if is_stale_staging {
+                        info!(
+                            "wrappers: pruned stale install staging dir '{}'",
+                            path.display()
+                        );
+                    } else {
+                        info!(
+                            "wrappers: pruned broken wrapper directory '{}' (missing dist/index-node.js or package.json)",
+                            path.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "wrappers: could not prune broken wrapper directory '{}': {} — installs targeting this id may fail until the lock holder releases it",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
     }
 
     /// Default app-data root: `<data_dir>/qontinui-runner/wrappers/`.
