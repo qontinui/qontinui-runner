@@ -8,6 +8,7 @@
  */
 
 import { useState, useRef, useCallback, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useAiSession } from "./useAiSession";
 import { buildPageSpecPrompt } from "@/lib/page-analysis-prompt-builder";
 import { getApiBase } from "@/lib/runner-api";
@@ -42,9 +43,32 @@ export interface SpecSyncState {
   warnings: string[];
 }
 
-interface SpecToSync {
+export type SpecSyncReason = "missing-state-machine" | "quarantined";
+
+export interface SpecToSync {
   spec: LoadedSpec;
-  reason: "missing-state-machine" | "stale";
+  reason: SpecSyncReason;
+}
+
+export interface AnalyzeResult {
+  toSync: SpecToSync[];
+  toSkip: string[];
+  /**
+   * Total quarantined-state-id set discovered during analyze. Useful for
+   * UIs that want to display "X quarantined specs available" hints even
+   * when the user has the "Sync only quarantined" toggle off.
+   */
+  quarantinedStateIds: Set<string>;
+}
+
+export interface RunSyncOptions {
+  /**
+   * When true, restrict the sync queue to specs that touch a quarantined
+   * state ID (or are missing their state machine). When false, fall back
+   * to the legacy "include every page-spec" behaviour useful for
+   * re-running against the latest prompt.
+   */
+  onlyQuarantined?: boolean;
 }
 
 // ============================================================================
@@ -86,9 +110,85 @@ function extractJsonBlock(content: string): string | null {
 // Staleness analysis
 // ============================================================================
 
-function analyzeSpecs(specs: LoadedSpec[]): { toSync: SpecToSync[]; toSkip: string[] } {
+interface QuarantineSummaryItem {
+  specId: string; // quarantine record id, NOT a registry spec id
+  reason: string;
+  detectedAt: string;
+  conflicts: Array<{
+    elementKey: string;
+    states: Array<{ stateId: string; provenance?: unknown }>;
+  }>;
+}
+
+/**
+ * Read the most recent quarantine record from the runner's
+ * `/state-machine/quarantine` endpoint and return the set of every
+ * `stateId` mentioned in its `conflicts[]`. Resolves to an empty set on
+ * any error or when no quarantine records exist (graceful degrade).
+ */
+export async function getQuarantinedStateIds(): Promise<Set<string>> {
+  // Resolve the runner's own port via Tauri IPC so the analyze pass works
+  // even before `_apiBase` has been hydrated by the boot listener.
+  let port: number;
+  try {
+    port = await invoke<number>("get_api_port");
+    if (!port || port <= 0) throw new Error(`invalid port ${port}`);
+  } catch {
+    const base = getApiBase();
+    if (!base) return new Set();
+    return fetchQuarantinedStateIdsFromBase(base);
+  }
+  return fetchQuarantinedStateIdsFromBase(`http://localhost:${port}`);
+}
+
+async function fetchQuarantinedStateIdsFromBase(base: string): Promise<Set<string>> {
+  try {
+    const res = await fetch(`${base}/state-machine/quarantine`);
+    if (!res.ok) return new Set();
+    const data = (await res.json()) as { data?: { items?: QuarantineSummaryItem[] } };
+    const items = data?.data?.items;
+    if (!items || items.length === 0) return new Set();
+    // Endpoint already sorts newest-first, but re-sort defensively.
+    const sorted = [...items].sort((a, b) =>
+      (b.detectedAt || "").localeCompare(a.detectedAt || ""),
+    );
+    const latest = sorted[0];
+    const ids = new Set<string>();
+    if (Array.isArray(latest.conflicts)) {
+      for (const conflict of latest.conflicts) {
+        if (!conflict || !Array.isArray(conflict.states)) continue;
+        for (const s of conflict.states) {
+          if (s && typeof s.stateId === "string") ids.add(s.stateId);
+        }
+      }
+    }
+    return ids;
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Analyze the spec set and decide which specs need to be re-synced.
+ *
+ * NOTE: An earlier version of this function flagged any spec where
+ * `groups[].name` and `stateMachine.states[].name` diverged as "stale".
+ * Those are different conceptual axes (groups != states) so the check
+ * produced false positives across nearly the whole registry, and the
+ * Sync All Specs flow re-ran every page spec (~5.5 hours). The legacy
+ * staleness path was removed; specs are now flagged only if they
+ * are missing a state machine entirely or appear in a quarantine
+ * record. See manual-test report covering the 95-spec re-run regression.
+ */
+export async function analyzeSpecs(
+  specs: LoadedSpec[],
+  options: RunSyncOptions = {},
+): Promise<AnalyzeResult> {
   const toSync: SpecToSync[] = [];
   const toSkip: string[] = [];
+  const onlyQuarantined = options.onlyQuarantined ?? false;
+
+  const quarantinedStateIds = await getQuarantinedStateIds();
 
   for (const spec of specs) {
     if (spec.kind !== "page-spec") {
@@ -98,32 +198,43 @@ function analyzeSpecs(specs: LoadedSpec[]): { toSync: SpecToSync[]; toSkip: stri
 
     const config = spec.config as SpecConfig;
 
-    // Check if stateMachine section is missing
+    // Compute quarantine flag first so it always wins.
+    let isQuarantined = false;
+    const smStates = config.stateMachine?.states;
+    if (Array.isArray(smStates) && quarantinedStateIds.size > 0) {
+      for (const s of smStates) {
+        if (s && typeof s.id === "string" && quarantinedStateIds.has(s.id)) {
+          isQuarantined = true;
+          break;
+        }
+      }
+    }
+
+    if (isQuarantined) {
+      toSync.push({ spec, reason: "quarantined" });
+      continue;
+    }
+
+    // Missing state machine — always a sync candidate.
     if (
       !config.stateMachine ||
       !config.stateMachine.states ||
       config.stateMachine.states.length === 0
     ) {
-      toSync.push({ spec, reason: "missing-state-machine" });
+      if (onlyQuarantined) {
+        toSkip.push(spec.specId);
+      } else {
+        toSync.push({ spec, reason: "missing-state-machine" });
+      }
       continue;
     }
 
-    // Check if the spec is stale: state machine references groups that no longer
-    // exist, or groups exist that have no corresponding state machine state.
-    const groupNames = new Set(config.groups.map((g) => g.name));
-    const smStateNames = new Set(config.stateMachine.states.map((s: { name: string }) => s.name));
-    const hasOrphanedStates = [...smStateNames].some((n) => !groupNames.has(n));
-    const hasMissingStates = [...groupNames].some((n) => !smStateNames.has(n));
-    if (hasOrphanedStates || hasMissingStates) {
-      toSync.push({ spec, reason: "stale" });
-      continue;
-    }
-
-    // Spec looks fresh — skip
+    // Spec has a state machine and isn't quarantined. The legacy
+    // group/state-name divergence check was removed (false-positive heavy).
     toSkip.push(spec.specId);
   }
 
-  return { toSync, toSkip };
+  return { toSync, toSkip, quarantinedStateIds };
 }
 
 // ============================================================================
@@ -416,7 +527,22 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
     finishSyncRef.current = finishSync;
   });
 
-  const startSync = useCallback(async () => {
+  /**
+   * Run analyze-only — does NOT start the sync loop. Callers (e.g. the
+   * pre-flight confirmation modal) use this to fetch the queue + reason
+   * breakdown so they can show counts before the user confirms.
+   */
+  const analyze = useCallback(async (options: RunSyncOptions = {}): Promise<AnalyzeResult> => {
+    return analyzeSpecs(specsRef.current, options);
+  }, []);
+
+  /**
+   * Kick off the sync flow with the given queue. The queue is typically
+   * obtained from a previous `analyze()` call so the modal can show counts
+   * before confirming. If `precomputed` is omitted, we run analyze inline
+   * (matches the legacy behaviour).
+   */
+  const runSync = useCallback(async (options: RunSyncOptions = {}, precomputed?: AnalyzeResult) => {
     // Guard against double-start
     if (abortRef.current && !abortRef.current.signal.aborted) return;
 
@@ -434,8 +560,8 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
       warnings: [],
     });
 
-    // Analyze which specs need updating
-    const { toSync, toSkip } = analyzeSpecs(specs);
+    const analyzed = precomputed ?? (await analyzeSpecs(specsRef.current, options));
+    const { toSync, toSkip } = analyzed;
     resultsRef.current.skipped = toSkip;
     totalRef.current = toSync.length;
 
@@ -468,7 +594,16 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
     setState((prev) => ({ ...prev, phase: "syncing" }));
 
     processNextSpecRef.current();
-  }, [specs]);
+  }, []);
+
+  /**
+   * Legacy entry point — kept for backwards compatibility. Equivalent to
+   * `runSync({ onlyQuarantined: false })`. New callers should prefer
+   * `analyze()` + `runSync()` so they can present a confirmation modal.
+   */
+  const startSync = useCallback(async () => {
+    await runSync({ onlyQuarantined: false });
+  }, [runSync]);
 
   const cancel = useCallback(() => {
     abortRef.current?.abort();
@@ -491,9 +626,30 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
     });
   }, []);
 
+  // Mirror state to the runner's SSE bus so external SSE consumers
+  // (manual-test sessions, automation scripts) can observe spec-sync
+  // progress without polling DOM text. Best-effort — silently ignores
+  // failures when invoke isn't available (e.g. browser dev mode).
+  // Backed by /ui-bridge/sdk/spec-sync/{status,stream} on the runner.
+  useEffect(() => {
+    invoke("push_spec_sync_state", {
+      state: {
+        phase: state.phase,
+        progress: state.progress,
+        results: state.results,
+        warnings: state.warnings,
+      },
+    }).catch(() => {});
+  }, [state]);
+
   return {
     state,
+    /** Backwards-compatible entry point — see `runSync` for the option-aware variant. */
     startSync,
+    /** Pre-flight: returns `{ toSync, toSkip, quarantinedStateIds }` without starting the loop. */
+    analyze,
+    /** Start the sync loop with explicit options (and optional precomputed analysis). */
+    runSync,
     cancel,
     reset,
     isSyncing: state.phase !== "idle" && state.phase !== "done",

@@ -34,6 +34,7 @@ pub mod page;
 pub mod request;
 pub mod routing;
 pub mod screenshots;
+pub mod sdk_spec_sync;
 pub mod state_machine;
 pub mod stubs;
 pub mod toasts;
@@ -331,6 +332,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
         all.extend_from_slice(screenshots::route_entries());
+        all.extend_from_slice(sdk_spec_sync::route_entries());
         all.extend_from_slice(state_machine::route_entries());
         all.extend_from_slice(stubs::route_entries());
         all.extend_from_slice(toasts::route_entries());
@@ -376,6 +378,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(network::routes())
         .merge(page::routes())
         .merge(screenshots::routes())
+        .merge(sdk_spec_sync::routes())
         .merge(state_machine::routes())
         .merge(stubs::routes())
         .merge(toasts::routes())

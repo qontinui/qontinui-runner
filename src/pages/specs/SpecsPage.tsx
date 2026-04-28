@@ -714,7 +714,8 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             isGeneratingWithAi={isGeneratingWithAi}
             onBuildWorkflow={() => handleBuildWorkflow()}
             onCompileStateMachine={handleCompileStateMachine}
-            onSyncAllSpecs={specSync.startSync}
+            onAnalyzeSpecs={specSync.analyze}
+            onRunSync={specSync.runSync}
             isSyncing={specSync.isSyncing}
             syncProgress={specSync.state.progress}
             onCancelSync={specSync.cancel}

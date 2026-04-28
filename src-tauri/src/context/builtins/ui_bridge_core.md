@@ -167,8 +167,13 @@ If not using the Python client:
 | GET    | `/ui-bridge/control/components`                     | List all components      |
 | POST   | `/ui-bridge/control/component/:id/action/:actionId` | Execute component action |
 | POST   | `/ui-bridge/control/find`                           | Find elements            |
+| POST   | `/ui-bridge/ai/find`                                | NL element lookup        |
 | GET    | `/ui-bridge/control/snapshot`                       | Get UI snapshot          |
 | GET    | `/health`                                           | Health check             |
+
+`/ui-bridge/ai/find` request body: `{ query: string, minConfidence?: number, includeHidden?: bool, context?: object, confidenceThreshold?: number }`.
+
+- `includeHidden` (bool, optional, default false): match elements regardless of visibility — useful when driving collapsed-sidebar nav.
 
 ### Choosing a wait / nav / batch primitive
 

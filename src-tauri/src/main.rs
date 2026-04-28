@@ -1202,6 +1202,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             spec_experimentation::commands::get_specs_needing_attention,
             spec_experimentation::commands::run_spec_mutation_test,
             spec_experimentation::commands::snapshot_current_spec,
+            commands::spec_sync_state::push_spec_sync_state,
             commands::state_explorer::clear_exploration_history,
             commands::state_explorer::get_exploration_analysis_prompt,
             commands::state_explorer::get_exploration_history,
@@ -1397,6 +1398,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(tokio::sync::Mutex::new(
             qontinui_runner_lib::accessibility::AccessibilityManager::default(),
         )) // Native cross-platform accessibility API
+        .manage(std::sync::Arc::new(
+            commands::spec_sync_state::SpecSyncStateBus::new(),
+        )) // P2 SSE remediation: useSpecSync progress mirror, consumed by /ui-bridge/sdk/spec-sync/{status,stream}
         // Tauri command handlers are registered via the central
         // `tauri::generate_handler![...]` block above. Each command module
         // (`commands/*.rs` and a few subsystem `commands.rs` files) ALSO

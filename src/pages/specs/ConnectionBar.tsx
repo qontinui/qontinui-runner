@@ -2,7 +2,7 @@
  * ConnectionBar — Connect to apps via UI Bridge, load bundled/file specs, build workflows
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import {
   Loader2,
@@ -20,9 +20,12 @@ import {
   Network,
   RefreshCw,
   Sparkles,
+  ShieldAlert,
 } from "lucide-react";
 import type { ConnectionState } from "./types";
 import { SpecDriftButton } from "./SpecDriftButton";
+import { SyncConfirmModal } from "./SyncConfirmModal";
+import type { AnalyzeResult, RunSyncOptions } from "@/hooks/useSpecSync";
 
 interface ConnectionBarProps {
   connection: ConnectionState;
@@ -45,7 +48,16 @@ interface ConnectionBarProps {
   onSaveToFile: () => void;
   onBuildWorkflow: () => void;
   onCompileStateMachine: () => void;
-  onSyncAllSpecs: () => void;
+  /**
+   * Analyze without starting the sync loop. Used to populate the
+   * pre-flight confirmation modal.
+   */
+  onAnalyzeSpecs: (options: RunSyncOptions) => Promise<AnalyzeResult>;
+  /**
+   * Start the sync loop. The pre-flight modal calls this with the
+   * AnalyzeResult it already computed so the hook does not re-analyze.
+   */
+  onRunSync: (options: RunSyncOptions, precomputed?: AnalyzeResult) => Promise<void>;
   isSyncing: boolean;
   syncProgress?: { current: number; total: number };
   onCancelSync?: () => void;
@@ -73,13 +85,71 @@ export function ConnectionBar({
   onSaveToFile,
   onBuildWorkflow,
   onCompileStateMachine,
-  onSyncAllSpecs,
+  onAnalyzeSpecs,
+  onRunSync,
   isSyncing,
   syncProgress,
   onCancelSync,
   onToggleEditMode,
 }: ConnectionBarProps) {
   const [url, setUrl] = useState(connection.url || "http://localhost:3001");
+
+  // Sync All Specs pre-flight state.
+  // `onlyQuarantined` defaults true — auto-disabled below if the most-recent
+  // quarantine record has no entries.
+  const [onlyQuarantined, setOnlyQuarantined] = useState(true);
+  const [hasQuarantined, setHasQuarantined] = useState(false);
+  const [pendingAnalyze, setPendingAnalyze] = useState<AnalyzeResult | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [modalOpen, setModalOpen] = useState(false);
+
+  // Background probe to enable/disable the toggle when the page first
+  // mounts. Does NOT block the sync button; if the probe fails, fall back
+  // to "no quarantined" (toggle disabled) — actual analyze happens on click.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await onAnalyzeSpecs({ onlyQuarantined: true });
+        if (!cancelled) {
+          const any = result.quarantinedStateIds.size > 0;
+          setHasQuarantined(any);
+          if (!any) setOnlyQuarantined(false);
+        }
+      } catch {
+        if (!cancelled) setHasQuarantined(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [onAnalyzeSpecs]);
+
+  const handleSyncClick = async () => {
+    if (analyzing) return;
+    setAnalyzing(true);
+    try {
+      const result = await onAnalyzeSpecs({ onlyQuarantined });
+      // Update the toggle's enabled-state from the freshest analyze pass.
+      setHasQuarantined(result.quarantinedStateIds.size > 0);
+      setPendingAnalyze(result);
+      setModalOpen(true);
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const handleConfirm = () => {
+    setModalOpen(false);
+    const precomputed = pendingAnalyze;
+    setPendingAnalyze(null);
+    void onRunSync({ onlyQuarantined }, precomputed ?? undefined);
+  };
+
+  const handleModalCancel = () => {
+    setModalOpen(false);
+    setPendingAnalyze(null);
+  };
 
   const { ref: bundledRef } = useUIElement({
     id: "specs-btn-bundled",
@@ -321,25 +391,62 @@ export function ConnectionBar({
             <span className="ml-1 text-[10px] opacity-75">(cancel)</span>
           </button>
         ) : (
-          <button
-            ref={syncRef}
-            onClick={onSyncAllSpecs}
-            disabled={isLoading || stats.totalSpecs === 0}
-            title={
-              "Re-runs the AI against every loaded spec whose structure looks stale " +
-              "(missing stateMachine section, or groups that don't line up with states) " +
-              "and merges the regenerated output back. Use this after editing groups to " +
-              "rebuild the state machine, or after bulk-adding assertions. Does not add " +
-              "new assertions for elements it finds in source — use Check Drift for that."
-            }
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
-            bg-teal-600 text-white shadow-xs shadow-teal-600/25
-            hover:bg-teal-700 disabled:opacity-50 transition-colors shrink-0"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-            Sync All Specs
-          </button>
+          <>
+            {/* "Sync only quarantined" toggle — defaults ON when there are
+                quarantined specs, otherwise disabled with a tooltip. */}
+            <button
+              id="specs-toggle-only-quarantined"
+              type="button"
+              role="switch"
+              aria-pressed={onlyQuarantined}
+              aria-label="Sync only quarantined specs"
+              onClick={() => hasQuarantined && setOnlyQuarantined((v) => !v)}
+              disabled={!hasQuarantined}
+              title={
+                hasQuarantined
+                  ? "When ON, only specs that touch a quarantined state are re-synced. Toggle OFF to force a full re-sync (e.g. after editing the AI prompt)."
+                  : "no quarantined specs"
+              }
+              className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
+              border transition-colors shrink-0 ${
+                onlyQuarantined && hasQuarantined
+                  ? "bg-amber-500/15 text-amber-400 border-amber-500/30"
+                  : "bg-white/5 text-muted-foreground border-white/10 hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed"
+              }`}
+            >
+              <ShieldAlert className="w-3.5 h-3.5" />
+              Only quarantined
+            </button>
+
+            <button
+              ref={syncRef}
+              onClick={() => void handleSyncClick()}
+              disabled={isLoading || stats.totalSpecs === 0 || analyzing}
+              title={
+                "Re-runs the AI against every loaded spec that is in the latest " +
+                "quarantine record (or missing its stateMachine section). Toggle " +
+                "'Only quarantined' off to force a full re-sync. A confirmation modal " +
+                "shows the count + estimated duration before any work starts."
+              }
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
+              bg-teal-600 text-white shadow-xs shadow-teal-600/25
+              hover:bg-teal-700 disabled:opacity-50 transition-colors shrink-0"
+            >
+              {analyzing ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="w-3.5 h-3.5" />
+              )}
+              {analyzing ? "Analyzing…" : "Sync All Specs"}
+            </button>
+          </>
         )}
+        <SyncConfirmModal
+          open={modalOpen}
+          toSync={pendingAnalyze?.toSync ?? []}
+          onConfirm={handleConfirm}
+          onCancel={handleModalCancel}
+        />
         <SpecDriftButton />
         <button
           ref={compileRef}
