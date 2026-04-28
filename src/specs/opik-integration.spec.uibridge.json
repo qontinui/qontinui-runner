@@ -30,7 +30,10 @@
           "assertionType": "visible",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "LLM Traces", "role": "heading" },
+            "criteria": {
+              "textContent": "LLM Traces",
+              "role": "heading"
+            },
             "label": "Page heading"
           },
           "expected": "Heading text 'LLM Traces' is visible at the top of the content area",
@@ -46,7 +49,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-connection-status']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-connection-status']"
+            },
             "label": "Opik connection status badge"
           },
           "expected": "Badge shows 'Connected' with green styling when Opik is reachable, or 'Disconnected' with red styling when unreachable",
@@ -62,7 +67,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "criteria": {
+              "selector": "[data-ui-element='trace-row']"
+            },
             "label": "Trace list row"
           },
           "expected": "Each row contains: workflow name (text), cost (dollar amount), tokens (formatted as 'N in / N out'), duration (human-readable), and quality badge (green >=0.7, yellow >=0.4, red <0.4)",
@@ -80,7 +87,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-cost-summary']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-cost-summary']"
+            },
             "label": "Cost summary cards"
           },
           "expected": "Four cards visible: Total Cost (dollar amount), Avg Cost/Trace (dollar amount), Total Tokens (formatted number), Trace Count (integer)",
@@ -105,7 +114,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-time-range']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-time-range']"
+            },
             "label": "Time range selector"
           },
           "expected": "Selector is visible with options: 1h, 6h, 24h, 7d, 30d",
@@ -140,7 +151,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-filters']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-filters']"
+            },
             "label": "Trace filter controls"
           },
           "source": "manual",
@@ -155,7 +168,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-list']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-list']"
+            },
             "label": "Trace list table"
           },
           "expected": "Table visible with column headers: Name, Status, Cost, Tokens, Duration, Feedback, Created",
@@ -171,7 +186,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-sync-status']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-sync-status']"
+            },
             "label": "Sync status indicator"
           },
           "expected": "Indicator shows one of: 'Synced' (idle), 'Syncing' (active push), 'Queued: N' (pending traces), or 'Retrying' (connection lost)",
@@ -187,7 +204,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-detail'] [role='tablist']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-detail'] [role='tablist']"
+            },
             "label": "Detail panel tab bar"
           },
           "expected": "Tab bar with tabs: Spans, Input/Output, Metadata, Feedback",
@@ -251,7 +270,9 @@
           "assertionType": "format",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-cost-summary']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-cost-summary']"
+            },
             "label": "Cost formatting"
           },
           "expected": "Dollar sign prefix, appropriate decimal precision as described",
@@ -268,7 +289,9 @@
           "assertionType": "format",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "criteria": {
+              "selector": "[data-ui-element='trace-row']"
+            },
             "label": "Token count formatting"
           },
           "expected": "Two numbers separated by ' in / ' with thousand-separator commas",
@@ -285,7 +308,9 @@
           "assertionType": "format",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "criteria": {
+              "selector": "[data-ui-element='trace-row']"
+            },
             "label": "Duration formatting"
           },
           "expected": "Duration text matches the appropriate tier format based on the actual value",
@@ -302,7 +327,9 @@
           "assertionType": "visual",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='span-tree']" },
+            "criteria": {
+              "selector": "[data-ui-element='span-tree']"
+            },
             "label": "Span timeline visualization"
           },
           "expected": "Each span row has a horizontal bar whose width is proportional to span duration / trace duration. Colors: LLM spans use getAccentColors('blue'), tool spans use getAccentColors('green'), general spans use getAccentColors('zinc'), guardrail spans use getAccentColors('amber')",
@@ -319,7 +346,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-json-viewer']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-json-viewer']"
+            },
             "label": "JSON viewer"
           },
           "expected": "Code block visible with syntax highlighting. Collapsed JSON shows a toggle button to expand. Expanded state persists until user collapses or selects a different span",
@@ -336,7 +365,9 @@
           "assertionType": "visual",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "criteria": {
+              "selector": "[data-ui-element='trace-row']"
+            },
             "label": "Model/provider badges"
           },
           "expected": "Badge visible with provider-specific color. Text shows model name (e.g., 'claude-sonnet-4-20250514')",
@@ -354,7 +385,9 @@
           "assertionType": "visual",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='trace-row'][data-status='error']" },
+            "criteria": {
+              "selector": "[data-ui-element='trace-row'][data-status='error']"
+            },
             "label": "Error trace styling"
           },
           "expected": "Row has a visible red left border (border-l-2 border-red-500 or similar). Error message text is truncated to one line with ellipsis. Full traceback available in the detail panel's Metadata tab",
@@ -380,7 +413,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-search']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-search']"
+            },
             "label": "Trace search"
           },
           "expected": "After pressing Enter, the trace list updates within 2 seconds showing only traces whose name or workflow contains the search string (case-insensitive substring match). Empty search restores the full list",
@@ -396,7 +431,9 @@
           "assertionType": "stateChange",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "criteria": {
+              "selector": "[data-ui-element='trace-row']"
+            },
             "label": "Trace row selection"
           },
           "expected": "Detail panel appears (or updates if already open) showing the selected trace's span tree in the Spans tab, with input/output, metadata, and feedback available via tabs. The selected row has a highlighted background (bg-primary/10 or similar)",
@@ -432,7 +469,9 @@
           "assertionType": "stateChange",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-time-range']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-time-range']"
+            },
             "label": "Time range change"
           },
           "expected": "Summary cards (Total Cost, Avg Cost, Tokens, Trace Count) update to reflect only traces within the selected window. Trace list filters accordingly. If the previously selected trace falls outside the new range, the detail panel closes",
@@ -467,7 +506,9 @@
           "assertionType": "sequence",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-add-feedback-btn']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-add-feedback-btn']"
+            },
             "label": "Add feedback flow"
           },
           "expected": "A form appears with: score name dropdown (relevance, accuracy, helpfulness, or custom text input), numeric value input (0.0-1.0), optional reason textarea, and Submit button. After submission, a new feedback score badge appears on the trace row and in the Feedback tab of the detail panel",
@@ -485,7 +526,9 @@
           "assertionType": "stateChange",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-list'] th" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-list'] th"
+            },
             "label": "Column sort"
           },
           "expected": "First click sorts ascending (up arrow indicator), second click sorts descending (down arrow), third click clears sort. Trace list reorders accordingly",
@@ -511,7 +554,9 @@
           "assertionType": "conditionalExists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "No traces yet" },
+            "criteria": {
+              "textContains": "No traces yet"
+            },
             "label": "Empty state message"
           },
           "expected": "Empty state message visible with text indicating traces will appear after running a workflow. No error indicators, no broken layout",
@@ -528,7 +573,9 @@
           "assertionType": "conditional",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-fallback-banner']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-fallback-banner']"
+            },
             "label": "Fallback banner"
           },
           "expected": "Yellow/amber banner visible with text 'Showing local data — Opik unavailable'. Dashboard displays data from runner's /analytics endpoints. No JavaScript errors in console. Connection status badge shows 'Disconnected' (red)",
@@ -545,7 +592,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-list']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-list']"
+            },
             "label": "Trace list pagination"
           },
           "expected": "Initially displays up to 50 traces. When user scrolls within 200px of the bottom, the next page loads automatically. A loading spinner appears briefly during fetch. Total trace count visible in summary card",
@@ -562,7 +611,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-list']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-list']"
+            },
             "label": "Auto-refresh"
           },
           "expected": "New traces appear in the list within 30 seconds of the background sync completing, without user action",
@@ -588,7 +639,9 @@
           "assertionType": "consistency",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-cost-summary']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-cost-summary']"
+            },
             "label": "Summary ↔ list consistency"
           },
           "expected": "The 'Trace Count' summary card value equals the total number of traces (which may exceed visible rows if paginated). Total Cost card equals the sum of individual trace costs",
@@ -605,7 +658,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='feedback-score-badge']" },
+            "criteria": {
+              "selector": "[data-ui-element='feedback-score-badge']"
+            },
             "label": "Bidirectional feedback sync"
           },
           "expected": "A feedback score added in the runner's Feedback tab appears in Opik's trace detail within 10 seconds. Conversely, a score added in Opik's UI appears in the runner's dashboard on the next auto-refresh cycle (≤30s)",
@@ -623,7 +678,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-list']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-list']"
+            },
             "label": "New trace latency"
           },
           "expected": "The most recent trace in the list corresponds to the just-completed workflow, with correct name, cost, and token data. Appears within 15 seconds (sync batch interval 10s + API latency)",
@@ -649,7 +706,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "LLM Traces" },
+            "criteria": {
+              "role": "button",
+              "textContent": "LLM Traces"
+            },
             "label": "Sidebar navigation item"
           },
           "expected": "Button labeled 'LLM Traces' is visible in the sidebar's OBSERVE section. Clicking it loads the Opik dashboard in the main content area",
@@ -665,7 +725,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-detail'] [role='tablist']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-detail'] [role='tablist']"
+            },
             "label": "Detail panel tab navigation"
           },
           "expected": "Clicking Spans, Input/Output, Metadata, or Feedback tabs switches the detail content while preserving the selected trace. The active tab has a distinct visual treatment (underline or background color)",
@@ -682,7 +744,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-detail']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-detail']"
+            },
             "label": "Detail panel dismiss"
           },
           "expected": "Pressing Escape or clicking a close/X button hides the detail panel. The trace list expands to fill the available width. No trace row remains highlighted",
@@ -708,7 +772,9 @@
           "assertionType": "style",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-dashboard']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-dashboard']"
+            },
             "label": "Dashboard theme compliance"
           },
           "expected": "Background uses bg-background (dark). Text uses text-foreground. Borders use border-border. No white backgrounds, no Opik purple branding, no light-theme leakage",
@@ -724,7 +790,9 @@
           "assertionType": "visual",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-connection-status']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-connection-status']"
+            },
             "label": "Connection status colors"
           },
           "expected": "Connected: getStatusColors('success') — green background/text. Disconnected: getStatusColors('error') — red. Syncing: getStatusColors('warning') — yellow/amber",
@@ -740,7 +808,9 @@
           "assertionType": "style",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-list']" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-list']"
+            },
             "label": "Row styling"
           },
           "expected": "Even rows transparent, odd rows bg-muted/10. Hover state: bg-muted/50. Selected row: bg-primary/10 with border-primary/30",
@@ -759,16 +829,22 @@
         "name": "Loading — Initial Data Fetch",
         "description": "The dashboard is loading. A health check to Opik determines connection status, and the initial trace list and summary stats are being fetched. Time range selector and search input are present but disabled until data arrives.",
         "elements": [
-          { "role": "heading", "accessibleName": "LLM Traces" },
-          { "role": "status", "accessibleName": "Loading indicator" }
+          {
+            "role": "status",
+            "accessibleName": "Loading indicator"
+          }
         ],
         "isInitial": true,
         "transitions": [
           {
             "id": "opik-loading-to-empty",
             "name": "No Traces Found",
-            "activateStates": ["opik-empty"],
-            "deactivateStates": ["opik-loading"],
+            "activateStates": [
+              "opik-empty"
+            ],
+            "deactivateStates": [
+              "opik-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -776,35 +852,56 @@
                 "target": {
                   "condition": "Opik responds with zero traces for the selected time range"
                 },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           },
           {
             "id": "opik-loading-to-trace-list",
             "name": "Traces Loaded",
-            "activateStates": ["opik-trace-list"],
-            "deactivateStates": ["opik-loading"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
+            "deactivateStates": [
+              "opik-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "Opik returns one or more traces" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "condition": "Opik returns one or more traces"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           },
           {
             "id": "opik-loading-to-fallback",
             "name": "Opik Unreachable — Fallback to Local Data",
-            "activateStates": ["opik-fallback"],
-            "deactivateStates": ["opik-loading"],
+            "activateStates": [
+              "opik-fallback"
+            ],
+            "deactivateStates": [
+              "opik-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "Opik health check fails or OPIK_BASE_URL unreachable" },
-                "waitAfter": { "type": "idle", "timeout": 10000 }
+                "target": {
+                  "condition": "Opik health check fails or OPIK_BASE_URL unreachable"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 10000
+                }
               }
             ]
           }
@@ -815,37 +912,60 @@
         "name": "Empty State — No Traces Yet",
         "description": "Opik is connected but no traces exist for the selected time range. An empty state message guides users that traces will appear after running a workflow. Summary cards show zero values. Controls (time range, search, filters) are enabled.",
         "elements": [
-          { "role": "heading", "accessibleName": "LLM Traces" },
-          { "role": "status", "accessibleName": "No traces yet" },
-          { "role": "combobox", "accessibleName": "Time range selector" }
+          {
+            "role": "status",
+            "accessibleName": "No traces yet"
+          },
+          {
+            "role": "combobox",
+            "accessibleName": "Time range selector"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "opik-empty-to-trace-list",
             "name": "Traces Arrive via Auto-Refresh",
-            "activateStates": ["opik-trace-list"],
-            "deactivateStates": ["opik-empty"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
+            "deactivateStates": [
+              "opik-empty"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "Auto-refresh detects new traces within 30 seconds" },
-                "waitAfter": { "type": "idle", "timeout": 30000 }
+                "target": {
+                  "condition": "Auto-refresh detects new traces within 30 seconds"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 30000
+                }
               }
             ]
           },
           {
             "id": "opik-empty-to-loading",
             "name": "Change Time Range",
-            "activateStates": ["opik-loading"],
-            "deactivateStates": ["opik-empty"],
+            "activateStates": [
+              "opik-loading"
+            ],
+            "deactivateStates": [
+              "opik-empty"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "selector": "[data-ui-element='opik-time-range']" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "selector": "[data-ui-element='opik-time-range']"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           }
@@ -856,73 +976,124 @@
         "name": "Trace List — Browsing Traces",
         "description": "The main dashboard view showing the trace list with summary cards (Total Cost, Avg Cost/Trace, Total Tokens, Trace Count), connection status badge (green/Connected), sync status indicator, and all filter controls enabled. Each trace row shows workflow name, cost, tokens (in/out), duration, quality badge, and model/provider badges. Infinite scroll loads more traces near the bottom.",
         "elements": [
-          { "role": "heading", "accessibleName": "LLM Traces" },
-          { "role": "table", "accessibleName": "Trace list" },
-          { "role": "status", "accessibleName": "Cost summary cards" },
-          { "role": "status", "accessibleName": "Connection status badge" },
-          { "role": "searchbox", "accessibleName": "Trace search input" },
-          { "role": "combobox", "accessibleName": "Time range selector" }
+          {
+            "role": "table",
+            "accessibleName": "Trace list"
+          },
+          {
+            "role": "status",
+            "accessibleName": "Cost summary cards"
+          },
+          {
+            "role": "status",
+            "accessibleName": "Connection status badge"
+          },
+          {
+            "role": "searchbox",
+            "accessibleName": "Trace search input"
+          },
+          {
+            "role": "combobox",
+            "accessibleName": "Time range selector"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "opik-trace-list-to-detail",
             "name": "Select a Trace",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "selector": "[data-ui-element='trace-row']" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "selector": "[data-ui-element='trace-row']"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
           {
             "id": "opik-trace-list-search",
             "name": "Search Traces",
-            "activateStates": ["opik-trace-list"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "type",
-                "target": { "selector": "[data-ui-element='opik-trace-search']" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "selector": "[data-ui-element='opik-trace-search']"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               },
               {
                 "action": "keypress",
-                "target": { "key": "Enter" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "key": "Enter"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
           {
             "id": "opik-trace-list-change-range",
             "name": "Change Time Range",
-            "activateStates": ["opik-loading"],
-            "deactivateStates": ["opik-trace-list"],
+            "activateStates": [
+              "opik-loading"
+            ],
+            "deactivateStates": [
+              "opik-trace-list"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "selector": "[data-ui-element='opik-time-range']" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "selector": "[data-ui-element='opik-time-range']"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           },
           {
             "id": "opik-trace-list-to-fallback",
             "name": "Opik Connection Lost",
-            "activateStates": ["opik-fallback"],
-            "deactivateStates": ["opik-trace-list"],
+            "activateStates": [
+              "opik-fallback"
+            ],
+            "deactivateStates": [
+              "opik-trace-list"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "Opik health check fails during auto-refresh" },
-                "waitAfter": { "type": "idle", "timeout": 10000 }
+                "target": {
+                  "condition": "Opik health check fails during auto-refresh"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 10000
+                }
               }
             ]
           }
@@ -933,80 +1104,129 @@
         "name": "Trace Detail — Span Tree & Metadata",
         "description": "A trace row is selected and the detail panel is open alongside the trace list. The panel shows tabs: Spans (Gantt-style timeline with hierarchical span tree), Input/Output (JSON viewer), Metadata (model, error info), and Feedback (score badges, Add Feedback button). Individual spans can be clicked for detail. The Open in Opik button is available when connected.",
         "elements": [
-          { "role": "tablist", "accessibleName": "Detail panel tabs" },
-          { "role": "tree", "accessibleName": "Span tree" },
-          { "role": "button", "accessibleName": "Add Feedback" },
-          { "role": "button", "accessibleName": "Open in Opik" }
+          {
+            "role": "tablist",
+            "accessibleName": "Detail panel tabs"
+          },
+          {
+            "role": "tree",
+            "accessibleName": "Span tree"
+          },
+          {
+            "role": "button",
+            "accessibleName": "Add Feedback"
+          },
+          {
+            "role": "button",
+            "accessibleName": "Open in Opik"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "opik-detail-switch-tab",
             "name": "Switch Detail Tab",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "selector": "[data-ui-element='opik-trace-detail'] [role='tab']" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "selector": "[data-ui-element='opik-trace-detail'] [role='tab']"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "opik-detail-select-span",
             "name": "Select a Span",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "selector": "[data-ui-element='span-row']" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "selector": "[data-ui-element='span-row']"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "opik-detail-add-feedback",
             "name": "Add Feedback Score",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "selector": "[data-ui-element='opik-add-feedback-btn']" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "selector": "[data-ui-element='opik-add-feedback-btn']"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "opik-detail-dismiss",
             "name": "Close Detail Panel",
-            "activateStates": ["opik-trace-list"],
-            "deactivateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
+            "deactivateStates": [
+              "opik-trace-detail"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "keypress",
-                "target": { "key": "Escape" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "key": "Escape"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "opik-detail-select-different-trace",
             "name": "Select a Different Trace",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "selector": "[data-ui-element='trace-row']" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "selector": "[data-ui-element='trace-row']"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -1017,38 +1237,62 @@
         "name": "Fallback Mode — Opik Unavailable",
         "description": "Opik is unreachable. The dashboard displays a yellow/amber fallback banner ('Showing local data — Opik unavailable'), connection status badge shows 'Disconnected' (red), and data is served from the runner's local /analytics endpoints. All dashboard functionality remains available with local data. The system periodically retries connecting to Opik.",
         "elements": [
-          { "role": "heading", "accessibleName": "LLM Traces" },
-          { "role": "alert", "accessibleName": "Fallback banner" },
-          { "role": "status", "accessibleName": "Disconnected status badge" },
-          { "role": "table", "accessibleName": "Trace list from local data" }
+          {
+            "role": "alert",
+            "accessibleName": "Fallback banner"
+          },
+          {
+            "role": "status",
+            "accessibleName": "Disconnected status badge"
+          },
+          {
+            "role": "table",
+            "accessibleName": "Trace list from local data"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "opik-fallback-to-trace-list",
             "name": "Opik Connection Restored",
-            "activateStates": ["opik-trace-list"],
-            "deactivateStates": ["opik-fallback"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
+            "deactivateStates": [
+              "opik-fallback"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "Opik health check succeeds on retry" },
-                "waitAfter": { "type": "idle", "timeout": 10000 }
+                "target": {
+                  "condition": "Opik health check succeeds on retry"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 10000
+                }
               }
             ]
           },
           {
             "id": "opik-fallback-to-detail",
             "name": "Select a Trace (Local Data)",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "selector": "[data-ui-element='trace-row']" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "selector": "[data-ui-element='trace-row']"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }

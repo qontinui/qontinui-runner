@@ -4,7 +4,13 @@
   "metadata": {
     "component": "WrappersLibraryPage",
     "pageUrl": "wrappers",
-    "tags": ["wrappers", "extensions", "registry", "install", "library"]
+    "tags": [
+      "wrappers",
+      "extensions",
+      "registry",
+      "install",
+      "library"
+    ]
   },
   "groups": [
     {
@@ -21,7 +27,11 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataAttributes": { "page-id": "wrappers" } },
+            "criteria": {
+              "dataAttributes": {
+                "page-id": "wrappers"
+              }
+            },
             "label": "Wrappers page container"
           },
           "assertionType": "exists",
@@ -36,7 +46,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers heading"
           },
           "assertionType": "visible",
@@ -51,7 +64,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Install wrapper extensions to give the runner" },
+            "criteria": {
+              "textContains": "Install wrapper extensions to give the runner"
+            },
             "label": "Page description paragraph"
           },
           "assertionType": "visible",
@@ -75,7 +90,10 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers heading (visual neighbor of the icon tile)"
           },
           "assertionType": "semantic",
@@ -100,7 +118,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Installed"
+            },
             "label": "Installed tab button"
           },
           "assertionType": "visible",
@@ -115,7 +136,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Browse" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Browse"
+            },
             "label": "Browse tab button"
           },
           "assertionType": "visible",
@@ -130,7 +154,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Browse" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Browse"
+            },
             "label": "Browse tab button"
           },
           "assertionType": "behavior",
@@ -145,7 +172,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Installed"
+            },
             "label": "Installed tab button"
           },
           "assertionType": "behavior",
@@ -170,7 +200,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "No wrappers installed yet" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "No wrappers installed yet"
+            },
             "label": "Empty-state heading"
           },
           "assertionType": "visible",
@@ -186,7 +219,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Switch to the Browse tab to discover wrappers" },
+            "criteria": {
+              "textContains": "Switch to the Browse tab to discover wrappers"
+            },
             "label": "Empty-state hint paragraph"
           },
           "assertionType": "visible",
@@ -211,7 +246,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Loading installed wrappers" },
+            "criteria": {
+              "textContains": "Loading installed wrappers"
+            },
             "label": "Installed loading message"
           },
           "assertionType": "visible",
@@ -227,7 +264,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Failed to load installed wrappers" },
+            "criteria": {
+              "textContains": "Failed to load installed wrappers"
+            },
             "label": "Installed-tab error card"
           },
           "assertionType": "visible",
@@ -243,7 +282,10 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Retry" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Retry"
+            },
             "label": "Retry button"
           },
           "assertionType": "behavior",
@@ -268,7 +310,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers page (count check anchor)"
           },
           "assertionType": "semantic",
@@ -284,7 +329,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers page (card content anchor)"
           },
           "assertionType": "semantic",
@@ -300,7 +348,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers page (badge anchor)"
           },
           "assertionType": "semantic",
@@ -316,7 +367,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "actions" },
+            "criteria": {
+              "textContains": "actions"
+            },
             "label": "Action count text"
           },
           "assertionType": "exists",
@@ -332,7 +385,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "accessibleName": "Wrapper actions" },
+            "criteria": {
+              "accessibleName": "Wrapper actions"
+            },
             "label": "Wrapper actions menu trigger"
           },
           "assertionType": "behavior",
@@ -348,7 +403,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Open" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Open"
+            },
             "label": "Open wrapper button"
           },
           "assertionType": "behavior",
@@ -364,7 +422,10 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers page (highlight check anchor)"
           },
           "assertionType": "behavior",
@@ -425,7 +486,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Refresh" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Refresh"
+            },
             "label": "Refresh registry button"
           },
           "assertionType": "behavior",
@@ -450,7 +514,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Loading registry" },
+            "criteria": {
+              "textContains": "Loading registry"
+            },
             "label": "Registry loading message"
           },
           "assertionType": "visible",
@@ -466,7 +532,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "reach the registry" },
+            "criteria": {
+              "textContains": "reach the registry"
+            },
             "label": "Registry error card"
           },
           "assertionType": "visible",
@@ -482,7 +550,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "registry is empty" },
+            "criteria": {
+              "textContains": "registry is empty"
+            },
             "label": "Empty registry message"
           },
           "assertionType": "visible",
@@ -507,7 +577,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "li" },
+            "criteria": {
+              "tagName": "li"
+            },
             "label": "Registry entry list item"
           },
           "assertionType": "semantic",
@@ -523,7 +595,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "li" },
+            "criteria": {
+              "tagName": "li"
+            },
             "label": "Registry entry"
           },
           "assertionType": "semantic",
@@ -539,7 +613,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "verified" },
+            "criteria": {
+              "textContent": "verified"
+            },
             "label": "Verified badge"
           },
           "assertionType": "behavior",
@@ -555,7 +631,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "li" },
+            "criteria": {
+              "tagName": "li"
+            },
             "label": "Registry entry"
           },
           "assertionType": "semantic",
@@ -571,7 +649,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Install" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Install"
+            },
             "label": "Install registry entry button"
           },
           "assertionType": "behavior",
@@ -587,7 +668,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Installed"
+            },
             "label": "Already-installed indicator"
           },
           "assertionType": "behavior",
@@ -603,7 +687,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "repo" },
+            "criteria": {
+              "textContent": "repo"
+            },
             "label": "Repo external link"
           },
           "assertionType": "behavior",
@@ -628,12 +714,18 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers h1"
           },
           "assertionType": "cssPropertyInSet",
           "propertyName": "font-size",
-          "expected": ["24px", "1.5rem"],
+          "expected": [
+            "24px",
+            "1.5rem"
+          ],
           "source": "ai-generated",
           "reviewed": false,
           "enabled": true
@@ -671,7 +763,10 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Installed"
+            },
             "label": "Active Installed tab"
           },
           "assertionType": "semantic",
@@ -687,7 +782,10 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Install" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Install"
+            },
             "label": "Install button"
           },
           "assertionType": "semantic",
@@ -712,7 +810,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers heading (anchor for layout assertion)"
           },
           "assertionType": "semantic",
@@ -727,7 +828,10 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers page (grid anchor)"
           },
           "assertionType": "semantic",
@@ -752,7 +856,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers page (correctness anchor)"
           },
           "assertionType": "semantic",
@@ -768,7 +875,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Installed" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Installed"
+            },
             "label": "Installed tab button (count anchor)"
           },
           "assertionType": "semantic",
@@ -784,7 +894,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Wrappers" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Wrappers"
+            },
             "label": "Wrappers page (status anchor)"
           },
           "assertionType": "semantic",
@@ -800,7 +913,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "button", "textContent": "Browse" },
+            "criteria": {
+              "tagName": "button",
+              "textContent": "Browse"
+            },
             "label": "Browse tab button (cross-ref anchor)"
           },
           "assertionType": "semantic",
@@ -819,9 +935,15 @@
         "name": "Installed Tab",
         "description": "Default view. The Installed tab is active and the page renders either the empty-state card, the loading spinner, the error card, or the wrapper card grid — whichever matches the backend state.",
         "elements": [
-          { "dataAttributes": { "page-id": "wrappers" } },
-          { "role": "heading", "textContent": "Wrappers" },
-          { "tagName": "button", "textContent": "Installed" }
+          {
+            "dataAttributes": {
+              "page-id": "wrappers"
+            }
+          },
+          {
+            "tagName": "button",
+            "textContent": "Installed"
+          }
         ],
         "isInitial": true,
         "transitions": [
@@ -829,14 +951,24 @@
             "id": "installed-to-browse",
             "name": "Switch to Browse tab",
             "description": "Click the Browse tab button. The content area swaps to the Browse view (search + registry list).",
-            "activateStates": ["wrappers-browse-tab"],
-            "deactivateStates": ["wrappers-installed-tab"],
+            "activateStates": [
+              "wrappers-browse-tab"
+            ],
+            "deactivateStates": [
+              "wrappers-installed-tab"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "tagName": "button", "textContent": "Browse" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "tagName": "button",
+                  "textContent": "Browse"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           }
@@ -847,23 +979,38 @@
         "name": "Browse Tab",
         "description": "The Browse tab is active. The search input + registry list are visible.",
         "elements": [
-          { "dataAttributes": { "page-id": "wrappers" } },
-          { "role": "heading", "textContent": "Wrappers" },
-          { "placeholder": "Search wrappers by name, category, or author" }
+          {
+            "dataAttributes": {
+              "page-id": "wrappers"
+            }
+          },
+          {
+            "placeholder": "Search wrappers by name, category, or author"
+          }
         ],
         "transitions": [
           {
             "id": "browse-to-installed",
             "name": "Switch to Installed tab",
             "description": "Click the Installed tab button to return to the local-wrappers grid.",
-            "activateStates": ["wrappers-installed-tab"],
-            "deactivateStates": ["wrappers-browse-tab"],
+            "activateStates": [
+              "wrappers-installed-tab"
+            ],
+            "deactivateStates": [
+              "wrappers-browse-tab"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "tagName": "button", "textContent": "Installed" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "tagName": "button",
+                  "textContent": "Installed"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           }

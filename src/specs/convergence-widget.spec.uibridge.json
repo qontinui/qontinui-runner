@@ -472,8 +472,12 @@
           {
             "id": "hidden-to-single-iteration",
             "name": "First iteration-metrics event arrives for the current task run",
-            "activateStates": ["single-iteration"],
-            "deactivateStates": ["hidden"],
+            "activateStates": [
+              "single-iteration"
+            ],
+            "deactivateStates": [
+              "hidden"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -483,38 +487,58 @@
         "id": "single-iteration",
         "name": "Single Iteration — First Data Point",
         "description": "Exactly one iteration-metrics event has been received. The widget is visible with the Convergence heading, a single bar in the chart, the iteration number and failing count in the summary, and pass/fail counts. No trend indicator or delta text is shown because there is no previous iteration to compare against.",
-        "elements": [{ "textContent": "Convergence" }, { "textContent": "Iteration 1" }],
+        "elements": [
+          {
+            "textContent": "Iteration 1"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "single-to-improving",
             "name": "Second iteration arrives with fewer failures than the first",
-            "activateStates": ["improving"],
-            "deactivateStates": ["single-iteration"],
+            "activateStates": [
+              "improving"
+            ],
+            "deactivateStates": [
+              "single-iteration"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "single-to-stalled",
             "name": "Second iteration arrives with same failure count or isStalled flag",
-            "activateStates": ["stalled"],
-            "deactivateStates": ["single-iteration"],
+            "activateStates": [
+              "stalled"
+            ],
+            "deactivateStates": [
+              "single-iteration"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "single-to-regressing",
             "name": "Second iteration arrives with more failures than the first",
-            "activateStates": ["regressing"],
-            "deactivateStates": ["single-iteration"],
+            "activateStates": [
+              "regressing"
+            ],
+            "deactivateStates": [
+              "single-iteration"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "single-to-hidden",
             "name": "Active task run changes to a run with no metrics yet",
-            "activateStates": ["hidden"],
-            "deactivateStates": ["single-iteration"],
+            "activateStates": [
+              "hidden"
+            ],
+            "deactivateStates": [
+              "single-iteration"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -524,30 +548,46 @@
         "id": "improving",
         "name": "Improving — Failures Decreasing",
         "description": "Two or more iterations received, and the latest iteration has fewer failed steps than the previous. The trend indicator shows 'Improving' with a green TrendingDown arrow. The summary includes a delta line (e.g., 'down 2 from 5'). The bar chart shows all received iterations with color-coded bars.",
-        "elements": [{ "textContent": "Convergence" }, { "textContent": "Improving" }],
+        "elements": [
+          {
+            "textContent": "Improving"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "improving-to-stalled",
             "name": "Next iteration arrives with same failure count or isStalled flag",
-            "activateStates": ["stalled"],
-            "deactivateStates": ["improving"],
+            "activateStates": [
+              "stalled"
+            ],
+            "deactivateStates": [
+              "improving"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "improving-to-regressing",
             "name": "Next iteration arrives with more failures",
-            "activateStates": ["regressing"],
-            "deactivateStates": ["improving"],
+            "activateStates": [
+              "regressing"
+            ],
+            "deactivateStates": [
+              "improving"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "improving-to-hidden",
             "name": "Active task run changes to a run with no metrics yet",
-            "activateStates": ["hidden"],
-            "deactivateStates": ["improving"],
+            "activateStates": [
+              "hidden"
+            ],
+            "deactivateStates": [
+              "improving"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -557,30 +597,46 @@
         "id": "stalled",
         "name": "Stalled — No Progress",
         "description": "Two or more iterations received, and the latest iteration has the same failure count as the previous or the isStalled flag is true. The trend indicator shows 'Stalled' with an amber Minus icon. An amber AlertTriangle icon appears next to the heading when isStalled is true. The summary shows the current counts without a delta or with a zero delta.",
-        "elements": [{ "textContent": "Convergence" }, { "textContent": "Stalled" }],
+        "elements": [
+          {
+            "textContent": "Stalled"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "stalled-to-improving",
             "name": "Next iteration arrives with fewer failures",
-            "activateStates": ["improving"],
-            "deactivateStates": ["stalled"],
+            "activateStates": [
+              "improving"
+            ],
+            "deactivateStates": [
+              "stalled"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "stalled-to-regressing",
             "name": "Next iteration arrives with more failures",
-            "activateStates": ["regressing"],
-            "deactivateStates": ["stalled"],
+            "activateStates": [
+              "regressing"
+            ],
+            "deactivateStates": [
+              "stalled"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "stalled-to-hidden",
             "name": "Active task run changes to a run with no metrics yet",
-            "activateStates": ["hidden"],
-            "deactivateStates": ["stalled"],
+            "activateStates": [
+              "hidden"
+            ],
+            "deactivateStates": [
+              "stalled"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -590,30 +646,46 @@
         "id": "regressing",
         "name": "Regressing — Failures Increasing",
         "description": "Two or more iterations received, and the latest iteration has more failed steps than the previous. The trend indicator shows 'Regressing' with a red TrendingUp arrow. The summary includes a delta line (e.g., 'up 1 from 3'). Red bars appear in the chart for regressing iterations.",
-        "elements": [{ "textContent": "Convergence" }, { "textContent": "Regressing" }],
+        "elements": [
+          {
+            "textContent": "Regressing"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "regressing-to-improving",
             "name": "Next iteration arrives with fewer failures",
-            "activateStates": ["improving"],
-            "deactivateStates": ["regressing"],
+            "activateStates": [
+              "improving"
+            ],
+            "deactivateStates": [
+              "regressing"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "regressing-to-stalled",
             "name": "Next iteration arrives with same failure count or isStalled flag",
-            "activateStates": ["stalled"],
-            "deactivateStates": ["regressing"],
+            "activateStates": [
+              "stalled"
+            ],
+            "deactivateStates": [
+              "regressing"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "regressing-to-hidden",
             "name": "Active task run changes to a run with no metrics yet",
-            "activateStates": ["hidden"],
-            "deactivateStates": ["regressing"],
+            "activateStates": [
+              "hidden"
+            ],
+            "deactivateStates": [
+              "regressing"
+            ],
             "staysVisible": false,
             "process": []
           }

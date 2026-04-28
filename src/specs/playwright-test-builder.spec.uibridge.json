@@ -218,15 +218,23 @@
         "id": "pw-list-empty",
         "name": "Empty Library — No Playwright Tests Exist",
         "description": "The page loads with no saved Playwright tests. The left panel list is empty. The right panel editor shows a placeholder state inviting the user to create their first test.",
-        "elements": [{ "textContent": "Playwright" }, { "role": "list" }],
+        "elements": [
+          {
+            "role": "list"
+          }
+        ],
         "isInitial": true,
         "transitions": [
           {
             "id": "empty-to-editing-new",
             "name": "Create new test",
             "description": "User initiates creation of a new Playwright test, opening a blank editor with name input and code editor",
-            "activateStates": ["pw-editing-new"],
-            "deactivateStates": ["pw-list-empty"],
+            "activateStates": [
+              "pw-editing-new"
+            ],
+            "deactivateStates": [
+              "pw-list-empty"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -236,14 +244,25 @@
         "id": "pw-list-populated",
         "name": "Populated — Test List with Editor Idle",
         "description": "One or more saved Playwright tests exist and are displayed in the left panel list. No test is actively selected for editing. The search box is available for filtering.",
-        "elements": [{ "textContent": "Playwright" }, { "role": "list" }, { "role": "searchbox" }],
+        "elements": [
+          {
+            "role": "list"
+          },
+          {
+            "role": "searchbox"
+          }
+        ],
         "transitions": [
           {
             "id": "populated-to-editing-existing",
             "name": "Select a test to edit",
             "description": "User clicks a test in the list to load it into the right-panel code editor for viewing or editing",
-            "activateStates": ["pw-editing-existing"],
-            "deactivateStates": ["pw-list-populated"],
+            "activateStates": [
+              "pw-editing-existing"
+            ],
+            "deactivateStates": [
+              "pw-list-populated"
+            ],
             "staysVisible": false,
             "process": []
           },
@@ -251,8 +270,12 @@
             "id": "populated-to-editing-new",
             "name": "Create new test",
             "description": "User initiates creation of a new Playwright test, clearing the editor to a blank form",
-            "activateStates": ["pw-editing-new"],
-            "deactivateStates": ["pw-list-populated"],
+            "activateStates": [
+              "pw-editing-new"
+            ],
+            "deactivateStates": [
+              "pw-list-populated"
+            ],
             "staysVisible": false,
             "process": []
           },
@@ -260,14 +283,23 @@
             "id": "populated-to-search-active",
             "name": "Enter search query",
             "description": "User types in the search box to filter the test list by name",
-            "activateStates": ["pw-search-active"],
-            "deactivateStates": ["pw-list-populated"],
+            "activateStates": [
+              "pw-search-active"
+            ],
+            "deactivateStates": [
+              "pw-list-populated"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "type",
-                "target": { "role": "searchbox" },
-                "params": { "text": "login", "clear": true }
+                "target": {
+                  "role": "searchbox"
+                },
+                "params": {
+                  "text": "login",
+                  "clear": true
+                }
               }
             ]
           }
@@ -277,20 +309,33 @@
         "id": "pw-search-active",
         "name": "Search Active — Filtering Test List",
         "description": "A search query has been entered in the search box and the left-panel list is filtered to show only tests matching the query.",
-        "elements": [{ "textContent": "Playwright" }, { "role": "searchbox" }],
+        "elements": [
+          {
+            "role": "searchbox"
+          }
+        ],
         "transitions": [
           {
             "id": "search-to-populated",
             "name": "Clear search query",
             "description": "User clears the search input to return to the full unfiltered test list",
-            "activateStates": ["pw-list-populated"],
-            "deactivateStates": ["pw-search-active"],
+            "activateStates": [
+              "pw-list-populated"
+            ],
+            "deactivateStates": [
+              "pw-search-active"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "type",
-                "target": { "role": "searchbox" },
-                "params": { "text": "", "clear": true }
+                "target": {
+                  "role": "searchbox"
+                },
+                "params": {
+                  "text": "",
+                  "clear": true
+                }
               }
             ]
           },
@@ -298,8 +343,12 @@
             "id": "search-to-editing-existing",
             "name": "Select a filtered test",
             "description": "User clicks a test from the filtered search results to load it into the editor",
-            "activateStates": ["pw-editing-existing"],
-            "deactivateStates": ["pw-search-active"],
+            "activateStates": [
+              "pw-editing-existing"
+            ],
+            "deactivateStates": [
+              "pw-search-active"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -310,23 +359,37 @@
         "name": "Editing New — Creating a Playwright Test",
         "description": "The editor is active with a blank test form. Users can enter a test name, write TypeScript test code in the code editor, and save. The Save button is available but Delete is not.",
         "elements": [
-          { "textContent": "Playwright" },
-          { "role": "textbox" },
-          { "role": "button", "textContent": "Save" }
+          {
+            "role": "textbox"
+          },
+          {
+            "role": "button",
+            "textContent": "Save"
+          }
         ],
         "transitions": [
           {
             "id": "editing-new-to-editing-existing",
             "name": "Save new test",
             "description": "User clicks Save to persist the new test to the library, transitioning to editing-existing with the newly saved test loaded",
-            "activateStates": ["pw-editing-existing"],
-            "deactivateStates": ["pw-editing-new"],
+            "activateStates": [
+              "pw-editing-existing"
+            ],
+            "deactivateStates": [
+              "pw-editing-new"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Save" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Save"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
@@ -334,8 +397,12 @@
             "id": "editing-new-to-populated",
             "name": "Cancel or select existing test",
             "description": "User clicks a different test in the list, discarding the unsaved new test",
-            "activateStates": ["pw-list-populated"],
-            "deactivateStates": ["pw-editing-new"],
+            "activateStates": [
+              "pw-list-populated"
+            ],
+            "deactivateStates": [
+              "pw-editing-new"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -346,25 +413,43 @@
         "name": "Editing Existing — Modifying a Saved Test",
         "description": "A saved Playwright test is loaded in the editor. The name field and code editor are populated with the test's current values. Save, Delete, and Run buttons are available.",
         "elements": [
-          { "textContent": "Playwright" },
-          { "role": "textbox" },
-          { "role": "button", "textContent": "Save" },
-          { "role": "button", "textContent": "Delete" },
-          { "role": "button", "textContent": "Run" }
+          {
+            "role": "textbox"
+          },
+          {
+            "role": "button",
+            "textContent": "Save"
+          },
+          {
+            "role": "button",
+            "textContent": "Delete"
+          },
+          {
+            "role": "button",
+            "textContent": "Run"
+          }
         ],
         "transitions": [
           {
             "id": "editing-existing-save",
             "name": "Save changes",
             "description": "User clicks Save to persist modifications to the existing test",
-            "activateStates": ["pw-editing-existing"],
+            "activateStates": [
+              "pw-editing-existing"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Save" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Save"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
@@ -372,14 +457,24 @@
             "id": "editing-existing-to-running",
             "name": "Run test",
             "description": "User clicks the Run button to execute the Playwright test and see results",
-            "activateStates": ["pw-test-running"],
-            "deactivateStates": ["pw-editing-existing"],
+            "activateStates": [
+              "pw-test-running"
+            ],
+            "deactivateStates": [
+              "pw-editing-existing"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Run" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Run"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -387,14 +482,22 @@
             "id": "editing-existing-to-confirm-delete",
             "name": "Delete test",
             "description": "User clicks the Delete button to initiate deletion of the current test",
-            "activateStates": ["pw-confirm-delete"],
+            "activateStates": [
+              "pw-confirm-delete"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Delete" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Delete"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
@@ -402,8 +505,12 @@
             "id": "editing-existing-to-editing-new",
             "name": "Create new test while editing",
             "description": "User initiates creation of a new test, clearing the editor",
-            "activateStates": ["pw-editing-new"],
-            "deactivateStates": ["pw-editing-existing"],
+            "activateStates": [
+              "pw-editing-new"
+            ],
+            "deactivateStates": [
+              "pw-editing-existing"
+            ],
             "staysVisible": false,
             "process": []
           },
@@ -411,7 +518,9 @@
             "id": "editing-existing-to-another",
             "name": "Select a different test",
             "description": "User clicks another test in the list to switch to editing that test instead",
-            "activateStates": ["pw-editing-existing"],
+            "activateStates": [
+              "pw-editing-existing"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": []
@@ -423,17 +532,24 @@
         "name": "Test Running — Executing Playwright Test",
         "description": "A Playwright test is currently executing. The results area shows execution progress. The editor remains visible with the test code.",
         "elements": [
-          { "textContent": "Playwright" },
-          { "role": "textbox" },
-          { "textContent": "Result" }
+          {
+            "role": "textbox"
+          },
+          {
+            "textContent": "Result"
+          }
         ],
         "transitions": [
           {
             "id": "running-to-results",
             "name": "Test execution completes",
             "description": "The test finishes executing and results (pass/fail, errors, screenshots) are displayed",
-            "activateStates": ["pw-test-results"],
-            "deactivateStates": ["pw-test-running"],
+            "activateStates": [
+              "pw-test-results"
+            ],
+            "deactivateStates": [
+              "pw-test-running"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -444,24 +560,40 @@
         "name": "Test Results — Viewing Execution Results",
         "description": "Test execution has completed and results are displayed showing pass/fail status, assertion error messages, and failure screenshots. The user can edit the test and run again.",
         "elements": [
-          { "textContent": "Playwright" },
-          { "role": "textbox" },
-          { "textContent": "Result" },
-          { "role": "button", "textContent": "Run" }
+          {
+            "role": "textbox"
+          },
+          {
+            "textContent": "Result"
+          },
+          {
+            "role": "button",
+            "textContent": "Run"
+          }
         ],
         "transitions": [
           {
             "id": "results-to-running",
             "name": "Re-run test",
             "description": "User clicks Run again to re-execute the test after making changes",
-            "activateStates": ["pw-test-running"],
-            "deactivateStates": ["pw-test-results"],
+            "activateStates": [
+              "pw-test-running"
+            ],
+            "deactivateStates": [
+              "pw-test-results"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Run" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Run"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -469,8 +601,12 @@
             "id": "results-to-editing-existing",
             "name": "Return to editing",
             "description": "User dismisses results and returns to editing the test code",
-            "activateStates": ["pw-editing-existing"],
-            "deactivateStates": ["pw-test-results"],
+            "activateStates": [
+              "pw-editing-existing"
+            ],
+            "deactivateStates": [
+              "pw-test-results"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -480,14 +616,23 @@
         "id": "pw-confirm-delete",
         "name": "Confirm Delete — Deletion Confirmation Dialog",
         "description": "A confirmation dialog is displayed asking the user to confirm deletion of the selected Playwright test.",
-        "elements": [{ "role": "dialog" }],
+        "elements": [
+          {
+            "role": "dialog"
+          }
+        ],
         "transitions": [
           {
             "id": "confirm-delete-to-populated",
             "name": "Confirm deletion",
             "description": "User confirms the deletion, removing the test from the library and returning to the populated list view",
-            "activateStates": ["pw-list-populated"],
-            "deactivateStates": ["pw-confirm-delete", "pw-editing-existing"],
+            "activateStates": [
+              "pw-list-populated"
+            ],
+            "deactivateStates": [
+              "pw-confirm-delete",
+              "pw-editing-existing"
+            ],
             "staysVisible": false,
             "process": []
           },
@@ -495,8 +640,12 @@
             "id": "confirm-delete-cancel",
             "name": "Cancel deletion",
             "description": "User cancels the deletion dialog, returning to the editing state with the test still intact",
-            "activateStates": ["pw-editing-existing"],
-            "deactivateStates": ["pw-confirm-delete"],
+            "activateStates": [
+              "pw-editing-existing"
+            ],
+            "deactivateStates": [
+              "pw-confirm-delete"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -510,7 +659,13 @@
     "createdAt": "2026-03-05T00:00:00.000Z",
     "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/build/playwright-tests",
-    "tags": ["playwright", "test-builder", "verification", "browser-testing", "library-asset"],
+    "tags": [
+      "playwright",
+      "test-builder",
+      "verification",
+      "browser-testing",
+      "library-asset"
+    ],
     "specType": "semantic"
   }
 }
