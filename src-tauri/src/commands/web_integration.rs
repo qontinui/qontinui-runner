@@ -118,6 +118,9 @@ pub struct GetWebIntegrationStatusResponse {
     pub runner_id: Option<String>,
     pub last_heartbeat_at: Option<String>,
     pub registration_error: Option<String>,
+    /// Whether the unified runner WebSocket is currently connected
+    /// (post-handshake). Updated by `crate::mcp::backend_relay`.
+    pub ws_connected: bool,
 }
 
 #[tauri::command]
@@ -127,13 +130,14 @@ pub async fn get_web_integration_status(
     let persisted = settings::load_settings().web_integration.clone();
     let sm_state_opt = integration.server_mode().read().await.clone();
 
-    let (runner_id, last_heartbeat_at, registration_error) = match sm_state_opt {
+    let (runner_id, last_heartbeat_at, registration_error, ws_connected) = match sm_state_opt {
         Some(sm) => (
             sm.runner_id().await.map(|id| id.to_string()),
             sm.last_heartbeat_at().await,
             sm.registration_error().await,
+            sm.is_ws_connected(),
         ),
-        None => (None, None, None),
+        None => (None, None, None, false),
     };
 
     Ok(GetWebIntegrationStatusResponse {
@@ -143,6 +147,7 @@ pub async fn get_web_integration_status(
         runner_id,
         last_heartbeat_at,
         registration_error,
+        ws_connected,
     })
 }
 
@@ -198,19 +203,17 @@ pub async fn apply_web_integration_settings<R: Runtime>(
         *guard = new_state_opt.clone();
     }
 
-    // Spawn background tasks on the new state (if any).
-    if let Some(new_state) = new_state_opt {
-        let restate_enabled = settings::load_settings().restate.enabled;
-        let ui_error_state = app_state.ui_error.clone();
-        let crash_dump_state = app_state.crash_dumps.clone();
-        crate::server_mode::spawn_background_tasks(
-            new_state,
-            restate_enabled,
-            ui_error_state,
-            crash_dump_state,
-        );
+    // The WS relay (see `crate::mcp::backend_relay`) is the single outbound
+    // channel. It is launched once at startup from `mcp_api::start_server`,
+    // reads `WebIntegrationSettings` (and the new `ServerModeState` we just
+    // installed) on every reconnect attempt, and observes `shutdown()` on
+    // the old state to drop the previous connection cleanly. Kick it here
+    // so any in-progress backoff sleep is interrupted and the relay
+    // immediately reconnects with the fresh settings + token.
+    if new_state_opt.is_some() {
+        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
         info!(
-            "Web-integration hot-reload: background tasks spawned (backend={})",
+            "Web-integration hot-reload: WS relay kicked to pick up new settings (backend={})",
             normalized.backend_url
         );
     } else {

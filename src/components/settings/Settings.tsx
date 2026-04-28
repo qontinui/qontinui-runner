@@ -8,7 +8,6 @@
 import { useState, useEffect } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
-import { AuthConnectionSettings } from "./AuthConnectionSettings";
 import { GeneralSettings } from "./GeneralSettings";
 import { StorageSettings } from "./StorageSettings";
 import { AdvancedSettings } from "./AdvancedSettings";
@@ -21,7 +20,6 @@ import { PlaywrightSettings } from "./PlaywrightSettings";
 import { SelfHealingSettings } from "./SelfHealingSettings";
 import { WorldStateVerifierSettings } from "./WorldStateVerifierSettings";
 import { MobileSettings } from "./MobileSettings";
-import { CloudRelaySettings } from "./CloudRelaySettings";
 import { WebIntegrationSettings } from "./WebIntegrationSettings";
 import { LogSourcesSettings } from "./LogSourcesSettings";
 import { McpSettings } from "./McpSettings";
@@ -31,40 +29,23 @@ import { NotificationSettings } from "./NotificationSettings";
 import { OtelSettings } from "./OtelSettings";
 import { ContainerSettings } from "./ContainerSettings";
 import { SecuritySettings } from "./SecuritySettings";
-import type { Project, ConnectionInfo } from "../../types/auth";
-
-interface WebSocketState {
-  connected: boolean;
-  connecting: boolean;
-  error: string | null;
-  connectionInfo: ConnectionInfo | null;
-  connect: () => Promise<void>;
-  disconnect: () => Promise<void>;
-}
 
 interface SettingsProps {
   /** Default tab to open. If provided, overrides instanceStorage persistence. */
   defaultTab?: string;
   onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
   onDebugModeChange: (enabled: boolean) => void;
-  projects: Project[];
-  selectedProjectId: string | null;
-  onProjectSelect: (projectId: string | null) => void;
-  onLoadProjects: () => Promise<void>;
-  webSocketState: WebSocketState;
 }
 
 type SettingsTab =
-  | "account"
   | "ai"
   | "agentic"
   | "self-healing"
   | "world-state-verifier"
   | "playwright"
   | "mobile"
-  | "cloud-relay"
   | "discovery"
-  | "web-integration"
+  | "backend-connection"
   | "mcp"
   | "log-sources"
   | "execution-variables"
@@ -84,26 +65,24 @@ const STORAGE_KEY = "qontinui-settings-active-tab";
 /**
  * Canonical list of settings sub-tabs.
  *
- * Exposed through the UI Bridge `list-tabs` action so AI drivers can enumerate
- * the available tabs without DOM scraping. The `id` is the internal identifier
- * (also used by the `switch-tab` action) and the `label` is a human-readable
- * name suitable for UI discovery.
- *
- * When adding a new settings tab, add an entry here AND a case in the
- * `switch (activeTab)` block below — `VALID_TABS` is derived from this list,
- * so the type system will catch mismatches.
+ * Phase 3 collapse: the legacy "Account" panel (`AuthConnectionSettings`,
+ * which managed the user-JWT WebSocket and project picker) and the
+ * "Cloud Relay" panel (which managed the same connection under a
+ * different name) are gone. The runner ↔ web channel is now a single
+ * outbound WebSocket driven entirely by `WebIntegrationSettings`. The
+ * panel id is `backend-connection` to reflect the unified scope, but
+ * we still mount `WebIntegrationSettings` underneath until the next UX
+ * pass.
  */
 const SETTINGS_TABS = [
-  { id: "account", label: "Account" },
+  { id: "backend-connection", label: "Backend Connection" },
   { id: "ai", label: "AI Providers" },
   { id: "agentic", label: "Advanced AI" },
   { id: "self-healing", label: "Self-Healing" },
   { id: "world-state-verifier", label: "World State Verifier" },
   { id: "playwright", label: "Playwright" },
   { id: "mobile", label: "Mobile" },
-  { id: "cloud-relay", label: "Cloud Relay" },
   { id: "discovery", label: "Discovery" },
-  { id: "web-integration", label: "Web Integration" },
   { id: "mcp", label: "MCP Servers" },
   { id: "log-sources", label: "Log Sources" },
   { id: "execution-variables", label: "Execution Variables" },
@@ -121,31 +100,32 @@ const SETTINGS_TABS = [
 
 const VALID_TABS = SETTINGS_TABS.map((t) => t.id);
 
-export function Settings({
-  defaultTab,
-  onLog,
-  onDebugModeChange,
-  projects,
-  selectedProjectId,
-  onProjectSelect,
-  onLoadProjects,
-  webSocketState,
-}: SettingsProps) {
+/**
+ * Migrate legacy stored tab ids to their Phase 3 replacements. Without
+ * this, a user whose last-active tab was "account" / "cloud-relay" /
+ * "web-integration" would land on a missing tab id and fall through to
+ * the default.
+ */
+function migrateStoredTab(stored: string | null): SettingsTab {
+  if (!stored) return "backend-connection";
+  if (stored === "connection" || stored === "account" || stored === "cloud-relay") {
+    return "backend-connection";
+  }
+  if (stored === "web-integration") {
+    return "backend-connection";
+  }
+  if ((VALID_TABS as readonly string[]).includes(stored)) {
+    return stored as SettingsTab;
+  }
+  return "backend-connection";
+}
+
+export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
-    // If defaultTab is provided and valid, use it
     if (defaultTab && (VALID_TABS as readonly string[]).includes(defaultTab)) {
       return defaultTab as SettingsTab;
     }
-    // Otherwise load persisted tab on mount
-    const stored = instanceStorage.getItem(STORAGE_KEY);
-    // Handle migration from old "connection" tab name
-    if (stored === "connection") {
-      return "account";
-    }
-    if (stored && (VALID_TABS as readonly string[]).includes(stored)) {
-      return stored as SettingsTab;
-    }
-    return "account";
+    return migrateStoredTab(instanceStorage.getItem(STORAGE_KEY));
   });
 
   // Sync with defaultTab prop when it changes (from navigation)
@@ -184,7 +164,7 @@ export function Settings({
         id: "reset",
         label: "Reset Settings",
         handler: async () => {
-          setActiveTab("account");
+          setActiveTab("backend-connection");
           onLog("info", "Settings reset to defaults");
         },
       },
@@ -219,17 +199,8 @@ export function Settings({
 
   const settingsContent = (() => {
     switch (activeTab) {
-      case "account":
-        return (
-          <AuthConnectionSettings
-            onLog={onLog}
-            projects={projects}
-            selectedProjectId={selectedProjectId}
-            onProjectSelect={onProjectSelect}
-            webSocketState={webSocketState}
-            onLoadProjects={onLoadProjects}
-          />
-        );
+      case "backend-connection":
+        return <WebIntegrationSettings onLog={onLog} />;
       case "ai":
         return <AiSettings onLog={onLog} />;
       case "agentic":
@@ -242,12 +213,8 @@ export function Settings({
         return <PlaywrightSettings onLog={onLog} />;
       case "mobile":
         return <MobileSettings onLog={onLog} />;
-      case "cloud-relay":
-        return <CloudRelaySettings onLog={onLog} />;
       case "discovery":
         return <DiscoverySettings onLog={onLog} />;
-      case "web-integration":
-        return <WebIntegrationSettings onLog={onLog} />;
       case "mcp":
         return <McpSettings onLog={onLog} />;
       case "log-sources":

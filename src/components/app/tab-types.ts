@@ -63,6 +63,7 @@ export type MainTabId =
   | "settings-cloud-relay"
   | "settings-discovery"
   | "settings-web-integration"
+  | "settings-backend-connection"
   | "settings-mcp"
   | "settings-log-sources"
   | "settings-execution-variables"
@@ -163,6 +164,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-cloud-relay",
   "settings-discovery",
   "settings-web-integration",
+  "settings-backend-connection",
   "settings-mcp",
   "settings-log-sources",
   "settings-execution-variables",
@@ -274,6 +276,7 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   "settings-cloud-relay": "Cloud Relay Settings",
   "settings-discovery": "Discovery Settings",
   "settings-web-integration": "Web Integration Settings",
+  "settings-backend-connection": "Backend Connection Settings",
   "settings-mcp": "MCP Settings",
   "settings-log-sources": "Log Sources Settings",
   "settings-execution-variables": "Execution Variables",

@@ -22,7 +22,6 @@ import type { UseModalStateResult } from "@/hooks/useModalState";
 import type { UseLogFilterResult } from "@/hooks/useLogFilter";
 import type { UseProjectLogsReturn } from "@/hooks/project-logs";
 import type { useProjectSelection } from "@/hooks/useProjectSelection";
-import type { UseWebSocketAutoConnectReturn } from "@/hooks/useWebSocketAutoConnect";
 import type { MainTabId, LogSubTab } from "./tab-types";
 import type { ErrorMonitorScope } from "./useAppNavigation";
 import { LogSourcesConfigTab } from "./LogSourcesConfigTab";
@@ -220,7 +219,6 @@ export interface TabContentProps {
   globalLogSourceSettings: GlobalLogSourceSettings | null;
   projectSelection: ReturnType<typeof useProjectSelection>;
   projectLogs: UseProjectLogsReturn;
-  webSocket: UseWebSocketAutoConnectReturn;
   lastRun: TaskRun | null;
   lastRunWorkflowId: string | null;
   lastRunWorkflowName: string | null;
@@ -262,7 +260,6 @@ export function TabContent({
   globalLogSourceSettings,
   projectSelection,
   projectLogs: _projectLogs,
-  webSocket,
   lastRun,
   lastRunWorkflowId,
   lastRunWorkflowName,
@@ -959,6 +956,7 @@ export function TabContent({
     case "settings-cloud-relay":
     case "settings-discovery":
     case "settings-web-integration":
+    case "settings-backend-connection":
     case "settings-mcp":
     case "settings-log-sources":
     case "settings-execution-variables":
@@ -969,18 +967,22 @@ export function TabContent({
     case "settings-debug":
     case "settings-security":
     case "settings-updates": {
+      // Phase 3 — `account`, `cloud-relay`, and `web-integration` are all
+      // legacy ids for the runner ↔ web channel; they all collapse to the
+      // unified `backend-connection` tab.
       const settingsTabMap: Record<string, string> = {
-        settings: "account",
-        "settings-account": "account",
+        settings: "backend-connection",
+        "settings-account": "backend-connection",
         "settings-ai": "ai",
         "settings-agentic": "agentic",
         "settings-self-healing": "self-healing",
         "settings-world-state-verifier": "world-state-verifier",
         "settings-playwright": "playwright",
         "settings-mobile": "mobile",
-        "settings-cloud-relay": "cloud-relay",
+        "settings-cloud-relay": "backend-connection",
         "settings-discovery": "discovery",
-        "settings-web-integration": "web-integration",
+        "settings-web-integration": "backend-connection",
+        "settings-backend-connection": "backend-connection",
         "settings-mcp": "mcp",
         "settings-log-sources": "log-sources",
         "settings-execution-variables": "execution-variables",
@@ -992,7 +994,7 @@ export function TabContent({
         "settings-security": "security",
         "settings-updates": "updates",
       };
-      const defaultSettingsTab = settingsTabMap[activeTab] || "account";
+      const defaultSettingsTab = settingsTabMap[activeTab] || "backend-connection";
 
       return (
         <div data-page-id="settings" className="h-full overflow-hidden">
@@ -1012,11 +1014,6 @@ export function TabContent({
                 addLog("error", `Failed to set debug mode: ${error}`);
               }
             }}
-            projects={projectSelection.projects}
-            selectedProjectId={projectSelection.selectedProjectId}
-            onProjectSelect={projectSelection.setSelectedProject}
-            onLoadProjects={projectSelection.loadProjects}
-            webSocketState={webSocket}
           />
         </div>
       );

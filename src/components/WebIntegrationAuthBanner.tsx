@@ -172,7 +172,7 @@ export function WebIntegrationAuthBanner() {
       <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
         <div style={{ fontWeight: 600 }}>Connect this runner to your account</div>
         <div style={{ fontSize: "0.8125rem", opacity: 0.85 }}>
-          Required to dispatch from the web app or your phone.
+          Authorize this runner with qontinui-web to make it visible to your account.
           {authorizeError ? (
             <>
               <br />

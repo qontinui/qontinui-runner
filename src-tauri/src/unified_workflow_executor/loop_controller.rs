@@ -3184,11 +3184,24 @@ pub(crate) async fn emit_and_persist_phase_result(
     ) {
         tracing::warn!("PHASE-RESULT: failed to emit {} phase: {}", result.phase, e);
     }
-    // Web integration: fire-and-forget POST to qontinui-web. The helper
-    // internally `tokio::spawn`s so this call returns immediately even when
-    // the web backend is slow or down.
-    if let Some(sm_state) = app_state.current_server_mode().await {
-        crate::server_mode::post_phase_result(sm_state, parent_id, result);
+    // Phase 3 — phase results travel to qontinui-web over the unified
+    // WebSocket relay (see `mcp::backend_relay`). We publish a `phase-result`
+    // event onto the runner's broadcast channel; the relay's outbound
+    // forwarder picks it up and emits it as a `phase_completed` message on
+    // the WS. When the relay is not running (web integration disabled) the
+    // event is simply unobserved — local persistence already happened above.
+    if app_state.current_server_mode().await.is_some() {
+        let payload = serde_json::json!({
+            "channel": "phase-result",
+            "payload": {
+                "execution_id": parent_id,
+                "result": &result,
+            }
+        });
+        // Best-effort send — the broadcast channel returns Err only when
+        // there are no live receivers, which simply means the relay isn't
+        // attached (e.g. backoff, settings change in flight).
+        let _ = app_state.event_broadcast.send(payload);
     }
 }
 

@@ -53,11 +53,9 @@ export type { UseInitialStatesOverrideReturn } from "./useInitialStatesOverride"
 
 export { useScheduler } from "./useScheduler";
 
-export { useWebSocketAutoConnect } from "./useWebSocketAutoConnect";
-export type {
-  UseWebSocketAutoConnectOptions,
-  UseWebSocketAutoConnectReturn,
-} from "./useWebSocketAutoConnect";
+// Phase 3 — `useWebSocketAutoConnect` removed. The runner ↔ web channel is
+// driven from Rust (`mcp::backend_relay`); the frontend no longer manages a
+// user-JWT WebSocket via the Python bridge.
 
 export {
   useWebSocketEvents,
@@ -257,7 +255,9 @@ export type { UseStateMachineConfigReturn } from "./useStateMachineConfig";
 export { useConstraints } from "./useConstraints";
 export type { UseConstraintsOptions, UseConstraintsReturn } from "./useConstraints";
 
-export { useCloudRelayAutoConnect } from "./useCloudRelayAutoConnect";
+// Phase 3 — `useCloudRelayAutoConnect` removed. Cloud-relay was the
+// previous owner of the user-JWT WebSocket; that channel is now the
+// unified runner-token WebSocket driven from Rust.
 
 export { useGraphDataRefresh } from "./useGraphDataRefresh";
 

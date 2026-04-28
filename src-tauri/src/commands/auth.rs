@@ -10,7 +10,6 @@ use crate::auth::AuthManager;
 use crate::commands::compartments::HealthCompartment;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
-use std::error::Error as StdError;
 use std::sync::atomic::Ordering;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -49,24 +48,6 @@ pub struct DeviceInfo {
     pub device_id: String,
     pub device_name: String,
     pub platform: String,
-}
-
-/// Request body for device registration
-#[derive(Debug, Serialize, Deserialize)]
-struct RegisterDeviceRequest {
-    device_id: String,
-    device_name: String,
-    platform: String,
-}
-
-/// Response from device registration endpoint
-#[derive(Debug, Serialize, Deserialize)]
-struct RegisterDeviceResponse {
-    id: String,
-    device_id: String,
-    device_name: String,
-    platform: String,
-    created_at: String,
 }
 
 /// Login API response (from qontinui-web)
@@ -223,46 +204,19 @@ async fn login_impl(email: String, password: String) -> Result<LoginResponse, Ap
     // 2. Store tokens in keychain
     auth_manager.store_tokens(&api_response.access_token, &api_response.refresh_token)?;
 
-    // 3. Get or generate device ID
+    // 3. Get or generate device ID for local identification only.
+    //
+    // Phase 3: the legacy `/api/v1/runner-devices/register` HTTP flow is
+    // deleted server-side. The runner is now identified to qontinui-web
+    // via the unified WebSocket relay (`mcp::backend_relay`), keyed by
+    // `(user_id, runner_name)` upserted into the `runners` table on
+    // handshake. The `device_id` here is retained only as a stable local
+    // identifier (used by some UI elements).
     let device_id = auth_manager.get_device_id()?;
-
-    // 4. Register device with backend
     let device_name = get_device_name();
     let platform = get_platform();
 
-    let register_request = RegisterDeviceRequest {
-        device_id: device_id.clone(),
-        device_name: device_name.clone(),
-        platform: platform.clone(),
-    };
-
-    let register_response = client
-        .post(format!(
-            "{}/api/v1/runner-devices/register",
-            get_api_base_url()
-        ))
-        .bearer_auth(&api_response.access_token)
-        .json(&register_request)
-        .send()
-        .await?;
-
-    if !register_response.status().is_success() {
-        let status = register_response.status();
-        let error_text = register_response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        warn!(
-            "Device registration failed with status {}: {}",
-            status, error_text
-        );
-        // Don't fail login if device registration fails - user is still authenticated
-        // This could happen if device was already registered
-    } else {
-        info!("Device registered successfully: {}", device_id);
-    }
-
-    // 5. Return success response
+    // 4. Return success response
     Ok(LoginResponse {
         access_token: api_response.access_token,
         refresh_token: api_response.refresh_token,
@@ -300,37 +254,12 @@ async fn logout_impl() -> Result<(), AppError> {
 
     let auth_manager = AuthManager::new();
 
-    // Get device ID and access token for deactivation
-    let device_id = auth_manager.get_device_id().ok();
-    let access_token = auth_manager.get_access_token().ok();
-
-    // Try to deactivate device on backend (best effort)
-    if let (Some(device_id), Some(token)) = (device_id, access_token) {
-        let client = reqwest::Client::new();
-        match client
-            .delete(format!(
-                "{}/api/v1/runner-devices/{}",
-                get_api_base_url(),
-                device_id
-            ))
-            .bearer_auth(&token)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    info!("Device deactivated successfully");
-                } else {
-                    warn!("Device deactivation failed: {}", response.status());
-                }
-            }
-            Err(e) => {
-                warn!("Failed to deactivate device (network error): {}", e);
-            }
-        }
-    }
-
-    // Clear tokens from keychain
+    // Phase 3: there's no longer a separate `/api/v1/runner-devices/{id}`
+    // backend record to deactivate. The runner's presence is governed by
+    // the unified WebSocket relay; closing the WS (which happens on token
+    // revocation) is the equivalent of "logging the device out".
+    //
+    // Clear tokens from the keychain.
     auth_manager.clear_tokens()?;
 
     info!("Logout successful");
@@ -466,72 +395,6 @@ async fn get_device_info_impl() -> Result<DeviceInfo, AppError> {
         device_name,
         platform,
     })
-}
-
-/// Connection information for WebSocket
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConnectionInfo {
-    pub device_id: String,
-    pub websocket_url: String,
-    pub http_url: String,
-    pub user_id: String,
-    pub is_active: bool,
-}
-
-/// Gets connection information for the current device.
-///
-/// This command:
-/// 1. Retrieves the device ID and access token from keychain
-/// 2. Calls the backend API to get WebSocket connection details
-/// 3. Returns the connection information needed to connect
-///
-/// # Errors
-///
-/// Returns an error string if:
-/// - Not authenticated (no tokens)
-/// - Device ID retrieval fails
-/// - Backend API call fails
-#[tauri::command]
-pub async fn get_connection_info() -> Result<ConnectionInfo, String> {
-    get_connection_info_impl().await.map_err(String::from)
-}
-
-async fn get_connection_info_impl() -> Result<ConnectionInfo, AppError> {
-    info!("Getting connection info");
-
-    let auth_manager = AuthManager::new();
-
-    if !auth_manager.has_tokens() {
-        return Err(AppError::AuthError(
-            "Not authenticated. Please log in first.".to_string(),
-        ));
-    }
-
-    let access_token = auth_manager.get_access_token()?;
-    let device_id = auth_manager.get_device_id()?;
-
-    let url = format!(
-        "{}/api/v1/runner-devices/{}/connection-info",
-        get_api_base_url(),
-        device_id
-    );
-
-    let response = reqwest::Client::new()
-        .get(&url)
-        .bearer_auth(&access_token)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-        error!("Connection info request failed: {} {}", status, body);
-        return Err(AppError::HttpStatusError { status, body });
-    }
-
-    let info: ConnectionInfo = response.json().await?;
-
-    Ok(info)
 }
 
 /// Project information
@@ -714,160 +577,6 @@ async fn get_access_token_for_websocket_impl() -> Result<String, AppError> {
     Ok(access_token)
 }
 
-/// Send heartbeat to backend
-///
-/// Updates the device's last_seen_at timestamp on the backend.
-/// This should be called periodically when connected.
-///
-/// # Arguments
-///
-/// * `project_id` - Optional project ID if associated with a project
-///
-/// # Errors
-///
-/// Returns an error string if:
-/// - Not authenticated
-/// - Device ID retrieval fails
-/// - Backend API call fails
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HeartbeatResponse {
-    pub message: String,
-    pub has_active_connection: bool,
-}
-
-#[tauri::command]
-pub async fn send_device_heartbeat(
-    project_id: Option<String>,
-) -> Result<HeartbeatResponse, String> {
-    send_device_heartbeat_impl(project_id)
-        .await
-        .map_err(String::from)
-}
-
-async fn send_device_heartbeat_impl(
-    project_id: Option<String>,
-) -> Result<HeartbeatResponse, AppError> {
-    info!(
-        "[HEARTBEAT] Starting device heartbeat (project_id: {:?})",
-        project_id
-    );
-
-    let auth_manager = AuthManager::new();
-    info!("[HEARTBEAT] AuthManager created");
-
-    // Check authentication
-    if !auth_manager.has_tokens() {
-        warn!("[HEARTBEAT] No tokens found - not authenticated");
-        return Err(AppError::AuthError(
-            "Not authenticated. Please log in first.".to_string(),
-        ));
-    }
-    info!("[HEARTBEAT] Tokens present, proceeding");
-
-    // Get device ID and access token
-    info!("[HEARTBEAT] Getting device ID...");
-    let device_id = auth_manager.get_device_id()?;
-    info!("[HEARTBEAT] Got device ID: {}", device_id);
-
-    info!("[HEARTBEAT] Getting access token...");
-    let access_token = auth_manager.get_access_token()?;
-    info!(
-        "[HEARTBEAT] Got access token (length: {} chars)",
-        access_token.len()
-    );
-
-    // Build URL first to log it
-    let api_base = get_api_base_url();
-    let url = format!("{}/api/v1/runner-devices/{}/heartbeat", api_base, device_id);
-    info!("[HEARTBEAT] Target URL: {}", url);
-
-    // Create HTTP client with timeout
-    info!("[HEARTBEAT] Creating HTTP client...");
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => {
-            info!("[HEARTBEAT] HTTP client created successfully");
-            c
-        }
-        Err(e) => {
-            error!("[HEARTBEAT] Failed to create HTTP client: {}", e);
-            return Err(AppError::Raw(format!(
-                "Failed to create HTTP client: {}",
-                e
-            )));
-        }
-    };
-
-    #[derive(Serialize)]
-    struct HeartbeatRequest {
-        project_id: Option<String>,
-    }
-
-    let heartbeat_request = HeartbeatRequest { project_id };
-    info!("[HEARTBEAT] Request payload prepared");
-
-    info!("[HEARTBEAT] Sending POST request...");
-    let response = match client
-        .post(&url)
-        .bearer_auth(&access_token)
-        .json(&heartbeat_request)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            info!("[HEARTBEAT] Response received: status={}", resp.status());
-            resp
-        }
-        Err(e) => {
-            // Log detailed error information
-            error!("[HEARTBEAT] Request failed: {}", e);
-            if e.is_timeout() {
-                error!("[HEARTBEAT] Error type: TIMEOUT");
-            } else if e.is_connect() {
-                error!("[HEARTBEAT] Error type: CONNECTION");
-            } else if e.is_request() {
-                error!("[HEARTBEAT] Error type: REQUEST BUILD");
-            } else if e.is_body() {
-                error!("[HEARTBEAT] Error type: BODY");
-            } else if e.is_decode() {
-                error!("[HEARTBEAT] Error type: DECODE");
-            } else if e.is_redirect() {
-                error!("[HEARTBEAT] Error type: REDIRECT");
-            } else if e.is_status() {
-                error!("[HEARTBEAT] Error type: STATUS");
-            }
-            if let Some(url) = e.url() {
-                error!("[HEARTBEAT] Failed URL: {}", url);
-            }
-            if let Some(source) = e.source() {
-                error!("[HEARTBEAT] Error source: {}", source);
-            }
-            return Err(AppError::Raw(format!("Network error: {}", e)));
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        info!(
-            "[HEARTBEAT] Non-success status: {}, reading body...",
-            status
-        );
-        let body = response.text().await.unwrap_or_default();
-        error!("[HEARTBEAT] Failed with status {}: {}", status, body);
-        return Err(AppError::HttpStatusError { status, body });
-    }
-
-    let heartbeat_response: HeartbeatResponse = response.json().await?;
-
-    info!(
-        "[HEARTBEAT] Heartbeat sent successfully (has_active_connection: {})",
-        heartbeat_response.has_active_connection
-    );
-    Ok(heartbeat_response)
-}
-
 /// Check if the HTTP API server is ready to accept requests.
 ///
 /// The frontend calls this on mount to detect if the API server started
@@ -925,11 +634,9 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             logout,
             check_auth_status,
             get_device_info,
-            get_connection_info,
             get_user_projects,
             refresh_token,
             get_access_token_for_websocket,
-            send_device_heartbeat,
             is_api_ready,
             get_api_port,
             get_test_auto_login,
