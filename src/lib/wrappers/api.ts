@@ -41,6 +41,20 @@ import type {
 const REGISTRY_FALLBACK_URL =
   "https://raw.githubusercontent.com/qontinui/wrappers-registry/main/registry.json";
 
+/**
+ * The runner wraps every JSON response in `{ success, data, error? }`
+ * (`crate::mcp::types::ApiResponse`). Earlier revisions of this client
+ * tried to handle a "bare value or `{ wrappers }` shape" — that was
+ * wrong; the canonical shape has always been the envelope. We unwrap
+ * `data` once at the top of every method and return raw payloads to
+ * callers, the same way the rest of the runner UI consumes its API.
+ */
+interface ApiEnvelope<T> {
+  success?: boolean;
+  data?: T;
+  error?: string;
+}
+
 /** Throw if the response isn't OK, surfacing the body for debugging. */
 async function ensureOk(res: Response, ctx: string): Promise<Response> {
   if (res.ok) return res;
@@ -53,24 +67,32 @@ async function ensureOk(res: Response, ctx: string): Promise<Response> {
   throw new Error(`${ctx} failed: ${res.status} ${res.statusText}${detail ? ` — ${detail}` : ""}`);
 }
 
+/**
+ * Parse the runner's `ApiResponse<T>` envelope and return the inner
+ * `data` value. Throws on `success: false` so callers don't have to
+ * branch — failures surface as exceptions just like network errors.
+ */
+async function unwrapEnvelope<T>(res: Response, ctx: string): Promise<T> {
+  const body = (await res.json()) as ApiEnvelope<T>;
+  if (body && body.success === false) {
+    throw new Error(`${ctx} failed: ${body.error ?? "unknown error"}`);
+  }
+  return body.data as T;
+}
+
 /** List all installed wrappers. */
 export async function listWrappers(): Promise<InstalledWrapper[]> {
   const res = await fetch(`${getApiBase()}/wrappers`);
   await ensureOk(res, "GET /wrappers");
-  const data = await res.json();
-  // Backend may return either a bare array or `{ wrappers: [...] }`.
-  if (Array.isArray(data)) return data;
-  if (data && Array.isArray((data as { wrappers?: unknown }).wrappers)) {
-    return (data as { wrappers: InstalledWrapper[] }).wrappers;
-  }
-  return [];
+  const list = await unwrapEnvelope<InstalledWrapper[] | undefined>(res, "GET /wrappers");
+  return list ?? [];
 }
 
 /** Fetch a single installed wrapper. */
 export async function getWrapper(id: string): Promise<InstalledWrapper> {
   const res = await fetch(`${getApiBase()}/wrappers/${encodeURIComponent(id)}`);
   await ensureOk(res, `GET /wrappers/${id}`);
-  return res.json();
+  return unwrapEnvelope<InstalledWrapper>(res, `GET /wrappers/${id}`);
 }
 
 /** Install a wrapper from npm. */
@@ -84,7 +106,7 @@ export async function installWrapper(
     body: JSON.stringify({ package: packageName, ...(version ? { version } : {}) }),
   });
   await ensureOk(res, `POST /wrappers/install (${packageName})`);
-  return res.json();
+  return unwrapEnvelope<InstalledWrapper>(res, `POST /wrappers/install (${packageName})`);
 }
 
 /** Re-install at latest (or pinned version). */
@@ -93,7 +115,7 @@ export async function updateWrapper(id: string): Promise<InstalledWrapper> {
     method: "POST",
   });
   await ensureOk(res, `POST /wrappers/${id}/update`);
-  return res.json();
+  return unwrapEnvelope<InstalledWrapper>(res, `POST /wrappers/${id}/update`);
 }
 
 /** Uninstall a wrapper. */
@@ -110,7 +132,7 @@ export async function startWrapper(id: string): Promise<WrapperStatusInfo> {
     method: "POST",
   });
   await ensureOk(res, `POST /wrappers/${id}/start`);
-  return res.json();
+  return unwrapEnvelope<WrapperStatusInfo>(res, `POST /wrappers/${id}/start`);
 }
 
 /** Stop the wrapper subprocess. */
@@ -119,14 +141,14 @@ export async function stopWrapper(id: string): Promise<WrapperStatusInfo> {
     method: "POST",
   });
   await ensureOk(res, `POST /wrappers/${id}/stop`);
-  return res.json();
+  return unwrapEnvelope<WrapperStatusInfo>(res, `POST /wrappers/${id}/stop`);
 }
 
 /** Fetch live wrapper status. */
 export async function getWrapperStatus(id: string): Promise<WrapperStatusInfo> {
   const res = await fetch(`${getApiBase()}/wrappers/${encodeURIComponent(id)}/status`);
   await ensureOk(res, `GET /wrappers/${id}/status`);
-  return res.json();
+  return unwrapEnvelope<WrapperStatusInfo>(res, `GET /wrappers/${id}/status`);
 }
 
 /** Dispatch an action through the wrapper. */
@@ -149,20 +171,27 @@ export async function dispatchAction<T = unknown>(
     }
     return { error: `dispatch failed: ${res.status} ${res.statusText}${body ? ` — ${body}` : ""}` };
   }
-  const json = (await res.json()) as DispatchResult<T>;
-  return json;
+  // Unwrap the runner envelope first; the wrapper subprocess returns
+  // its own `{ success, data: { result } }` shape inside `data`. Hand
+  // the inner DispatchResult back to callers verbatim — they already
+  // branch on `result` / `error`.
+  try {
+    const inner = await unwrapEnvelope<DispatchResult<T>>(res, `POST /wrappers/${id}/dispatch`);
+    return inner ?? { error: "empty response" };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /** List wrapper credentials (names only — values are never returned). */
 export async function listCredentials(id: string): Promise<CredentialEntry[]> {
   const res = await fetch(`${getApiBase()}/wrappers/${encodeURIComponent(id)}/credentials`);
   await ensureOk(res, `GET /wrappers/${id}/credentials`);
-  const data = await res.json();
-  if (Array.isArray(data)) return data;
-  if (data && Array.isArray((data as { credentials?: unknown }).credentials)) {
-    return (data as { credentials: CredentialEntry[] }).credentials;
-  }
-  return [];
+  const list = await unwrapEnvelope<CredentialEntry[] | undefined>(
+    res,
+    `GET /wrappers/${id}/credentials`,
+  );
+  return list ?? [];
 }
 
 /** Set a credential value. */
@@ -205,10 +234,29 @@ export async function listRegistry(opts?: { force?: boolean }): Promise<Registry
   try {
     const res = await fetch(`${getApiBase()}/wrappers/registry`);
     if (res.ok) {
-      const data = (await res.json()) as RegistryListing | RegistryWrapperEntry[];
-      const listing: RegistryListing = Array.isArray(data) ? { version: 1, wrappers: data } : data;
-      _registryCache = { at: now, data: listing };
-      return listing.wrappers ?? [];
+      // The runner-side handler (when present) returns the same
+      // ApiResponse<T> envelope as the rest of `/wrappers/*`. Fall back
+      // to treating the body as a bare RegistryListing or array for
+      // forward compat.
+      const body = (await res.json()) as
+        | ApiEnvelope<RegistryListing | RegistryWrapperEntry[]>
+        | RegistryListing
+        | RegistryWrapperEntry[];
+      let payload: RegistryListing | RegistryWrapperEntry[] | undefined;
+      if (Array.isArray(body)) {
+        payload = body;
+      } else if (body && "wrappers" in body && Array.isArray((body as RegistryListing).wrappers)) {
+        payload = body as RegistryListing;
+      } else if (body && "data" in body) {
+        payload = (body as ApiEnvelope<RegistryListing | RegistryWrapperEntry[]>).data;
+      }
+      if (payload) {
+        const listing: RegistryListing = Array.isArray(payload)
+          ? { version: 1, wrappers: payload }
+          : payload;
+        _registryCache = { at: now, data: listing };
+        return listing.wrappers ?? [];
+      }
     }
   } catch {
     /* fall through to direct fetch */
