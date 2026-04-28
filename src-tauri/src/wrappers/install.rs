@@ -261,20 +261,58 @@ pub async fn install(
     // volume), then promote the wrapper's package contents to the top
     // of canonical, overwriting the stub package.json. Deps remain
     // beneath canonical/node_modules/ where Node will find them.
-    if canonical.exists() {
-        std::fs::remove_dir_all(&canonical)?;
+    // Try the fast path first: blow away any existing canonical and
+    // rename the staging tree into place. This is one atomic op on the
+    // same volume.
+    //
+    // Fall-back if either the remove or the rename fails (most commonly
+    // because the existing canonical's directory handle is pinned by
+    // some external process — antimalware, indexer, a stuck handle from
+    // a crashed previous install — and `remove_dir_all` returns
+    // `os error 32: process cannot access the file because it is being
+    // used by another process`). On Windows, *adding* and *removing*
+    // files inside a "locked" directory still works even when
+    // renaming/deleting the dir itself doesn't, so we copy the staging
+    // tree's contents OVER the existing canonical's contents and clear
+    // the staging dir afterwards. The wrapper ends up runnable; the
+    // residual locked-but-now-overwritten directory becomes a no-op.
+    let canonical_existed_before = canonical.exists();
+    let mut used_overlay = false;
+    if canonical_existed_before {
+        if let Err(e) = std::fs::remove_dir_all(&canonical) {
+            warn!(
+                "wrappers.install: remove_dir_all('{}') failed ({}); falling back to overlay copy",
+                canonical.display(),
+                e
+            );
+            used_overlay = true;
+        }
     }
-    if let Err(e) = std::fs::rename(&stage, &canonical) {
-        warn!(
-            "wrappers.install: rename '{}' → '{}' failed ({}), copying",
-            stage.display(),
-            canonical.display(),
-            e
-        );
+    if !used_overlay {
+        if let Err(e) = std::fs::rename(&stage, &canonical) {
+            warn!(
+                "wrappers.install: rename '{}' → '{}' failed ({}), copying",
+                stage.display(),
+                canonical.display(),
+                e
+            );
+            if let Err(copy_err) = copy_dir_recursive(&stage, &canonical) {
+                let _ = std::fs::remove_dir_all(&stage);
+                return Err(InstallError::InstallFailed(format!(
+                    "failed to install wrapper to {}: {}",
+                    canonical.display(),
+                    copy_err
+                )));
+            }
+            let _ = std::fs::remove_dir_all(&stage);
+        }
+    } else {
+        // Overlay path: canonical exists and is locked. Copy stage's
+        // contents into it, then drop the now-redundant stage tree.
         if let Err(copy_err) = copy_dir_recursive(&stage, &canonical) {
             let _ = std::fs::remove_dir_all(&stage);
             return Err(InstallError::InstallFailed(format!(
-                "failed to install wrapper to {}: {}",
+                "failed to overlay-install wrapper to {}: {}",
                 canonical.display(),
                 copy_err
             )));
