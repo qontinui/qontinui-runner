@@ -5,8 +5,10 @@
 //! primary-tab routing, heartbeats and grace periods; for Phase 1 of the
 //! wrapper framework we only port the essentials:
 //!
-//! 1. A `pending_commands` map keyed by `command_id`, each slot holding a
-//!    `oneshot::Sender<CommandResponse>` that the response handler completes.
+//! 1. A `pending` map keyed by `command_id`, each slot holding the routing
+//!    `conn_id` plus a `oneshot::Sender<CommandResponse>` that the response
+//!    handler completes. The `conn_id` lets cleanup paths target a specific
+//!    socket — see `reject_by_conn`.
 //! 2. A `dispatch(app_id, action, payload)` call that
 //!    - generates a UUID `command_id`,
 //!    - looks up the app's WebSocket `conn_id`,
@@ -14,13 +16,22 @@
 //!    - sends `{type:"command",commandId,action,payload,timestamp}` on the
 //!      WS outbound channel,
 //!    - awaits the oneshot with a 30s timeout, cleaning up on timeout.
-//! 3. A `resolve`/`reject` API that the WS receive loop calls when a
-//!    `{type:"response", commandId, success, result?, error?}` frame arrives.
+//! 3. A `resolve`/`reject_by_conn` API that the WS receive loop calls when a
+//!    `{type:"response", commandId, success, result?, error?}` frame arrives
+//!    or when a connection closes / is displaced. Displacement-time rejection
+//!    is targeted at the displaced `conn_id` so a sibling tab's pending
+//!    commands are not collateral damage.
 //! 4. Change-event forwarding: `push_change_event(app_id, event)` feeds
 //!    subscribers; for v1 there are no subscribers (caller logs and discards).
 //!
-//! Multi-tab grace period, primary-tab failover and demotion are explicitly
-//! **deferred**. "Last tab wins" is called out in the plan's risk notes.
+//! Multi-tab semantics today: **last-tab-wins routing with graceful
+//! displacement.** When a new tab registers with the same `app_id`, the old
+//! conn loses its slot in `WsConnectionManager::by_app` and any in-flight
+//! commands routed to it fail synchronously with `CommandRelayError::Displaced`
+//! (instead of the previous 30s silent timeout). Primary-tab election and a
+//! configurable grace period before displacement remain deferred — there is
+//! still no protocol for the old tab to either negotiate or block the
+//! handoff. Add those when a multi-tab wrapper is actually in production.
 
 use std::collections::HashMap;
 use std::sync::Arc;

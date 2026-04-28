@@ -15,8 +15,13 @@
 //!
 //! Heartbeat: axum ws auto-handles ping frames, but we additionally send a
 //! ping every 20s and close the socket if two consecutive pings go
-//! un-ponged. Multi-tab grace period / primary-tab election are deferred to
-//! Phase 2 — "last tab wins" is acceptable for v1.
+//! un-ponged. Multi-tab routing is **last-tab-wins with graceful
+//! displacement**: when a new tab registers with the same `app_id`, the
+//! displaced conn's pending commands fail synchronously with
+//! `CommandRelayError::Displaced` (not silent 30s timeouts), but the old
+//! socket itself stays open until the wrapper drops it. Primary-tab
+//! election and a configurable grace period before the routing-slot
+//! handoff remain Phase 2 — add when a multi-tab wrapper is in production.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
