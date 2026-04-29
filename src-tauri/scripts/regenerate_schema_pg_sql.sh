@@ -14,9 +14,9 @@
 # -----
 # Default (no flag): dump from a running canonical Postgres container.
 #   Expects the qontinui-canonical-postgres container to be up with
-#   schemas project/coord/agent/auth/public created and populated by
-#   the alembic chain (which, post-transplant, includes the
-#   _staged_consolidation/ revisions).
+#   schemas project/coord/agent/auth/cloud/public created and
+#   populated by the alembic chain (which post-transplant includes
+#   the consolidation revisions formerly in _staged_consolidation/).
 #
 # --fresh-temp-db: create a throwaway database inside the same container,
 #   apply alembic upgrade head into it from qontinui-web/backend, dump
@@ -56,7 +56,7 @@ HOST="${CLORINDE_PG_HOST:-localhost}"
 PORT="${CLORINDE_PG_PORT:-5433}"
 DB="${CLORINDE_PG_DB:-qontinui_db}"
 PG_USER="${CLORINDE_PG_USER:-qontinui_user}"
-SCHEMAS=(project coord agent auth public)
+SCHEMAS=(project coord agent auth cloud public)
 
 # Default to relative path; can be overridden by env.
 QONTINUI_WEB_DIR="${QONTINUI_WEB_DIR:-../../../qontinui-web/backend}"
@@ -124,7 +124,7 @@ cat > "$TMP" <<'EOF'
 --
 -- Source: alembic-managed schema, dumped via pg_dump with
 --   --schema=project --schema=coord --schema=agent --schema=auth
---   --schema=public --no-owner --no-privileges.
+--   --schema=cloud --schema=public --no-owner --no-privileges.
 --
 -- Consumers: Clorinde (validates queries/*.sql against this file).
 --
