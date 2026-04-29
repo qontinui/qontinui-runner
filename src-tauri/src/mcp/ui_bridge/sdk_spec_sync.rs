@@ -75,8 +75,10 @@ pub async fn handle_spec_sync_status(
 /// shutdown).
 pub async fn handle_spec_sync_stream(
     State(state): State<Arc<ApiState>>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)>
-{
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, String),
+> {
     let bus = bus_from_state(&state).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "SpecSyncStateBus not registered".to_string(),
