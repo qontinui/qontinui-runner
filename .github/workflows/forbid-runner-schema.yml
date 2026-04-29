@@ -34,22 +34,46 @@ jobs:
       - name: Scan for forbidden runner.* references
         run: |
           set -e
-          # Patterns that must not appear in source post-consolidation:
+          # Two pattern passes (combined fail semantics):
+          #
+          # Pass 1 — case-sensitive, matches conventional SQL/Rust/Python:
           # - SCHEMA runner   (DDL)
-          # - FROM runner.<table>  /  JOIN runner.<table>  /  INTO runner.<table>
-          # - UPDATE runner.<table>  /  DELETE FROM runner.<table>
+          # - FROM/JOIN/INTO/UPDATE/DELETE FROM runner.<table>
           # - ForeignKey("runner.<table>...
           # - schema="runner"  /  schema='runner'
-          PATTERN='SCHEMA runner|FROM runner\.|JOIN runner\.|INTO runner\.|UPDATE runner\.|DELETE FROM runner\.|ForeignKey\([^)]*runner\.|schema\s*=\s*["'\'']runner["'\'']'
+          PATTERN_CS='SCHEMA runner|FROM runner\.|JOIN runner\.|INTO runner\.|UPDATE runner\.|DELETE FROM runner\.|ForeignKey\([^)]*runner\.|schema\s*=\s*["'\'']runner["'\'']'
 
-          # git grep returns 1 when nothing matches; flip the exit code so
-          # the workflow fails when patterns ARE found.
-          if git grep -nE "$PATTERN" \
-              -- ':!*.md' \
-                 ':!**/alembic/versions/' \
-                 ':!**/alembic/_staged_consolidation/' \
-                 ':!**/scripts/regenerate_schema_pg_sql.sh' \
-              ; then
+          # Pass 2 — case-insensitive, narrowly targets `SET search_path TO
+          # runner`. Caught at consumer-audit edit time in qontinui/vga;
+          # gating it here prevents regressions. Case-insensitive because
+          # SQL keywords vary in case across the codebase.
+          PATTERN_CI='SET\s+search_path\s+TO\s+runner'
+
+          # Shared exclude list (legitimate runner.* references):
+          EXCLUDES=(
+            ':!*.md'
+            ':!**/alembic/versions/'
+            ':!**/alembic/_staged_consolidation/'
+            ':!**/scripts/regenerate_schema_pg_sql.sh'
+            # Self-reference: this workflow file contains the pattern
+            # strings as part of its definition.
+            ':!.github/workflows/forbid-runner-schema.yml'
+            # Transitional: the runner-native MIGRATIONS array references
+            # the runner schema legitimately (it's the schema being
+            # migrated). Phase 4 of the consolidation plan deletes this
+            # file entirely. After that lands, drop this exclude.
+            ':!src-tauri/src/database/pg/mod.rs'
+          )
+
+          found_any=0
+          if git grep -nE "$PATTERN_CS" -- "${EXCLUDES[@]}"; then
+            found_any=1
+          fi
+          if git grep -niE "$PATTERN_CI" -- "${EXCLUDES[@]}"; then
+            found_any=1
+          fi
+
+          if [ "$found_any" = "1" ]; then
             echo "::error::runner.* schema reference detected in source. The runner schema is retired post-consolidation; tables now live in project / coord / agent / auth."
             echo "::error::If this is a legitimate historical reference (docs, alembic chain history), add the file pattern to the exclude list in .github/workflows/forbid-runner-schema.yml."
             exit 1
