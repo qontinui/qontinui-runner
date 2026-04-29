@@ -1,7 +1,7 @@
 # Qontinui Runner
 
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
-![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 Desktop application for running [Qontinui](https://github.com/qontinui/qontinui) GUI automation projects.
@@ -317,7 +317,7 @@ Please note that this project is released with a [Code of Conduct](CODE_OF_CONDU
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file for details.
+Licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See [LICENSE](LICENSE) for full terms.
 
 ## Related Projects
 

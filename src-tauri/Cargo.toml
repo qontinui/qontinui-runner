@@ -4,6 +4,7 @@ version = "1.0.0"
 description = "Desktop application for running Qontinui automation projects"
 authors = ["Qontinui <contact@qontinui.org>"]
 edition = "2021"
+license = "AGPL-3.0-or-later"
 default-run = "qontinui-runner"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
