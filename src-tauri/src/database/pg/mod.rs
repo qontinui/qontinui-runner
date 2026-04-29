@@ -1219,6 +1219,102 @@ const MIGRATIONS: &[Migration] = &[
                   AND user_decision IS NULL;
         "#,
     },
+    Migration {
+        version: 32,
+        description: "Schema-drift Phase 1 batch 1: add ENUM columns to runner.* tables that the qontinui-web SQLAlchemy models expect (software_test_runs.status etc.)",
+        // Background: 33 tables exist as 0-row duplicates in `public.*`
+        // alongside the live `runner.*` copies, with column-set drift. The
+        // web ORM's queries (with search_path = runner, public) hit
+        // `runner.X` first; when the model expects a column that lives
+        // only in `public.X`, queries fail (e.g. DELETE /projects 500 on
+        // missing `runner.software_test_runs.status`).
+        //
+        // Fix is to add the missing columns to runner.* tables. The
+        // column types are PG ENUMs that already exist in the `public`
+        // schema (created by alembic). We reference them cross-schema
+        // (`public.<enumtype>`) rather than duplicating into runner —
+        // schema-level enum consolidation is deferred to Phase 4.
+        //
+        // Defensive: each ALTER TABLE is wrapped in a check that BOTH
+        // the runner.X table AND the public.<enumtype> exist. If either
+        // is missing (fresh DB before alembic has run), the statement
+        // is skipped with a NOTICE and the migration still completes,
+        // so re-running on a properly-initialized DB lands the changes.
+        // The DO block runs all alters in a single transaction.
+        //
+        // Columns are added as nullable. The web SQLAlchemy model marks
+        // them NOT NULL, so the application enforces non-null at insert
+        // time; existing 0-row tables don't need backfill, and avoiding
+        // a default eliminates the question of which enum value is
+        // sensible for legacy rows that don't exist.
+        //
+        // After this migration applies, the matching `public.X` becomes
+        // a structural duplicate of `runner.X` and can be dropped by
+        // re-running migration `e8a3c5b9d142` on the qontinui-web side
+        // (Phase 1 web step, blocked on Phase −1).
+        sql: r#"
+            DO $$
+            DECLARE
+                spec RECORD;
+                added INT := 0;
+                skipped_table INT := 0;
+                skipped_enum INT := 0;
+            BEGIN
+                FOR spec IN
+                    SELECT * FROM (VALUES
+                        ('software_test_runs',           'status',          'testrunstatus'),
+                        ('execution_runs',               'run_type',        'execution_run_type'),
+                        ('execution_runs',               'status',          'execution_run_status'),
+                        ('transition_executions',        'status',          'transitionexecutionstatus'),
+                        ('test_deficiencies',            'deficiency_type', 'deficiencytype'),
+                        ('test_deficiencies',            'severity',        'deficiencyseverity'),
+                        ('test_deficiencies',            'status',          'deficiencystatus'),
+                        ('training_dataset_export_jobs', 'format',          'export_format_enum'),
+                        ('training_dataset_export_jobs', 'status',          'export_job_status_enum'),
+                        ('visual_comparison_results',    'review_decision', 'reviewdecision'),
+                        ('visual_comparison_results',    'status',          'visualcomparisonstatus'),
+                        ('action_executions',            'action_type',     'action_execution_type'),
+                        ('action_executions',            'status',          'action_execution_status'),
+                        ('activity_logs',                'action_type',     'actiontype'),
+                        ('activity_logs',                'resource_type',   'resourcetype'),
+                        ('execution_screenshots',        'screenshot_type', 'execution_screenshot_type'),
+                        ('test_screenshots',             'screenshot_type', 'testscreenshottype')
+                    ) AS s(tbl, col, enum_name)
+                LOOP
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = 'runner' AND table_name = spec.tbl
+                    ) THEN
+                        skipped_table := skipped_table + 1;
+                        RAISE NOTICE 'v32 skip: runner.% does not exist', spec.tbl;
+                        CONTINUE;
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_type t
+                        JOIN pg_namespace n ON n.oid = t.typnamespace
+                        WHERE t.typname = spec.enum_name AND n.nspname = 'public'
+                    ) THEN
+                        skipped_enum := skipped_enum + 1;
+                        RAISE NOTICE 'v32 skip: enum public.% (for runner.%.%) does not exist',
+                            spec.enum_name, spec.tbl, spec.col;
+                        CONTINUE;
+                    END IF;
+
+                    EXECUTE format(
+                        'ALTER TABLE runner.%I ADD COLUMN IF NOT EXISTS %I public.%I',
+                        spec.tbl, spec.col, spec.enum_name
+                    );
+                    added := added + 1;
+                    RAISE NOTICE 'v32 add: runner.%.% (public.%)',
+                        spec.tbl, spec.col, spec.enum_name;
+                END LOOP;
+
+                RAISE NOTICE 'v32 summary: added=%, skipped_table=%, skipped_enum=%',
+                    added, skipped_table, skipped_enum;
+            END $$;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
