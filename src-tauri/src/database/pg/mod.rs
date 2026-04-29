@@ -1219,6 +1219,93 @@ const MIGRATIONS: &[Migration] = &[
                   AND user_decision IS NULL;
         "#,
     },
+    Migration {
+        version: 33,
+        description: "Schema-drift Phase 1 batch 2: add ENUM columns to runner.* tables that the qontinui-web SQLAlchemy models expect (execution_issues.status etc.)",
+        // Companion to v32 (batch 1). Same idea, different table set.
+        // Adds 13 ENUM columns across 8 of the 10 batch-2 tables that the
+        // qontinui-web SQLAlchemy models declare but were missing from
+        // the runner-side schema. Two of the 10 tables — domain_knowledge
+        // and project_embeddings — have no enum drift so they're not in
+        // the spec list (they're still part of the structural drift
+        // survey but resolve via Phase 2/3 work, not enum addition).
+        //
+        // Cross-schema enum reference (`public.<enumtype>`) matches v32:
+        // the ENUM types already exist in `public` (created by alembic);
+        // schema-level enum consolidation is deferred to Phase 4 of the
+        // drift-cleanup plan.
+        //
+        // Defensive DO block: skips any (table, column, enum) triple if
+        // either the runner.X table or the public.<enumtype> doesn't
+        // exist (fresh-DB ordering scenarios), with a NOTICE. Columns
+        // are nullable; SQLAlchemy enforces NOT NULL at the application
+        // layer for new inserts, and existing 0-row tables don't need
+        // backfill.
+        //
+        // After this migration applies (in tandem with v32), the matching
+        // public.* duplicates for these tables become structurally
+        // identical to runner.* and can be dropped by the qontinui-web
+        // alembic migration that re-runs e8a3c5b9d142 on a post-batch-1+2
+        // DB. Drift count: after v32 33→23, after v33 23→13.
+        sql: r#"
+            DO $$
+            DECLARE
+                spec RECORD;
+                added INT := 0;
+                skipped_table INT := 0;
+                skipped_enum INT := 0;
+            BEGIN
+                FOR spec IN
+                    SELECT * FROM (VALUES
+                        ('automation_input_events',      'event_type',      'input_event_type_enum'),
+                        ('execution_issues',             'issue_type',      'execution_issue_type'),
+                        ('execution_issues',             'severity',        'execution_issue_severity'),
+                        ('execution_issues',             'status',          'execution_issue_status'),
+                        ('execution_issues',             'source',          'execution_issue_source'),
+                        ('notifications',                'type',            'notificationtype'),
+                        ('processing_logs',              'phase',           'processingphase'),
+                        ('project_locks',                'resource_type',   'resourcetype'),
+                        ('training_dataset_annotations', 'source',          'annotation_source_enum'),
+                        ('training_dataset_annotations', 'element_type',    'element_type_enum'),
+                        ('training_dataset_annotations', 'review_status',   'review_status_enum'),
+                        ('training_datasets',            'source',          'dataset_source_enum'),
+                        ('workflow_test_associations',   'trigger_point',   'trigger_point')
+                    ) AS s(tbl, col, enum_name)
+                LOOP
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = 'runner' AND table_name = spec.tbl
+                    ) THEN
+                        skipped_table := skipped_table + 1;
+                        RAISE NOTICE 'v33 skip: runner.% does not exist', spec.tbl;
+                        CONTINUE;
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_type t
+                        JOIN pg_namespace n ON n.oid = t.typnamespace
+                        WHERE t.typname = spec.enum_name AND n.nspname = 'public'
+                    ) THEN
+                        skipped_enum := skipped_enum + 1;
+                        RAISE NOTICE 'v33 skip: enum public.% (for runner.%.%) does not exist',
+                            spec.enum_name, spec.tbl, spec.col;
+                        CONTINUE;
+                    END IF;
+
+                    EXECUTE format(
+                        'ALTER TABLE runner.%I ADD COLUMN IF NOT EXISTS %I public.%I',
+                        spec.tbl, spec.col, spec.enum_name
+                    );
+                    added := added + 1;
+                    RAISE NOTICE 'v33 add: runner.%.% (public.%)',
+                        spec.tbl, spec.col, spec.enum_name;
+                END LOOP;
+
+                RAISE NOTICE 'v33 summary: added=%, skipped_table=%, skipped_enum=%',
+                    added, skipped_table, skipped_enum;
+            END $$;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
