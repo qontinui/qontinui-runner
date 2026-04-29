@@ -1470,7 +1470,7 @@ impl PgDb {
             .max_size(8)
             .post_create(deadpool_postgres::Hook::async_fn(|conn, _| {
                 Box::pin(async move {
-                    conn.simple_query("SET search_path TO runner, public")
+                    conn.simple_query("SET search_path TO project, public")
                         .await
                         .map_err(|e| {
                             deadpool_postgres::HookError::Message(

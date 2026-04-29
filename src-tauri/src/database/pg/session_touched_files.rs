@@ -44,7 +44,7 @@ impl PgDb {
         // into a worktree mid-flight (Phase 2 promote method); the latest
         // observed scope wins.
         conn.execute(
-            r#"INSERT INTO session_touched_files
+            r#"INSERT INTO coord.session_touched_files
                    (task_run_id, file_path, worktree_id, recorded_at)
                VALUES ($1, $2, $3, NOW())
                ON CONFLICT (task_run_id, file_path) DO UPDATE
@@ -72,7 +72,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"SELECT file_path
-                   FROM session_touched_files
+                   FROM coord.session_touched_files
                    WHERE task_run_id = $1
                    ORDER BY recorded_at ASC, file_path ASC"#,
                 &[&task_run_id],
@@ -109,7 +109,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"SELECT file_path, task_run_id
-                   FROM session_touched_files
+                   FROM coord.session_touched_files
                    WHERE file_path = ANY($1)
                    ORDER BY recorded_at DESC, file_path ASC"#,
                 &[&file_paths],
@@ -135,7 +135,7 @@ impl PgDb {
 
         let n = conn
             .execute(
-                "DELETE FROM session_touched_files WHERE task_run_id = $1",
+                "DELETE FROM coord.session_touched_files WHERE task_run_id = $1",
                 &[&task_run_id],
             )
             .await
@@ -338,7 +338,7 @@ mod tests {
         let conn = db.pool().get().await.expect("pool");
         let rows = conn
             .query(
-                "SELECT file_path, worktree_id FROM session_touched_files \
+                "SELECT file_path, worktree_id FROM coord.session_touched_files \
                  WHERE task_run_id = $1 ORDER BY file_path ASC",
                 &[&task_run_id],
             )
@@ -381,7 +381,7 @@ mod tests {
         let conn = db.pool().get().await.unwrap();
         let row = conn
             .query_one(
-                "SELECT worktree_id FROM session_touched_files \
+                "SELECT worktree_id FROM coord.session_touched_files \
                  WHERE task_run_id = $1 AND file_path = $2",
                 &[&task_run_id, &"/repo/promoted.rs"],
             )

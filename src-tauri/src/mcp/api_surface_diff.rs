@@ -143,7 +143,7 @@ async fn handle_save_snapshot(
 
     let row = conn
         .query_one(
-            "INSERT INTO api_surface_snapshots (scan_json, summary, total_endpoints, orphan_count) \
+            "INSERT INTO agent.api_surface_snapshots (scan_json, summary, total_endpoints, orphan_count) \
              VALUES ($1, $2, $3, $4) RETURNING id, created_at::text",
             &[&scan_json, &summary, &total_endpoints, &orphan_count],
         )
@@ -207,7 +207,7 @@ async fn handle_list_snapshots(
     let rows = conn
         .query(
             "SELECT id, total_endpoints, orphan_count, summary, created_at::text \
-             FROM api_surface_snapshots ORDER BY created_at DESC LIMIT 50",
+             FROM agent.api_surface_snapshots ORDER BY created_at DESC LIMIT 50",
             &[],
         )
         .await
@@ -250,7 +250,7 @@ async fn load_latest_snapshot(pg: &crate::database::pg::PgDb) -> Option<ApiSurfa
     let conn = pg.pool().get().await.ok()?;
     let row = conn
         .query_opt(
-            "SELECT scan_json FROM api_surface_snapshots ORDER BY created_at DESC LIMIT 1",
+            "SELECT scan_json FROM agent.api_surface_snapshots ORDER BY created_at DESC LIMIT 1",
             &[],
         )
         .await

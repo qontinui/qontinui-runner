@@ -1,0 +1,57 @@
+name: forbid runner.* schema regressions
+
+# Phase 6 deliverable of the migration consolidation
+# (D:/qontinui-root/tmp_migration_consolidation_plan.md §"Phase 6").
+#
+# Fails if any source file (re-)introduces a `runner.<table>` schema
+# reference. Post-consolidation the `runner` schema is retired; tables
+# live in project / coord / agent / auth.
+#
+# Exclusions (legitimate runner.* references that must not trigger):
+# - All Markdown documentation (historical context, plan archaeology).
+# - alembic/versions/ — pre-consolidation chain history.
+# - alembic/_staged_consolidation/ — Phase 1 batches that legitimately
+#   reference runner.* in cleanup ALTER statements; Phase 2 v_32/v_33
+#   preserve runner.* literals in RAISE NOTICE strings by design; the
+#   cleanup revision (zz_final_runner_cleanup) drops the schema and
+#   relocates the survivors.
+# - Clorinde regen script — has documentation comments describing the
+#   runner-schema concept.
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+jobs:
+  forbid-runner-schema:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for forbidden runner.* references
+        run: |
+          set -e
+          # Patterns that must not appear in source post-consolidation:
+          # - SCHEMA runner   (DDL)
+          # - FROM runner.<table>  /  JOIN runner.<table>  /  INTO runner.<table>
+          # - UPDATE runner.<table>  /  DELETE FROM runner.<table>
+          # - ForeignKey("runner.<table>...
+          # - schema="runner"  /  schema='runner'
+          PATTERN='SCHEMA runner|FROM runner\.|JOIN runner\.|INTO runner\.|UPDATE runner\.|DELETE FROM runner\.|ForeignKey\([^)]*runner\.|schema\s*=\s*["'\'']runner["'\'']'
+
+          # git grep returns 1 when nothing matches; flip the exit code so
+          # the workflow fails when patterns ARE found.
+          if git grep -nE "$PATTERN" \
+              -- ':!*.md' \
+                 ':!**/alembic/versions/' \
+                 ':!**/alembic/_staged_consolidation/' \
+                 ':!**/scripts/regenerate_schema_pg_sql.sh' \
+              ; then
+            echo "::error::runner.* schema reference detected in source. The runner schema is retired post-consolidation; tables now live in project / coord / agent / auth."
+            echo "::error::If this is a legitimate historical reference (docs, alembic chain history), add the file pattern to the exclude list in .github/workflows/forbid-runner-schema.yml."
+            exit 1
+          fi
+          echo "No forbidden runner.* references found."

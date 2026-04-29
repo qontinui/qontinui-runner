@@ -55,7 +55,7 @@ impl PgDb {
         let row = conn
             .query_one(
                 r#"
-                INSERT INTO plans (markdown_path, version_hash, status, title, summary)
+                INSERT INTO coord.plans (markdown_path, version_hash, status, title, summary)
                 VALUES ($1, $2, $3, $4, $5)
                 RETURNING id::text, markdown_path, version_hash, status, title, summary,
                           created_at::text, updated_at::text
@@ -97,7 +97,7 @@ impl PgDb {
                 r#"
                 SELECT id::text, markdown_path, version_hash, status, title, summary,
                        created_at::text, updated_at::text
-                FROM plans
+                FROM coord.plans
                 WHERE markdown_path = $1
                 "#,
                 &[&markdown_path],
@@ -130,7 +130,7 @@ impl PgDb {
                 r#"
                 SELECT id::text, markdown_path, version_hash, status, title, summary,
                        created_at::text, updated_at::text
-                FROM plans
+                FROM coord.plans
                 WHERE id = $1::uuid
                 "#,
                 &[&plan_id],
@@ -175,14 +175,14 @@ impl PgDb {
             r#"
             SELECT id::text, markdown_path, version_hash, status, title, summary,
                    created_at::text, updated_at::text
-            FROM plans
+            FROM coord.plans
             ORDER BY created_at DESC
             "#
         } else {
             r#"
             SELECT id::text, markdown_path, version_hash, status, title, summary,
                    created_at::text, updated_at::text
-            FROM plans
+            FROM coord.plans
             WHERE status NOT IN ('done', 'abandoned')
             ORDER BY created_at DESC
             "#
@@ -227,7 +227,7 @@ impl PgDb {
 
         let task_count: i64 = conn
             .query_one(
-                "SELECT COUNT(*)::bigint FROM tasks WHERE plan_id = $1::uuid",
+                "SELECT COUNT(*)::bigint FROM coord.tasks WHERE plan_id = $1::uuid",
                 &[&plan_id],
             )
             .await
@@ -253,7 +253,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE plans
+                UPDATE coord.plans
                 SET status = $2, updated_at = NOW()
                 WHERE id = $1::uuid
                 "#,
@@ -277,7 +277,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                DELETE FROM plans WHERE id = $1::uuid
+                DELETE FROM coord.plans WHERE id = $1::uuid
                 "#,
                 &[&plan_id],
             )

@@ -18,7 +18,7 @@ impl PgDb {
             conn.query(
                 r#"SELECT id, worktree_path, branch_name, source_branch, source_commit,
                           repo_path, task_run_id, workflow_name, status, created_at, updated_at
-                   FROM worktrees WHERE status = $1 ORDER BY created_at DESC"#,
+                   FROM coord.worktrees WHERE status = $1 ORDER BY created_at DESC"#,
                 &[&s],
             )
             .await
@@ -27,7 +27,7 @@ impl PgDb {
             conn.query(
                 r#"SELECT id, worktree_path, branch_name, source_branch, source_commit,
                           repo_path, task_run_id, workflow_name, status, created_at, updated_at
-                   FROM worktrees ORDER BY created_at DESC"#,
+                   FROM coord.worktrees ORDER BY created_at DESC"#,
                 &[],
             )
             .await
@@ -70,7 +70,7 @@ impl PgDb {
         let status_str = record.status.to_string();
 
         conn.execute(
-            r#"INSERT INTO worktrees
+            r#"INSERT INTO coord.worktrees
                (id, worktree_path, branch_name, source_branch, source_commit, repo_path,
                 task_run_id, workflow_name, status, created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz)"#,

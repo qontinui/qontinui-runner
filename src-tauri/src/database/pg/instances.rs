@@ -1,4 +1,4 @@
-//! PostgreSQL runner_instances operations for multi-instance coordination.
+//! PostgreSQL coord.runner_instances operations for multi-instance coordination.
 
 use super::PgDb;
 use serde::Serialize;
@@ -41,7 +41,7 @@ impl PgDb {
         // Remove any stale entry on the same port (from a previous runner with a different id)
         // before upserting. This avoids a unique-constraint violation on the port column.
         conn.execute(
-            "DELETE FROM runner_instances WHERE port = $1 AND id != $2",
+            "DELETE FROM coord.runner_instances WHERE port = $1 AND id != $2",
             &[
                 &port_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -52,7 +52,7 @@ impl PgDb {
 
         conn.execute(
             r#"
-            INSERT INTO runner_instances (id, name, port, hostname, is_primary, pid, status, last_heartbeat, started_at, running_tasks)
+            INSERT INTO coord.runner_instances (id, name, port, hostname, is_primary, pid, status, last_heartbeat, started_at, running_tasks)
             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), 0)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
@@ -92,7 +92,7 @@ impl PgDb {
                 r#"
                 SELECT id, name, port, hostname, is_primary, pid, status,
                        last_heartbeat::TEXT, started_at::TEXT, running_tasks
-                FROM runner_instances
+                FROM coord.runner_instances
                 ORDER BY is_primary DESC, port ASC
                 "#,
                 &[],
@@ -126,7 +126,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         let count = conn
-            .execute("DELETE FROM runner_instances WHERE id = $1", &[&id])
+            .execute("DELETE FROM coord.runner_instances WHERE id = $1", &[&id])
             .await
             .map_err(|e| format!("PG remove_runner_instance: {}", e))?;
 
@@ -150,7 +150,7 @@ impl PgDb {
         let count = conn
             .execute(
                 r#"
-                UPDATE runner_instances
+                UPDATE coord.runner_instances
                 SET last_heartbeat = NOW(),
                     status = $2,
                     running_tasks = COALESCE($3, running_tasks)
@@ -183,7 +183,7 @@ impl PgDb {
         let count = conn
             .execute(
                 r#"
-                UPDATE runner_instances
+                UPDATE coord.runner_instances
                 SET status = 'unhealthy'
                 WHERE status = 'healthy'
                   AND is_primary = FALSE
@@ -212,7 +212,7 @@ impl PgDb {
         let count = conn
             .execute(
                 r#"
-                DELETE FROM runner_instances
+                DELETE FROM coord.runner_instances
                 WHERE status IN ('stopped', 'unhealthy')
                   AND last_heartbeat < NOW() - ($1 * INTERVAL '1 second')
                 "#,

@@ -25,7 +25,7 @@ impl PgDb {
 
         conn.execute(
             r#"
-            INSERT INTO process_sessions (id, process_config_id, process_name, started_at, state)
+            INSERT INTO coord.process_sessions (id, process_config_id, process_name, started_at, state)
             VALUES ($1, $2, $3, $4, 'running')
             "#,
             &[&id, &config_id, &name, &now],
@@ -54,7 +54,7 @@ impl PgDb {
 
         conn.execute(
             r#"
-            UPDATE process_sessions
+            UPDATE coord.process_sessions
             SET stopped_at = $1, state = $2, exit_code = $3, error_count = $4
             WHERE id = $5
             "#,
@@ -89,7 +89,7 @@ impl PgDb {
             conn.query(
                 r#"
                 SELECT id, process_config_id, process_name, started_at, stopped_at, exit_code, state, error_count
-                FROM process_sessions
+                FROM coord.process_sessions
                 WHERE process_config_id = $1
                 ORDER BY started_at DESC
                 LIMIT $2
@@ -101,7 +101,7 @@ impl PgDb {
             conn.query(
                 r#"
                 SELECT id, process_config_id, process_name, started_at, stopped_at, exit_code, state, error_count
-                FROM process_sessions
+                FROM coord.process_sessions
                 ORDER BY started_at DESC
                 LIMIT $1
                 "#,
@@ -152,7 +152,7 @@ impl PgDb {
         // Build a single INSERT with N value tuples: ($1,$2,$3,$4),($5,$6,$7,$8),...
         // Each row has 4 params: session_id, timestamp, stream, line.
         let mut sql = String::from(
-            "INSERT INTO process_session_output (session_id, timestamp, stream, line) VALUES ",
+            "INSERT INTO coord.process_session_output (session_id, timestamp, stream, line) VALUES ",
         );
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
         for (i, (timestamp, stream, line)) in lines.iter().enumerate() {
@@ -199,7 +199,7 @@ impl PgDb {
             .query(
                 r#"
                 SELECT id, session_id, timestamp, stream, line
-                FROM process_session_output
+                FROM coord.process_session_output
                 WHERE session_id = $1
                 ORDER BY id ASC
                 LIMIT $2 OFFSET $3
@@ -244,7 +244,7 @@ impl PgDb {
         let session_row = conn
             .query_opt(
                 r#"
-                SELECT id FROM process_sessions
+                SELECT id FROM coord.process_sessions
                 WHERE process_name = $1
                   AND started_at <= $2::timestamptz
                   AND (stopped_at IS NULL OR stopped_at >= $2::timestamptz)
@@ -271,7 +271,7 @@ impl PgDb {
                 r#"
                 (
                     SELECT id, session_id, timestamp, stream, line
-                    FROM process_session_output
+                    FROM coord.process_session_output
                     WHERE session_id = $1
                       AND timestamp <= $2
                     ORDER BY id DESC
@@ -280,7 +280,7 @@ impl PgDb {
                 UNION ALL
                 (
                     SELECT id, session_id, timestamp, stream, line
-                    FROM process_session_output
+                    FROM coord.process_session_output
                     WHERE session_id = $1
                       AND timestamp > $2
                     ORDER BY id ASC
@@ -329,8 +329,8 @@ impl PgDb {
                 r#"
                 SELECT pso.id, pso.session_id, pso.timestamp, pso.stream, pso.line,
                        ps.process_config_id, ps.process_name
-                FROM process_session_output pso
-                JOIN process_sessions ps ON pso.session_id = ps.id
+                FROM coord.process_session_output pso
+                JOIN coord.process_sessions ps ON pso.session_id = ps.id
                 WHERE pso.line ILIKE $1
                   AND ps.process_config_id = $2
                 ORDER BY pso.id DESC
@@ -344,8 +344,8 @@ impl PgDb {
                 r#"
                 SELECT pso.id, pso.session_id, pso.timestamp, pso.stream, pso.line,
                        ps.process_config_id, ps.process_name
-                FROM process_session_output pso
-                JOIN process_sessions ps ON pso.session_id = ps.id
+                FROM coord.process_session_output pso
+                JOIN coord.process_sessions ps ON pso.session_id = ps.id
                 WHERE pso.line ILIKE $1
                 ORDER BY pso.id DESC
                 LIMIT $2
@@ -398,7 +398,7 @@ impl PgDb {
         let now = Utc::now().to_rfc3339();
         let affected = conn
             .execute(
-                "UPDATE process_sessions \
+                "UPDATE coord.process_sessions \
                  SET state = 'failed', \
                      stopped_at = COALESCE(stopped_at, $1::timestamptz) \
                  WHERE state NOT IN ('stopped', 'failed') \
@@ -423,7 +423,7 @@ impl PgDb {
         let days = retention_days as f64;
         let affected = conn
             .execute(
-                "DELETE FROM process_sessions \
+                "DELETE FROM coord.process_sessions \
                  WHERE started_at < NOW() - ($1 || ' days')::interval",
                 &[&days.to_string()],
             )
@@ -449,10 +449,10 @@ impl PgDb {
         let affected = conn
             .execute(
                 r#"
-                DELETE FROM process_session_output
+                DELETE FROM coord.process_session_output
                 WHERE session_id = $1
                 AND id NOT IN (
-                    SELECT id FROM process_session_output
+                    SELECT id FROM coord.process_session_output
                     WHERE session_id = $1
                     ORDER BY id DESC
                     LIMIT $2
