@@ -1,0 +1,3370 @@
+-- GENERATED FILE — do not hand-edit.
+-- Regenerate via: src-tauri/scripts/regenerate_schema_pg_sql.sh
+--
+-- Source: alembic-managed schema, dumped via pg_dump with
+--   --schema=project --schema=coord --schema=agent --schema=auth
+--   --schema=public --no-owner --no-privileges.
+--
+-- Consumers: Clorinde (validates queries/*.sql against this file).
+--
+-- Determinism: timestamp/runtime-context lines are stripped so two
+-- consecutive runs produce byte-equal output. CI gate fails if
+-- `git diff schema.pg.sql.generated` is non-empty after a fresh run.
+
+--
+-- PostgreSQL database dump
+--
+
+
+-- Dumped from database version 16.13 (Debian 16.13-1.pgdg12+1)
+-- Dumped by pg_dump version 16.13 (Debian 16.13-1.pgdg12+1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: agent; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA agent;
+
+
+--
+-- Name: auth; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA auth;
+
+
+--
+-- Name: coord; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA coord;
+
+
+--
+-- Name: project; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA project;
+
+
+--
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA public;
+
+
+--
+-- Name: action_execution_status; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.action_execution_status AS ENUM (
+    'success',
+    'failed',
+    'timeout',
+    'skipped',
+    'error',
+    'pending'
+);
+
+
+--
+-- Name: action_execution_type; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.action_execution_type AS ENUM (
+    'find',
+    'click',
+    'double_click',
+    'right_click',
+    'type',
+    'key_press',
+    'scroll',
+    'drag',
+    'hover',
+    'wait',
+    'screenshot',
+    'go_to_state',
+    'assert_state',
+    'assert_element',
+    'custom'
+);
+
+
+--
+-- Name: actiontype; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.actiontype AS ENUM (
+    'created',
+    'modified',
+    'deleted',
+    'shared',
+    'commented',
+    'locked',
+    'unlocked',
+    'viewed',
+    'exported',
+    'imported'
+);
+
+
+--
+-- Name: annotation_source_enum; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.annotation_source_enum AS ENUM (
+    'USER_CLICK',
+    'TEMPLATE_MATCHING',
+    'SMART_CLICK_ANALYSIS',
+    'MANUAL'
+);
+
+
+--
+-- Name: dataset_source_enum; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.dataset_source_enum AS ENUM (
+    'RUNNER_EXPORT',
+    'MANUAL_UPLOAD',
+    'MERGED'
+);
+
+
+--
+-- Name: deficiencyseverity; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.deficiencyseverity AS ENUM (
+    'CRITICAL',
+    'HIGH',
+    'MEDIUM',
+    'LOW',
+    'INFO'
+);
+
+
+--
+-- Name: deficiencystatus; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.deficiencystatus AS ENUM (
+    'NEW',
+    'TRIAGED',
+    'ASSIGNED',
+    'IN_PROGRESS',
+    'RESOLVED',
+    'CLOSED',
+    'WONT_FIX'
+);
+
+
+--
+-- Name: deficiencytype; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.deficiencytype AS ENUM (
+    'CRASH',
+    'TIMEOUT',
+    'VISUAL',
+    'FUNCTIONAL',
+    'PERFORMANCE',
+    'DATA',
+    'ACCESSIBILITY',
+    'SECURITY'
+);
+
+
+--
+-- Name: element_type_enum; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.element_type_enum AS ENUM (
+    'BUTTON',
+    'ICON',
+    'TEXT',
+    'IMAGE',
+    'CHECKBOX',
+    'RADIO',
+    'INPUT_FIELD',
+    'LINK',
+    'MENU_ITEM',
+    'TAB',
+    'UNKNOWN'
+);
+
+
+--
+-- Name: execution_issue_severity; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.execution_issue_severity AS ENUM (
+    'critical',
+    'high',
+    'medium',
+    'low',
+    'info'
+);
+
+
+--
+-- Name: execution_issue_source; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.execution_issue_source AS ENUM (
+    'automation',
+    'ai_analysis',
+    'visual_regression',
+    'user_reported'
+);
+
+
+--
+-- Name: execution_issue_status; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.execution_issue_status AS ENUM (
+    'open',
+    'in_progress',
+    'resolved',
+    'wont_fix',
+    'duplicate',
+    'cannot_reproduce'
+);
+
+
+--
+-- Name: execution_issue_type; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.execution_issue_type AS ENUM (
+    'visual_regression',
+    'element_not_found',
+    'state_mismatch',
+    'timeout',
+    'assertion_failed',
+    'navigation_error',
+    'script_error',
+    'performance',
+    'accessibility',
+    'other'
+);
+
+
+--
+-- Name: execution_run_status; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.execution_run_status AS ENUM (
+    'pending',
+    'running',
+    'completed',
+    'failed',
+    'timeout',
+    'cancelled',
+    'paused'
+);
+
+
+--
+-- Name: execution_run_type; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.execution_run_type AS ENUM (
+    'qa_test',
+    'integration_test',
+    'live_automation',
+    'recording',
+    'debug'
+);
+
+
+--
+-- Name: execution_screenshot_type; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.execution_screenshot_type AS ENUM (
+    'before_action',
+    'after_action',
+    'on_error',
+    'on_success',
+    'state_capture',
+    'diff_baseline',
+    'diff_comparison',
+    'manual'
+);
+
+
+--
+-- Name: export_format_enum; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.export_format_enum AS ENUM (
+    'COCO',
+    'YOLO',
+    'PASCAL_VOC',
+    'CSV',
+    'JSONL'
+);
+
+
+--
+-- Name: export_job_status_enum; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.export_job_status_enum AS ENUM (
+    'PENDING',
+    'PROCESSING',
+    'COMPLETED',
+    'FAILED'
+);
+
+
+--
+-- Name: finding_action_type; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.finding_action_type AS ENUM (
+    'auto_fix',
+    'needs_user_input',
+    'informational',
+    'manual'
+);
+
+
+--
+-- Name: finding_category; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.finding_category AS ENUM (
+    'code_bug',
+    'security',
+    'performance',
+    'todo',
+    'enhancement',
+    'config_issue',
+    'test_issue',
+    'documentation',
+    'runtime_issue',
+    'already_fixed',
+    'expected_behavior',
+    'data_migration',
+    'warning'
+);
+
+
+--
+-- Name: finding_severity; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.finding_severity AS ENUM (
+    'critical',
+    'high',
+    'medium',
+    'low',
+    'info'
+);
+
+
+--
+-- Name: finding_status; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.finding_status AS ENUM (
+    'detected',
+    'in_progress',
+    'needs_input',
+    'resolved',
+    'wont_fix',
+    'deferred'
+);
+
+
+--
+-- Name: input_event_type_enum; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.input_event_type_enum AS ENUM (
+    'MOUSE_CLICKED',
+    'MOUSE_MOVED',
+    'MOUSE_DRAGGED',
+    'KEYBOARD_TEXT_TYPED'
+);
+
+
+--
+-- Name: notificationtype; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.notificationtype AS ENUM (
+    'MENTION',
+    'SHARE',
+    'COMMENT',
+    'REPLY',
+    'LOCK_RELEASED',
+    'PROJECT_UPDATE',
+    'TEAM_INVITE',
+    'ACCESS_GRANTED',
+    'ACCESS_REVOKED'
+);
+
+
+--
+-- Name: processingphase; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.processingphase AS ENUM (
+    'FRAME_ANALYSIS',
+    'STATE_IDENTIFICATION',
+    'INTERACTION_PROCESSING',
+    'TRANSITION_DISCOVERY',
+    'STATE_MACHINE_ASSEMBLY',
+    'OPTIMIZATION',
+    'COMPLETED'
+);
+
+
+--
+-- Name: recordingstatus; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.recordingstatus AS ENUM (
+    'UPLOADED',
+    'VALIDATING',
+    'PROCESSING',
+    'COMPLETED',
+    'FAILED',
+    'CANCELLED'
+);
+
+
+--
+-- Name: resourcetype; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.resourcetype AS ENUM (
+    'workflow',
+    'state',
+    'image',
+    'transition',
+    'action',
+    'project'
+);
+
+
+--
+-- Name: review_status_enum; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.review_status_enum AS ENUM (
+    'PENDING',
+    'APPROVED',
+    'REJECTED',
+    'FLAGGED'
+);
+
+
+--
+-- Name: reviewdecision; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.reviewdecision AS ENUM (
+    'APPROVED',
+    'REJECTED',
+    'NEW_BASELINE'
+);
+
+
+--
+-- Name: task_run_status; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.task_run_status AS ENUM (
+    'running',
+    'complete',
+    'failed',
+    'stopped'
+);
+
+
+--
+-- Name: task_type; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.task_type AS ENUM (
+    'task',
+    'automation',
+    'scheduled'
+);
+
+
+--
+-- Name: test_result_status; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.test_result_status AS ENUM (
+    'pending',
+    'running',
+    'passed',
+    'failed',
+    'skipped',
+    'error',
+    'timeout'
+);
+
+
+--
+-- Name: testrunstatus; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.testrunstatus AS ENUM (
+    'RUNNING',
+    'COMPLETED',
+    'FAILED',
+    'CANCELLED',
+    'TIMEOUT'
+);
+
+
+--
+-- Name: testscreenshottype; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.testscreenshottype AS ENUM (
+    'STATE_VERIFICATION',
+    'ACTION_RESULT',
+    'FAILURE',
+    'BEFORE_ACTION',
+    'AFTER_ACTION'
+);
+
+
+--
+-- Name: transitionexecutionstatus; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.transitionexecutionstatus AS ENUM (
+    'SUCCESS',
+    'FAILED',
+    'TIMEOUT',
+    'SKIPPED',
+    'ERROR'
+);
+
+
+--
+-- Name: trigger_point; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.trigger_point AS ENUM (
+    'before_workflow',
+    'after_workflow',
+    'on_checkpoint',
+    'on_action',
+    'on_state_entry',
+    'on_state_exit',
+    'on_error'
+);
+
+
+--
+-- Name: variablescope; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.variablescope AS ENUM (
+    'GLOBAL',
+    'WORKFLOW'
+);
+
+
+--
+-- Name: verification_test_category; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.verification_test_category AS ENUM (
+    'smoke',
+    'regression',
+    'integration',
+    'e2e',
+    'unit',
+    'performance',
+    'security',
+    'accessibility',
+    'visual',
+    'custom'
+);
+
+
+--
+-- Name: verification_test_type; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.verification_test_type AS ENUM (
+    'playwright',
+    'vision',
+    'python',
+    'repo_test',
+    'custom'
+);
+
+
+--
+-- Name: visualcomparisonstatus; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.visualcomparisonstatus AS ENUM (
+    'PASSED',
+    'FAILED',
+    'PENDING_REVIEW',
+    'APPROVED_AS_NEW',
+    'NO_BASELINE'
+);
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: alembic_version; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.alembic_version (
+    version_num character varying(32) NOT NULL
+);
+
+
+--
+-- Name: automation_input_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.automation_input_events (
+    id bigint NOT NULL,
+    session_id uuid NOT NULL,
+    event_type public.input_event_type_enum NOT NULL,
+    "timestamp" timestamp with time zone NOT NULL,
+    mouse_x integer,
+    mouse_y integer,
+    mouse_button character varying(20),
+    drag_from_x integer,
+    drag_from_y integer,
+    drag_to_x integer,
+    drag_to_y integer,
+    drag_duration double precision,
+    drag_path_points jsonb,
+    drag_avg_speed double precision,
+    drag_max_speed double precision,
+    text_typed text,
+    character_count integer,
+    screenshot_before_id uuid,
+    screenshot_after_id uuid,
+    created_at timestamp with time zone NOT NULL
+);
+
+
+--
+-- Name: automation_input_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.automation_input_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: automation_input_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.automation_input_events_id_seq OWNED BY public.automation_input_events.id;
+
+
+--
+-- Name: domain_knowledge; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.domain_knowledge (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    project_id uuid,
+    title character varying(255) NOT NULL,
+    content text NOT NULL,
+    tags jsonb DEFAULT '[]'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    content_embedding public.vector(384)
+);
+
+
+--
+-- Name: COLUMN domain_knowledge.content_embedding; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.domain_knowledge.content_embedding IS '384-dim MiniLM embedding of the knowledge content';
+
+
+--
+-- Name: execution_issues; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.execution_issues (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    run_id uuid NOT NULL,
+    action_execution_id uuid,
+    issue_type public.execution_issue_type NOT NULL,
+    severity public.execution_issue_severity NOT NULL,
+    status public.execution_issue_status NOT NULL,
+    source public.execution_issue_source NOT NULL,
+    title character varying(500) NOT NULL,
+    description text NOT NULL,
+    state_name character varying(255),
+    screenshot_ids jsonb DEFAULT '[]'::jsonb NOT NULL,
+    reproduction_steps jsonb DEFAULT '[]'::jsonb NOT NULL,
+    error_details jsonb DEFAULT '{}'::jsonb NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    assigned_to_user_id uuid,
+    resolution_notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    title_embedding public.vector(384),
+    description_embedding public.vector(384),
+    resolution_embedding public.vector(384)
+);
+
+
+--
+-- Name: COLUMN execution_issues.state_name; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.execution_issues.state_name IS 'State where issue was detected';
+
+
+--
+-- Name: COLUMN execution_issues.screenshot_ids; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.execution_issues.screenshot_ids IS 'Array of screenshot UUIDs related to this issue';
+
+
+--
+-- Name: COLUMN execution_issues.reproduction_steps; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.execution_issues.reproduction_steps IS 'Array of steps to reproduce the issue';
+
+
+--
+-- Name: COLUMN execution_issues.error_details; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.execution_issues.error_details IS 'Detailed error information: stack trace, logs, etc.';
+
+
+--
+-- Name: COLUMN execution_issues.metadata; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.execution_issues.metadata IS 'Additional issue metadata';
+
+
+--
+-- Name: COLUMN execution_issues.title_embedding; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.execution_issues.title_embedding IS '384-dim MiniLM embedding of the issue title';
+
+
+--
+-- Name: COLUMN execution_issues.description_embedding; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.execution_issues.description_embedding IS '384-dim MiniLM embedding of the issue description';
+
+
+--
+-- Name: COLUMN execution_issues.resolution_embedding; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.execution_issues.resolution_embedding IS '384-dim MiniLM embedding of the resolution notes';
+
+
+--
+-- Name: known_issues; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.known_issues (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    organization_id uuid NOT NULL,
+    created_by_user_id uuid NOT NULL,
+    title character varying(500) NOT NULL,
+    description text NOT NULL,
+    category character varying(50) DEFAULT 'other'::character varying NOT NULL,
+    severity character varying(20) DEFAULT 'medium'::character varying NOT NULL,
+    status character varying(20) DEFAULT 'active'::character varying NOT NULL,
+    scope_type character varying(50) DEFAULT 'global'::character varying NOT NULL,
+    scope_value character varying(500),
+    scope_tags jsonb DEFAULT '[]'::jsonb NOT NULL,
+    detection_method character varying(50) DEFAULT 'ai_judgment'::character varying NOT NULL,
+    detection_config jsonb DEFAULT '{}'::jsonb NOT NULL,
+    pattern_template_id character varying(255),
+    reproduction_context text,
+    trigger_conditions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    confidence double precision DEFAULT 0.5 NOT NULL,
+    provenance character varying(50) DEFAULT 'manual'::character varying NOT NULL,
+    source_finding_ids jsonb DEFAULT '[]'::jsonb NOT NULL,
+    source_task_run_id character varying(255),
+    verification_hint text,
+    verification_step_template jsonb,
+    times_detected integer DEFAULT 1 NOT NULL,
+    times_checked integer DEFAULT 0 NOT NULL,
+    last_detected_at timestamp with time zone,
+    last_checked_at timestamp with time zone,
+    resolved_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: notifications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notifications (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    type public.notificationtype NOT NULL,
+    title character varying NOT NULL,
+    message text NOT NULL,
+    project_id uuid,
+    resource_type character varying,
+    resource_id character varying,
+    actor_id uuid,
+    read boolean NOT NULL,
+    read_at timestamp with time zone,
+    metadata json,
+    created_at timestamp with time zone NOT NULL
+);
+
+
+--
+-- Name: phase_results; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.phase_results (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    runner_id uuid,
+    execution_id character varying(255) NOT NULL,
+    phase character varying(32) NOT NULL,
+    iteration integer,
+    stage_index integer,
+    success boolean NOT NULL,
+    all_passed boolean NOT NULL,
+    duration_ms bigint NOT NULL,
+    failure_context text,
+    commit_hash character varying(64),
+    step_results jsonb DEFAULT '[]'::jsonb NOT NULL,
+    variables_set jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: COLUMN phase_results.runner_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.phase_results.runner_id IS 'Runner fleet id that produced this phase result (nullable so history is preserved after a runner is deregistered).';
+
+
+--
+-- Name: COLUMN phase_results.execution_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.phase_results.execution_id IS 'Runner-generated execution identifier the phase belongs to.';
+
+
+--
+-- Name: COLUMN phase_results.phase; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.phase_results.phase IS '''setup'' | ''verification'' | ''agentic'' | ''completion''';
+
+
+--
+-- Name: COLUMN phase_results.iteration; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.phase_results.iteration IS 'Iteration number (NULL for setup/completion).';
+
+
+--
+-- Name: COLUMN phase_results.stage_index; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.phase_results.stage_index IS 'Stage index for multi-stage workflows (NULL = single-stage).';
+
+
+--
+-- Name: COLUMN phase_results.duration_ms; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.phase_results.duration_ms IS 'Phase duration in milliseconds.';
+
+
+--
+-- Name: COLUMN phase_results.commit_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.phase_results.commit_hash IS 'Git commit hash at end of phase (compensation correlation).';
+
+
+--
+-- Name: COLUMN phase_results.step_results; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.phase_results.step_results IS 'Per-step results (list of StepResultRecord JSON objects).';
+
+
+--
+-- Name: COLUMN phase_results.variables_set; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.phase_results.variables_set IS 'Variables set during this phase (NULL = not captured).';
+
+
+--
+-- Name: processing_logs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.processing_logs (
+    id uuid NOT NULL,
+    recording_id uuid NOT NULL,
+    "timestamp" timestamp with time zone NOT NULL,
+    phase public.processingphase NOT NULL,
+    level character varying NOT NULL,
+    message text NOT NULL,
+    data json,
+    progress double precision
+);
+
+
+--
+-- Name: project_embeddings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_embeddings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    project_id uuid NOT NULL,
+    pattern_id character varying(255) NOT NULL,
+    pattern_name character varying(255),
+    state_id character varying(255) NOT NULL,
+    state_name character varying(255) NOT NULL,
+    image_id character varying(255) NOT NULL,
+    image_storage_path character varying(500) NOT NULL,
+    embedding public.vector(512) NOT NULL,
+    embedding_model character varying(100) NOT NULL,
+    embedding_version character varying(50) NOT NULL,
+    pattern_metadata jsonb NOT NULL,
+    image_width integer NOT NULL,
+    image_height integer NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL,
+    text_description character varying(1000),
+    text_embedding public.vector(384)
+);
+
+
+--
+-- Name: project_locks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_locks (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    project_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    resource_type public.resourcetype NOT NULL,
+    resource_id character varying NOT NULL,
+    acquired_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    auto_release boolean NOT NULL,
+    metadata json
+);
+
+
+--
+-- Name: recordings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.recordings (
+    id uuid NOT NULL,
+    project_id uuid NOT NULL,
+    created_by_id uuid NOT NULL,
+    name character varying NOT NULL,
+    description text,
+    tags json,
+    recording_start_time timestamp with time zone NOT NULL,
+    recording_end_time timestamp with time zone NOT NULL,
+    duration_ms integer NOT NULL,
+    recorder_name character varying,
+    recorder_version character varying,
+    recorder_platform character varying,
+    screen_width integer NOT NULL,
+    screen_height integer NOT NULL,
+    screen_dpi integer,
+    os_name character varying,
+    os_version character varying,
+    locale character varying,
+    app_name character varying NOT NULL,
+    app_version character varying,
+    app_type character varying,
+    app_url character varying,
+    frame_rate double precision NOT NULL,
+    total_frames integer NOT NULL,
+    total_interactions integer,
+    total_context_events integer,
+    s3_bucket character varying,
+    s3_prefix character varying,
+    upload_size_bytes integer,
+    status public.recordingstatus NOT NULL,
+    processing_phase public.processingphase,
+    processing_progress double precision,
+    processing_started_at timestamp with time zone,
+    processing_completed_at timestamp with time zone,
+    processing_error text,
+    validation_errors json,
+    validation_warnings json,
+    discovered_states_count integer,
+    discovered_transitions_count integer,
+    discovered_workflows_count integer,
+    discovery_confidence double precision,
+    reviewed boolean,
+    reviewed_at timestamp with time zone,
+    accepted boolean,
+    accepted_at timestamp with time zone,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+
+--
+-- Name: runner_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.runner_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    name character varying(255) NOT NULL,
+    token_hash character varying(255) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone,
+    last_used_at timestamp with time zone,
+    is_revoked boolean DEFAULT false NOT NULL,
+    revoked_at timestamp with time zone,
+    last_ip_address character varying(45),
+    last_user_agent character varying(500)
+);
+
+
+--
+-- Name: COLUMN runner_tokens.name; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runner_tokens.name IS 'User-friendly name like ''My Laptop'', ''Work Desktop''';
+
+
+--
+-- Name: COLUMN runner_tokens.token_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runner_tokens.token_hash IS 'Argon2 hash of the plain token (plain never persisted)';
+
+
+--
+-- Name: COLUMN runner_tokens.expires_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runner_tokens.expires_at IS 'Token expiration time. None = never expires';
+
+
+--
+-- Name: COLUMN runner_tokens.last_used_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runner_tokens.last_used_at IS 'Last time this token was used for authentication';
+
+
+--
+-- Name: COLUMN runner_tokens.is_revoked; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runner_tokens.is_revoked IS 'Soft-delete flag for audit trail';
+
+
+--
+-- Name: COLUMN runner_tokens.revoked_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runner_tokens.revoked_at IS 'When the token was revoked';
+
+
+--
+-- Name: COLUMN runner_tokens.last_ip_address; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runner_tokens.last_ip_address IS 'Last IP address that used this token';
+
+
+--
+-- Name: COLUMN runner_tokens.last_user_agent; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runner_tokens.last_user_agent IS 'Last user agent that used this token';
+
+
+--
+-- Name: runners; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.runners (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    name character varying(255) NOT NULL,
+    hostname character varying(255) NOT NULL,
+    port integer NOT NULL,
+    capabilities jsonb DEFAULT '[]'::jsonb NOT NULL,
+    server_mode boolean DEFAULT true NOT NULL,
+    restate_enabled boolean DEFAULT false NOT NULL,
+    restate_healthy boolean DEFAULT false NOT NULL,
+    last_heartbeat timestamp with time zone,
+    status character varying(32) DEFAULT 'offline'::character varying NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    runner_token_id uuid,
+    dispatch_secret character varying(128) DEFAULT encode(public.gen_random_bytes(32), 'hex'::text) NOT NULL,
+    ui_error jsonb,
+    derived_status character varying(32),
+    recent_crash jsonb
+);
+
+
+--
+-- Name: COLUMN runners.dispatch_secret; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runners.dispatch_secret IS 'Per-runner m2m secret used by web to authenticate workflow dispatch POSTs to the runner. Stored plaintext; rotated on re-registration.';
+
+
+--
+-- Name: COLUMN runners.ui_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runners.ui_error IS 'Most recent UI error reported by the runner (message/stack/component_stack/digest/first_seen/reported_at/count) or NULL if none is outstanding.';
+
+
+--
+-- Name: COLUMN runners.derived_status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runners.derived_status IS 'Runner-derived overall status (healthy|degraded|errored|offline|starting). NULL for pre-Phase-3J runners that have not yet heartbeat with the extended payload.';
+
+
+--
+-- Name: COLUMN runners.recent_crash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runners.recent_crash IS 'Most recent Rust crash dump surfaced by the runner''s startup scanner (file_path/reported_at/panic_location/panic_message/thread) or NULL if no fresh dump is present.';
+
+
+--
+-- Name: scheduled_workflow_runs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scheduled_workflow_runs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    workflow_id uuid NOT NULL,
+    name character varying(255) NOT NULL,
+    description text,
+    cron_expression character varying(255) NOT NULL,
+    target character varying(255) NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    last_fired_at timestamp with time zone,
+    last_execution_id character varying(255),
+    last_status character varying(32),
+    last_error text,
+    redbeat_entry_id character varying(255),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: COLUMN scheduled_workflow_runs.cron_expression; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.scheduled_workflow_runs.cron_expression IS '5-field cron expression, validated via croniter on write.';
+
+
+--
+-- Name: COLUMN scheduled_workflow_runs.target; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.scheduled_workflow_runs.target IS 'Either the literal string ''auto'' or a stringified runner UUID — mirrors the WorkflowDispatchRequest.target shape.';
+
+
+--
+-- Name: COLUMN scheduled_workflow_runs.last_execution_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.scheduled_workflow_runs.last_execution_id IS 'Runner-returned execution_id from the most recent successful dispatch.';
+
+
+--
+-- Name: COLUMN scheduled_workflow_runs.last_status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.scheduled_workflow_runs.last_status IS '''dispatched'' | ''failed'' — outcome of the most recent fire.';
+
+
+--
+-- Name: COLUMN scheduled_workflow_runs.redbeat_entry_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.scheduled_workflow_runs.redbeat_entry_id IS 'Redbeat scheduler key for this row, conventionally ''qontinui:schedule:{id}''. Present when a redbeat entry exists in Redis; cleared when the entry is removed (disable/delete).';
+
+
+--
+-- Name: state_machine_configs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.state_machine_configs (
+    id uuid NOT NULL,
+    project_id uuid NOT NULL,
+    created_by uuid NOT NULL,
+    name character varying NOT NULL,
+    description text,
+    version character varying DEFAULT '1.0.0'::character varying NOT NULL,
+    configuration json NOT NULL,
+    tags json DEFAULT '[]'::json NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+
+--
+-- Name: task_run_findings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.task_run_findings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    task_run_id uuid NOT NULL,
+    category public.finding_category NOT NULL,
+    severity public.finding_severity NOT NULL,
+    status public.finding_status DEFAULT 'detected'::public.finding_status NOT NULL,
+    action_type public.finding_action_type DEFAULT 'auto_fix'::public.finding_action_type NOT NULL,
+    signature_hash character varying(64),
+    title character varying(500) NOT NULL,
+    description text NOT NULL,
+    resolution text,
+    file_path character varying(1000),
+    line_number integer,
+    column_number integer,
+    code_snippet text,
+    detected_in_session integer NOT NULL,
+    resolved_in_session integer,
+    needs_input boolean DEFAULT false NOT NULL,
+    question text,
+    input_options jsonb,
+    user_response text,
+    detected_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolved_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: COLUMN task_run_findings.signature_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.signature_hash IS 'Hash for finding deduplication';
+
+
+--
+-- Name: COLUMN task_run_findings.resolution; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.resolution IS 'How the finding was resolved';
+
+
+--
+-- Name: COLUMN task_run_findings.file_path; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.file_path IS 'File path where finding was detected';
+
+
+--
+-- Name: COLUMN task_run_findings.code_snippet; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.code_snippet IS 'Code snippet showing the issue';
+
+
+--
+-- Name: COLUMN task_run_findings.detected_in_session; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.detected_in_session IS 'Session number where finding was detected';
+
+
+--
+-- Name: COLUMN task_run_findings.resolved_in_session; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.resolved_in_session IS 'Session number where finding was resolved';
+
+
+--
+-- Name: COLUMN task_run_findings.needs_input; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.needs_input IS 'Whether user input is required';
+
+
+--
+-- Name: COLUMN task_run_findings.question; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.question IS 'Question to ask user if input needed';
+
+
+--
+-- Name: COLUMN task_run_findings.input_options; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.input_options IS 'Array of options for user selection';
+
+
+--
+-- Name: COLUMN task_run_findings.user_response; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_run_findings.user_response IS 'User''s response to the question';
+
+
+--
+-- Name: task_runs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.task_runs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    project_id uuid,
+    created_by_user_id uuid,
+    runner_id character varying(255),
+    task_name character varying(255) NOT NULL,
+    prompt text,
+    status public.task_run_status DEFAULT 'running'::public.task_run_status NOT NULL,
+    sessions_count integer DEFAULT 0 NOT NULL,
+    max_sessions integer,
+    auto_continue boolean DEFAULT true NOT NULL,
+    output_summary text,
+    full_output_stored boolean DEFAULT false NOT NULL,
+    full_output text,
+    error_message text,
+    duration_seconds integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    task_type public.task_type DEFAULT 'task'::public.task_type NOT NULL,
+    config_id character varying(255),
+    workflow_name character varying(255),
+    summary text,
+    goal_achieved boolean,
+    remaining_work text,
+    summary_generated_at timestamp with time zone,
+    execution_steps_json text,
+    log_sources_json text
+);
+
+
+--
+-- Name: COLUMN task_runs.runner_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.runner_id IS 'Runner instance identifier';
+
+
+--
+-- Name: COLUMN task_runs.prompt; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.prompt IS 'The task description/instructions (NULL for pure automation)';
+
+
+--
+-- Name: COLUMN task_runs.sessions_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.sessions_count IS 'Number of Claude sessions spawned';
+
+
+--
+-- Name: COLUMN task_runs.max_sessions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.max_sessions IS 'Maximum sessions before giving up (null = unlimited)';
+
+
+--
+-- Name: COLUMN task_runs.auto_continue; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.auto_continue IS 'Whether to automatically spawn new sessions';
+
+
+--
+-- Name: COLUMN task_runs.output_summary; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.output_summary IS 'Summary of task output for display';
+
+
+--
+-- Name: COLUMN task_runs.full_output_stored; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.full_output_stored IS 'Whether full output is stored';
+
+
+--
+-- Name: COLUMN task_runs.full_output; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.full_output IS 'Complete Claude conversation history (premium)';
+
+
+--
+-- Name: COLUMN task_runs.duration_seconds; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.duration_seconds IS 'Total task duration in seconds';
+
+
+--
+-- Name: COLUMN task_runs.task_type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.task_type IS 'Type of task: task, automation, scheduled';
+
+
+--
+-- Name: COLUMN task_runs.config_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.config_id IS 'Config ID for automation tasks';
+
+
+--
+-- Name: COLUMN task_runs.workflow_name; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.workflow_name IS 'Workflow name for automation tasks';
+
+
+--
+-- Name: COLUMN task_runs.summary; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.summary IS 'Post-completion summary';
+
+
+--
+-- Name: COLUMN task_runs.goal_achieved; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.goal_achieved IS 'Whether the task goal was achieved';
+
+
+--
+-- Name: COLUMN task_runs.remaining_work; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.remaining_work IS 'Description of remaining work';
+
+
+--
+-- Name: COLUMN task_runs.summary_generated_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.summary_generated_at IS 'When the summary was generated';
+
+
+--
+-- Name: COLUMN task_runs.execution_steps_json; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.execution_steps_json IS 'JSON array of execution steps configuration';
+
+
+--
+-- Name: COLUMN task_runs.log_sources_json; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.task_runs.log_sources_json IS 'JSON array of log sources to capture';
+
+
+--
+-- Name: test_results; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.test_results (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    test_id uuid,
+    task_run_id uuid,
+    execution_run_id uuid,
+    status public.test_result_status DEFAULT 'pending'::public.test_result_status NOT NULL,
+    started_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    duration_ms integer,
+    output text,
+    error_message text,
+    structured_output jsonb,
+    screenshots jsonb DEFAULT '[]'::jsonb NOT NULL,
+    assertions_passed integer,
+    assertions_failed integer,
+    individual_tests jsonb,
+    coverage jsonb,
+    exit_code integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: COLUMN test_results.test_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.test_id IS 'Reference to the verification test definition';
+
+
+--
+-- Name: COLUMN test_results.task_run_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.task_run_id IS 'Optional reference to AI task run context';
+
+
+--
+-- Name: COLUMN test_results.execution_run_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.execution_run_id IS 'Optional reference to execution run context';
+
+
+--
+-- Name: COLUMN test_results.duration_ms; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.duration_ms IS 'Test execution duration in milliseconds';
+
+
+--
+-- Name: COLUMN test_results.output; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.output IS 'Raw test output (stdout/stderr)';
+
+
+--
+-- Name: COLUMN test_results.error_message; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.error_message IS 'Error message if test failed';
+
+
+--
+-- Name: COLUMN test_results.structured_output; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.structured_output IS 'Structured output data (JSON)';
+
+
+--
+-- Name: COLUMN test_results.screenshots; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.screenshots IS 'Array of screenshot references';
+
+
+--
+-- Name: COLUMN test_results.assertions_passed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.assertions_passed IS 'Number of assertions that passed';
+
+
+--
+-- Name: COLUMN test_results.assertions_failed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.assertions_failed IS 'Number of assertions that failed';
+
+
+--
+-- Name: COLUMN test_results.individual_tests; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.individual_tests IS 'Individual test results within a suite';
+
+
+--
+-- Name: COLUMN test_results.coverage; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.coverage IS 'Code/state coverage data';
+
+
+--
+-- Name: COLUMN test_results.exit_code; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.test_results.exit_code IS 'Process exit code';
+
+
+--
+-- Name: training_dataset_annotations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.training_dataset_annotations (
+    id uuid NOT NULL,
+    dataset_id uuid NOT NULL,
+    image_id uuid NOT NULL,
+    x integer NOT NULL,
+    y integer NOT NULL,
+    width integer NOT NULL,
+    height integer NOT NULL,
+    category_id integer NOT NULL,
+    category_name character varying(100) NOT NULL,
+    confidence double precision NOT NULL,
+    source public.annotation_source_enum NOT NULL,
+    element_type public.element_type_enum,
+    verified boolean NOT NULL,
+    inference_metadata json,
+    review_status public.review_status_enum NOT NULL,
+    reviewer_notes text,
+    reviewed_by_id uuid,
+    reviewed_at timestamp with time zone,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+
+--
+-- Name: training_datasets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.training_datasets (
+    id uuid NOT NULL,
+    name character varying(255) NOT NULL,
+    description text,
+    source public.dataset_source_enum NOT NULL,
+    total_images integer NOT NULL,
+    total_annotations integer NOT NULL,
+    reviewed_count integer NOT NULL,
+    dataset_version character varying(50),
+    export_metadata json,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL,
+    created_by_id uuid NOT NULL
+);
+
+
+--
+-- Name: ui_bridge_states; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ui_bridge_states (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    config_id uuid NOT NULL,
+    state_id character varying(100) NOT NULL,
+    name character varying(255) NOT NULL,
+    description text,
+    element_ids jsonb DEFAULT '[]'::jsonb NOT NULL,
+    render_ids jsonb DEFAULT '[]'::jsonb NOT NULL,
+    confidence double precision DEFAULT '0.9'::double precision NOT NULL,
+    acceptance_criteria jsonb DEFAULT '[]'::jsonb NOT NULL,
+    extra_metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: ui_bridge_transitions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ui_bridge_transitions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    config_id uuid NOT NULL,
+    transition_id character varying(100) NOT NULL,
+    name character varying(255) NOT NULL,
+    from_states json DEFAULT '[]'::json NOT NULL,
+    activate_states json DEFAULT '[]'::json NOT NULL,
+    exit_states json DEFAULT '[]'::json NOT NULL,
+    actions json DEFAULT '[]'::json NOT NULL,
+    path_cost double precision DEFAULT '1'::double precision NOT NULL,
+    stays_visible boolean DEFAULT false NOT NULL,
+    extra_metadata json DEFAULT '{}'::json NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: unified_workflows; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unified_workflows (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    created_by_user_id uuid,
+    project_id uuid,
+    name character varying(255) NOT NULL,
+    description text DEFAULT ''::text NOT NULL,
+    category character varying(100) DEFAULT 'general'::character varying NOT NULL,
+    tags jsonb DEFAULT '[]'::jsonb NOT NULL,
+    setup_steps jsonb DEFAULT '[]'::jsonb NOT NULL,
+    verification_steps jsonb DEFAULT '[]'::jsonb NOT NULL,
+    agentic_steps jsonb DEFAULT '[]'::jsonb NOT NULL,
+    completion_steps jsonb DEFAULT '[]'::jsonb NOT NULL,
+    max_iterations integer DEFAULT 10 NOT NULL,
+    timeout_seconds integer,
+    provider character varying(100),
+    model character varying(100),
+    skip_ai_summary boolean DEFAULT false NOT NULL,
+    log_watch_enabled boolean DEFAULT true NOT NULL,
+    health_check_enabled boolean DEFAULT true NOT NULL,
+    health_check_urls jsonb DEFAULT '[]'::jsonb NOT NULL,
+    preflight_check_enabled boolean DEFAULT true NOT NULL,
+    log_source_selection jsonb DEFAULT '"default"'::jsonb NOT NULL,
+    context_ids jsonb DEFAULT '[]'::jsonb NOT NULL,
+    disabled_context_ids jsonb DEFAULT '[]'::jsonb NOT NULL,
+    auto_include_contexts boolean DEFAULT true NOT NULL,
+    prompt_template text,
+    generated_by_task_run_id character varying(255),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    enable_sweep boolean DEFAULT false NOT NULL,
+    max_sweep_iterations integer DEFAULT 5 NOT NULL,
+    stages jsonb,
+    stop_on_failure boolean DEFAULT false NOT NULL,
+    reflection_mode boolean DEFAULT true NOT NULL,
+    model_overrides jsonb DEFAULT '{}'::jsonb,
+    approval_gate boolean DEFAULT false NOT NULL,
+    constraint_overrides jsonb
+);
+
+
+--
+-- Name: COLUMN unified_workflows.generated_by_task_run_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unified_workflows.generated_by_task_run_id IS 'Task run ID that generated this workflow (e.g. error-fix generator)';
+
+
+--
+-- Name: COLUMN unified_workflows.stages; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unified_workflows.stages IS 'JSON array of WorkflowStage objects for multi-stage execution';
+
+
+--
+-- Name: COLUMN unified_workflows.stop_on_failure; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unified_workflows.stop_on_failure IS 'Whether to stop execution if a stage fails verification';
+
+
+--
+-- Name: COLUMN unified_workflows.reflection_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unified_workflows.reflection_mode IS 'Whether to enable reflection mode during AI iterations';
+
+
+--
+-- Name: COLUMN unified_workflows.model_overrides; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unified_workflows.model_overrides IS 'Per-phase AI model overrides: {phase: {provider, model}}';
+
+
+--
+-- Name: COLUMN unified_workflows.approval_gate; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unified_workflows.approval_gate IS 'Whether to pause for human approval before agentic phase';
+
+
+--
+-- Name: COLUMN unified_workflows.constraint_overrides; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unified_workflows.constraint_overrides IS 'Per-constraint enable/disable overrides keyed by constraint ID';
+
+
+--
+-- Name: verification_tests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.verification_tests (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    project_id uuid NOT NULL,
+    created_by_user_id uuid,
+    name character varying(255) NOT NULL,
+    description text,
+    test_type public.verification_test_type NOT NULL,
+    category public.verification_test_category,
+    playwright_code text,
+    vision_config jsonb,
+    python_code text,
+    repo_test_config jsonb,
+    success_criteria text,
+    config jsonb DEFAULT '{}'::jsonb NOT NULL,
+    timeout_seconds integer DEFAULT 300 NOT NULL,
+    is_critical boolean DEFAULT false NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    ai_generated boolean DEFAULT false NOT NULL,
+    tags jsonb DEFAULT '[]'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: COLUMN verification_tests.playwright_code; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.verification_tests.playwright_code IS 'Playwright test code (TypeScript)';
+
+
+--
+-- Name: COLUMN verification_tests.vision_config; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.verification_tests.vision_config IS 'Vision test configuration (patterns, assertions)';
+
+
+--
+-- Name: COLUMN verification_tests.python_code; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.verification_tests.python_code IS 'Python test code';
+
+
+--
+-- Name: COLUMN verification_tests.repo_test_config; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.verification_tests.repo_test_config IS 'External test runner config (command, working_dir, etc.)';
+
+
+--
+-- Name: COLUMN verification_tests.success_criteria; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.verification_tests.success_criteria IS 'Human-readable success criteria';
+
+
+--
+-- Name: COLUMN verification_tests.config; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.verification_tests.config IS 'Additional test configuration';
+
+
+--
+-- Name: COLUMN verification_tests.timeout_seconds; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.verification_tests.timeout_seconds IS 'Test timeout in seconds';
+
+
+--
+-- Name: COLUMN verification_tests.is_critical; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.verification_tests.is_critical IS 'Whether test failure should block deployment';
+
+
+--
+-- Name: COLUMN verification_tests.ai_generated; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.verification_tests.ai_generated IS 'Whether test was generated by AI';
+
+
+--
+-- Name: workflow_test_associations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflow_test_associations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    project_id uuid NOT NULL,
+    test_id uuid NOT NULL,
+    workflow_id character varying(255) NOT NULL,
+    trigger_point public.trigger_point NOT NULL,
+    checkpoint_name character varying(255),
+    action_id character varying(255),
+    execution_order integer DEFAULT 0 NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: COLUMN workflow_test_associations.workflow_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.workflow_test_associations.workflow_id IS 'Workflow ID from project configuration';
+
+
+--
+-- Name: COLUMN workflow_test_associations.checkpoint_name; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.workflow_test_associations.checkpoint_name IS 'Checkpoint name for on_checkpoint trigger';
+
+
+--
+-- Name: COLUMN workflow_test_associations.action_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.workflow_test_associations.action_id IS 'Action ID for on_action trigger';
+
+
+--
+-- Name: COLUMN workflow_test_associations.execution_order; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.workflow_test_associations.execution_order IS 'Order of execution when multiple tests triggered';
+
+
+--
+-- Name: workflow_variables; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.workflow_variables (
+    id character varying NOT NULL,
+    project_id uuid NOT NULL,
+    workflow_id character varying,
+    name character varying NOT NULL,
+    value json,
+    scope public.variablescope NOT NULL,
+    description character varying,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+
+--
+-- Name: wrapper_comments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.wrapper_comments (
+    id bigint NOT NULL,
+    wrapper_id text NOT NULL,
+    user_id uuid NOT NULL,
+    parent_id bigint,
+    body text NOT NULL,
+    moderation_state text DEFAULT 'visible'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: COLUMN wrapper_comments.moderation_state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.wrapper_comments.moderation_state IS 'visible | flagged | hidden';
+
+
+--
+-- Name: wrapper_comments_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.wrapper_comments ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public.wrapper_comments_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: wrapper_entries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.wrapper_entries (
+    id text NOT NULL,
+    package text NOT NULL,
+    latest_version text NOT NULL,
+    display_name text NOT NULL,
+    description text,
+    categories jsonb DEFAULT '[]'::jsonb NOT NULL,
+    transport text NOT NULL,
+    author_json jsonb NOT NULL,
+    repo text,
+    license text,
+    verified boolean DEFAULT false NOT NULL,
+    registry_synced_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: COLUMN wrapper_entries.id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.wrapper_entries.id IS 'Mirrors the wrapper.id field in registry.json.';
+
+
+--
+-- Name: COLUMN wrapper_entries.transport; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.wrapper_entries.transport IS 'api | headless | headed | live';
+
+
+--
+-- Name: COLUMN wrapper_entries.author_json; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.wrapper_entries.author_json IS '{name, url?, email?}';
+
+
+--
+-- Name: wrapper_install_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.wrapper_install_events (
+    id bigint NOT NULL,
+    wrapper_id text NOT NULL,
+    runner_id_hash text NOT NULL,
+    version text,
+    installed_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: COLUMN wrapper_install_events.runner_id_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.wrapper_install_events.runner_id_hash IS 'sha256 of runner id; never the raw value (privacy).';
+
+
+--
+-- Name: wrapper_install_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.wrapper_install_events ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public.wrapper_install_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: wrapper_ratings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.wrapper_ratings (
+    id bigint NOT NULL,
+    wrapper_id text NOT NULL,
+    user_id uuid NOT NULL,
+    stars smallint NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT wrapper_ratings_stars_check CHECK (((stars >= 1) AND (stars <= 5)))
+);
+
+
+--
+-- Name: wrapper_ratings_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.wrapper_ratings ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public.wrapper_ratings_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: automation_input_events id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.automation_input_events ALTER COLUMN id SET DEFAULT nextval('public.automation_input_events_id_seq'::regclass);
+
+
+--
+-- Name: task_run_findings ai_task_findings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_run_findings
+    ADD CONSTRAINT ai_task_findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: task_runs ai_tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_runs
+    ADD CONSTRAINT ai_tasks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: alembic_version alembic_version_pkc; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.alembic_version
+    ADD CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num);
+
+
+--
+-- Name: automation_input_events automation_input_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.automation_input_events
+    ADD CONSTRAINT automation_input_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: domain_knowledge domain_knowledge_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.domain_knowledge
+    ADD CONSTRAINT domain_knowledge_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: execution_issues execution_issues_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_issues
+    ADD CONSTRAINT execution_issues_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: known_issues known_issues_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.known_issues
+    ADD CONSTRAINT known_issues_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: phase_results phase_results_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.phase_results
+    ADD CONSTRAINT phase_results_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: processing_logs processing_logs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.processing_logs
+    ADD CONSTRAINT processing_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: project_embeddings project_embeddings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_embeddings
+    ADD CONSTRAINT project_embeddings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: project_locks project_locks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_locks
+    ADD CONSTRAINT project_locks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: recordings recordings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.recordings
+    ADD CONSTRAINT recordings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: runner_tokens runner_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runner_tokens
+    ADD CONSTRAINT runner_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: runners runners_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runners
+    ADD CONSTRAINT runners_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: scheduled_workflow_runs scheduled_workflow_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_workflow_runs
+    ADD CONSTRAINT scheduled_workflow_runs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: scheduled_workflow_runs scheduled_workflow_runs_redbeat_entry_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_workflow_runs
+    ADD CONSTRAINT scheduled_workflow_runs_redbeat_entry_id_key UNIQUE (redbeat_entry_id);
+
+
+--
+-- Name: state_machine_configs state_machine_configs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_machine_configs
+    ADD CONSTRAINT state_machine_configs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: test_results test_results_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_results
+    ADD CONSTRAINT test_results_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: training_dataset_annotations training_dataset_annotations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.training_dataset_annotations
+    ADD CONSTRAINT training_dataset_annotations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: training_datasets training_datasets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.training_datasets
+    ADD CONSTRAINT training_datasets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ui_bridge_states ui_bridge_states_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_bridge_states
+    ADD CONSTRAINT ui_bridge_states_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ui_bridge_transitions ui_bridge_transitions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_bridge_transitions
+    ADD CONSTRAINT ui_bridge_transitions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unified_workflows unified_workflows_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unified_workflows
+    ADD CONSTRAINT unified_workflows_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: workflow_variables uq_project_workflow_var; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_variables
+    ADD CONSTRAINT uq_project_workflow_var UNIQUE (project_id, workflow_id, name);
+
+
+--
+-- Name: verification_tests verification_tests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.verification_tests
+    ADD CONSTRAINT verification_tests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: workflow_test_associations workflow_test_associations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_test_associations
+    ADD CONSTRAINT workflow_test_associations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: workflow_variables workflow_variables_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_variables
+    ADD CONSTRAINT workflow_variables_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: wrapper_comments wrapper_comments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_comments
+    ADD CONSTRAINT wrapper_comments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: wrapper_entries wrapper_entries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_entries
+    ADD CONSTRAINT wrapper_entries_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: wrapper_install_events wrapper_install_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_install_events
+    ADD CONSTRAINT wrapper_install_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: wrapper_ratings wrapper_ratings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_ratings
+    ADD CONSTRAINT wrapper_ratings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: wrapper_ratings wrapper_ratings_wrapper_id_user_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_ratings
+    ADD CONSTRAINT wrapper_ratings_wrapper_id_user_id_key UNIQUE (wrapper_id, user_id);
+
+
+--
+-- Name: ix_ai_task_findings_category; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ai_task_findings_category ON public.task_run_findings USING btree (category);
+
+
+--
+-- Name: ix_ai_task_findings_severity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ai_task_findings_severity ON public.task_run_findings USING btree (severity);
+
+
+--
+-- Name: ix_ai_task_findings_signature_hash; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ai_task_findings_signature_hash ON public.task_run_findings USING btree (signature_hash);
+
+
+--
+-- Name: ix_ai_task_findings_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ai_task_findings_status ON public.task_run_findings USING btree (status);
+
+
+--
+-- Name: ix_ai_task_findings_task_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ai_task_findings_task_id ON public.task_run_findings USING btree (task_run_id);
+
+
+--
+-- Name: ix_ai_tasks_created_by_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ai_tasks_created_by_user_id ON public.task_runs USING btree (created_by_user_id);
+
+
+--
+-- Name: ix_ai_tasks_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ai_tasks_project_id ON public.task_runs USING btree (project_id);
+
+
+--
+-- Name: ix_ai_tasks_runner_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ai_tasks_runner_id ON public.task_runs USING btree (runner_id);
+
+
+--
+-- Name: ix_ai_tasks_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ai_tasks_status ON public.task_runs USING btree (status);
+
+
+--
+-- Name: ix_automation_input_events_event_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_automation_input_events_event_type ON public.automation_input_events USING btree (event_type);
+
+
+--
+-- Name: ix_automation_input_events_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_automation_input_events_id ON public.automation_input_events USING btree (id);
+
+
+--
+-- Name: ix_automation_input_events_session_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_automation_input_events_session_id ON public.automation_input_events USING btree (session_id);
+
+
+--
+-- Name: ix_automation_input_events_session_timestamp; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_automation_input_events_session_timestamp ON public.automation_input_events USING btree (session_id, "timestamp");
+
+
+--
+-- Name: ix_domain_knowledge_content_embedding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_domain_knowledge_content_embedding ON public.domain_knowledge USING ivfflat (content_embedding public.vector_cosine_ops) WITH (lists='10');
+
+
+--
+-- Name: ix_domain_knowledge_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_domain_knowledge_project_id ON public.domain_knowledge USING btree (project_id);
+
+
+--
+-- Name: ix_execution_issues_action_execution_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_action_execution_id ON public.execution_issues USING btree (action_execution_id);
+
+
+--
+-- Name: ix_execution_issues_assigned_to_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_assigned_to_user_id ON public.execution_issues USING btree (assigned_to_user_id);
+
+
+--
+-- Name: ix_execution_issues_description_embedding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_description_embedding ON public.execution_issues USING ivfflat (description_embedding public.vector_cosine_ops) WITH (lists='10');
+
+
+--
+-- Name: ix_execution_issues_issue_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_issue_type ON public.execution_issues USING btree (issue_type);
+
+
+--
+-- Name: ix_execution_issues_run_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_run_id ON public.execution_issues USING btree (run_id);
+
+
+--
+-- Name: ix_execution_issues_run_severity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_run_severity ON public.execution_issues USING btree (run_id, severity);
+
+
+--
+-- Name: ix_execution_issues_run_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_run_status ON public.execution_issues USING btree (run_id, status);
+
+
+--
+-- Name: ix_execution_issues_screenshot_ids; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_screenshot_ids ON public.execution_issues USING gin (screenshot_ids jsonb_path_ops);
+
+
+--
+-- Name: ix_execution_issues_severity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_severity ON public.execution_issues USING btree (severity);
+
+
+--
+-- Name: ix_execution_issues_source; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_source ON public.execution_issues USING btree (source);
+
+
+--
+-- Name: ix_execution_issues_state_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_state_name ON public.execution_issues USING btree (state_name);
+
+
+--
+-- Name: ix_execution_issues_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_status ON public.execution_issues USING btree (status);
+
+
+--
+-- Name: ix_execution_issues_title_embedding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_execution_issues_title_embedding ON public.execution_issues USING ivfflat (title_embedding public.vector_cosine_ops) WITH (lists='10');
+
+
+--
+-- Name: ix_known_issues_category; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_known_issues_category ON public.known_issues USING btree (category);
+
+
+--
+-- Name: ix_known_issues_created_by_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_known_issues_created_by_user_id ON public.known_issues USING btree (created_by_user_id);
+
+
+--
+-- Name: ix_known_issues_organization_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_known_issues_organization_id ON public.known_issues USING btree (organization_id);
+
+
+--
+-- Name: ix_known_issues_severity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_known_issues_severity ON public.known_issues USING btree (severity);
+
+
+--
+-- Name: ix_known_issues_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_known_issues_status ON public.known_issues USING btree (status);
+
+
+--
+-- Name: ix_notifications_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_created_at ON public.notifications USING btree (created_at);
+
+
+--
+-- Name: ix_notifications_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_project_id ON public.notifications USING btree (project_id);
+
+
+--
+-- Name: ix_notifications_read; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_read ON public.notifications USING btree (read);
+
+
+--
+-- Name: ix_notifications_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_type ON public.notifications USING btree (type);
+
+
+--
+-- Name: ix_notifications_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_notifications_user_id ON public.notifications USING btree (user_id);
+
+
+--
+-- Name: ix_phase_results_execution_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_phase_results_execution_id ON public.phase_results USING btree (execution_id);
+
+
+--
+-- Name: ix_phase_results_execution_id_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_phase_results_execution_id_created_at ON public.phase_results USING btree (execution_id, created_at);
+
+
+--
+-- Name: ix_phase_results_runner_id_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_phase_results_runner_id_created_at ON public.phase_results USING btree (runner_id, created_at);
+
+
+--
+-- Name: ix_processing_logs_phase; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_processing_logs_phase ON public.processing_logs USING btree (recording_id, phase);
+
+
+--
+-- Name: ix_processing_logs_recording_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_processing_logs_recording_id ON public.processing_logs USING btree (recording_id);
+
+
+--
+-- Name: ix_processing_logs_recording_time; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_processing_logs_recording_time ON public.processing_logs USING btree (recording_id, "timestamp");
+
+
+--
+-- Name: ix_project_embeddings_image_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_project_embeddings_image_id ON public.project_embeddings USING btree (image_id);
+
+
+--
+-- Name: ix_project_embeddings_pattern_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_project_embeddings_pattern_id ON public.project_embeddings USING btree (pattern_id);
+
+
+--
+-- Name: ix_project_embeddings_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_project_embeddings_project_id ON public.project_embeddings USING btree (project_id);
+
+
+--
+-- Name: ix_project_embeddings_project_pattern; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_project_embeddings_project_pattern ON public.project_embeddings USING btree (project_id, pattern_id);
+
+
+--
+-- Name: ix_project_embeddings_state_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_project_embeddings_state_id ON public.project_embeddings USING btree (state_id);
+
+
+--
+-- Name: ix_project_locks_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_project_locks_project_id ON public.project_locks USING btree (project_id);
+
+
+--
+-- Name: ix_project_locks_resource_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_project_locks_resource_id ON public.project_locks USING btree (resource_id);
+
+
+--
+-- Name: ix_project_locks_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_project_locks_user_id ON public.project_locks USING btree (user_id);
+
+
+--
+-- Name: ix_recordings_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_recordings_created_at ON public.recordings USING btree (created_at);
+
+
+--
+-- Name: ix_recordings_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_recordings_project_id ON public.recordings USING btree (project_id);
+
+
+--
+-- Name: ix_recordings_project_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_recordings_project_status ON public.recordings USING btree (project_id, status);
+
+
+--
+-- Name: ix_recordings_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_recordings_status ON public.recordings USING btree (status);
+
+
+--
+-- Name: ix_runner_tokens_is_revoked; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_runner_tokens_is_revoked ON public.runner_tokens USING btree (is_revoked);
+
+
+--
+-- Name: ix_runner_tokens_last_used_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_runner_tokens_last_used_at ON public.runner_tokens USING btree (last_used_at);
+
+
+--
+-- Name: ix_runner_tokens_token_hash; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ix_runner_tokens_token_hash ON public.runner_tokens USING btree (token_hash);
+
+
+--
+-- Name: ix_runner_tokens_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_runner_tokens_user_id ON public.runner_tokens USING btree (user_id);
+
+
+--
+-- Name: ix_runners_runner_token_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_runners_runner_token_id ON public.runners USING btree (runner_token_id);
+
+
+--
+-- Name: ix_runners_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_runners_status ON public.runners USING btree (status);
+
+
+--
+-- Name: ix_runners_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_runners_user_id ON public.runners USING btree (user_id);
+
+
+--
+-- Name: ix_scheduled_workflow_runs_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_scheduled_workflow_runs_user_id ON public.scheduled_workflow_runs USING btree (user_id);
+
+
+--
+-- Name: ix_scheduled_workflow_runs_user_workflow; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_scheduled_workflow_runs_user_workflow ON public.scheduled_workflow_runs USING btree (user_id, workflow_id);
+
+
+--
+-- Name: ix_scheduled_workflow_runs_workflow_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_scheduled_workflow_runs_workflow_id ON public.scheduled_workflow_runs USING btree (workflow_id);
+
+
+--
+-- Name: ix_state_machine_configs_created_by; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_state_machine_configs_created_by ON public.state_machine_configs USING btree (created_by);
+
+
+--
+-- Name: ix_state_machine_configs_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_state_machine_configs_id ON public.state_machine_configs USING btree (id);
+
+
+--
+-- Name: ix_state_machine_configs_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_state_machine_configs_name ON public.state_machine_configs USING btree (name);
+
+
+--
+-- Name: ix_state_machine_configs_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_state_machine_configs_project_id ON public.state_machine_configs USING btree (project_id);
+
+
+--
+-- Name: ix_task_runs_config_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_task_runs_config_id ON public.task_runs USING btree (config_id);
+
+
+--
+-- Name: ix_task_runs_task_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_task_runs_task_type ON public.task_runs USING btree (task_type);
+
+
+--
+-- Name: ix_test_results_execution_run_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_test_results_execution_run_id ON public.test_results USING btree (execution_run_id);
+
+
+--
+-- Name: ix_test_results_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_test_results_status ON public.test_results USING btree (status);
+
+
+--
+-- Name: ix_test_results_task_run_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_test_results_task_run_id ON public.test_results USING btree (task_run_id);
+
+
+--
+-- Name: ix_test_results_test_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_test_results_test_id ON public.test_results USING btree (test_id);
+
+
+--
+-- Name: ix_training_dataset_annotations_confidence; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_training_dataset_annotations_confidence ON public.training_dataset_annotations USING btree (dataset_id, confidence);
+
+
+--
+-- Name: ix_training_dataset_annotations_dataset; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_training_dataset_annotations_dataset ON public.training_dataset_annotations USING btree (dataset_id);
+
+
+--
+-- Name: ix_training_dataset_annotations_image; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_training_dataset_annotations_image ON public.training_dataset_annotations USING btree (image_id);
+
+
+--
+-- Name: ix_training_dataset_annotations_review; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_training_dataset_annotations_review ON public.training_dataset_annotations USING btree (dataset_id, review_status);
+
+
+--
+-- Name: ix_training_dataset_annotations_source; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_training_dataset_annotations_source ON public.training_dataset_annotations USING btree (dataset_id, source);
+
+
+--
+-- Name: ix_training_datasets_created_by; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_training_datasets_created_by ON public.training_datasets USING btree (created_by_id);
+
+
+--
+-- Name: ix_training_datasets_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_training_datasets_name ON public.training_datasets USING btree (name);
+
+
+--
+-- Name: ix_ui_bridge_states_config_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ui_bridge_states_config_id ON public.ui_bridge_states USING btree (config_id);
+
+
+--
+-- Name: ix_ui_bridge_transitions_config_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_ui_bridge_transitions_config_id ON public.ui_bridge_transitions USING btree (config_id);
+
+
+--
+-- Name: ix_unified_workflows_category; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_unified_workflows_category ON public.unified_workflows USING btree (category);
+
+
+--
+-- Name: ix_unified_workflows_created_by_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_unified_workflows_created_by_user_id ON public.unified_workflows USING btree (created_by_user_id);
+
+
+--
+-- Name: ix_unified_workflows_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_unified_workflows_project_id ON public.unified_workflows USING btree (project_id);
+
+
+--
+-- Name: ix_verification_tests_category; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_verification_tests_category ON public.verification_tests USING btree (category);
+
+
+--
+-- Name: ix_verification_tests_created_by_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_verification_tests_created_by_user_id ON public.verification_tests USING btree (created_by_user_id);
+
+
+--
+-- Name: ix_verification_tests_enabled; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_verification_tests_enabled ON public.verification_tests USING btree (enabled);
+
+
+--
+-- Name: ix_verification_tests_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_verification_tests_project_id ON public.verification_tests USING btree (project_id);
+
+
+--
+-- Name: ix_verification_tests_test_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_verification_tests_test_type ON public.verification_tests USING btree (test_type);
+
+
+--
+-- Name: ix_workflow_test_associations_enabled; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_workflow_test_associations_enabled ON public.workflow_test_associations USING btree (enabled);
+
+
+--
+-- Name: ix_workflow_test_associations_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_workflow_test_associations_project_id ON public.workflow_test_associations USING btree (project_id);
+
+
+--
+-- Name: ix_workflow_test_associations_test_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_workflow_test_associations_test_id ON public.workflow_test_associations USING btree (test_id);
+
+
+--
+-- Name: ix_workflow_test_associations_trigger_point; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_workflow_test_associations_trigger_point ON public.workflow_test_associations USING btree (trigger_point);
+
+
+--
+-- Name: ix_workflow_test_associations_workflow_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_workflow_test_associations_workflow_id ON public.workflow_test_associations USING btree (workflow_id);
+
+
+--
+-- Name: ix_workflow_variables_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_workflow_variables_name ON public.workflow_variables USING btree (name);
+
+
+--
+-- Name: ix_workflow_variables_project_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_workflow_variables_project_id ON public.workflow_variables USING btree (project_id);
+
+
+--
+-- Name: ix_workflow_variables_scope; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_workflow_variables_scope ON public.workflow_variables USING btree (scope);
+
+
+--
+-- Name: ix_workflow_variables_workflow_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_workflow_variables_workflow_id ON public.workflow_variables USING btree (workflow_id);
+
+
+--
+-- Name: wrapper_comments_wrapper_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX wrapper_comments_wrapper_idx ON public.wrapper_comments USING btree (wrapper_id, created_at);
+
+
+--
+-- Name: wrapper_entries_categories_gin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX wrapper_entries_categories_gin ON public.wrapper_entries USING gin (categories);
+
+
+--
+-- Name: wrapper_install_events_wrapper_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX wrapper_install_events_wrapper_idx ON public.wrapper_install_events USING btree (wrapper_id);
+
+
+--
+-- Name: wrapper_ratings_wrapper_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX wrapper_ratings_wrapper_idx ON public.wrapper_ratings USING btree (wrapper_id);
+
+
+--
+-- Name: task_run_findings ai_task_findings_task_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_run_findings
+    ADD CONSTRAINT ai_task_findings_task_id_fkey FOREIGN KEY (task_run_id) REFERENCES public.task_runs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: task_runs ai_tasks_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.task_runs
+    ADD CONSTRAINT ai_tasks_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES runner.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: execution_issues execution_issues_assigned_to_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.execution_issues
+    ADD CONSTRAINT execution_issues_assigned_to_user_id_fkey FOREIGN KEY (assigned_to_user_id) REFERENCES runner.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: known_issues known_issues_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.known_issues
+    ADD CONSTRAINT known_issues_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES runner.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notifications notifications_actor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_actor_id_fkey FOREIGN KEY (actor_id) REFERENCES runner.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: notifications notifications_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES runner.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: phase_results phase_results_runner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.phase_results
+    ADD CONSTRAINT phase_results_runner_id_fkey FOREIGN KEY (runner_id) REFERENCES public.runners(id) ON DELETE SET NULL;
+
+
+--
+-- Name: processing_logs processing_logs_recording_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.processing_logs
+    ADD CONSTRAINT processing_logs_recording_id_fkey FOREIGN KEY (recording_id) REFERENCES public.recordings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_locks project_locks_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_locks
+    ADD CONSTRAINT project_locks_user_id_fkey FOREIGN KEY (user_id) REFERENCES runner.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: recordings recordings_created_by_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.recordings
+    ADD CONSTRAINT recordings_created_by_id_fkey FOREIGN KEY (created_by_id) REFERENCES runner.users(id);
+
+
+--
+-- Name: runner_tokens runner_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runner_tokens
+    ADD CONSTRAINT runner_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES runner.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: runners runners_runner_token_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runners
+    ADD CONSTRAINT runners_runner_token_id_fkey FOREIGN KEY (runner_token_id) REFERENCES public.runner_tokens(id) ON DELETE SET NULL;
+
+
+--
+-- Name: runners runners_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runners
+    ADD CONSTRAINT runners_user_id_fkey FOREIGN KEY (user_id) REFERENCES runner.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: scheduled_workflow_runs scheduled_workflow_runs_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_workflow_runs
+    ADD CONSTRAINT scheduled_workflow_runs_user_id_fkey FOREIGN KEY (user_id) REFERENCES runner.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: scheduled_workflow_runs scheduled_workflow_runs_workflow_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_workflow_runs
+    ADD CONSTRAINT scheduled_workflow_runs_workflow_id_fkey FOREIGN KEY (workflow_id) REFERENCES public.unified_workflows(id) ON DELETE CASCADE;
+
+
+--
+-- Name: state_machine_configs state_machine_configs_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_machine_configs
+    ADD CONSTRAINT state_machine_configs_created_by_fkey FOREIGN KEY (created_by) REFERENCES runner.users(id);
+
+
+--
+-- Name: test_results test_results_task_run_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_results
+    ADD CONSTRAINT test_results_task_run_id_fkey FOREIGN KEY (task_run_id) REFERENCES public.task_runs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: test_results test_results_test_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.test_results
+    ADD CONSTRAINT test_results_test_id_fkey FOREIGN KEY (test_id) REFERENCES public.verification_tests(id) ON DELETE CASCADE;
+
+
+--
+-- Name: training_dataset_annotations training_dataset_annotations_dataset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.training_dataset_annotations
+    ADD CONSTRAINT training_dataset_annotations_dataset_id_fkey FOREIGN KEY (dataset_id) REFERENCES public.training_datasets(id) ON DELETE CASCADE;
+
+
+--
+-- Name: training_dataset_annotations training_dataset_annotations_reviewed_by_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.training_dataset_annotations
+    ADD CONSTRAINT training_dataset_annotations_reviewed_by_id_fkey FOREIGN KEY (reviewed_by_id) REFERENCES runner.users(id);
+
+
+--
+-- Name: training_datasets training_datasets_created_by_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.training_datasets
+    ADD CONSTRAINT training_datasets_created_by_id_fkey FOREIGN KEY (created_by_id) REFERENCES runner.users(id);
+
+
+--
+-- Name: verification_tests verification_tests_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.verification_tests
+    ADD CONSTRAINT verification_tests_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES runner.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: workflow_test_associations workflow_test_associations_test_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.workflow_test_associations
+    ADD CONSTRAINT workflow_test_associations_test_id_fkey FOREIGN KEY (test_id) REFERENCES public.verification_tests(id) ON DELETE CASCADE;
+
+
+--
+-- Name: wrapper_comments wrapper_comments_parent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_comments
+    ADD CONSTRAINT wrapper_comments_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.wrapper_comments(id) ON DELETE CASCADE;
+
+
+--
+-- Name: wrapper_comments wrapper_comments_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_comments
+    ADD CONSTRAINT wrapper_comments_user_id_fkey FOREIGN KEY (user_id) REFERENCES runner.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: wrapper_comments wrapper_comments_wrapper_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_comments
+    ADD CONSTRAINT wrapper_comments_wrapper_id_fkey FOREIGN KEY (wrapper_id) REFERENCES public.wrapper_entries(id) ON DELETE CASCADE;
+
+
+--
+-- Name: wrapper_install_events wrapper_install_events_wrapper_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_install_events
+    ADD CONSTRAINT wrapper_install_events_wrapper_id_fkey FOREIGN KEY (wrapper_id) REFERENCES public.wrapper_entries(id) ON DELETE CASCADE;
+
+
+--
+-- Name: wrapper_ratings wrapper_ratings_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_ratings
+    ADD CONSTRAINT wrapper_ratings_user_id_fkey FOREIGN KEY (user_id) REFERENCES runner.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: wrapper_ratings wrapper_ratings_wrapper_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.wrapper_ratings
+    ADD CONSTRAINT wrapper_ratings_wrapper_id_fkey FOREIGN KEY (wrapper_id) REFERENCES public.wrapper_entries(id) ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
