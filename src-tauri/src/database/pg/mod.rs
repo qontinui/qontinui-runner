@@ -1315,6 +1315,84 @@ const MIGRATIONS: &[Migration] = &[
             END $$;
         "#,
     },
+    Migration {
+        version: 33,
+        description: "Schema-drift Phase 2 (deferred_questions slice): align runner.deferred_questions column types to match the SQLAlchemy model (text → uuid/varchar)",
+        // Background: runner.deferred_questions has 6 columns typed as TEXT
+        // (the runner-historical default, originally for sqlite parity) where
+        // the qontinui-web SQLAlchemy model expects UUID and VARCHAR(N). Both
+        // schemas have 0 rows currently, so the type changes are risk-free.
+        //
+        // Once these align, the empty public.deferred_questions duplicate
+        // becomes droppable by the next re-run of the introspection-based
+        // drop logic from `e8a3c5b9d142` (paired qontinui-web migration in
+        // a sibling PR).
+        //
+        // Defensive: each ALTER COLUMN TYPE is wrapped so it skips if the
+        // column is already the target type (idempotent re-run). All run
+        // inside the migration's enclosing transaction.
+        sql: r#"
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'runner' AND table_name = 'deferred_questions'
+                ) THEN
+                    RAISE NOTICE 'v33 skip: runner.deferred_questions does not exist';
+                    RETURN;
+                END IF;
+
+                -- id: text -> uuid + add gen_random_uuid() default
+                IF (SELECT data_type FROM information_schema.columns
+                    WHERE table_schema='runner' AND table_name='deferred_questions' AND column_name='id') = 'text' THEN
+                    ALTER TABLE runner.deferred_questions
+                        ALTER COLUMN id TYPE uuid USING id::uuid,
+                        ALTER COLUMN id SET DEFAULT gen_random_uuid();
+                    RAISE NOTICE 'v33 fix: runner.deferred_questions.id text -> uuid (with gen_random_uuid default)';
+                END IF;
+
+                -- task_run_id: text -> uuid
+                IF (SELECT data_type FROM information_schema.columns
+                    WHERE table_schema='runner' AND table_name='deferred_questions' AND column_name='task_run_id') = 'text' THEN
+                    ALTER TABLE runner.deferred_questions
+                        ALTER COLUMN task_run_id TYPE uuid USING task_run_id::uuid;
+                    RAISE NOTICE 'v33 fix: runner.deferred_questions.task_run_id text -> uuid';
+                END IF;
+
+                -- status: text -> varchar(50), keep 'pending' default
+                IF (SELECT data_type FROM information_schema.columns
+                    WHERE table_schema='runner' AND table_name='deferred_questions' AND column_name='status') = 'text' THEN
+                    ALTER TABLE runner.deferred_questions
+                        ALTER COLUMN status TYPE varchar(50);
+                    RAISE NOTICE 'v33 fix: runner.deferred_questions.status text -> varchar(50)';
+                END IF;
+
+                -- risk_level: text -> varchar(50)
+                IF (SELECT data_type FROM information_schema.columns
+                    WHERE table_schema='runner' AND table_name='deferred_questions' AND column_name='risk_level') = 'text' THEN
+                    ALTER TABLE runner.deferred_questions
+                        ALTER COLUMN risk_level TYPE varchar(50);
+                    RAISE NOTICE 'v33 fix: runner.deferred_questions.risk_level text -> varchar(50)';
+                END IF;
+
+                -- auto_decision_type: text -> varchar(100)
+                IF (SELECT data_type FROM information_schema.columns
+                    WHERE table_schema='runner' AND table_name='deferred_questions' AND column_name='auto_decision_type') = 'text' THEN
+                    ALTER TABLE runner.deferred_questions
+                        ALTER COLUMN auto_decision_type TYPE varchar(100);
+                    RAISE NOTICE 'v33 fix: runner.deferred_questions.auto_decision_type text -> varchar(100)';
+                END IF;
+
+                -- git_checkpoint: text -> varchar(255)
+                IF (SELECT data_type FROM information_schema.columns
+                    WHERE table_schema='runner' AND table_name='deferred_questions' AND column_name='git_checkpoint') = 'text' THEN
+                    ALTER TABLE runner.deferred_questions
+                        ALTER COLUMN git_checkpoint TYPE varchar(255);
+                    RAISE NOTICE 'v33 fix: runner.deferred_questions.git_checkpoint text -> varchar(255)';
+                END IF;
+            END $$;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
