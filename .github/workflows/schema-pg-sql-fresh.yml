@@ -1,0 +1,114 @@
+name: schema.pg.sql.generated freshness
+
+# Runs the Clorinde schema regenerator and fails if the checked-in
+# schema.pg.sql.generated differs from a fresh dump. This is the
+# Phase 6 deliverable of the migration consolidation
+# (D:/qontinui-root/tmp_migration_consolidation_plan.md §"Phase 5"
+# verification gate).
+#
+# Trigger posture
+# ---------------
+# Currently set to `workflow_dispatch` only (manual). Reason: the
+# regenerator depends on the alembic chain in the sibling qontinui-web
+# repository, which isn't checked out in this workflow yet.
+#
+# After the consolidation transplants `_staged_consolidation/*` into
+# `qontinui-web/backend/alembic/versions/`, change `on:` to include
+# `pull_request: branches: [main, develop]` so every PR is gated.
+
+on:
+  workflow_dispatch:
+  # Pre-transplant: keep this disabled.
+  # pull_request:
+  #   branches: [main, develop]
+  #   paths:
+  #     - "qontinui-runner/src-tauri/queries/**"
+  #     - "qontinui-runner/src-tauri/schema.pg.sql.generated"
+
+jobs:
+  schema-fresh:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: qontinui_user
+          POSTGRES_PASSWORD: qontinui_dev_password
+          POSTGRES_DB: qontinui_db
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U qontinui_user -d qontinui_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout qontinui-runner
+        uses: actions/checkout@v4
+        with:
+          path: qontinui-runner
+
+      - name: Checkout qontinui-web (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/qontinui-web
+          path: qontinui-web
+          # Use the same branch name if it exists in qontinui-web,
+          # otherwise main. Avoids drift when both repos move together.
+          ref: ${{ github.head_ref || github.ref_name }}
+          # Token in the workflow secrets to allow cross-repo checkout.
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install alembic dependencies
+        working-directory: qontinui-web/backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install alembic sqlalchemy psycopg2-binary python-dotenv
+
+      - name: Apply alembic chain
+        working-directory: qontinui-web/backend
+        env:
+          DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
+        run: alembic upgrade head
+
+      - name: Install Postgres client (for pg_dump)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-16
+
+      - name: Stash checked-in artifact
+        working-directory: qontinui-runner/src-tauri
+        run: cp schema.pg.sql.generated /tmp/schema.checked-in.sql
+
+      - name: Regenerate (native pg_dump, no docker)
+        working-directory: qontinui-runner
+        env:
+          # Empty CLORINDE_PG_CONTAINER triggers the script's native
+          # pg_dump path (no docker-exec). Postgres client was installed
+          # in the previous step.
+          CLORINDE_PG_CONTAINER: ""
+          CLORINDE_PG_HOST: localhost
+          CLORINDE_PG_PORT: "5433"
+          PGPASSWORD: qontinui_dev_password
+        run: bash src-tauri/scripts/regenerate_schema_pg_sql.sh
+
+      - name: Diff against checked-in
+        working-directory: qontinui-runner/src-tauri
+        run: |
+          if ! diff -q /tmp/schema.checked-in.sql schema.pg.sql.generated; then
+            echo "::error::schema.pg.sql.generated is stale relative to a fresh alembic upgrade head + pg_dump."
+            echo "::error::Regenerate locally via:"
+            echo "::error::  bash src-tauri/scripts/regenerate_schema_pg_sql.sh"
+            echo ""
+            echo "Diff:"
+            diff -u /tmp/schema.checked-in.sql schema.pg.sql.generated | head -80
+            exit 1
+          fi
+          echo "schema.pg.sql.generated is up to date."
