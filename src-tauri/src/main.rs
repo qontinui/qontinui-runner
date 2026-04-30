@@ -269,16 +269,27 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize VideoRecordingService
     let video_recorder = Arc::new(Mutex::new(VideoRecordingService::new()));
 
-    // Initialize PostgreSQL connection (required — local docker-compose PG).
-    // Uses RUNNER_DATABASE_URL env var, or defaults to the local docker-compose PostgreSQL.
-    // Uses a dedicated tokio runtime for the one-shot async connection — cannot use
-    // tauri::async_runtime::block_on here because the Tauri runtime hasn't started yet.
-    // Initialize PG and run one-time data migration in the same tokio runtime.
-    // Critical: PG pool connections are tied to their creating runtime.
+    // Initialize PostgreSQL connection.
+    //
+    // Connection settings come from `~/.qontinui/profiles.json` per the
+    // canonical-DB topology (see `tmp_canonical_db_topology_plan.md` §3 and
+    // `crate::profiles`). Selection order: `QONTINUI_ENV` env var → file's
+    // `active` field → `dev`. Falls back to legacy `RUNNER_DATABASE_URL`
+    // env var (and ultimately a localhost default) when profiles.json is
+    // missing, so unmigrated machines remain bootable.
+    //
+    // Uses a dedicated tokio runtime for the one-shot async connection —
+    // cannot use tauri::async_runtime::block_on here because the Tauri
+    // runtime hasn't started yet. PG pool connections are tied to their
+    // creating runtime, so this same runtime stays alive for the rest of
+    // the bootstrap path.
     let pg_db: Arc<crate::database::pg::PgDb> = {
-        let pg_url = std::env::var("RUNNER_DATABASE_URL").unwrap_or_else(|_| {
-            "host=localhost port=5432 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db".to_string()
-        });
+        let profile = qontinui_runner_lib::profiles::load();
+        info!(
+            "Connecting to canonical PG via profile '{}'",
+            profile.source
+        );
+        let pg_url = profile.database_url;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
