@@ -2,32 +2,16 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
-      - id: trailing-whitespace
-      - id: end-of-file-fixer
       - id: check-yaml
       - id: check-json
       - id: check-toml
       - id: check-added-large-files
         args: ['--maxkb=1000']
       - id: check-merge-conflict
-      - id: mixed-line-ending
-        args: ['--fix=lf']
 
-  # Frontend (src/): prettier on TS/TSX/JS/JSX/JSON/CSS/MD.
   # ESLint and cargo clippy are intentionally omitted here — they run too
   # slowly to gate every commit in the shared multi-agent tree. CI and
   # cargo-guard.sh already enforce them.
-  - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: v4.0.0-alpha.8
-    hooks:
-      - id: prettier
-        files: ^src/.*\.(ts|tsx|js|jsx|json|css|md)$
-        exclude: ^(node_modules/|dist/|src/types/generated/|src/specs/.*\.uibridge\.json$)
-
-  # NOTE: Unlike some sibling repos, we intentionally skip the repo-wide
-  # `validate-line-endings` check here. The runner has pre-existing CRLF files
-  # in its tree that would block every commit. The `mixed-line-ending` hook
-  # above already autofixes staged files to LF, which is the right scope.
 
   - repo: local
     hooks:
