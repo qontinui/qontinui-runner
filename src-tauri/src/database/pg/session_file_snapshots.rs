@@ -76,7 +76,7 @@ impl PgDb {
             .query_one(
                 &format!(
                     r#"
-                    INSERT INTO session_file_snapshots
+                    INSERT INTO coord.session_file_snapshots
                         (session_id, file_path, snapshot_blob_path, blob_sha256,
                          captured_before)
                     VALUES ($1, $2, $3, $4, $5)
@@ -115,7 +115,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM session_file_snapshots
+                    FROM coord.session_file_snapshots
                     WHERE session_id = $1
                     ORDER BY taken_at ASC
                     "#,
@@ -149,7 +149,7 @@ impl PgDb {
             .query_one(
                 r#"
                 SELECT EXISTS(
-                    SELECT 1 FROM session_file_snapshots
+                    SELECT 1 FROM coord.session_file_snapshots
                     WHERE session_id = $1
                       AND file_path = $2
                       AND captured_before = TRUE
@@ -187,7 +187,7 @@ impl PgDb {
             .query(
                 r#"
                 SELECT id::text, snapshot_blob_path
-                FROM session_file_snapshots
+                FROM coord.session_file_snapshots
                 WHERE taken_at < NOW() - ($1 || ' days')::interval
                 "#,
                 &[&days.to_string()],
@@ -217,7 +217,7 @@ impl PgDb {
         let deleted =
             conn.execute(
                 r#"
-                DELETE FROM session_file_snapshots
+                DELETE FROM coord.session_file_snapshots
                 WHERE taken_at < NOW() - ($1 || ' days')::interval
                 "#,
                 &[&days.to_string()],

@@ -34,7 +34,7 @@ impl PgDb {
         let now = chrono::Utc::now();
 
         conn.execute(
-            r#"INSERT INTO cached_app_specs (id, app_url, app_name, spec_id, spec_json, discovered_at, page_url)
+            r#"INSERT INTO agent.cached_app_specs (id, app_url, app_name, spec_id, spec_json, discovered_at, page_url)
                VALUES ($1, $2, $3, $4, $5, $6, $7)
                ON CONFLICT (id) DO UPDATE SET
                    app_name = EXCLUDED.app_name,
@@ -63,7 +63,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"SELECT id, app_url, app_name, spec_id, spec_json, discovered_at, page_url
-                   FROM cached_app_specs
+                   FROM agent.cached_app_specs
                    WHERE app_url = $1
                    ORDER BY spec_id"#,
                 &[&app_url],
@@ -96,7 +96,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"SELECT id, app_url, app_name, spec_id, spec_json, discovered_at, page_url
-                   FROM cached_app_specs
+                   FROM agent.cached_app_specs
                    ORDER BY app_url, spec_id"#,
                 &[],
             )
@@ -127,7 +127,7 @@ impl PgDb {
 
         let deleted = conn
             .execute(
-                "DELETE FROM cached_app_specs WHERE app_url = $1",
+                "DELETE FROM agent.cached_app_specs WHERE app_url = $1",
                 &[&app_url],
             )
             .await

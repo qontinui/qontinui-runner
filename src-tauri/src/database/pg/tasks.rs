@@ -117,7 +117,7 @@ impl PgDb {
             .query_one(
                 &format!(
                     r#"
-                    INSERT INTO tasks (
+                    INSERT INTO coord.tasks (
                         plan_id, plan_version_hash, phase_name, sequence_in_phase,
                         description, expected_file_claims, expected_dirs,
                         depends_on, status, notes
@@ -161,7 +161,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 &format!(
-                    "SELECT {} FROM tasks WHERE id = $1::uuid",
+                    "SELECT {} FROM coord.tasks WHERE id = $1::uuid",
                     SELECT_TASK_COLUMNS
                 ),
                 &[&task_id],
@@ -185,7 +185,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM tasks
+                    FROM coord.tasks
                     WHERE plan_id = $1::uuid
                     ORDER BY phase_name, sequence_in_phase
                     "#,
@@ -213,7 +213,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM tasks
+                    FROM coord.tasks
                     WHERE plan_id = $1::uuid
                       AND status = ANY($2::text[])
                     ORDER BY phase_name, sequence_in_phase
@@ -242,7 +242,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM tasks
+                    FROM coord.tasks
                     WHERE status = ANY($1::text[])
                     ORDER BY created_at ASC
                     "#,
@@ -271,14 +271,14 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"
-                UPDATE tasks t
+                UPDATE coord.tasks t
                 SET status = 'ready', updated_at = NOW()
                 WHERE t.plan_id = $1::uuid
                   AND t.status = 'pending'
                   AND NOT EXISTS (
                       SELECT 1 FROM unnest(t.depends_on) AS dep_id
                       WHERE NOT EXISTS (
-                          SELECT 1 FROM tasks d
+                          SELECT 1 FROM coord.tasks d
                           WHERE d.id = dep_id AND d.status = 'done'
                       )
                   )
@@ -312,7 +312,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE tasks
+                UPDATE coord.tasks
                 SET assigned_session_id = $2,
                     status = CASE WHEN status IN ('ready', 'needs_fix')
                                   THEN 'assigned' ELSE status END,
@@ -356,7 +356,7 @@ impl PgDb {
         let sql = match to {
             "running" => {
                 r#"
-                UPDATE tasks
+                UPDATE coord.tasks
                 SET status = $3,
                     started_at = COALESCE(started_at, NOW()),
                     updated_at = NOW()
@@ -365,7 +365,7 @@ impl PgDb {
             }
             "done" | "cancelled" => {
                 r#"
-                UPDATE tasks
+                UPDATE coord.tasks
                 SET status = $3,
                     completed_at = NOW(),
                     updated_at = NOW()
@@ -374,7 +374,7 @@ impl PgDb {
             }
             _ => {
                 r#"
-                UPDATE tasks
+                UPDATE coord.tasks
                 SET status = $3, updated_at = NOW()
                 WHERE id = $1::uuid AND status = $2
                 "#

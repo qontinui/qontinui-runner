@@ -1,4 +1,4 @@
-//! PostgreSQL CRUD for the `coordinator_leader` singleton (migration v29).
+//! PostgreSQL CRUD for the `coord.coordinator_leader` singleton (migration v29).
 //!
 //! Per productivity-stack §6 ("Multi-instance awareness"), only one
 //! `/coordinate` session may run at a time across the runner's PG-shared
@@ -58,19 +58,19 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                INSERT INTO coordinator_leader (id, instance_id, leased_until, acquired_at, renewed_at)
+                INSERT INTO coord.coordinator_leader (id, instance_id, leased_until, acquired_at, renewed_at)
                 VALUES (TRUE, $1, NOW() + ($2::bigint || ' seconds')::interval, NOW(), NOW())
                 ON CONFLICT (id) DO UPDATE
                     SET instance_id   = EXCLUDED.instance_id,
                         leased_until  = EXCLUDED.leased_until,
                         acquired_at   = CASE
-                            WHEN coordinator_leader.instance_id = EXCLUDED.instance_id
-                                THEN coordinator_leader.acquired_at
+                            WHEN coord.coordinator_leader.instance_id = EXCLUDED.instance_id
+                                THEN coord.coordinator_leader.acquired_at
                             ELSE NOW()
                         END,
                         renewed_at    = NOW()
-                    WHERE coordinator_leader.leased_until <= NOW()
-                       OR coordinator_leader.instance_id = EXCLUDED.instance_id
+                    WHERE coord.coordinator_leader.leased_until <= NOW()
+                       OR coord.coordinator_leader.instance_id = EXCLUDED.instance_id
                 "#,
                 &[&instance_id, &ttl_seconds],
             )
@@ -97,7 +97,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coordinator_leader
+                UPDATE coord.coordinator_leader
                 SET leased_until = NOW() + ($2::bigint || ' seconds')::interval,
                     renewed_at   = NOW()
                 WHERE id = TRUE
@@ -128,7 +128,7 @@ impl PgDb {
                        leased_until::text,
                        acquired_at::text,
                        renewed_at::text
-                FROM coordinator_leader
+                FROM coord.coordinator_leader
                 WHERE id = TRUE
                 "#,
                 &[],

@@ -138,13 +138,13 @@ async fn decompose_plan(
     let plan_row = txn
         .query_one(
             r#"
-            INSERT INTO plans (markdown_path, version_hash, status, title, summary)
+            INSERT INTO coord.plans (markdown_path, version_hash, status, title, summary)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (markdown_path) DO UPDATE
                 SET version_hash = EXCLUDED.version_hash,
                     status       = EXCLUDED.status,
-                    title        = COALESCE(EXCLUDED.title, plans.title),
-                    summary      = COALESCE(EXCLUDED.summary, plans.summary),
+                    title        = COALESCE(EXCLUDED.title, coord.plans.title),
+                    summary      = COALESCE(EXCLUDED.summary, coord.plans.summary),
                     updated_at   = NOW()
             RETURNING id::text, version_hash
             "#,
@@ -168,7 +168,7 @@ async fn decompose_plan(
 
     // 2. Replace tasks for this plan. The cascade-on-delete also removes
     //    any review/snapshot rows once those tables exist (later phases).
-    txn.execute("DELETE FROM tasks WHERE plan_id = $1::uuid", &[&plan_id])
+    txn.execute("DELETE FROM coord.tasks WHERE plan_id = $1::uuid", &[&plan_id])
         .await
         .map_err(|e| {
             (
@@ -185,7 +185,7 @@ async fn decompose_plan(
         let row = txn
             .query_one(
                 r#"
-                INSERT INTO tasks (
+                INSERT INTO coord.tasks (
                     plan_id, plan_version_hash, phase_name, sequence_in_phase,
                     description, expected_file_claims, expected_dirs,
                     depends_on, status, notes
@@ -226,7 +226,7 @@ async fn decompose_plan(
             .collect();
         txn.execute(
             r#"
-            UPDATE tasks
+            UPDATE coord.tasks
             SET depends_on = (
                 SELECT COALESCE(array_agg(d::uuid), '{}'::uuid[])
                 FROM unnest($2::text[]) d
@@ -249,7 +249,7 @@ async fn decompose_plan(
     //    used elsewhere by mark_ready_for_unblocked, scoped to this plan.
     txn.execute(
         r#"
-        UPDATE tasks
+        UPDATE coord.tasks
         SET status = 'ready', updated_at = NOW()
         WHERE plan_id = $1::uuid
           AND status = 'pending'

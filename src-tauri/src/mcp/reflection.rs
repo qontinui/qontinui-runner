@@ -101,7 +101,7 @@ pub async fn compute_reflection(
                 COUNT(*)::bigint                                                AS total,
                 COUNT(*) FILTER (WHERE status = 'done')::bigint                 AS completed,
                 COUNT(*) FILTER (WHERE status = 'escalated')::bigint            AS escalated
-            FROM tasks
+            FROM coord.tasks
             WHERE plan_id = $1::uuid
             "#,
             &[&plan_id],
@@ -119,8 +119,8 @@ pub async fn compute_reflection(
         .query_one(
             r#"
             SELECT AVG(r.confidence)::float8 AS avg_conf
-            FROM reviews r
-            JOIN tasks  t ON t.id = r.task_id
+            FROM coord.reviews r
+            JOIN coord.tasks  t ON t.id = r.task_id
             WHERE t.plan_id = $1::uuid
             "#,
             &[&plan_id],
@@ -137,7 +137,7 @@ pub async fn compute_reflection(
             r#"
             SELECT COUNT(*)::bigint
             FROM productivity_knowledge k
-            JOIN tasks t ON t.id = k.task_id
+            JOIN coord.tasks t ON t.id = k.task_id
             WHERE t.plan_id = $1::uuid
             "#,
             &[&plan_id],
@@ -153,7 +153,7 @@ pub async fn compute_reflection(
             r#"
             SELECT k.id::text, k.area, k.summary
             FROM productivity_knowledge k
-            JOIN tasks t ON t.id = k.task_id
+            JOIN coord.tasks t ON t.id = k.task_id
             WHERE t.plan_id = $1::uuid
             ORDER BY k.created_at DESC
             LIMIT 5
@@ -177,8 +177,8 @@ pub async fn compute_reflection(
         .query(
             r#"
             SELECT r.id::text, r.task_id::text, r.verdict, r.confidence, r.created_at::text
-            FROM reviews r
-            JOIN tasks t ON t.id = r.task_id
+            FROM coord.reviews r
+            JOIN coord.tasks t ON t.id = r.task_id
             WHERE t.plan_id = $1::uuid
             ORDER BY r.created_at DESC
             "#,
@@ -276,7 +276,7 @@ pub async fn compute_plan_recommendations(
         .query(
             r#"
             SELECT DISTINCT assigned_session_id
-            FROM tasks
+            FROM coord.tasks
             WHERE assigned_session_id IS NOT NULL
               AND status IN ('assigned', 'running', 'review', 'needs_fix')
             "#,
@@ -302,7 +302,7 @@ pub async fn compute_plan_recommendations(
             .query_one(
                 r#"
                 SELECT COUNT(*)::bigint
-                FROM tasks
+                FROM coord.tasks
                 WHERE plan_id = $1::uuid
                   AND status IN ('ready', 'pending')
                   AND assigned_session_id IS NULL

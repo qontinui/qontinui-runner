@@ -149,7 +149,7 @@ impl PgDb {
             .query_one(
                 &format!(
                     r#"
-                    INSERT INTO reviews (
+                    INSERT INTO coord.reviews (
                         task_id, reviewer_session_id, reviewed_session_id,
                         verdict, confidence, reasoning,
                         diff_summary, test_results
@@ -188,7 +188,7 @@ impl PgDb {
 
         let row = conn
             .query_opt(
-                &format!("SELECT {} FROM reviews WHERE id = $1::uuid", SELECT_COLS),
+                &format!("SELECT {} FROM coord.reviews WHERE id = $1::uuid", SELECT_COLS),
                 &[&review_id],
             )
             .await
@@ -215,7 +215,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM reviews
+                    FROM coord.reviews
                     WHERE reviewed_session_id = $1
                     ORDER BY created_at DESC
                     LIMIT 1
@@ -244,7 +244,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM reviews
+                    FROM coord.reviews
                     WHERE task_id = $1::uuid
                     ORDER BY created_at DESC
                     "#,
@@ -277,7 +277,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM reviews
+                    FROM coord.reviews
                     WHERE created_at >= NOW() - make_interval(secs => $1::double precision)
                     ORDER BY created_at DESC
                     LIMIT $2
@@ -305,7 +305,7 @@ impl PgDb {
             .query_one(
                 r#"
                 SELECT COUNT(*)::bigint
-                FROM reviews
+                FROM coord.reviews
                 WHERE task_id = $1::uuid AND verdict = 'needs_fix'
                 "#,
                 &[&task_id],
@@ -331,7 +331,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM reviews
+                    FROM coord.reviews
                     WHERE verdict = 'approved'
                       AND confidence >= 0.7
                       AND confidence < 0.85
@@ -371,7 +371,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE reviews
+                UPDATE coord.reviews
                 SET user_decision = $2,
                     user_decided_at = NOW()
                 WHERE id = $1::uuid

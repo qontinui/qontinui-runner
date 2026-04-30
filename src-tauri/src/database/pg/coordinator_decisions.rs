@@ -92,7 +92,7 @@ impl PgDb {
             .query_one(
                 &format!(
                     r#"
-                    INSERT INTO coordinator_decisions
+                    INSERT INTO coord.coordinator_decisions
                         (session_id, iteration, rule, action, target_id,
                          reasoning, auto_acted)
                     VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -130,7 +130,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 &format!(
-                    "SELECT {} FROM coordinator_decisions WHERE id = $1::uuid",
+                    "SELECT {} FROM coord.coordinator_decisions WHERE id = $1::uuid",
                     SELECT_COLS
                 ),
                 &[&decision_id],
@@ -163,7 +163,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coordinator_decisions
+                    FROM coord.coordinator_decisions
                     WHERE ($2::text IS NULL OR rule = $2)
                       AND ($3::text IS NULL OR action = $3)
                     ORDER BY created_at DESC
@@ -196,7 +196,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coordinator_decisions
+                    FROM coord.coordinator_decisions
                     WHERE session_id = $1
                     ORDER BY created_at DESC
                     LIMIT $2
@@ -226,7 +226,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coordinator_decisions
+                    FROM coord.coordinator_decisions
                     WHERE resolved = FALSE
                       AND auto_acted = FALSE
                       AND action IN ('escalate', 'kill-session', 'force-promote-to-worktree')
@@ -259,7 +259,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coordinator_decisions
+                UPDATE coord.coordinator_decisions
                 SET resolved = TRUE,
                     resolution = $2,
                     resolved_at = NOW()

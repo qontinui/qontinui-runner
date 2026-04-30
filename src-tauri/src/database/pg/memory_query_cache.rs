@@ -20,7 +20,7 @@ impl PgDb {
 
         let row = conn
             .query_opt(
-                "UPDATE memory_query_cache
+                "UPDATE agent.memory_query_cache
                  SET hit_count = hit_count + 1
                  WHERE query_hash = $1 AND reasoning_level = $2 AND expires_at > NOW()
                  RETURNING result_json",
@@ -47,7 +47,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         conn.execute(
-            "INSERT INTO memory_query_cache (query_hash, reasoning_level, result_json, expires_at)
+            "INSERT INTO agent.memory_query_cache (query_hash, reasoning_level, result_json, expires_at)
              VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::INTERVAL)
              ON CONFLICT (query_hash, reasoning_level)
              DO UPDATE SET result_json = EXCLUDED.result_json,
@@ -77,7 +77,7 @@ impl PgDb {
 
         let deleted = conn
             .execute(
-                "DELETE FROM memory_query_cache WHERE expires_at <= NOW()",
+                "DELETE FROM agent.memory_query_cache WHERE expires_at <= NOW()",
                 &[],
             )
             .await
