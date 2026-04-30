@@ -173,7 +173,7 @@ If not using the Python client:
 
 `/ui-bridge/ai/find` request body: `{ query: string, minConfidence?: number, includeHidden?: bool, context?: object, confidenceThreshold?: number }`.
 
-- `includeHidden` (bool, optional, default false): match elements regardless of visibility — useful when driving collapsed-sidebar nav.
+- `includeHidden` (bool, optional, **default true**): match elements regardless of visibility — preserves historical front-end behaviour (the registry contains hidden elements like collapsed-sidebar children). Pass `false` to opt into the visibility filter.
 
 ### Choosing a wait / nav / batch primitive
 

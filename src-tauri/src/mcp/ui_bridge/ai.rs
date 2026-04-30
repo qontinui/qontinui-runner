@@ -51,17 +51,16 @@ pub async fn ui_bridge_ai_search_handler(
 /// home — every other field is still forwarded as-is via the underlying
 /// `serde_json::Value` body, so adding new query knobs (e.g. `context`,
 /// `confidenceThreshold`) doesn't require a struct edit. `include_hidden`
-/// is the one field whose default we need to be explicit about: missing
-/// or `false` keeps the prior behaviour (visibility filter applied);
-/// `true` matches against every registered element regardless of
-/// `state.visible`, which is what callers need when driving collapsed
-/// sidebars or tabs whose targets are off-screen but still in the
-/// registry.
+/// defaults to `true`: callers that omit it match against every
+/// registered element regardless of `state.visible`, which is the
+/// historical front-end behaviour (the IPC handler hardcoded
+/// `SearchEngine({ includeHidden: true })`). Callers that pass
+/// `includeHidden: false` opt into the visibility filter.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiFindRequest {
-    /// When true, skip the visibility filter — match elements regardless
-    /// of `state.visible`. Default false to preserve back-compat.
+    /// Default true: skip the visibility filter — match elements regardless
+    /// of `state.visible`. Pass `false` to apply the visibility filter.
     #[serde(default)]
     pub include_hidden: Option<bool>,
 }
@@ -72,10 +71,10 @@ pub struct AiFindRequest {
 /// the default threshold. The default (0.5) balances precision and recall
 /// for common queries like "text input" or "search box".
 ///
-/// Callers can also pass `"includeHidden": true` to match elements that
-/// are registered but currently hidden (e.g. items in a collapsed sidebar
-/// section). Default `false` preserves the previous behaviour where the
-/// visibility filter is applied downstream.
+/// Callers can also pass `"includeHidden": false` to apply the visibility
+/// filter. Default `true` matches the historical front-end behaviour and
+/// is what callers need when driving collapsed sidebars or tabs whose
+/// targets are off-screen but still in the registry.
 pub async fn ui_bridge_ai_find_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
@@ -89,7 +88,7 @@ pub async fn ui_bridge_ai_find_handler(
     // forwarded params so downstream handlers always see a concrete
     // boolean rather than "missing" vs "explicit false".
     let parsed: AiFindRequest = serde_json::from_value(body.clone()).unwrap_or_default();
-    let include_hidden = parsed.include_hidden.unwrap_or(false);
+    let include_hidden = parsed.include_hidden.unwrap_or(true);
 
     let mut forwarded_body = body.clone();
     if let Some(obj) = forwarded_body.as_object_mut() {

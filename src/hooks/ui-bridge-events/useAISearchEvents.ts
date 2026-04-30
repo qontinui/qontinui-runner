@@ -47,7 +47,11 @@ export function useAISearchEvents(
           const registryElements = (registry?.getAllElements?.() ?? []) as Parameters<
             InstanceType<typeof SearchEngine>["updateElements"]
           >[0];
-          const engine = new SearchEngine({ includeHidden: true });
+          // Honor the request's includeHidden flag (forwarded by the Rust
+          // /ai/find handler at mcp/ui_bridge/ai.rs which defaults to true).
+          // Pass `includeHidden: false` to opt into the visibility filter.
+          const includeHidden = (payload.params?.includeHidden as boolean | undefined) ?? true;
+          const engine = new SearchEngine({ includeHidden });
           engine.updateElements(registryElements);
           const criteria = payload.params ?? payload.body ?? {};
           const results = engine.search(criteria as Parameters<typeof engine.search>[0]);
@@ -103,7 +107,11 @@ export function useAISearchEvents(
           const registryElements = (registry?.getAllElements?.() ?? []) as Parameters<
             InstanceType<typeof SearchEngine>["updateElements"]
           >[0];
-          const engine = new SearchEngine({ includeHidden: true });
+          // Honor the request's includeHidden flag (forwarded by the Rust
+          // /ai/find handler at mcp/ui_bridge/ai.rs which defaults to true).
+          // Pass `includeHidden: false` to opt into the visibility filter.
+          const includeHidden = (payload.params?.includeHidden as boolean | undefined) ?? true;
+          const engine = new SearchEngine({ includeHidden });
           engine.updateElements(registryElements);
 
           const query = (payload.params?.query as string) ?? "";
