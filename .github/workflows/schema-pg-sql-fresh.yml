@@ -8,22 +8,20 @@ name: schema.pg.sql.generated freshness
 #
 # Trigger posture
 # ---------------
-# Currently set to `workflow_dispatch` only (manual). Reason: the
-# regenerator depends on the alembic chain in the sibling qontinui-web
-# repository, which isn't checked out in this workflow yet.
-#
-# After the consolidation transplants `_staged_consolidation/*` into
-# `qontinui-web/backend/alembic/versions/`, change `on:` to include
-# `pull_request: branches: [main, develop]` so every PR is gated.
+# Active on every PR (post-transplant). The consolidation chain now lives
+# in `qontinui-web/backend/alembic/versions/` and the workflow checks out
+# both repos; the gate ensures `schema.pg.sql.generated` doesn't drift
+# from a fresh `alembic upgrade head + pg_dump`. `workflow_dispatch` is
+# kept for manual reruns. Paths are repo-relative (no `qontinui-runner/`
+# prefix — the trigger filter operates on changed files in this repo).
 
 on:
   workflow_dispatch:
-  # Pre-transplant: keep this disabled.
-  # pull_request:
-  #   branches: [main, develop]
-  #   paths:
-  #     - "qontinui-runner/src-tauri/queries/**"
-  #     - "qontinui-runner/src-tauri/schema.pg.sql.generated"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src-tauri/queries/**"
+      - "src-tauri/schema.pg.sql.generated"
 
 jobs:
   schema-fresh:
