@@ -88,6 +88,7 @@ export default [
       "*.js",
       "!src/**/*.js",
       "!extension/**/*.js",
+      "src/generated/**",
     ],
   },
 ];

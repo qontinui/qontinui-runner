@@ -255,12 +255,8 @@
             "id": "empty-to-editing-new",
             "name": "Create new check",
             "description": "User clicks the New button to begin creating a check, populating the editor with a blank form and sensible defaults",
-            "activateStates": [
-              "chk-editing-new"
-            ],
-            "deactivateStates": [
-              "chk-list-empty"
-            ],
+            "activateStates": ["chk-editing-new"],
+            "deactivateStates": ["chk-list-empty"],
             "staysVisible": false,
             "process": [
               {
@@ -296,12 +292,8 @@
             "id": "populated-to-editing-existing",
             "name": "Select a check to edit",
             "description": "User clicks a check in the list to load it into the right-panel editor for viewing or editing",
-            "activateStates": [
-              "chk-editing-existing"
-            ],
-            "deactivateStates": [
-              "chk-list-populated"
-            ],
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": ["chk-list-populated"],
             "staysVisible": false,
             "process": []
           },
@@ -309,12 +301,8 @@
             "id": "populated-to-editing-new",
             "name": "Create new check",
             "description": "User clicks the New button to clear the editor and start a blank check form",
-            "activateStates": [
-              "chk-editing-new"
-            ],
-            "deactivateStates": [
-              "chk-list-populated"
-            ],
+            "activateStates": ["chk-editing-new"],
+            "deactivateStates": ["chk-list-populated"],
             "staysVisible": false,
             "process": [
               {
@@ -334,12 +322,8 @@
             "id": "populated-to-search-active",
             "name": "Enter search query",
             "description": "User types in the search box to filter the check list by name",
-            "activateStates": [
-              "chk-search-active"
-            ],
-            "deactivateStates": [
-              "chk-list-populated"
-            ],
+            "activateStates": ["chk-search-active"],
+            "deactivateStates": ["chk-list-populated"],
             "staysVisible": false,
             "process": [
               {
@@ -370,12 +354,8 @@
             "id": "search-to-populated",
             "name": "Clear search query",
             "description": "User clears the search input to return to the full unfiltered check list",
-            "activateStates": [
-              "chk-list-populated"
-            ],
-            "deactivateStates": [
-              "chk-search-active"
-            ],
+            "activateStates": ["chk-list-populated"],
+            "deactivateStates": ["chk-search-active"],
             "staysVisible": false,
             "process": [
               {
@@ -394,12 +374,8 @@
             "id": "search-to-editing-existing",
             "name": "Select a filtered check",
             "description": "User clicks a check from the filtered search results to load it into the editor",
-            "activateStates": [
-              "chk-editing-existing"
-            ],
-            "deactivateStates": [
-              "chk-search-active"
-            ],
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": ["chk-search-active"],
             "staysVisible": false,
             "process": []
           }
@@ -420,12 +396,8 @@
             "id": "editing-new-to-editing-existing",
             "name": "Save new check",
             "description": "User clicks Save to persist the new check to the library, transitioning to the editing-existing state with the newly saved check loaded",
-            "activateStates": [
-              "chk-editing-existing"
-            ],
-            "deactivateStates": [
-              "chk-editing-new"
-            ],
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": ["chk-editing-new"],
             "staysVisible": false,
             "process": [
               {
@@ -445,12 +417,8 @@
             "id": "editing-new-to-populated",
             "name": "Cancel or select existing check",
             "description": "User clicks a different check in the list, discarding the unsaved new check and loading the selected one",
-            "activateStates": [
-              "chk-list-populated"
-            ],
-            "deactivateStates": [
-              "chk-editing-new"
-            ],
+            "activateStates": ["chk-list-populated"],
+            "deactivateStates": ["chk-editing-new"],
             "staysVisible": false,
             "process": []
           }
@@ -475,9 +443,7 @@
             "id": "editing-existing-save",
             "name": "Save changes",
             "description": "User clicks Save to persist modifications to the existing check",
-            "activateStates": [
-              "chk-editing-existing"
-            ],
+            "activateStates": ["chk-editing-existing"],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -498,9 +464,7 @@
             "id": "editing-existing-to-confirm-delete",
             "name": "Delete check",
             "description": "User clicks the Delete button to initiate deletion of the current check, triggering a confirmation dialog",
-            "activateStates": [
-              "chk-confirm-delete"
-            ],
+            "activateStates": ["chk-confirm-delete"],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -521,12 +485,8 @@
             "id": "editing-existing-to-editing-new",
             "name": "Create new check while editing",
             "description": "User clicks the New button to clear the editor and start a fresh check form",
-            "activateStates": [
-              "chk-editing-new"
-            ],
-            "deactivateStates": [
-              "chk-editing-existing"
-            ],
+            "activateStates": ["chk-editing-new"],
+            "deactivateStates": ["chk-editing-existing"],
             "staysVisible": false,
             "process": [
               {
@@ -546,9 +506,7 @@
             "id": "editing-existing-to-another",
             "name": "Select a different check",
             "description": "User clicks another check in the list to switch to editing that check instead",
-            "activateStates": [
-              "chk-editing-existing"
-            ],
+            "activateStates": ["chk-editing-existing"],
             "deactivateStates": [],
             "staysVisible": true,
             "process": []
@@ -569,13 +527,8 @@
             "id": "confirm-delete-to-populated",
             "name": "Confirm deletion",
             "description": "User confirms the deletion, removing the check from the library and returning to the populated list view",
-            "activateStates": [
-              "chk-list-populated"
-            ],
-            "deactivateStates": [
-              "chk-confirm-delete",
-              "chk-editing-existing"
-            ],
+            "activateStates": ["chk-list-populated"],
+            "deactivateStates": ["chk-confirm-delete", "chk-editing-existing"],
             "staysVisible": false,
             "process": []
           },
@@ -583,12 +536,8 @@
             "id": "confirm-delete-cancel",
             "name": "Cancel deletion",
             "description": "User cancels the deletion dialog, returning to the editing state with the check still intact",
-            "activateStates": [
-              "chk-editing-existing"
-            ],
-            "deactivateStates": [
-              "chk-confirm-delete"
-            ],
+            "activateStates": ["chk-editing-existing"],
+            "deactivateStates": ["chk-confirm-delete"],
             "staysVisible": false,
             "process": []
           }
@@ -603,14 +552,7 @@
     "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/build/checks",
     "elementSource": "sdk",
-    "tags": [
-      "checks",
-      "verification",
-      "builder",
-      "library",
-      "linter",
-      "test-runner"
-    ],
+    "tags": ["checks", "verification", "builder", "library", "linter", "test-runner"],
     "specType": "semantic"
   }
 }

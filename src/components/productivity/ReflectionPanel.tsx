@@ -101,6 +101,7 @@ export function ReflectionPanel({ planId, plan }: ReflectionPanelProps) {
   }, [planId]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async data load on dependency change
     void load();
   }, [load]);
 

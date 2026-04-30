@@ -472,12 +472,8 @@
           {
             "id": "hidden-to-single-iteration",
             "name": "First iteration-metrics event arrives for the current task run",
-            "activateStates": [
-              "single-iteration"
-            ],
-            "deactivateStates": [
-              "hidden"
-            ],
+            "activateStates": ["single-iteration"],
+            "deactivateStates": ["hidden"],
             "staysVisible": false,
             "process": []
           }
@@ -497,48 +493,32 @@
           {
             "id": "single-to-improving",
             "name": "Second iteration arrives with fewer failures than the first",
-            "activateStates": [
-              "improving"
-            ],
-            "deactivateStates": [
-              "single-iteration"
-            ],
+            "activateStates": ["improving"],
+            "deactivateStates": ["single-iteration"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "single-to-stalled",
             "name": "Second iteration arrives with same failure count or isStalled flag",
-            "activateStates": [
-              "stalled"
-            ],
-            "deactivateStates": [
-              "single-iteration"
-            ],
+            "activateStates": ["stalled"],
+            "deactivateStates": ["single-iteration"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "single-to-regressing",
             "name": "Second iteration arrives with more failures than the first",
-            "activateStates": [
-              "regressing"
-            ],
-            "deactivateStates": [
-              "single-iteration"
-            ],
+            "activateStates": ["regressing"],
+            "deactivateStates": ["single-iteration"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "single-to-hidden",
             "name": "Active task run changes to a run with no metrics yet",
-            "activateStates": [
-              "hidden"
-            ],
-            "deactivateStates": [
-              "single-iteration"
-            ],
+            "activateStates": ["hidden"],
+            "deactivateStates": ["single-iteration"],
             "staysVisible": false,
             "process": []
           }
@@ -558,36 +538,24 @@
           {
             "id": "improving-to-stalled",
             "name": "Next iteration arrives with same failure count or isStalled flag",
-            "activateStates": [
-              "stalled"
-            ],
-            "deactivateStates": [
-              "improving"
-            ],
+            "activateStates": ["stalled"],
+            "deactivateStates": ["improving"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "improving-to-regressing",
             "name": "Next iteration arrives with more failures",
-            "activateStates": [
-              "regressing"
-            ],
-            "deactivateStates": [
-              "improving"
-            ],
+            "activateStates": ["regressing"],
+            "deactivateStates": ["improving"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "improving-to-hidden",
             "name": "Active task run changes to a run with no metrics yet",
-            "activateStates": [
-              "hidden"
-            ],
-            "deactivateStates": [
-              "improving"
-            ],
+            "activateStates": ["hidden"],
+            "deactivateStates": ["improving"],
             "staysVisible": false,
             "process": []
           }
@@ -607,36 +575,24 @@
           {
             "id": "stalled-to-improving",
             "name": "Next iteration arrives with fewer failures",
-            "activateStates": [
-              "improving"
-            ],
-            "deactivateStates": [
-              "stalled"
-            ],
+            "activateStates": ["improving"],
+            "deactivateStates": ["stalled"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "stalled-to-regressing",
             "name": "Next iteration arrives with more failures",
-            "activateStates": [
-              "regressing"
-            ],
-            "deactivateStates": [
-              "stalled"
-            ],
+            "activateStates": ["regressing"],
+            "deactivateStates": ["stalled"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "stalled-to-hidden",
             "name": "Active task run changes to a run with no metrics yet",
-            "activateStates": [
-              "hidden"
-            ],
-            "deactivateStates": [
-              "stalled"
-            ],
+            "activateStates": ["hidden"],
+            "deactivateStates": ["stalled"],
             "staysVisible": false,
             "process": []
           }
@@ -656,36 +612,24 @@
           {
             "id": "regressing-to-improving",
             "name": "Next iteration arrives with fewer failures",
-            "activateStates": [
-              "improving"
-            ],
-            "deactivateStates": [
-              "regressing"
-            ],
+            "activateStates": ["improving"],
+            "deactivateStates": ["regressing"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "regressing-to-stalled",
             "name": "Next iteration arrives with same failure count or isStalled flag",
-            "activateStates": [
-              "stalled"
-            ],
-            "deactivateStates": [
-              "regressing"
-            ],
+            "activateStates": ["stalled"],
+            "deactivateStates": ["regressing"],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "regressing-to-hidden",
             "name": "Active task run changes to a run with no metrics yet",
-            "activateStates": [
-              "hidden"
-            ],
-            "deactivateStates": [
-              "regressing"
-            ],
+            "activateStates": ["hidden"],
+            "deactivateStates": ["regressing"],
             "staysVisible": false,
             "process": []
           }

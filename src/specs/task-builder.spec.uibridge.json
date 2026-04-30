@@ -237,12 +237,8 @@
             "id": "loading-to-list-ready",
             "name": "Tasks loaded",
             "description": "The API fetch completes and at least one task exists, populating the left-panel list",
-            "activateStates": [
-              "task-list-ready"
-            ],
-            "deactivateStates": [
-              "task-loading"
-            ],
+            "activateStates": ["task-list-ready"],
+            "deactivateStates": ["task-loading"],
             "staysVisible": false,
             "process": []
           },
@@ -250,12 +246,8 @@
             "id": "loading-to-empty-library",
             "name": "No tasks exist",
             "description": "The API fetch completes but no task definitions were returned",
-            "activateStates": [
-              "task-empty-library"
-            ],
-            "deactivateStates": [
-              "task-loading"
-            ],
+            "activateStates": ["task-empty-library"],
+            "deactivateStates": ["task-loading"],
             "staysVisible": false,
             "process": []
           }
@@ -276,12 +268,8 @@
             "id": "empty-library-to-editing",
             "name": "Create first task",
             "description": "User clicks the New button to open a blank task editor, beginning their first task definition",
-            "activateStates": [
-              "task-editing"
-            ],
-            "deactivateStates": [
-              "task-empty-library"
-            ],
+            "activateStates": ["task-editing"],
+            "deactivateStates": ["task-empty-library"],
             "staysVisible": false,
             "process": [
               {
@@ -317,12 +305,8 @@
             "id": "list-ready-to-editing-via-new",
             "name": "Create new task",
             "description": "User clicks the New button to open a blank editor with empty name, content, and category fields",
-            "activateStates": [
-              "task-editing"
-            ],
-            "deactivateStates": [
-              "task-list-ready"
-            ],
+            "activateStates": ["task-editing"],
+            "deactivateStates": ["task-list-ready"],
             "staysVisible": false,
             "process": [
               {
@@ -342,12 +326,8 @@
             "id": "list-ready-to-editing-via-select",
             "name": "Select existing task",
             "description": "User clicks a task in the list to load it into the right-panel editor for viewing or modification",
-            "activateStates": [
-              "task-editing"
-            ],
-            "deactivateStates": [
-              "task-list-ready"
-            ],
+            "activateStates": ["task-editing"],
+            "deactivateStates": ["task-list-ready"],
             "staysVisible": false,
             "process": []
           },
@@ -355,12 +335,8 @@
             "id": "list-ready-to-search-active",
             "name": "Enter search query",
             "description": "User types in the search box to filter the task list by name",
-            "activateStates": [
-              "task-search-active"
-            ],
-            "deactivateStates": [
-              "task-list-ready"
-            ],
+            "activateStates": ["task-search-active"],
+            "deactivateStates": ["task-list-ready"],
             "staysVisible": false,
             "process": [
               {
@@ -396,12 +372,8 @@
             "id": "editing-to-list-ready-via-save",
             "name": "Save task",
             "description": "User clicks Save to persist the task definition, returning to the list which now reflects the saved changes",
-            "activateStates": [
-              "task-list-ready"
-            ],
-            "deactivateStates": [
-              "task-editing"
-            ],
+            "activateStates": ["task-list-ready"],
+            "deactivateStates": ["task-editing"],
             "staysVisible": false,
             "process": [
               {
@@ -421,12 +393,8 @@
             "id": "editing-to-list-ready-via-delete",
             "name": "Delete task",
             "description": "User clicks Delete to remove the task definition, returning to the list with the deleted task removed",
-            "activateStates": [
-              "task-list-ready"
-            ],
-            "deactivateStates": [
-              "task-editing"
-            ],
+            "activateStates": ["task-list-ready"],
+            "deactivateStates": ["task-editing"],
             "staysVisible": false,
             "process": [
               {
@@ -446,12 +414,8 @@
             "id": "editing-to-editing-via-select",
             "name": "Switch to another task",
             "description": "User clicks a different task in the list, replacing the editor contents with the newly selected task",
-            "activateStates": [
-              "task-editing"
-            ],
-            "deactivateStates": [
-              "task-editing"
-            ],
+            "activateStates": ["task-editing"],
+            "deactivateStates": ["task-editing"],
             "staysVisible": false,
             "process": []
           },
@@ -459,12 +423,8 @@
             "id": "editing-to-editing-via-new",
             "name": "Create new task while editing",
             "description": "User clicks New to discard the current editor contents and start a fresh blank task definition",
-            "activateStates": [
-              "task-editing"
-            ],
-            "deactivateStates": [
-              "task-editing"
-            ],
+            "activateStates": ["task-editing"],
+            "deactivateStates": ["task-editing"],
             "staysVisible": false,
             "process": [
               {
@@ -496,12 +456,8 @@
             "id": "search-to-list-ready",
             "name": "Clear search query",
             "description": "User clears the search input to return to the full unfiltered task list",
-            "activateStates": [
-              "task-list-ready"
-            ],
-            "deactivateStates": [
-              "task-search-active"
-            ],
+            "activateStates": ["task-list-ready"],
+            "deactivateStates": ["task-search-active"],
             "staysVisible": false,
             "process": [
               {
@@ -520,12 +476,8 @@
             "id": "search-to-editing",
             "name": "Select task from filtered results",
             "description": "User clicks a task from the filtered search results to load it into the editor",
-            "activateStates": [
-              "task-editing"
-            ],
-            "deactivateStates": [
-              "task-search-active"
-            ],
+            "activateStates": ["task-editing"],
+            "deactivateStates": ["task-search-active"],
             "staysVisible": false,
             "process": []
           },
@@ -533,12 +485,8 @@
             "id": "search-to-empty-results",
             "name": "No matching tasks",
             "description": "The search query does not match any tasks, showing an empty results state",
-            "activateStates": [
-              "task-empty-results"
-            ],
-            "deactivateStates": [
-              "task-search-active"
-            ],
+            "activateStates": ["task-empty-results"],
+            "deactivateStates": ["task-search-active"],
             "staysVisible": false,
             "process": [
               {
@@ -572,12 +520,8 @@
             "id": "empty-results-to-list-ready",
             "name": "Clear search to restore list",
             "description": "User clears the search input to return to the full task list",
-            "activateStates": [
-              "task-list-ready"
-            ],
-            "deactivateStates": [
-              "task-empty-results"
-            ],
+            "activateStates": ["task-list-ready"],
+            "deactivateStates": ["task-empty-results"],
             "staysVisible": false,
             "process": [
               {
@@ -603,13 +547,7 @@
     "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/build/tasks",
     "elementSource": "sdk",
-    "tags": [
-      "tasks",
-      "prompts",
-      "builder",
-      "library",
-      "ai-instructions"
-    ],
+    "tags": ["tasks", "prompts", "builder", "library", "ai-instructions"],
     "specType": "semantic"
   }
 }

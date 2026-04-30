@@ -144,6 +144,7 @@ export function useReviewState(sessionId: string | undefined): ReviewState | nul
 
   useEffect(() => {
     if (!sessionId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- resetting state when session clears
       setState(null);
       return;
     }

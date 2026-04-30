@@ -686,18 +686,22 @@ export function CoordinatorDashboard() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async data load on dependency change
     void loadDecisions();
   }, [loadDecisions]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async data load on dependency change
     void loadEscalations();
   }, [loadEscalations]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async data load on dependency change
     void loadRecommendations();
   }, [loadRecommendations]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async data load on dependency change
     void loadAdvisories();
   }, [loadAdvisories]);
 

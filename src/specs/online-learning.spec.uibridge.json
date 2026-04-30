@@ -835,12 +835,8 @@
             "id": "loading-to-overview",
             "name": "Data fetch completes",
             "description": "All API endpoints have responded and data is populated into the dashboard. The loading indicator disappears and the Overview tab content becomes visible with stat cards and any drift alerts.",
-            "activateStates": [
-              "ol-state-overview"
-            ],
-            "deactivateStates": [
-              "ol-state-loading"
-            ],
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-loading"],
             "staysVisible": false,
             "process": [
               {
@@ -872,12 +868,8 @@
             "id": "overview-to-model-routing",
             "name": "Switch to Model Routing tab",
             "description": "User clicks the Model Routing tab to view the bandit Q-table with context/model pairs, Q-values, and visit counts.",
-            "activateStates": [
-              "ol-state-model-routing"
-            ],
-            "deactivateStates": [
-              "ol-state-overview"
-            ],
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-overview"],
             "staysVisible": false,
             "process": [
               {
@@ -897,12 +889,8 @@
             "id": "overview-to-drift-detection",
             "name": "Switch to Drift Detection tab",
             "description": "User clicks the Drift Detection tab to view the drift signals table and detector status.",
-            "activateStates": [
-              "ol-state-drift-detection"
-            ],
-            "deactivateStates": [
-              "ol-state-overview"
-            ],
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-overview"],
             "staysVisible": false,
             "process": [
               {
@@ -922,12 +910,8 @@
             "id": "overview-to-step-credits",
             "name": "Switch to Step Credits tab",
             "description": "User clicks the Step Credits tab to view the ADCA credit attribution scorecard.",
-            "activateStates": [
-              "ol-state-step-credits"
-            ],
-            "deactivateStates": [
-              "ol-state-overview"
-            ],
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-overview"],
             "staysVisible": false,
             "process": [
               {
@@ -947,12 +931,8 @@
             "id": "overview-to-strategies",
             "name": "Switch to Strategies tab",
             "description": "User clicks the Strategies tab to view the evolvable strategy bank cards.",
-            "activateStates": [
-              "ol-state-strategies"
-            ],
-            "deactivateStates": [
-              "ol-state-overview"
-            ],
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-overview"],
             "staysVisible": false,
             "process": [
               {
@@ -972,12 +952,8 @@
             "id": "overview-to-experiences",
             "name": "Switch to Experiences tab",
             "description": "User clicks the Experiences tab to view post-run experience summary cards.",
-            "activateStates": [
-              "ol-state-experiences"
-            ],
-            "deactivateStates": [
-              "ol-state-overview"
-            ],
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-overview"],
             "staysVisible": false,
             "process": [
               {
@@ -997,12 +973,8 @@
             "id": "overview-refresh",
             "name": "Manual refresh from Overview",
             "description": "User clicks the Refresh button to re-fetch all API endpoints. The loading indicator briefly appears, then the Overview tab re-renders with fresh data.",
-            "activateStates": [
-              "ol-state-loading"
-            ],
-            "deactivateStates": [
-              "ol-state-overview"
-            ],
+            "activateStates": ["ol-state-loading"],
+            "deactivateStates": ["ol-state-overview"],
             "staysVisible": false,
             "process": [
               {
@@ -1038,12 +1010,8 @@
             "id": "model-routing-to-overview",
             "name": "Switch to Overview tab",
             "description": "User clicks the Overview tab to return to the stat cards and drift alert summary.",
-            "activateStates": [
-              "ol-state-overview"
-            ],
-            "deactivateStates": [
-              "ol-state-model-routing"
-            ],
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-model-routing"],
             "staysVisible": false,
             "process": [
               {
@@ -1063,12 +1031,8 @@
             "id": "model-routing-to-drift-detection",
             "name": "Switch to Drift Detection tab",
             "description": "User clicks the Drift Detection tab.",
-            "activateStates": [
-              "ol-state-drift-detection"
-            ],
-            "deactivateStates": [
-              "ol-state-model-routing"
-            ],
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-model-routing"],
             "staysVisible": false,
             "process": [
               {
@@ -1088,12 +1052,8 @@
             "id": "model-routing-to-step-credits",
             "name": "Switch to Step Credits tab",
             "description": "User clicks the Step Credits tab.",
-            "activateStates": [
-              "ol-state-step-credits"
-            ],
-            "deactivateStates": [
-              "ol-state-model-routing"
-            ],
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-model-routing"],
             "staysVisible": false,
             "process": [
               {
@@ -1113,12 +1073,8 @@
             "id": "model-routing-to-strategies",
             "name": "Switch to Strategies tab",
             "description": "User clicks the Strategies tab.",
-            "activateStates": [
-              "ol-state-strategies"
-            ],
-            "deactivateStates": [
-              "ol-state-model-routing"
-            ],
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-model-routing"],
             "staysVisible": false,
             "process": [
               {
@@ -1138,12 +1094,8 @@
             "id": "model-routing-to-experiences",
             "name": "Switch to Experiences tab",
             "description": "User clicks the Experiences tab.",
-            "activateStates": [
-              "ol-state-experiences"
-            ],
-            "deactivateStates": [
-              "ol-state-model-routing"
-            ],
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-model-routing"],
             "staysVisible": false,
             "process": [
               {
@@ -1179,12 +1131,8 @@
             "id": "drift-detection-to-overview",
             "name": "Switch to Overview tab",
             "description": "User clicks the Overview tab.",
-            "activateStates": [
-              "ol-state-overview"
-            ],
-            "deactivateStates": [
-              "ol-state-drift-detection"
-            ],
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-drift-detection"],
             "staysVisible": false,
             "process": [
               {
@@ -1204,12 +1152,8 @@
             "id": "drift-detection-to-model-routing",
             "name": "Switch to Model Routing tab",
             "description": "User clicks the Model Routing tab.",
-            "activateStates": [
-              "ol-state-model-routing"
-            ],
-            "deactivateStates": [
-              "ol-state-drift-detection"
-            ],
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-drift-detection"],
             "staysVisible": false,
             "process": [
               {
@@ -1229,12 +1173,8 @@
             "id": "drift-detection-to-step-credits",
             "name": "Switch to Step Credits tab",
             "description": "User clicks the Step Credits tab.",
-            "activateStates": [
-              "ol-state-step-credits"
-            ],
-            "deactivateStates": [
-              "ol-state-drift-detection"
-            ],
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-drift-detection"],
             "staysVisible": false,
             "process": [
               {
@@ -1254,12 +1194,8 @@
             "id": "drift-detection-to-strategies",
             "name": "Switch to Strategies tab",
             "description": "User clicks the Strategies tab.",
-            "activateStates": [
-              "ol-state-strategies"
-            ],
-            "deactivateStates": [
-              "ol-state-drift-detection"
-            ],
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-drift-detection"],
             "staysVisible": false,
             "process": [
               {
@@ -1279,12 +1215,8 @@
             "id": "drift-detection-to-experiences",
             "name": "Switch to Experiences tab",
             "description": "User clicks the Experiences tab.",
-            "activateStates": [
-              "ol-state-experiences"
-            ],
-            "deactivateStates": [
-              "ol-state-drift-detection"
-            ],
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-drift-detection"],
             "staysVisible": false,
             "process": [
               {
@@ -1320,12 +1252,8 @@
             "id": "step-credits-to-overview",
             "name": "Switch to Overview tab",
             "description": "User clicks the Overview tab.",
-            "activateStates": [
-              "ol-state-overview"
-            ],
-            "deactivateStates": [
-              "ol-state-step-credits"
-            ],
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-step-credits"],
             "staysVisible": false,
             "process": [
               {
@@ -1345,12 +1273,8 @@
             "id": "step-credits-to-model-routing",
             "name": "Switch to Model Routing tab",
             "description": "User clicks the Model Routing tab.",
-            "activateStates": [
-              "ol-state-model-routing"
-            ],
-            "deactivateStates": [
-              "ol-state-step-credits"
-            ],
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-step-credits"],
             "staysVisible": false,
             "process": [
               {
@@ -1370,12 +1294,8 @@
             "id": "step-credits-to-drift-detection",
             "name": "Switch to Drift Detection tab",
             "description": "User clicks the Drift Detection tab.",
-            "activateStates": [
-              "ol-state-drift-detection"
-            ],
-            "deactivateStates": [
-              "ol-state-step-credits"
-            ],
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-step-credits"],
             "staysVisible": false,
             "process": [
               {
@@ -1395,12 +1315,8 @@
             "id": "step-credits-to-strategies",
             "name": "Switch to Strategies tab",
             "description": "User clicks the Strategies tab.",
-            "activateStates": [
-              "ol-state-strategies"
-            ],
-            "deactivateStates": [
-              "ol-state-step-credits"
-            ],
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-step-credits"],
             "staysVisible": false,
             "process": [
               {
@@ -1420,12 +1336,8 @@
             "id": "step-credits-to-experiences",
             "name": "Switch to Experiences tab",
             "description": "User clicks the Experiences tab.",
-            "activateStates": [
-              "ol-state-experiences"
-            ],
-            "deactivateStates": [
-              "ol-state-step-credits"
-            ],
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-step-credits"],
             "staysVisible": false,
             "process": [
               {
@@ -1461,12 +1373,8 @@
             "id": "strategies-to-overview",
             "name": "Switch to Overview tab",
             "description": "User clicks the Overview tab.",
-            "activateStates": [
-              "ol-state-overview"
-            ],
-            "deactivateStates": [
-              "ol-state-strategies"
-            ],
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-strategies"],
             "staysVisible": false,
             "process": [
               {
@@ -1486,12 +1394,8 @@
             "id": "strategies-to-model-routing",
             "name": "Switch to Model Routing tab",
             "description": "User clicks the Model Routing tab.",
-            "activateStates": [
-              "ol-state-model-routing"
-            ],
-            "deactivateStates": [
-              "ol-state-strategies"
-            ],
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-strategies"],
             "staysVisible": false,
             "process": [
               {
@@ -1511,12 +1415,8 @@
             "id": "strategies-to-drift-detection",
             "name": "Switch to Drift Detection tab",
             "description": "User clicks the Drift Detection tab.",
-            "activateStates": [
-              "ol-state-drift-detection"
-            ],
-            "deactivateStates": [
-              "ol-state-strategies"
-            ],
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-strategies"],
             "staysVisible": false,
             "process": [
               {
@@ -1536,12 +1436,8 @@
             "id": "strategies-to-step-credits",
             "name": "Switch to Step Credits tab",
             "description": "User clicks the Step Credits tab.",
-            "activateStates": [
-              "ol-state-step-credits"
-            ],
-            "deactivateStates": [
-              "ol-state-strategies"
-            ],
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-strategies"],
             "staysVisible": false,
             "process": [
               {
@@ -1561,12 +1457,8 @@
             "id": "strategies-to-experiences",
             "name": "Switch to Experiences tab",
             "description": "User clicks the Experiences tab.",
-            "activateStates": [
-              "ol-state-experiences"
-            ],
-            "deactivateStates": [
-              "ol-state-strategies"
-            ],
+            "activateStates": ["ol-state-experiences"],
+            "deactivateStates": ["ol-state-strategies"],
             "staysVisible": false,
             "process": [
               {
@@ -1602,12 +1494,8 @@
             "id": "experiences-to-overview",
             "name": "Switch to Overview tab",
             "description": "User clicks the Overview tab.",
-            "activateStates": [
-              "ol-state-overview"
-            ],
-            "deactivateStates": [
-              "ol-state-experiences"
-            ],
+            "activateStates": ["ol-state-overview"],
+            "deactivateStates": ["ol-state-experiences"],
             "staysVisible": false,
             "process": [
               {
@@ -1627,12 +1515,8 @@
             "id": "experiences-to-model-routing",
             "name": "Switch to Model Routing tab",
             "description": "User clicks the Model Routing tab.",
-            "activateStates": [
-              "ol-state-model-routing"
-            ],
-            "deactivateStates": [
-              "ol-state-experiences"
-            ],
+            "activateStates": ["ol-state-model-routing"],
+            "deactivateStates": ["ol-state-experiences"],
             "staysVisible": false,
             "process": [
               {
@@ -1652,12 +1536,8 @@
             "id": "experiences-to-drift-detection",
             "name": "Switch to Drift Detection tab",
             "description": "User clicks the Drift Detection tab.",
-            "activateStates": [
-              "ol-state-drift-detection"
-            ],
-            "deactivateStates": [
-              "ol-state-experiences"
-            ],
+            "activateStates": ["ol-state-drift-detection"],
+            "deactivateStates": ["ol-state-experiences"],
             "staysVisible": false,
             "process": [
               {
@@ -1677,12 +1557,8 @@
             "id": "experiences-to-step-credits",
             "name": "Switch to Step Credits tab",
             "description": "User clicks the Step Credits tab.",
-            "activateStates": [
-              "ol-state-step-credits"
-            ],
-            "deactivateStates": [
-              "ol-state-experiences"
-            ],
+            "activateStates": ["ol-state-step-credits"],
+            "deactivateStates": ["ol-state-experiences"],
             "staysVisible": false,
             "process": [
               {
@@ -1702,12 +1578,8 @@
             "id": "experiences-to-strategies",
             "name": "Switch to Strategies tab",
             "description": "User clicks the Strategies tab.",
-            "activateStates": [
-              "ol-state-strategies"
-            ],
-            "deactivateStates": [
-              "ol-state-experiences"
-            ],
+            "activateStates": ["ol-state-strategies"],
+            "deactivateStates": ["ol-state-experiences"],
             "staysVisible": false,
             "process": [
               {

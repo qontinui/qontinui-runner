@@ -56,16 +56,15 @@ export function useApiBase(): string {
   const [base, setBase] = useState<string>(_apiBase);
   useEffect(() => {
     // Sync immediately in case `setApiPort` already ran between this hook's
-    // initial render and effect mount.
-    if (base !== _apiBase) setBase(_apiBase);
+    // initial render and effect mount. React bails out on same-value setState,
+    // so no conditional check is needed.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional sync on effect mount to catch missed setApiBase calls
+    setBase(_apiBase);
     const listener = () => setBase(_apiBase);
     portChangeListeners.add(listener);
     return () => {
       portChangeListeners.delete(listener);
     };
-    // Intentionally exclude `base` — the listener handles propagation, and
-    // including it would re-add/remove the listener on every change.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   return base;
 }
@@ -77,13 +76,13 @@ export function useApiBase(): string {
 export function useApiPort(): number {
   const [port, setPort] = useState<number>(_apiPort);
   useEffect(() => {
-    if (port !== _apiPort) setPort(_apiPort);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional sync on effect mount to catch missed setApiPort calls
+    setPort(_apiPort);
     const listener = () => setPort(_apiPort);
     portChangeListeners.add(listener);
     return () => {
       portChangeListeners.delete(listener);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   return port;
 }

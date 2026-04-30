@@ -237,12 +237,8 @@
             "id": "empty-to-editing-new",
             "name": "Create new check group",
             "description": "User clicks the New button to begin creating a check group, populating the editor with a blank form and default settings (sequential execution, stop on failure)",
-            "activateStates": [
-              "cg-editing-new"
-            ],
-            "deactivateStates": [
-              "cg-list-empty"
-            ],
+            "activateStates": ["cg-editing-new"],
+            "deactivateStates": ["cg-list-empty"],
             "staysVisible": false,
             "process": [
               {
@@ -278,12 +274,8 @@
             "id": "populated-to-editing-existing",
             "name": "Select a check group to edit",
             "description": "User clicks a check group in the list to load it into the right-panel editor for viewing or editing",
-            "activateStates": [
-              "cg-editing-existing"
-            ],
-            "deactivateStates": [
-              "cg-list-populated"
-            ],
+            "activateStates": ["cg-editing-existing"],
+            "deactivateStates": ["cg-list-populated"],
             "staysVisible": false,
             "process": []
           },
@@ -291,12 +283,8 @@
             "id": "populated-to-editing-new",
             "name": "Create new check group",
             "description": "User clicks the New button to clear the editor and start a blank check group form",
-            "activateStates": [
-              "cg-editing-new"
-            ],
-            "deactivateStates": [
-              "cg-list-populated"
-            ],
+            "activateStates": ["cg-editing-new"],
+            "deactivateStates": ["cg-list-populated"],
             "staysVisible": false,
             "process": [
               {
@@ -316,12 +304,8 @@
             "id": "populated-to-search-active",
             "name": "Enter search query",
             "description": "User types in the search box to filter the check group list by name",
-            "activateStates": [
-              "cg-search-active"
-            ],
-            "deactivateStates": [
-              "cg-list-populated"
-            ],
+            "activateStates": ["cg-search-active"],
+            "deactivateStates": ["cg-list-populated"],
             "staysVisible": false,
             "process": [
               {
@@ -352,12 +336,8 @@
             "id": "search-to-populated",
             "name": "Clear search query",
             "description": "User clears the search input to return to the full unfiltered check group list",
-            "activateStates": [
-              "cg-list-populated"
-            ],
-            "deactivateStates": [
-              "cg-search-active"
-            ],
+            "activateStates": ["cg-list-populated"],
+            "deactivateStates": ["cg-search-active"],
             "staysVisible": false,
             "process": [
               {
@@ -376,12 +356,8 @@
             "id": "search-to-editing-existing",
             "name": "Select a filtered check group",
             "description": "User clicks a check group from the filtered search results to load it into the editor",
-            "activateStates": [
-              "cg-editing-existing"
-            ],
-            "deactivateStates": [
-              "cg-search-active"
-            ],
+            "activateStates": ["cg-editing-existing"],
+            "deactivateStates": ["cg-search-active"],
             "staysVisible": false,
             "process": []
           }
@@ -402,12 +378,8 @@
             "id": "editing-new-to-editing-existing",
             "name": "Save new check group",
             "description": "User clicks Save to persist the new check group to the library, transitioning to editing-existing with the newly saved group loaded",
-            "activateStates": [
-              "cg-editing-existing"
-            ],
-            "deactivateStates": [
-              "cg-editing-new"
-            ],
+            "activateStates": ["cg-editing-existing"],
+            "deactivateStates": ["cg-editing-new"],
             "staysVisible": false,
             "process": [
               {
@@ -427,12 +399,8 @@
             "id": "editing-new-to-populated",
             "name": "Cancel or select existing group",
             "description": "User clicks a different check group in the list, discarding the unsaved new group",
-            "activateStates": [
-              "cg-list-populated"
-            ],
-            "deactivateStates": [
-              "cg-editing-new"
-            ],
+            "activateStates": ["cg-list-populated"],
+            "deactivateStates": ["cg-editing-new"],
             "staysVisible": false,
             "process": []
           }
@@ -453,9 +421,7 @@
             "id": "editing-existing-save",
             "name": "Save changes",
             "description": "User clicks Save to persist modifications to the existing check group",
-            "activateStates": [
-              "cg-editing-existing"
-            ],
+            "activateStates": ["cg-editing-existing"],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -476,12 +442,8 @@
             "id": "editing-existing-to-editing-new",
             "name": "Create new check group while editing",
             "description": "User clicks the New button to clear the editor and start a fresh check group form",
-            "activateStates": [
-              "cg-editing-new"
-            ],
-            "deactivateStates": [
-              "cg-editing-existing"
-            ],
+            "activateStates": ["cg-editing-new"],
+            "deactivateStates": ["cg-editing-existing"],
             "staysVisible": false,
             "process": [
               {
@@ -501,9 +463,7 @@
             "id": "editing-existing-to-another",
             "name": "Select a different check group",
             "description": "User clicks another check group in the list to switch to editing that group instead",
-            "activateStates": [
-              "cg-editing-existing"
-            ],
+            "activateStates": ["cg-editing-existing"],
             "deactivateStates": [],
             "staysVisible": true,
             "process": []
@@ -519,13 +479,7 @@
     "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/build/check-groups",
     "elementSource": "sdk",
-    "tags": [
-      "check-groups",
-      "verification",
-      "builder",
-      "library",
-      "test-suites"
-    ],
+    "tags": ["check-groups", "verification", "builder", "library", "test-suites"],
     "specType": "semantic"
   }
 }

@@ -191,6 +191,7 @@ function PlacementEditor({ draft, onChange, monitors, onLog }: PlacementEditorPr
   // Debounced live preview
   useEffect(() => {
     if (!draft.enabled) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- clearing derived UI state when feature disabled
       setPreview(null);
       setPreviewError(null);
       return;
@@ -649,6 +650,7 @@ function TempPlacementsSection({ monitors, onLog }: TempPlacementsSectionProps) 
   }, [onLog]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async data load on dependency change
     void loadTemps();
   }, [loadTemps]);
 

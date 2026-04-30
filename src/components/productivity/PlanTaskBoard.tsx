@@ -689,10 +689,8 @@ export function PlanTaskBoard() {
     }
     try {
       const raw = window.localStorage.getItem(REFLECTION_OPEN_KEY(selectedPlanId));
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing persisted UI state on selection change
       setReflectionOpen(raw === "1");
     } catch {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage unavailable; safe default
       setReflectionOpen(false);
     }
   }, [selectedPlanId]);
