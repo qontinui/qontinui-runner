@@ -1,0 +1,134 @@
+{
+  "version": "1.0",
+  "id": "active",
+  "name": "Active Dashboard",
+  "description": "Real-time monitoring hub for running workflows. Users observe live AI conversation output, verification results, and iteration progress; the dashboard transitions between idle, running, paused, and completion-overlay states as workflows execute.",
+  "metadata": {
+    "purpose": "ActiveDashboardPage",
+    "tags": ["active-dashboard", "monitoring", "real-time", "tier-1"]
+  },
+  "states": [
+    {
+      "id": "idle",
+      "name": "Idle - No Active Workflow",
+      "description": "No workflow is running. The page shows a centered prompt with the 'No Active Workflow' heading and options to run the last workflow or view the last run recap.",
+      "requiredElements": [{ "text": "No Active Workflow" }],
+      "isInitial": true,
+      "provenance": { "source": "migrated", "file": "src/specs/active.spec.uibridge.json" }
+    },
+    {
+      "id": "running",
+      "name": "Running - Workflow Executing",
+      "description": "A workflow is actively executing. The control bar shows the task name, phase badges, and a Stop button; the dynamic widget layout displays the active widget at 65% and summary widgets at 35%.",
+      "requiredElements": [{ "role": "button", "text": "Stop" }],
+      "isInitial": false,
+      "provenance": { "source": "migrated", "file": "src/specs/active.spec.uibridge.json" }
+    },
+    {
+      "id": "paused",
+      "name": "Paused - Workflow Paused",
+      "description": "The workflow is temporarily paused. The control bar shows a Play button to resume; widgets remain visible but execution is halted.",
+      "requiredElements": [{ "role": "button", "ariaLabel": "Play" }],
+      "isInitial": false,
+      "provenance": { "source": "migrated", "file": "src/specs/active.spec.uibridge.json" }
+    },
+    {
+      "id": "completion-overlay",
+      "name": "Completion Summary Overlay",
+      "description": "An overlay dialog appears when a workflow finishes. Shows the final status, step statistics, success rate, and duration. Auto-dismisses after 15 seconds.",
+      "requiredElements": [
+        { "role": "dialog", "ariaLabel": "Workflow completion summary" },
+        { "text": "Dismiss" }
+      ],
+      "isInitial": false,
+      "provenance": { "source": "migrated", "file": "src/specs/active.spec.uibridge.json" }
+    }
+  ],
+  "transitions": [
+    {
+      "id": "idle-to-running",
+      "name": "Start a workflow",
+      "fromStates": ["idle"],
+      "activateStates": ["running"],
+      "exitStates": ["idle"],
+      "actions": [
+        {
+          "type": "click",
+          "target": { "text": "Run Last Workflow" },
+          "waitAfter": { "type": "idle", "timeout": 5000 }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "running-to-paused",
+      "name": "Pause the workflow",
+      "fromStates": ["running"],
+      "activateStates": ["paused"],
+      "exitStates": ["running"],
+      "actions": [
+        {
+          "type": "click",
+          "target": { "role": "button", "ariaLabel": "Pause" },
+          "waitAfter": { "type": "idle", "timeout": 2000 }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "running-to-completion-overlay",
+      "name": "Workflow finishes (automatic transition)",
+      "fromStates": ["running"],
+      "activateStates": ["completion-overlay"],
+      "exitStates": ["running"],
+      "actions": [],
+      "effect": "read"
+    },
+    {
+      "id": "running-to-idle",
+      "name": "Stop the workflow",
+      "fromStates": ["running"],
+      "activateStates": ["idle"],
+      "exitStates": ["running"],
+      "actions": [
+        {
+          "type": "click",
+          "target": { "role": "button", "text": "Stop" },
+          "waitAfter": { "type": "idle", "timeout": 3000 }
+        }
+      ],
+      "effect": "destructive"
+    },
+    {
+      "id": "paused-to-running",
+      "name": "Resume the workflow",
+      "fromStates": ["paused"],
+      "activateStates": ["running"],
+      "exitStates": ["paused"],
+      "actions": [
+        {
+          "type": "click",
+          "target": { "role": "button", "ariaLabel": "Play" },
+          "waitAfter": { "type": "idle", "timeout": 2000 }
+        }
+      ],
+      "effect": "write"
+    },
+    {
+      "id": "completion-overlay-to-idle",
+      "name": "Dismiss the completion overlay",
+      "fromStates": ["completion-overlay"],
+      "activateStates": ["idle"],
+      "exitStates": ["completion-overlay"],
+      "actions": [
+        {
+          "type": "click",
+          "target": { "text": "Dismiss" },
+          "waitAfter": { "type": "idle", "timeout": 1000 }
+        }
+      ],
+      "effect": "read"
+    }
+  ],
+  "initialState": "idle"
+}

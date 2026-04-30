@@ -1528,6 +1528,10 @@ pub fn create_router(
         .merge(crate::mcp::hitl::routes())
         .merge(crate::mcp::streaming::routes())
         .merge(crate::vga::routes())
+        // Section 2 of UI Bridge redesign — `/spec/...` Spec API. Mounted
+        // outside `/ui-bridge/...` because the surface is consumed
+        // differently (IR + projection storage, not page-control RPC).
+        .merge(crate::spec_api::routes())
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))

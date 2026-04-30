@@ -1,0 +1,544 @@
+//! Axum handlers for the Spec API. Endpoints under `/spec/...`.
+//!
+//! Surface (verified against the Section 2 prompt):
+//! - `GET  /spec/get?path=<rel>`       — raw file contents (path-traversal protected)
+//! - `GET  /spec/page/:id`             — bundled-page projection
+//! - `GET  /spec/graph`                — cross-page graph (IDs only)
+//! - `POST /spec/query`                — find* queries against IR
+//! - `POST /spec/derive`               — derived data without persistence
+//! - `GET  /spec/diff?since=<epoch>`   — pages whose IR/projection mtime is newer
+//! - `POST /spec/author`               — write IR + regenerate projection + emit event
+//! - `GET  /spec/subscribe`            — SSE stream of `spec.changed` events
+//!
+//! Every empty/error response carries a `reason` field per Section 2's
+//! "no silent empty responses" constraint.
+
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::{Path as AxPath, Query, State};
+use axum::http::{header, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use futures_util::StreamExt as _;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio_stream::wrappers::BroadcastStream;
+
+use crate::mcp::types::ApiState;
+
+use super::events::{self, SpecChanged};
+use super::projection::project_ir_to_bundled_page;
+use super::responses::{EmptyOk, QueryResult, SpecError};
+use super::storage::{self, ReadWithinRootError};
+use super::types::IrDocument;
+
+// ---------------------------------------------------------------------------
+// GET /spec/get?path=<rel>
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct GetQuery {
+    pub path: Option<String>,
+}
+
+pub async fn get_file(State(_state): State<Arc<ApiState>>, Query(q): Query<GetQuery>) -> Response {
+    let rel = match q.path.as_deref() {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SpecError::new("missing-path-query-param")),
+            )
+                .into_response();
+        }
+    };
+
+    let root = storage::resolve_specs_root();
+    match storage::read_within_root(&root, rel) {
+        Ok(bytes) => {
+            // Always respond as application/octet-stream — caller can
+            // override via `Accept` later. Avoids guessing wrong MIME.
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(ReadWithinRootError::OutsideRoot) => (
+            StatusCode::FORBIDDEN,
+            Json(SpecError::with_detail(
+                "path-outside-root",
+                json!({ "path": rel }),
+            )),
+        )
+            .into_response(),
+        Err(ReadWithinRootError::FileNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(SpecError::with_detail(
+                "file-not-found",
+                json!({ "path": rel }),
+            )),
+        )
+            .into_response(),
+        Err(ReadWithinRootError::RootMissing) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SpecError::with_detail(
+                "specs-root-missing",
+                json!({ "root": root.display().to_string() }),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /spec/page/:id
+// ---------------------------------------------------------------------------
+
+pub async fn get_page(State(_state): State<Arc<ApiState>>, AxPath(id): AxPath<String>) -> Response {
+    let root = storage::resolve_specs_root();
+    match storage::read_projection(&root, &id) {
+        Ok(Some(value)) => (StatusCode::OK, Json(value)).into_response(),
+        Ok(None) => {
+            // Fall back to projecting on-the-fly if the IR exists but
+            // projection doesn't. Keeps the API useful when an IR file is
+            // hand-edited without re-running the generator script.
+            match storage::read_ir(&root, &id) {
+                Ok(Some(doc)) => {
+                    let notes = storage::read_notes(&root, &id).unwrap_or(None);
+                    let value = project_ir_to_bundled_page(&doc, notes.as_deref());
+                    (StatusCode::OK, Json(value)).into_response()
+                }
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(SpecError::with_detail(
+                        "page-not-found",
+                        json!({ "id": id }),
+                    )),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SpecError::with_detail(
+                        "page-read-failed",
+                        json!({ "id": id, "error": e }),
+                    )),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SpecError::with_detail(
+                "projection-read-failed",
+                json!({ "id": id, "error": e }),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /spec/graph
+// ---------------------------------------------------------------------------
+
+pub async fn get_graph(State(_state): State<Arc<ApiState>>) -> Response {
+    let root = storage::resolve_specs_root();
+    let ids = match storage::list_pages(&root) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "list-pages-failed",
+                    json!({ "error": e.to_string() }),
+                )),
+            )
+                .into_response();
+        }
+    };
+    if ids.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "pages": [],
+                "reason": "no-pages-registered"
+            })),
+        )
+            .into_response();
+    }
+    let mut pages: Vec<Value> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let entry = match storage::read_ir(&root, id) {
+            Ok(Some(doc)) => json!({
+                "id": doc.id,
+                "stateIds": doc.states.iter().map(|s| &s.id).collect::<Vec<_>>(),
+                "transitionIds": doc.transitions.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            }),
+            Ok(None) => json!({
+                "id": id,
+                "stateIds": [],
+                "transitionIds": [],
+                "reason": "no-ir-document"
+            }),
+            Err(e) => json!({
+                "id": id,
+                "error": e,
+                "reason": "ir-read-failed"
+            }),
+        };
+        pages.push(entry);
+    }
+    (StatusCode::OK, Json(json!({ "ok": true, "pages": pages }))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /spec/query
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryBody {
+    pub kind: String,
+    pub value: String,
+}
+
+pub async fn post_query(
+    State(_state): State<Arc<ApiState>>,
+    Json(body): Json<QueryBody>,
+) -> Response {
+    let root = storage::resolve_specs_root();
+    let ids = match storage::list_pages(&root) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "list-pages-failed",
+                    json!({ "error": e.to_string() }),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let mut docs: Vec<IrDocument> = Vec::new();
+    for id in &ids {
+        if let Ok(Some(doc)) = storage::read_ir(&root, id) {
+            docs.push(doc);
+        }
+    }
+
+    match body.kind.as_str() {
+        "findStatesByGroup" => {
+            let mut matches: Vec<Value> = Vec::new();
+            for doc in &docs {
+                for s in &doc.states {
+                    if s.group.as_deref() == Some(body.value.as_str()) {
+                        matches.push(json!({
+                            "pageId": doc.id,
+                            "stateId": s.id,
+                            "name": s.name,
+                        }));
+                    }
+                }
+            }
+            let reason = if matches.is_empty() {
+                "no-matches"
+            } else {
+                "matched-by-group"
+            };
+            (StatusCode::OK, Json(QueryResult::ok(matches, reason))).into_response()
+        }
+        "findTransitionsByEffect" => {
+            let mut matches: Vec<Value> = Vec::new();
+            for doc in &docs {
+                for t in &doc.transitions {
+                    if t.effect.as_deref() == Some(body.value.as_str()) {
+                        matches.push(json!({
+                            "pageId": doc.id,
+                            "transitionId": t.id,
+                            "name": t.name,
+                        }));
+                    }
+                }
+            }
+            let reason = if matches.is_empty() {
+                "no-matches"
+            } else {
+                "matched-by-effect"
+            };
+            (StatusCode::OK, Json(QueryResult::ok(matches, reason))).into_response()
+        }
+        "findStatesReferencing" => {
+            // States referenced by transitions whose activate/exit/from set
+            // contains `value`.
+            let mut matches: Vec<Value> = Vec::new();
+            let needle = &body.value;
+            for doc in &docs {
+                for t in &doc.transitions {
+                    let referenced = t.from_states.iter().any(|s| s == needle)
+                        || t.activate_states.iter().any(|s| s == needle)
+                        || t.exit_states
+                            .as_deref()
+                            .map(|v| v.iter().any(|s| s == needle))
+                            .unwrap_or(false);
+                    if referenced {
+                        matches.push(json!({
+                            "pageId": doc.id,
+                            "transitionId": t.id,
+                            "stateId": needle,
+                        }));
+                    }
+                }
+            }
+            let reason = if matches.is_empty() {
+                "no-matches"
+            } else {
+                "matched-references"
+            };
+            (StatusCode::OK, Json(QueryResult::ok(matches, reason))).into_response()
+        }
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(SpecError::with_detail(
+                "unknown-query-kind",
+                json!({ "kind": other }),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /spec/derive
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeriveBody {
+    pub page_id: String,
+    pub derivation: String,
+}
+
+pub async fn post_derive(
+    State(_state): State<Arc<ApiState>>,
+    Json(body): Json<DeriveBody>,
+) -> Response {
+    let root = storage::resolve_specs_root();
+    let doc = match storage::read_ir(&root, &body.page_id) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(SpecError::with_detail(
+                    "page-not-found",
+                    json!({ "pageId": body.page_id }),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "ir-read-failed",
+                    json!({ "pageId": body.page_id, "error": e }),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    match body.derivation.as_str() {
+        "incomingTransitions" => {
+            // Map state-id -> Vec<transition-id> activating it.
+            let mut by_state: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for t in &doc.transitions {
+                for activated in &t.activate_states {
+                    by_state
+                        .entry(activated.clone())
+                        .or_default()
+                        .push(t.id.clone());
+                }
+            }
+            let result: Vec<Value> = doc
+                .states
+                .iter()
+                .map(|s| {
+                    json!({
+                        "stateId": s.id,
+                        "incomingTransitions": by_state
+                            .get(&s.id)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "pageId": body.page_id,
+                    "derivation": body.derivation,
+                    "result": result,
+                })),
+            )
+                .into_response()
+        }
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(SpecError::with_detail(
+                "unknown-derivation",
+                json!({ "derivation": other }),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /spec/diff?since=<epoch-secs>
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct DiffQuery {
+    pub since: Option<u64>,
+}
+
+pub async fn get_diff(State(_state): State<Arc<ApiState>>, Query(q): Query<DiffQuery>) -> Response {
+    let since = q.since.unwrap_or(0);
+    let root = storage::resolve_specs_root();
+    let ids = match storage::list_pages(&root) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "list-pages-failed",
+                    json!({ "error": e.to_string() }),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let mut changed: Vec<Value> = Vec::new();
+    for id in &ids {
+        if let Some(mtime) = storage::newest_mtime_for_page(&root, id) {
+            if mtime > since {
+                changed.push(json!({ "pageId": id, "mtime": mtime }));
+            }
+        }
+    }
+    let reason = if changed.is_empty() {
+        "no-changes-since"
+    } else {
+        "changes-detected"
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "since": since,
+            "changed": changed,
+            "reason": reason,
+        })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /spec/author
+// ---------------------------------------------------------------------------
+
+pub async fn post_author(
+    State(_state): State<Arc<ApiState>>,
+    Json(doc): Json<IrDocument>,
+) -> Response {
+    if doc.id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SpecError::new("missing-document-id")),
+        )
+            .into_response();
+    }
+    if doc.version != "1.0" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SpecError::with_detail(
+                "unsupported-version",
+                json!({ "got": doc.version, "expected": "1.0" }),
+            )),
+        )
+            .into_response();
+    }
+    let root = storage::resolve_specs_root();
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SpecError::with_detail(
+                "specs-root-create-failed",
+                json!({ "error": e.to_string() }),
+            )),
+        )
+            .into_response();
+    }
+    let projection_path = match storage::write_ir_and_regenerate(&root, &doc) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "write-failed",
+                    json!({ "error": e }),
+                )),
+            )
+                .into_response();
+        }
+    };
+    events::emit(SpecChanged {
+        page_id: doc.id.clone(),
+        kind: "ir-and-projection".to_string(),
+        at_ms: events::now_ms(),
+    });
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "pageId": doc.id,
+            "projectionPath": projection_path.display().to_string(),
+        })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /spec/subscribe
+// ---------------------------------------------------------------------------
+
+pub async fn get_subscribe(
+    State(_state): State<Arc<ApiState>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let rx = events::subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|res| async move {
+        match res {
+            Ok(ev) => match Event::default().event("spec.changed").json_data(&ev) {
+                Ok(e) => Some(Ok::<Event, Infallible>(e)),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+}
+
+/// Smoke endpoint — used to confirm the spec_api router is mounted.
+pub async fn get_health() -> Response {
+    (StatusCode::OK, Json(EmptyOk::new("spec-api-mounted"))).into_response()
+}
