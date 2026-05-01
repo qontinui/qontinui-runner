@@ -510,71 +510,16 @@ impl PythonBridge {
         }
     }
 
-    pub fn configure_websocket(
-        &mut self,
-        enabled: bool,
-        url: String,
-        token: String,
-        project_id: Option<String>,
-        runner_name: Option<String>,
-        runner_port: Option<u16>,
-    ) -> Result<(), String> {
-        // Configure WebSocket
-        self.send_command(
-            "ws_configure",
-            Some(json!({
-                "enabled": enabled,
-                "api_url": url,
-                "jwt_token": token,
-                "project_id": project_id,
-                "runner_name": runner_name,
-                "runner_port": runner_port,
-            })),
-        )?;
-
-        // Also configure test results with the same credentials
-        // Test results use HTTP API on the same backend
-        if let Some(ref project) = project_id {
-            self.send_command(
-                "test_results_configure",
-                Some(json!({
-                    "enabled": enabled,
-                    "api_url": url,
-                    "access_token": token,
-                    "project_id": project,
-                })),
-            )?;
-        }
-
-        Ok(())
-    }
-
-    #[allow(dead_code)] // Reserved for future use - test results configuration
-    pub fn configure_test_results(
-        &mut self,
-        enabled: bool,
-        api_url: String,
-        access_token: String,
-        project_id: Option<String>,
-    ) -> Result<(), String> {
-        self.send_command(
-            "test_results_configure",
-            Some(json!({
-                "enabled": enabled,
-                "api_url": api_url,
-                "access_token": access_token,
-                "project_id": project_id,
-            })),
-        )
-    }
-
-    pub fn connect_websocket(&mut self) -> Result<(), String> {
-        self.send_command("ws_connect", None)
-    }
-
-    pub fn disconnect_websocket(&mut self) -> Result<(), String> {
-        self.send_command("ws_disconnect", None)
-    }
+    // Phase 3 — `configure_websocket` / `connect_websocket` /
+    // `disconnect_websocket` removed. The Python-side WebSocket client
+    // (`python-bridge/websocket_client.py`) was deleted in favor of the
+    // unified Rust-side relay (`mcp::backend_relay`), which is the sole
+    // outbound channel to qontinui-web.
+    //
+    // `configure_test_results` is also removed — it shipped together with
+    // `configure_websocket` and shared its plumbing. Test-result
+    // forwarding now happens via the unified channel if a future caller
+    // needs it.
 
     /// Check if the executor is running (sync version).
     ///

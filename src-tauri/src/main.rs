@@ -113,6 +113,7 @@ mod settings;
 mod skills;
 mod slash_commands;
 mod spawn_placement;
+mod spec_api;
 mod spec_experimentation;
 mod spec_utils;
 mod startup_panic;
@@ -660,7 +661,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::check_auth_status,
             commands::auth::get_access_token_for_websocket,
             commands::auth::get_api_port,
-            commands::auth::get_connection_info,
             commands::auth::get_device_info,
             commands::auth::get_test_auto_login,
             commands::auth::get_user_projects,
@@ -668,14 +668,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::login,
             commands::auth::logout,
             commands::auth::refresh_token,
-            commands::auth::send_device_heartbeat,
             commands::autostart::get_autostart_enabled,
             commands::autostart::set_autostart_enabled,
-            mcp::backend_relay::commands::get_cloud_relay_settings,
-            mcp::backend_relay::commands::get_cloud_relay_status,
-            mcp::backend_relay::commands::save_cloud_relay_settings,
-            mcp::backend_relay::commands::start_cloud_relay,
-            mcp::backend_relay::commands::stop_cloud_relay,
             commands::backup::export_all_data,
             commands::backup::get_export_summary,
             commands::backup::get_import_preview,
@@ -1386,9 +1380,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::web_integration::save_web_integration_settings,
             commands::web_integration::start_web_token_flow,
             commands::web_integration::test_web_integration_connection,
-            commands::websocket::configure_websocket,
-            commands::websocket::connect_websocket,
-            commands::websocket::disconnect_websocket,
             commands::window_manager::activate_system_window,
             commands::window_manager::list_system_windows,
             commands::workflow_events::emit_workflow_event,
@@ -1723,27 +1714,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Start heartbeat background task for fleet registration
             heartbeat::start_heartbeat(heartbeat_app_state);
 
-            // Start web-backend registration + heartbeat loop when
-            // WebIntegrationSettings are configured. Runs independently of
-            // QONTINUI_SERVER_MODE — any runner (desktop, secondary, or
-            // headless) that has web integration enabled participates.
-            {
-                let startup_app_state = app.state::<Arc<AppState>>().inner().clone();
-                tauri::async_runtime::spawn(async move {
-                    let sm_state_opt = startup_app_state.current_server_mode().await;
-                    if let Some(sm_state) = sm_state_opt {
-                        let restate_enabled = crate::settings::load_settings().restate.enabled;
-                        let ui_error_state = startup_app_state.ui_error.clone();
-                        let crash_dump_state = startup_app_state.crash_dumps.clone();
-                        crate::server_mode::spawn_background_tasks(
-                            sm_state,
-                            restate_enabled,
-                            ui_error_state,
-                            crash_dump_state,
-                        );
-                    }
-                });
-            }
+            // Phase 3 — web-backend integration is now driven entirely by
+            // the unified WebSocket relay (`crate::mcp::backend_relay`).
+            // The relay is launched from `mcp_api::start_server` once
+            // `Arc<ApiState>` is available; it reads `WebIntegrationSettings`
+            // on every reconnect and observes `ServerModeState::shutdown()`
+            // for hot-reload. There is no separate HTTP register/heartbeat
+            // loop in this phase.
 
             // Register this runner in the PostgreSQL instance registry.
             // Primary registers itself; secondaries register via heartbeat to the primary.

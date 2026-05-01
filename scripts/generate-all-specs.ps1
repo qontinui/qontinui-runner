@@ -133,7 +133,7 @@ function Extract-AndSave-Spec {
 
 # Parallel arrays: button slug (from page label) and correct spec ID (runner:{navId})
 $pageBtns = @(
-    "account", "advanced-ai", "ai-providers",
+    "backend-connection", "advanced-ai", "ai-providers",
     "architecture", "autoresearch", "backup", "dag-editor", "dashboard",
     "debug", "decision-trail", "demo-videos", "dev-intelligence", "explainer",
     "general", "image-quality", "llm-analytics", "log-sources", "mcp-servers",
@@ -142,7 +142,7 @@ $pageBtns = @(
     "updates", "visual-gui", "world-state-verifier"
 )
 $pageSpecIds = @(
-    "runner:settings-account", "runner:settings-agentic", "runner:settings-ai",
+    "runner:settings-backend-connection", "runner:settings-agentic", "runner:settings-ai",
     "runner:architecture", "runner:autoresearch", "runner:settings-backup", "runner:dag-workflow-editor", "runner:visual-dashboard",
     "runner:settings-debug", "runner:decision-trail", "runner:demo-video", "runner:development-intelligence", "runner:project-explainer",
     "runner:settings-general", "runner:image-quality-tests", "runner:llm-analytics", "runner:settings-log-sources", "runner:settings-mcp",

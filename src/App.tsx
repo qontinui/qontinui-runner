@@ -32,9 +32,7 @@ import {
   useLogFilter,
   useProjectSelection,
   useProjectLogs,
-  useWebSocketAutoConnect,
   useBackgroundActivities,
-  useCloudRelayAutoConnect,
   UIBridgeEventHandler,
   UIBridgeInvokeHandler,
   UIBridgeEvaluateHandler,
@@ -277,13 +275,12 @@ function AppContent() {
     extractionProgress: undefined,
   });
 
-  const webSocket = useWebSocketAutoConnect({
-    isAuthenticated: auth.authStatus?.authenticated ?? false,
-    selectedProjectId: projectSelection.selectedProjectId,
-    onLog: addLog,
-  });
-
-  useCloudRelayAutoConnect();
+  // Phase 3 — the runner ↔ qontinui-web channel is now a single outbound
+  // WebSocket driven from the Rust side (`mcp::backend_relay`). The legacy
+  // frontend-driven `useWebSocketAutoConnect` (user-JWT WebSocket via
+  // Python bridge) and `useCloudRelayAutoConnect` (separate cloud-relay
+  // toggle) are gone. The relay starts automatically at runner boot
+  // whenever `WebIntegrationSettings.enabled && runner_token` are set.
 
   // Subscribe to runner events and auto-invalidate graph analytics queries
   // when tasks complete, findings change, or workflows are generated.
@@ -498,7 +495,6 @@ function AppContent() {
                 globalLogSourceSettings={globalLogSources.settings}
                 projectSelection={projectSelection}
                 projectLogs={projectLogs}
-                webSocket={webSocket}
                 lastRun={lastRun}
                 lastRunWorkflowId={lastRunWorkflowId}
                 lastRunWorkflowName={lastRunWorkflowName}

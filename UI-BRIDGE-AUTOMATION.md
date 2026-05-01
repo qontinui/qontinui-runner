@@ -3,10 +3,10 @@
 This document covers three UI Bridge HTTP endpoints added in Phase 3I so
 automation can drive the runner's UI without `page/evaluate` tricks:
 
-| Route | Purpose |
-| --- | --- |
-| `GET /ui-bridge/commands` | List allowlisted Tauri commands + JSON schemas |
-| `POST /ui-bridge/invoke/{command_name}` | Invoke an allowlisted Tauri command over HTTP |
+| Route                                           | Purpose                                                                         |
+| ----------------------------------------------- | ------------------------------------------------------------------------------- |
+| `GET /ui-bridge/commands`                       | List allowlisted Tauri commands + JSON schemas                                  |
+| `POST /ui-bridge/invoke/{command_name}`         | Invoke an allowlisted Tauri command over HTTP                                   |
 | `POST /ui-bridge/control/activate-tab/{tab_id}` | Switch the runner's main tab (or `settings-*` sub-tab) via a native Tauri event |
 
 All routes are exposed on the runner's MCP API port (default `9876`;
@@ -158,13 +158,13 @@ calls `setActiveTab(tab_id)`.
 
 Both endpoints flip the same underlying `activeTab` state. Differences:
 
-| | `/page/set-tab` | `/activate-tab/{tab_id}` |
-| --- | --- | --- |
-| Tab id location | JSON body `{ "tab": "..." }` | URL path segment |
-| Transport | `page/evaluate` dispatching a JS `CustomEvent` | Native Tauri event |
-| Return | Waits ~100ms, reads `[data-page-id]` and returns it | Returns 200 immediately (fire-and-forget) |
-| Works when webview is slow/stuck | Less reliable (needs JS eval round-trip) | More reliable (no eval required) |
-| Settings sub-tab support | Main-tab only; sub-tab stays on default | Sub-tab propagates via `TabContent` → `<Settings defaultTab>` |
+|                                  | `/page/set-tab`                                     | `/activate-tab/{tab_id}`                                      |
+| -------------------------------- | --------------------------------------------------- | ------------------------------------------------------------- |
+| Tab id location                  | JSON body `{ "tab": "..." }`                        | URL path segment                                              |
+| Transport                        | `page/evaluate` dispatching a JS `CustomEvent`      | Native Tauri event                                            |
+| Return                           | Waits ~100ms, reads `[data-page-id]` and returns it | Returns 200 immediately (fire-and-forget)                     |
+| Works when webview is slow/stuck | Less reliable (needs JS eval round-trip)            | More reliable (no eval required)                              |
+| Settings sub-tab support         | Main-tab only; sub-tab stays on default             | Sub-tab propagates via `TabContent` → `<Settings defaultTab>` |
 
 Prefer `/activate-tab/` for automation; prefer `/page/set-tab` when you
 need the post-switch `pageId` readback in a single round-trip.
@@ -172,8 +172,8 @@ need the post-switch `pageId` readback in a single round-trip.
 ### Request
 
 ```bash
-# Switch to the web-integration settings sub-tab in one call.
-curl -X POST http://localhost:9876/ui-bridge/control/activate-tab/settings-web-integration
+# Switch to the backend-connection settings sub-tab in one call.
+curl -X POST http://localhost:9876/ui-bridge/control/activate-tab/settings-backend-connection
 
 # Switch to the main Processes tab.
 curl -X POST http://localhost:9876/ui-bridge/control/activate-tab/processes
@@ -194,7 +194,7 @@ Anything in the `MainTabId` union in
 `VALID_TAB_IDS` list in `src-tauri/src/mcp/ui_bridge.rs`; adding a new
 tab id requires updating both sides by hand.
 
-`settings-*` ids (e.g. `settings-web-integration`, `settings-ai`)
+`settings-*` ids (e.g. `settings-backend-connection`, `settings-ai`)
 activate the main Settings tab and land on the named sub-tab in one
 step — the `TabContent` component maps the settings-prefixed id to a
 `defaultTab` prop on the `<Settings>` component, which re-syncs its

@@ -43,6 +43,8 @@ interface WebIntegrationStatus {
   runnerId: string | null;
   lastHeartbeatAt: string | null;
   registrationError: string | null;
+  /** Whether the unified runner WebSocket is currently connected. */
+  wsConnected: boolean;
 }
 
 /** Shape of `test_web_integration_connection` response on success. */
@@ -396,7 +398,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   // --- Status banner --------------------------------------------------------
   const renderStatusBanner = () => {
     if (!status?.enabled) return null;
-    if (status.runnerId) {
+    if (status.wsConnected && status.runnerId) {
       return (
         <div className="flex items-start gap-2 p-3 rounded-md bg-green-500/10 border border-green-500/20">
           <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0 mt-0.5" />
@@ -406,6 +408,21 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
             </div>
             <div className="text-muted-foreground">
               Last heartbeat {formatRelativeTime(status.lastHeartbeatAt)}
+            </div>
+          </div>
+        </div>
+      );
+    }
+    if (status.runnerId && !status.wsConnected) {
+      // Runner was registered earlier in the session but the WS has dropped.
+      // The relay is reconnecting in the background.
+      return (
+        <div className="flex items-start gap-2 p-3 rounded-md bg-yellow-500/10 border border-yellow-500/20">
+          <Loader2 className="w-4 h-4 text-yellow-500 shrink-0 mt-0.5 animate-spin" />
+          <div className="text-xs">
+            <div className="font-medium text-yellow-500">Reconnecting…</div>
+            <div className="text-muted-foreground">
+              Lost connection to {status.backendUrl || PLACEHOLDER_BACKEND_URL}; retrying.
             </div>
           </div>
         </div>

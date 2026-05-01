@@ -241,7 +241,6 @@ pub mod verification;
 pub mod video;
 pub mod watchers; // Screenpipe-inspired scheduled reactive AI agents
 pub mod web_integration; // Phase 3G: runner↔web backend integration toggle
-pub mod websocket;
 pub mod window_manager; // OS-level window enumeration and activation
 pub mod workflow_events; // Workflow event emission to backend for mobile push notifications
 pub mod worktrees; // Phase F: pre-merge guard + force-merge Tauri commands
@@ -458,8 +457,8 @@ impl AppState {
     ///
     /// Returns a cloned `Option<ServerModeState>` under a read lock, so the
     /// caller does not hold the lock while awaiting downstream HTTP work.
-    /// Callers that need to inspect state fields (runner_id, dispatch_secret)
-    /// should use this helper rather than locking directly — the inner
+    /// Callers that need to inspect state fields (runner_id) should use
+    /// this helper rather than locking directly — the inner
     /// `ServerModeState` already shares its data via `Arc<RwLock<...>>`, so
     /// the clone is cheap.
     pub async fn current_server_mode(&self) -> Option<crate::server_mode::ServerModeState> {

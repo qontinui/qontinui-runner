@@ -1,0 +1,331 @@
+{
+  "description": "Real-time monitoring hub for running workflows. Users observe live AI conversation output, verification results, and iteration progress; the dashboard transitions between idle, running, paused, and completion-overlay states as workflows execute.\n\nSample IR document for the Active Dashboard, derived from\n`qontinui-runner/src/specs/active.spec.uibridge.json`. Subset of the full\nstate machine: idle, running, paused, completion-overlay.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Idle - No Active Workflow",
+          "enabled": true,
+          "id": "idle-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No Active Workflow"
+            },
+            "label": "Required element for Idle - No Active Workflow",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "No workflow is running. The page shows a centered prompt with the 'No Active Workflow' heading and options to run the last workflow or view the last run recap.",
+      "id": "idle",
+      "name": "Idle - No Active Workflow",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Running - Workflow Executing",
+          "enabled": true,
+          "id": "running-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Stop"
+            },
+            "label": "Required element for Running - Workflow Executing",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A workflow is actively executing. The control bar shows the task name, phase badges, and a Stop button; the dynamic widget layout displays the active widget at 65% and summary widgets at 35%.",
+      "id": "running",
+      "name": "Running - Workflow Executing",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Paused - Workflow Paused",
+          "enabled": true,
+          "id": "paused-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "accessibleName": "Play",
+              "role": "button"
+            },
+            "label": "Required element for Paused - Workflow Paused",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The workflow is temporarily paused. The control bar shows a Play button to resume; widgets remain visible but execution is halted.",
+      "id": "paused",
+      "name": "Paused - Workflow Paused",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Completion Summary Overlay",
+          "enabled": true,
+          "id": "completion-overlay-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "accessibleName": "Workflow completion summary",
+              "role": "dialog"
+            },
+            "label": "Required element for Completion Summary Overlay",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Completion Summary Overlay",
+          "enabled": true,
+          "id": "completion-overlay-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Dismiss"
+            },
+            "label": "Required element for Completion Summary Overlay",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "An overlay dialog appears when a workflow finishes. Shows the final status, step statistics, success rate, and duration. Auto-dismisses after 15 seconds.",
+      "id": "completion-overlay",
+      "name": "Completion Summary Overlay",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "ActiveDashboardPage",
+    "tags": [
+      "active-dashboard",
+      "monitoring",
+      "real-time",
+      "tier-1"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "No workflow is running. The page shows a centered prompt with the 'No Active Workflow' heading and options to run the last workflow or view the last run recap.",
+        "elements": [
+          {
+            "textContent": "No Active Workflow"
+          }
+        ],
+        "id": "idle",
+        "isInitial": true,
+        "name": "Idle - No Active Workflow",
+        "transitions": [
+          {
+            "activateStates": [
+              "running"
+            ],
+            "deactivateStates": [
+              "idle"
+            ],
+            "id": "idle-to-running",
+            "name": "Start a workflow",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Run Last Workflow"
+                },
+                "waitAfter": {
+                  "timeout": 5000,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          }
+        ]
+      },
+      {
+        "description": "A workflow is actively executing. The control bar shows the task name, phase badges, and a Stop button; the dynamic widget layout displays the active widget at 65% and summary widgets at 35%.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Stop"
+          }
+        ],
+        "id": "running",
+        "isInitial": false,
+        "name": "Running - Workflow Executing",
+        "transitions": [
+          {
+            "activateStates": [
+              "paused"
+            ],
+            "deactivateStates": [
+              "running"
+            ],
+            "id": "running-to-paused",
+            "name": "Pause the workflow",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "accessibleName": "Pause",
+                  "role": "button"
+                },
+                "waitAfter": {
+                  "timeout": 2000,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          },
+          {
+            "activateStates": [
+              "completion-overlay"
+            ],
+            "deactivateStates": [
+              "running"
+            ],
+            "id": "running-to-completion-overlay",
+            "name": "Workflow finishes (automatic transition)",
+            "process": [],
+            "staysVisible": false
+          },
+          {
+            "activateStates": [
+              "idle"
+            ],
+            "deactivateStates": [
+              "running"
+            ],
+            "id": "running-to-idle",
+            "name": "Stop the workflow",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "role": "button",
+                  "textContent": "Stop"
+                },
+                "waitAfter": {
+                  "timeout": 3000,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          }
+        ]
+      },
+      {
+        "description": "The workflow is temporarily paused. The control bar shows a Play button to resume; widgets remain visible but execution is halted.",
+        "elements": [
+          {
+            "accessibleName": "Play",
+            "role": "button"
+          }
+        ],
+        "id": "paused",
+        "isInitial": false,
+        "name": "Paused - Workflow Paused",
+        "transitions": [
+          {
+            "activateStates": [
+              "running"
+            ],
+            "deactivateStates": [
+              "paused"
+            ],
+            "id": "paused-to-running",
+            "name": "Resume the workflow",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "accessibleName": "Play",
+                  "role": "button"
+                },
+                "waitAfter": {
+                  "timeout": 2000,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          }
+        ]
+      },
+      {
+        "description": "An overlay dialog appears when a workflow finishes. Shows the final status, step statistics, success rate, and duration. Auto-dismisses after 15 seconds.",
+        "elements": [
+          {
+            "accessibleName": "Workflow completion summary",
+            "role": "dialog"
+          },
+          {
+            "textContent": "Dismiss"
+          }
+        ],
+        "id": "completion-overlay",
+        "isInitial": false,
+        "name": "Completion Summary Overlay",
+        "transitions": [
+          {
+            "activateStates": [
+              "idle"
+            ],
+            "deactivateStates": [
+              "completion-overlay"
+            ],
+            "id": "completion-overlay-to-idle",
+            "name": "Dismiss the completion overlay",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Dismiss"
+                },
+                "waitAfter": {
+                  "timeout": 1000,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          }
+        ]
+      }
+    ]
+  },
+  "version": "1.0.0"
+}
