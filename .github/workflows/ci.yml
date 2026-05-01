@@ -116,7 +116,7 @@ jobs:
       - name: Run security audit on Rust dependencies
         run: |
           cargo install cargo-audit
-          cd qontinui-runner/src-tauri
+          cd src-tauri
           cargo audit
 
       - name: Setup pnpm
@@ -126,5 +126,4 @@ jobs:
 
       - name: Run pnpm audit
         run: |
-          cd qontinui-runner
           pnpm audit --audit-level=moderate || true
