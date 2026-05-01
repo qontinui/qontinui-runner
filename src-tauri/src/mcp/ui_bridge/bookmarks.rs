@@ -220,6 +220,14 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
         // Change tracking — /control/ai/* family
+        //
+        // The list/save endpoint uses the plural `/bookmarks`; the per-resource
+        // endpoints historically used the singular `/bookmark/{name}` variant.
+        // Plural aliases (`/bookmarks/{name}` and `/bookmarks/{name}/diff`) are
+        // mounted on the same handlers so callers reading the canonical
+        // reference (which uses plural throughout) don't hit 404s when paths
+        // drift in their head. Mirrors the alias added to the SDK's API_ROUTES
+        // table at `ui-bridge/packages/ui-bridge/src/server/types.ts:1164` (commit 732e15a).
         .route(
             "/ui-bridge/control/ai/bookmarks",
             get(ui_bridge_list_bookmarks_handler).post(ui_bridge_save_bookmark_handler),
@@ -229,7 +237,15 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             get(ui_bridge_get_bookmark_handler).delete(ui_bridge_delete_bookmark_handler),
         )
         .route(
+            "/ui-bridge/control/ai/bookmarks/{name}",
+            get(ui_bridge_get_bookmark_handler).delete(ui_bridge_delete_bookmark_handler),
+        )
+        .route(
             "/ui-bridge/control/ai/bookmark/{name}/diff",
+            get(ui_bridge_diff_from_bookmark_handler),
+        )
+        .route(
+            "/ui-bridge/control/ai/bookmarks/{name}/diff",
             get(ui_bridge_diff_from_bookmark_handler),
         )
         .route(
@@ -278,6 +294,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_with_diff_handler),
         )
         // /ai/* aliases (mirror of /control/ai/*)
+        //
+        // Same plural/singular alias rationale as above — `/ai/bookmarks/{name}`
+        // and `/ai/bookmarks/{name}/diff` are accepted in addition to the
+        // singular forms for symmetry with list/save.
         .route(
             "/ui-bridge/ai/bookmarks",
             get(ui_bridge_list_bookmarks_handler).post(ui_bridge_save_bookmark_handler),
@@ -287,7 +307,15 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             get(ui_bridge_get_bookmark_handler).delete(ui_bridge_delete_bookmark_handler),
         )
         .route(
+            "/ui-bridge/ai/bookmarks/{name}",
+            get(ui_bridge_get_bookmark_handler).delete(ui_bridge_delete_bookmark_handler),
+        )
+        .route(
             "/ui-bridge/ai/bookmark/{name}/diff",
+            get(ui_bridge_diff_from_bookmark_handler),
+        )
+        .route(
+            "/ui-bridge/ai/bookmarks/{name}/diff",
             get(ui_bridge_diff_from_bookmark_handler),
         )
         .route(
