@@ -19,10 +19,25 @@ export interface PromptPlan {
 
 export type ExecutionPhase = "idle" | "planning" | "executing" | "done" | "error";
 
+export type ErrorKind = "auth-required" | "generic" | null;
+
 export interface StepProgress {
   currentIndex: number;
   total: number;
   currentStep: PlanStep | null;
+}
+
+/**
+ * Thrown when the planner endpoint returns 401/403 — the runner's JWT auth
+ * has expired. The catch block uses `instanceof` to distinguish this from
+ * generic planning failures so the UI can surface a sign-in affordance.
+ */
+class AuthRequiredError extends Error {
+  readonly kind = "auth-required" as const;
+  constructor(message = "Sign-in required to run prompts.") {
+    super(message);
+    this.name = "AuthRequiredError";
+  }
 }
 
 interface UsePromptExecutionReturn {
@@ -30,6 +45,7 @@ interface UsePromptExecutionReturn {
   plan: PromptPlan | null;
   progress: StepProgress;
   error: string | null;
+  errorKind: ErrorKind;
   lastPrompt: string | null;
   submit: (prompt: string, explain: boolean) => Promise<void>;
   retry: () => void;
@@ -46,6 +62,7 @@ export function usePromptExecution(): UsePromptExecutionReturn {
     currentStep: null,
   });
   const [error, setError] = useState<string | null>(null);
+  const [errorKind, setErrorKind] = useState<ErrorKind>(null);
   const [lastPrompt, setLastPrompt] = useState<string | null>(null);
   const lastExplainRef = useRef(false);
   const abortRef = useRef(false);
@@ -57,6 +74,7 @@ export function usePromptExecution(): UsePromptExecutionReturn {
     setPlan(null);
     setProgress({ currentIndex: -1, total: 0, currentStep: null });
     setError(null);
+    setErrorKind(null);
   }, []);
 
   const submit = useCallback(
@@ -67,6 +85,7 @@ export function usePromptExecution(): UsePromptExecutionReturn {
       setLastPrompt(prompt);
       lastExplainRef.current = explain;
       setError(null);
+      setErrorKind(null);
       setPhase("planning");
 
       try {
@@ -81,6 +100,18 @@ export function usePromptExecution(): UsePromptExecutionReturn {
         });
 
         if (!resp.ok) {
+          // Auth failures (typically expired JWT) need a distinct UI affordance
+          // so the user can re-authenticate. Tag them before falling into the
+          // generic error path.
+          if (resp.status === 401 || resp.status === 403) {
+            // Drain the body so the connection can be released; ignore content.
+            try {
+              await resp.text();
+            } catch {
+              /* ignore */
+            }
+            throw new AuthRequiredError();
+          }
           let errorMsg = `Planning failed (${resp.status})`;
           try {
             const json = await resp.json();
@@ -159,6 +190,7 @@ export function usePromptExecution(): UsePromptExecutionReturn {
         if (abortRef.current) return;
         const msg = err instanceof Error ? err.message : "An error occurred";
         setError(msg);
+        setErrorKind(err instanceof AuthRequiredError ? "auth-required" : "generic");
         setPhase("error");
       } finally {
         runningRef.current = false;
@@ -173,7 +205,7 @@ export function usePromptExecution(): UsePromptExecutionReturn {
     }
   }, [lastPrompt, submit]);
 
-  return { phase, plan, progress, error, lastPrompt, submit, retry, reset };
+  return { phase, plan, progress, error, errorKind, lastPrompt, submit, retry, reset };
 }
 
 interface StateMachineAPI {

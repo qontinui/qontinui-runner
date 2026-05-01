@@ -1,12 +1,20 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { Search, Loader2, CheckCircle2, XCircle, Sparkles, ChevronRight } from "lucide-react";
+import {
+  Search,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Sparkles,
+  ChevronRight,
+  LogIn,
+} from "lucide-react";
 import { PromptSuggestions, savePromptToHistory } from "./PromptSuggestions";
 import { usePromptExecutionContext } from "./PromptExecutionContext";
 
 export function PromptHomePage() {
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-  const { phase, plan, progress, error, submit, reset, explain, setExplain } =
+  const { phase, plan, progress, error, errorKind, submit, reset, explain, setExplain } =
     usePromptExecutionContext();
 
   // Focus input on mount
@@ -159,8 +167,40 @@ export function PromptHomePage() {
             </div>
           )}
 
-          {/* Error state */}
-          {phase === "error" && (
+          {/* Auth-required banner — distinct affordance for expired JWT.
+              The literal text "Sign-in required to run prompts" is also
+              relied on by probe-driven tests reading document.body.innerText. */}
+          {phase === "error" && errorKind === "auth-required" && (
+            <div
+              role="alert"
+              className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300 space-y-2"
+            >
+              <div className="flex items-center gap-2 font-medium">
+                <LogIn className="w-4 h-4" />
+                Sign-in required to run prompts.
+              </div>
+              <p className="text-xs text-red-600/80 dark:text-red-300/80">
+                Your session has expired. Reload the runner to sign in again.
+              </p>
+              <div className="flex gap-3 pt-1">
+                <button
+                  onClick={() => window.location.reload()}
+                  className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
+                >
+                  Reload
+                </button>
+                <button
+                  onClick={handleReset}
+                  className="text-sm text-muted-foreground hover:underline"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Generic error state */}
+          {phase === "error" && errorKind !== "auth-required" && (
             <div className="text-center space-y-3">
               <div className="flex items-center gap-2 text-sm text-red-500 justify-center">
                 <XCircle className="w-4 h-4" />

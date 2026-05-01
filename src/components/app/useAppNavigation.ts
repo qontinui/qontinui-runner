@@ -5,7 +5,12 @@ import { useApiReady, useRenderPerformance } from "@/hooks";
 import { getApiPort } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { MainTabId } from "./tab-types";
-import { migrateTabId, SIDEBAR_COLLAPSED_KEY } from "./tab-types";
+import {
+  ACTIVE_TAB_STORAGE_KEY,
+  migrateTabId,
+  setActiveTabAndPersist,
+  SIDEBAR_COLLAPSED_KEY,
+} from "./tab-types";
 import { useNavigation } from "./NavigationContext";
 
 const PAGE_TO_TAB: Record<string, MainTabId> = {
@@ -144,13 +149,36 @@ export function useAppNavigation(): UseAppNavigationReturn {
     setErrorMonitorScope({});
   }, []);
 
+  // One-shot reconciliation: when the API port finalises (it can resolve
+  // *after* this hook mounts on temp/spawned runners), the initial mount-time
+  // read of `instanceStorage` may have hit the wrong namespace and defaulted
+  // to "prompt-home". Once `isApiReady` flips true and the port is settled,
+  // re-read storage ONCE to pick up the correct value.
+  //
+  // Critically this must NOT clobber a deliberate live state change. If the
+  // user (or a Tauri event, or a UI Bridge command) has already navigated
+  // away from "prompt-home" before isApiReady fires, that live state wins —
+  // we only reconcile when our in-memory state is still the default
+  // ("prompt-home") and storage now has a different (real) persisted value.
+  // Without this guard, isApiReady flipping (e.g. after a transient health
+  // probe failure) would yank the user back to whatever's stored.
+  const hasReconciledApiPortRef = useRef(false);
   useEffect(() => {
-    if (isApiReady && getApiPort() !== 9876) {
-      const stored = instanceStorage.getItem("qontinui-main-active-tab");
-      const correct = migrateTabId(stored);
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- re-sync tab after API becomes ready
-      setActiveTab(correct);
-    }
+    if (!isApiReady) return;
+    if (getApiPort() === 9876) return;
+    if (hasReconciledApiPortRef.current) return;
+    hasReconciledApiPortRef.current = true;
+    const stored = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY);
+    const correct = migrateTabId(stored);
+    // Only adopt the storage value if our current state is still the mount
+    // default AND storage actually contains a real (non-null) value. This
+    // prevents wiping a deliberate navigation that happened in the gap
+    // between mount and isApiReady=true.
+    setActiveTab((current) => {
+      if (current !== "prompt-home") return current;
+      if (stored === null) return current;
+      return correct;
+    });
   }, [isApiReady]);
 
   // When a `productivity-*` alias is requested, the main tab is `productivity`
@@ -176,7 +204,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
     registerNavigate((page: string) => {
       const tabId = PAGE_TO_TAB[page];
       if (tabId) {
-        setActiveTab(tabId);
+        setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
         dispatchProductivitySubView(page);
       }
     });
@@ -187,13 +215,13 @@ export function useAppNavigation(): UseAppNavigationReturn {
       const { page } = e.detail;
       const tabId = PAGE_TO_TAB[page];
       if (tabId) {
-        setActiveTab(tabId);
+        setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
         dispatchProductivitySubView(page);
       }
     };
     // Direct tab setter (bypasses PAGE_TO_TAB for navigate_tab endpoint)
     const directHandler = (e: CustomEvent<{ tab: MainTabId }>) => {
-      setActiveTab(e.detail.tab);
+      setActiveTabAndPersist(setActiveTab, instanceStorage, e.detail.tab);
     };
     window.addEventListener("ui-bridge-navigate", handler);
     window.addEventListener("ui-bridge-set-tab", directHandler as EventListener);
@@ -218,7 +246,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
       unlisten = await listen<{ tab_id: string }>("ui-bridge:activate-tab", (event) => {
         const { tab_id } = event.payload ?? { tab_id: "" };
         if (!tab_id) return;
-        setActiveTab(tab_id as MainTabId);
+        setActiveTabAndPersist(setActiveTab, instanceStorage, tab_id as MainTabId);
       });
     };
 
@@ -242,7 +270,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         const { page } = event.payload;
         const tabId = PAGE_TO_TAB[page];
         if (tabId) {
-          setActiveTab(tabId);
+          setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
           if (page === "state-machine") {
             setTimeout(() => window.dispatchEvent(new Event("sm-show-exploration")), 200);
           }
@@ -268,7 +296,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
     ) => {
       const { taskRunId, taskRunName } = e.detail ?? {};
       setErrorMonitorScope({ taskRunId, taskRunName });
-      setActiveTab("error-monitor");
+      setActiveTabAndPersist(setActiveTab, instanceStorage, "error-monitor");
     };
     window.addEventListener("navigate-to-error-monitor", handleNavigateToErrorMonitor);
     return () =>
@@ -277,7 +305,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
 
   useEffect(() => {
     const handleNavigateToActive = () => {
-      setActiveTab("active");
+      setActiveTabAndPersist(setActiveTab, instanceStorage, "active");
     };
     window.addEventListener("navigate-to-active", handleNavigateToActive);
     return () => window.removeEventListener("navigate-to-active", handleNavigateToActive);
@@ -324,8 +352,13 @@ export function useAppNavigation(): UseAppNavigationReturn {
     }
   }, [activeTab, terminalSessionCount, sidebarCollapsed]);
 
+  // Backstop persistence: every event-handler that calls `setActiveTab`
+  // already persists synchronously via `setActiveTabAndPersist`, but this
+  // useEffect catches any caller we missed (and also runs once on mount to
+  // seed storage with the initial state) so storage and React state never
+  // permanently diverge.
   useEffect(() => {
-    instanceStorage.setItem("qontinui-main-active-tab", activeTab);
+    instanceStorage.setItem(ACTIVE_TAB_STORAGE_KEY, activeTab);
   }, [activeTab]);
 
   // Register navigateHandler on __UI_BRIDGE__ so that pageNavigate commands
@@ -343,11 +376,11 @@ export function useAppNavigation(): UseAppNavigationReturn {
         const path = raw.split(/[?#]/)[0];
         const tabId = PAGE_TO_TAB[path];
         if (tabId) {
-          setActiveTab(tabId);
+          setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
           dispatchProductivitySubView(path);
         } else {
           // Fall back: try using the path directly as a tab ID
-          setActiveTab(path as MainTabId);
+          setActiveTabAndPersist(setActiveTab, instanceStorage, path as MainTabId);
         }
       };
     }
