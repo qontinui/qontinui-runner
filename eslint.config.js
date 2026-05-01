@@ -3,6 +3,7 @@ import typescript from "@typescript-eslint/eslint-plugin";
 import typescriptParser from "@typescript-eslint/parser";
 import react from "eslint-plugin-react";
 import reactHooks from "eslint-plugin-react-hooks";
+import uiBridgePlugin from "@qontinui/ui-bridge-eslint-plugin";
 import globals from "globals";
 
 export default [
@@ -23,6 +24,7 @@ export default [
       "@typescript-eslint": typescript,
       react: react,
       "react-hooks": reactHooks,
+      "@qontinui/ui-bridge": uiBridgePlugin,
     },
     settings: {
       react: {
@@ -58,6 +60,7 @@ export default [
       "react-hooks/immutability": "warn",
       "react-hooks/purity": "warn",
       "react-hooks/preserve-manual-memoization": "warn",
+      "@qontinui/ui-bridge/require-state-annotation": "warn",
     },
   },
   {
