@@ -3013,6 +3013,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/task-runs/session", post(create_ai_session))
         .route("/task-runs/{id}", get(get_task_run).delete(delete_task_run))
         .route("/task-runs/{id}/output", get(get_task_output))
+        .route(
+            "/task-runs/{id}/output-structured",
+            get(crate::mcp::task_run_structured_output::get_task_output_structured),
+        )
+        .route(
+            "/task-runs/{id}/status-stream",
+            get(crate::mcp::task_run_structured_output::status_stream),
+        )
         .route("/task-runs/{id}/workflow-state", get(get_workflow_state))
         .route("/task-runs/{id}/result-data", get(get_task_run_result_data))
         .route(
