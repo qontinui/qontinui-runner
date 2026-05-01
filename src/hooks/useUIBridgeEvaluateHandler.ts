@@ -14,7 +14,7 @@
  *     v
  * This Hook
  *     | new Function("return " + expression)()  (security-gated)
- *     | await Promise.resolve(result)
+ *     | awaitWithTimeout(result, PAGE_EVALUATE_PROMISE_TIMEOUT_MS)
  *     v
  * This Hook
  *     | emit("ui-bridge:evaluate-response", { request_id, ok, result, error })
@@ -43,6 +43,10 @@ import { useEffect } from "react";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
+import {
+  awaitWithTimeout,
+  PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+} from "./ui-bridge-events/utils";
 
 const log = createLogger("UIBridgeEvaluateHandler");
 
@@ -125,8 +129,12 @@ function rejectIfDangerous(expression: string, allowNetworkRequests: boolean): v
  * semantics: default-wrap as `return <expr>` so `document.title`-style
  * simple expressions evaluate to their value; fall back to raw function
  * body if the wrap produces a SyntaxError (e.g. caller wrote top-level
- * `let`/`const` + explicit `return`). Promises are awaited via
- * `Promise.resolve(...)` before the response is emitted.
+ * `let`/`const` + explicit `return`). Top-level Promises (and any
+ * thenable) are auto-awaited with a {@link PAGE_EVALUATE_PROMISE_TIMEOUT_MS}
+ * cap so `(async () => ...)()` and `Promise.resolve(...)` patterns return
+ * their resolved value rather than the bare Promise object (which would
+ * serialize to `{}`). Mirrors the sibling
+ * `usePageEvents.ts::page_evaluate` branch.
  */
 async function evaluateExpression(expression: string): Promise<unknown> {
   let result: unknown;
@@ -139,7 +147,7 @@ async function evaluateExpression(expression: string): Promise<unknown> {
       throw firstErr;
     }
   }
-  return await Promise.resolve(result);
+  return await awaitWithTimeout(result, PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
 }
 
 /**

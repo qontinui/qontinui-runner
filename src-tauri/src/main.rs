@@ -17,6 +17,7 @@ mod ai_router;
 mod ai_workflows;
 pub mod api_config;
 mod api_request;
+mod asset_headers;
 mod auth;
 mod auto_commit;
 mod backup;
@@ -1517,7 +1518,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         .min_inner_size(1200.0, 700.0)
                         .fullscreen(false)
                         .resizable(true)
-                        .decorations(env_decorations.unwrap_or(true));
+                        .decorations(env_decorations.unwrap_or(true))
+                        // Phase P2.2 of `tmp_plans/sw-cache-invalidation.md`:
+                        // mark the embedded index.html as `no-store` so a
+                        // webview that survives a binary swap can't serve a
+                        // stale shell whose <script src> tags point at
+                        // hashed asset filenames the new bundle no longer
+                        // contains. Hashed `/assets/*` responses pass
+                        // through with their default headers.
+                        .on_web_resource_request(asset_headers::stamp_no_store_on_index);
 
                     if let Some(ref dir) = data_dir {
                         builder = builder.data_directory(std::path::PathBuf::from(dir));

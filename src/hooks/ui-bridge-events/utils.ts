@@ -175,6 +175,65 @@ export function levenshtein(a: string, b: string): number {
 }
 
 /**
+ * Cap on auto-awaiting a top-level Promise returned by `page_evaluate`.
+ * Without this, a caller passing `(async () => { await new Promise(() => {}) })()`
+ * would wedge the eval response forever. 30 s is generous for legitimate
+ * async work (network round-trip, batch DOM scan) while still bounding
+ * the worst case. Used by both the legacy IPC `page_evaluate` branch
+ * (`usePageEvents.ts`) and the tagged Tauri-event evaluate handler
+ * (`useUIBridgeEvaluateHandler.ts`).
+ */
+export const PAGE_EVALUATE_PROMISE_TIMEOUT_MS = 30_000;
+
+/**
+ * Duck-typed thenable check. Spec-correct (matches what `await` itself
+ * does): "thenable" is "has a callable `.then`". Catches cross-realm
+ * Promises (e.g. iframes whose Promise constructor lives in a different
+ * realm) that `instanceof Promise` would miss.
+ */
+export function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
+/**
+ * If `value` is a thenable, await it with a timeout cap; otherwise
+ * return as-is (no Promise-wrap allocation for the common synchronous
+ * case). Used by the `page_evaluate` handlers to auto-resolve top-level
+ * Promises returned by expressions like `(async () => ({a:1}))()` so
+ * callers don't have to spell out `.then(v => v)` to unwrap them.
+ *
+ * On timeout, throws an Error whose message names the elapsed seconds —
+ * the caller's existing try/catch maps that to the standard error
+ * envelope, so timeouts are surfaced as `success: false, error: "..."`
+ * rather than wedging the response forever. Rejections of the awaited
+ * Promise propagate normally (same try/catch handles them).
+ */
+export async function awaitWithTimeout(value: unknown, timeoutMs: number): Promise<unknown> {
+  if (!isThenable(value)) {
+    return value;
+  }
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new Error(
+          `page_evaluate: Promise did not resolve within ${(timeoutMs / 1000).toFixed(1)}s`,
+        ),
+      );
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([value, timeoutPromise]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
  * Pick up to 5 element ids closest to `target` by Levenshtein distance,
  * filtered to ids whose distance is at most `floor(target.length / 2)`.
  *

@@ -14,7 +14,13 @@ import {
   installStubFetchInterceptor,
   validateStubRequest,
 } from "@qontinui/ui-bridge";
-import { serializeComponent, getUIBridgeGlobal, toTabCanonical } from "./utils";
+import {
+  serializeComponent,
+  getUIBridgeGlobal,
+  toTabCanonical,
+  awaitWithTimeout,
+  PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+} from "./utils";
 
 const logger = createLogger("UIBridgePageEvents");
 
@@ -457,7 +463,20 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
                 throw firstErr;
               }
             }
-            const resolvedResult = await Promise.resolve(result);
+            // Auto-await top-level Promises (and thenables, for cross-realm
+            // safety — iframes can produce Promise objects whose constructor
+            // is a different realm's Promise, so `instanceof Promise` would
+            // miss them). The `then` duck-test catches both.
+            //
+            // Cap the wait at PAGE_EVALUATE_PROMISE_TIMEOUT_MS so a hanging
+            // Promise can't block the bridge response indefinitely. On
+            // timeout we surface an error envelope describing the elapsed
+            // time so callers can distinguish "expression returned a
+            // pending Promise" from "expression threw synchronously".
+            const resolvedResult = await awaitWithTimeout(
+              result,
+              PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+            );
             if (unwrap) {
               // Opt-in consistent shape: always `{ value, type }`.
               let valueType: "scalar" | "object" | "undefined" | "function" | "null";
