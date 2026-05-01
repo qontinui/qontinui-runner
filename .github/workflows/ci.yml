@@ -30,7 +30,7 @@ jobs:
         with:
           node-version: "20"
           cache: "pnpm"
-          cache-dependency-path: qontinui-runner/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -67,45 +67,37 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            qontinui-runner/src-tauri/target/
+            src-tauri/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install frontend dependencies
-        run: |
-          cd qontinui-runner
-          pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Lint frontend code
-        run: |
-          cd qontinui-runner
-          pnpm run lint
+        run: pnpm run lint
 
       - name: Format Rust code check
         run: |
-          cd qontinui-runner/src-tauri
+          cd src-tauri
           cargo fmt -- --check
 
       - name: Clippy check
         run: |
-          cd qontinui-runner/src-tauri
+          cd src-tauri
           cargo clippy -- -D warnings
 
       - name: Run Rust tests
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
         run: |
-          cd qontinui-runner/src-tauri
+          cd src-tauri
           cargo test --verbose
 
       - name: Build frontend
-        run: |
-          cd qontinui-runner
-          pnpm run build
+        run: pnpm run build
 
       - name: Build Tauri app (development)
-        run: |
-          cd qontinui-runner
-          pnpm run tauri build -- --debug
+        run: pnpm run tauri build -- --debug
 
   security:
     runs-on: ubuntu-latest
@@ -116,7 +108,7 @@ jobs:
       - name: Run security audit on Rust dependencies
         run: |
           cargo install cargo-audit
-          cd qontinui-runner/src-tauri
+          cd src-tauri
           cargo audit
 
       - name: Setup pnpm
@@ -125,6 +117,4 @@ jobs:
           version: 10.33.2
 
       - name: Run pnpm audit
-        run: |
-          cd qontinui-runner
-          pnpm audit --audit-level=moderate || true
+        run: pnpm audit --audit-level=moderate || true
