@@ -58,11 +58,6 @@ jobs:
             # Self-reference: this workflow file contains the pattern
             # strings as part of its definition.
             ':!.github/workflows/forbid-runner-schema.yml'
-            # Transitional: the runner-native MIGRATIONS array references
-            # the runner schema legitimately (it's the schema being
-            # migrated). Phase 4 of the consolidation plan deletes this
-            # file entirely. After that lands, drop this exclude.
-            ':!src-tauri/src/database/pg/mod.rs'
           )
 
           found_any=0
