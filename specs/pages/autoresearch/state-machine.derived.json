@@ -1,0 +1,247 @@
+{
+  "version": "1.0",
+  "id": "autoresearch",
+  "name": "AutoresearchPage",
+  "states": [
+    {
+      "id": "page-structure",
+      "name": "Page Structure & Layout",
+      "requiredElements": [
+        {
+          "role": "heading"
+        },
+        {
+          "role": "button",
+          "text": "Compare"
+        },
+        {},
+        {}
+      ],
+      "description": "The Autoresearch page is a dev-only tab rendered in the main content area. It displays a header with the page title and a launch button, a list of existing comparison runs, and a detail panel for the selected run.",
+      "precondition": "No comparison runs exist in the database",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "workflow-selection",
+      "name": "Workflow Selection",
+      "requiredElements": [
+        {
+          "role": "combobox"
+        },
+        {
+          "role": "alert"
+        },
+        {
+          "role": "combobox"
+        }
+      ],
+      "description": "Before starting a comparison, the user must select which unified workflow to run. The backend validates that the workflow exists in PostgreSQL via GET /unified-workflows/:id before accepting a POST /comparison/start request. The Tauri command start_comparison (plugin: qontinui_comparison) performs the same lookup before inserting the comparison_runs row.",
+      "precondition": "A workflow that no longer exists is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "comparison-launch",
+      "name": "Comparison Launch Form",
+      "requiredElements": [
+        {
+          "role": "group"
+        },
+        {
+          "role": "checkbox"
+        },
+        {
+          "role": "button",
+          "text": "Run"
+        },
+        {
+          "role": "list"
+        },
+        {
+          "role": "list"
+        }
+      ],
+      "description": "The launch form or dialog allows the user to configure a new comparison run: select a workflow, choose a variation type (architecture or same), and optionally toggle worktree isolation. Submitting posts to POST /comparison/start via the runner HTTP API or via the Tauri qontinui_comparison.start_comparison command.",
+      "precondition": "A workflow is selected and a variation type is chosen",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "comparison-list",
+      "name": "Comparison Run List",
+      "requiredElements": [
+        {
+          "role": "list"
+        },
+        {
+          "role": "list"
+        },
+        {
+          "role": "list"
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        }
+      ],
+      "description": "The page lists recent comparison runs fetched from GET /comparisons (up to 50 most recent, returned as an array of ComparisonRunView). Each run shows its ID (or short ID), workflow ID, variation type, status, and creation date. The list is the primary navigation surface for entering a run's detail view.",
+      "precondition": "At least one comparison run exists",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "running-comparison-detail",
+      "name": "Running Comparison Detail View",
+      "requiredElements": [
+        {
+          "role": "list"
+        },
+        {
+          "role": "list"
+        },
+        {
+          "role": "main"
+        }
+      ],
+      "description": "When a comparison run with status 'running' is selected, the detail view shows all entries and their individual live statuses. Entry statuses are fetched from GET /comparison/:id which enriches the stored entries with live task_run statuses from PostgreSQL. Entries transition from 'pending' → 'running' → 'completed'/'failed' as workflow runs progress.",
+      "precondition": "A running comparison run is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "completed-comparison-detail",
+      "name": "Completed Comparison Detail — Results Overview",
+      "requiredElements": [
+        {
+          "role": "table"
+        },
+        {
+          "role": "region"
+        },
+        {
+          "role": "region"
+        },
+        {
+          "role": "region"
+        }
+      ],
+      "description": "When a comparison run completes (status='completed'), the detail view shows the full result breakdown: per-entry results (success/fail, iteration count, duration_ms), the AI comparison report, and the AI recommendation with confidence score. The completed_at timestamp is shown. Status auto-transitions to 'completed' when the GET /comparison/:id handler detects all_done=true.",
+      "precondition": "A completed comparison run is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "metric-analysis",
+      "name": "Structured Metric Analysis",
+      "requiredElements": [
+        {
+          "role": "table"
+        },
+        {
+          "role": "region"
+        },
+        {
+          "role": "table"
+        },
+        {
+          "role": "region"
+        },
+        {
+          "role": "region"
+        }
+      ],
+      "description": "The page displays machine-readable metric comparisons across variants from StructuredComparisonReport (built by build_structured_report in comparison.rs). The HTTP API surfaces three metrics per completed entry from ComparisonEntryResultJson: success (bool → 1.0/0.0, higher=better), iterations (u32, lower=better), and duration_ms (u64, lower=better). A winner is identified by which variant wins the most metrics, with a confidence score expressed as winner_wins / total_metrics (0.0–1.0).",
+      "precondition": "A completed comparison run with at least 2 completed entries is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "comparison-algorithm-correctness",
+      "name": "Comparison Algorithm Correctness",
+      "requiredElements": [
+        {
+          "role": "region"
+        },
+        {
+          "role": "region"
+        },
+        {
+          "role": "list"
+        },
+        {
+          "role": "region"
+        }
+      ],
+      "description": "The winner and confidence in StructuredComparisonReport are derived by a specific algorithm in build_structured_report (comparison.rs): winner = variant with the most metric wins (tie-broken by highest success_rate); confidence = winner_metric_wins / total_metrics_count (0.0–1.0). With 3 metrics, valid confidence values are 0.33, 0.67, or 1.0. An AI verification workflow can check that displayed winner and confidence match these formulas applied to the visible metric values.",
+      "precondition": "A completed comparison run with at least 2 completed entries is displayed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "comparison-states",
+      "name": "Comparison Status Lifecycle",
+      "requiredElements": [
+        {
+          "role": "region"
+        },
+        {
+          "role": "region"
+        },
+        {
+          "role": "region"
+        },
+        {
+          "role": "region"
+        }
+      ],
+      "description": "The page correctly reflects the status progression for comparison runs: running (entries launching and executing) → completed (all entries done, auto-transitioned by GET /comparison/:id when all_done=true). The 'comparing' status is a valid enum variant but requires a separate AI analysis pipeline to be set — the GET endpoint does not set it automatically. Failed state is shown when all entries fail on launch.",
+      "precondition": "A 'running' comparison run is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "research-config",
+      "name": "Research Configuration (Multi-Trial, Aspirational)",
+      "requiredElements": [
+        {
+          "role": "form"
+        },
+        {
+          "role": "group"
+        },
+        {
+          "role": "region"
+        }
+      ],
+      "description": "Beyond single-shot comparisons, the ResearchConfig data structure in comparison.rs defines multi-trial experiment parameters: trials_per_experiment, search_dimensions (model, multi_agent_mode, max_iterations, context_tokens, workflow_architecture, custom), mutation_strategy (sequential/random_perturbation/ai_guided), and acceptance_criteria. If this advanced configuration UI is implemented, it should surface these fields. Currently the HTTP API only supports single-trial comparisons and p_value is always null.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Autoresearch Page — A dev-only dashboard for launching and analyzing parallel workflow architecture comparison runs with statistical A/B testing. Users select a workflow and a variation type (Architecture: Traditional vs Agentic Verification vs Multi-Agent Pipeline; Same: 3 identical runs for repeatability), then observe each entry's live status as workflows execute in isolated worktrees. When all entries complete, a structured metric comparison (success, iterations, duration_ms) and an AI-generated prose report identify the winning architecture with a confidence score. Comparison runs are stored in the comparison_runs PostgreSQL table and served via runner HTTP endpoints POST /comparison/start, GET /comparison/:id, GET /comparisons and Tauri commands under the qontinui_comparison plugin. This page surfaces the research infrastructure underlying architecture selection decisions.",
+  "metadata": {
+    "tags": [
+      "dev-only",
+      "comparison",
+      "a-b-testing",
+      "architectures",
+      "statistics",
+      "research"
+    ]
+  }
+}

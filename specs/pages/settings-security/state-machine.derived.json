@@ -1,0 +1,327 @@
+{
+  "version": "1.0",
+  "id": "settings-security",
+  "name": "SecuritySettings",
+  "states": [
+    {
+      "id": "ss-page-structure",
+      "name": "Page Structure & Header",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Security & Sandboxing"
+        },
+        {
+          "text": "Configure security policies and sandbox constraints for workflow execution"
+        },
+        {
+          "text": "Loading security settings..."
+        },
+        {
+          "text": "Loading security settings..."
+        }
+      ],
+      "description": "The Security settings tab renders a page header with a Shield icon, the heading 'Security & Sandboxing', and a subtitle. Below that are the profile selector, security posture visualization, custom policy editor (conditional), features section, audit log viewer (conditional), AST info banner, and action buttons. A loading indicator replaces the form while initial data is being fetched. Error and success banners appear transiently at the top of the form.",
+      "precondition": "Settings tab has just been opened and data is still loading",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-profile-selector",
+      "name": "Security Profile Selector",
+      "requiredElements": [
+        {
+          "text": "Security Profile"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "text": "AST Fingerprint:"
+        }
+      ],
+      "description": "A labeled dropdown lets the user pick from the available built-in profiles (Permissive, Standard, Strict) and a Custom option. Profiles are loaded from the Rust backend via get_security_profiles (returns Vec<ProfileSummary> with name, description, fingerprint). When a built-in profile is selected, a description panel appears below the dropdown showing the profile's description text and its AST fingerprint in monospace format (e.g. 'L1:2/L2:1/L3:1/L4:0/L5:1/L6:1'). Selecting 'Custom' hides the fingerprint panel and reveals the full Custom Policy Editor section.",
+      "precondition": "A built-in profile (permissive, standard, or strict) is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-security-posture",
+      "name": "Security Posture Visualization",
+      "requiredElements": [
+        {
+          "text": "Security Posture"
+        },
+        {
+          "text": "Compute"
+        },
+        {
+          "text": "Security Posture"
+        }
+      ],
+      "description": "A 'Security Posture' panel shows a 7-row bar chart, one row per AST layer. Each row has the layer name on the left and 3 colored bar segments representing the security score (0-3). Filled segments represent the current score. Score labels are: 0=None (red), 1=Cooperative (orange), 2=Software (yellow), 3=Kernel (green). Each built-in profile maps to fixed layer scores — Permissive: {L1:2,L2:1,L3:1,L4:0,L5:1,L6:1,L7:1}, Standard: {L1:3,L2:3,L3:3,L4:2,L5:3,L6:3,L7:2}, Strict: all L1-L7 at 3. Custom shows a fixed intermediate visualization.",
+      "precondition": "Settings have loaded and a profile is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-custom-editor-presence",
+      "name": "Custom Policy Editor — Visibility & Structure",
+      "requiredElements": [
+        {
+          "text": "Custom Policy Editor"
+        },
+        {
+          "text": "Custom Policy Editor"
+        },
+        {
+          "role": "combobox"
+        }
+      ],
+      "description": "The Custom Policy Editor section is only rendered when the Security Profile dropdown is set to 'Custom'. It shows a heading 'Custom Policy Editor' (with a Sliders icon) and five sub-sections: Network, Actions, Filesystem, Resources, and Credentials. When any built-in profile is selected, this entire section is hidden.",
+      "precondition": "A built-in profile is selected (permissive, standard, or strict)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-custom-network-policy",
+      "name": "Custom Policy Editor — Network Section",
+      "requiredElements": [
+        {},
+        {},
+        {
+          "text": "Block cloud metadata endpoints"
+        }
+      ],
+      "description": "The Network sub-section of the Custom Policy Editor controls L4 network access. It contains a 'Mode' dropdown (id: security-network-mode) with options: Unrestricted, Allow List, Deny List, Disabled. When 'Allow List' or 'Deny List' is selected, a domains textarea appears for entering one domain per line (supports wildcard patterns like '*.openai.com'). A separate 'Block cloud metadata endpoints' toggle (boolean, default off) controls blocking of cloud provider metadata endpoints regardless of mode.",
+      "precondition": "Profile dropdown is set to 'Custom'",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-custom-actions-policy",
+      "name": "Custom Policy Editor — Actions Section",
+      "requiredElements": [
+        {
+          "text": "Block destructive commands"
+        },
+        {},
+        {}
+      ],
+      "description": "The Actions sub-section controls L6 action governance. It contains a 'Block destructive commands' toggle (boolean) and a 'Blocked command patterns (regex, one per line)' textarea (id: security-blocked-commands) with placeholder '^\\s*sudo\\b\\n^\\s*su\\b'. Command patterns are regex strings matched against command invocations before execution.",
+      "precondition": "Profile dropdown is set to 'Custom'",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-custom-filesystem-policy",
+      "name": "Custom Policy Editor — Filesystem Section",
+      "requiredElements": [
+        {
+          "text": "Read-only root filesystem"
+        },
+        {}
+      ],
+      "description": "The Filesystem sub-section controls L3 filesystem boundaries. It contains a 'Read-only root filesystem' toggle (boolean) and a 'Denied paths (glob, one per line)' textarea (id: security-denied-paths) with placeholder '/etc/shadow\\n/home/*/.ssh/**'. Denied path patterns use glob syntax and are matched against file access attempts during workflow execution.",
+      "precondition": "Profile dropdown is set to 'Custom'",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-custom-resources-policy",
+      "name": "Custom Policy Editor — Resources Section",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {
+          "text": "Security Profile"
+        }
+      ],
+      "description": "The Resources sub-section controls L2 compute resource limits. It contains a 2×2 grid of number inputs: CPU limit (id: security-cpu-limit, step=0.5, min=0.5, max=16, placeholder='No limit'), Memory in MB (id: security-memory-limit, min=64, max=32768, placeholder='No limit'), PID limit (id: security-pids-limit, min=16, max=4096, placeholder='No limit'), and Timeout in seconds (min=10, max=3600). Empty values mean no limit is applied.",
+      "precondition": "Profile dropdown is set to 'Custom'",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-custom-credentials-policy",
+      "name": "Custom Policy Editor — Credentials Section",
+      "requiredElements": [
+        {
+          "text": "Direct (current behavior)"
+        },
+        {
+          "text": "Proxy (placeholder injection)"
+        }
+      ],
+      "description": "The Credentials sub-section controls L5 credential access. It contains a Mode dropdown with three options: 'Direct (current behavior)' — credentials passed through unchanged; 'Proxy (placeholder injection)' — real API keys replaced with placeholder tokens that are rehydrated by a host-side proxy; 'Denied (no credentials)' — all credential access blocked. The Strict built-in profile enforces Proxy mode; Permissive uses Direct.",
+      "precondition": "Profile dropdown is set to 'Custom'",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-features-section",
+      "name": "Features Section — Toggles",
+      "requiredElements": [
+        {
+          "text": "Features"
+        },
+        {
+          "text": "Credential Proxy"
+        },
+        {
+          "text": "Network Mediation"
+        },
+        {
+          "text": "Security Audit Log"
+        },
+        {
+          "text": "Features"
+        }
+      ],
+      "description": "A 'Features' section below the profile selector contains three toggle rows, each with a heading and description. The toggles control: (1) Credential Proxy — 'Replace API keys with placeholders; real keys injected by host-side proxy'; (2) Network Mediation — 'Route container network through filtering proxy with domain allowlisting'; (3) Security Audit Log — 'Record policy decisions, network requests, and credential activity'. All three are boolean switches using the ToggleSwitch component with blue-on/neutral-off styling.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-audit-retention",
+      "name": "Audit Retention Field",
+      "requiredElements": [
+        {
+          "text": "Audit Retention (days)"
+        },
+        {
+          "text": "Audit Retention (days)"
+        }
+      ],
+      "description": "When the Security Audit Log toggle is enabled, an additional 'Audit Retention (days)' labeled number input appears below the three feature toggles, indented with a left border. It accepts values from 1 to 365 days (default: 30). This field is hidden when audit logging is disabled.",
+      "precondition": "Security Audit Log toggle is off (audit_enabled=false)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-audit-log-viewer",
+      "name": "Audit Log Viewer — Structure & Controls",
+      "requiredElements": [
+        {
+          "text": "Audit Log"
+        },
+        {
+          "text": "Audit Log"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "allowed"
+        }
+      ],
+      "description": "When audit_enabled is true, an 'Audit Log' section (with a FileSearch icon) appears below the Features section. It contains: a summary badge row (green 'N allowed', red 'N denied', yellow 'N warnings' — warnings badge hidden if 0); a filter dropdown (All / Denied / Allowed / Warnings) with default 'All'; a Refresh button (icon: RefreshCw, spinning while loading, tooltip: 'Refresh audit log'); and an Export button (icon: Download, tooltip: 'Export as JSON') that is only shown when at least one event is in the list. Changing the filter immediately re-fetches from GET /security/audit/events with the corresponding decision query parameter.",
+      "precondition": "Security Audit Log toggle is off (audit_enabled=false)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-audit-event-table",
+      "name": "Audit Log Viewer — Event Table",
+      "requiredElements": [
+        {
+          "text": "No audit events. Click refresh to load."
+        },
+        {
+          "text": "Decision"
+        },
+        {
+          "text": "Type"
+        },
+        {
+          "text": "All"
+        }
+      ],
+      "description": "The audit event table has a sticky header with columns: Time, Type, Decision, Action, Reason. Each row represents one AuditEvent. Time is formatted as toLocaleTimeString(). Type is a badge using EVENT_TYPE_LABELS mapping: policy_evaluation→Policy, capability_grant→Grant, capability_denial→Denial, network_request→Network, filesystem_access→Filesystem, credential_injection→Credential, command_blocked→Command, container_lifecycle→Container. Decision is a colored badge: allowed=green, denied=red, warning=yellow. Action and Reason columns are truncated with title tooltip for overflow. Empty state shows 'No audit events. Click refresh to load.' (or 'Loading...' while fetching).",
+      "precondition": "Audit is enabled, no events loaded yet, and no fetch in progress",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-ast-info-banner",
+      "name": "AST 7-Layer Info Banner",
+      "requiredElements": [
+        {
+          "text": "Agent Sandbox Taxonomy (AST)"
+        },
+        {
+          "text": "L1:Compute"
+        }
+      ],
+      "description": "A static informational banner near the bottom of the page (before the action buttons) explains the Agent Sandbox Taxonomy model. It has a blue-tinted background (bg-blue-500/5, border-blue-500/10), an Info icon (blue-400), and text: 'Security policies follow the Agent Sandbox Taxonomy (AST) 7-layer model:' followed by the layer list 'L1:Compute / L2:Resources / L3:Filesystem / L4:Network / L5:Credentials / L6:Actions / L7:Audit'. This banner is always visible regardless of profile or settings.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ss-action-buttons",
+      "name": "Action Buttons — Save & Reset",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Reset to Defaults"
+        },
+        {
+          "role": "button",
+          "text": "Save Security Settings"
+        },
+        {
+          "role": "button",
+          "text": "Save Security Settings"
+        },
+        {
+          "role": "button",
+          "text": "Reset to Defaults"
+        },
+        {
+          "role": "button",
+          "text": "Save Security Settings"
+        }
+      ],
+      "description": "Two action buttons appear at the bottom of the form: 'Reset to Defaults' (left, neutral styling) and 'Save Security Settings' (right, blue styling with Shield icon). The Save button cycles through three states: default (Shield icon + 'Save Security Settings'), saving (spinner + 'Saving...', disabled), and success (Check icon + 'Saved', auto-reverts to default after 3 seconds). On save, the Tauri command update_security_settings is invoked with the current config. The backend validates that the profile name is one of permissive/standard/strict/custom, and that custom profile provides a custom_policy.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Security & Sandboxing settings page within the runner Settings panel. Implements the Agent Sandbox Taxonomy (AST) 7-layer defense model: L1 Compute, L2 Resources, L3 Filesystem, L4 Network, L5 Credentials, L6 Actions, L7 Audit. The page provides: (1) a Security Profile selector with three built-in profiles (Permissive, Standard, Strict) and a Custom option that exposes the full policy editor; (2) a Security Posture visualization showing per-layer scores as colored bars; (3) feature toggles for Credential Proxy, Network Mediation, and Security Audit Log; (4) a live Audit Log viewer with filtering, refresh, and JSON export — visible only when audit logging is enabled; (5) an AST educational banner; and (6) Save / Reset buttons. Data is persisted via Tauri IPC commands get_security_settings / update_security_settings. Audit events are fetched from the runner MCP HTTP API at /security/audit/events and /security/audit/summary.",
+  "metadata": {
+    "tags": [
+      "settings",
+      "security",
+      "sandboxing",
+      "audit",
+      "AST",
+      "policies"
+    ]
+  }
+}

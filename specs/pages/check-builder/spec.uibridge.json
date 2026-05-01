@@ -1,0 +1,321 @@
+{
+  "description": "Check Builder page -- a specialized editor for creating and managing reusable verification checks. Checks are individual validation rules that can detect code quality issues, run linters, formatters, type checkers, test runners, security scanners, and build tools. Each check defines a command, working directory, timeout, and behavioral flags like auto-fix and fail-on-warning. Checks serve as building blocks for check groups and can be used directly as verification steps in workflows.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Check Library Management",
+          "enabled": true,
+          "id": "chk-list-management-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Checks"
+            },
+            "label": "Required element for Check Library Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Check Library Management",
+          "enabled": true,
+          "id": "chk-list-management-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "New"
+            },
+            "label": "Required element for Check Library Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Check Library Management",
+          "enabled": true,
+          "id": "chk-list-management-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "searchbox"
+            },
+            "label": "Required element for Check Library Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Check Library Management",
+          "enabled": true,
+          "id": "chk-list-management-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Checks"
+            },
+            "label": "Required element for Check Library Management",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The left panel displays all saved checks in a searchable, scrollable list. Users can browse existing checks to find one to edit, create new checks, and delete checks they no longer need. Each list item shows the check name, type badge (linter, formatter, type checker, test runner, security, build, custom), and tool information. The split-panel layout follows the library builder pattern used across all builder pages, with the list on the left and the editor on the right. Users select a check from the list to load it into the editor, or click the create button to start a new one.",
+      "id": "chk-list-management",
+      "name": "Check Library Management",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Check Editor and Configuration",
+          "enabled": true,
+          "id": "chk-editor-config-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Checks"
+            },
+            "label": "Required element for Check Editor and Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Check Editor and Configuration",
+          "enabled": true,
+          "id": "chk-editor-config-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Checks"
+            },
+            "label": "Required element for Check Editor and Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Check Editor and Configuration",
+          "enabled": true,
+          "id": "chk-editor-config-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Checks"
+            },
+            "label": "Required element for Check Editor and Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Check Editor and Configuration",
+          "enabled": true,
+          "id": "chk-editor-config-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
+            "label": "Required element for Check Editor and Configuration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The right-panel editor provides all fields needed to define a check. Users select the check type (linter, formatter, etc.) and tool (eslint, prettier, mypy, etc.), which auto-populates sensible defaults for the name and command. Users can customize the command, set a working directory, configure a timeout, and toggle behavioral flags: auto-fix (attempt automatic fixes before reporting), fail-on-warning (treat warnings as failures), and is-critical (mark as a blocking check). Tags can be added for organization. The editor includes save and delete actions in the toolbar.",
+      "id": "chk-editor-config",
+      "name": "Check Editor and Configuration",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Workflow Integration and Reuse",
+          "enabled": true,
+          "id": "chk-workflow-integration-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Checks"
+            },
+            "label": "Required element for Workflow Integration and Reuse",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Workflow Integration and Reuse",
+          "enabled": true,
+          "id": "chk-workflow-integration-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Checks"
+            },
+            "label": "Required element for Workflow Integration and Reuse",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Workflow Integration and Reuse",
+          "enabled": true,
+          "id": "chk-workflow-integration-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Checks"
+            },
+            "label": "Required element for Workflow Integration and Reuse",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Workflow Integration and Reuse",
+          "enabled": true,
+          "id": "chk-workflow-integration-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Delete"
+            },
+            "label": "Required element for Workflow Integration and Reuse",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Checks are designed as reusable building blocks that integrate into the broader workflow system. Once saved, checks can be referenced by check groups (which bundle multiple checks together) and used directly as verification steps in workflows. The check type and tool categorization system ensures users can find and select appropriate checks when building workflows. Tags further aid organization and discovery across the library dashboard.",
+      "id": "chk-workflow-integration",
+      "name": "Workflow Integration and Reuse",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "check-builder",
+    "tags": [
+      "checks",
+      "verification",
+      "builder",
+      "library",
+      "linter",
+      "test-runner"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The left panel displays all saved checks in a searchable, scrollable list. Users can browse existing checks to find one to edit, create new checks, and delete checks they no longer need. Each list item shows the check name, type badge (linter, formatter, type checker, test runner, security, build, custom), and tool information. The split-panel layout follows the library builder pattern used across all builder pages, with the list on the left and the editor on the right. Users select a check from the list to load it into the editor, or click the create button to start a new one.",
+        "elements": [
+          {
+            "textContent": "Checks"
+          },
+          {
+            "role": "button",
+            "textContent": "New"
+          },
+          {
+            "role": "searchbox"
+          },
+          {
+            "textContent": "Checks"
+          }
+        ],
+        "id": "chk-list-management",
+        "isInitial": false,
+        "name": "Check Library Management",
+        "transitions": []
+      },
+      {
+        "description": "The right-panel editor provides all fields needed to define a check. Users select the check type (linter, formatter, etc.) and tool (eslint, prettier, mypy, etc.), which auto-populates sensible defaults for the name and command. Users can customize the command, set a working directory, configure a timeout, and toggle behavioral flags: auto-fix (attempt automatic fixes before reporting), fail-on-warning (treat warnings as failures), and is-critical (mark as a blocking check). Tags can be added for organization. The editor includes save and delete actions in the toolbar.",
+        "elements": [
+          {
+            "textContent": "Checks"
+          },
+          {
+            "textContent": "Checks"
+          },
+          {
+            "textContent": "Checks"
+          },
+          {
+            "role": "button",
+            "textContent": "Save"
+          }
+        ],
+        "id": "chk-editor-config",
+        "isInitial": false,
+        "name": "Check Editor and Configuration",
+        "transitions": []
+      },
+      {
+        "description": "Checks are designed as reusable building blocks that integrate into the broader workflow system. Once saved, checks can be referenced by check groups (which bundle multiple checks together) and used directly as verification steps in workflows. The check type and tool categorization system ensures users can find and select appropriate checks when building workflows. Tags further aid organization and discovery across the library dashboard.",
+        "elements": [
+          {
+            "textContent": "Checks"
+          },
+          {
+            "textContent": "Checks"
+          },
+          {
+            "textContent": "Checks"
+          },
+          {
+            "role": "button",
+            "textContent": "Delete"
+          }
+        ],
+        "id": "chk-workflow-integration",
+        "isInitial": false,
+        "name": "Workflow Integration and Reuse",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

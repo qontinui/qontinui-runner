@@ -1,0 +1,629 @@
+{
+  "description": "General settings tab within the runner Settings panel. Displays application-level preferences for startup behavior and workflow builder defaults. Contains two sections: 'Application' (Auto-load Last Configuration on Startup, Launch on System Startup) and 'Workflow Builder' (Include AI Summary in New Workflows). All three settings are boolean toggle switches that persist via Tauri IPC commands. Toggling uses optimistic UI updates with rollback on failure. The Launch on System Startup toggle is backed by the OS autostart mechanism (Windows Registry Run key, macOS LaunchAgent, Linux .desktop) and reconciles against the actual OS state after each toggle.\n\n# GeneralSettings\n\n_(notes)_",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Page Structure",
+          "enabled": true,
+          "id": "gen-page-structure-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContent": "General"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Page Structure",
+          "enabled": true,
+          "id": "gen-page-structure-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Application-level preferences that control startup behavior and defaults."
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Page Structure",
+          "enabled": true,
+          "id": "gen-page-structure-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "General"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The General settings tab renders a SectionHeader with title 'General' and a description, followed by two card sections: 'Application' and 'Workflow Builder'. There are no sub-tabs or nested navigation within this tab.",
+      "id": "gen-page-structure",
+      "name": "Page Structure",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Application Section",
+          "enabled": true,
+          "id": "gen-application-section-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Application"
+            },
+            "label": "Required element for Application Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Application Section",
+          "enabled": true,
+          "id": "gen-application-section-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Auto-load Last Configuration on Startup"
+            },
+            "label": "Required element for Application Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Application Section",
+          "enabled": true,
+          "id": "gen-application-section-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Launch on System Startup"
+            },
+            "label": "Required element for Application Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Application Section",
+          "enabled": true,
+          "id": "gen-application-section-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Tip:"
+            },
+            "label": "Required element for Application Section",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The 'Application' card contains two toggle rows: 'Auto-load Last Configuration on Startup' and 'Launch on System Startup'. A tip banner below both toggles explains the auto-load behavior.",
+      "id": "gen-application-section",
+      "name": "Application Section",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Workflow Builder Section",
+          "enabled": true,
+          "id": "gen-workflow-builder-section-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Workflow Builder"
+            },
+            "label": "Required element for Workflow Builder Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Workflow Builder Section",
+          "enabled": true,
+          "id": "gen-workflow-builder-section-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Include AI Summary in New Workflows"
+            },
+            "label": "Required element for Workflow Builder Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Workflow Builder Section",
+          "enabled": true,
+          "id": "gen-workflow-builder-section-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "AI Summary step generates"
+            },
+            "label": "Required element for Workflow Builder Section",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The 'Workflow Builder' card contains one toggle row: 'Include AI Summary in New Workflows'. A FileText icon appears next to the section heading. A tip banner explains that the AI Summary step runs at the end of the completion phase.",
+      "id": "gen-workflow-builder-section",
+      "name": "Workflow Builder Section",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Toggle Button Elements",
+          "enabled": true,
+          "id": "gen-toggle-buttons-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Toggle Button Elements",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Toggle Button Elements",
+          "enabled": true,
+          "id": "gen-toggle-buttons-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Toggle Button Elements",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Each setting row contains a pill-shaped toggle button. When a setting is ON, the toggle background uses the primary color and the indicator is translated to the right. When OFF, the background is muted and the indicator is at the left.",
+      "id": "gen-toggle-buttons",
+      "name": "Toggle Button Elements",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Auto-load Toggle Behavior",
+          "enabled": true,
+          "id": "gen-autoload-behavior-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Auto-load Last Configuration on Startup"
+            },
+            "label": "Required element for Auto-load Toggle Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Auto-load Toggle Behavior",
+          "enabled": true,
+          "id": "gen-autoload-behavior-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Automatically load the last used configuration file and workflow when the application starts"
+            },
+            "label": "Required element for Auto-load Toggle Behavior",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The 'Auto-load Last Configuration on Startup' toggle immediately updates its visual state (optimistic), then calls the Tauri command save_auto_load_last_config. On success, a success log message appears. On failure, the toggle reverts to its prior state.",
+      "id": "gen-autoload-behavior",
+      "name": "Auto-load Toggle Behavior",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Launch on System Startup Toggle Behavior",
+          "enabled": true,
+          "id": "gen-autostart-behavior-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Launch on System Startup"
+            },
+            "label": "Required element for Launch on System Startup Toggle Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Launch on System Startup Toggle Behavior",
+          "enabled": true,
+          "id": "gen-autostart-behavior-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Launch on System Startup"
+            },
+            "label": "Required element for Launch on System Startup Toggle Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Launch on System Startup Toggle Behavior",
+          "enabled": true,
+          "id": "gen-autostart-behavior-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Auto-start the runner at user login so scheduled tasks fire reliably"
+            },
+            "label": "Required element for Launch on System Startup Toggle Behavior",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The 'Launch on System Startup' toggle writes to the OS autostart mechanism (Windows Registry Run key, macOS LaunchAgent, Linux .desktop). Unlike the other toggles, the Rust backend reads back the actual OS state after the write and returns it — the UI reconciles its display against this actual value rather than trusting the optimistic update.",
+      "id": "gen-autostart-behavior",
+      "name": "Launch on System Startup Toggle Behavior",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Include AI Summary Toggle Behavior",
+          "enabled": true,
+          "id": "gen-summary-step-behavior-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Include AI Summary in New Workflows"
+            },
+            "label": "Required element for Include AI Summary Toggle Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Include AI Summary Toggle Behavior",
+          "enabled": true,
+          "id": "gen-summary-step-behavior-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Automatically add an AI Summary step to the completion phase of new workflows"
+            },
+            "label": "Required element for Include AI Summary Toggle Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Include AI Summary Toggle Behavior",
+          "enabled": true,
+          "id": "gen-summary-step-behavior-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Include AI Summary in New Workflows"
+            },
+            "label": "Required element for Include AI Summary Toggle Behavior",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The 'Include AI Summary in New Workflows' toggle controls whether a completion-phase AI Summary step is automatically added when new workflows are created. This is a saved preference, not a live workflow modification.",
+      "id": "gen-summary-step-behavior",
+      "name": "Include AI Summary Toggle Behavior",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Settings Persistence Model",
+          "enabled": true,
+          "id": "gen-settings-persistence-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
+            "label": "Required element for Settings Persistence Model",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Settings Persistence Model",
+          "enabled": true,
+          "id": "gen-settings-persistence-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "General"
+            },
+            "label": "Required element for Settings Persistence Model",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Settings Persistence Model",
+          "enabled": true,
+          "id": "gen-settings-persistence-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Settings Persistence Model",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "All three settings are stored in the runner's settings.json file at {config_dir}/com.qontinui.runner/settings.json. Settings are loaded asynchronously on mount via three independent Tauri IPC calls. Each setting persists independently — there is no batch Save button. Changes take effect immediately after the toggle click resolves.",
+      "id": "gen-settings-persistence",
+      "name": "Settings Persistence Model",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "settings-general",
+    "tags": [
+      "settings",
+      "general",
+      "startup",
+      "autostart",
+      "workflow-builder",
+      "toggle"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The General settings tab renders a SectionHeader with title 'General' and a description, followed by two card sections: 'Application' and 'Workflow Builder'. There are no sub-tabs or nested navigation within this tab.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "General"
+          },
+          {
+            "textContent": "Application-level preferences that control startup behavior and defaults."
+          },
+          {
+            "textContent": "General"
+          }
+        ],
+        "id": "gen-page-structure",
+        "isInitial": false,
+        "name": "Page Structure",
+        "transitions": []
+      },
+      {
+        "description": "The 'Application' card contains two toggle rows: 'Auto-load Last Configuration on Startup' and 'Launch on System Startup'. A tip banner below both toggles explains the auto-load behavior.",
+        "elements": [
+          {
+            "textContent": "Application"
+          },
+          {
+            "textContent": "Auto-load Last Configuration on Startup"
+          },
+          {
+            "textContent": "Launch on System Startup"
+          },
+          {
+            "textContent": "Tip:"
+          }
+        ],
+        "id": "gen-application-section",
+        "isInitial": false,
+        "name": "Application Section",
+        "transitions": []
+      },
+      {
+        "description": "The 'Workflow Builder' card contains one toggle row: 'Include AI Summary in New Workflows'. A FileText icon appears next to the section heading. A tip banner explains that the AI Summary step runs at the end of the completion phase.",
+        "elements": [
+          {
+            "textContent": "Workflow Builder"
+          },
+          {
+            "textContent": "Include AI Summary in New Workflows"
+          },
+          {
+            "textContent": "AI Summary step generates"
+          }
+        ],
+        "id": "gen-workflow-builder-section",
+        "isInitial": false,
+        "name": "Workflow Builder Section",
+        "transitions": []
+      },
+      {
+        "description": "Each setting row contains a pill-shaped toggle button. When a setting is ON, the toggle background uses the primary color and the indicator is translated to the right. When OFF, the background is muted and the indicator is at the left.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "gen-toggle-buttons",
+        "isInitial": false,
+        "name": "Toggle Button Elements",
+        "transitions": []
+      },
+      {
+        "description": "The 'Auto-load Last Configuration on Startup' toggle immediately updates its visual state (optimistic), then calls the Tauri command save_auto_load_last_config. On success, a success log message appears. On failure, the toggle reverts to its prior state.",
+        "elements": [
+          {
+            "textContent": "Auto-load Last Configuration on Startup"
+          },
+          {
+            "textContent": "Automatically load the last used configuration file and workflow when the application starts"
+          }
+        ],
+        "id": "gen-autoload-behavior",
+        "isInitial": false,
+        "name": "Auto-load Toggle Behavior",
+        "transitions": []
+      },
+      {
+        "description": "The 'Launch on System Startup' toggle writes to the OS autostart mechanism (Windows Registry Run key, macOS LaunchAgent, Linux .desktop). Unlike the other toggles, the Rust backend reads back the actual OS state after the write and returns it — the UI reconciles its display against this actual value rather than trusting the optimistic update.",
+        "elements": [
+          {
+            "textContent": "Launch on System Startup"
+          },
+          {
+            "textContent": "Launch on System Startup"
+          },
+          {
+            "textContent": "Auto-start the runner at user login so scheduled tasks fire reliably"
+          }
+        ],
+        "id": "gen-autostart-behavior",
+        "isInitial": false,
+        "name": "Launch on System Startup Toggle Behavior",
+        "transitions": []
+      },
+      {
+        "description": "The 'Include AI Summary in New Workflows' toggle controls whether a completion-phase AI Summary step is automatically added when new workflows are created. This is a saved preference, not a live workflow modification.",
+        "elements": [
+          {
+            "textContent": "Include AI Summary in New Workflows"
+          },
+          {
+            "textContent": "Automatically add an AI Summary step to the completion phase of new workflows"
+          },
+          {
+            "textContent": "Include AI Summary in New Workflows"
+          }
+        ],
+        "id": "gen-summary-step-behavior",
+        "isInitial": false,
+        "name": "Include AI Summary Toggle Behavior",
+        "transitions": []
+      },
+      {
+        "description": "All three settings are stored in the runner's settings.json file at {config_dir}/com.qontinui.runner/settings.json. Settings are loaded asynchronously on mount via three independent Tauri IPC calls. Each setting persists independently — there is no batch Save button. Changes take effect immediately after the toggle click resolves.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Save"
+          },
+          {
+            "textContent": "General"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "gen-settings-persistence",
+        "isInitial": false,
+        "name": "Settings Persistence Model",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

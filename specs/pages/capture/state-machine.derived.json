@@ -1,0 +1,81 @@
+{
+  "version": "1.0",
+  "id": "capture",
+  "name": "CaptureTab",
+  "states": [
+    {
+      "id": "cap-recording-controls",
+      "name": "Recording Controls and Session Management",
+      "requiredElements": [
+        {
+          "text": "Start Recording"
+        },
+        {
+          "text": "Mouse"
+        },
+        {
+          "text": "Interaction Recording"
+        },
+        {
+          "text": "Record your interactions"
+        }
+      ],
+      "description": "The core recording workflow is straightforward: users click Start Recording to begin capturing, then Stop Recording to end the session. While recording, a live timer shows elapsed duration with a pulsing red indicator, and an event counter tracks the number of mouse and keyboard events captured. The recording captures three types of data simultaneously: mouse input, keyboard input, and screen video. Users configure the video FPS before starting. The start and stop buttons provide clear visual feedback about the current state and disable appropriately to prevent double-starts or premature stops.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cap-settings-configuration",
+      "name": "Recording Settings",
+      "requiredElements": [
+        {
+          "text": "Interaction Recording"
+        },
+        {
+          "text": "Video FPS"
+        },
+        {
+          "text": "30 FPS is recommended"
+        }
+      ],
+      "description": "Before starting a recording, users can configure capture settings through a collapsible settings panel. The primary setting is video FPS, which controls the frame rate of screen recording and can be adjusted between 10 and 60 FPS using a slider. Higher FPS produces smoother video but larger files, with 30 FPS recommended as the default. Settings are disabled during an active recording to prevent mid-session configuration changes that could corrupt data.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cap-recording-output",
+      "name": "Recording Output and Results",
+      "requiredElements": [
+        {
+          "text": "Purpose"
+        },
+        {
+          "text": "JSONL"
+        },
+        {
+          "text": "Use cases"
+        }
+      ],
+      "description": "After stopping a recording, users see a summary of the captured session including duration and total event count. The last recording section persists until a new recording is started, allowing users to review and access the output files. Users can open the output folder containing the JSONL events file and video recording directly from the interface. This output data serves as input for creating State Machines that model complex user interaction patterns.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Capture page -- a dev-only interaction recording tool available exclusively in the runner application. Users record mouse and keyboard interactions along with screen video to create data for State Machine construction from desktop and mixed-environment workflows. The tool captures input events as timestamped JSONL data synchronized with video frames, enabling analysis of complex multi-step user interactions including drag operations and cross-application workflows.",
+  "metadata": {
+    "tags": [
+      "capture",
+      "recording",
+      "interaction",
+      "dev-only",
+      "state-machine"
+    ]
+  }
+}

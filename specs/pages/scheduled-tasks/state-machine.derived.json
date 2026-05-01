@@ -1,0 +1,196 @@
+{
+  "version": "1.0",
+  "id": "scheduled-tasks",
+  "name": "SchedulerTab",
+  "states": [
+    {
+      "id": "scheduler-overview",
+      "name": "Scheduler Status and Task Inventory",
+      "requiredElements": [
+        {
+          "text": "Scheduled Tasks"
+        },
+        {
+          "text": "Running"
+        },
+        {
+          "text": "Scheduled"
+        }
+      ],
+      "description": "Header with overall scheduler status (Running/Paused) and running-task count. Three sub-tabs (Scheduled / History / Settings) and an Auto-Fix shortcut. The Scheduled sub-tab shows the task inventory with per-task next-run, enable toggle, run-now, edit, and delete actions.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "scheduler-task-management",
+      "name": "Task Creation and Lifecycle",
+      "requiredElements": [
+        {
+          "text": "New Task"
+        },
+        {
+          "text": "Scheduled"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "Auto-Fix"
+        }
+      ],
+      "description": "Users can create new tasks via the New Task button, edit existing tasks, run them on-demand via Run Now, toggle their enabled state, or delete them. Each row in the task list shows: task name, task-type label (e.g. 'Workflow', 'Prompt', 'Remote agent'), schedule expression, next-run delta, and per-task action buttons. The Auto-Fix Now button at the top triggers the auto-fix run outside any schedule.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "scheduler-history-settings",
+      "name": "Execution History and Settings",
+      "requiredElements": [
+        {
+          "text": "History"
+        },
+        {
+          "text": "Settings"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "The History sub-tab shows the chronological log of executions per selected task. The Settings sub-tab exposes scheduler engine configuration (global enable, concurrency limits, etc).",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "scheduler-catch-up-policy",
+      "name": "Catch-up Policy Controls (Phase A/B/E)",
+      "requiredElements": [
+        {
+          "id": "catch-up-policy"
+        },
+        {
+          "id": "catch-up-grace"
+        },
+        {
+          "id": "catch-up-policy"
+        },
+        {
+          "id": "catch-up-policy"
+        }
+      ],
+      "description": "When a runner is offline at a task's scheduled fire time, the catch-up reconciler decides what to do. Users select per-task behavior via the 'If the runner was down' selector, with three options that map to the runner's CatchUpPolicy enum: 'run_once' (default — collapse all missed slots into one execution after the runner returns), 'run' (execute each missed slot individually), and 'skip' (record each missed slot as MissedRunnerDown without executing). A 'Grace window' input sets the seconds of slack — slots within `now - grace` of restart are considered fresh and not eligible for catch-up. The selector is only relevant for time-based schedules (Cron / Once / Interval); condition-based schedules don't have missed slots.",
+      "precondition": "New Task form is open and a time-based schedule (Cron / Once / Interval) is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "scheduler-remote-agent-form",
+      "name": "Remote Agent Task Type Form (Phase D/E)",
+      "requiredElements": [
+        {
+          "text": "Remote agent"
+        },
+        {
+          "id": "agent-prompt"
+        },
+        {
+          "id": "agent-working-directory"
+        },
+        {
+          "id": "agent-model"
+        },
+        {
+          "id": "agent-allowed-tools"
+        },
+        {
+          "id": "agent-allowed-tool-bash"
+        },
+        {
+          "id": "agent-max-turns"
+        }
+      ],
+      "description": "The 'Remote agent' task type lets users schedule arbitrary Claude prompts without pre-registering them in the prompt library. When this radio is selected the form reveals a multi-line prompt textarea, optional working directory, model selector, allowed-tools chip group, and an Advanced disclosure containing max-turns, timeout, and MCP-connection editor. At dispatch time the runner's launch_remote_agent calls POST /prompts/run with these fields. The form's defaults match the runner-side defaults (model = sonnet-4-6, allowed_tools = Bash/Read/Write/Edit/Glob/Grep, max_turns = 50, timeout = 600s); drift between form defaults and runner defaults causes silent behavior changes.",
+      "precondition": "New Task form is open",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "scheduler-launch-failure-display",
+      "name": "Launch Failure Backoff Display in Task List (Phase C/E)",
+      "requiredElements": [
+        {
+          "textContains": "launch failure"
+        },
+        {
+          "textContains": "after"
+        }
+      ],
+      "description": "When a scheduled task's launch (start call) fails — e.g. workflow file missing, prompt-id not found, /prompts/run HTTP error, missing session_id — the runner increments task.consecutive_launch_failures and pushes next_run forward by min(base * 2^(failures-1), 86400) seconds. The task list surfaces this so the operator can see retries are being throttled. Required visual indicators: an orange 'launch_failed' badge on the task row, the next-run cell rendered as 'Next: in X (after N failures)' instead of plain 'Next: in X', and a tooltip explaining the wait. This is distinct from a runtime failure (status 'failed'), which doesn't push next_run forward — backoff applies only to LaunchFailed.",
+      "precondition": "At least one task in the list has consecutiveLaunchFailures > 0",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "scheduler-history-status-badges",
+      "name": "History Status Badges for New Statuses (Phase B/E)",
+      "requiredElements": [
+        {
+          "text": "Launch failed"
+        },
+        {
+          "textContains": "Missed (runner offline)"
+        },
+        {
+          "textContains": "(catch-up)"
+        },
+        {
+          "textContains": "Scheduled for:"
+        }
+      ],
+      "description": "The History sub-tab shows one row per execution. Beyond the original Pending/Running/Completed/Failed/Skipped/Cancelled, two new statuses landed in Phase B: 'launch_failed' (LaunchFailed — task could not start) and 'missed_runner_down' (MissedRunnerDown — slot was synthesized by the catch-up reconciler with policy=Skip). These need distinguishable visual treatment because they mean different things from generic Failed: launch_failed is retry-with-backoff, missed_runner_down is informational. Catch-up runs also tag the task name with '(catch-up)' so the operator can tell that a Completed row was a catch-up rather than a normal-schedule fire.",
+      "precondition": "History tab is selected and at least one execution record has status=launch_failed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "scheduler-design",
+      "name": "Visual Design and Theme Compliance",
+      "requiredElements": [
+        {
+          "text": "Launch failed"
+        },
+        {
+          "textContains": "Missed (runner offline)"
+        }
+      ],
+      "description": "Style-guide coverage: scheduler tab uses the runner's standard panel layout with semantic accent colors for status indicators. Critical theme tokens: orange for transient/retry states (launch_failed, launch-failure backoff badge), slate for neutral/informational (missed_runner_down), red for permanent failures (failed), green for completed, blue for running, yellow for pending/skipped. These accent semantics MUST stay consistent across the task list, history rows, and any new surface that displays task state, otherwise operators will misread severity.",
+      "precondition": "History tab is selected and at least one record has status=launch_failed",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Scheduled Tasks page — manages recurring task execution. A task pairs an arbitrary task type (Workflow / Prompt / Auto-Fix / Watcher / Background-capture / Remote agent) with a schedule (cron / interval / once / condition). The page surfaces the task list, execution history with launch-failure and missed-runner-down indicators, and scheduler engine settings, plus a New Task form covering all variants and catch-up policy.",
+  "metadata": {
+    "tags": [
+      "scheduler",
+      "scheduled-tasks",
+      "cron",
+      "recurring",
+      "remote-agent",
+      "catch-up-policy",
+      "launch-failure-backoff",
+      "dev-only"
+    ]
+  }
+}

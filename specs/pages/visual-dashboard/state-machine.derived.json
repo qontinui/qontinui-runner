@@ -1,0 +1,311 @@
+{
+  "version": "1.0",
+  "id": "visual-dashboard",
+  "name": "ActiveDashboardPage",
+  "states": [
+    {
+      "id": "vd-page-structure",
+      "name": "Page Structure — Fixed Bars and Content Area",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {
+          "role": "region"
+        }
+      ],
+      "description": "The dashboard has a fixed vertical layout: ControlBar at the top (always visible), a flex-1 DashboardLayout content area in the middle, and BottomBar at the bottom (always visible). An optional OrchestrationLoopBanner and TopPatternsWidget may appear between the ControlBar and the content area when orchestration is active.",
+      "precondition": "A workflow is running with at least two detected activity types",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-idle-state",
+      "name": "Idle State — No Active Workflow",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "No Active Workflow"
+        },
+        {
+          "role": "button",
+          "text": "Run Last Workflow"
+        },
+        {
+          "role": "heading",
+          "text": "No Active Workflow"
+        },
+        {
+          "role": "button",
+          "text": "Run Last Workflow"
+        }
+      ],
+      "description": "When no workflow is running, the content area shows the IdleState component: a workflow icon, 'No Active Workflow' heading, a subtitle, and optional 'Run Last Workflow ({name})' / 'View Last Run ({name})' buttons when a previous run exists.",
+      "precondition": "No workflow is running or queued",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-control-bar-task-phase",
+      "name": "Control Bar — Task Name and Phase",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "The left section of the ControlBar shows the running workflow's task name (data-content-label='task name', truncated if too long). For simple (non-orchestrated) workflows a phase badge reflects setup/verification/ai_work/idle phases with matching color coding. A 'RUNNING' fallback label appears when the task is executing but no specific phase is detected.",
+      "precondition": "A workflow is currently running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-orchestrated-stages",
+      "name": "Control Bar — Orchestrated Workflow Stage Pills",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {
+          "text": "Iteration"
+        }
+      ],
+      "description": "For multi-stage orchestrated workflows the ControlBar center shows four stage pill badges in order: Setup → Agentic ↔ Verification → Completion. Each badge has data-content-label='{stage} stage'. The currently active stage glows via an animate-phase-glow CSS animation. Optional step-count sub-labels (completed/total) appear inside each pill. An iteration counter badge shows 'Iteration X/Y' or 'Iteration X' when iterating.",
+      "precondition": "An orchestrated (multi-stage) workflow is running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-playback-controls",
+      "name": "Control Bar — Playback Controls",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Stop"
+        },
+        {
+          "role": "button",
+          "text": "Stop"
+        },
+        {
+          "role": "button",
+          "text": "Pause"
+        },
+        {
+          "role": "button",
+          "text": "Stop"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "The right section of the ControlBar contains three controls: a combined Play/Pause toggle (icon switches based on state), a Stop button, and an Auto-Continue toggle. The Stop button is disabled when status is 'idle'. The Play/Pause button is disabled when status is 'idle'. The Auto-Continue toggle shows an orange icon when enabled and a muted icon when disabled.",
+      "precondition": "Dashboard is idle — no workflow running or queued",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-bottom-bar",
+      "name": "Bottom Bar — Real-Time Status Metrics",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {},
+        {}
+      ],
+      "description": "The BottomBar (h-10, always visible) provides three sections: left = elapsed time metric; center = orchestrator-agent badge (when orchestrated) + current activity-type label (when running); right = data-freshness metric + connection-status badge. All metrics update in real time during execution.",
+      "precondition": "A workflow is running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-widget-layout",
+      "name": "Dynamic Widget Layout",
+      "requiredElements": [
+        {
+          "text": "AI Conversation"
+        },
+        {
+          "role": "region"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "Execution Timeline"
+        }
+      ],
+      "description": "The DashboardLayout content area assigns detected activities to widgets. The primary (active) widget occupies ~65% width on the left with a 2px accent border matching the activity type's color; secondary widgets stack compactly in ~35% on the right. Clicking a compact widget promotes it to the primary position. Each activity type has a distinct accent color: gui_automation=blue, ai_conversation=green, verification=teal, findings=amber, shell_command=slate, api_request=orange, script=indigo, workflow_ref=pink, mcp_call=violet, execution_timeline=cyan, flow_execution=emerald, canvas=rose, trace_viewer=sky.",
+      "precondition": "A workflow with AI conversation activity is running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-completion-summary",
+      "name": "Completion Summary Overlay",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Workflow Completed"
+        },
+        {
+          "role": "heading",
+          "text": "Workflow Failed"
+        },
+        {
+          "role": "button",
+          "text": "Dismiss"
+        },
+        {
+          "text": "Success Rate"
+        },
+        {
+          "role": "button",
+          "text": "Dismiss"
+        }
+      ],
+      "description": "When a workflow transitions from running to finished (completed or failed), a CompletionSummary overlay appears over the dashboard. The overlay shows: a header with success (green, checkmark, 'Workflow Completed') or failure (red, X, 'Workflow Failed') theme; a stats grid with duration, step counts (total/passed/failed), and success-rate percentage; a progress bar; and a Dismiss button. Auto-dismisses after 15 s. Escape also dismisses.",
+      "precondition": "A workflow just completed successfully and the overlay is visible",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-breakpoint-indicator",
+      "name": "Control Bar — Breakpoint Pause Indicator",
+      "requiredElements": [
+        {
+          "text": "Breakpoint"
+        },
+        {},
+        {
+          "role": "button",
+          "text": "Inspect"
+        },
+        {
+          "role": "button",
+          "text": "Resume"
+        },
+        {
+          "text": "Breakpoint"
+        }
+      ],
+      "description": "When a workflow step with breakpoint:true completes, execution suspends. The ControlBar shows an amber 'Breakpoint' badge with animate-phase-glow animation, the step name (data-content-label='breakpoint step'), an 'Inspect' button (blue, eye icon), and a 'Resume' button (green, play icon). These controls are absent when no breakpoint is active.",
+      "precondition": "A workflow is paused at a breakpoint (snapshot status='waiting')",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-breakpoint-inspector",
+      "name": "Breakpoint Inspector Panel",
+      "requiredElements": [
+        {
+          "text": "Breakpoint Inspector"
+        },
+        {
+          "role": "button",
+          "text": "Close inspector"
+        },
+        {
+          "text": "Variables"
+        },
+        {
+          "text": "ago"
+        }
+      ],
+      "description": "The BreakpointInspector is a 384px-wide overlay panel anchored to the right side of the screen (full height, z-40). It opens when the user clicks Inspect. Content: 'Breakpoint Inspector' heading + close button (aria-label='Close inspector'); an info bar with step index (amber badge 'Step N'), step name, phase badge, and optional iteration; a freshness indicator ('Ns ago', amber if 10-30 min, red if >30 min); a Variables collapsible tree; a Pending Steps list; and an optional Last Screenshot thumbnail.",
+      "precondition": "Inspector panel is open (user clicked Inspect)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-approval-dialog",
+      "name": "Human Approval Dialog",
+      "requiredElements": [
+        {
+          "text": "Approval Required"
+        },
+        {
+          "role": "button",
+          "text": "Approve"
+        },
+        {
+          "role": "button",
+          "text": "Approve"
+        }
+      ],
+      "description": "When a workflow step requires human approval the ApprovalDialog overlay appears on top of the running dashboard. It shows 'Approval Required' header, context about the pending action (summary, modified files, optional diff), a comment textarea, and three action buttons: Approve (resumes workflow), Reject (continues to next iteration), Abort Workflow (terminates run). The dashboard remains visible behind the semi-transparent backdrop.",
+      "precondition": "A workflow is paused awaiting human approval",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-multi-run-switcher",
+      "name": "Multi-Run Switcher (ActiveRunsBar)",
+      "requiredElements": [
+        {
+          "text": "Active Runs"
+        },
+        {
+          "role": "button",
+          "text": "New Run"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "When two or more concurrent workflow runs are active, the ActiveRunsBar appears at the bottom-right of the dashboard (above the BottomBar). Each run has a card showing its name and status. Clicking a card switches the main dashboard to that run's view. A 'New Run' button navigates to the Execute page.",
+      "precondition": "Only one workflow is running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "vd-keyboard-shortcuts",
+      "name": "Keyboard Shortcuts",
+      "requiredElements": [
+        {
+          "text": "Keyboard Shortcuts"
+        },
+        {},
+        {
+          "role": "region"
+        }
+      ],
+      "description": "The dashboard supports: '?' opens the ShortcutsModal (lists all bindings); Ctrl+1-8 promotes a summary widget to active by position; Ctrl+R (Cmd+R) triggers a data refresh (GET /status); Escape closes open overlays (completion summary, shortcuts modal).",
+      "precondition": "No modal overlay is currently open",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The Visual Dashboard (accessible via the 'active' tab in runner navigation) is the real-time monitoring hub for workflow execution in qontinui-runner. It provides: a top ControlBar (h-14) showing the running task name, workflow stage indicator pills, and playback controls (pause/resume/stop/auto-continue); a dynamic widget content area with a 65% active / 35% summary-stack split that supports 14 activity types (gui_automation, ai_conversation, verification, findings, shell_command, api_request, script, workflow_ref, mcp_call, execution_timeline, flow_execution, canvas, trace_viewer, playwright); a bottom status bar (h-10) with elapsed-time metric, current-activity label, orchestrator-agent badge, and connection-health indicator. Overlays include: a completion summary auto-dismissing after 15 s, a breakpoint inspector panel for paused executions, a human approval dialog, and an ActiveRunsBar multi-run switcher that appears when two or more concurrent runs are active. Keyboard shortcuts (?, Ctrl+1-8, Ctrl+R, Escape) are available throughout.",
+  "metadata": {
+    "tags": [
+      "visual-dashboard",
+      "active-dashboard",
+      "monitoring",
+      "real-time",
+      "widgets",
+      "runner",
+      "execution",
+      "multi-run",
+      "breakpoints",
+      "tier-1"
+    ]
+  }
+}

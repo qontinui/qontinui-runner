@@ -1,0 +1,310 @@
+{
+  "version": "1.0",
+  "id": "orchestration-loop",
+  "name": "OrchestrationLoopPanel",
+  "states": [
+    {
+      "id": "ol-page-structure",
+      "name": "Page Structure & Layout",
+      "requiredElements": [
+        {
+          "text": "Orchestration Loop"
+        },
+        {
+          "text": "Multi"
+        },
+        {
+          "text": "Run Loop"
+        },
+        {
+          "textContains": "Iterative develop-rebuild-verify"
+        }
+      ],
+      "description": "The orchestration loop panel fills its container with a header bar and scrollable content area. The header contains the title, mode toggle, phase badge, iteration counter, and action buttons.",
+      "precondition": "Loop is not running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-config-library",
+      "name": "Saved Config Library",
+      "requiredElements": [
+        {
+          "textContains": "Library"
+        },
+        {
+          "textContains": "Save"
+        },
+        {
+          "text": "Saved Configurations"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "Users can save, load, overwrite, favorite, and delete orchestration loop configurations. The library panel shows all saved configs with name, mode, and last updated date. Favorites appear as quick-load buttons below the header when the library is closed.",
+      "precondition": "Loop is not running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-mode-selection",
+      "name": "Mode Selection — Simple vs Pipeline",
+      "requiredElements": [
+        {
+          "text": "Simple"
+        },
+        {
+          "text": "Pipeline"
+        },
+        {
+          "text": "Simple"
+        }
+      ],
+      "description": "The config form provides two radio buttons to choose between Simple mode (runs an existing workflow by ID) and Pipeline mode (builds workflows from description, with optional fixes and diagnostics). Pipeline mode is the default.",
+      "precondition": "Loop is not running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-common-controls",
+      "name": "Common Controls — Between, Max, Target, Options",
+      "requiredElements": [
+        {
+          "textContains": "Between"
+        },
+        {
+          "textContains": "Max"
+        },
+        {
+          "textContains": "Target"
+        },
+        {
+          "textContains": "Retry on failure"
+        },
+        {
+          "textContains": "Run in isolated worktree"
+        }
+      ],
+      "description": "Both modes share common controls for iteration behavior, maximum iteration count, target runner selection, and behavioral toggles (retry on failure, wait for fixer, use worktree).",
+      "precondition": "Loop is not running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-pipeline-config",
+      "name": "Pipeline Mode — Build, Fix, and Diagnose Configuration",
+      "requiredElements": [
+        {
+          "text": "Build Description"
+        },
+        {
+          "textContains": "Build Context"
+        },
+        {
+          "textContains": "Enable Fix Implementation"
+        },
+        {
+          "textContains": "Enable Diagnostic Phase"
+        },
+        {
+          "textContains": "Workflow (fallback)"
+        }
+      ],
+      "description": "Pipeline mode displays textarea inputs for build description and context, optional fix context, and diagnostic phase configuration. The pipeline has three capability toggles: Enable Fix Implementation and Enable Diagnostic Phase.",
+      "precondition": "Pipeline mode is selected, loop not running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-diagnostic-config",
+      "name": "Diagnostic Configuration Panel",
+      "requiredElements": [
+        {
+          "text": "Diagnostic Configuration"
+        },
+        {
+          "textContains": "Assertions (JSON array)"
+        },
+        {
+          "textContains": "Capture DOM snapshot"
+        },
+        {
+          "textContains": "Max chars"
+        },
+        {
+          "textContains": "Model override"
+        },
+        {
+          "textContains": "Exit"
+        },
+        {
+          "text": "Run Loop"
+        }
+      ],
+      "description": "When 'Enable Diagnostic Phase' is checked, a teal-bordered configuration panel appears with fields for UI Bridge assertions, DOM snapshot capture options, and an optional model override. An exit strategy dropdown also appears with Reflection, Diagnostic Evaluation, and Fixed Iterations options.",
+      "precondition": "Enable Diagnostic Phase is checked",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-running-state",
+      "name": "Running State — Progress, Phase, Controls",
+      "requiredElements": [
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "text": "Stop"
+        },
+        {
+          "text": "Signal"
+        }
+      ],
+      "description": "When the loop is running, the config form hides and is replaced by a progress bar showing current phase, iteration progress, and action buttons (Stop, Signal).",
+      "precondition": "Loop is running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-iteration-history",
+      "name": "Iteration History Table",
+      "requiredElements": [
+        {
+          "text": "Iteration History"
+        },
+        {
+          "tagName": "thead"
+        },
+        {
+          "text": "No iterations yet"
+        },
+        {
+          "tagName": "tbody"
+        }
+      ],
+      "description": "A table showing results for each completed iteration with columns: #, Duration, Exit, Reason, Diag, Pipeline. Each row summarizes one iteration's outcome.",
+      "precondition": "No iterations have completed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-diagnostic-results",
+      "name": "Diagnostic Results Display",
+      "requiredElements": [
+        {
+          "textContains": "PASS"
+        },
+        {
+          "textContains": "FAIL"
+        },
+        {
+          "tagName": "tr"
+        },
+        {
+          "textContains": "Diagnosis:"
+        },
+        {
+          "tagName": "td"
+        }
+      ],
+      "description": "The Diag column in the iteration history shows diagnostic evaluation results. When diagnostic data exists, the row is clickable with expand/collapse chevrons. The PASS/FAIL badge shows the result and root cause category. Expanding a row reveals diagnosis text, prompt rewrite suggestion, and individual assertion results.",
+      "precondition": "At least one iteration has a passing diagnostic result",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-diagnostic-pipeline-behavior",
+      "name": "Diagnostic Phase — Pipeline Behavior",
+      "requiredElements": [
+        {
+          "tagName": "tbody"
+        },
+        {
+          "tagName": "tbody"
+        },
+        {
+          "textContains": "EXIT"
+        },
+        {
+          "tagName": "tbody"
+        },
+        {
+          "textContains": "diagnosing"
+        }
+      ],
+      "description": "The diagnostic phase runs between Execute and Reflect in the pipeline loop. It captures page health, runs UI Bridge assertions, and uses AI triage to classify failures. The phase is skipped when the workflow crashed. When diagnostics fail, the next iteration rebuilds the workflow with diagnostic context injected into the prompt.",
+      "precondition": "An iteration completed where the workflow failed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-visual-design",
+      "name": "Visual Design & Typography",
+      "requiredElements": [
+        {
+          "role": "textbox"
+        },
+        {
+          "tagName": "span"
+        },
+        {
+          "text": "Diagnostic Configuration"
+        },
+        {
+          "tagName": "div"
+        }
+      ],
+      "description": "The orchestration loop panel follows the runner's dark theme with consistent typography, spacing, and color usage. Form inputs use the shared inputCls style (muted background, bordered, rounded), and the panel uses a scrollbar-dark class for the content area.",
+      "precondition": "Loop is not running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-form-state-persistence",
+      "name": "Form State Save/Load Round-Trip",
+      "requiredElements": [
+        {
+          "textContains": "Save"
+        },
+        {
+          "tagName": "button"
+        }
+      ],
+      "description": "All form fields including diagnostic configuration persist correctly through the save/load cycle. Saving a config captures the complete form state, and loading it restores all fields including diagnostic assertions, snapshot settings, and model override.",
+      "precondition": "Library panel is open with at least one saved config",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Orchestration Loop panel — iterative develop-rebuild-verify loop for testing changes. Supports two modes: Simple (runs an existing workflow repeatedly with reflection-based exit) and Pipeline (builds workflows from description, runs them, optionally diagnoses via UI Bridge assertions, reflects, implements fixes, and rebuilds). Includes a saved config library with favorites, a multi-runner mode for parallel orchestration across runner instances, and an iteration history table with diagnostic result expansion.",
+  "metadata": {
+    "tags": [
+      "orchestration",
+      "pipeline",
+      "diagnostics",
+      "iteration",
+      "ui-bridge",
+      "config-library"
+    ]
+  }
+}

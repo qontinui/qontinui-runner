@@ -1,0 +1,288 @@
+{
+  "version": "1.0",
+  "id": "knowledge-explorer",
+  "name": "KnowledgeExplorerPage",
+  "states": [
+    {
+      "id": "ke-page-layout",
+      "name": "Page Layout and Structure",
+      "requiredElements": [
+        {
+          "tagName": "div"
+        },
+        {},
+        {}
+      ],
+      "description": "The Knowledge Explorer page occupies the full tab content area with a top tab bar (Search | Stats) and a scrollable content region below. The layout uses flex-col with h-full to fill available space.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-tab-navigation",
+      "name": "Tab Navigation (Search / Stats)",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Search"
+        },
+        {
+          "role": "button",
+          "text": "Stats"
+        },
+        {
+          "role": "button",
+          "text": "Stats"
+        },
+        {
+          "role": "button",
+          "text": "Search"
+        }
+      ],
+      "description": "Two tabs at the top of the page: Search (with search icon) and Stats (with bar chart icon). Clicking a tab switches the content area. The active tab has a card-colored background with a border (no bottom border to merge with content), while inactive tabs show muted text with hover highlight.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-search-mode-selector",
+      "name": "Search Mode Selector",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Web Search"
+        },
+        {
+          "role": "button",
+          "text": "Error Research"
+        },
+        {
+          "role": "button",
+          "text": "Vuln Search"
+        },
+        {
+          "role": "textbox"
+        },
+        {
+          "role": "button",
+          "text": "Web Search"
+        }
+      ],
+      "description": "Three search mode buttons in the Search tab: 'Web Search' (globe icon), 'Error Research' (bug icon), 'Vuln Search' (shield icon). The active mode has primary-tinted background and border; inactive modes have muted text. Selecting a mode changes the input placeholder text and the API endpoint used for search.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-search-input",
+      "name": "Search Input and Submit",
+      "requiredElements": [
+        {
+          "role": "textbox"
+        },
+        {
+          "role": "button",
+          "text": "Search"
+        },
+        {
+          "role": "button",
+          "text": "Search"
+        },
+        {
+          "role": "textbox"
+        },
+        {
+          "role": "button",
+          "text": "Search"
+        }
+      ],
+      "description": "A text input field with a mode-specific icon (left) and a Search button (right). The input accepts text and supports Enter-to-submit. The Search button is disabled when the query is less than 2 characters or a search is in progress. During search, the button shows a spinning loader icon.",
+      "precondition": "Search tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-empty-and-error-states",
+      "name": "Empty State and Error Handling",
+      "requiredElements": [
+        {
+          "textContains": "Enter a search query"
+        },
+        {
+          "textContains": "No results found"
+        },
+        {}
+      ],
+      "description": "Before any search, the results area shows an empty state with a file-search icon and helpful text. After a failed search, a red error banner appears. After a search with no results, a 'No results found' message is shown.",
+      "precondition": "No search has been performed yet",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-result-cards",
+      "name": "Search Result Cards",
+      "requiredElements": [
+        {},
+        {},
+        {
+          "textContains": "relevant"
+        },
+        {
+          "textContains": "CVSS"
+        },
+        {
+          "role": "link"
+        },
+        {
+          "textContains": "Show more"
+        },
+        {
+          "textContains": "result"
+        },
+        {}
+      ],
+      "description": "Each search result is displayed as a card with: a provider-colored icon (left), title (bold, truncated), provider badge, relevance score percentage, optional CVSS badge, optional external link icon, and expandable content body. Results from different providers use different icon colors (DuckDuckGo=orange, Tavily=blue, Sploitus=red, Perplexity=purple, Local Cache=green).",
+      "precondition": "A search has returned results",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-search-behavior",
+      "name": "Search Execution Behavior",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Web Search"
+        },
+        {
+          "role": "button",
+          "text": "Error Research"
+        },
+        {
+          "role": "button",
+          "text": "Vuln Search"
+        }
+      ],
+      "description": "The search flow: user types query → selects mode → clicks Search or presses Enter → loading spinner appears → results populate or error shows. Each search mode calls a different backend endpoint: web→/knowledge/search-web, error→/knowledge/research-error, vulnerability→/knowledge/search-vulnerabilities. After a successful search, the stats are automatically invalidated to reflect the new query.",
+      "precondition": "Web Search mode is active and a query with ≥2 chars is entered",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-stats-widget",
+      "name": "Knowledge Stats Widget",
+      "requiredElements": [
+        {
+          "textContains": "Knowledge Acquisition"
+        },
+        {
+          "textContains": "Total Searches"
+        },
+        {
+          "textContains": "Cache Hit Rate"
+        },
+        {
+          "textContains": "Cache Hit Rate"
+        },
+        {
+          "textContains": "Results Stored"
+        },
+        {
+          "textContains": "Active Providers"
+        },
+        {
+          "textContains": "injection"
+        },
+        {
+          "textContains": "Loading knowledge stats"
+        },
+        {
+          "textContains": "stats unavailable"
+        }
+      ],
+      "description": "The stats widget (visible on both the Stats tab as full-size and embeddable elsewhere as compact) displays: a header with Brain icon, 'Knowledge Acquisition' title, and uptime; a 2x2 grid of stat cells (Total Searches, Cache Hit Rate, Results Stored, Cache Hits); an Active Providers section with success/query badges; and a prompt injection warning when detections > 0. Data auto-refreshes every 30 seconds.",
+      "precondition": "Stats tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-provider-availability",
+      "name": "Provider Availability Grid",
+      "requiredElements": [
+        {
+          "textContains": "Provider Availability"
+        },
+        {
+          "textContains": "DuckDuckGo"
+        },
+        {},
+        {
+          "textContains": "API key required"
+        }
+      ],
+      "description": "The Stats tab includes a Provider Availability card listing all 6 providers with their availability status (green dot = available, gray dot = unavailable) and API key requirement labels. This shows the user which search capabilities are active and what configuration is needed.",
+      "precondition": "Stats tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-design-typography",
+      "name": "Typography and Visual Design",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {
+          "role": "textbox"
+        }
+      ],
+      "description": "The Knowledge Explorer follows the runner's established design system: card components use bg-card with border-border, text uses the foreground/muted-foreground hierarchy, stat values use tabular-nums for aligned digits, provider badges use text-[10px], and section headers use uppercase tracking-wider. All text is legible against its background in both light and dark themes.",
+      "precondition": "Stats are loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ke-data-consistency",
+      "name": "Data Consistency and Flywheel Verification",
+      "requiredElements": [
+        {
+          "textContains": "Total Searches"
+        },
+        {
+          "textContains": "Local Cache"
+        },
+        {
+          "textContains": "Provider"
+        }
+      ],
+      "description": "The Knowledge Explorer can verify that the knowledge flywheel is working correctly by comparing stats before and after a search. A web search should increment total_searches, and if results are stored, results_ingested should increment. A subsequent identical search should show a cache hit if the flywheel stored the previous results.",
+      "precondition": "A search has been performed and the Stats tab is viewed",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Knowledge Explorer page — a two-tab interface for searching external knowledge sources (DuckDuckGo, Tavily, Sploitus, OSV.dev, Perplexity) and viewing system-wide knowledge acquisition statistics. The Search tab provides three search modes (Web, Error Research, Vulnerability) with result cards showing provider attribution, relevance scores, CVSS badges, and expandable content. The Stats tab displays a metrics dashboard with per-provider counters, cache hit rates, ingestion counts, and a provider availability grid.",
+  "metadata": {
+    "tags": [
+      "knowledge-acquisition",
+      "search",
+      "stats-dashboard",
+      "multi-provider",
+      "vulnerability-search",
+      "error-research",
+      "knowledge-flywheel"
+    ]
+  }
+}

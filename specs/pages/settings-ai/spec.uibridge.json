@@ -1,0 +1,1319 @@
+{
+  "description": "The AI Provider settings page configures how the runner connects to AI for automation analysis. It supports four providers: Claude Code CLI (subscription-based, recommended), Claude API (direct per-token billing), Gemini CLI (Google CLI with OAuth or API key), and Gemini API (direct Gemini billing). Each provider has a conditionally rendered configuration section. The page also manages auto-refine video escalation defaults, interactive session mode, connection testing, and circuit breaker health status. Settings are persisted via Tauri IPC to the OS keychain (API keys) and runner config store.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Page Structure and Header",
+          "enabled": true,
+          "id": "ai-page-structure-elem-0",
+          "precondition": "Page is navigating to AI settings for the first time",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContent": "AI Provider"
+            },
+            "label": "Required element for Page Structure and Header",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Page Structure and Header",
+          "enabled": true,
+          "id": "ai-page-structure-elem-1",
+          "precondition": "Page is navigating to AI settings for the first time",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Configure how the runner connects to AI"
+            },
+            "label": "Required element for Page Structure and Header",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Page Structure and Header",
+          "enabled": true,
+          "id": "ai-page-structure-elem-2",
+          "precondition": "Page is navigating to AI settings for the first time",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Page Structure and Header",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The AI Provider settings page renders a scrollable column with a Bot icon, heading, description, and tutorial link. A loading spinner is shown while the initial get_ai_settings Tauri command is in flight.",
+      "id": "ai-page-structure",
+      "name": "Page Structure and Header",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Provider Selection",
+          "enabled": true,
+          "id": "ai-provider-selection-elem-0",
+          "precondition": "Settings page has loaded with claude_cli provider selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "radio"
+            },
+            "label": "Required element for Provider Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Provider Selection",
+          "enabled": true,
+          "id": "ai-provider-selection-elem-1",
+          "precondition": "Settings page has loaded with claude_cli provider selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "radio"
+            },
+            "label": "Required element for Provider Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Provider Selection",
+          "enabled": true,
+          "id": "ai-provider-selection-elem-2",
+          "precondition": "Settings page has loaded with claude_cli provider selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "radio"
+            },
+            "label": "Required element for Provider Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Provider Selection",
+          "enabled": true,
+          "id": "ai-provider-selection-elem-3",
+          "precondition": "Settings page has loaded with claude_cli provider selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "radio"
+            },
+            "label": "Required element for Provider Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Provider Selection",
+          "enabled": true,
+          "id": "ai-provider-selection-elem-4",
+          "precondition": "Settings page has loaded with claude_cli provider selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "radio"
+            },
+            "label": "Required element for Provider Selection",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A radio button group with four mutually exclusive provider options. Selecting a provider immediately shows that provider's configuration section and hides the others. Each option includes a label and short description of the billing model.",
+      "id": "ai-provider-selection",
+      "name": "Provider Selection",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Provider Health Status (Circuit Breakers)",
+          "enabled": true,
+          "id": "ai-provider-health-elem-0",
+          "precondition": "At least one AI provider has been used since runner started",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Closed"
+            },
+            "label": "Required element for Provider Health Status (Circuit Breakers)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Provider Health Status (Circuit Breakers)",
+          "enabled": true,
+          "id": "ai-provider-health-elem-1",
+          "precondition": "At least one AI provider has been used since runner started",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Open"
+            },
+            "label": "Required element for Provider Health Status (Circuit Breakers)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Provider Health Status (Circuit Breakers)",
+          "enabled": true,
+          "id": "ai-provider-health-elem-2",
+          "precondition": "At least one AI provider has been used since runner started",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Closed"
+            },
+            "label": "Required element for Provider Health Status (Circuit Breakers)",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When one or more providers have had activity since the runner started, a health status row appears showing a badge per active provider. Each badge reflects its circuit breaker state. This section is absent on a fresh runner with no AI activity.",
+      "id": "ai-provider-health",
+      "name": "Provider Health Status (Circuit Breakers)",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Claude CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-cli-section-elem-0",
+          "precondition": "claude_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Claude CLI Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Claude CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-cli-section-elem-1",
+          "precondition": "claude_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Authenticated"
+            },
+            "label": "Required element for Claude CLI Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Claude CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-cli-section-elem-2",
+          "precondition": "claude_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Re-authenticate"
+            },
+            "label": "Required element for Claude CLI Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Claude CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-cli-section-elem-3",
+          "precondition": "claude_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Claude CLI Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Claude CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-cli-section-elem-4",
+          "precondition": "claude_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Required element for Claude CLI Provider Configuration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Visible only when claude_cli provider is selected. Contains authentication status banner, execution mode dropdown, optional custom executable path, Claude account management, selection mode, and timeout input.",
+      "id": "ai-claude-cli-section",
+      "name": "Claude CLI Provider Configuration",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Claude CLI Account Management",
+          "enabled": true,
+          "id": "ai-claude-cli-accounts-elem-0",
+          "precondition": "claude_cli provider is selected and no account directories are configured",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No accounts configured"
+            },
+            "label": "Required element for Claude CLI Account Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Claude CLI Account Management",
+          "enabled": true,
+          "id": "ai-claude-cli-accounts-elem-1",
+          "precondition": "claude_cli provider is selected and no account directories are configured",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Add Directory"
+            },
+            "label": "Required element for Claude CLI Account Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Claude CLI Account Management",
+          "enabled": true,
+          "id": "ai-claude-cli-accounts-elem-2",
+          "precondition": "claude_cli provider is selected and no account directories are configured",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Auto-Detect"
+            },
+            "label": "Required element for Claude CLI Account Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Claude CLI Account Management",
+          "enabled": true,
+          "id": "ai-claude-cli-accounts-elem-3",
+          "precondition": "claude_cli provider is selected and no account directories are configured",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Check Usage"
+            },
+            "label": "Required element for Claude CLI Account Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Claude CLI Account Management",
+          "enabled": true,
+          "id": "ai-claude-cli-accounts-elem-4",
+          "precondition": "claude_cli provider is selected and no account directories are configured",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Active"
+            },
+            "label": "Required element for Claude CLI Account Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Claude CLI Account Management",
+          "enabled": true,
+          "id": "ai-claude-cli-accounts-elem-5",
+          "precondition": "claude_cli provider is selected and no account directories are configured",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Least Usage"
+            },
+            "label": "Required element for Claude CLI Account Management",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Manages multiple Claude config directories for rate-limit failover. Users can add directories via file picker, auto-detect them, check usage quotas, switch active accounts, configure per-account launch commands, and choose between Manual and Least Usage selection modes.",
+      "id": "ai-claude-cli-accounts",
+      "name": "Claude CLI Account Management",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Claude API Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-api-section-elem-0",
+          "precondition": "claude_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Claude API Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Claude API Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-api-section-elem-1",
+          "precondition": "claude_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Claude API Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Claude API Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-api-section-elem-2",
+          "precondition": "claude_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save Key"
+            },
+            "label": "Required element for Claude API Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Claude API Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-api-section-elem-3",
+          "precondition": "claude_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Claude API Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Claude API Provider Configuration",
+          "enabled": true,
+          "id": "ai-claude-api-section-elem-4",
+          "precondition": "claude_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "per-token costs"
+            },
+            "label": "Required element for Claude API Provider Configuration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Visible only when claude_api provider is selected. Manages Claude API key storage in the OS keychain, model selection from four Claude model options, max tokens limit, and displays a per-token cost warning.",
+      "id": "ai-claude-api-section",
+      "name": "Claude API Provider Configuration",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Gemini CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-cli-section-elem-0",
+          "precondition": "gemini_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Gemini CLI Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Gemini CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-cli-section-elem-1",
+          "precondition": "gemini_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "radio"
+            },
+            "label": "Required element for Gemini CLI Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Gemini CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-cli-section-elem-2",
+          "precondition": "gemini_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "radio"
+            },
+            "label": "Required element for Gemini CLI Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Gemini CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-cli-section-elem-3",
+          "precondition": "gemini_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Gemini CLI Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Gemini CLI Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-cli-section-elem-4",
+          "precondition": "gemini_cli provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "npm install -g @google/gemini-cli"
+            },
+            "label": "Required element for Gemini CLI Provider Configuration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Visible only when gemini_cli provider is selected. Configures authentication method (OAuth for Google account free tier, or API key), model selection from five Gemini models, execution mode, and timeout. Includes an npm install tip.",
+      "id": "ai-gemini-cli-section",
+      "name": "Gemini CLI Provider Configuration",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Gemini API Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-api-section-elem-0",
+          "precondition": "gemini_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Gemini API Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Gemini API Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-api-section-elem-1",
+          "precondition": "gemini_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Gemini API Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Gemini API Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-api-section-elem-2",
+          "precondition": "gemini_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save Key"
+            },
+            "label": "Required element for Gemini API Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Gemini API Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-api-section-elem-3",
+          "precondition": "gemini_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Required element for Gemini API Provider Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Gemini API Provider Configuration",
+          "enabled": true,
+          "id": "ai-gemini-api-section-elem-4",
+          "precondition": "gemini_api provider radio button is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost Savings"
+            },
+            "label": "Required element for Gemini API Provider Configuration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Visible only when gemini_api provider is selected. Manages Gemini API key in the OS keychain, model selection, max output tokens, and temperature (creativity). Includes a cost savings note comparing Gemini Flash to Claude for simple tasks.",
+      "id": "ai-gemini-api-section",
+      "name": "Gemini API Provider Configuration",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Auto-Refine Defaults",
+          "enabled": true,
+          "id": "ai-auto-refine-defaults-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Include Video After Iterations"
+            },
+            "label": "Required element for Auto-Refine Defaults",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Auto-Refine Defaults",
+          "enabled": true,
+          "id": "ai-auto-refine-defaults-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Required element for Auto-Refine Defaults",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Auto-Refine Defaults",
+          "enabled": true,
+          "id": "ai-auto-refine-defaults-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Required element for Auto-Refine Defaults",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Auto-Refine Defaults",
+          "enabled": true,
+          "id": "ai-auto-refine-defaults-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Video frames use significantly more tokens"
+            },
+            "label": "Required element for Auto-Refine Defaults",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Global setting controlling how many failed AI analysis iterations occur before the system escalates to include video frames in the prompt. Setting 0 disables video escalation entirely. Applies as the default for new scripts across all providers.",
+      "id": "ai-auto-refine-defaults",
+      "name": "Auto-Refine Defaults",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Session Mode Configuration",
+          "enabled": true,
+          "id": "ai-session-mode-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Session Mode Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Session Mode Configuration",
+          "enabled": true,
+          "id": "ai-session-mode-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Session Mode Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Session Mode Configuration",
+          "enabled": true,
+          "id": "ai-session-mode-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "message queuing"
+            },
+            "label": "Required element for Session Mode Configuration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A toggle controlling whether AI CLI sessions use interactive (bidirectional, multi-turn, message queuing) or one-shot (inline) execution mode. Affects how the runner communicates with the AI CLI during workflow execution.",
+      "id": "ai-session-mode",
+      "name": "Session Mode Configuration",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Test Connection",
+          "enabled": true,
+          "id": "ai-test-connection-elem-0",
+          "precondition": "claude_api or gemini_api provider is selected and no API key is configured",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Test Connection"
+            },
+            "label": "Required element for Test Connection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Test Connection",
+          "enabled": true,
+          "id": "ai-test-connection-elem-1",
+          "precondition": "claude_api or gemini_api provider is selected and no API key is configured",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Test Connection"
+            },
+            "label": "Required element for Test Connection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Test Connection",
+          "enabled": true,
+          "id": "ai-test-connection-elem-2",
+          "precondition": "claude_api or gemini_api provider is selected and no API key is configured",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Test Connection"
+            },
+            "label": "Required element for Test Connection",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A card allowing users to verify the current provider configuration is functional before saving. Calls test_ai_connection Tauri command and displays a success or failure result with the backend's message.",
+      "id": "ai-test-connection",
+      "name": "Test Connection",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Save Settings",
+          "enabled": true,
+          "id": "ai-save-settings-elem-0",
+          "precondition": "Save operation completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save AI Settings"
+            },
+            "label": "Required element for Save Settings",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Save Settings",
+          "enabled": true,
+          "id": "ai-save-settings-elem-1",
+          "precondition": "Save operation completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save AI Settings"
+            },
+            "label": "Required element for Save Settings",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Save Settings",
+          "enabled": true,
+          "id": "ai-save-settings-elem-2",
+          "precondition": "Save operation completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Settings saved successfully"
+            },
+            "label": "Required element for Save Settings",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Save Settings",
+          "enabled": true,
+          "id": "ai-save-settings-elem-3",
+          "precondition": "Save operation completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save AI Settings"
+            },
+            "label": "Required element for Save Settings",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Save button at the bottom of the page persists all AI settings. It calls save_ai_settings for Claude provider fields and save_gemini_settings for Gemini fields. Provides animated feedback for saving, success, and error states.",
+      "id": "ai-save-settings",
+      "name": "Save Settings",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "settings-ai",
+    "tags": [
+      "settings",
+      "ai",
+      "provider",
+      "claude",
+      "gemini",
+      "api-key",
+      "circuit-breaker",
+      "configuration"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The AI Provider settings page renders a scrollable column with a Bot icon, heading, description, and tutorial link. A loading spinner is shown while the initial get_ai_settings Tauri command is in flight.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "AI Provider"
+          },
+          {
+            "textContent": "Configure how the runner connects to AI"
+          },
+          {}
+        ],
+        "id": "ai-page-structure",
+        "isInitial": false,
+        "name": "Page Structure and Header",
+        "transitions": []
+      },
+      {
+        "description": "A radio button group with four mutually exclusive provider options. Selecting a provider immediately shows that provider's configuration section and hides the others. Each option includes a label and short description of the billing model.",
+        "elements": [
+          {
+            "role": "radio"
+          },
+          {
+            "role": "radio"
+          },
+          {
+            "role": "radio"
+          },
+          {
+            "role": "radio"
+          },
+          {
+            "role": "radio"
+          }
+        ],
+        "id": "ai-provider-selection",
+        "isInitial": false,
+        "name": "Provider Selection",
+        "transitions": []
+      },
+      {
+        "description": "When one or more providers have had activity since the runner started, a health status row appears showing a badge per active provider. Each badge reflects its circuit breaker state. This section is absent on a fresh runner with no AI activity.",
+        "elements": [
+          {
+            "textContent": "Closed"
+          },
+          {
+            "textContent": "Open"
+          },
+          {
+            "textContent": "Closed"
+          }
+        ],
+        "id": "ai-provider-health",
+        "isInitial": false,
+        "name": "Provider Health Status (Circuit Breakers)",
+        "transitions": []
+      },
+      {
+        "description": "Visible only when claude_cli provider is selected. Contains authentication status banner, execution mode dropdown, optional custom executable path, Claude account management, selection mode, and timeout input.",
+        "elements": [
+          {
+            "role": "combobox"
+          },
+          {
+            "textContent": "Authenticated"
+          },
+          {
+            "role": "button",
+            "textContent": "Re-authenticate"
+          },
+          {
+            "role": "combobox"
+          },
+          {
+            "role": "spinbutton"
+          }
+        ],
+        "id": "ai-claude-cli-section",
+        "isInitial": false,
+        "name": "Claude CLI Provider Configuration",
+        "transitions": []
+      },
+      {
+        "description": "Manages multiple Claude config directories for rate-limit failover. Users can add directories via file picker, auto-detect them, check usage quotas, switch active accounts, configure per-account launch commands, and choose between Manual and Least Usage selection modes.",
+        "elements": [
+          {
+            "textContent": "No accounts configured"
+          },
+          {
+            "role": "button",
+            "textContent": "Add Directory"
+          },
+          {
+            "role": "button",
+            "textContent": "Auto-Detect"
+          },
+          {
+            "role": "button",
+            "textContent": "Check Usage"
+          },
+          {
+            "textContent": "Active"
+          },
+          {
+            "role": "button",
+            "textContent": "Least Usage"
+          }
+        ],
+        "id": "ai-claude-cli-accounts",
+        "isInitial": false,
+        "name": "Claude CLI Account Management",
+        "transitions": []
+      },
+      {
+        "description": "Visible only when claude_api provider is selected. Manages Claude API key storage in the OS keychain, model selection from four Claude model options, max tokens limit, and displays a per-token cost warning.",
+        "elements": [
+          {
+            "role": "combobox"
+          },
+          {},
+          {
+            "role": "button",
+            "textContent": "Save Key"
+          },
+          {
+            "role": "combobox"
+          },
+          {
+            "textContent": "per-token costs"
+          }
+        ],
+        "id": "ai-claude-api-section",
+        "isInitial": false,
+        "name": "Claude API Provider Configuration",
+        "transitions": []
+      },
+      {
+        "description": "Visible only when gemini_cli provider is selected. Configures authentication method (OAuth for Google account free tier, or API key), model selection from five Gemini models, execution mode, and timeout. Includes an npm install tip.",
+        "elements": [
+          {
+            "role": "combobox"
+          },
+          {
+            "role": "radio"
+          },
+          {
+            "role": "radio"
+          },
+          {
+            "role": "combobox"
+          },
+          {
+            "textContent": "npm install -g @google/gemini-cli"
+          }
+        ],
+        "id": "ai-gemini-cli-section",
+        "isInitial": false,
+        "name": "Gemini CLI Provider Configuration",
+        "transitions": []
+      },
+      {
+        "description": "Visible only when gemini_api provider is selected. Manages Gemini API key in the OS keychain, model selection, max output tokens, and temperature (creativity). Includes a cost savings note comparing Gemini Flash to Claude for simple tasks.",
+        "elements": [
+          {
+            "role": "combobox"
+          },
+          {},
+          {
+            "role": "button",
+            "textContent": "Save Key"
+          },
+          {
+            "role": "spinbutton"
+          },
+          {
+            "textContent": "Cost Savings"
+          }
+        ],
+        "id": "ai-gemini-api-section",
+        "isInitial": false,
+        "name": "Gemini API Provider Configuration",
+        "transitions": []
+      },
+      {
+        "description": "Global setting controlling how many failed AI analysis iterations occur before the system escalates to include video frames in the prompt. Setting 0 disables video escalation entirely. Applies as the default for new scripts across all providers.",
+        "elements": [
+          {
+            "textContent": "Include Video After Iterations"
+          },
+          {
+            "role": "spinbutton"
+          },
+          {
+            "role": "spinbutton"
+          },
+          {
+            "textContent": "Video frames use significantly more tokens"
+          }
+        ],
+        "id": "ai-auto-refine-defaults",
+        "isInitial": false,
+        "name": "Auto-Refine Defaults",
+        "transitions": []
+      },
+      {
+        "description": "A toggle controlling whether AI CLI sessions use interactive (bidirectional, multi-turn, message queuing) or one-shot (inline) execution mode. Affects how the runner communicates with the AI CLI during workflow execution.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "textContent": "message queuing"
+          }
+        ],
+        "id": "ai-session-mode",
+        "isInitial": false,
+        "name": "Session Mode Configuration",
+        "transitions": []
+      },
+      {
+        "description": "A card allowing users to verify the current provider configuration is functional before saving. Calls test_ai_connection Tauri command and displays a success or failure result with the backend's message.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Test Connection"
+          },
+          {
+            "role": "button",
+            "textContent": "Test Connection"
+          },
+          {
+            "role": "button",
+            "textContent": "Test Connection"
+          }
+        ],
+        "id": "ai-test-connection",
+        "isInitial": false,
+        "name": "Test Connection",
+        "transitions": []
+      },
+      {
+        "description": "The Save button at the bottom of the page persists all AI settings. It calls save_ai_settings for Claude provider fields and save_gemini_settings for Gemini fields. Provides animated feedback for saving, success, and error states.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Save AI Settings"
+          },
+          {
+            "role": "button",
+            "textContent": "Save AI Settings"
+          },
+          {
+            "textContent": "Settings saved successfully"
+          },
+          {
+            "role": "button",
+            "textContent": "Save AI Settings"
+          }
+        ],
+        "id": "ai-save-settings",
+        "isInitial": false,
+        "name": "Save Settings",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

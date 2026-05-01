@@ -1,0 +1,59 @@
+{
+  "description": "Sidebar navigation — persistent navigation menu with links to all major pages. Always visible (collapsed or expanded) alongside the active page content.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Sidebar Presence",
+          "enabled": true,
+          "id": "sidebar-presence-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "accessibleName": "Main navigation",
+              "role": "navigation"
+            },
+            "label": "Required element for Sidebar Presence",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The sidebar navigation is always visible",
+      "id": "sidebar-presence",
+      "name": "Sidebar Presence",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "sidebar",
+    "tags": [
+      "runner",
+      "navigation",
+      "sidebar",
+      "global"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The sidebar navigation is always visible",
+        "elements": [
+          {
+            "accessibleName": "Main navigation",
+            "role": "navigation"
+          }
+        ],
+        "id": "sidebar-presence",
+        "isInitial": false,
+        "name": "Sidebar Presence",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

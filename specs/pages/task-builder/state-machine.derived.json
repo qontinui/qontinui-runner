@@ -1,0 +1,87 @@
+{
+  "version": "1.0",
+  "id": "task-builder",
+  "name": "TasksPage",
+  "states": [
+    {
+      "id": "task-list-management",
+      "name": "Task Library Management",
+      "requiredElements": [
+        {
+          "text": "Tasks"
+        },
+        {
+          "role": "button",
+          "text": "New"
+        },
+        {
+          "role": "searchbox"
+        },
+        {
+          "text": "Tasks"
+        }
+      ],
+      "description": "The left panel displays all saved tasks in a searchable list following the standard library builder layout. Each task item shows its name, category badge, a content preview (first 60 characters of the prompt text), and tag count. Users can browse the list, search by name, create new tasks, and select a task to load into the editor. The UI labels this as 'Tasks' though the underlying API uses 'prompts' as the resource name.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "task-editor-config",
+      "name": "Task Editor and Content",
+      "requiredElements": [
+        {
+          "text": "Tasks"
+        },
+        {
+          "text": "Tasks"
+        },
+        {
+          "role": "button",
+          "text": "Save"
+        },
+        {
+          "text": "Tasks"
+        }
+      ],
+      "description": "The right-panel editor provides fields for defining a task. The name field identifies the task in lists and pickers. The content field is a textarea for entering the full prompt text or AI instructions -- this is the most important field as it defines what the AI should do when this task is used in a workflow. An optional category field supports organizational grouping. Tags can be added for flexible labeling. The editor toolbar includes save and delete actions.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "task-organization",
+      "name": "Organization and Discovery",
+      "requiredElements": [
+        {
+          "text": "Tasks"
+        },
+        {
+          "role": "button",
+          "text": "Delete"
+        },
+        {
+          "text": "Tasks"
+        }
+      ],
+      "description": "Tasks support tags for flexible cross-cutting labeling that enhances discovery through the library dashboard and search. The tag input allows adding multiple tags using an enter-to-add pattern and individual tag removal. Combined with categories, tags create a rich organizational system that scales with library growth. The delete action allows users to remove outdated or unused task definitions.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Task Builder page -- a specialized editor for creating and managing task definitions (also known as prompts internally). Tasks define automation work units with a name, content body containing AI instructions or prompt text, category, and tags. They serve as reusable prompt building blocks that can be referenced from workflow agentic steps, providing consistent AI instructions across multiple workflows without duplication.",
+  "metadata": {
+    "tags": [
+      "tasks",
+      "prompts",
+      "builder",
+      "library",
+      "ai-instructions"
+    ]
+  }
+}

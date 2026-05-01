@@ -1,0 +1,421 @@
+{
+  "version": "1.0",
+  "id": "settings-self-healing",
+  "name": "SelfHealingSettings",
+  "states": [
+    {
+      "id": "sh-page-structure",
+      "name": "Page Structure",
+      "requiredElements": [
+        {
+          "text": "Self-Healing Configuration"
+        },
+        {
+          "text": "Configure automation self-healing features"
+        },
+        {
+          "text": "Action Caching"
+        },
+        {
+          "text": "Visual Validation"
+        },
+        {
+          "text": "LLM Assistance"
+        }
+      ],
+      "description": "The self-healing tab renders a titled page header, a descriptive subtitle, and three collapsible section panels. This group verifies the top-level structure is present after settings have loaded.",
+      "precondition": "Settings have loaded (loading indicator is gone)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-loading-state",
+      "name": "Loading State",
+      "requiredElements": [
+        {},
+        {
+          "text": "Self-Healing Configuration"
+        }
+      ],
+      "description": "When the page first mounts, it fetches settings via the get_self_healing_settings Tauri IPC command. During this fetch, a loading indicator is shown in place of the settings form. This group verifies the loading and transition-to-loaded behavior.",
+      "precondition": "Page has just mounted and the get_self_healing_settings fetch has not yet completed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-action-caching",
+      "name": "Action Caching Section",
+      "requiredElements": [
+        {
+          "text": "Cache action results to avoid redundant operations"
+        },
+        {
+          "text": "Cache TTL (seconds)"
+        },
+        {
+          "text": "Action caching prevents redundant template matching"
+        },
+        {
+          "text": "Action Caching"
+        },
+        {
+          "text": "Cache TTL (seconds)"
+        }
+      ],
+      "description": "A collapsible panel with a section header containing a toggle switch. Clicking the header expands/collapses the body. When expanded, it shows a Cache TTL number input (min 30, max 3600, step 30 seconds) and an info box explaining the caching behavior. The TTL input is disabled when the toggle is off. Defaults: enabled=true, ttl=300.",
+      "precondition": "Settings have loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-visual-validation",
+      "name": "Visual Validation Section",
+      "requiredElements": [
+        {
+          "text": "Validate actions by checking screen state after execution"
+        },
+        {
+          "text": "When enabled, actions are validated by checking"
+        },
+        {
+          "text": "Visual Validation"
+        }
+      ],
+      "description": "A collapsible panel with a toggle switch in the header. When expanded, it shows only an info box explaining that actions are validated by checking expected screen state after execution. There are no additional configuration fields. Defaults to enabled=true.",
+      "precondition": "Settings have loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-llm-assistance",
+      "name": "LLM Assistance Section — Mode Selector",
+      "requiredElements": [
+        {
+          "text": "Use AI to assist with element identification and recovery"
+        },
+        {
+          "text": "LLM Mode"
+        },
+        {
+          "text": "LLM Mode"
+        },
+        {
+          "text": "LLM Mode"
+        },
+        {
+          "text": "LLM assistance enables AI-powered element identification"
+        }
+      ],
+      "description": "A collapsible panel without a toggle switch (unlike the other two sections). It contains an LLM Mode dropdown with three options. The selected mode determines which sub-configuration panel appears below the dropdown. An info box is always shown at the bottom of the expanded section. Defaults to mode=disabled.",
+      "precondition": "Settings have loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-llm-local-ollama",
+      "name": "LLM Assistance — Local Ollama Configuration",
+      "requiredElements": [
+        {},
+        {
+          "text": "Model Name"
+        },
+        {}
+      ],
+      "description": "When LLM Mode is 'Local Ollama', a sub-section appears labeled 'Local Ollama Configuration' with a Server icon. It contains a single Model Name text input defaulting to 'llava'. This model name is passed to the qontinui Python library to address a locally running Ollama instance for visual understanding tasks during automation recovery.",
+      "isInitial": false,
+      "precondition": "LLM Assistance is expanded and LLM Mode is set to Local Ollama",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-llm-remote-api",
+      "name": "LLM Assistance — Remote API Configuration",
+      "requiredElements": [
+        {},
+        {
+          "text": "API Provider"
+        },
+        {
+          "text": "API Provider"
+        },
+        {}
+      ],
+      "description": "When LLM Mode is 'Remote API', a sub-section appears labeled 'Remote API Configuration' with a Cloud icon. It contains an API Provider dropdown (OpenAI or Anthropic) and an API key management area. Changing the provider triggers a fresh keychain check. This sub-section is exclusive to Remote API mode.",
+      "isInitial": false,
+      "precondition": "LLM Assistance is expanded and LLM Mode is set to Remote API",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-api-key-management",
+      "name": "API Key Management — Two-State UI",
+      "requiredElements": [
+        {},
+        {
+          "role": "button",
+          "text": "Save API Key"
+        },
+        {
+          "role": "button",
+          "text": "Save API Key"
+        },
+        {
+          "role": "button",
+          "text": "Remove"
+        },
+        {
+          "text": "API key is stored securely in the OS keychain"
+        }
+      ],
+      "description": "The API key area within Remote API mode has two mutually exclusive states. State A (no key): shows a password input with Show/Hide toggle and a 'Save API Key' button (disabled until input is non-empty). State B (key exists): shows a muted 'API key configured' status element and a red 'Remove' button. Transitions between states happen immediately on save or remove. The key is stored in the OS keychain, not the settings file.",
+      "precondition": "LLM Mode is Remote API and the selected provider has an API key in the OS keychain",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-action-buttons",
+      "name": "Action Buttons — Save and Reset",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Save Self-Healing Settings"
+        },
+        {
+          "role": "button",
+          "text": "Reset to Defaults"
+        },
+        {
+          "role": "button",
+          "text": "Save Self-Healing Settings"
+        },
+        {
+          "role": "button",
+          "text": "Reset to Defaults"
+        }
+      ],
+      "description": "Two action buttons appear at the bottom of the page. 'Reset to Defaults' (left, muted) restores all form fields to their default values in-memory without saving. 'Save Self-Healing Settings' (right, primary) calls save_self_healing_settings and shows animated state feedback during and after the save.",
+      "precondition": "Settings have loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-feedback-alerts",
+      "name": "Feedback Alerts — Error and Success",
+      "requiredElements": [
+        {
+          "text": "Settings saved successfully!"
+        },
+        {
+          "text": "Self-Healing Configuration"
+        }
+      ],
+      "description": "The page shows contextual alerts at the top of the form area (above the sections) in response to save operations. Success alerts auto-dismiss after 3 seconds. Error alerts persist until the next user action clears them.",
+      "precondition": "A save operation has just completed successfully",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-settings-persistence",
+      "name": "Settings Persistence and Data Model",
+      "requiredElements": [
+        {
+          "text": "Self-Healing Configuration"
+        },
+        {
+          "text": "Self-Healing Configuration"
+        },
+        {
+          "text": "passed to qontinui Python when executing workflows"
+        }
+      ],
+      "description": "Self-healing settings are persisted via save_self_healing_settings and retrieved via get_self_healing_settings. The data model has exactly six fields. API keys are stored separately in the OS keychain. This group verifies the round-trip integrity and the semantic contract of the settings object.",
+      "precondition": "Settings have been saved and the user navigated away and back",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [
+    {
+      "id": "sh-ollama-to-disabled",
+      "name": "Switch back to Disabled",
+      "fromStates": [
+        "sh-llm-local-ollama"
+      ],
+      "activateStates": [
+        "sh-llm-disabled"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "text": "Local Ollama"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 300
+          }
+        },
+        {
+          "type": "click",
+          "target": {
+            "text": "Disabled"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 500
+          }
+        }
+      ],
+      "exitStates": [
+        "sh-llm-local-ollama"
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-ollama-to-remote-api",
+      "name": "Switch to Remote API",
+      "fromStates": [
+        "sh-llm-local-ollama"
+      ],
+      "activateStates": [
+        "sh-llm-remote-api"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "text": "Local Ollama"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 300
+          }
+        },
+        {
+          "type": "click",
+          "target": {
+            "text": "Remote API"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 500
+          }
+        }
+      ],
+      "exitStates": [
+        "sh-llm-local-ollama"
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-remote-api-to-disabled",
+      "name": "Switch back to Disabled",
+      "fromStates": [
+        "sh-llm-remote-api"
+      ],
+      "activateStates": [
+        "sh-llm-disabled"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "text": "Remote API"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 300
+          }
+        },
+        {
+          "type": "click",
+          "target": {
+            "text": "Disabled"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 500
+          }
+        }
+      ],
+      "exitStates": [
+        "sh-llm-remote-api"
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sh-remote-api-to-ollama",
+      "name": "Switch to Local Ollama",
+      "fromStates": [
+        "sh-llm-remote-api"
+      ],
+      "activateStates": [
+        "sh-llm-local-ollama"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "text": "Remote API"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 300
+          }
+        },
+        {
+          "type": "click",
+          "target": {
+            "text": "Local Ollama"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 500
+          }
+        }
+      ],
+      "exitStates": [
+        "sh-llm-remote-api"
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The Self-Healing settings page in the qontinui-runner desktop application, accessed via the 'Self-Healing' tab in the Settings sidebar. It configures three automation self-healing subsystems: Action Caching (TTL-based cache that avoids redundant template matching and screen captures), Visual Validation (post-action screen state verification to detect failed actions), and LLM Assistance (AI-powered element recovery using local Ollama or remote OpenAI/Anthropic APIs). Each subsystem is presented as an independently collapsible section with a toggle switch or mode selector. When LLM Mode is set to Remote API, the page adds API key management backed by the OS keychain (Windows Credential Manager) — separate from the main settings file. All six settings fields are persisted via the save_self_healing_settings Tauri IPC command and passed directly to the qontinui Python library at workflow execution time. The SelfHealingSettings Rust struct is the canonical type; the TypeScript interface mirrors it exactly.",
+  "metadata": {
+    "tags": [
+      "settings",
+      "self-healing",
+      "action-caching",
+      "visual-validation",
+      "llm",
+      "ollama",
+      "openai",
+      "anthropic",
+      "api-key",
+      "keychain",
+      "runner"
+    ]
+  }
+}

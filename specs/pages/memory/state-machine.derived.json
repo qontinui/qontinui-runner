@@ -1,0 +1,307 @@
+{
+  "version": "1.0",
+  "id": "memory",
+  "name": "MemoryHealthPanel + ObservationBrowser",
+  "states": [
+    {
+      "id": "mem-page-layout",
+      "name": "Page Layout and Structure",
+      "requiredElements": [
+        {
+          "text": "Memory Health"
+        },
+        {
+          "text": "Observation Memory"
+        },
+        {
+          "text": "Cross-session knowledge from past runs"
+        },
+        {
+          "text": "Memory Health"
+        }
+      ],
+      "description": "The page container uses data-page-id='observations' and stacks MemoryHealthPanel (border-b separator) above ObservationBrowser. Both sections are simultaneously visible without page-level scrolling.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-health-header",
+      "name": "Memory Health Panel — Header Controls",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Consolidate"
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        },
+        {
+          "role": "button",
+          "text": "Consolidate"
+        }
+      ],
+      "description": "The MemoryHealthPanel header row contains the 'Memory Health' title (with a brain icon), a Consolidate button for triggering manual memory consolidation, and a Refresh button to reload stats. Both buttons are always present after load.",
+      "precondition": "Memory Health panel has loaded successfully (no loading spinner visible)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-health-stats",
+      "name": "Memory Health — Stats Cards",
+      "requiredElements": [
+        {
+          "text": "Observations"
+        },
+        {
+          "text": "Mental Models"
+        },
+        {
+          "text": "Decay Queue"
+        },
+        {
+          "text": "Last Consolidation"
+        },
+        {
+          "text": "Memory Health"
+        }
+      ],
+      "description": "Four stat cards display key memory system metrics: Observations (total count), Mental Models (consolidated memory count), Decay Queue (pending decay size, highlighted amber if >50), and Last Consolidation (relative time since last run, or 'never'). Data sourced from GET /memory/health.",
+      "precondition": "Memory Health panel has loaded (no loading spinner visible)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-health-loading",
+      "name": "Memory Health Panel — Loading and Error States",
+      "requiredElements": [
+        {
+          "text": "Loading memory health"
+        },
+        {
+          "text": "Memory Health"
+        }
+      ],
+      "description": "While fetching /memory/health and /memory/consolidation-log on mount, the panel shows a spinner with 'Loading memory health...' text. On API failure, a red error banner with the error message replaces the stats area.",
+      "precondition": "The page has just loaded and the /memory/health API call has not yet returned",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-consolidation-log",
+      "name": "Consolidation Log — Recent Runs",
+      "requiredElements": [
+        {
+          "text": "models created"
+        },
+        {
+          "text": "models created"
+        }
+      ],
+      "description": "Below the stats grid, the health panel shows up to 10 recent consolidation entries from GET /memory/consolidation-log?max_results=10. Each entry shows relative start time, models created, observations scanned, observations archived, and an error message if the run failed. The section only appears if the log is non-empty.",
+      "precondition": "At least one consolidation run has been performed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-browser-header",
+      "name": "Observation Browser — Header",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "New"
+        },
+        {
+          "text": "Observation title..."
+        },
+        {
+          "role": "button",
+          "text": "New"
+        }
+      ],
+      "description": "The ObservationBrowser header contains the 'Observation Memory' heading, 'Cross-session knowledge from past runs' subtitle, a '+ New' button (data-ui-element='new-observation-btn'), and a Refresh button. The create form is hidden by default.",
+      "precondition": "Page has loaded and the '+ New' button has NOT been clicked",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-create-form",
+      "name": "Observation Create Form",
+      "requiredElements": [
+        {
+          "role": "textbox"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "role": "button",
+          "text": "Save"
+        },
+        {
+          "role": "button",
+          "text": "Save"
+        },
+        {
+          "role": "combobox"
+        }
+      ],
+      "description": "When open, the create form contains a title input (aria-label: 'Observation title', placeholder: 'Observation title...'), a content textarea (aria-label: 'Observation content', placeholder: 'Content (markdown supported)...'), a type dropdown (aria-label: 'Observation type'), and Save/Cancel buttons. Save is disabled until both title and content are non-empty.",
+      "precondition": "The '+ New' create form is open",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-stats-bar",
+      "name": "Observation Stats Bar — Type Counts",
+      "requiredElements": [
+        {
+          "text": "total"
+        },
+        {
+          "text": "total"
+        },
+        {
+          "text": "decision"
+        }
+      ],
+      "description": "When at least one observation exists, the stats bar shows a '{N} total' badge and clickable per-type count badges. The 6 types are color-coded: decision=blue, architecture=violet, bugfix=red, pattern=amber, learning=green, discovery=cyan. Clicking a type badge pre-fills and triggers a search for that type.",
+      "precondition": "At least one observation exists in the database",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-search",
+      "name": "Observation Search Interface",
+      "requiredElements": [
+        {
+          "role": "textbox"
+        },
+        {
+          "role": "button",
+          "text": "Search"
+        },
+        {
+          "role": "button",
+          "text": "Search"
+        },
+        {
+          "role": "textbox"
+        }
+      ],
+      "description": "The search row contains an input (aria-label: 'Search observations', placeholder: 'Search observations...') and a Search button. Search triggers via Enter key or button click. The button is disabled when the query is empty or a search is in progress. The backend uses PostgreSQL full-text search via GET /observations/search.",
+      "precondition": "At least one observation exists in the database",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-results-display",
+      "name": "Observation Results — List Display",
+      "requiredElements": [
+        {
+          "text": "decision"
+        },
+        {
+          "text": "rev "
+        },
+        {
+          "text": "Observation Memory"
+        }
+      ],
+      "description": "Result rows each show: a chevron icon (right=collapsed, down=expanded), a color-coded type badge, truncated title, 'rev {N}' badge if revisionCount>1, 'relevance: {N}%' if rank>0, 2-line content preview (contentPreview field), and a metadata footer with [topicKey] (if non-null) and the updatedAt date.",
+      "precondition": "Search has returned at least one result of type 'decision'",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-expand-delete",
+      "name": "Observation Row — Expand and Delete",
+      "requiredElements": [
+        {
+          "text": "Observation Memory"
+        },
+        {
+          "text": "Hash:"
+        },
+        {
+          "role": "button",
+          "text": "Delete"
+        },
+        {
+          "role": "button",
+          "text": "Delete"
+        }
+      ],
+      "description": "Clicking a result row expands it showing full content (from GET /observations/{id}) in a <pre> block, plus: content hash (first 12 chars as 'Hash: {hash}...'), scope ('Scope: {scope}'), duplicate prevention count if >0, and a red Delete button. Only one row is expanded at a time.",
+      "precondition": "Search has returned at least two results",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-empty-loading-states",
+      "name": "Empty and Loading States",
+      "requiredElements": [
+        {
+          "text": "Search to browse observations"
+        },
+        {
+          "text": "Searching..."
+        },
+        {
+          "text": "No observations found"
+        }
+      ],
+      "description": "The observation browser has three distinct result-area states: initial (no search performed — shows BookOpen icon + 'Search to browse observations'), searching (spinner + 'Searching...'), and no-results (BookOpen icon + 'No observations found').",
+      "precondition": "No search has been performed since page load",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mem-data-model",
+      "name": "Observation Data Model — Semantic Correctness",
+      "requiredElements": [
+        {
+          "text": "rev "
+        },
+        {
+          "text": "Duplicates prevented"
+        },
+        {
+          "text": "Observation Memory"
+        }
+      ],
+      "description": "Observations are temporal knowledge artifacts with revision history and content deduplication. The UI must accurately surface these invariants. Topic-key upsert (same topic_key → increment revisionCount, snapshot old version), content-hash deduplication (same SHA-256 within 15min → blocked, duplicates_prevented increments), and scope-based organization are backend behaviors visible through the UI.",
+      "precondition": "An observation has been revised at least once via topic-key upsert",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The Memory page (Observations tab, data-page-id='observations') in the qontinui-runner provides cross-session observation memory from past automation runs. It consists of two vertically stacked panels: MemoryHealthPanel (health metrics, 4 stat cards, Consolidate/Refresh controls, and a consolidation run log) and ObservationBrowser (full observation management with search, create, expand, and delete). Observations are typed artifacts — one of 6 types: decision, architecture, bugfix, pattern, learning, discovery — each with a distinct color. The backend uses PostgreSQL full-text search, content-hash deduplication (15-min window), and topic-key upsert semantics for revision history. Observations are also formatted into AI context (markdown summaries injected into session prompts). The health panel reflects the state of a memory consolidation system that groups observations into mental models and decays low-value entries.",
+  "metadata": {
+    "tags": [
+      "memory",
+      "observations",
+      "consolidation",
+      "knowledge",
+      "ai-context",
+      "search"
+    ]
+  }
+}

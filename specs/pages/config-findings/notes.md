@@ -1,0 +1,3 @@
+# CategoryManager
+
+_(notes)_

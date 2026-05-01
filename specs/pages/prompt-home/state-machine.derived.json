@@ -1,0 +1,206 @@
+{
+  "version": "1.0",
+  "id": "prompt-home",
+  "name": "PromptHomePage",
+  "states": [
+    {
+      "id": "ph-layout",
+      "name": "Page Layout & Structure",
+      "requiredElements": [
+        {
+          "attributes": {
+            "page-id": "prompt-home"
+          }
+        },
+        {
+          "attributes": {
+            "page-id": "prompt-home"
+          }
+        }
+      ],
+      "description": "The page is a full-height centered flex column with the app wordmark, a search-style input bar, suggestion chips, and an explain toggle. Content is vertically and horizontally centered.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ph-wordmark",
+      "name": "App Wordmark",
+      "requiredElements": [
+        {
+          "text": "qontinui"
+        },
+        {
+          "text": "qontinui"
+        }
+      ],
+      "description": "A subtle 'qontinui' wordmark with a Sparkles icon appears above the input, establishing brand identity without dominating the page.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ph-search-input",
+      "name": "Search Input Bar",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {},
+        {}
+      ],
+      "description": "The primary input — a rounded search bar with a search icon, placeholder text, and a submit arrow that appears when text is entered.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ph-suggestions",
+      "name": "Suggestion Chips",
+      "requiredElements": [
+        {
+          "text": "Show me the error monitor"
+        },
+        {
+          "text": "Show me the error monitor"
+        },
+        {
+          "text": "Show me the error monitor"
+        }
+      ],
+      "description": "Below the input, suggestion chips show recent prompts (if history exists) or example prompts for new users. Chips are rounded-full pill buttons.",
+      "precondition": "Page is in idle state (no active execution) and no prompt history exists",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ph-explain-toggle",
+      "name": "Explain Steps Toggle",
+      "requiredElements": [
+        {
+          "textContains": "Explain steps"
+        },
+        {
+          "textContains": "Explain steps"
+        }
+      ],
+      "description": "A checkbox toggle below suggestions that enables tutorial overlay narration during execution. Persisted to instanceStorage.",
+      "precondition": "Page is in idle state",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ph-planning-state",
+      "name": "Planning State",
+      "requiredElements": [
+        {
+          "textContains": "Understanding your request"
+        },
+        {}
+      ],
+      "description": "After submission, the page shows a spinner with 'Understanding your request...' while the AI plans the action sequence.",
+      "precondition": "A prompt has just been submitted and the backend is generating a plan",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ph-executing-state",
+      "name": "Executing State — Step Progress",
+      "requiredElements": [
+        {
+          "tagName": "p"
+        },
+        {
+          "attributes": {
+            "page-id": "prompt-home"
+          }
+        },
+        {
+          "attributes": {
+            "page-id": "prompt-home"
+          }
+        }
+      ],
+      "description": "During execution, the page displays the AI's plan summary and a step-by-step progress list. Each step shows a status icon (done/current/pending) and its explanation text.",
+      "precondition": "Page is in executing phase with a plan loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ph-done-state",
+      "name": "Done State",
+      "requiredElements": [
+        {
+          "textContains": "Done!"
+        },
+        {
+          "text": "Start another task"
+        }
+      ],
+      "description": "After all steps complete, shows a green 'Done!' message with a 'Start another task' link to reset.",
+      "precondition": "All plan steps have completed successfully",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ph-error-state",
+      "name": "Error State",
+      "requiredElements": [
+        {
+          "attributes": {
+            "page-id": "prompt-home"
+          }
+        },
+        {
+          "text": "Retry"
+        }
+      ],
+      "description": "If planning or execution fails, shows a red error message with Retry and Start over options.",
+      "precondition": "The backend returned an error or a step failed during execution",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ph-self-steering",
+      "name": "Self-Steering Execution — Domain Logic",
+      "requiredElements": [
+        {
+          "attributes": {
+            "page-id": "prompt-home"
+          }
+        },
+        {
+          "attributes": {
+            "page-id": "prompt-home"
+          }
+        },
+        {}
+      ],
+      "description": "The core feature: the runner steers itself by using the UI Bridge state machine for navigation and NLActionExecutor for page interactions. The AI plans a sequence of navigate + action steps, and the runner executes them visibly.",
+      "precondition": "A navigate step is executing during plan execution",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Prompt Home — the runner's Google-style landing page. Users type a natural language request (e.g., 'schedule a workflow at 3am'), the AI plans a sequence of UI actions, and the runner steers itself via the state machine and NLActionExecutor. Optional 'Explain steps' mode narrates each action via tutorial overlays.",
+  "metadata": {
+    "tags": [
+      "prompt",
+      "home",
+      "self-steering",
+      "navigation",
+      "landing-page"
+    ]
+  }
+}

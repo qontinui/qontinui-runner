@@ -1,0 +1,336 @@
+{
+  "description": "Run Statistics page — displays execution performance metrics for a workflow configuration. Provides two views: Overview (config health, flaky items, run history, error patterns) and Performance (action timing, success trends, transition reliability). Shows config-level automation statistics rather than individual task run statistics.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Overview Dashboard",
+          "enabled": true,
+          "id": "statistics-overview-dashboard-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Statistics|Health"
+            },
+            "label": "Required element for Overview Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Overview Dashboard",
+          "enabled": true,
+          "id": "statistics-overview-dashboard-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "flaky|Flaky|unreliable"
+            },
+            "label": "Required element for Overview Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Overview Dashboard",
+          "enabled": true,
+          "id": "statistics-overview-dashboard-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "history|runs|recent"
+            },
+            "label": "Required element for Overview Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Overview Dashboard",
+          "enabled": true,
+          "id": "statistics-overview-dashboard-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "error|pattern"
+            },
+            "label": "Required element for Overview Dashboard",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Overview view provides a high-level health assessment of the workflow configuration. Users see a grid of panels showing config health metrics, a list of flaky items (elements or actions with inconsistent success rates), recent run history, and recurring error patterns. This view helps users understand whether their workflow configuration is reliable over time, identify items that need attention, and spot trends in execution quality.",
+      "id": "statistics-overview-dashboard",
+      "name": "Overview Dashboard",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Performance Dashboard",
+          "enabled": true,
+          "id": "statistics-performance-view-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Overview|Performance"
+            },
+            "label": "Required element for Performance Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Performance Dashboard",
+          "enabled": true,
+          "id": "statistics-performance-view-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Performance|timing|duration"
+            },
+            "label": "Required element for Performance Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Performance Dashboard",
+          "enabled": true,
+          "id": "statistics-performance-view-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh|refresh"
+            },
+            "label": "Required element for Performance Dashboard",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Performance view provides deeper metrics on execution timing and success rates. Users can analyze action timing distributions, success trends over time, and transition reliability between states. This view is valuable for optimizing workflow performance — identifying slow actions, understanding where time is spent, and measuring how improvements to the configuration translate into better execution metrics.",
+      "id": "statistics-performance-view",
+      "name": "Performance Dashboard",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Run Details Drill-Down",
+          "enabled": true,
+          "id": "statistics-run-details-drilldown-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Run Details Drill-Down",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Run Details Drill-Down",
+          "enabled": true,
+          "id": "statistics-run-details-drilldown-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Close"
+            },
+            "label": "Required element for Run Details Drill-Down",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "From the run history panel, users can click on any individual run to see its details in a slide-out panel. This provides a quick way to inspect specific runs without leaving the statistics context. The drill-down shows run-level metrics and helps correlate specific executions with the aggregate statistics shown in the main panels.",
+      "id": "statistics-run-details-drilldown",
+      "name": "Run Details Drill-Down",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Empty and Loading States",
+          "enabled": true,
+          "id": "statistics-empty-and-loading-states-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Load a configuration|No Run Selected"
+            },
+            "label": "Required element for Empty and Loading States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Empty and Loading States",
+          "enabled": true,
+          "id": "statistics-empty-and-loading-states-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No statistics|Run some workflows"
+            },
+            "label": "Required element for Empty and Loading States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Empty and Loading States",
+          "enabled": true,
+          "id": "statistics-empty-and-loading-states-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "status"
+            },
+            "label": "Required element for Empty and Loading States",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Statistics page requires a loaded configuration to display data. When no configuration is loaded, no run is selected, or statistics data is still loading, the page must communicate these states clearly. It also handles the case where no statistics have been collected yet, guiding the user to run workflows to generate data.",
+      "id": "statistics-empty-and-loading-states",
+      "name": "Empty and Loading States",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "run-statistics",
+    "tags": [
+      "run-statistics",
+      "performance",
+      "config-health",
+      "analytics",
+      "observe"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The Overview view provides a high-level health assessment of the workflow configuration. Users see a grid of panels showing config health metrics, a list of flaky items (elements or actions with inconsistent success rates), recent run history, and recurring error patterns. This view helps users understand whether their workflow configuration is reliable over time, identify items that need attention, and spot trends in execution quality.",
+        "elements": [
+          {
+            "textContent": "Statistics|Health"
+          },
+          {
+            "textContent": "flaky|Flaky|unreliable"
+          },
+          {
+            "textContent": "history|runs|recent"
+          },
+          {
+            "textContent": "error|pattern"
+          }
+        ],
+        "id": "statistics-overview-dashboard",
+        "isInitial": false,
+        "name": "Overview Dashboard",
+        "transitions": []
+      },
+      {
+        "description": "The Performance view provides deeper metrics on execution timing and success rates. Users can analyze action timing distributions, success trends over time, and transition reliability between states. This view is valuable for optimizing workflow performance — identifying slow actions, understanding where time is spent, and measuring how improvements to the configuration translate into better execution metrics.",
+        "elements": [
+          {
+            "textContent": "Overview|Performance"
+          },
+          {
+            "textContent": "Performance|timing|duration"
+          },
+          {
+            "role": "button",
+            "textContent": "Refresh|refresh"
+          }
+        ],
+        "id": "statistics-performance-view",
+        "isInitial": false,
+        "name": "Performance Dashboard",
+        "transitions": []
+      },
+      {
+        "description": "From the run history panel, users can click on any individual run to see its details in a slide-out panel. This provides a quick way to inspect specific runs without leaving the statistics context. The drill-down shows run-level metrics and helps correlate specific executions with the aggregate statistics shown in the main panels.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "role": "button",
+            "textContent": "Close"
+          }
+        ],
+        "id": "statistics-run-details-drilldown",
+        "isInitial": false,
+        "name": "Run Details Drill-Down",
+        "transitions": []
+      },
+      {
+        "description": "The Statistics page requires a loaded configuration to display data. When no configuration is loaded, no run is selected, or statistics data is still loading, the page must communicate these states clearly. It also handles the case where no statistics have been collected yet, guiding the user to run workflows to generate data.",
+        "elements": [
+          {
+            "textContent": "Load a configuration|No Run Selected"
+          },
+          {
+            "textContent": "No statistics|Run some workflows"
+          },
+          {
+            "role": "status"
+          }
+        ],
+        "id": "statistics-empty-and-loading-states",
+        "isInitial": false,
+        "name": "Empty and Loading States",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

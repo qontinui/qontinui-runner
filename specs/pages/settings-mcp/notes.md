@@ -1,0 +1,3 @@
+# McpSettings
+
+_(notes)_

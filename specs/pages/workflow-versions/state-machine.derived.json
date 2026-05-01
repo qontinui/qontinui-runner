@@ -1,0 +1,124 @@
+{
+  "version": "1.0",
+  "id": "workflow-versions",
+  "name": "WorkflowVersionLineage",
+  "states": [
+    {
+      "id": "workflow-versions-timeline",
+      "name": "Version Timeline",
+      "requiredElements": [
+        {
+          "text": "Workflow Version Lineage"
+        },
+        {
+          "text": "v"
+        },
+        {
+          "role": "listitem"
+        },
+        {
+          "text": ":"
+        }
+      ],
+      "description": "Users need a timeline of workflow versions showing version numbers, what triggered each version (generation, reflection, manual edit, fix), and when it was created.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "workflow-versions-diffs",
+      "name": "Version Diff Summaries",
+      "requiredElements": [
+        {
+          "role": "article"
+        }
+      ],
+      "description": "Users need diff summaries explaining what changed between versions to understand workflow evolution without reading raw JSON.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "workflow-versions-triggers",
+      "name": "Trigger Type Color Coding",
+      "requiredElements": [
+        {
+          "role": "listitem"
+        }
+      ],
+      "description": "Trigger types are color-coded: green for generation, purple for reflection, blue for manual, orange for fix.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "workflow-versions-states",
+      "name": "Selection, Loading, and Empty States",
+      "requiredElements": [
+        {
+          "text": "Select a workflow to view version history"
+        },
+        {
+          "text": "Loading versions..."
+        },
+        {
+          "text": "No version history available"
+        }
+      ],
+      "description": "When no workflow is selected or no versions exist, clear messages guide the user.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "workflow-versions-data-display",
+      "name": "Version Data Rendering",
+      "requiredElements": [
+        {
+          "text": "v"
+        },
+        {
+          "text": "generation|reflection|manual|fix"
+        },
+        {
+          "text": "Workflow Version Lineage"
+        }
+      ],
+      "description": "Each version node must accurately render the version number, trigger type badge, formatted timestamp, and diff summary text from the API response.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "workflow-versions-behavior",
+      "name": "Version Timeline Behavior",
+      "requiredElements": [
+        {
+          "text": "Select a workflow to view version history"
+        },
+        {
+          "text": "Workflow Version Lineage"
+        }
+      ],
+      "description": "The version timeline scrolls when versions exceed the visible area, and requires a workflow to be selected via the execution context before displaying data.",
+      "precondition": "No workflow is selected in the execution context",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Workflow Version Lineage — shows how a workflow evolved over time through generations, reflection fixes, and manual edits, with version numbers, trigger types, timestamps, and diff summaries.",
+  "metadata": {
+    "tags": [
+      "knowledge-graph",
+      "workflow",
+      "versioning",
+      "lineage",
+      "runner-only"
+    ]
+  }
+}

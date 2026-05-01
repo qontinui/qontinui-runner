@@ -1,0 +1,87 @@
+{
+  "version": "1.0",
+  "id": "shell-command-builder",
+  "name": "ShellCommandsPage",
+  "states": [
+    {
+      "id": "sc-list-management",
+      "name": "Shell Command Library Management",
+      "requiredElements": [
+        {
+          "text": "Shell Commands"
+        },
+        {
+          "role": "button",
+          "text": "New"
+        },
+        {
+          "role": "searchbox"
+        }
+      ],
+      "description": "The left panel shows all saved shell commands in a searchable list using the standard library builder layout pattern. Users can browse their command library, search by name, create new commands, and select existing ones to edit. Each list item displays the command name and key metadata. The split-panel layout places the command list on the left and the editor on the right, consistent with all other builder pages in the runner.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sc-editor-fields",
+      "name": "Command Editor and Configuration",
+      "requiredElements": [
+        {
+          "text": "Shell Commands"
+        },
+        {
+          "text": "Shell Commands"
+        },
+        {
+          "text": "Shell Commands"
+        },
+        {
+          "text": "Shell Commands"
+        },
+        {
+          "role": "button",
+          "text": "Save"
+        }
+      ],
+      "description": "The right-panel editor provides all fields for defining a shell command. The command text field is the primary input where users enter the actual shell command or script to execute. Users set a descriptive name, specify a working directory for command execution, select the target platform (any, Windows, Linux, macOS), and configure a timeout in seconds. A category field and tag input support organizational needs. The editor toolbar includes save and delete actions.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sc-organization",
+      "name": "Organization and Reuse",
+      "requiredElements": [
+        {
+          "text": "Shell Commands"
+        },
+        {
+          "text": "Shell Commands"
+        },
+        {
+          "role": "button",
+          "text": "Delete"
+        }
+      ],
+      "description": "Shell commands support organizational metadata to help users manage large command libraries. Categories group commands by function (e.g., build, test, deploy). Tags provide flexible cross-cutting labels for discovery through the library dashboard. The combination of name, category, and tags ensures commands are easy to find when building workflows, whether through the library dashboard search or the workflow builder's step picker.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Shell Command Builder page -- a specialized editor for creating and managing reusable shell commands that serve as building blocks for workflow setup, verification, and completion steps. Users define commands with their text, working directory, platform compatibility, timeout, and organizational metadata. Shell commands can be referenced from any workflow phase, enabling consistent environment preparation, health checks, and cleanup operations across multiple workflows.",
+  "metadata": {
+    "tags": [
+      "shell-commands",
+      "builder",
+      "library",
+      "setup",
+      "verification"
+    ]
+  }
+}

@@ -1,0 +1,131 @@
+{
+  "version": "1.0",
+  "id": "run-ai-data",
+  "name": "AiDataViewerTab",
+  "states": [
+    {
+      "id": "ai-data-sidebar-navigation",
+      "name": "Sidebar Navigation and Data Categories",
+      "requiredElements": [
+        {
+          "text": "AI Session|Execution Logs|Configuration"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "AI Session|Execution"
+        }
+      ],
+      "description": "The AI Data page uses a grouped sidebar navigation to organize the many types of data that AI can access during execution. Categories include AI Session (prompt, output, contexts), Execution Logs (events, API requests, MCP calls, image recognition, Playwright tests, AWAS steps, execution spans), Captures (DOM snapshots), Processes (sessions, output), and Configuration (loaded config, dev logs). Users navigate between these categories to inspect exactly what data the AI received and produced, which is essential for understanding AI decision-making and debugging integration issues.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-data-session-data",
+      "name": "AI Session Data Inspection",
+      "requiredElements": [
+        {
+          "text": "Prompt|prompt"
+        },
+        {
+          "text": "Output|output"
+        },
+        {
+          "text": "Context|context"
+        }
+      ],
+      "description": "The AI Session group provides access to the prompt that was sent to AI, the consolidated AI output, and the context objects that were available during the session. This is the most commonly inspected data group because it directly shows what the AI was told, what it produced, and what context it had available. Users inspect these to verify prompt quality, understand AI reasoning, and debug cases where AI made unexpected decisions due to missing or incorrect context.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-data-execution-logs",
+      "name": "Execution Logs and Events",
+      "requiredElements": [
+        {
+          "text": "Events|events"
+        },
+        {
+          "text": "API|request"
+        },
+        {
+          "text": "MCP|tool"
+        }
+      ],
+      "description": "The Execution Logs group provides access to structured event data from the run: task run events, API request logs, MCP tool calls, image recognition results, Playwright test results, AWAS steps, and execution spans. Each data type is displayed as structured JSON or formatted tables. This group is primarily used for debugging integration issues — understanding what API calls were made, what MCP tools were invoked, and how different system components interacted during execution.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-data-captures-and-config",
+      "name": "Captures and Configuration",
+      "requiredElements": [
+        {
+          "text": "DOM|Snapshot|snapshot"
+        },
+        {
+          "text": "Config|Configuration|config"
+        },
+        {
+          "text": "JSON|json"
+        }
+      ],
+      "description": "The remaining data categories cover DOM snapshots captured during execution (showing the page structure at specific points), process session data, and configuration information. DOM snapshots are particularly valuable for debugging verification failures — they show exactly what the page looked like from a structural perspective at the time a check was run. Configuration data helps verify that the correct config was loaded during execution.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-data-pagination-memory-protection",
+      "name": "Pagination and Memory Protection",
+      "requiredElements": [
+        {
+          "textContains": "Show more"
+        },
+        {
+          "textContains": "Show more"
+        },
+        {
+          "textContains": "Show more"
+        },
+        {
+          "textContains": "Show more"
+        },
+        {
+          "textContains": "Show more"
+        },
+        {
+          "textContains": "Session Output"
+        },
+        {
+          "textContains": "Out of Memory"
+        }
+      ],
+      "description": "All data-heavy panels (Events, API Requests, MCP Calls, Playwright Results, AWAS Steps, Process Session Output) use backend-driven pagination to prevent webview OOM crashes. Large datasets (240K+ rows, 48MB+) must never be loaded in full. Each panel initially loads a limited page of results and provides a 'Show more' mechanism to load additional pages on demand. The backend enforces LIMIT/OFFSET at the SQL level for unfiltered queries, capping IPC payload size at ~200 items by default.",
+      "precondition": "A completed task run with >200 events is selected and Events section is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Run AI Data page — a structured viewer for all data accessible to AI via MCP tools during a workflow run. Organized into grouped sidebar navigation (AI Session, Execution Logs, Captures, Processes, Configuration) with panels for prompts, output, contexts, events, API requests, DOM snapshots, and more.",
+  "metadata": {
+    "tags": [
+      "run-ai-data",
+      "data-viewer",
+      "mcp-tools",
+      "debugging",
+      "observe",
+      "pagination",
+      "memory-protection"
+    ]
+  }
+}

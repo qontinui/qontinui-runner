@@ -1,0 +1,297 @@
+{
+  "version": "1.0",
+  "id": "architecture",
+  "name": "ArchitectureView",
+  "states": [
+    {
+      "id": "arch-page-structure",
+      "name": "Page Structure",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Architecture Model"
+        },
+        {
+          "attributes": {
+            "page-id": "architecture"
+          }
+        }
+      ],
+      "description": "Top-level page structure: heading and page container. The heading 'Architecture Model' is always visible regardless of mode.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-mode-tabs",
+      "name": "Mode Switcher",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Reflection"
+        },
+        {
+          "role": "button",
+          "text": "SDK Projects"
+        },
+        {
+          "role": "button",
+          "text": "Developer"
+        },
+        {
+          "role": "button",
+          "text": "Reflection"
+        }
+      ],
+      "description": "The three mode buttons — Reflection, SDK Projects, Developer — appear in a segmented control in the header. Exactly one mode is active (highlighted) at a time. SDK Projects label shows a count in parentheses when specs are loaded (e.g. 'SDK Projects (1)').",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-reflection-controls",
+      "name": "Reflection Mode — Controls",
+      "requiredElements": [
+        {
+          "role": "combobox"
+        },
+        {
+          "role": "button",
+          "text": "Rebuild"
+        },
+        {
+          "role": "button",
+          "text": "Rebuild"
+        },
+        {
+          "role": "combobox"
+        }
+      ],
+      "description": "When Reflection mode is active, the header shows a workflow dropdown selector (aria-label='Select workflow'), a Rebuild button, and a Refresh button. The workflow dropdown lists workflow names from GET /task-runs?limit=100. Rebuild calls POST /reflection/architecture/rebuild, Refresh calls GET /reflection/architecture.",
+      "precondition": "Reflection mode is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-reflection-stats",
+      "name": "Reflection Mode — Statistics Bar",
+      "requiredElements": [
+        {
+          "text": "Components"
+        },
+        {
+          "text": "Relationships"
+        },
+        {
+          "text": "Avg Health"
+        },
+        {
+          "text": "Most Volatile"
+        },
+        {
+          "text": "Components"
+        }
+      ],
+      "description": "When Reflection mode has data loaded (graph.nodes.length > 0), four stat cards appear below the header: Components (blue Boxes icon), Relationships (purple Link2 icon), Avg Health (green Activity icon, formatted as percentage), and Most Volatile (orange AlertTriangle icon, shows the basename of the most volatile component path).",
+      "precondition": "Reflection mode is active and architecture graph has been loaded with at least one component",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-reflection-graph",
+      "name": "Reflection Mode — Component Dependency Graph",
+      "requiredElements": [
+        {
+          "role": "graphics-document"
+        },
+        {
+          "role": "graphics-document"
+        },
+        {
+          "role": "graphics-document"
+        },
+        {
+          "role": "button",
+          "text": "Rebuild"
+        }
+      ],
+      "description": "When reflection data is loaded, an interactive XYFlow (ReactFlow) graph renders component nodes laid out by dagre. Each node uses a custom HealthNode: health score > 0.7 renders green, 0.4–0.7 amber, < 0.4 red. Node width scales with activity (fix_count + causal_involvement_count). Nodes display the component's basename and parent directory as a secondary label. Edges connect components that have a relationship from reflection data. Clicking a node opens the ComponentDetailPanel on the right.",
+      "precondition": "Reflection mode is active and architecture graph has at least one component",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-reflection-empty-state",
+      "name": "Reflection Mode — Empty State",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "No Architecture Data"
+        },
+        {
+          "role": "button",
+          "text": "Rebuild Architecture Model"
+        },
+        {
+          "role": "heading",
+          "text": "No Architecture Data"
+        }
+      ],
+      "description": "When no architecture data exists for the selected workflow (or no workflow is selected), the graph area shows an empty state with: a large GitBranch icon, heading 'No Architecture Data', and explanatory text. If a workflow is selected, a 'Rebuild Architecture Model' button appears so the user can generate the initial graph.",
+      "precondition": "Reflection mode is active and selected workflow has no architecture data",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-reflection-error",
+      "name": "Reflection Mode — Error State",
+      "requiredElements": [
+        {
+          "role": "alert"
+        }
+      ],
+      "description": "When the GET /reflection/architecture request fails, a red error banner appears below the header showing the error message. The graph area remains empty or shows the previous data.",
+      "precondition": "Reflection mode is active and API call fails",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-sdk-projects-mode",
+      "name": "SDK Projects Mode — Loaded State",
+      "requiredElements": [
+        {
+          "text": "Features"
+        },
+        {
+          "text": "Dependencies"
+        },
+        {
+          "text": "Tech Stack"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "role": "combobox"
+        }
+      ],
+      "description": "When SDK Projects mode is active and architecture specs are loaded from connected apps, the panel shows: optional project selector (if multiple specs), stat cards (Features count, Dependencies count, Tech Stack count), a Features/Patterns scrollable list on the left, an optional detail panel for selected nodes, and a Tech Stack + Directories panel on the right. Data comes from UI Bridge architecture spec discovery via POST /ui-bridge/sdk/discover-and-cache.",
+      "precondition": "SDK Projects mode is active and at least one architecture spec is loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-sdk-empty-state",
+      "name": "SDK Projects Mode — Empty State",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "No SDK Projects Found"
+        },
+        {
+          "text": "No SDK Projects Found"
+        },
+        {
+          "text": "Discovering specs from connected app"
+        }
+      ],
+      "description": "When SDK Projects mode is active but no architecture specs have been discovered, the panel shows an SDK app connector widget (SdkAppConnector in compact mode) at the top for connecting to running apps, followed by a 'No SDK Projects Found' empty state message below.",
+      "precondition": "SDK Projects mode is active and no architecture specs are loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-developer-mode",
+      "name": "Developer Mode — Sub-tabs",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Overview"
+        },
+        {
+          "role": "button",
+          "text": "Dependencies"
+        },
+        {
+          "role": "button",
+          "text": "Tech Map"
+        },
+        {
+          "role": "button",
+          "text": "Overview"
+        },
+        {
+          "role": "button",
+          "text": "Developer"
+        }
+      ],
+      "description": "Developer mode renders DeveloperArchitecturePanel which has 5 sub-tab views: Overview (LayoutDashboard icon), Dependencies (GitBranch icon), Tech Map (Cpu icon), Explorer (Search icon), Agentic (Bot icon). The sub-tabs appear as a horizontal list of buttons with icon+label. Overview is the default active view.",
+      "precondition": "Developer mode is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-reflection-algorithm-correctness",
+      "name": "Reflection Mode — Architecture Algorithm Correctness",
+      "requiredElements": [
+        {
+          "role": "graphics-document"
+        },
+        {
+          "text": "Most Volatile"
+        },
+        {
+          "role": "graphics-document"
+        }
+      ],
+      "description": "The reflection architecture graph is produced by an algorithm that analyzes completed reflection workflow runs and infers component relationships. The graph displayed on this page is the algorithm's output — verifying the page means verifying that the algorithm produced sensible output. Key invariants: component nodes must have a health_score between 0 and 1, fix_count and causal_involvement_count must be non-negative integers, edges must connect existing nodes, and the graph should be a DAG-like structure (no isolated nodes that were never referenced in any reflection run).",
+      "precondition": "Reflection mode is active and graph has been loaded with at least one component",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "arch-sdk-data-correctness",
+      "name": "SDK Projects Mode — Architecture Spec Correctness",
+      "requiredElements": [
+        {
+          "text": "Features"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "Dependencies"
+        }
+      ],
+      "description": "The SDK Projects mode displays architecture spec data loaded from connected apps via the UI Bridge. The Features stat count should equal the number of items visible in the Features section of the list panel. The Dependencies stat should equal the number of visible edge entries. Tech Stack count should equal the number of entries in the Tech Stack section on the right panel.",
+      "precondition": "SDK Projects mode is active and a spec is loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Architecture page — visualizes component dependency graphs and SDK project architecture. Three modes: Reflection (XYFlow graph derived from reflection workflow data showing component health scores and relationships), SDK Projects (architecture specs from UI Bridge-connected apps showing features, patterns, tech stack, and directories), and Developer (5 sub-tabs: Overview, Dependencies, Tech Map, Explorer, Agentic). The page surfaces runtime intelligence about how components interact, which are volatile, and how features depend on each other. In Reflection mode, the graph is the primary output of an architecture-rebuild algorithm — correctness means component nodes have health scores, edges represent real relationships, and counts are internally consistent.",
+  "metadata": {
+    "tags": [
+      "architecture",
+      "graph",
+      "reflection",
+      "sdk-projects",
+      "dependency-graph",
+      "visualization"
+    ]
+  }
+}

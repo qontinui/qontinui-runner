@@ -1,0 +1,83 @@
+{
+  "version": "1.0",
+  "id": "step-builders",
+  "name": "StepBuildersPage",
+  "states": [
+    {
+      "id": "sb-page-purpose",
+      "name": "Page Purpose and Discovery",
+      "requiredElements": [
+        {
+          "text": "Step Builders"
+        },
+        {
+          "text": "Checks"
+        },
+        {
+          "text": "Shell Commands"
+        }
+      ],
+      "description": "The Step Builders page serves as a wayfinding hub for users who want to create reusable automation building blocks. Rather than presenting a single complex form, it shows a grid of builder cards so users can quickly identify and navigate to the right tool for the asset they want to create. The page heading and subtitle explain the purpose, and the card layout provides visual differentiation through color-coded icons. This is the entry point for all library asset creation outside of the workflow editor itself.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sb-builder-types",
+      "name": "Available Builder Types",
+      "requiredElements": [
+        {
+          "text": "Verification checks for validating UI state"
+        },
+        {
+          "text": "Check Groups"
+        },
+        {
+          "text": "Tasks"
+        },
+        {
+          "text": "Contexts"
+        },
+        {
+          "text": "Playwright Tests"
+        }
+      ],
+      "description": "The page presents six distinct builder types, each corresponding to a type of reusable asset in the automation library. Checks validate UI or system state. Check Groups bundle multiple checks into test suites. Shell Commands define reusable system commands. Tasks define automation work units with prompts. Contexts provide AI instructions and knowledge. Playwright Tests create browser automation scripts. Each builder type is visually distinguished with a unique color and icon, making it easy to scan and locate the desired builder.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sb-visual-hierarchy",
+      "name": "Visual Organization and Layout",
+      "requiredElements": [
+        {
+          "text": "Step Builders"
+        },
+        {
+          "text": "System commands and shell scripts"
+        },
+        {
+          "text": "Build individual workflow steps with specialized editors"
+        }
+      ],
+      "description": "The builder cards are arranged in a responsive grid layout that adapts to screen size, showing one to three columns depending on available width. Each card uses consistent visual structure: a color-coded icon on the left, the builder title and description on the right, and a hover-revealed arrow indicating navigability. The grid layout ensures all builder types are visible without scrolling on typical screens, providing immediate overview of all creation options.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Step Builders landing page -- a discovery hub that presents all available step builder types as a card grid. Users land here to understand what kinds of automation assets they can create and navigate to the specialized builder for each type. Each card represents a distinct builder (checks, check groups, shell commands, tasks, contexts, playwright tests) with a brief description and visual icon. Clicking a card navigates to the full builder interface for that asset type.",
+  "metadata": {
+    "tags": [
+      "step-builders",
+      "landing-page",
+      "navigation",
+      "asset-creation"
+    ]
+  }
+}

@@ -1,0 +1,336 @@
+{
+  "description": "Run AI Output page — displays the full AI conversation transcript from a workflow run. Users can select between multiple AI sessions (setup, agentic, completion), read the complete conversation, view session statistics, manage auto-continue settings, and control live execution.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state AI Session Selection and Navigation",
+          "enabled": true,
+          "id": "ai-output-session-selection-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Session|All Sessions"
+            },
+            "label": "Required element for AI Session Selection and Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state AI Session Selection and Navigation",
+          "enabled": true,
+          "id": "ai-output-session-selection-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "duration|messages|session"
+            },
+            "label": "Required element for AI Session Selection and Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state AI Session Selection and Navigation",
+          "enabled": true,
+          "id": "ai-output-session-selection-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "All"
+            },
+            "label": "Required element for AI Session Selection and Navigation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A single workflow run may produce multiple AI sessions — setup sessions, agentic iterations, and completion sessions. Users need to navigate between these sessions to read the specific conversation they are interested in. The session selector provides a dropdown listing all available sessions with metadata (type, status, duration, message count), plus an 'All Sessions' option that concatenates all output chronologically. This navigation is essential for understanding the full AI interaction across a multi-phase workflow.",
+      "id": "ai-output-session-selection",
+      "name": "AI Session Selection and Navigation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Conversation Transcript Reading",
+          "enabled": true,
+          "id": "ai-output-conversation-reading-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "output|conversation"
+            },
+            "label": "Required element for Conversation Transcript Reading",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Conversation Transcript Reading",
+          "enabled": true,
+          "id": "ai-output-conversation-reading-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Copy"
+            },
+            "label": "Required element for Conversation Transcript Reading",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Conversation Transcript Reading",
+          "enabled": true,
+          "id": "ai-output-conversation-reading-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loop|Iteration|iteration"
+            },
+            "label": "Required element for Conversation Transcript Reading",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The primary purpose of this page is reading the AI conversation. The transcript shows the full exchange between the user's prompt, the AI's reasoning, the commands AI issued, and their results. The conversation is rendered with proper formatting (markdown, code blocks) and fills the main content area for maximum readability. Users come here to understand exactly what the AI did, why it made certain decisions, and what it learned during the workflow execution.",
+      "id": "ai-output-conversation-reading",
+      "name": "Conversation Transcript Reading",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Execution Controls and Status",
+          "enabled": true,
+          "id": "ai-output-execution-controls-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Running|Complete|Failed|Stopped"
+            },
+            "label": "Required element for Execution Controls and Status",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Execution Controls and Status",
+          "enabled": true,
+          "id": "ai-output-execution-controls-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Auto"
+            },
+            "label": "Required element for Execution Controls and Status",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Execution Controls and Status",
+          "enabled": true,
+          "id": "ai-output-execution-controls-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Stop"
+            },
+            "label": "Required element for Execution Controls and Status",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The AI Output page is not just a passive viewer — it also provides execution controls for managing AI sessions. Users can see the current execution status (running, complete, failed, stopped), control auto-continue behavior, stop running sessions, restart completed ones, and manage session deletion. The status banner at the top communicates the live execution state, and controls allow real-time intervention during active runs.",
+      "id": "ai-output-execution-controls",
+      "name": "Execution Controls and Status",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Empty and Loading States",
+          "enabled": true,
+          "id": "ai-output-empty-and-loading-states-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a run|No run"
+            },
+            "label": "Required element for Empty and Loading States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Empty and Loading States",
+          "enabled": true,
+          "id": "ai-output-empty-and-loading-states-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No sessions|no output"
+            },
+            "label": "Required element for Empty and Loading States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Empty and Loading States",
+          "enabled": true,
+          "id": "ai-output-empty-and-loading-states-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Running|output"
+            },
+            "label": "Required element for Empty and Loading States",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The AI Output page must handle various data availability states. When no run is selected, it prompts the user to select one. When a run has no AI output (pure automation workflows), it shows an appropriate empty state. During live execution, the output streams in progressively. The page must also handle the case where AI session data is still being written to the database (output chunks arrive asynchronously).",
+      "id": "ai-output-empty-and-loading-states",
+      "name": "Empty and Loading States",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "run-ai-output",
+    "tags": [
+      "run-ai-output",
+      "ai-conversation",
+      "sessions",
+      "live-execution",
+      "observe"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "A single workflow run may produce multiple AI sessions — setup sessions, agentic iterations, and completion sessions. Users need to navigate between these sessions to read the specific conversation they are interested in. The session selector provides a dropdown listing all available sessions with metadata (type, status, duration, message count), plus an 'All Sessions' option that concatenates all output chronologically. This navigation is essential for understanding the full AI interaction across a multi-phase workflow.",
+        "elements": [
+          {
+            "textContent": "Session|All Sessions"
+          },
+          {
+            "textContent": "duration|messages|session"
+          },
+          {
+            "textContent": "All"
+          }
+        ],
+        "id": "ai-output-session-selection",
+        "isInitial": false,
+        "name": "AI Session Selection and Navigation",
+        "transitions": []
+      },
+      {
+        "description": "The primary purpose of this page is reading the AI conversation. The transcript shows the full exchange between the user's prompt, the AI's reasoning, the commands AI issued, and their results. The conversation is rendered with proper formatting (markdown, code blocks) and fills the main content area for maximum readability. Users come here to understand exactly what the AI did, why it made certain decisions, and what it learned during the workflow execution.",
+        "elements": [
+          {
+            "textContent": "output|conversation"
+          },
+          {
+            "role": "button",
+            "textContent": "Copy"
+          },
+          {
+            "textContent": "Loop|Iteration|iteration"
+          }
+        ],
+        "id": "ai-output-conversation-reading",
+        "isInitial": false,
+        "name": "Conversation Transcript Reading",
+        "transitions": []
+      },
+      {
+        "description": "The AI Output page is not just a passive viewer — it also provides execution controls for managing AI sessions. Users can see the current execution status (running, complete, failed, stopped), control auto-continue behavior, stop running sessions, restart completed ones, and manage session deletion. The status banner at the top communicates the live execution state, and controls allow real-time intervention during active runs.",
+        "elements": [
+          {
+            "textContent": "Running|Complete|Failed|Stopped"
+          },
+          {
+            "textContent": "Auto"
+          },
+          {
+            "role": "button",
+            "textContent": "Stop"
+          }
+        ],
+        "id": "ai-output-execution-controls",
+        "isInitial": false,
+        "name": "Execution Controls and Status",
+        "transitions": []
+      },
+      {
+        "description": "The AI Output page must handle various data availability states. When no run is selected, it prompts the user to select one. When a run has no AI output (pure automation workflows), it shows an appropriate empty state. During live execution, the output streams in progressively. The page must also handle the case where AI session data is still being written to the database (output chunks arrive asynchronously).",
+        "elements": [
+          {
+            "textContent": "Select a run|No run"
+          },
+          {
+            "textContent": "No sessions|no output"
+          },
+          {
+            "textContent": "Running|output"
+          }
+        ],
+        "id": "ai-output-empty-and-loading-states",
+        "isInitial": false,
+        "name": "Empty and Loading States",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

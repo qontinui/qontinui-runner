@@ -1,0 +1,76 @@
+{
+  "version": "1.0",
+  "id": "run-state-explorer",
+  "name": "StateExplorerTab",
+  "states": [
+    {
+      "id": "state-explorer-history-browsing",
+      "name": "Exploration History Browsing",
+      "requiredElements": [
+        {
+          "text": "exploration|history|state"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "No Run Selected|Select a run"
+        }
+      ],
+      "description": "The State Explorer presents a history of past state exploration runs associated with the selected workflow run. Each exploration represents a point-in-time capture of the target application's UI state. Users browse this history to find specific exploration runs, understand the progression of state changes across the workflow, and select individual explorations for detailed review. The history view is the entry point for all state analysis.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "state-explorer-report-viewing",
+      "name": "Exploration Report Viewing",
+      "requiredElements": [
+        {
+          "text": "report|state|exploration"
+        },
+        {
+          "role": "button",
+          "text": "Back|History"
+        },
+        {
+          "text": "AI|prompt|analyze"
+        }
+      ],
+      "description": "When the user selects a specific exploration from the history, they see a detailed report of the captured state. This report shows the UI elements that were discovered, their properties and values, and the overall structure of the application at that point in time. The report is the core analytical artifact that helps developers verify whether expected state changes occurred during workflow execution.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "state-explorer-verification-support",
+      "name": "Verification and Debugging Support",
+      "requiredElements": [
+        {
+          "text": "state|snapshot|capture"
+        },
+        {
+          "text": "element|value|property"
+        }
+      ],
+      "description": "The State Explorer's primary purpose is to support verification debugging. When a verification phase reports unexpected results, developers use state explorations to understand why the application was in a particular state. By comparing state snapshots taken at different execution points, users can identify what changed (or did not change) and trace the root cause of verification failures back to specific automation actions or AI decisions.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Run State Explorer page (dev-only) — displays UI state exploration results captured during verification phases. Users can browse exploration history, view detailed reports of state snapshots, and compare application state at different points in execution.",
+  "metadata": {
+    "tags": [
+      "run-state-explorer",
+      "state-exploration",
+      "dev-only",
+      "verification",
+      "observe"
+    ]
+  }
+}

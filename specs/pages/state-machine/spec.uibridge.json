@@ -1,0 +1,3063 @@
+{
+  "description": "UI Bridge State Machine page — connect to SDK-integrated apps, discover UI states via automated exploration or manual recording with fingerprint-based co-occurrence analysis, then manage state machine configs across seven tabs: Discovery (SDK app connection, explore/record data collection, fingerprint-based state discovery with auto-save), Graph Editor (interactive dagre node-edge layout with element thumbnails, drag-and-drop element reassignment, transition creation), State View (list + spatial + screenshot modes via shared StateViewPanel), Transitions (list with action playback via shared TransitionsPanel), Pathfinding (find optimal paths between states via shared PathfindingPanel), Exploration Results (dashboard with pass rate, coverage stats, discrepancy severity groups, history list, and per-state detail with confidence scores, element verification, and AI analysis prompt), and Export (save to JSON file or load into Python runtime).",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Page Header and Config Selector",
+          "enabled": true,
+          "id": "sm-page-header-elem-0",
+          "precondition": "No config is currently selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "UI Bridge States"
+            },
+            "label": "Required element for Page Header and Config Selector",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Page Header and Config Selector",
+          "enabled": true,
+          "id": "sm-page-header-elem-1",
+          "precondition": "No config is currently selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select configuration..."
+            },
+            "label": "Required element for Page Header and Config Selector",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Page Header and Config Selector",
+          "enabled": true,
+          "id": "sm-page-header-elem-2",
+          "precondition": "No config is currently selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Refresh"
+            },
+            "label": "Required element for Page Header and Config Selector",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Page Header and Config Selector",
+          "enabled": true,
+          "id": "sm-page-header-elem-3",
+          "precondition": "No config is currently selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "h1"
+            },
+            "label": "Required element for Page Header and Config Selector",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The page header shows a Network icon, the active config name (or 'UI Bridge States' when none is selected), and a config selector dropdown with a Refresh button. Users pick an existing config to load it. There is no 'New' or 'Delete' button — configs are created through the Discovery flow.",
+      "id": "sm-page-header",
+      "name": "Page Header and Config Selector",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Tab Navigation Bar",
+          "enabled": true,
+          "id": "sm-tab-bar-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Discovery"
+            },
+            "label": "Required element for Tab Navigation Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Tab Navigation Bar",
+          "enabled": true,
+          "id": "sm-tab-bar-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Graph Editor"
+            },
+            "label": "Required element for Tab Navigation Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Tab Navigation Bar",
+          "enabled": true,
+          "id": "sm-tab-bar-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "State View"
+            },
+            "label": "Required element for Tab Navigation Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Tab Navigation Bar",
+          "enabled": true,
+          "id": "sm-tab-bar-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Transitions"
+            },
+            "label": "Required element for Tab Navigation Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Tab Navigation Bar",
+          "enabled": true,
+          "id": "sm-tab-bar-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Pathfinding"
+            },
+            "label": "Required element for Tab Navigation Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Tab Navigation Bar",
+          "enabled": true,
+          "id": "sm-tab-bar-elem-5",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Exploration Results"
+            },
+            "label": "Required element for Tab Navigation Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Tab Navigation Bar",
+          "enabled": true,
+          "id": "sm-tab-bar-elem-6",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Export"
+            },
+            "label": "Required element for Tab Navigation Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Tab Navigation Bar",
+          "enabled": true,
+          "id": "sm-tab-bar-elem-7",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Tab Navigation Bar",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Seven tabs appear below the header and are always visible (regardless of config selection): Discovery, Graph Editor, State View, Transitions, Pathfinding, Exploration Results, and Export. The active tab is highlighted with a background shadow. Each tab has an icon and label.",
+      "id": "sm-tab-bar",
+      "name": "Tab Navigation Bar",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Empty States (No Config Selected)",
+          "enabled": true,
+          "id": "sm-empty-states-elem-0",
+          "precondition": "No config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a configuration to view the state graph"
+            },
+            "label": "Required element for Empty States (No Config Selected)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Empty States (No Config Selected)",
+          "enabled": true,
+          "id": "sm-empty-states-elem-1",
+          "precondition": "No config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a configuration to view states"
+            },
+            "label": "Required element for Empty States (No Config Selected)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Empty States (No Config Selected)",
+          "enabled": true,
+          "id": "sm-empty-states-elem-2",
+          "precondition": "No config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a configuration to view transitions"
+            },
+            "label": "Required element for Empty States (No Config Selected)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Empty States (No Config Selected)",
+          "enabled": true,
+          "id": "sm-empty-states-elem-3",
+          "precondition": "No config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a configuration to use pathfinding"
+            },
+            "label": "Required element for Empty States (No Config Selected)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Empty States (No Config Selected)",
+          "enabled": true,
+          "id": "sm-empty-states-elem-4",
+          "precondition": "No config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a configuration to export"
+            },
+            "label": "Required element for Empty States (No Config Selected)",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When no config is selected, most tabs show centered placeholder text guiding the user. Discovery and Exploration Results tabs are always available regardless of config selection.",
+      "id": "sm-empty-states",
+      "name": "Empty States (No Config Selected)",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Discovery Tab: Connect to SDK App",
+          "enabled": true,
+          "id": "sm-discovery-connect-elem-0",
+          "precondition": "Discovery tab is active, no co-occurrence data collected yet",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Scan for Apps"
+            },
+            "label": "Required element for Discovery Tab: Connect to SDK App",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Discovery Tab: Connect to SDK App",
+          "enabled": true,
+          "id": "sm-discovery-connect-elem-1",
+          "precondition": "Discovery tab is active, no co-occurrence data collected yet",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Connect to SDK App"
+            },
+            "label": "Required element for Discovery Tab: Connect to SDK App",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Discovery Tab: Connect to SDK App",
+          "enabled": true,
+          "id": "sm-discovery-connect-elem-2",
+          "precondition": "Discovery tab is active, no co-occurrence data collected yet",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Connect"
+            },
+            "label": "Required element for Discovery Tab: Connect to SDK App",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Discovery Tab: Connect to SDK App",
+          "enabled": true,
+          "id": "sm-discovery-connect-elem-3",
+          "precondition": "Discovery tab is active, no co-occurrence data collected yet",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Connected:"
+            },
+            "label": "Required element for Discovery Tab: Connect to SDK App",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Discovery Tab: Connect to SDK App",
+          "enabled": true,
+          "id": "sm-discovery-connect-elem-4",
+          "precondition": "Discovery tab is active, no co-occurrence data collected yet",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Click Scan to find apps with the UI Bridge SDK installed."
+            },
+            "label": "Required element for Discovery Tab: Connect to SDK App",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Phase 1 of the Discovery flow. Users scan for SDK-integrated apps (web and desktop), see discovered apps in a list, and connect to one. Once connected, a green 'Connected: [AppName]' banner appears and the app list hides. Auto-scans on mount.",
+      "id": "sm-discovery-connect",
+      "name": "Discovery Tab: Connect to SDK App",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Discovery Tab: Data Collection (Explore/Record)",
+          "enabled": true,
+          "id": "sm-discovery-collect-elem-0",
+          "precondition": "Discovery tab is active, connected to an app",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Explore"
+            },
+            "label": "Required element for Discovery Tab: Data Collection (Explore/Record)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Discovery Tab: Data Collection (Explore/Record)",
+          "enabled": true,
+          "id": "sm-discovery-collect-elem-1",
+          "precondition": "Discovery tab is active, connected to an app",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Record"
+            },
+            "label": "Required element for Discovery Tab: Data Collection (Explore/Record)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Discovery Tab: Data Collection (Explore/Record)",
+          "enabled": true,
+          "id": "sm-discovery-collect-elem-2",
+          "precondition": "Discovery tab is active, connected to an app",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Start Exploration"
+            },
+            "label": "Required element for Discovery Tab: Data Collection (Explore/Record)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Discovery Tab: Data Collection (Explore/Record)",
+          "enabled": true,
+          "id": "sm-discovery-collect-elem-3",
+          "precondition": "Discovery tab is active, connected to an app",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Start Recording"
+            },
+            "label": "Required element for Discovery Tab: Data Collection (Explore/Record)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Discovery Tab: Data Collection (Explore/Record)",
+          "enabled": true,
+          "id": "sm-discovery-collect-elem-4",
+          "precondition": "Discovery tab is active, connected to an app",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Stop Recording"
+            },
+            "label": "Required element for Discovery Tab: Data Collection (Explore/Record)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Discovery Tab: Data Collection (Explore/Record)",
+          "enabled": true,
+          "id": "sm-discovery-collect-elem-5",
+          "precondition": "Discovery tab is active, connected to an app",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Progress:"
+            },
+            "label": "Required element for Discovery Tab: Data Collection (Explore/Record)",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Phase 2 of Discovery. After connecting to an app, two sub-tabs appear: 'Explore' (automated exploration) and 'Record' (manual capture session). Explore automatically interacts with UI elements; Record lets users manually navigate while capturing states. Both produce co-occurrence data for state discovery.",
+      "id": "sm-discovery-collect",
+      "name": "Discovery Tab: Data Collection (Explore/Record)",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Discovery Tab: State Discovery and Save",
+          "enabled": true,
+          "id": "sm-discovery-discover-elem-0",
+          "precondition": "Discovery tab is active, co-occurrence data has been collected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Co-occurrence Data Collected"
+            },
+            "label": "Required element for Discovery Tab: State Discovery and Save",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Discovery Tab: State Discovery and Save",
+          "enabled": true,
+          "id": "sm-discovery-discover-elem-1",
+          "precondition": "Discovery tab is active, co-occurrence data has been collected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Start Over"
+            },
+            "label": "Required element for Discovery Tab: State Discovery and Save",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Discovery Tab: State Discovery and Save",
+          "enabled": true,
+          "id": "sm-discovery-discover-elem-2",
+          "precondition": "Discovery tab is active, co-occurrence data has been collected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Discover States"
+            },
+            "label": "Required element for Discovery Tab: State Discovery and Save",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Discovery Tab: State Discovery and Save",
+          "enabled": true,
+          "id": "sm-discovery-discover-elem-3",
+          "precondition": "Discovery tab is active, co-occurrence data has been collected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Discovery Complete"
+            },
+            "label": "Required element for Discovery Tab: State Discovery and Save",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Discovery Tab: State Discovery and Save",
+          "enabled": true,
+          "id": "sm-discovery-discover-elem-4",
+          "precondition": "Discovery tab is active, co-occurrence data has been collected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Save Configuration"
+            },
+            "label": "Required element for Discovery Tab: State Discovery and Save",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Discovery Tab: State Discovery and Save",
+          "enabled": true,
+          "id": "sm-discovery-discover-elem-5",
+          "precondition": "Discovery tab is active, co-occurrence data has been collected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Discovery Tab: State Discovery and Save",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Phase 3-4 of Discovery. After co-occurrence data is collected, the connection card hides and a data summary card appears. Users click 'Discover States' to run fingerprint-based state discovery. Results show discovered states with confidence scores. After auto-save or manual save with a config name, the user is redirected to the Graph Editor tab.",
+      "id": "sm-discovery-discover",
+      "name": "Discovery Tab: State Discovery and Save",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Graph Editor Tab Content",
+          "enabled": true,
+          "id": "sm-graph-tab-elem-0",
+          "precondition": "A config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Add Transition"
+            },
+            "label": "Required element for Graph Editor Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Graph Editor Tab Content",
+          "enabled": true,
+          "id": "sm-graph-tab-elem-1",
+          "precondition": "A config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No states discovered yet"
+            },
+            "label": "Required element for Graph Editor Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Graph Editor Tab Content",
+          "enabled": true,
+          "id": "sm-graph-tab-elem-2",
+          "precondition": "A config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Graph Editor Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Graph Editor Tab Content",
+          "enabled": true,
+          "id": "sm-graph-tab-elem-3",
+          "precondition": "A config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Graph Editor Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Graph Editor Tab Content",
+          "enabled": true,
+          "id": "sm-graph-tab-elem-4",
+          "precondition": "A config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Graph Editor Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Graph Editor Tab Content",
+          "enabled": true,
+          "id": "sm-graph-tab-elem-5",
+          "precondition": "A config is selected, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Graph Editor Tab Content",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Graph Editor tab renders an interactive node-edge graph using @xyflow/react with dagre layout. States are nodes and transitions are edges. A floating 'Add Transition' button is positioned at top-left. Clicking a node opens the state detail side panel; clicking an edge opens the transition editor side panel. Supports drag-and-drop element reassignment between states and transition deletion. An empty graph shows an instructional message.",
+      "id": "sm-graph-tab",
+      "name": "Graph Editor Tab Content",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Graph Visualization Controls",
+          "enabled": true,
+          "id": "sm-graph-controls-elem-0",
+          "precondition": "A config is selected with states, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Fit"
+            },
+            "label": "Required element for Graph Visualization Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Graph Visualization Controls",
+          "enabled": true,
+          "id": "sm-graph-controls-elem-1",
+          "precondition": "A config is selected with states, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Re-layout"
+            },
+            "label": "Required element for Graph Visualization Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Graph Visualization Controls",
+          "enabled": true,
+          "id": "sm-graph-controls-elem-2",
+          "precondition": "A config is selected with states, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Keyboard Shortcuts"
+            },
+            "label": "Required element for Graph Visualization Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Graph Visualization Controls",
+          "enabled": true,
+          "id": "sm-graph-controls-elem-3",
+          "precondition": "A config is selected with states, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Graph Visualization Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Graph Visualization Controls",
+          "enabled": true,
+          "id": "sm-graph-controls-elem-4",
+          "precondition": "A config is selected with states, Graph Editor tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Graph Visualization Controls",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The graph canvas has control buttons in the top-right (Fit, keyboard shortcut toggle, Re-layout), a MiniMap in the bottom-right, and keyboard shortcuts. Nodes display element thumbnails, badges (START, outgoing/incoming counts), and confidence indicators. Extra shortcut entries show 'Create transition: Drag element' and 'Move element: Alt+Drag'.",
+      "id": "sm-graph-controls",
+      "name": "Graph Visualization Controls",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state State View Tab Content",
+          "enabled": true,
+          "id": "sm-states-tab-elem-0",
+          "precondition": "A config is selected, State View tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "States"
+            },
+            "label": "Required element for State View Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state State View Tab Content",
+          "enabled": true,
+          "id": "sm-states-tab-elem-1",
+          "precondition": "A config is selected, State View tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for State View Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state State View Tab Content",
+          "enabled": true,
+          "id": "sm-states-tab-elem-2",
+          "precondition": "A config is selected, State View tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for State View Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state State View Tab Content",
+          "enabled": true,
+          "id": "sm-states-tab-elem-3",
+          "precondition": "A config is selected, State View tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State View Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state State View Tab Content",
+          "enabled": true,
+          "id": "sm-states-tab-elem-4",
+          "precondition": "A config is selected, State View tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State View Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state State View Tab Content",
+          "enabled": true,
+          "id": "sm-states-tab-elem-5",
+          "precondition": "A config is selected, State View tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No capture screenshots available"
+            },
+            "label": "Required element for State View Tab Content",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The State View tab shows all states using the shared StateViewPanel component. It supports three view modes: List (collapsible text list), Spatial (force-directed canvas), and Screenshot (three-panel viewer with bounding box overlays). State selection syncs with the graph tab's selectedStateId. No 'Add State' button — states come from Discovery.",
+      "id": "sm-states-tab",
+      "name": "State View Tab Content",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Transitions Tab Content",
+          "enabled": true,
+          "id": "sm-transitions-tab-elem-0",
+          "precondition": "A config is selected, Transitions tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Transitions"
+            },
+            "label": "Required element for Transitions Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Transitions Tab Content",
+          "enabled": true,
+          "id": "sm-transitions-tab-elem-1",
+          "precondition": "A config is selected, Transitions tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Transitions Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Transitions Tab Content",
+          "enabled": true,
+          "id": "sm-transitions-tab-elem-2",
+          "precondition": "A config is selected, Transitions tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "All from states"
+            },
+            "label": "Required element for Transitions Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Transitions Tab Content",
+          "enabled": true,
+          "id": "sm-transitions-tab-elem-3",
+          "precondition": "A config is selected, Transitions tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Action Playback"
+            },
+            "label": "Required element for Transitions Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Transitions Tab Content",
+          "enabled": true,
+          "id": "sm-transitions-tab-elem-4",
+          "precondition": "A config is selected, Transitions tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Transitions Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Transitions Tab Content",
+          "enabled": true,
+          "id": "sm-transitions-tab-elem-5",
+          "precondition": "A config is selected, Transitions tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a transition to view its details"
+            },
+            "label": "Required element for Transitions Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Transitions Tab Content",
+          "enabled": true,
+          "id": "sm-transitions-tab-elem-6",
+          "precondition": "A config is selected, Transitions tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No transitions match filters."
+            },
+            "label": "Required element for Transitions Tab Content",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Transitions tab shows all transitions using the shared TransitionsPanel component with a left sidebar (searchable transition list with state filters) and a right detail panel with action playback controls.",
+      "id": "sm-transitions-tab",
+      "name": "Transitions Tab Content",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Pathfinding Tab Content",
+          "enabled": true,
+          "id": "sm-pathfinding-tab-elem-0",
+          "precondition": "A config is selected, Pathfinding tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Pathfinding"
+            },
+            "label": "Required element for Pathfinding Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Pathfinding Tab Content",
+          "enabled": true,
+          "id": "sm-pathfinding-tab-elem-1",
+          "precondition": "A config is selected, Pathfinding tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "From"
+            },
+            "label": "Required element for Pathfinding Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Pathfinding Tab Content",
+          "enabled": true,
+          "id": "sm-pathfinding-tab-elem-2",
+          "precondition": "A config is selected, Pathfinding tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "To"
+            },
+            "label": "Required element for Pathfinding Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Pathfinding Tab Content",
+          "enabled": true,
+          "id": "sm-pathfinding-tab-elem-3",
+          "precondition": "A config is selected, Pathfinding tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Find Path"
+            },
+            "label": "Required element for Pathfinding Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Pathfinding Tab Content",
+          "enabled": true,
+          "id": "sm-pathfinding-tab-elem-4",
+          "precondition": "A config is selected, Pathfinding tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Dijkstra"
+            },
+            "label": "Required element for Pathfinding Tab Content",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Pathfinding Tab Content",
+          "enabled": true,
+          "id": "sm-pathfinding-tab-elem-5",
+          "precondition": "A config is selected, Pathfinding tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Pathfinding Tab Content",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Pathfinding tab provides graph pathfinding between states using the shared PathfindingPanel component. Users select a 'From' and 'To' state from dropdowns, choose an algorithm (Dijkstra or BFS), and click 'Find Path'. Results show the path steps with transition names and costs. Found paths are highlighted on the graph.",
+      "id": "sm-pathfinding-tab",
+      "name": "Pathfinding Tab Content",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Side Panel: State Detail",
+          "enabled": true,
+          "id": "sm-sidebar-state-detail-elem-0",
+          "precondition": "A state is selected in Graph Editor, side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "State Details"
+            },
+            "label": "Required element for Side Panel: State Detail",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Side Panel: State Detail",
+          "enabled": true,
+          "id": "sm-sidebar-state-detail-elem-1",
+          "precondition": "A state is selected in Graph Editor, side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Name"
+            },
+            "label": "Required element for Side Panel: State Detail",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Side Panel: State Detail",
+          "enabled": true,
+          "id": "sm-sidebar-state-detail-elem-2",
+          "precondition": "A state is selected in Graph Editor, side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "State ID"
+            },
+            "label": "Required element for Side Panel: State Detail",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Side Panel: State Detail",
+          "enabled": true,
+          "id": "sm-sidebar-state-detail-elem-3",
+          "precondition": "A state is selected in Graph Editor, side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Elements"
+            },
+            "label": "Required element for Side Panel: State Detail",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Side Panel: State Detail",
+          "enabled": true,
+          "id": "sm-sidebar-state-detail-elem-4",
+          "precondition": "A state is selected in Graph Editor, side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Acceptance Criteria"
+            },
+            "label": "Required element for Side Panel: State Detail",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Side Panel: State Detail",
+          "enabled": true,
+          "id": "sm-sidebar-state-detail-elem-5",
+          "precondition": "A state is selected in Graph Editor, side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Domain Knowledge"
+            },
+            "label": "Required element for Side Panel: State Detail",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Side Panel: State Detail",
+          "enabled": true,
+          "id": "sm-sidebar-state-detail-elem-6",
+          "precondition": "A state is selected in Graph Editor, side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Save Changes"
+            },
+            "label": "Required element for Side Panel: State Detail",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When a state is selected in the Graph Editor, a w-80 side panel opens on the right showing the shared StateDetailPanel component. It provides a 'State Details' header with Close button, editable name, description, metadata grid, element list with type-colored badges, acceptance criteria list, domain knowledge cards, and save/delete actions.",
+      "id": "sm-sidebar-state-detail",
+      "name": "Side Panel: State Detail",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Side Panel: Transition Editor",
+          "enabled": true,
+          "id": "sm-sidebar-transition-detail-elem-0",
+          "precondition": "User clicked 'Add Transition', side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "New Transition"
+            },
+            "label": "Required element for Side Panel: Transition Editor",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Side Panel: Transition Editor",
+          "enabled": true,
+          "id": "sm-sidebar-transition-detail-elem-1",
+          "precondition": "User clicked 'Add Transition', side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Edit Transition"
+            },
+            "label": "Required element for Side Panel: Transition Editor",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Side Panel: Transition Editor",
+          "enabled": true,
+          "id": "sm-sidebar-transition-detail-elem-2",
+          "precondition": "User clicked 'Add Transition', side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Side Panel: Transition Editor",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Side Panel: Transition Editor",
+          "enabled": true,
+          "id": "sm-sidebar-transition-detail-elem-3",
+          "precondition": "User clicked 'Add Transition', side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "From States"
+            },
+            "label": "Required element for Side Panel: Transition Editor",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Side Panel: Transition Editor",
+          "enabled": true,
+          "id": "sm-sidebar-transition-detail-elem-4",
+          "precondition": "User clicked 'Add Transition', side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Actions"
+            },
+            "label": "Required element for Side Panel: Transition Editor",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Side Panel: Transition Editor",
+          "enabled": true,
+          "id": "sm-sidebar-transition-detail-elem-5",
+          "precondition": "User clicked 'Add Transition', side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Path Cost"
+            },
+            "label": "Required element for Side Panel: Transition Editor",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Side Panel: Transition Editor",
+          "enabled": true,
+          "id": "sm-sidebar-transition-detail-elem-6",
+          "precondition": "User clicked 'Add Transition', side panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Side Panel: Transition Editor",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When a transition is selected or 'Add Transition' is clicked in the Graph Editor, a w-80 side panel opens on the right showing the shared TransitionEditor component. In create mode it shows 'New Transition' header; in edit mode it shows 'Edit Transition' header. The editor provides a Close button, name input, state toggle groups (From, Activate, Exit), action list with type-specific fields, path cost, and stays-visible checkbox.",
+      "id": "sm-sidebar-transition-detail",
+      "name": "Side Panel: Transition Editor",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Exploration Results: Summary Dashboard",
+          "enabled": true,
+          "id": "sm-exploration-dashboard-elem-0",
+          "precondition": "Exploration Results tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Exploration Results"
+            },
+            "label": "Required element for Exploration Results: Summary Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Exploration Results: Summary Dashboard",
+          "enabled": true,
+          "id": "sm-exploration-dashboard-elem-1",
+          "precondition": "Exploration Results tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Dashboard"
+            },
+            "label": "Required element for Exploration Results: Summary Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Exploration Results: Summary Dashboard",
+          "enabled": true,
+          "id": "sm-exploration-dashboard-elem-2",
+          "precondition": "Exploration Results tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "History"
+            },
+            "label": "Required element for Exploration Results: Summary Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Exploration Results: Summary Dashboard",
+          "enabled": true,
+          "id": "sm-exploration-dashboard-elem-3",
+          "precondition": "Exploration Results tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Overall Pass Rate"
+            },
+            "label": "Required element for Exploration Results: Summary Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Exploration Results: Summary Dashboard",
+          "enabled": true,
+          "id": "sm-exploration-dashboard-elem-4",
+          "precondition": "Exploration Results tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "State Coverage"
+            },
+            "label": "Required element for Exploration Results: Summary Dashboard",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Exploration Results: Summary Dashboard",
+          "enabled": true,
+          "id": "sm-exploration-dashboard-elem-5",
+          "precondition": "Exploration Results tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Transition Coverage"
+            },
+            "label": "Required element for Exploration Results: Summary Dashboard",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Exploration Results tab shows a summary dashboard with pass rate, state coverage, transition coverage, discrepancy counts by severity, and recent exploration runs. View mode toggles allow switching between Dashboard and History views. An AI Analysis button is shown (disabled until a run is selected). The tab uses off-screen positioning instead of display:none so that UI Bridge SDK can still scan severity elements when the tab is inactive.",
+      "id": "sm-exploration-dashboard",
+      "name": "Exploration Results: Summary Dashboard",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Exploration Results: Discrepancy Severity Groups",
+          "enabled": true,
+          "id": "sm-exploration-discrepancies-elem-0",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Discrepancy Counts"
+            },
+            "label": "Required element for Exploration Results: Discrepancy Severity Groups",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Exploration Results: Discrepancy Severity Groups",
+          "enabled": true,
+          "id": "sm-exploration-discrepancies-elem-1",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Exploration Results: Discrepancy Severity Groups",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Exploration Results: Discrepancy Severity Groups",
+          "enabled": true,
+          "id": "sm-exploration-discrepancies-elem-2",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Exploration Results: Discrepancy Severity Groups",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Exploration Results: Discrepancy Severity Groups",
+          "enabled": true,
+          "id": "sm-exploration-discrepancies-elem-3",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Exploration Results: Discrepancy Severity Groups",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Exploration Results: Discrepancy Severity Groups",
+          "enabled": true,
+          "id": "sm-exploration-discrepancies-elem-4",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Required element for Exploration Results: Discrepancy Severity Groups",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The dashboard displays discrepancy counts grouped by severity in a 3-column grid: Critical (red, XCircle icon), Warning (amber, AlertTriangle icon), and Info (blue, Info icon). Each severity group has a data-testid attribute for automated testing. A role='list' with aria-label='discrepancy severity groups critical warning info' wraps the groups.",
+      "id": "sm-exploration-discrepancies",
+      "name": "Exploration Results: Discrepancy Severity Groups",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Exploration Results: History and Run List",
+          "enabled": true,
+          "id": "sm-exploration-history-elem-0",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Recent Exploration Runs"
+            },
+            "label": "Required element for Exploration Results: History and Run List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Exploration Results: History and Run List",
+          "enabled": true,
+          "id": "sm-exploration-history-elem-1",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Refresh"
+            },
+            "label": "Required element for Exploration Results: History and Run List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Exploration Results: History and Run List",
+          "enabled": true,
+          "id": "sm-exploration-history-elem-2",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No exploration history"
+            },
+            "label": "Required element for Exploration Results: History and Run List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Exploration Results: History and Run List",
+          "enabled": true,
+          "id": "sm-exploration-history-elem-3",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Exploration Results: History and Run List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Exploration Results: History and Run List",
+          "enabled": true,
+          "id": "sm-exploration-history-elem-4",
+          "precondition": "Exploration Results tab is active, Dashboard view",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Exploration History"
+            },
+            "label": "Required element for Exploration Results: History and Run List",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The dashboard shows recent exploration runs (up to 5) and the History view shows all runs. Each run row displays a status badge (Passed/Failed/Unknown), config name, strategy badge (color-coded), timestamp, summary text, and run ID. Clicking a run navigates to the detail view.",
+      "id": "sm-exploration-history",
+      "name": "Exploration Results: History and Run List",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Exploration Results: Detail View",
+          "enabled": true,
+          "id": "sm-exploration-detail-elem-0",
+          "precondition": "Exploration Results tab is active, detail view of a run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Exploration Results: Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Exploration Results: Detail View",
+          "enabled": true,
+          "id": "sm-exploration-detail-elem-1",
+          "precondition": "Exploration Results tab is active, detail view of a run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Pass Rate"
+            },
+            "label": "Required element for Exploration Results: Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Exploration Results: Detail View",
+          "enabled": true,
+          "id": "sm-exploration-detail-elem-2",
+          "precondition": "Exploration Results tab is active, detail view of a run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Discrepancies by Severity"
+            },
+            "label": "Required element for Exploration Results: Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Exploration Results: Detail View",
+          "enabled": true,
+          "id": "sm-exploration-detail-elem-3",
+          "precondition": "Exploration Results tab is active, detail view of a run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "State Details"
+            },
+            "label": "Required element for Exploration Results: Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Exploration Results: Detail View",
+          "enabled": true,
+          "id": "sm-exploration-detail-elem-4",
+          "precondition": "Exploration Results tab is active, detail view of a run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "AI Analysis"
+            },
+            "label": "Required element for Exploration Results: Detail View",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When a run is selected, the detail view shows the report header (config name, strategy badge, timestamp), summary stats grid (Pass Rate, States, Transitions, Discrepancies), discrepancies by severity, expandable state detail cards with confidence scores and element verification, and an AI Analysis prompt button.",
+      "id": "sm-exploration-detail",
+      "name": "Exploration Results: Detail View",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Export Tab",
+          "enabled": true,
+          "id": "sm-export-tab-elem-0",
+          "precondition": "A config is selected, Export tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Export"
+            },
+            "label": "Required element for Export Tab",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Export Tab",
+          "enabled": true,
+          "id": "sm-export-tab-elem-1",
+          "precondition": "A config is selected, Export tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "UIBridgeRuntime.from_dict()"
+            },
+            "label": "Required element for Export Tab",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Export Tab",
+          "enabled": true,
+          "id": "sm-export-tab-elem-2",
+          "precondition": "A config is selected, Export tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Save to File"
+            },
+            "label": "Required element for Export Tab",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Export Tab",
+          "enabled": true,
+          "id": "sm-export-tab-elem-3",
+          "precondition": "A config is selected, Export tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Load into Runtime"
+            },
+            "label": "Required element for Export Tab",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Export Tab",
+          "enabled": true,
+          "id": "sm-export-tab-elem-4",
+          "precondition": "A config is selected, Export tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Export Tab",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Export Tab",
+          "enabled": true,
+          "id": "sm-export-tab-elem-5",
+          "precondition": "A config is selected, Export tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Export Tab",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Export tab provides a centered panel with a FileJson icon heading, description text about JSON export compatible with UIBridgeRuntime.from_dict(), config summary (name, state count, transition count), and two action buttons: 'Save to File' (Tauri save dialog) and 'Load into Runtime' (POST to /state-machine/load). Both show spinners during operation.",
+      "id": "sm-export-tab",
+      "name": "Export Tab",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Discovery Algorithm: Fingerprint-Based State Grouping",
+          "enabled": true,
+          "id": "sm-discovery-algorithm-elem-0",
+          "precondition": "Discovery has completed with results",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Discovery Algorithm: Fingerprint-Based State Grouping",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Discovery Algorithm: Fingerprint-Based State Grouping",
+          "enabled": true,
+          "id": "sm-discovery-algorithm-elem-1",
+          "precondition": "Discovery has completed with results",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Discovery Algorithm: Fingerprint-Based State Grouping",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Discovery Algorithm: Fingerprint-Based State Grouping",
+          "enabled": true,
+          "id": "sm-discovery-algorithm-elem-2",
+          "precondition": "Discovery has completed with results",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "captures"
+            },
+            "label": "Required element for Discovery Algorithm: Fingerprint-Based State Grouping",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The state discovery algorithm uses fingerprint-based co-occurrence analysis to group UI elements into states. Co-occurrence data is collected via exploration (automated interaction) or recording (manual capture). Each capture produces a fingerprint of visible interactive elements. States are discovered by clustering fingerprints with similar element sets. The algorithm correctness can be verified by examining the discovered states' element lists and confidence scores.",
+      "id": "sm-discovery-algorithm",
+      "name": "Discovery Algorithm: Fingerprint-Based State Grouping",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state State Model Rules (qontinui/multistate)",
+          "enabled": true,
+          "id": "sm-state-model-rules-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State Model Rules (qontinui/multistate)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state State Model Rules (qontinui/multistate)",
+          "enabled": true,
+          "id": "sm-state-model-rules-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State Model Rules (qontinui/multistate)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state State Model Rules (qontinui/multistate)",
+          "enabled": true,
+          "id": "sm-state-model-rules-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State Model Rules (qontinui/multistate)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state State Model Rules (qontinui/multistate)",
+          "enabled": true,
+          "id": "sm-state-model-rules-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State Model Rules (qontinui/multistate)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state State Model Rules (qontinui/multistate)",
+          "enabled": true,
+          "id": "sm-state-model-rules-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State Model Rules (qontinui/multistate)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state State Model Rules (qontinui/multistate)",
+          "enabled": true,
+          "id": "sm-state-model-rules-elem-5",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State Model Rules (qontinui/multistate)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state State Model Rules (qontinui/multistate)",
+          "enabled": true,
+          "id": "sm-state-model-rules-elem-6",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State Model Rules (qontinui/multistate)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state State Model Rules (qontinui/multistate)",
+          "enabled": true,
+          "id": "sm-state-model-rules-elem-7",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State Model Rules (qontinui/multistate)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 8 for state State Model Rules (qontinui/multistate)",
+          "enabled": true,
+          "id": "sm-state-model-rules-elem-8",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for State Model Rules (qontinui/multistate)",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The state machine follows the multistate model (qontinui/multistate), which extends model-based GUI automation theory. These rules define how states, elements, and screenshots relate to each other. The multistate formal model is Ω = (S, T, G, ω, Td) where S is the set of states, T the transitions, G state groups, ω the occlusion function, and Td dynamic transition generation. All state machine features — discovery, graph editing, state view, screenshots, and export — must conform to these rules. Source: https://qontinui.github.io/multistate/",
+      "id": "sm-state-model-rules",
+      "name": "State Model Rules (qontinui/multistate)",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-0",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Drift fit score"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-1",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Re-derive all"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-2",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Invalidate spec observations"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-3",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Invalidation log"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-4",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "No invalidations"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-5",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Invalidation log"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-6",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "observed"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-7",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "ai-generated"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 8 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-8",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "ai-fallback"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 9 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-9",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Re-derive all"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 10 for state Observation Pipeline Surface",
+          "enabled": true,
+          "id": "sm-observation-pipeline-elem-10",
+          "precondition": "No invalidations have been emitted for this spec within the current window",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "State View"
+            },
+            "label": "Required element for Observation Pipeline Surface",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Co-occurrence observations drive state element lists via a derive → promote → invalidate → undo loop. The page surface exposes this via ObservationsPanel (mounted below the page header) and ProvenanceBadge (rendered next to each state name in the detail panel). ObservationsPanel shows the most recent drift fit_score (from GET /state-discovery/drift-scores), offers a 'Re-derive all' bulk action (POST /state-discovery/derive?window_days=90), an 'Invalidate spec observations' button (POST /co-occurrence/invalidate — disabled with tooltip when the StateMachineConfig has no spec_id), and an invalidation log table fed by GET /co-occurrence/invalidations. Each invalidation is grouped by undo_token; rows within the 24 h window show an Undo button (POST /co-occurrence/invalidate/undo). ProvenanceBadge renders three variants — green 'observed' (with support/contrast tooltip + observation count + age), gray 'ai-generated', yellow 'ai-fallback' (with invalidation age). Missing provenance on older compiled SMs silently falls back to 'ai-generated'.",
+      "id": "sm-observation-pipeline",
+      "name": "Observation Pipeline Surface",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "state-machine",
+    "tags": [
+      "runner",
+      "state-machine",
+      "builder",
+      "graph",
+      "config",
+      "ui-bridge",
+      "discovery"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The page header shows a Network icon, the active config name (or 'UI Bridge States' when none is selected), and a config selector dropdown with a Refresh button. Users pick an existing config to load it. There is no 'New' or 'Delete' button — configs are created through the Discovery flow.",
+        "elements": [
+          {
+            "textContent": "UI Bridge States"
+          },
+          {
+            "textContent": "Select configuration..."
+          },
+          {
+            "textContent": "Refresh"
+          },
+          {
+            "tagName": "h1"
+          }
+        ],
+        "id": "sm-page-header",
+        "isInitial": false,
+        "name": "Page Header and Config Selector",
+        "transitions": []
+      },
+      {
+        "description": "Seven tabs appear below the header and are always visible (regardless of config selection): Discovery, Graph Editor, State View, Transitions, Pathfinding, Exploration Results, and Export. The active tab is highlighted with a background shadow. Each tab has an icon and label.",
+        "elements": [
+          {
+            "textContent": "Discovery"
+          },
+          {
+            "textContent": "Graph Editor"
+          },
+          {
+            "textContent": "State View"
+          },
+          {
+            "textContent": "Transitions"
+          },
+          {
+            "textContent": "Pathfinding"
+          },
+          {
+            "textContent": "Exploration Results"
+          },
+          {
+            "textContent": "Export"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "sm-tab-bar",
+        "isInitial": false,
+        "name": "Tab Navigation Bar",
+        "transitions": []
+      },
+      {
+        "description": "When no config is selected, most tabs show centered placeholder text guiding the user. Discovery and Exploration Results tabs are always available regardless of config selection.",
+        "elements": [
+          {
+            "textContent": "Select a configuration to view the state graph"
+          },
+          {
+            "textContent": "Select a configuration to view states"
+          },
+          {
+            "textContent": "Select a configuration to view transitions"
+          },
+          {
+            "textContent": "Select a configuration to use pathfinding"
+          },
+          {
+            "textContent": "Select a configuration to export"
+          }
+        ],
+        "id": "sm-empty-states",
+        "isInitial": false,
+        "name": "Empty States (No Config Selected)",
+        "transitions": []
+      },
+      {
+        "description": "Phase 1 of the Discovery flow. Users scan for SDK-integrated apps (web and desktop), see discovered apps in a list, and connect to one. Once connected, a green 'Connected: [AppName]' banner appears and the app list hides. Auto-scans on mount.",
+        "elements": [
+          {
+            "textContent": "Scan for Apps"
+          },
+          {
+            "textContent": "Connect to SDK App"
+          },
+          {
+            "textContent": "Connect"
+          },
+          {
+            "textContent": "Connected:"
+          },
+          {
+            "textContent": "Click Scan to find apps with the UI Bridge SDK installed."
+          }
+        ],
+        "id": "sm-discovery-connect",
+        "isInitial": false,
+        "name": "Discovery Tab: Connect to SDK App",
+        "transitions": []
+      },
+      {
+        "description": "Phase 2 of Discovery. After connecting to an app, two sub-tabs appear: 'Explore' (automated exploration) and 'Record' (manual capture session). Explore automatically interacts with UI elements; Record lets users manually navigate while capturing states. Both produce co-occurrence data for state discovery.",
+        "elements": [
+          {
+            "textContent": "Explore"
+          },
+          {
+            "textContent": "Record"
+          },
+          {
+            "textContent": "Start Exploration"
+          },
+          {
+            "textContent": "Start Recording"
+          },
+          {
+            "textContent": "Stop Recording"
+          },
+          {
+            "textContent": "Progress:"
+          }
+        ],
+        "id": "sm-discovery-collect",
+        "isInitial": false,
+        "name": "Discovery Tab: Data Collection (Explore/Record)",
+        "transitions": []
+      },
+      {
+        "description": "Phase 3-4 of Discovery. After co-occurrence data is collected, the connection card hides and a data summary card appears. Users click 'Discover States' to run fingerprint-based state discovery. Results show discovered states with confidence scores. After auto-save or manual save with a config name, the user is redirected to the Graph Editor tab.",
+        "elements": [
+          {
+            "textContent": "Co-occurrence Data Collected"
+          },
+          {
+            "textContent": "Start Over"
+          },
+          {
+            "textContent": "Discover States"
+          },
+          {
+            "textContent": "Discovery Complete"
+          },
+          {
+            "textContent": "Save Configuration"
+          },
+          {
+            "role": "generic"
+          }
+        ],
+        "id": "sm-discovery-discover",
+        "isInitial": false,
+        "name": "Discovery Tab: State Discovery and Save",
+        "transitions": []
+      },
+      {
+        "description": "The Graph Editor tab renders an interactive node-edge graph using @xyflow/react with dagre layout. States are nodes and transitions are edges. A floating 'Add Transition' button is positioned at top-left. Clicking a node opens the state detail side panel; clicking an edge opens the transition editor side panel. Supports drag-and-drop element reassignment between states and transition deletion. An empty graph shows an instructional message.",
+        "elements": [
+          {
+            "textContent": "Add Transition"
+          },
+          {
+            "textContent": "No states discovered yet"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          }
+        ],
+        "id": "sm-graph-tab",
+        "isInitial": false,
+        "name": "Graph Editor Tab Content",
+        "transitions": []
+      },
+      {
+        "description": "The graph canvas has control buttons in the top-right (Fit, keyboard shortcut toggle, Re-layout), a MiniMap in the bottom-right, and keyboard shortcuts. Nodes display element thumbnails, badges (START, outgoing/incoming counts), and confidence indicators. Extra shortcut entries show 'Create transition: Drag element' and 'Move element: Alt+Drag'.",
+        "elements": [
+          {
+            "textContent": "Fit"
+          },
+          {
+            "textContent": "Re-layout"
+          },
+          {
+            "textContent": "Keyboard Shortcuts"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          }
+        ],
+        "id": "sm-graph-controls",
+        "isInitial": false,
+        "name": "Graph Visualization Controls",
+        "transitions": []
+      },
+      {
+        "description": "The State View tab shows all states using the shared StateViewPanel component. It supports three view modes: List (collapsible text list), Spatial (force-directed canvas), and Screenshot (three-panel viewer with bounding box overlays). State selection syncs with the graph tab's selectedStateId. No 'Add State' button — states come from Discovery.",
+        "elements": [
+          {
+            "textContent": "States"
+          },
+          {
+            "role": "textbox"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "textContent": "No capture screenshots available"
+          }
+        ],
+        "id": "sm-states-tab",
+        "isInitial": false,
+        "name": "State View Tab Content",
+        "transitions": []
+      },
+      {
+        "description": "The Transitions tab shows all transitions using the shared TransitionsPanel component with a left sidebar (searchable transition list with state filters) and a right detail panel with action playback controls.",
+        "elements": [
+          {
+            "textContent": "Transitions"
+          },
+          {
+            "role": "textbox"
+          },
+          {
+            "textContent": "All from states"
+          },
+          {
+            "textContent": "Action Playback"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "textContent": "Select a transition to view its details"
+          },
+          {
+            "textContent": "No transitions match filters."
+          }
+        ],
+        "id": "sm-transitions-tab",
+        "isInitial": false,
+        "name": "Transitions Tab Content",
+        "transitions": []
+      },
+      {
+        "description": "The Pathfinding tab provides graph pathfinding between states using the shared PathfindingPanel component. Users select a 'From' and 'To' state from dropdowns, choose an algorithm (Dijkstra or BFS), and click 'Find Path'. Results show the path steps with transition names and costs. Found paths are highlighted on the graph.",
+        "elements": [
+          {
+            "textContent": "Pathfinding"
+          },
+          {
+            "textContent": "From"
+          },
+          {
+            "textContent": "To"
+          },
+          {
+            "textContent": "Find Path"
+          },
+          {
+            "textContent": "Dijkstra"
+          },
+          {
+            "role": "generic"
+          }
+        ],
+        "id": "sm-pathfinding-tab",
+        "isInitial": false,
+        "name": "Pathfinding Tab Content",
+        "transitions": []
+      },
+      {
+        "description": "When a state is selected in the Graph Editor, a w-80 side panel opens on the right showing the shared StateDetailPanel component. It provides a 'State Details' header with Close button, editable name, description, metadata grid, element list with type-colored badges, acceptance criteria list, domain knowledge cards, and save/delete actions.",
+        "elements": [
+          {
+            "textContent": "State Details"
+          },
+          {
+            "textContent": "Name"
+          },
+          {
+            "textContent": "State ID"
+          },
+          {
+            "textContent": "Elements"
+          },
+          {
+            "textContent": "Acceptance Criteria"
+          },
+          {
+            "textContent": "Domain Knowledge"
+          },
+          {
+            "textContent": "Save Changes"
+          }
+        ],
+        "id": "sm-sidebar-state-detail",
+        "isInitial": false,
+        "name": "Side Panel: State Detail",
+        "transitions": []
+      },
+      {
+        "description": "When a transition is selected or 'Add Transition' is clicked in the Graph Editor, a w-80 side panel opens on the right showing the shared TransitionEditor component. In create mode it shows 'New Transition' header; in edit mode it shows 'Edit Transition' header. The editor provides a Close button, name input, state toggle groups (From, Activate, Exit), action list with type-specific fields, path cost, and stays-visible checkbox.",
+        "elements": [
+          {
+            "textContent": "New Transition"
+          },
+          {
+            "textContent": "Edit Transition"
+          },
+          {
+            "role": "textbox"
+          },
+          {
+            "textContent": "From States"
+          },
+          {
+            "textContent": "Actions"
+          },
+          {
+            "textContent": "Path Cost"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "sm-sidebar-transition-detail",
+        "isInitial": false,
+        "name": "Side Panel: Transition Editor",
+        "transitions": []
+      },
+      {
+        "description": "The Exploration Results tab shows a summary dashboard with pass rate, state coverage, transition coverage, discrepancy counts by severity, and recent exploration runs. View mode toggles allow switching between Dashboard and History views. An AI Analysis button is shown (disabled until a run is selected). The tab uses off-screen positioning instead of display:none so that UI Bridge SDK can still scan severity elements when the tab is inactive.",
+        "elements": [
+          {
+            "textContent": "Exploration Results"
+          },
+          {
+            "textContent": "Dashboard"
+          },
+          {
+            "textContent": "History"
+          },
+          {
+            "textContent": "Overall Pass Rate"
+          },
+          {
+            "textContent": "State Coverage"
+          },
+          {
+            "textContent": "Transition Coverage"
+          }
+        ],
+        "id": "sm-exploration-dashboard",
+        "isInitial": false,
+        "name": "Exploration Results: Summary Dashboard",
+        "transitions": []
+      },
+      {
+        "description": "The dashboard displays discrepancy counts grouped by severity in a 3-column grid: Critical (red, XCircle icon), Warning (amber, AlertTriangle icon), and Info (blue, Info icon). Each severity group has a data-testid attribute for automated testing. A role='list' with aria-label='discrepancy severity groups critical warning info' wraps the groups.",
+        "elements": [
+          {
+            "textContent": "Discrepancy Counts"
+          },
+          {},
+          {},
+          {},
+          {
+            "role": "list"
+          }
+        ],
+        "id": "sm-exploration-discrepancies",
+        "isInitial": false,
+        "name": "Exploration Results: Discrepancy Severity Groups",
+        "transitions": []
+      },
+      {
+        "description": "The dashboard shows recent exploration runs (up to 5) and the History view shows all runs. Each run row displays a status badge (Passed/Failed/Unknown), config name, strategy badge (color-coded), timestamp, summary text, and run ID. Clicking a run navigates to the detail view.",
+        "elements": [
+          {
+            "textContent": "Recent Exploration Runs"
+          },
+          {
+            "textContent": "Refresh"
+          },
+          {
+            "textContent": "No exploration history"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "textContent": "Exploration History"
+          }
+        ],
+        "id": "sm-exploration-history",
+        "isInitial": false,
+        "name": "Exploration Results: History and Run List",
+        "transitions": []
+      },
+      {
+        "description": "When a run is selected, the detail view shows the report header (config name, strategy badge, timestamp), summary stats grid (Pass Rate, States, Transitions, Discrepancies), discrepancies by severity, expandable state detail cards with confidence scores and element verification, and an AI Analysis prompt button.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "textContent": "Pass Rate"
+          },
+          {
+            "textContent": "Discrepancies by Severity"
+          },
+          {
+            "textContent": "State Details"
+          },
+          {
+            "textContent": "AI Analysis"
+          }
+        ],
+        "id": "sm-exploration-detail",
+        "isInitial": false,
+        "name": "Exploration Results: Detail View",
+        "transitions": []
+      },
+      {
+        "description": "The Export tab provides a centered panel with a FileJson icon heading, description text about JSON export compatible with UIBridgeRuntime.from_dict(), config summary (name, state count, transition count), and two action buttons: 'Save to File' (Tauri save dialog) and 'Load into Runtime' (POST to /state-machine/load). Both show spinners during operation.",
+        "elements": [
+          {
+            "textContent": "Export"
+          },
+          {
+            "textContent": "UIBridgeRuntime.from_dict()"
+          },
+          {
+            "textContent": "Save to File"
+          },
+          {
+            "textContent": "Load into Runtime"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "sm-export-tab",
+        "isInitial": false,
+        "name": "Export Tab",
+        "transitions": []
+      },
+      {
+        "description": "The state discovery algorithm uses fingerprint-based co-occurrence analysis to group UI elements into states. Co-occurrence data is collected via exploration (automated interaction) or recording (manual capture). Each capture produces a fingerprint of visible interactive elements. States are discovered by clustering fingerprints with similar element sets. The algorithm correctness can be verified by examining the discovered states' element lists and confidence scores.",
+        "elements": [
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "textContent": "captures"
+          }
+        ],
+        "id": "sm-discovery-algorithm",
+        "isInitial": false,
+        "name": "Discovery Algorithm: Fingerprint-Based State Grouping",
+        "transitions": []
+      },
+      {
+        "description": "The state machine follows the multistate model (qontinui/multistate), which extends model-based GUI automation theory. These rules define how states, elements, and screenshots relate to each other. The multistate formal model is Ω = (S, T, G, ω, Td) where S is the set of states, T the transitions, G state groups, ω the occlusion function, and Td dynamic transition generation. All state machine features — discovery, graph editing, state view, screenshots, and export — must conform to these rules. Source: https://qontinui.github.io/multistate/",
+        "elements": [
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          },
+          {
+            "role": "generic"
+          }
+        ],
+        "id": "sm-state-model-rules",
+        "isInitial": false,
+        "name": "State Model Rules (qontinui/multistate)",
+        "transitions": []
+      },
+      {
+        "description": "Co-occurrence observations drive state element lists via a derive → promote → invalidate → undo loop. The page surface exposes this via ObservationsPanel (mounted below the page header) and ProvenanceBadge (rendered next to each state name in the detail panel). ObservationsPanel shows the most recent drift fit_score (from GET /state-discovery/drift-scores), offers a 'Re-derive all' bulk action (POST /state-discovery/derive?window_days=90), an 'Invalidate spec observations' button (POST /co-occurrence/invalidate — disabled with tooltip when the StateMachineConfig has no spec_id), and an invalidation log table fed by GET /co-occurrence/invalidations. Each invalidation is grouped by undo_token; rows within the 24 h window show an Undo button (POST /co-occurrence/invalidate/undo). ProvenanceBadge renders three variants — green 'observed' (with support/contrast tooltip + observation count + age), gray 'ai-generated', yellow 'ai-fallback' (with invalidation age). Missing provenance on older compiled SMs silently falls back to 'ai-generated'.",
+        "elements": [
+          {
+            "textContains": "Drift fit score"
+          },
+          {
+            "role": "button",
+            "textContent": "Re-derive all"
+          },
+          {
+            "role": "button",
+            "textContent": "Invalidate spec observations"
+          },
+          {
+            "textContains": "Invalidation log"
+          },
+          {
+            "textContains": "No invalidations"
+          },
+          {
+            "textContent": "Invalidation log"
+          },
+          {
+            "textContent": "observed"
+          },
+          {
+            "textContent": "ai-generated"
+          },
+          {
+            "textContent": "ai-fallback"
+          },
+          {
+            "textContent": "Re-derive all"
+          },
+          {
+            "textContent": "State View"
+          }
+        ],
+        "id": "sm-observation-pipeline",
+        "isInitial": false,
+        "name": "Observation Pipeline Surface",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

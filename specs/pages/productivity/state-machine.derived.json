@@ -1,0 +1,561 @@
+{
+  "version": "1.0",
+  "id": "productivity",
+  "name": "ProductivityPage",
+  "states": [
+    {
+      "id": "productivity-shell",
+      "name": "Productivity Shell",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Productivity"
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.view-tab-plans"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.view-tab-coordinator"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.view-tab-knowledge"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.open-knowledge-modal"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.view-tab-plans"
+          }
+        }
+      ],
+      "description": "The page renders a top bar with a 'Productivity' heading, three sub-view tabs (Plans & Tasks, Coordinator, Knowledge) with lucide-react icons (ClipboardList, Bot, BookOpen), and a right-aligned 'Knowledge' button that opens the modal browser. Below the top bar the active sub-view is rendered into a flex-1 content area. The active sub-view defaults to 'plans' and can be switched by clicking a tab or by dispatching a `productivity-set-view` CustomEvent.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-typography",
+      "name": "Visual Design — Typography",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Productivity"
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.view-tab-plans"
+          }
+        },
+        {
+          "role": "heading",
+          "text": "Plans"
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.plan-list"
+          }
+        }
+      ],
+      "description": "The page uses a typography hierarchy that follows the runner's design tokens: the page-title 'Productivity' uses the `text-h2` heading class, sub-view tab labels use text-sm font-medium, panel headers use text-sm font-semibold, list-row primary text uses text-sm, and metadata/timestamps use text-xs or [11px]/[10px] muted variants. Text-visibility (foreground vs background) is also covered here because every text element must be legible against its panel background.",
+      "precondition": "At least one plan row is present.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-color-scheme",
+      "name": "Visual Design — Color Scheme",
+      "requiredElements": [
+        {
+          "attributes": {
+            "page-id": "productivity"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.view-tab-plans"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.task-list"
+          }
+        },
+        {
+          "attributes": {
+            "page-id": "productivity-plans"
+          }
+        }
+      ],
+      "description": "The page uses the runner's neutral panel/background tokens (`bg-background`, `bg-card/30`, `bg-card/40`) for surfaces, `border-border` for separators, and a small palette of semantic accent colors keyed to status: blue (ready/running), cyan (assigned), purple (review/reflection/advisory), amber (needs_fix/escalation/advisory-only), emerald (done/auto-acted/approve), red (escalated/decline). These accents appear on borders, badge backgrounds, and badge text.",
+      "precondition": "The Plans sub-view is active (default).",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-layout",
+      "name": "Visual Design — Spacing & Layout",
+      "requiredElements": [
+        {},
+        {
+          "attributes": {
+            "page-id": "productivity-coordinator"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.knowledge-modal"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.task-detail"
+          }
+        }
+      ],
+      "description": "The plan/task board uses a fixed 25% / 50% / 25% three-column flex layout with explicit minWidth on the side columns (220px plans, 260px detail). The Coordinator dashboard centers its panel stack at max-w-5xl with gap-4 between panels and p-4 internal padding. Rows in lists use border-b border-border/60 dividers with px-3 py-2 padding. Every interactive button has at least p-1 to guarantee a comfortable hit target.",
+      "precondition": "The Coordinator sub-view is active.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-plan-task-board",
+      "name": "Plans & Tasks — Three-Column Structure",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.plan-list"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.task-list"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.task-detail"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.show-archived-toggle"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.task-claims"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.task-deps"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.task-list"
+          }
+        }
+      ],
+      "description": "The Plans & Tasks sub-view renders three columns. LEFT (25%): PlansList with header ('Plans' h2 + Show-archived checkbox + refresh button) and a scrollable plan-row list. Each plan row shows the plan title (or markdownPath basename fallback), a PlanStatus badge, an optional 2-line summary, and the markdownPath in monospace muted text. The active plan has bg-primary/10 + border-primary left rail. MIDDLE (50%): collapsible Reflection panel above + TasksList below. The TasksList groups by phaseName (UPPERCASE phase header bg-muted/20) with rows sorted by sequenceInPhase showing the sequence #, the first line of the description, and a TaskStatus badge. Each row has a chevron to expand the full description. RIGHT (25%): TaskDetailPanel showing Status (badge + 2-col dl grid: Phase, Sequence, Assigned, Started, Completed), Expected file claims (with conflict badge when other tasks claim the same path), Depends on, Latest review summary, Worker session, and Notes.",
+      "precondition": "A task is selected.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-coordinator-panels",
+      "name": "Coordinator Dashboard — Five-Panel Stack",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.plan-recommendations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-recommendations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-advisories"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-escalations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-decision-log"
+          }
+        },
+        {
+          "attributes": {
+            "page-id": "productivity-coordinator"
+          }
+        }
+      ],
+      "description": "The Coordinator dashboard renders five vertically-stacked panels in a fixed order: (1) PlanRecommendations 'Coordinator suggests next plan' card; (2) RecommendationsPanel — medium-confidence approved review queue; (3) AdvisoriesPanel — LLM advise-with-text rows from the last hour; (4) EscalationsPanel — open destructive recommendations the agent flagged advisory-only; (5) DecisionLogPanel — chronological feed of last 200 coordinator_decisions rows filterable by rule (A-E or LLM) and action. Each panel is wrapped in a border-border + bg-card/30 rounded-lg section with its own header (icon + title + count chip + Refresh button) and a content area that handles error / empty / populated states.",
+      "precondition": "The Coordinator sub-view is active.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-knowledge-browser",
+      "name": "Knowledge Browser — Modal & Inline Modes",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.knowledge-search-input"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.knowledge-area-filter"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.knowledge-search-submit"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.knowledge-results"
+          }
+        },
+        {
+          "role": "dialog",
+          "accessibleName": "Knowledge browser"
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.knowledge-result-row"
+          }
+        }
+      ],
+      "description": "The KnowledgeBrowser renders in two modes from the same component: 'modal' (overlay with backdrop + dialog role + Esc-to-close + close X button) and 'inline' (full-height panel with no backdrop or close button). Both modes share: a Search input (data-ui-bridge-id productivity.knowledge-search-input, placeholder 'Search knowledge…', Enter triggers search), an area-filter dropdown (data-ui-bridge-id productivity.knowledge-area-filter, populated dynamically from distinct areas in the current hit set with 'All areas' default), a Search submit button (data-ui-bridge-id productivity.knowledge-search-submit, disabled when query is blank), a results list (data-ui-bridge-id productivity.knowledge-results), and a footer showing the result count. Each result row is keyed by hit.row.id with data-ui-bridge-id productivity.knowledge-result-row, shows area pill + session id + score + summary, and click toggles a body disclosure rendering hit.row.body in a monospace pre block.",
+      "precondition": "The Knowledge sub-view is active or the modal is open.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-domain-state-machine",
+      "name": "Domain Logic — Task State Machine & Confidence Gates",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.task-list"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.task-detail"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-decision-log"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-recommendations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-recommendation-card"
+          }
+        }
+      ],
+      "description": "Per productivity-stack §2 (data model) and §5 (Coordinator state machine), every task lives in exactly one of nine states: pending → ready (when all dependsOn are done) → assigned → running → review → (done | needs_fix | escalated) — with cancelled as a terminal abort. needs_fix retries cap at 3 before forced escalation. Reviews are confidence-gated: verdict=approved AND confidence ≥ 0.85 → auto-merge (no UI surface); confidence in [0.7, 0.85) → user-approval Recommendations queue; confidence < 0.7 OR verdict in {needs_fix, escalate} → coordinator action. The board is the only surface where these state transitions are user-visible — incorrect states or transitions on display indicate a bug in the underlying tasks/reviews tables or in their derivation.",
+      "precondition": "A plan with at least one task is selected.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-domain-auto-act",
+      "name": "Domain Logic — Coordinator Auto-Act Boundary",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-decision-log"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-escalations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-advisories"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-escalation-card"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-advisory-card"
+          }
+        }
+      ],
+      "description": "The server-enforced auto-act boundary (productivity-stack §5) guarantees that destructive or LLM-judgement actions ALWAYS persist with auto_acted=false regardless of whether the agent claimed to act: kill-session, force-promote-to-worktree, cancel-task, escalate, escalate-with-text, advise-with-text, idle-no-action. These are surfaced as advisory chips in the Decision log and route to the Escalations panel (destructive subset) or the Advisories panel (advise-with-text only). Every Decision log row also displays an 'auto' (emerald) or 'advisory' (amber) chip based on autoActed — a kill-session or force-promote-to-worktree row showing 'auto' indicates the server boundary was bypassed and is a critical safety bug.",
+      "precondition": "The Coordinator sub-view is active and the decision log contains at least one destructive-action row.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-reflection-aggregates",
+      "name": "Reflection Panel — Aggregate Correctness",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.reflection-panel"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.reflection-panel"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.reflection-panel"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.reflection-panel"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.reflection-top-knowledge"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.reflection-review-trail"
+          }
+        }
+      ],
+      "description": "The ReflectionPanel renders a per-plan rollup composed by the get_reflection backend command. The header shows plan title · status · short version-hash (first 8 chars). The 5-tile stat row shows totalTasks, completedTasks, escalatedTasks, avgConfidence, and knowledgeCount. Aggregate invariants per plan §2 + plan §5: avgConfidence is null when no reviews exist (rendered as '—', NOT '0%'); knowledgeCount equals the number of productivity_knowledge rows linked to this plan's tasks; totalTasks equals the count of TaskRow rows for this planId; completedTasks counts tasks with status 'Done'; escalatedTasks counts tasks with status 'Escalated'. Two list sections follow: 'Top knowledge' (top-5 entries with area pill + summary, click switches to Knowledge sub-view filtered by area) and 'Review trail' (every review row with verdict badge + confidence + relative time + open-session link).",
+      "precondition": "A plan is selected and the Reflection toggle is open.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-decision-log-filters",
+      "name": "Decision Log — Filters & Row Cap",
+      "requiredElements": [
+        {},
+        {},
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-decision-log"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-decision-log"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-decision-log-refresh"
+          }
+        }
+      ],
+      "description": "The Decision log panel queries getCoordinatorDecisions(limit=200, {rule, action}) and renders rows sorted by createdAt descending. The rule-filter select (data-ui-bridge-id productivity.coord-decision-log-rule-filter) offers options 'all' (value=''), A, B, C, D, E, LLM, idle. The action-filter select (data-ui-bridge-id productivity.coord-decision-log-action-filter) offers options 'all' plus the 11 CoordinatorActionName values: assign-task, pause-session, merge-task, reassign-needs-fix, escalate, advise-with-text, escalate-with-text, kill-session, force-promote-to-worktree, cancel-task, idle-no-action. Changing either filter triggers a reload and re-renders rows. Each row shows action (color-keyed by autoActed), rule, iteration, time, optional targetId, and full reasoning.",
+      "precondition": "The Coordinator sub-view is active.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-recommendations-actions",
+      "name": "Recommendations Queue — Approve / Reject / Open Task",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-recommendation-approve"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-recommendation-reject"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-recommendation-open-task"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-recommendation-approve"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-recommendation-card"
+          }
+        }
+      ],
+      "description": "Each Recommendations queue card (data-ui-bridge-id productivity.coord-recommendation-card with data-review-id) exposes three actions: Approve (emerald), Reject (red), and Open task (muted external-link button). Approve calls approveRecommendation(reviewId) which marks the underlying review as approved and flips the task to 'done'; on success both the recommendation list and the decision log are refreshed. Reject calls rejectRecommendation(reviewId) and refreshes the recommendation list only. Open task dispatches both 'productivity-set-view' (plans) AND 'productivity-select-task' so the user lands on the plan/task board with that task pre-selected. While a row's action is in flight, all three buttons are disabled. ReviewBadge in the terminal also dispatches 'productivity-select-recommendation' which highlights a card here in amber and scrolls it into view.",
+      "precondition": "At least one recommendation is queued.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-empty-loading-error",
+      "name": "Empty / Loading / Error States",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.plan-list"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-recommendations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.coord-escalations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.knowledge-results"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.plan-list"
+          }
+        }
+      ],
+      "description": "Each panel handles three lifecycle states. LOADING: a small spinner (Loader2 animate-spin) + grey muted text (e.g. 'Loading plans…', 'Loading tasks…', 'Loading detail…', 'Computing recommendations…', 'Loading reflection…'). ERROR: a soft empty state with explanatory italic muted copy — never a crashed page (try/catch wrappers in fetchPlans / loadDecisions / etc. coerce errors into empty results so an unmigrated backend renders cleanly). EMPTY: instructional muted copy that explains how to populate the surface (e.g. 'Run /decompose-plan', 'Run /summarize-session', 'Once /coordinate is running'). The PlansList specifically renders 'Plan registry unavailable. The backend command may not be registered yet.' on error.",
+      "precondition": "No plans exist in the database.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-user-interactions",
+      "name": "User Interactions — Toggles, Sub-View Switches, Hotkey",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.view-tab-coordinator"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.show-archived-toggle"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.open-knowledge-modal"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.knowledge-modal"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.reflection-panel"
+          }
+        },
+        {
+          "attributes": {
+            "page-id": "productivity"
+          }
+        }
+      ],
+      "description": "Page-level interactions: clicking a sub-view tab calls setView and updates the active tab style + which sub-view component renders. The 'Knowledge' top-bar button opens the modal (not the sub-view); the modal can also be opened anywhere via Ctrl+Shift+K (useKnowledgeBrowserHotkey). The Show-archived checkbox triggers fetchPlans with includeArchived=true and re-paints the plans list. The Reflection collapse button persists its open/closed state in localStorage under productivity.reflection-open.{planId} so the choice survives plan re-selection. Clicking a plan-recommendation card's 'Open plan' switches the sub-view to plans AND selects the plan via two CustomEvents (productivity-set-view + productivity-select-plan). Esc closes the knowledge modal; clicking the backdrop or the X also closes it.",
+      "precondition": "The Knowledge modal is open.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "productivity-plan-recommendations-card",
+      "name": "Plan Recommendations Card — Top-K Candidates",
+      "requiredElements": [
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.plan-recommendations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.plan-recommendations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.plan-recommendations"
+          }
+        },
+        {
+          "attributes": {
+            "ui-bridge-id": "productivity.plan-recommendation-card"
+          }
+        }
+      ],
+      "description": "The PlanRecommendations card at the top of the Coordinator dashboard renders up to 3 candidate plans (server-ranked by getPlanRecommendations — cheap-rule only, no LLM). Each card row shows a ListChecks icon + plan title (or planId fallback), reasoning text (e.g. '3 ready tasks, 2 idle sessions, no upcoming-claim conflicts'), and an 'Open plan' button (ArrowRight icon) that dispatches productivity-set-view (plans) and productivity-select-plan (planId) so the plan/task board lands on the candidate. The empty state explicitly directs the user to /decompose-plan on a vetted plan. The card header shows 'top {N}' where N is rows.length.",
+      "precondition": "The Coordinator sub-view is active.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Productivity page — top-level tab housing three sub-views (Plans & Tasks / Coordinator / Knowledge) backed by the productivity-stack PG tables (plans, tasks, reviews, productivity_knowledge, coordinator_decisions, snapshots). The plan/task board is a three-column read-only board: a plans list with a 'Show archived' toggle (left, 25%), a tasks-for-selected-plan list grouped by phase with a collapsible Reflection panel above it (middle, 50%), and a task-detail panel showing claims, deps, latest review summary, and worker session metadata (right, 25%). The Coordinator dashboard stacks five panels — PlanRecommendations card, the medium-confidence Recommendations queue, an LLM-driven Advisories list (advise-with-text rows from the last hour), an Escalations list of destructive auto_acted=false rows (kill-session, force-promote-to-worktree, escalate, escalate-with-text), and a chronological Decision log of the last 200 coordinator_decisions filterable by rule (A-E or LLM) and action. The Knowledge browser is rendered both inline (Knowledge sub-view) and as a modal globally triggered by Ctrl+Shift+K; both modes share the same FTS-only search surface with an area-filter dropdown and click-to-expand result rows. A top-bar selector switches between the three sub-views and is also driven by the `productivity-set-view` window CustomEvent (used by useAppNavigation alias routing and by the Recommendations / Reflection / PlanRecommendations cross-component triggers). The page is a window into orchestration logic: tasks transition pending → ready → assigned → running → review → (done | needs_fix | escalated), reviews flow through a confidence-gated handler (auto-merge ≥ 0.85, user-approval queue [0.7, 0.85), coordinator action below), and the Coordinator's auto-act boundary keeps destructive actions advisory-only.",
+  "metadata": {
+    "tags": [
+      "runner",
+      "productivity",
+      "plans",
+      "tasks",
+      "coordinator",
+      "knowledge",
+      "reflection"
+    ]
+  }
+}

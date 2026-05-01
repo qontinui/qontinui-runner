@@ -1,0 +1,891 @@
+{
+  "description": "Opik LLM Traces Dashboard — shows every LLM API call made during automation workflows as structured traces with hierarchical spans, cost attribution, token counts, latency, and quality feedback scores. Users come here to answer: What did the AI do? How much did it cost? Was it effective? Data arrives from two sources: (1) the Opik REST API at OPIK_BASE_URL/v1/private/traces for trace/span data stored in ClickHouse, and (2) the runner's own /analytics/token-usage endpoints as a fallback when Opik is unavailable. A background sync service in the Rust backend pushes execution_spans and phase_token_usage records to Opik as traces/spans, and syncs observations and agentic_metric_scores as feedback scores. Opik runs as a self-hosted Docker stack (backend, ClickHouse, MySQL, Redis, MinIO) managed by the supervisor.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Architecture — Data Flow & Integration Design",
+          "enabled": true,
+          "id": "opik-architecture-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Architecture — Data Flow & Integration Design",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "How the Opik integration is structured. Data flows in one primary direction: the runner records execution_spans and phase_token_usage in PostgreSQL during workflow execution, then a background OpikSyncService pushes batches to Opik every 10 seconds. Observations are mapped to Opik feedback scores. The frontend queries Opik directly for the trace viewer and falls back to local analytics endpoints when Opik is unreachable. MCP tools (opik_traces, opik_trace_detail, opik_feedback, opik_evaluate, opik_sync_status) expose trace data to AI agents.\n\nData model mapping:\n- task_run → Opik project (project_name = workflow_name)\n- execution_spans (root, parent_span_id=NULL) → Opik trace\n- execution_spans (child) → Opik span (preserves parent_span_id hierarchy)\n- phase_token_usage → span.usage + span.model + span.provider + span.total_estimated_cost\n- observations → feedback_score (name=observation_type, value=1.0 for learning / 0.0 for bugfix, reason=content)\n- agentic_metric_scores → feedback_score (name=metric_type, value=score, reason=rationale)\n\nSync is idempotent via trace_id (UUIDv7). On restart, sync resumes from last_synced_at timestamp. Retry uses exponential backoff (1s→2s→4s→8s, max 60s). Unsent traces queue in memory (max 10,000) and overflow to PostgreSQL.",
+      "id": "opik-architecture",
+      "name": "Architecture — Data Flow & Integration Design",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Semantic — Purpose & Communication",
+          "enabled": true,
+          "id": "opik-semantic-elem-0",
+          "precondition": "At least one workflow has been executed and synced to Opik",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContent": "LLM Traces"
+            },
+            "label": "Required element for Semantic — Purpose & Communication",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Semantic — Purpose & Communication",
+          "enabled": true,
+          "id": "opik-semantic-elem-1",
+          "precondition": "At least one workflow has been executed and synced to Opik",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Semantic — Purpose & Communication",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Semantic — Purpose & Communication",
+          "enabled": true,
+          "id": "opik-semantic-elem-2",
+          "precondition": "At least one workflow has been executed and synced to Opik",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Semantic — Purpose & Communication",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Semantic — Purpose & Communication",
+          "enabled": true,
+          "id": "opik-semantic-elem-3",
+          "precondition": "At least one workflow has been executed and synced to Opik",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Semantic — Purpose & Communication",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "What the dashboard communicates to users. The page heading, status indicators, and summary cards orient users immediately: Is Opik connected? How many traces exist? What's the total cost? Each trace row provides a scannable summary (name, cost, tokens, duration, quality) so users can spot expensive or failing AI calls without clicking into details.",
+      "id": "opik-semantic",
+      "name": "Semantic — Purpose & Communication",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Element Presence — Required UI Controls",
+          "enabled": true,
+          "id": "opik-element-presence-elem-0",
+          "precondition": "A trace row has been selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Element Presence — Required UI Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Element Presence — Required UI Controls",
+          "enabled": true,
+          "id": "opik-element-presence-elem-1",
+          "precondition": "A trace row has been selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "searchbox"
+            },
+            "label": "Required element for Element Presence — Required UI Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Element Presence — Required UI Controls",
+          "enabled": true,
+          "id": "opik-element-presence-elem-2",
+          "precondition": "A trace row has been selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Element Presence — Required UI Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Element Presence — Required UI Controls",
+          "enabled": true,
+          "id": "opik-element-presence-elem-3",
+          "precondition": "A trace row has been selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Element Presence — Required UI Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Element Presence — Required UI Controls",
+          "enabled": true,
+          "id": "opik-element-presence-elem-4",
+          "precondition": "A trace row has been selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Element Presence — Required UI Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Element Presence — Required UI Controls",
+          "enabled": true,
+          "id": "opik-element-presence-elem-5",
+          "precondition": "A trace row has been selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Element Presence — Required UI Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Element Presence — Required UI Controls",
+          "enabled": true,
+          "id": "opik-element-presence-elem-6",
+          "precondition": "A trace row has been selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Element Presence — Required UI Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Element Presence — Required UI Controls",
+          "enabled": true,
+          "id": "opik-element-presence-elem-7",
+          "precondition": "A trace row has been selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Element Presence — Required UI Controls",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "All interactive controls that must exist for the dashboard to be functional. These elements are always present regardless of data state — they represent the page's chrome, not its content.",
+      "id": "opik-element-presence",
+      "name": "Element Presence — Required UI Controls",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Data Display — Formatting & Presentation",
+          "enabled": true,
+          "id": "opik-data-display-elem-0",
+          "precondition": "At least one trace exists with cost data",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Data Display — Formatting & Presentation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Data Display — Formatting & Presentation",
+          "enabled": true,
+          "id": "opik-data-display-elem-1",
+          "precondition": "At least one trace exists with cost data",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Data Display — Formatting & Presentation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Data Display — Formatting & Presentation",
+          "enabled": true,
+          "id": "opik-data-display-elem-2",
+          "precondition": "At least one trace exists with cost data",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Data Display — Formatting & Presentation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Data Display — Formatting & Presentation",
+          "enabled": true,
+          "id": "opik-data-display-elem-3",
+          "precondition": "At least one trace exists with cost data",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Data Display — Formatting & Presentation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Data Display — Formatting & Presentation",
+          "enabled": true,
+          "id": "opik-data-display-elem-4",
+          "precondition": "At least one trace exists with cost data",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Data Display — Formatting & Presentation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Data Display — Formatting & Presentation",
+          "enabled": true,
+          "id": "opik-data-display-elem-5",
+          "precondition": "At least one trace exists with cost data",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Data Display — Formatting & Presentation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Data Display — Formatting & Presentation",
+          "enabled": true,
+          "id": "opik-data-display-elem-6",
+          "precondition": "At least one trace exists with cost data",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Data Display — Formatting & Presentation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "How trace, span, cost, and feedback data is formatted for readability. Users scanning the trace list need to compare costs and durations quickly, so consistent formatting is essential. The span tree needs visual hierarchy to show the execution chain clearly.",
+      "id": "opik-data-display",
+      "name": "Data Display — Formatting & Presentation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Interaction — User Actions & Responses",
+          "enabled": true,
+          "id": "opik-interaction-elem-0",
+          "precondition": "At least one trace exists in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Interaction — User Actions & Responses",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Interaction — User Actions & Responses",
+          "enabled": true,
+          "id": "opik-interaction-elem-1",
+          "precondition": "At least one trace exists in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Interaction — User Actions & Responses",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Interaction — User Actions & Responses",
+          "enabled": true,
+          "id": "opik-interaction-elem-2",
+          "precondition": "At least one trace exists in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Interaction — User Actions & Responses",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Interaction — User Actions & Responses",
+          "enabled": true,
+          "id": "opik-interaction-elem-3",
+          "precondition": "At least one trace exists in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Interaction — User Actions & Responses",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Interaction — User Actions & Responses",
+          "enabled": true,
+          "id": "opik-interaction-elem-4",
+          "precondition": "At least one trace exists in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Interaction — User Actions & Responses",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Interaction — User Actions & Responses",
+          "enabled": true,
+          "id": "opik-interaction-elem-5",
+          "precondition": "At least one trace exists in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Interaction — User Actions & Responses",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Interaction — User Actions & Responses",
+          "enabled": true,
+          "id": "opik-interaction-elem-6",
+          "precondition": "At least one trace exists in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Interaction — User Actions & Responses",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "How users interact with the dashboard — searching, filtering, selecting traces, navigating the span tree, and adding feedback. Each interaction should feel responsive (<2s for local actions, <5s for Opik API calls).",
+      "id": "opik-interaction",
+      "name": "Interaction — User Actions & Responses",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Behavior — Loading, Empty, Error, & Auto-refresh States",
+          "enabled": true,
+          "id": "opik-behavior-elem-0",
+          "precondition": "No workflows have been executed, or Opik has no trace data for the current time range",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "No traces yet"
+            },
+            "label": "Required element for Behavior — Loading, Empty, Error, & Auto-refresh States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Behavior — Loading, Empty, Error, & Auto-refresh States",
+          "enabled": true,
+          "id": "opik-behavior-elem-1",
+          "precondition": "No workflows have been executed, or Opik has no trace data for the current time range",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Behavior — Loading, Empty, Error, & Auto-refresh States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Behavior — Loading, Empty, Error, & Auto-refresh States",
+          "enabled": true,
+          "id": "opik-behavior-elem-2",
+          "precondition": "No workflows have been executed, or Opik has no trace data for the current time range",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Behavior — Loading, Empty, Error, & Auto-refresh States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Behavior — Loading, Empty, Error, & Auto-refresh States",
+          "enabled": true,
+          "id": "opik-behavior-elem-3",
+          "precondition": "No workflows have been executed, or Opik has no trace data for the current time range",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Behavior — Loading, Empty, Error, & Auto-refresh States",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Automatic behaviors and edge case handling. The dashboard must handle: first-time use (no data), Opik being unreachable, slow API responses, and ongoing data arrival from background sync.",
+      "id": "opik-behavior",
+      "name": "Behavior — Loading, Empty, Error, & Auto-refresh States",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state State Consistency — Local ↔ Opik Data Agreement",
+          "enabled": true,
+          "id": "opik-state-consistency-elem-0",
+          "precondition": "At least one trace exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for State Consistency — Local ↔ Opik Data Agreement",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state State Consistency — Local ↔ Opik Data Agreement",
+          "enabled": true,
+          "id": "opik-state-consistency-elem-1",
+          "precondition": "At least one trace exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for State Consistency — Local ↔ Opik Data Agreement",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state State Consistency — Local ↔ Opik Data Agreement",
+          "enabled": true,
+          "id": "opik-state-consistency-elem-2",
+          "precondition": "At least one trace exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for State Consistency — Local ↔ Opik Data Agreement",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The dashboard shows data from two sources: Opik (primary) and the runner's local database (fallback). These must agree when both are available, and the fallback must be seamless when Opik is down.",
+      "id": "opik-state-consistency",
+      "name": "State Consistency — Local ↔ Opik Data Agreement",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Navigation — Page Access & Internal Navigation",
+          "enabled": true,
+          "id": "opik-navigation-elem-0",
+          "precondition": "A trace row has been selected and the detail panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "LLM Traces"
+            },
+            "label": "Required element for Navigation — Page Access & Internal Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Navigation — Page Access & Internal Navigation",
+          "enabled": true,
+          "id": "opik-navigation-elem-1",
+          "precondition": "A trace row has been selected and the detail panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Navigation — Page Access & Internal Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Navigation — Page Access & Internal Navigation",
+          "enabled": true,
+          "id": "opik-navigation-elem-2",
+          "precondition": "A trace row has been selected and the detail panel is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Navigation — Page Access & Internal Navigation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "How users reach the Opik dashboard and navigate within it. The page is a tab in the OBSERVE sidebar group. Internal navigation is panel-based (trace list + detail panel), not route-based.",
+      "id": "opik-navigation",
+      "name": "Navigation — Page Access & Internal Navigation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Style — Visual Design & Theming",
+          "enabled": true,
+          "id": "opik-style-elem-0",
+          "precondition": "At least 2 traces exist in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Style — Visual Design & Theming",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Style — Visual Design & Theming",
+          "enabled": true,
+          "id": "opik-style-elem-1",
+          "precondition": "At least 2 traces exist in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Style — Visual Design & Theming",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Style — Visual Design & Theming",
+          "enabled": true,
+          "id": "opik-style-elem-2",
+          "precondition": "At least 2 traces exist in the list",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Style — Visual Design & Theming",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Opik dashboard must visually integrate with the runner's existing dark theme and design system. No Opik-branded colors or styles should leak through — it should feel native to the runner.",
+      "id": "opik-style",
+      "name": "Style — Visual Design & Theming",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "opik-integration",
+    "tags": [
+      "opik",
+      "llm-observability",
+      "tracing",
+      "evaluation",
+      "feedback",
+      "cost-tracking",
+      "spans",
+      "opentelemetry",
+      "integration"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "How the Opik integration is structured. Data flows in one primary direction: the runner records execution_spans and phase_token_usage in PostgreSQL during workflow execution, then a background OpikSyncService pushes batches to Opik every 10 seconds. Observations are mapped to Opik feedback scores. The frontend queries Opik directly for the trace viewer and falls back to local analytics endpoints when Opik is unreachable. MCP tools (opik_traces, opik_trace_detail, opik_feedback, opik_evaluate, opik_sync_status) expose trace data to AI agents.\n\nData model mapping:\n- task_run → Opik project (project_name = workflow_name)\n- execution_spans (root, parent_span_id=NULL) → Opik trace\n- execution_spans (child) → Opik span (preserves parent_span_id hierarchy)\n- phase_token_usage → span.usage + span.model + span.provider + span.total_estimated_cost\n- observations → feedback_score (name=observation_type, value=1.0 for learning / 0.0 for bugfix, reason=content)\n- agentic_metric_scores → feedback_score (name=metric_type, value=score, reason=rationale)\n\nSync is idempotent via trace_id (UUIDv7). On restart, sync resumes from last_synced_at timestamp. Retry uses exponential backoff (1s→2s→4s→8s, max 60s). Unsent traces queue in memory (max 10,000) and overflow to PostgreSQL.",
+        "elements": [],
+        "id": "opik-architecture",
+        "isInitial": false,
+        "name": "Architecture — Data Flow & Integration Design",
+        "transitions": []
+      },
+      {
+        "description": "What the dashboard communicates to users. The page heading, status indicators, and summary cards orient users immediately: Is Opik connected? How many traces exist? What's the total cost? Each trace row provides a scannable summary (name, cost, tokens, duration, quality) so users can spot expensive or failing AI calls without clicking into details.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "LLM Traces"
+          },
+          {},
+          {},
+          {}
+        ],
+        "id": "opik-semantic",
+        "isInitial": false,
+        "name": "Semantic — Purpose & Communication",
+        "transitions": []
+      },
+      {
+        "description": "All interactive controls that must exist for the dashboard to be functional. These elements are always present regardless of data state — they represent the page's chrome, not its content.",
+        "elements": [
+          {},
+          {
+            "role": "searchbox"
+          },
+          {},
+          {},
+          {},
+          {},
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "opik-element-presence",
+        "isInitial": false,
+        "name": "Element Presence — Required UI Controls",
+        "transitions": []
+      },
+      {
+        "description": "How trace, span, cost, and feedback data is formatted for readability. Users scanning the trace list need to compare costs and durations quickly, so consistent formatting is essential. The span tree needs visual hierarchy to show the execution chain clearly.",
+        "elements": [
+          {},
+          {},
+          {},
+          {},
+          {},
+          {},
+          {}
+        ],
+        "id": "opik-data-display",
+        "isInitial": false,
+        "name": "Data Display — Formatting & Presentation",
+        "transitions": []
+      },
+      {
+        "description": "How users interact with the dashboard — searching, filtering, selecting traces, navigating the span tree, and adding feedback. Each interaction should feel responsive (<2s for local actions, <5s for Opik API calls).",
+        "elements": [
+          {},
+          {},
+          {},
+          {},
+          {},
+          {},
+          {}
+        ],
+        "id": "opik-interaction",
+        "isInitial": false,
+        "name": "Interaction — User Actions & Responses",
+        "transitions": []
+      },
+      {
+        "description": "Automatic behaviors and edge case handling. The dashboard must handle: first-time use (no data), Opik being unreachable, slow API responses, and ongoing data arrival from background sync.",
+        "elements": [
+          {
+            "textContains": "No traces yet"
+          },
+          {},
+          {},
+          {}
+        ],
+        "id": "opik-behavior",
+        "isInitial": false,
+        "name": "Behavior — Loading, Empty, Error, & Auto-refresh States",
+        "transitions": []
+      },
+      {
+        "description": "The dashboard shows data from two sources: Opik (primary) and the runner's local database (fallback). These must agree when both are available, and the fallback must be seamless when Opik is down.",
+        "elements": [
+          {},
+          {},
+          {}
+        ],
+        "id": "opik-state-consistency",
+        "isInitial": false,
+        "name": "State Consistency — Local ↔ Opik Data Agreement",
+        "transitions": []
+      },
+      {
+        "description": "How users reach the Opik dashboard and navigate within it. The page is a tab in the OBSERVE sidebar group. Internal navigation is panel-based (trace list + detail panel), not route-based.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "LLM Traces"
+          },
+          {},
+          {}
+        ],
+        "id": "opik-navigation",
+        "isInitial": false,
+        "name": "Navigation — Page Access & Internal Navigation",
+        "transitions": []
+      },
+      {
+        "description": "The Opik dashboard must visually integrate with the runner's existing dark theme and design system. No Opik-branded colors or styles should leak through — it should feel native to the runner.",
+        "elements": [
+          {},
+          {},
+          {}
+        ],
+        "id": "opik-style",
+        "isInitial": false,
+        "name": "Style — Visual Design & Theming",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

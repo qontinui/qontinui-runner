@@ -1,0 +1,321 @@
+{
+  "version": "1.0",
+  "id": "settings-backup",
+  "name": "BackupSettings",
+  "states": [
+    {
+      "id": "bk-page-structure",
+      "name": "Page Structure",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Backup & Restore"
+        },
+        {
+          "text": "comprehensive backups"
+        },
+        {
+          "text": "Backup & Restore"
+        }
+      ],
+      "description": "The Backup & Restore tab renders a SectionHeader titled 'Backup & Restore' with a description about creating and restoring backups, followed by four card sections: Your Data, Export All Data, Import Data, and a bottom info panel. All four sections are always rendered — none are conditionally hidden based on state.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-data-summary",
+      "name": "Your Data — Summary Section",
+      "requiredElements": [
+        {
+          "text": "Your Data"
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        },
+        {},
+        {
+          "role": "button",
+          "text": "Refresh"
+        }
+      ],
+      "description": "The 'Your Data' card displays the current item count for each of the 13 data categories as a responsive grid. Each cell shows the human-readable category label and its integer count. A 'Refresh' button re-runs get_export_summary. The summary is fetched automatically on mount and the button is disabled while loading (showing 'Loading...').",
+      "precondition": "The data summary has loaded (not in loading state)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-export-section",
+      "name": "Export All Data — Section Structure",
+      "requiredElements": [
+        {
+          "text": "Export All Data"
+        },
+        {
+          "text": "Export Options"
+        },
+        {
+          "role": "button",
+          "text": "Export"
+        }
+      ],
+      "description": "The 'Export All Data' card contains: a section heading 'Export All Data' with a Download icon; a description paragraph about exporting to a JSON file; an 'Export Options' toggle button with a Settings icon and a chevron; and the 'Export (N items)' action button. All elements are always present within this card.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-export-options-panel",
+      "name": "Export Options — Category Selector",
+      "requiredElements": [
+        {
+          "text": "Export Options"
+        },
+        {
+          "text": "Export Options"
+        },
+        {
+          "role": "button",
+          "text": "Export"
+        }
+      ],
+      "description": "When the 'Export Options' toggle is expanded, a grid of 13 checkboxes is shown — one per data category. All 13 are checked by default (defaultExportOptions). Each checkbox label shows the category name and its current count in parentheses. Unchecking a category removes it from the export and reduces the N in 'Export (N items)'.",
+      "precondition": "Page has just loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-export-flow",
+      "name": "Export Flow — File Download",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Exporting"
+        },
+        {
+          "role": "button",
+          "text": "Export"
+        }
+      ],
+      "description": "Clicking the 'Export (N items)' button invokes the Tauri export_all_data command with the current export options, creates a Blob from the returned JSON, and triggers a browser file download. The downloaded file is named qontinui-backup-YYYY-MM-DD.json where the date is today's UTC date. During export, the button shows a spinner and progress text ('Exporting data from database...' then 'Preparing download...').",
+      "precondition": "An export has been initiated and is in progress",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-import-idle",
+      "name": "Import Data — Idle State (No File Selected)",
+      "requiredElements": [
+        {
+          "text": "Import Data"
+        },
+        {
+          "role": "button",
+          "text": "Select Backup File"
+        },
+        {
+          "role": "button",
+          "text": "Select Backup File"
+        }
+      ],
+      "description": "When no backup file has been selected (and no import result is showing), the Import Data section shows only a 'Select Backup File' button with an Upload icon. A hidden <input type='file' accept='.json'> is present but not visible. After a file is selected and preview is shown, this button disappears. If a file is being read, a small spinner with 'Reading file...' text appears in place of the button.",
+      "precondition": "No import preview is currently displayed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-import-preview-metadata",
+      "name": "Import Preview — File Metadata Display",
+      "requiredElements": [
+        {
+          "text": "Import Preview"
+        },
+        {
+          "role": "button",
+          "text": "Cancel"
+        },
+        {},
+        {
+          "role": "button",
+          "text": "Cancel"
+        }
+      ],
+      "description": "After selecting a .json backup file, the page calls get_import_preview and shows an 'Import Preview' panel. The panel displays three metadata fields: Version (from manifest.version, e.g. '2.0.0'), App Version (from manifest.app_version), and Created (manifest.created_at formatted via toLocaleString()). A 'Cancel' button is visible to dismiss the preview and return to the idle state.",
+      "precondition": "A backup file has been selected and the import preview is displayed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-import-compatibility",
+      "name": "Import Compatibility Check",
+      "requiredElements": [
+        {
+          "text": "Compatibility issues"
+        },
+        {
+          "role": "button",
+          "text": "Import Data"
+        }
+      ],
+      "description": "get_import_preview checks the backup's manifest.version. Versions starting with '2.' or '1.' are compatible. An incompatible backup shows a red error banner listing the compatibility issues. The 'Import Data' button is disabled for incompatible backups.",
+      "precondition": "A backup file with version not starting with '1.' or '2.' has been selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-import-options-panel",
+      "name": "Import Options — Conflict Resolution and Category Selection",
+      "requiredElements": [
+        {
+          "text": "Import Options"
+        },
+        {
+          "text": "Conflict Resolution"
+        },
+        {
+          "text": "Import Options"
+        }
+      ],
+      "description": "Within the Import Preview panel, an 'Import Options' toggle button (Settings icon, chevron) expands a sub-panel with two controls: (1) Conflict Resolution radio group with 'Skip existing' (default) and 'Overwrite' options; (2) a grid of 13 category checkboxes with defaults — enabled: flows, learning_outcomes, learning_patterns, settings, prompts, unified_workflows, verification_tests, task_hooks, scheduled_tasks, saved_api_requests, configs; disabled: flow_executions, checkpoints.",
+      "precondition": "Import preview is displayed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-import-preview-grid-and-warning",
+      "name": "Import Preview — Data Grid and Warning Banner",
+      "requiredElements": [
+        {
+          "text": "Import Preview"
+        },
+        {
+          "text": "Existing items will be skipped"
+        },
+        {
+          "text": "Existing items will be overwritten"
+        },
+        {
+          "role": "button",
+          "text": "Import Data"
+        }
+      ],
+      "description": "The Import Preview panel shows a grid of 13 data-count cells (same layout as the Your Data summary) and an amber warning banner. Selected categories are highlighted with a primary/10 background; deselected categories have 50% opacity. The warning banner text changes based on conflict_mode: 'overwrite' shows 'Existing items will be overwritten. This cannot be undone.' and 'skip' shows 'Existing items will be skipped. Only new items will be imported.'",
+      "precondition": "Import preview is displayed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-import-flow",
+      "name": "Import Flow — End-to-End Behavior",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Importing"
+        },
+        {},
+        {},
+        {}
+      ],
+      "description": "Clicking 'Import Data' invokes import_all_data with the parsed backup data and current ImportOptions. Per-category import uses INSERT ... ON CONFLICT: 'skip' mode does nothing on conflict, 'overwrite' mode updates existing rows. After completion: importResult is set, importPreview and pendingImportData are cleared, and get_export_summary is called to refresh the data summary counts.",
+      "precondition": "Import Data has been clicked and is in progress",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-import-result-success",
+      "name": "Import Result — Successful Import",
+      "requiredElements": [
+        {},
+        {
+          "text": "Imported:"
+        },
+        {}
+      ],
+      "description": "When import_all_data returns success: true (total_errors = 0), a green result panel is shown with a CheckCircle icon and the text 'Import Successful'. Below it, a summary line 'Imported: X | Skipped: Y | Errors: Z' is shown, followed by per-category detail lines (e.g., 'Flows: 3 imported, 1 skipped'). The data-content-label='import result' element contains 'Import Successful'.",
+      "precondition": "Import has completed with no errors",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-import-result-errors",
+      "name": "Import Result — Import With Errors",
+      "requiredElements": [
+        {},
+        {
+          "text": "errors"
+        }
+      ],
+      "description": "When import_all_data returns success: false (total_errors > 0), an amber result panel is shown with an AlertCircle icon and the text 'Import Completed with Errors'. The totals line and per-category breakdown are the same as the success case, but categories with errors show a red error count in parentheses.",
+      "precondition": "Import has completed with total_errors > 0",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-info-section",
+      "name": "Info Panel — What's Included",
+      "requiredElements": [
+        {
+          "text": "What's included in a comprehensive backup"
+        },
+        {
+          "text": "API keys stored in the system keychain are not included"
+        },
+        {
+          "text": "JSON format"
+        }
+      ],
+      "description": "A static info panel at the bottom of the page (light primary/5 background) lists what's included in a comprehensive backup: flows and flow executions, checkpoints, learning outcomes and patterns, settings and configurations, prompts and AI workflows, verification tests and scheduled tasks, saved API requests and task hooks. A footnote explicitly states that API keys stored in the system keychain are not included for security reasons, and that the backup file is in JSON format and can be inspected before importing.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bk-data-model",
+      "name": "Backup Data Model — Coverage and Correctness",
+      "requiredElements": [
+        {
+          "text": "Import Preview"
+        },
+        {
+          "text": "Import Preview"
+        },
+        {
+          "text": "API keys stored in the system keychain are not included"
+        }
+      ],
+      "description": "The backup format (version 2.0.0) is a single JSON object with a manifest and 13 category arrays. The manifest contains version (string starting with '2.'), created_at (ISO8601 timestamp), and app_version. The 13 categories cover all persistent user data in the runner database. API keys are explicitly excluded. A version '1.x' backup is accepted for import (backward compatible). Anything else is rejected as incompatible.",
+      "precondition": "A backup file is loaded in the import preview",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Backup & Restore settings tab in the qontinui runner Settings panel. Provides comprehensive data export and import for all 13 user data categories: Flows, Flow Executions, Checkpoints, Learning Outcomes, Learning Patterns, Settings, Prompts, Unified Workflows, Verification Tests, Task Hooks, Scheduled Tasks, Saved API Requests, and Configurations. The page has four always-visible sections: (1) 'Your Data' — live per-category counts fetched via get_export_summary on mount, with a Refresh button; (2) 'Export All Data' — exports to a timestamped JSON file (qontinui-backup-YYYY-MM-DD.json) via export_all_data IPC, with an optional per-category selector; (3) 'Import Data' — three-state flow (select file → preview with compatibility check → result), using get_import_preview then import_all_data IPC, with conflict resolution (skip/overwrite) and per-category toggles; (4) Info panel listing what's included and noting that API keys stored in the system keychain are excluded for security. After a successful import the data summary is automatically refreshed.",
+  "metadata": {
+    "tags": [
+      "settings",
+      "backup",
+      "restore",
+      "export",
+      "import",
+      "data",
+      "tauri-ipc"
+    ]
+  }
+}

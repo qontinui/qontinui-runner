@@ -1,0 +1,196 @@
+{
+  "version": "1.0",
+  "id": "context-builder",
+  "name": "ContextsPage",
+  "states": [
+    {
+      "id": "ctx-purpose",
+      "name": "Page Purpose",
+      "requiredElements": [
+        {
+          "text": "Context"
+        },
+        {
+          "role": "button",
+          "text": "Save"
+        },
+        {
+          "role": "list"
+        }
+      ],
+      "description": "The Context Builder allows users to create and manage reusable context configurations. Contexts provide structured background information, domain knowledge, and behavioral instructions that are injected into AI prompts during workflow execution. By defining contexts separately from workflows, users can share common knowledge across multiple workflows without duplication.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ctx-editing",
+      "name": "Editing Existing Context",
+      "requiredElements": [
+        {
+          "role": "textbox"
+        },
+        {
+          "role": "textbox"
+        },
+        {
+          "role": "button",
+          "text": "Delete"
+        }
+      ],
+      "description": "Users need to define rich context configurations with names, descriptions, and structured content that will be injected into AI prompts. The editing experience should make it easy to craft precise instructions that guide AI behavior during workflow execution.",
+      "isInitial": false,
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ctx-workflow-integration",
+      "name": "Workflow Integration Goals",
+      "requiredElements": [
+        {
+          "text": "Context"
+        },
+        {
+          "text": "Context"
+        }
+      ],
+      "description": "The primary value of contexts comes from their integration with workflows. Users create contexts so they can attach them to workflow steps, ensuring the AI has the right background information when executing automation tasks.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [
+    {
+      "id": "editing-save",
+      "name": "Save changes",
+      "fromStates": [
+        "ctx-editing"
+      ],
+      "activateStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "role": "button",
+            "text": "Save"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "exitStates": [],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "editing-delete",
+      "name": "Delete context",
+      "fromStates": [
+        "ctx-editing"
+      ],
+      "activateStates": [
+        "ctx-list-browse"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "role": "button",
+            "text": "Delete"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 1000
+          }
+        },
+        {
+          "type": "click",
+          "target": {
+            "role": "button",
+            "text": "Confirm"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "exitStates": [
+        "ctx-editing"
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "editing-to-creating",
+      "name": "Create new context while editing",
+      "fromStates": [
+        "ctx-editing"
+      ],
+      "activateStates": [
+        "ctx-creating"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "role": "button",
+            "text": "New"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 1000
+          }
+        }
+      ],
+      "exitStates": [
+        "ctx-editing"
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "editing-switch-item",
+      "name": "Switch to different context",
+      "fromStates": [
+        "ctx-editing"
+      ],
+      "activateStates": [],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "role": "listitem"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 1000
+          }
+        }
+      ],
+      "exitStates": [],
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Context Builder page — where users create reusable context configurations that provide background information and instructions to AI during workflow execution",
+  "metadata": {
+    "tags": [
+      "context-builder",
+      "contexts",
+      "ai-configuration",
+      "library-asset"
+    ]
+  }
+}
