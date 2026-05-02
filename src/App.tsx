@@ -70,6 +70,7 @@ import {
 } from "./components/productivity/KnowledgeBrowser";
 import { PromptExecutionProvider } from "./components/prompt-home/PromptExecutionContext";
 import { PromptAutomationOverlay } from "./components/prompt-home/PromptAutomationOverlay";
+import { BackgroundTaskPill } from "./components/prompt-home/BackgroundTaskPill";
 import { useTaskRuns } from "./hooks/useAiData";
 import { getAllSpecs } from "./lib/spec-registry";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
@@ -636,6 +637,15 @@ function AppWithTutorials() {
         <ContextualTutorial />
         <DemoVisualOverlay />
         <PromptAutomationOverlay />
+        {/*
+          Persistent global pill that surfaces in-progress background tasks
+          (currently the long-running UI Bridge integration generation
+          triggered from the home prompt). Mounted inside
+          PromptExecutionProvider but outside <AppContent>'s tab content so
+          it stays visible across tab switches. See BackgroundTaskPill.tsx
+          for the detection rule and dismiss flow.
+        */}
+        <BackgroundTaskPill />
       </PromptExecutionProvider>
     </TutorialProvider>
   );

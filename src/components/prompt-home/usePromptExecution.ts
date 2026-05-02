@@ -167,14 +167,63 @@ export function usePromptExecution(): UsePromptExecutionReturn {
             const executor = new NLActionExecutor();
             executor.updateElements(discovered.elements);
             executor.setActionExecutor(bridge as never);
+
+            // P18A — capture pre-action state for "<verb> element <id>" forms.
+            // The id-routing path takes a deterministic registry lookup (no
+            // fuzzy text match), so a state snapshot before/after the action
+            // is meaningful. Free-text instructions go through fuzzy search
+            // and may be re-resolved between calls, so we skip the toggle
+            // check there and rely on the action executor's own success flag.
+            const idMatch = step.instruction.match(/^(?:click|check|uncheck) element ([\w-]+)$/i);
+            const targetId = idMatch ? idMatch[1] : null;
+            const preState = targetId ? bridge.getElementState(targetId) : undefined;
+
             const result = await executor.execute({ instruction: step.instruction });
             if (!result.success) {
               throw new Error(
                 `Step ${i + 1} failed: ${result.error ?? result.errorCode ?? "action failed"} — could not ${step.instruction}`,
               );
             }
-            // Wait for action to settle
+
+            // Wait for action to settle before observing post-state. The
+            // 300ms here is the same flat settle the executor used before
+            // P18A; the new effect checks run AFTER this so they see the
+            // settled state, not the in-flight transition.
             await new Promise((r) => setTimeout(r, 300));
+
+            // P18A — reject silent toggle no-ops. If the registered element
+            // exposes `checked` (checkbox) or `ariaExpanded` (disclosure),
+            // it MUST flip after a click/check action. Buttons that expose
+            // neither field fall through to P18B (pipeline-phase poll) when
+            // applicable, or just rely on the success flag otherwise.
+            if (targetId && preState) {
+              const postState = bridge.getElementState(targetId);
+              const checkedToggled =
+                preState.checked !== undefined &&
+                postState?.checked !== undefined &&
+                preState.checked !== postState.checked;
+              const expandedToggled =
+                preState.ariaExpanded !== undefined &&
+                postState?.ariaExpanded !== undefined &&
+                preState.ariaExpanded !== postState.ariaExpanded;
+              const hadObservableField =
+                preState.checked !== undefined || preState.ariaExpanded !== undefined;
+              if (hadObservableField && !checkedToggled && !expandedToggled) {
+                throw new Error(
+                  `Step ${i + 1} failed: action had no observable effect on "${targetId}" — element may be disabled, gated, or off-screen (instruction: "${step.instruction}")`,
+                );
+              }
+            }
+
+            // P18B — pipeline-phase poll for the two known phase-changing
+            // triggers. After clicking Analyze or Generate, the
+            // ProjectCoordinator's `data-pipeline-phase` must transition out
+            // of "idle" within 30s; staying at idle means the click reached
+            // the DOM but the React handler didn't fire (button gated,
+            // double-click guard, project not selected, etc).
+            if (targetId && PIPELINE_TRIGGER_IDS.has(targetId)) {
+              await awaitPipelinePhaseTransition(i + 1, targetId);
+            }
           }
         }
 
@@ -206,6 +255,50 @@ export function usePromptExecution(): UsePromptExecutionReturn {
   }, [lastPrompt, submit]);
 
   return { phase, plan, progress, error, errorKind, lastPrompt, submit, retry, reset };
+}
+
+/**
+ * P18B trigger set — element ids whose click is known to drive the
+ * ProjectCoordinator's `data-pipeline-phase` attribute. Adding new entries
+ * here opts those clicks into the 30s phase-transition gate.
+ */
+const PIPELINE_TRIGGER_IDS = new Set<string>([
+  "ui-bridge-analyze-button",
+  "ui-bridge-generate-button",
+]);
+
+/**
+ * Poll the ProjectCoordinator's `data-pipeline-phase` attribute for a
+ * transition out of "idle" after clicking a known phase-changing trigger.
+ *
+ * Resolves on the first non-idle, non-failed phase observed (e.g.
+ * "analyzing", "integrating", "discovering", "generating", "generated",
+ * "applied", "no-pages"). Throws if it stays at "idle" past `timeoutMs`,
+ * or transitions to "failed" at any point.
+ */
+async function awaitPipelinePhaseTransition(
+  stepNumber: number,
+  triggerId: string,
+  timeoutMs = 30000,
+): Promise<void> {
+  const intervalMs = 200;
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const root = document.querySelector<HTMLElement>("[data-pipeline-phase]");
+    const phase = root?.dataset.pipelinePhase;
+    if (phase === "failed") {
+      throw new Error(
+        `Step ${stepNumber} failed: pipeline reported failure (phase=failed) after clicking ${triggerId}`,
+      );
+    }
+    if (phase && phase !== "idle") {
+      return;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(
+    `Step ${stepNumber} failed: pipeline phase did not transition out of idle within ${timeoutMs / 1000} s after clicking ${triggerId} — handler may not have fired`,
+  );
 }
 
 interface StateMachineAPI {
