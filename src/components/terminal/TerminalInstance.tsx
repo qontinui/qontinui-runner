@@ -156,11 +156,16 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     const outputDecoderRef = useRef(new TextDecoder());
     const firstInputReportedRef = useRef(false);
     const inputAccumulatorRef = useRef("");
-    // Gate for reconnection: queues live events until scrollback is replayed
+    // Mount/reconnect gate: queues live `terminal-output` events until the
+    // PTY scrollback has been replayed into xterm. Always created — on first
+    // mount this catches the init burst (alt-screen + welcome banner) that
+    // the PTY emits before the frontend listener is wired up; on reconnect
+    // it replays the entire backlog. `onReconnected` still only fires when
+    // the prop indicated a real reconnect (see usage below).
     const reconnectGateRef = useRef<{
       open: boolean;
       queue: Uint8Array[];
-    } | null>(isReconnecting ? { open: false, queue: [] } : null);
+    } | null>({ open: false, queue: [] });
 
     // Expose selection, write, and scrollback API to parent components
     useImperativeHandle(ref, () => ({
@@ -517,7 +522,11 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           }
           gate.queue.length = 0;
 
-          onReconnectedRef.current?.();
+          // Reconnect callback only fires on actual reconnects, not on the
+          // first-mount scrollback bootstrap that uses the same gate path.
+          if (isReconnecting) {
+            onReconnectedRef.current?.();
+          }
         }
         if (disposed) return;
 
