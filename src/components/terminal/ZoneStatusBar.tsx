@@ -1023,20 +1023,29 @@ function MetricsPopover({
               </div>
             )}
             <div className="h-px bg-[#2a2d3d] my-1" />
+            <div
+              className="text-[9px] uppercase tracking-wider text-[#565f89] mb-1"
+              title="Live count of sessions currently in each state — does not indicate sessions have terminated"
+            >
+              Current state
+            </div>
             <div className="flex justify-between">
-              <span className="text-[#a9b1d6]">Currently working</span>
+              <span className="text-[#a9b1d6]">Working</span>
               <span className="text-[#7aa2f7] font-mono">{stateCounts.working}</span>
             </div>
             <div className="flex justify-between">
-              <span className="text-[#a9b1d6]">Currently waiting</span>
+              <span className="text-[#a9b1d6]">Waiting for input</span>
               <span className="text-[#e0af68] font-mono">{stateCounts["needs-input"]}</span>
             </div>
-            <div className="flex justify-between">
-              <span className="text-[#a9b1d6]">Completed</span>
+            <div
+              className="flex justify-between"
+              title="Session is alive and awaiting the next prompt (last response finished). Does not mean the session has terminated."
+            >
+              <span className="text-[#a9b1d6]">Idle (done responding)</span>
               <span className="text-[#9ece6a] font-mono">{stateCounts.completed}</span>
             </div>
             <div className="flex justify-between">
-              <span className="text-[#a9b1d6]">Errors</span>
+              <span className="text-[#a9b1d6]">Errored</span>
               <span className="text-[#f7768e] font-mono">{stateCounts.error}</span>
             </div>
             {stateTimeAccum &&

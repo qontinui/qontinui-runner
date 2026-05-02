@@ -6,6 +6,10 @@ import { useUIBridgeOptional } from "@qontinui/ui-bridge";
 import { createTerminalBackend } from "./backends";
 import type { BackendType, ITerminalBackend } from "./backends";
 import { instanceStorage } from "@/lib/instance-storage";
+import {
+  registerTerminalBufferReader,
+  unregisterTerminalBufferReader,
+} from "@/lib/terminalBufferRegistry";
 
 export interface TerminalInstanceHandle {
   getSelection: () => string;
@@ -233,6 +237,25 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         }
 
         backendRef.current = backend;
+
+        // Register a cross-page buffer reader so the
+        // `GET /ui-bridge/sdk/terminal/sessions/:session_id/buffer` HTTP
+        // endpoint can fetch this terminal's rendered text via the
+        // `useTerminalBufferIpc` Tauri-event listener. Unregistration
+        // happens in the cleanup branch below.
+        registerTerminalBufferReader(terminalId, (maxLines) => {
+          const totalLines = backend.getBufferLength();
+          const cap = typeof maxLines === "number" && maxLines > 0 ? maxLines : totalLines;
+          const startLine = Math.max(0, totalLines - cap);
+          const lines: string[] = [];
+          for (let i = startLine; i < totalLines; i++) {
+            const line = backend.getBufferLine(i);
+            if (line !== null) {
+              lines.push(line);
+            }
+          }
+          return { lines, totalLines };
+        });
 
         // Register file path link provider (backend-agnostic)
         disposables.push(
@@ -557,6 +580,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           inputEl.removeEventListener("paste", blockNativePaste, true);
         }
         uiBridge?.registry?.unregisterElement(`terminal-input-${terminalId}`);
+        unregisterTerminalBufferReader(terminalId);
         outputUnsub?.();
         exitUnsub?.();
         try {

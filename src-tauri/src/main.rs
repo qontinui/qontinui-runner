@@ -134,6 +134,7 @@ mod storage;
 pub(crate) mod str_utils;
 mod summary_generator;
 mod terminal;
+mod terminal_buffer;
 mod test_executor;
 mod test_orchestrator;
 mod ticket_system;

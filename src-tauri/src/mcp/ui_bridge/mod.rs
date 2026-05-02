@@ -162,8 +162,8 @@ pub use screenshots::{
     ui_bridge_diagnose_stuck_screen_handler, ui_bridge_element_screenshot_handler,
     ui_bridge_get_element_images_handler, ui_bridge_media_analyze_handler,
     ui_bridge_media_audit_handler, ui_bridge_media_find_handler, ui_bridge_media_snapshot_handler,
-    ui_bridge_page_health_handler, AnnotatedScreenshotData, AnnotatedScreenshotQuery,
-    PageHealthRequest,
+    ui_bridge_page_health_handler, ui_bridge_screenshot_handler, AnnotatedScreenshotData,
+    AnnotatedScreenshotQuery, PageHealthRequest, ScreenshotRequest, ScreenshotResponse,
 };
 pub use types::{
     classify_assertion_failure, classify_transport_error, recovery_hint_for, ClipboardWriteRequest,

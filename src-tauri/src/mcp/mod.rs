@@ -105,6 +105,7 @@ pub mod reviews;
 pub mod saved_api_requests;
 pub mod scheduler;
 pub mod sdk_client;
+pub mod sdk_terminal_buffer;
 pub mod security_audit;
 pub mod server;
 pub mod session_recap;

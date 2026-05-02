@@ -511,6 +511,9 @@ pub fn create_router(
         ios_transport: Arc::new(crate::mcp::transport::ios::IosTransport::new()),
         ui_bridge_invoke_store: Arc::new(crate::ui_bridge_invoke::InvokeRequestStore::new()),
         ui_bridge_evaluate_store: Arc::new(crate::ui_bridge_evaluate::EvaluateRequestStore::new()),
+        terminal_buffer_store: Arc::new(
+            crate::terminal_buffer::TerminalBufferRequestStore::new(),
+        ),
     });
 
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
@@ -751,6 +754,100 @@ pub fn create_router(
             }
         });
         info!("UI Bridge: page/evaluate response listener set up");
+    }
+
+    // Set up UI Bridge terminal-buffer response listener.
+    //
+    // Mirrors the `ui-bridge:evaluate-response` listener above, but for the
+    // `GET /ui-bridge/sdk/terminal/sessions/:session_id/buffer` flow. The
+    // React hook (useTerminalBufferIpc) looks up the xterm backend by
+    // session_id, serializes the buffer text, and emits
+    // `{ request_id, ok, lines?, total_lines?, error? }`.
+    {
+        let buffer_store = api_state.terminal_buffer_store.clone();
+        let handle = app_handle.clone();
+
+        use tauri::Listener;
+
+        let _listener_id = handle.listen("ui-bridge:terminal-buffer-response", move |event| {
+            let payload_str = event.payload();
+            let parsed: Option<serde_json::Value> =
+                serde_json::from_str::<serde_json::Value>(payload_str)
+                    .ok()
+                    .and_then(|v| {
+                        if v.is_object() {
+                            Some(v)
+                        } else if let Some(s) = v.as_str() {
+                            serde_json::from_str::<serde_json::Value>(s).ok()
+                        } else {
+                            Some(v)
+                        }
+                    });
+
+            let Some(parsed) = parsed else {
+                warn!(
+                    "UI Bridge terminal-buffer: failed to parse response payload: {}",
+                    &payload_str[..payload_str.len().min(200)]
+                );
+                return;
+            };
+
+            let request_id = parsed
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let Some(request_id) = request_id else {
+                warn!(
+                    "UI Bridge terminal-buffer: response missing request_id: {}",
+                    &payload_str[..payload_str.len().min(200)]
+                );
+                return;
+            };
+
+            let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let lines = parsed
+                .get("lines")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<String>>()
+                });
+            let total_lines = parsed
+                .get("total_lines")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            let error = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let response = crate::terminal_buffer::TerminalBufferResponse {
+                ok,
+                lines,
+                total_lines,
+                error,
+            };
+
+            let store = buffer_store.clone();
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let delivered = store.deliver(&request_id, response).await;
+                    if !delivered {
+                        tracing::debug!(
+                            "UI Bridge terminal-buffer: response for unknown request_id {} (likely timed out)",
+                            request_id
+                        );
+                    }
+                });
+            } else {
+                warn!(
+                    "UI Bridge terminal-buffer: no tokio runtime available — dropping response for {}",
+                    request_id
+                );
+            }
+        });
+        info!("UI Bridge: terminal-buffer response listener set up");
     }
 
     // UI Bridge invoke-proxy wire-contract probe (Phase 1 of

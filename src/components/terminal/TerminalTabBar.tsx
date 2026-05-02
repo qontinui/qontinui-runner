@@ -369,9 +369,14 @@ export function TerminalTabBar({
       aria-label="Terminal sessions"
       className="flex items-center bg-[#13141f] border-b border-[#2a2d3d] h-9 shrink-0"
     >
-      {/* Always-present empty-state indicator for accessibility / spec snapshots. */}
-      <span role="status" aria-live="polite" aria-label="No terminals open" className="sr-only">
-        No terminals open
+      {/* Aria-live indicator that reflects current terminal-tab count for accessibility / spec snapshots. */}
+      <span
+        role="status"
+        aria-live="polite"
+        aria-label={tabs.length === 0 ? "No terminals open" : `${tabs.length} terminal${tabs.length === 1 ? "" : "s"} open`}
+        className="sr-only"
+      >
+        {tabs.length === 0 ? "No terminals open" : `${tabs.length} terminal${tabs.length === 1 ? "" : "s"} open`}
       </span>
       {/* Pinned left: layout picker + terminal creation buttons */}
       <div className="flex items-center gap-0.5 px-1 shrink-0">

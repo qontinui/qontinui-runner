@@ -166,6 +166,8 @@ export { useUIBridgeInvokeHandler, UIBridgeInvokeHandler } from "./useUIBridgeIn
 
 export { useUIBridgeEvaluateHandler, UIBridgeEvaluateHandler } from "./useUIBridgeEvaluateHandler";
 
+export { useTerminalBufferIpc, TerminalBufferIpcHandler } from "./useTerminalBufferIpc";
+
 export { useSpecExecutionHandler, SpecExecutionHandler } from "./useSpecExecutionHandler";
 
 export { useWorkflowGenerator } from "./useWorkflowGenerator";

@@ -4783,6 +4783,13 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Screenshot (monitor capture for SDK apps that can't self-screenshot)
         .route("/ui-bridge/sdk/screenshot", get(handle_screenshot))
+        // Terminal buffer readback — returns the rendered text of an
+        // xterm.js Terminal session, so callers can verify content of
+        // canvas-rendered terminals without taking a screenshot.
+        .route(
+            "/ui-bridge/sdk/terminal/sessions/{session_id}/buffer",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_buffer),
+        )
         // Components
         .route("/ui-bridge/sdk/components", get(handle_components))
         .route("/ui-bridge/sdk/component/{id}", get(handle_component))

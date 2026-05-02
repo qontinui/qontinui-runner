@@ -1767,6 +1767,250 @@ pub async fn ui_bridge_media_analyze_handler(
 }
 
 // ============================================================================
+// Plain screenshot (POST /control/screenshot)
+// ============================================================================
+
+/// Request body for `POST /ui-bridge/control/screenshot`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenshotRequest {
+    /// Optional `data-ui-bridge-id` of an element to crop the screenshot to.
+    /// If omitted, the full runner-window screenshot is returned.
+    #[serde(default)]
+    pub element_id: Option<String>,
+    /// Output image format. `png` (default) is the only supported value
+    /// — `jpeg` is reserved but not currently encodable (the `image` crate
+    /// is built without the jpeg feature; requesting jpeg returns 400).
+    #[serde(default)]
+    pub format: Option<String>,
+    /// JPEG quality 1-100. Currently ignored because jpeg encoding is
+    /// not enabled — kept on the schema so callers can preflight without
+    /// shape changes once jpeg is added.
+    #[serde(default)]
+    pub quality: Option<u8>,
+}
+
+/// Response body for `POST /ui-bridge/control/screenshot`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenshotResponse {
+    /// Base64-encoded PNG bytes (no `data:` prefix).
+    pub image_base64: String,
+    /// Always `"png"` today (see `ScreenshotRequest::format`).
+    pub format: String,
+    /// Width of the returned image in pixels (post-crop if `elementId` set).
+    pub width: i32,
+    /// Height of the returned image in pixels (post-crop if `elementId` set).
+    pub height: i32,
+    /// Echo of the requested elementId, or `null` when full window was returned.
+    #[serde(rename = "elementId")]
+    pub element_id: Option<String>,
+}
+
+/// Look up an element's normalized bounding rect by id via the UI Bridge
+/// `discover` IPC. Mirrors `apply_annotation`'s discover/elements traversal
+/// but matches a single id rather than aggregating all interactive elements.
+/// Returns `Ok(None)` when discover succeeded but no element with that id
+/// exposed a usable rect.
+async fn lookup_element_normalized_rect(
+    state: &Arc<ApiState>,
+    element_id: &str,
+) -> Result<Option<crate::vision::types::NormalizedRect>, String> {
+    let discover_payload = serde_json::json!({ "interactive_only": false });
+    let discover_data = ui_bridge_request_sync(state, "discover", discover_payload)
+        .await
+        .map_err(|e| format!("discover failed: {}", e))?;
+
+    let elements_arr = discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            discover_data
+                .get("data")
+                .and_then(|d| d.get("elements"))
+                .and_then(|v| v.as_array())
+        });
+
+    let Some(elements_arr) = elements_arr else {
+        return Ok(None);
+    };
+
+    for el in elements_arr {
+        let id_str = el.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id_str != element_id {
+            continue;
+        }
+        return Ok(extract_normalized_rect_from_element(el));
+    }
+
+    Ok(None)
+}
+
+/// `POST /ui-bridge/control/screenshot`
+///
+/// Plain (no annotations) base64 PNG of the runner's webview, optionally
+/// cropped to a specific `data-ui-bridge-id` element. Reuses the same
+/// xcap-monitor-then-crop path as the annotated handler so DPI handling
+/// stays in one place.
+pub async fn ui_bridge_screenshot_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<ScreenshotRequest>>,
+) -> Result<Json<ApiResponse<ScreenshotResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+
+    // Format gate. PNG is always available; JPEG would require the `image`
+    // crate's `jpeg` feature which is intentionally not enabled in
+    // src-tauri/Cargo.toml. Reject up front rather than silently degrading.
+    let format = req.format.as_deref().unwrap_or("png").to_lowercase();
+    if format != "png" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "format '{}' not supported — only 'png' is currently encodable",
+                format
+            ))),
+        ));
+    }
+
+    info!(
+        element_id = ?req.element_id,
+        "UI Bridge API: Plain screenshot (control/screenshot)"
+    );
+
+    // --- Phase 1: Capture the runner window ------------------------------
+    use tauri::Manager;
+    let window = state
+        .app_handle
+        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error("Runner window not found".to_string())),
+            )
+        })?;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let pos = window.inner_position().unwrap_or_default();
+    let size = window.inner_size().unwrap_or_default();
+    let x = pos.x;
+    let y = pos.y;
+    let w = size.width;
+    let h = size.height;
+    let title = window
+        .title()
+        .unwrap_or_else(|_| "Qontinui Runner".to_string());
+
+    let captured = match tokio::task::spawn_blocking(move || {
+        capture_runner_window(x, y, w, h, scale, &title)
+    })
+    .await
+    {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => {
+            error!("UI Bridge screenshot: capture failed: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Screenshot capture failed: {}", e))),
+            ));
+        }
+        Err(e) => {
+            error!("UI Bridge screenshot: capture task join error: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Screenshot capture task failed: {}",
+                    e
+                ))),
+            ));
+        }
+    };
+
+    // --- Phase 2: Optional crop to element bounds ------------------------
+    if let Some(ref id) = req.element_id {
+        let rect = match lookup_element_normalized_rect(&state, id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(format!(
+                        "element_not_found: no element with data-ui-bridge-id '{}' \
+                         (or it has no usable bounding rect)",
+                        id
+                    ))),
+                ));
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("element lookup failed: {}", e))),
+                ));
+            }
+        };
+
+        // Decode base64 PNG → DynamicImage, crop in pixel space, re-encode.
+        use base64::Engine;
+        let png_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&captured.screenshot)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("base64 decode failed: {}", e))),
+                )
+            })?;
+        let img = image::load_from_memory(&png_bytes).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("image decode failed: {}", e))),
+            )
+        })?;
+
+        let img_w = img.width();
+        let img_h = img.height();
+        let crop_x = (rect.x as f64 * img_w as f64).round().max(0.0) as u32;
+        let crop_y = (rect.y as f64 * img_h as f64).round().max(0.0) as u32;
+        let crop_w = (rect.width as f64 * img_w as f64).round().max(1.0) as u32;
+        let crop_h = (rect.height as f64 * img_h as f64).round().max(1.0) as u32;
+        let crop_w = crop_w.min(img_w.saturating_sub(crop_x));
+        let crop_h = crop_h.min(img_h.saturating_sub(crop_y));
+
+        if crop_w == 0 || crop_h == 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "element_not_found: element '{}' has zero-area bounding rect \
+                     (rect=({:.3},{:.3},{:.3},{:.3}), image={}x{})",
+                    id, rect.x, rect.y, rect.width, rect.height, img_w, img_h
+                ))),
+            ));
+        }
+
+        let cropped = img.crop_imm(crop_x, crop_y, crop_w, crop_h);
+        let cropped_b64 = encode_image_to_base64(&cropped).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("png encode failed: {}", e))),
+            )
+        })?;
+
+        return Ok(Json(ApiResponse::success(ScreenshotResponse {
+            image_base64: cropped_b64,
+            format: "png".to_string(),
+            width: crop_w as i32,
+            height: crop_h as i32,
+            element_id: Some(id.clone()),
+        })));
+    }
+
+    // --- Phase 3: No element crop — return the captured runner window ----
+    Ok(Json(ApiResponse::success(ScreenshotResponse {
+        image_base64: captured.screenshot,
+        format: "png".to_string(),
+        width: captured.width,
+        height: captured.height,
+        element_id: None,
+    })))
+}
+
+// ============================================================================
 // Routes + manifest
 // ============================================================================
 
@@ -1777,6 +2021,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/control/annotated-screenshot",
             get(ui_bridge_annotated_screenshot_handler),
+        )
+        .route(
+            "/ui-bridge/control/screenshot",
+            post(ui_bridge_screenshot_handler),
         )
         .route(
             "/ui-bridge/control/diagnose-stuck",
@@ -1851,6 +2099,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     &[
         ("GET", "/ui-bridge/control/annotated-screenshot"),
+        ("POST", "/ui-bridge/control/screenshot"),
         ("POST", "/ui-bridge/control/diagnose-stuck"),
         ("POST", "/ui-bridge/control/page-health"),
         ("GET", "/ui-bridge/control/element-screenshot"),
