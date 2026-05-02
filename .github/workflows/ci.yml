@@ -12,6 +12,11 @@ env:
 jobs:
   test:
     strategy:
+      # Surface platform-specific failures independently. Default fail-fast
+      # cancels ubuntu/windows the moment macos clippy trips, masking
+      # whether the linux/win build is actually OK. Now blocked only by
+      # genuine per-platform failures.
+      fail-fast: false
       matrix:
         platform: [ubuntu-22.04, macos-latest, windows-latest]
 
