@@ -121,7 +121,7 @@ export function KnowledgeBrowser({ mode = "modal", open = true, onClose }: Knowl
   const body = (
     <div
       className="flex flex-col h-full bg-background"
-      data-page-id="productivity-knowledge"
+      data-page-id={mode === "modal" ? "productivity-knowledge-modal" : "productivity-knowledge"}
       data-ui-bridge-id="productivity.knowledge-browser"
     >
       {/* Header / search bar */}

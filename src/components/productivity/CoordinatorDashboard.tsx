@@ -880,6 +880,15 @@ export function CoordinatorDashboard() {
           </p>
         </header>
 
+        {/*
+         * Panel order is part of the productivity-stack spec
+         * (productivity-stack.md §6, productivity.spec.uibridge.json
+         * group `productivity-coordinator-panels:order-invariant`):
+         * PlanRecommendations → Recommendations → Advisories →
+         * Escalations → Decision Log. Spec assertions read this
+         * order top-to-bottom. Don't reorder without updating the
+         * spec assertion in the same PR.
+         */}
         <PlanRecommendations />
 
         <RecommendationsPanel
