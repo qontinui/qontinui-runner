@@ -925,43 +925,47 @@ export function CoordinatorDashboard() {
   // Phase 3 launch controls. After a successful spawn, immediately refresh
   // the lease so the pill flips to "active" without waiting for the next
   // 5s tick, then hand off to the Terminals tab via the sidebar SM.
+  // `navigateHandler` is registered unconditionally by useAppNavigation
+  // (see useAppNavigation.ts:368). Calling it with the page slug
+  // `"terminal"` flips the active main tab via PAGE_TO_TAB.
+  // Avoid `__UI_BRIDGE__.stateMachine.navigateTo` — that property is
+  // only present when the spec auto-compile succeeds, and the runner's
+  // 47-element duplicate quarantine routinely leaves it undefined,
+  // making the optional-chained call silently no-op.
+  const revealTerminalTab = useCallback(() => {
+    const handler = (
+      window as unknown as {
+        __UI_BRIDGE__?: { navigateHandler?: (url: string) => void };
+      }
+    )?.__UI_BRIDGE__?.navigateHandler;
+    handler?.("terminal");
+  }, []);
+
   const handleLaunchCoordinator = useCallback(async () => {
     setLaunchError(null);
     try {
       await launchCoordinatorSession({ planPath: null, titleHint: null });
       await loadLease();
-      const win = window as unknown as {
-        __UI_BRIDGE__?: {
-          stateMachine?: { navigateTo?: (id: string) => Promise<void> | void };
-        };
-      };
-      // State id is `tab-terminal` per sidebar.spec.uibridge.json (NOT
-      // `terminal-tab`). Bail silently if the SM is unavailable in tests.
-      await win?.__UI_BRIDGE__?.stateMachine?.navigateTo?.("tab-terminal");
+      revealTerminalTab();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("Failed to launch Coordinator:", err);
       setLaunchError(`Failed to launch Coordinator: ${msg}`);
     }
-  }, [loadLease]);
+  }, [loadLease, revealTerminalTab]);
 
   const handleSpawnWorker = useCallback(async () => {
     setLaunchError(null);
     try {
       await spawnWorkerSession({ titleHint: null });
       await loadLease();
-      const win = window as unknown as {
-        __UI_BRIDGE__?: {
-          stateMachine?: { navigateTo?: (id: string) => Promise<void> | void };
-        };
-      };
-      await win?.__UI_BRIDGE__?.stateMachine?.navigateTo?.("tab-terminal");
+      revealTerminalTab();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("Failed to spawn worker:", err);
       setLaunchError(`Failed to spawn worker: ${msg}`);
     }
-  }, [loadLease]);
+  }, [loadLease, revealTerminalTab]);
 
   const handleAcknowledgeAdvisory = useCallback(
     async (decisionId: string) => {

@@ -557,15 +557,25 @@ fn resolve_runner_repo_path() -> Option<String> {
     }
 }
 
-/// Build the wiring prompt the user would otherwise type by hand. Pinning
-/// the runner port prevents the Coordinator from talking to the wrong
-/// runner instance (e.g. the default 9876 when this is a temp/secondary
-/// runner on a different port).
+/// Build the wiring prompt the user would otherwise type by hand and
+/// stage it on disk. Returns a single-line shell invocation that feeds
+/// the prompt to `claude` via `Get-Content -Raw`.
+///
+/// Why temp-file + Get-Content rather than `cd <path> && claude "<prompt>"`:
+/// 1. PowerShell 5.1 (the default Windows shell the pty inherits) does
+///    NOT support `&&` as a chain operator — `cd ... && claude ...`
+///    raises `The token '&&' is not a valid statement separator`.
+/// 2. Multi-line prompts written into a pty are interpreted line-by-line
+///    by PSReadLine; embedded `\n` characters break out of the quoted
+///    arg and PowerShell tries to execute the prompt body as commands.
+/// Bundling the prompt into a temp file sidesteps both — the pty sees
+/// one short line that PowerShell parses cleanly, and `cd` is unneeded
+/// because `TerminalManager::create` already starts the pty in
+/// `working_dir = Some(repo_path)`.
 fn build_coordinator_initial_command(
-    repo_path: &str,
     runner_port: u16,
     plan_path: Option<&str>,
-) -> String {
+) -> Result<String, String> {
     let plan_line = match plan_path {
         Some(p) if !p.is_empty() => format!("\nPlan to schedule: {}", p),
         _ => String::new(),
@@ -573,13 +583,25 @@ fn build_coordinator_initial_command(
     let prompt = format!(
         "/coordinate\n\nCoordinate against THIS runner (port {port}, not 9876). \
 All HTTP calls in your observe->decide->act loop must hit \
-http://localhost:{port}/coordinator/state and /coordinator/act.{plan_line}",
+http://localhost:{port}/coordinator/state and /coordinator/act.{plan_line}\n",
         port = runner_port,
         plan_line = plan_line,
     );
-    // Escape embedded double-quotes so the shell sees a single positional arg.
-    let escaped = prompt.replace('"', "\\\"");
-    format!("cd {repo} && claude \"{escaped}\"", repo = repo_path)
+
+    let dir = std::env::temp_dir().join("qontinui-launch-prompts");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create launch-prompt dir: {}", e))?;
+    let file_name = format!("coordinator-{}.md", uuid::Uuid::new_v4());
+    let path = dir.join(file_name);
+    std::fs::write(&path, &prompt)
+        .map_err(|e| format!("Failed to write launch-prompt file: {}", e))?;
+
+    // PowerShell single-quoted strings don't expand variables and don't
+    // interpret backslash escapes — safest quoting for a Windows path.
+    // Double any literal single quotes per PS escape rules (rare on
+    // temp paths but cheap defense).
+    let escaped_path = path.to_string_lossy().replace('\'', "''");
+    Ok(format!("claude (Get-Content -Raw '{}')", escaped_path))
 }
 
 /// Auto-numbered "Worker N" title — finds the highest existing N across
@@ -657,7 +679,7 @@ pub async fn launch_coordinator_session(
     let repo_path = resolve_runner_repo_path()
         .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
     let initial_command =
-        build_coordinator_initial_command(&repo_path, runner_port, plan_path.as_deref());
+        build_coordinator_initial_command(runner_port, plan_path.as_deref())?;
     let title = title_hint.unwrap_or_else(|| "Coordinator".to_string());
 
     let terminal_manager = app_handle
@@ -702,7 +724,11 @@ pub async fn spawn_worker_session(
         .clone();
 
     let title = title_hint.unwrap_or_else(|| next_worker_title(&terminal_manager));
-    let initial_command = format!("cd {} && claude", repo_path);
+    // PowerShell 5.1 doesn't accept `&&`, and the pty already starts
+    // with `working_dir = Some(repo_path)` — no `cd` needed. Worker tabs
+    // sit idle at the Claude prompt; Coordinator dispatches via
+    // assign-task → POST /sessions/<id>/message.
+    let initial_command = "claude".to_string();
 
     let info = terminal_manager.create(
         Some(title),
