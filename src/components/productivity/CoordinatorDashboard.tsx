@@ -21,6 +21,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { formatDistanceToNowStrict } from "date-fns";
 import {
   RefreshCw,
   AlertTriangle,
@@ -32,10 +33,15 @@ import {
 } from "lucide-react";
 import {
   getCoordinatorDecisions,
+  getCoordinatorLeader,
   getEscalations,
+  launchCoordinatorSession,
   resolveEscalation,
+  spawnWorkerSession,
   type CoordinatorDecision,
+  type CoordinatorLeaderRow,
   type Escalation,
+  type LeaderResponse,
 } from "./coordinatorApi";
 import {
   approveRecommendation,
@@ -621,6 +627,51 @@ function DecisionLogPanel({
 }
 
 // ---------------------------------------------------------------------------
+// Lease status pill (Phase 3 — launch controls)
+// ---------------------------------------------------------------------------
+
+interface CoordinatorLeaseStatusPillProps {
+  status: "active" | "stale" | "vacant";
+  leader: CoordinatorLeaderRow | null;
+}
+
+function safeFormatAge(iso: string | undefined | null): string {
+  if (!iso) return "unknown";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "unknown";
+  return formatDistanceToNowStrict(d);
+}
+
+function CoordinatorLeaseStatusPill({ status, leader }: CoordinatorLeaseStatusPillProps) {
+  let className: string;
+  let text: string;
+
+  if (status === "active" && leader) {
+    className =
+      "inline-flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300";
+    text = `Coordinator: running (${leader.instanceId.slice(0, 8)}, ${safeFormatAge(leader.renewedAt)})`;
+  } else if (status === "stale" && leader) {
+    className =
+      "inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-300";
+    text = `Coordinator: stale lease (last heartbeat ${safeFormatAge(leader.renewedAt)} ago)`;
+  } else {
+    className =
+      "inline-flex items-center gap-1.5 rounded-full border border-border/40 bg-muted/20 px-2.5 py-1 text-xs font-medium text-muted-foreground";
+    text = "Coordinator: vacant";
+  }
+
+  return (
+    <span
+      className={className}
+      data-ui-bridge-id="productivity.lease-status-pill"
+      data-lease-status={status}
+    >
+      {text}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Top-level dashboard
 // ---------------------------------------------------------------------------
 
@@ -640,6 +691,8 @@ export function CoordinatorDashboard() {
   const [ruleFilter, setRuleFilter] = useState("");
   const [actionFilter, setActionFilter] = useState("");
   const [highlightedReviewId, setHighlightedReviewId] = useState<string | null>(null);
+  const [leaderResponse, setLeaderResponse] = useState<LeaderResponse | null>(null);
+  const [launchError, setLaunchError] = useState<string | null>(null);
 
   const loadDecisions = useCallback(async () => {
     setDecisionsLoading(true);
@@ -712,6 +765,28 @@ export function CoordinatorDashboard() {
       setAdvisoriesLoading(false);
     }
   }, []);
+
+  // Phase 3 — Coordinator lease (header pill + Start button gating). The
+  // backend `get_coordinator_leader` Tauri command may not exist on older
+  // runner builds; swallow errors and fall back to the `vacant` default.
+  const loadLease = useCallback(async () => {
+    try {
+      const resp = await getCoordinatorLeader();
+      setLeaderResponse(resp);
+    } catch {
+      // Soft-fail: keep the previous response (or null) so the pill renders
+      // as `vacant` without flashing an error to the user.
+    }
+  }, []);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async data load on dependency change
+    void loadLease();
+    const id = setInterval(() => {
+      void loadLease();
+    }, 5000);
+    return () => clearInterval(id);
+  }, [loadLease]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- async data load on dependency change
@@ -847,6 +922,47 @@ export function CoordinatorDashboard() {
     [loadRecommendations],
   );
 
+  // Phase 3 launch controls. After a successful spawn, immediately refresh
+  // the lease so the pill flips to "active" without waiting for the next
+  // 5s tick, then hand off to the Terminals tab via the sidebar SM.
+  const handleLaunchCoordinator = useCallback(async () => {
+    setLaunchError(null);
+    try {
+      await launchCoordinatorSession({ planPath: null, titleHint: null });
+      await loadLease();
+      const win = window as unknown as {
+        __UI_BRIDGE__?: {
+          stateMachine?: { navigateTo?: (id: string) => Promise<void> | void };
+        };
+      };
+      // State id is `tab-terminal` per sidebar.spec.uibridge.json (NOT
+      // `terminal-tab`). Bail silently if the SM is unavailable in tests.
+      await win?.__UI_BRIDGE__?.stateMachine?.navigateTo?.("tab-terminal");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("Failed to launch Coordinator:", err);
+      setLaunchError(`Failed to launch Coordinator: ${msg}`);
+    }
+  }, [loadLease]);
+
+  const handleSpawnWorker = useCallback(async () => {
+    setLaunchError(null);
+    try {
+      await spawnWorkerSession({ titleHint: null });
+      await loadLease();
+      const win = window as unknown as {
+        __UI_BRIDGE__?: {
+          stateMachine?: { navigateTo?: (id: string) => Promise<void> | void };
+        };
+      };
+      await win?.__UI_BRIDGE__?.stateMachine?.navigateTo?.("tab-terminal");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("Failed to spawn worker:", err);
+      setLaunchError(`Failed to spawn worker: ${msg}`);
+    }
+  }, [loadLease]);
+
   const handleAcknowledgeAdvisory = useCallback(
     async (decisionId: string) => {
       try {
@@ -869,9 +985,49 @@ export function CoordinatorDashboard() {
   const recommendationRows = useMemo(() => recommendations, [recommendations]);
   const advisoryRows = useMemo(() => advisories, [advisories]);
 
+  // Defaults to `vacant` when the leader endpoint is unavailable (older
+  // runner builds without the Phase 1 backend command).
+  const leaseStatus: "active" | "stale" | "vacant" = leaderResponse?.leaseStatus ?? "vacant";
+  const leader: CoordinatorLeaderRow | null = leaderResponse?.leader ?? null;
+
+  // Match the existing in-file button styling (see refresh buttons). The
+  // dashboard doesn't import a `Button` component — uses plain <button>.
+  const baseBtnClass =
+    "inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed";
+  const primaryBtnClass = `${baseBtnClass} bg-primary text-primary-foreground hover:bg-primary/90`;
+  const outlineBtnClass = `${baseBtnClass} border border-border text-foreground hover:bg-muted/30`;
+
   return (
     <div className="h-full overflow-auto bg-background" data-page-id="productivity-coordinator">
       <div className="flex flex-col gap-4 p-4 max-w-5xl mx-auto">
+        <div className="flex items-center justify-between mb-2">
+          <CoordinatorLeaseStatusPill status={leaseStatus} leader={leader} />
+          <div className="flex gap-2">
+            <button
+              type="button"
+              className={leaseStatus === "active" ? outlineBtnClass : primaryBtnClass}
+              disabled={leaseStatus === "active"}
+              onClick={handleLaunchCoordinator}
+              data-ui-bridge-id="productivity.launch-coordinator"
+            >
+              {leaseStatus === "stale" ? "Force-takeover Coordinator" : "Start Coordinator"}
+            </button>
+            <button
+              type="button"
+              className={outlineBtnClass}
+              onClick={handleSpawnWorker}
+              data-ui-bridge-id="productivity.spawn-worker"
+            >
+              Spawn worker tab
+            </button>
+          </div>
+        </div>
+        {launchError ? (
+          <div className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400">
+            {launchError}
+          </div>
+        ) : null}
+
         <header>
           <h1 className="text-lg font-semibold text-foreground">Coordinator dashboard</h1>
           <p className="text-sm text-muted-foreground">

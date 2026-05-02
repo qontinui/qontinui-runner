@@ -79,3 +79,55 @@ export async function getEscalations(): Promise<Escalation[]> {
 export async function resolveEscalation(decisionId: string, resolution: string): Promise<boolean> {
   return invoke<boolean>("resolve_escalation", { decisionId, resolution });
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 — Coordinator launch controls (header buttons + lease status pill)
+// ---------------------------------------------------------------------------
+
+/** A single `coordinator_leader` lease row. Timestamps are RFC3339 UTC
+ *  strings (the Rust side serializes them via `::text` from PG). */
+export interface CoordinatorLeaderRow {
+  instanceId: string;
+  leasedUntil: string;
+  acquiredAt: string;
+  renewedAt: string;
+}
+
+/** Result of `get_coordinator_leader`. `leaseStatus` is computed Rust-side
+ *  off `leased_until` vs `NOW()` and `renewed_at` heartbeat freshness:
+ *  - `active`  — lease holder is alive (renewed within ~90s).
+ *  - `stale`   — lease still owned but heartbeat older than ~90s.
+ *  - `vacant`  — no row, or `leased_until` already in the past. */
+export interface LeaderResponse {
+  leader: CoordinatorLeaderRow | null;
+  leaseStatus: "active" | "stale" | "vacant";
+}
+
+/** Result of `launch_coordinator_session` / `spawn_worker_session`. The
+ *  frontend uses `terminalId` only to confirm the launch succeeded; the
+ *  sidebar state-machine `navigateTo("tab-terminal")` reveals the new
+ *  pty without needing the id. */
+export interface LaunchResult {
+  terminalId: string;
+}
+
+/** Read the current `coordinator_leader` row + derived lease status. */
+export async function getCoordinatorLeader(): Promise<LeaderResponse> {
+  return invoke<LeaderResponse>("get_coordinator_leader");
+}
+
+/** Spawn a Coordinator Claude session in a fresh Terminal tab. The new
+ *  pty runs `claude "/coordinate ..."` with the runner port baked in. */
+export async function launchCoordinatorSession(args: {
+  planPath?: string | null;
+  titleHint?: string | null;
+}): Promise<LaunchResult> {
+  return invoke<LaunchResult>("launch_coordinator_session", args);
+}
+
+/** Spawn an idle worker Claude session in a fresh Terminal tab. */
+export async function spawnWorkerSession(args: {
+  titleHint?: string | null;
+}): Promise<LaunchResult> {
+  return invoke<LaunchResult>("spawn_worker_session", args);
+}

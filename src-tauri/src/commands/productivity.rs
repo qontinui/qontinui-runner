@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -17,11 +18,13 @@ use tracing::warn;
 
 use crate::commands::AppState;
 use crate::database::pg::coordinator_decisions::CoordinatorDecisionRow;
+use crate::database::pg::coordinator_leader::CoordinatorLeaderRow;
 use crate::database::pg::plans::PlanRow;
 use crate::database::pg::productivity_knowledge::KnowledgeHit;
 use crate::database::pg::reviews::ReviewRow;
 use crate::database::pg::tasks::TaskRow;
 use crate::executor::upcoming_file_registry::UpcomingClaim;
+use crate::terminal::TerminalManager;
 
 /// Detail payload for a single task — bundles the row plus
 /// upcoming-claim peers (other tasks claiming the same paths).
@@ -461,4 +464,258 @@ pub async fn acknowledge_advisory(
         .pg_db
         .resolve_coordinator_decision(&decision_id, "acknowledged")
         .await
+}
+
+// ============================================================================
+// Coordinator launch controls — Phases 1 & 2
+// ============================================================================
+
+/// Snapshot of the coordinator-leader lease + a discriminator the dashboard
+/// uses to colour the status pill.
+///
+/// `lease_status` rules (computed against `chrono::Utc::now()`):
+/// - `"active"`: `leased_until > NOW()` AND `renewed_at` within last 90s
+/// - `"stale"`:  `leased_until > NOW()` but `renewed_at` older than 90s
+/// - `"vacant"`: no leader row OR `leased_until <= NOW()`
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaderResponse {
+    pub leader: Option<CoordinatorLeaderRow>,
+    /// One of `"active" | "stale" | "vacant"`.
+    pub lease_status: String,
+}
+
+/// Result returned by [`launch_coordinator_session`] / [`spawn_worker_session`].
+/// The frontend uses `terminal_id` to focus the new tab.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchResult {
+    pub terminal_id: String,
+}
+
+/// Compute the `lease_status` discriminator for a `CoordinatorLeaderRow`.
+/// `leased_until` and `renewed_at` come back from PG as RFC3339-ish text
+/// (`::text` cast); we parse them to compare against `Utc::now()`.
+pub(crate) fn compute_lease_status_for_http(leader: &Option<CoordinatorLeaderRow>) -> String {
+    compute_lease_status(leader)
+}
+
+fn compute_lease_status(leader: &Option<CoordinatorLeaderRow>) -> String {
+    let Some(row) = leader.as_ref() else {
+        return "vacant".to_string();
+    };
+    let now = chrono::Utc::now();
+
+    let leased_until = match chrono::DateTime::parse_from_rfc3339(&row.leased_until) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(_) => return "vacant".to_string(),
+    };
+    if leased_until <= now {
+        return "vacant".to_string();
+    }
+
+    let renewed_at = match chrono::DateTime::parse_from_rfc3339(&row.renewed_at) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(_) => return "stale".to_string(),
+    };
+    let age = now.signed_duration_since(renewed_at);
+    if age <= chrono::Duration::seconds(90) {
+        "active".to_string()
+    } else {
+        "stale".to_string()
+    }
+}
+
+/// Read the current coordinator-leader lease + computed status. Drives the
+/// dashboard's "Coordinator: active/stale/vacant" status pill and the
+/// enabled-state of the Start/Force-takeover button.
+#[tauri::command]
+pub async fn get_coordinator_leader(
+    app_handle: tauri::AppHandle,
+) -> Result<LeaderResponse, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let leader = app_state.pg_db.current_coordinator_leader().await?;
+    let lease_status = compute_lease_status(&leader);
+    Ok(LeaderResponse {
+        leader,
+        lease_status,
+    })
+}
+
+/// Resolve `<workspace_root>/qontinui-runner` for use as the working dir
+/// of the spawned terminal. Falls back to whatever
+/// `current_project_path()` returns, since the terminal manager itself
+/// also defaults there.
+fn resolve_runner_repo_path() -> Option<String> {
+    let workspace_root = crate::mcp::shared::current_project_path()?;
+    let repo = std::path::Path::new(&workspace_root).join("qontinui-runner");
+    if repo.is_dir() {
+        Some(repo.to_string_lossy().to_string())
+    } else {
+        // Fallback: workspace root itself (terminal manager handles missing).
+        Some(workspace_root)
+    }
+}
+
+/// Build the wiring prompt the user would otherwise type by hand. Pinning
+/// the runner port prevents the Coordinator from talking to the wrong
+/// runner instance (e.g. the default 9876 when this is a temp/secondary
+/// runner on a different port).
+fn build_coordinator_initial_command(
+    repo_path: &str,
+    runner_port: u16,
+    plan_path: Option<&str>,
+) -> String {
+    let plan_line = match plan_path {
+        Some(p) if !p.is_empty() => format!("\nPlan to schedule: {}", p),
+        _ => String::new(),
+    };
+    let prompt = format!(
+        "/coordinate\n\nCoordinate against THIS runner (port {port}, not 9876). \
+All HTTP calls in your observe->decide->act loop must hit \
+http://localhost:{port}/coordinator/state and /coordinator/act.{plan_line}",
+        port = runner_port,
+        plan_line = plan_line,
+    );
+    // Escape embedded double-quotes so the shell sees a single positional arg.
+    let escaped = prompt.replace('"', "\\\"");
+    format!("cd {repo} && claude \"{escaped}\"", repo = repo_path)
+}
+
+/// Auto-numbered "Worker N" title — finds the highest existing N across
+/// open terminals matching `^Worker (\d+)$` and returns `Worker (N+1)`.
+fn next_worker_title(manager: &TerminalManager) -> String {
+    let mut max_n: u32 = 0;
+    for info in manager.list() {
+        let title = info.title.trim();
+        if let Some(rest) = title.strip_prefix("Worker ") {
+            if let Ok(n) = rest.trim().parse::<u32>() {
+                if n > max_n {
+                    max_n = n;
+                }
+            }
+        }
+    }
+    format!("Worker {}", max_n + 1)
+}
+
+/// Spawn the post-init shell-line write that `terminal_create` doesn't
+/// do for us when invoked via Tauri (the HTTP path at
+/// `mcp/terminals.rs:115-126` does this; we replicate it here so the
+/// dashboard's launch buttons get the same behaviour).
+fn schedule_initial_command(
+    manager: Arc<TerminalManager>,
+    terminal_id: String,
+    initial_command: String,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Some(session) = manager.get(&terminal_id) {
+            let line = format!("{}\r\n", initial_command);
+            if let Err(e) = session.write(line.as_bytes()) {
+                warn!(
+                    "launch session: failed to write initial command to {}: {}",
+                    terminal_id, e
+                );
+            }
+        } else {
+            warn!(
+                "launch session: terminal {} vanished before initial command write",
+                terminal_id
+            );
+        }
+    });
+}
+
+/// Spawn a fresh "Coordinator" terminal tab running `claude "/coordinate ..."`
+/// with the runner port pre-injected. Defends against double-launch by
+/// checking the leader lease first — refuses when an existing lease is
+/// `active`. Stale and vacant leases proceed.
+#[tauri::command]
+pub async fn launch_coordinator_session(
+    app_handle: tauri::AppHandle,
+    plan_path: Option<String>,
+    title_hint: Option<String>,
+) -> Result<LaunchResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+
+    // Single-coordinator enforcement (defense-in-depth — frontend disables
+    // the button anyway when status == "active"). Stale leases proceed —
+    // the takeover happens transparently when the new Coordinator's
+    // try_acquire_coordinator_lease fires.
+    let leader = app_state.pg_db.current_coordinator_leader().await?;
+    let status = compute_lease_status(&leader);
+    if status == "active" {
+        let id = leader
+            .as_ref()
+            .map(|l| l.instance_id.as_str())
+            .unwrap_or("unknown");
+        return Err(format!("Coordinator already running (instance {})", id));
+    }
+
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+    let repo_path = resolve_runner_repo_path()
+        .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
+    let initial_command =
+        build_coordinator_initial_command(&repo_path, runner_port, plan_path.as_deref());
+    let title = title_hint.unwrap_or_else(|| "Coordinator".to_string());
+
+    let terminal_manager = app_handle
+        .try_state::<Arc<TerminalManager>>()
+        .ok_or_else(|| "TerminalManager not initialised".to_string())?
+        .inner()
+        .clone();
+
+    let info = terminal_manager.create(
+        Some(title),
+        Some(repo_path),
+        None,
+        None,
+        None,
+        app_handle.clone(),
+    )?;
+
+    schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
+
+    Ok(LaunchResult {
+        terminal_id: info.id,
+    })
+}
+
+/// Spawn a fresh "Worker N" terminal tab running plain `claude` (no slash
+/// command). Workers sit idle at the prompt until the Coordinator
+/// dispatches an `assign-task` action.
+#[tauri::command]
+pub async fn spawn_worker_session(
+    app_handle: tauri::AppHandle,
+    title_hint: Option<String>,
+) -> Result<LaunchResult, String> {
+    let _app_state = require_app_state(&app_handle)?;
+
+    let repo_path = resolve_runner_repo_path()
+        .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
+
+    let terminal_manager = app_handle
+        .try_state::<Arc<TerminalManager>>()
+        .ok_or_else(|| "TerminalManager not initialised".to_string())?
+        .inner()
+        .clone();
+
+    let title = title_hint.unwrap_or_else(|| next_worker_title(&terminal_manager));
+    let initial_command = format!("cd {} && claude", repo_path);
+
+    let info = terminal_manager.create(
+        Some(title),
+        Some(repo_path),
+        None,
+        None,
+        None,
+        app_handle.clone(),
+    )?;
+
+    schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
+
+    Ok(LaunchResult {
+        terminal_id: info.id,
+    })
 }

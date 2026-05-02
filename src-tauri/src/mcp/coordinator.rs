@@ -574,6 +574,34 @@ async fn coordinator_act(
 }
 
 // =============================================================================
+// /coordinator/leader
+// =============================================================================
+
+/// HTTP mirror of the `get_coordinator_leader` Tauri command. Returns the
+/// same `LeaderResponse` shape (camelCase JSON) so external agents can
+/// poll the lease status without going through Tauri IPC.
+async fn get_coordinator_leader(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<crate::commands::productivity::LeaderResponse>, (StatusCode, String)> {
+    let leader = state
+        .app_state
+        .pg_db
+        .current_coordinator_leader()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("current_coordinator_leader: {}", e),
+            )
+        })?;
+    let lease_status = crate::commands::productivity::compute_lease_status_for_http(&leader);
+    Ok(Json(crate::commands::productivity::LeaderResponse {
+        leader,
+        lease_status,
+    }))
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -581,4 +609,5 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/coordinator/state", get(get_coordinator_state))
         .route("/coordinator/act", post(coordinator_act))
+        .route("/coordinator/leader", get(get_coordinator_leader))
 }
