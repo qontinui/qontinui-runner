@@ -92,6 +92,7 @@
   "private": true,
   "scripts": {
     "build": "tsc && vite build",
+    "build-ir": "node ../ui-bridge-auto/dist/ir-builder/cli.cjs --document-id=runner-root --document-name=\"Qontinui Runner\" --include=\"src/**/*.tsx\" --out=\"specs/pages/runner-root/state-machine.derived.json\"",
     "build-storybook": "storybook build",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run validate:ws-actions && npm run vocab:check",
     "check:all": "npm run check && npm run rust:check && npm run rust:lint",
