@@ -1,0 +1,340 @@
+{
+  "version": "1.0",
+  "id": "settings",
+  "name": "Settings",
+  "states": [
+    {
+      "id": "settings-purpose",
+      "name": "Page Purpose",
+      "requiredElements": [
+        {
+          "text": "Settings"
+        },
+        {
+          "role": "navigation"
+        }
+      ],
+      "description": "The Settings page is the central configuration hub for the entire runner application.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-ai-config",
+      "name": "AI Provider Configuration Goals",
+      "requiredElements": [
+        {
+          "text": "AI"
+        },
+        {
+          "text": "Model"
+        }
+      ],
+      "description": "Users need to configure which AI providers and models power their automation workflows.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-claude-accounts",
+      "name": "Claude Account Switching",
+      "requiredElements": [
+        {
+          "text": "Claude Accounts"
+        },
+        {
+          "text": "Active"
+        },
+        {
+          "text": "Switch"
+        },
+        {
+          "text": "Rate-limited"
+        },
+        {
+          "textContains": "failover on rate-limit"
+        },
+        {
+          "text": "Switching..."
+        }
+      ],
+      "description": "The AI tab's Claude Accounts section supports multi-account management with automatic failover on rate-limit. Users can see which account is active, which are rate-limited, and manually switch between accounts. When in Least Usage mode, the runner auto-selects the best account at startup and auto-rotates on rate-limit during workflows.",
+      "precondition": "AI Providers tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-agentic",
+      "name": "Agentic Behavior Goals",
+      "requiredElements": [
+        {
+          "text": "iteration"
+        }
+      ],
+      "description": "Users fine-tune how the AI behaves during workflow execution.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-integrations",
+      "name": "Integration Configuration Goals",
+      "requiredElements": [
+        {
+          "text": "MCP"
+        },
+        {
+          "text": "Log Sources"
+        },
+        {
+          "text": "Playwright"
+        }
+      ],
+      "description": "Users configure external integrations like MCP servers, cloud relay, Playwright, and log sources.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-data-management",
+      "name": "Data Management Goals",
+      "requiredElements": [
+        {
+          "text": "Backup"
+        },
+        {
+          "text": "Updates"
+        }
+      ],
+      "description": "Users manage storage, backups, and updates.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-claude-auth",
+      "name": "Claude CLI Authentication Status",
+      "requiredElements": [
+        {
+          "textContains": "Auth"
+        },
+        {
+          "textContains": "subscription"
+        },
+        {
+          "textContains": "expir"
+        },
+        {
+          "textContains": "uthenticat"
+        }
+      ],
+      "description": "The Claude CLI section displays authentication status including subscription type and expiry countdown, with the ability to re-authenticate when needed.",
+      "precondition": "AI Providers tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-claude-execution",
+      "name": "Claude CLI Execution Configuration",
+      "requiredElements": [
+        {
+          "textContains": "Execution Mode"
+        },
+        {
+          "textContains": "executable"
+        },
+        {
+          "textContains": "timeout"
+        },
+        {
+          "textContains": "launch"
+        }
+      ],
+      "description": "Users configure how the Claude CLI is executed: choosing an execution mode (auto, windows_native, wsl, native), optionally setting a custom executable path, and configuring a timeout for CLI operations.",
+      "precondition": "AI Providers tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-claude-accounts-mgmt",
+      "name": "Claude CLI Multi-Account Management",
+      "requiredElements": [
+        {
+          "textContains": "usage"
+        },
+        {
+          "text": "Active"
+        },
+        {
+          "textContains": "Check Usage"
+        },
+        {}
+      ],
+      "description": "The Claude CLI section provides multi-account management with live state badges (Active, Rate-limited, Auto-selected), color-coded usage bars (green <50%, yellow 50-80%, red >80%), switch buttons per account, and a Check Usage button to refresh usage data.",
+      "precondition": "AI Providers tab is selected and at least one Claude account directory is configured and usage has been checked",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-claude-account-actions",
+      "name": "Claude CLI Account Directory Actions",
+      "requiredElements": [
+        {
+          "textContains": "Add"
+        },
+        {
+          "textContains": "Remove"
+        },
+        {
+          "textContains": "Auto"
+        },
+        {
+          "textContains": "Selection Mode"
+        }
+      ],
+      "description": "Users can manage their Claude account directories: add new directories, remove existing ones, auto-detect available directories, and toggle between Manual and Least Usage account selection modes.",
+      "precondition": "AI Providers tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-wsv-mode",
+      "name": "World State Verifier — Mode & Connection",
+      "requiredElements": [
+        {
+          "textContains": "World State Verifier"
+        },
+        {
+          "attributes": {
+            "content-label": "wsv mode"
+          }
+        },
+        {
+          "textContains": "Shadow mode is the recommended"
+        },
+        {
+          "attributes": {
+            "content-label": "wsv endpoint"
+          }
+        },
+        {
+          "attributes": {
+            "content-label": "wsv model"
+          }
+        },
+        {
+          "attributes": {
+            "content-label": "test wsv connection"
+          }
+        },
+        {
+          "attributes": {
+            "content-label": "save wsv settings"
+          }
+        }
+      ],
+      "description": "The WSV tab allows configuring the VLM-based World State Verifier (CUA-WSM / SEAgent 7B judge). The mode dropdown selects between Disabled (default), Enabled (WSM verdict wins), and Shadow (both run, text verifier decides, disagreements logged). Changes take effect on the next agentic verification iteration without a runner restart.",
+      "precondition": "World State Verifier tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-wsv-evidence",
+      "name": "World State Verifier — Screenshot Evidence Toggle",
+      "requiredElements": [
+        {
+          "textContains": "Screenshot Evidence"
+        },
+        {
+          "textContains": "320px wide"
+        }
+      ],
+      "description": "A toggle controls whether downsampled pre/post screenshot thumbnails are embedded in the agentic verification iteration canvas panels when the WSM verdict is used.",
+      "precondition": "World State Verifier tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-wsv-calibration",
+      "name": "World State Verifier — Shadow-Mode Calibration View",
+      "requiredElements": [
+        {
+          "textContains": "Shadow-Mode Calibration"
+        },
+        {
+          "textContains": "Enable Shadow mode above"
+        },
+        {
+          "attributes": {
+            "content-label": "filter-any"
+          }
+        },
+        {
+          "attributes": {
+            "content-label": "wsv calibration empty"
+          }
+        },
+        {
+          "attributes": {
+            "content-label": "wsv disagreements"
+          }
+        },
+        {
+          "textContains": "auto-refresh every 10s"
+        }
+      ],
+      "description": "A calibration section shows recent disagreements between the WSM (VLM judge) and the text verifier agent from shadow-mode runs. Users review these to decide whether to flip from Shadow to Enabled mode. The section auto-polls every 10 seconds and supports filtering by status-pair pattern.",
+      "precondition": "World State Verifier tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "settings-wsv-reset",
+      "name": "World State Verifier — Reset & Validation",
+      "requiredElements": [
+        {
+          "attributes": {
+            "content-label": "reset wsv defaults"
+          }
+        },
+        {
+          "attributes": {
+            "content-label": "save wsv settings"
+          }
+        },
+        {
+          "attributes": {
+            "content-label": "save wsv settings"
+          }
+        }
+      ],
+      "description": "Edge cases and the Reset to Defaults flow.",
+      "precondition": "World State Verifier tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Settings page",
+  "metadata": {
+    "tags": [
+      "settings",
+      "configuration",
+      "ai-providers",
+      "integrations",
+      "system"
+    ]
+  }
+}

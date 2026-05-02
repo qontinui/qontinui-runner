@@ -1,0 +1,206 @@
+{
+  "version": "1.0",
+  "id": "flow-control",
+  "name": "FlowControlPanel",
+  "states": [
+    {
+      "id": "fc-concurrency",
+      "name": "Concurrency Limit Configuration",
+      "requiredElements": [
+        {
+          "text": "Concurrency"
+        },
+        {
+          "role": "spinbutton"
+        },
+        {
+          "role": "spinbutton"
+        },
+        {
+          "text": "Scope key"
+        },
+        {
+          "role": "spinbutton"
+        }
+      ],
+      "description": "Controls max simultaneous instances of this workflow. When limit reached, new executions queue and wait (FlowControlDecision::Wait). Optionally scoped by key. Backend: FlowControl.concurrency (ConcurrencyLimit), enforced by FlowControlEnforcer.check(), tracked by record_start/record_end.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "fc-throttle",
+      "name": "Throttle Configuration",
+      "requiredElements": [
+        {
+          "text": "Throttle"
+        },
+        {
+          "text": "Max runs"
+        },
+        {
+          "role": "button",
+          "text": "1min"
+        },
+        {
+          "role": "button",
+          "text": "5min"
+        }
+      ],
+      "description": "Limits workflow throughput over time. Unlike rate limiting, throttled requests queue and wait. Backend: FlowControl.throttle (ThrottleConfig), enforced by FlowControlEnforcer via sliding-window timestamps.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "fc-rate-limit",
+      "name": "Rate Limit Configuration",
+      "requiredElements": [
+        {
+          "text": "Rate Limit"
+        },
+        {
+          "text": "Max runs"
+        },
+        {
+          "role": "button",
+          "text": "1hr"
+        }
+      ],
+      "description": "Hard cap that drops excess requests (unlike throttle which queues). Backend: FlowControl.rate_limit, returns FlowControlDecision::Skip.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "fc-debounce",
+      "name": "Debounce Configuration",
+      "requiredElements": [
+        {
+          "text": "Debounce"
+        },
+        {
+          "role": "button",
+          "text": "500ms"
+        },
+        {
+          "role": "button",
+          "text": "1s"
+        },
+        {
+          "text": "Custom"
+        }
+      ],
+      "description": "Sliding window deduplication â€” only the latest trigger executes. Backend: FlowControl.debounce (DebounceConfig), enforced with saturating_sub for clock safety.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "fc-phase-timeouts",
+      "name": "Phase Timeout Configuration",
+      "requiredElements": [
+        {
+          "text": "Phase Timeouts"
+        },
+        {
+          "text": "Setup"
+        },
+        {
+          "text": "Execution"
+        },
+        {
+          "text": "Verification"
+        },
+        {
+          "text": "Completion"
+        },
+        {
+          "text": "min"
+        },
+        {
+          "text": "Execution"
+        },
+        {
+          "role": "spinbutton"
+        }
+      ],
+      "description": "Per-phase timeout overrides in minutes. Backend: PhaseTimeouts in orchestrator/state.rs, parsed from phase_timeouts_json in types.rs, enforced by check_timeout() in loop_handlers.rs. Defaults: setup=5min, execution=30min, verification=10min, completion=5min.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "fc-persistence",
+      "name": "Configuration Persistence and State Consistency",
+      "requiredElements": [
+        {
+          "text": "Concurrency"
+        },
+        {
+          "text": "Concurrency"
+        },
+        {
+          "text": "Flow Control"
+        },
+        {
+          "text": "Flow Control"
+        }
+      ],
+      "description": "Settings serialize to JSON and persist as flow_control_json and phase_timeouts_json on unified_workflows. On save, WorkflowEditor PATCHes via MCP API. On load, LoopController reads for enforcement. Both SQLite (v147) and PostgreSQL store these fields.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "fc-layout",
+      "name": "Panel Layout and Visual Structure",
+      "requiredElements": [
+        {
+          "text": "Flow Control"
+        },
+        {
+          "text": "Concurrency"
+        }
+      ],
+      "description": "The FlowControlPanel renders as a collapsible section within the workflow editor settings. Each flow control type (concurrency, throttle, rate limit, debounce) is a distinct subsection with a heading, inputs, and optional scope key. Phase timeouts are a separate subsection with per-phase rows.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "fc-callback-integration",
+      "name": "Callback Integration with Workflow Editor",
+      "requiredElements": [
+        {
+          "text": "Concurrency"
+        },
+        {
+          "text": "Phase Timeouts"
+        }
+      ],
+      "description": "The FlowControlPanel communicates changes to its parent (WorkflowEditor) via callbacks. When any flow control value changes, onFlowControlChange fires with the serialized JSON. When any timeout changes, onPhaseTimeoutsChange fires. The parent is responsible for saving via updateWorkflow().",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Flow Control Settings Panel -- a workflow builder component (FlowControlPanel.tsx) for configuring per-workflow Inngest-inspired flow control policies and per-phase timeout overrides. Integrated into WorkflowEditor in qontinui-web. Produces two JSON strings (flow_control_json, phase_timeouts_json) persisted to unified_workflows table. At runtime, LoopController loads configs and enforces them: FlowControlEnforcer checks concurrency/throttle/debounce/rate-limit before admitting a workflow, and phase_timeout_ms enforces per-phase deadlines via check_timeout(). Backend: flow_control.rs, orchestrator/state.rs, loop_controller.rs, loop_handlers.rs, unified_workflows.rs, workflow_ops.rs, migrations v147.",
+  "metadata": {
+    "tags": [
+      "inngest",
+      "flow-control",
+      "concurrency",
+      "throttle",
+      "debounce",
+      "rate-limit",
+      "phase-timeouts",
+      "workflow-builder",
+      "tier-2"
+    ]
+  }
+}

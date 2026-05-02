@@ -1,4 +1,4 @@
-﻿{
+{
   "version": "1.0.0",
   "description": "Security & Sandboxing settings page within the runner Settings panel. Implements the Agent Sandbox Taxonomy (AST) 7-layer defense model: L1 Compute, L2 Resources, L3 Filesystem, L4 Network, L5 Credentials, L6 Actions, L7 Audit. The page provides: (1) a Security Profile selector with three built-in profiles (Permissive, Standard, Strict) and a Custom option that exposes the full policy editor; (2) a Security Posture visualization showing per-layer scores as colored bars; (3) feature toggles for Credential Proxy, Network Mediation, and Security Audit Log; (4) a live Audit Log viewer with filtering, refresh, and JSON export — visible only when audit logging is enabled; (5) an AST educational banner; and (6) Save / Reset buttons. Data is persisted via Tauri IPC commands get_security_settings / update_security_settings. Audit events are fetched from the runner MCP HTTP API at /security/audit/events and /security/audit/summary.",
   "groups": [

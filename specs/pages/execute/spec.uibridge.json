@@ -1,0 +1,442 @@
+{
+  "description": "Workflow Queue (Execute) page -- the primary interface for composing and executing sequential workflow runs. Users browse a workflow library, build an ordered execution queue, configure execution options like stop-on-failure, and launch the entire queue as a composed workflow. The page persists queue state and options across sessions via localStorage, ensuring users can return to an in-progress queue without losing their selections.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Workflow Library Browsing",
+          "enabled": true,
+          "id": "exec-library-browsing-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "searchbox"
+            },
+            "label": "Required element for Workflow Library Browsing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Workflow Library Browsing",
+          "enabled": true,
+          "id": "exec-library-browsing-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "all"
+            },
+            "label": "Required element for Workflow Library Browsing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Workflow Library Browsing",
+          "enabled": true,
+          "id": "exec-library-browsing-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Library"
+            },
+            "label": "Required element for Workflow Library Browsing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Workflow Library Browsing",
+          "enabled": true,
+          "id": "exec-library-browsing-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh"
+            },
+            "label": "Required element for Workflow Library Browsing",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users arrive at the Execute page to select which workflows to run. The left panel presents the full workflow library with search and category filtering. Users should be able to quickly locate workflows by name or description, narrow results by category, and see relevant metadata (step counts, run history) for each workflow before adding it to the queue. The library panel is collapsible to maximize queue space when selection is complete.",
+      "id": "exec-library-browsing",
+      "name": "Workflow Library Browsing",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Execution Queue Management",
+          "enabled": true,
+          "id": "exec-queue-management-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContent": "Workflow Queue"
+            },
+            "label": "Required element for Execution Queue Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Execution Queue Management",
+          "enabled": true,
+          "id": "exec-queue-management-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Queue:"
+            },
+            "label": "Required element for Execution Queue Management",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Execution Queue Management",
+          "enabled": true,
+          "id": "exec-queue-management-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Clear"
+            },
+            "label": "Required element for Execution Queue Management",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The right panel is the execution queue where users build an ordered sequence of workflows to run. Users add workflows from the library, reorder them via drag-and-drop to control execution sequence, remove individual items, or clear the entire queue. The queue persists across browser sessions so users do not lose their selections when navigating away. Queue state (count and total steps) is always visible in the bottom bar.",
+      "id": "exec-queue-management",
+      "name": "Execution Queue Management",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Execution Options Configuration",
+          "enabled": true,
+          "id": "exec-options-config-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Execution options"
+            },
+            "label": "Required element for Execution Options Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Execution Options Configuration",
+          "enabled": true,
+          "id": "exec-options-config-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Stop on failure"
+            },
+            "label": "Required element for Execution Options Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Execution Options Configuration",
+          "enabled": true,
+          "id": "exec-options-config-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Stop the sequence if any workflow fails"
+            },
+            "label": "Required element for Execution Options Configuration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Before launching the queue, users can configure execution behavior through an options panel. The primary option is 'stop on failure' which controls whether the composed workflow should halt when any individual workflow fails or continue through the remaining queue. Options are persisted in localStorage so the user's preference is remembered across sessions. The options panel is accessible from the bottom bar via a settings toggle.",
+      "id": "exec-options-config",
+      "name": "Execution Options Configuration",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Queue Execution Launch",
+          "enabled": true,
+          "id": "exec-run-queue-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Run Queue"
+            },
+            "label": "Required element for Queue Execution Launch",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Queue Execution Launch",
+          "enabled": true,
+          "id": "exec-run-queue-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Run Queue"
+            },
+            "label": "Required element for Queue Execution Launch",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Queue Execution Launch",
+          "enabled": true,
+          "id": "exec-run-queue-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Clear"
+            },
+            "label": "Required element for Queue Execution Launch",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The primary action on this page is launching the composed workflow. Users click 'Run Queue' to send all queued workflows to the runner for sequential execution. The button is disabled when the queue is empty or when execution is already in progress. During launch, the button shows a loading state to provide feedback. Upon successful launch, the user is automatically navigated to the Active Dashboard to monitor execution progress.",
+      "id": "exec-run-queue",
+      "name": "Queue Execution Launch",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Two-Panel Layout Structure",
+          "enabled": true,
+          "id": "exec-two-panel-layout-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Workflow Queue"
+            },
+            "label": "Required element for Two-Panel Layout Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Two-Panel Layout Structure",
+          "enabled": true,
+          "id": "exec-two-panel-layout-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Queue:"
+            },
+            "label": "Required element for Two-Panel Layout Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Two-Panel Layout Structure",
+          "enabled": true,
+          "id": "exec-two-panel-layout-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Library"
+            },
+            "label": "Required element for Two-Panel Layout Structure",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Execute page uses a two-panel layout optimized for the workflow selection and queuing workflow. The left panel contains the workflow library with search and filtering, while the right panel shows the execution queue. A bottom bar provides queue statistics, execution options, and the primary action buttons (Clear, Run Queue). This layout allows users to see both their available workflows and their current queue simultaneously, supporting an efficient drag-and-select interaction model.",
+      "id": "exec-two-panel-layout",
+      "name": "Two-Panel Layout Structure",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "execute",
+    "tags": [
+      "execute",
+      "workflow-queue",
+      "composed-workflow",
+      "run-group",
+      "tier-1"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "Users arrive at the Execute page to select which workflows to run. The left panel presents the full workflow library with search and category filtering. Users should be able to quickly locate workflows by name or description, narrow results by category, and see relevant metadata (step counts, run history) for each workflow before adding it to the queue. The library panel is collapsible to maximize queue space when selection is complete.",
+        "elements": [
+          {
+            "role": "searchbox"
+          },
+          {
+            "textContent": "all"
+          },
+          {
+            "textContent": "Library"
+          },
+          {
+            "role": "button",
+            "textContent": "Refresh"
+          }
+        ],
+        "id": "exec-library-browsing",
+        "isInitial": false,
+        "name": "Workflow Library Browsing",
+        "transitions": []
+      },
+      {
+        "description": "The right panel is the execution queue where users build an ordered sequence of workflows to run. Users add workflows from the library, reorder them via drag-and-drop to control execution sequence, remove individual items, or clear the entire queue. The queue persists across browser sessions so users do not lose their selections when navigating away. Queue state (count and total steps) is always visible in the bottom bar.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Workflow Queue"
+          },
+          {
+            "textContent": "Queue:"
+          },
+          {
+            "role": "button",
+            "textContent": "Clear"
+          }
+        ],
+        "id": "exec-queue-management",
+        "isInitial": false,
+        "name": "Execution Queue Management",
+        "transitions": []
+      },
+      {
+        "description": "Before launching the queue, users can configure execution behavior through an options panel. The primary option is 'stop on failure' which controls whether the composed workflow should halt when any individual workflow fails or continue through the remaining queue. Options are persisted in localStorage so the user's preference is remembered across sessions. The options panel is accessible from the bottom bar via a settings toggle.",
+        "elements": [
+          {
+            "textContent": "Execution options"
+          },
+          {
+            "textContent": "Stop on failure"
+          },
+          {
+            "textContent": "Stop the sequence if any workflow fails"
+          }
+        ],
+        "id": "exec-options-config",
+        "isInitial": false,
+        "name": "Execution Options Configuration",
+        "transitions": []
+      },
+      {
+        "description": "The primary action on this page is launching the composed workflow. Users click 'Run Queue' to send all queued workflows to the runner for sequential execution. The button is disabled when the queue is empty or when execution is already in progress. During launch, the button shows a loading state to provide feedback. Upon successful launch, the user is automatically navigated to the Active Dashboard to monitor execution progress.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Run Queue"
+          },
+          {
+            "role": "button",
+            "textContent": "Run Queue"
+          },
+          {
+            "role": "button",
+            "textContent": "Clear"
+          }
+        ],
+        "id": "exec-run-queue",
+        "isInitial": false,
+        "name": "Queue Execution Launch",
+        "transitions": []
+      },
+      {
+        "description": "The Execute page uses a two-panel layout optimized for the workflow selection and queuing workflow. The left panel contains the workflow library with search and filtering, while the right panel shows the execution queue. A bottom bar provides queue statistics, execution options, and the primary action buttons (Clear, Run Queue). This layout allows users to see both their available workflows and their current queue simultaneously, supporting an efficient drag-and-select interaction model.",
+        "elements": [
+          {
+            "textContent": "Workflow Queue"
+          },
+          {
+            "textContent": "Queue:"
+          },
+          {
+            "textContent": "Library"
+          }
+        ],
+        "id": "exec-two-panel-layout",
+        "isInitial": false,
+        "name": "Two-Panel Layout Structure",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

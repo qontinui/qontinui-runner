@@ -1,0 +1,1571 @@
+{
+  "description": "The LLM Observability Dashboard provides analytics for LLM token usage, cost breakdown, and provider performance. Displays summary metric cards, cost-over-time and cost-by-model charts, phase cost breakdown, provider latency distribution, a 7-day moving average cost trend line, and a per-run cost table. Data sourced via Tauri commands (SQLite) and web API (PostgreSQL) with TanStack Query caching.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Summary Cards",
+          "enabled": true,
+          "id": "llm-summary-cards-elem-0",
+          "precondition": "LLM analytics data has loaded successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Total Cost"
+            },
+            "label": "Required element for Summary Cards",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Summary Cards",
+          "enabled": true,
+          "id": "llm-summary-cards-elem-1",
+          "precondition": "LLM analytics data has loaded successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Total Tokens"
+            },
+            "label": "Required element for Summary Cards",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Summary Cards",
+          "enabled": true,
+          "id": "llm-summary-cards-elem-2",
+          "precondition": "LLM analytics data has loaded successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Total Calls"
+            },
+            "label": "Required element for Summary Cards",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Summary Cards",
+          "enabled": true,
+          "id": "llm-summary-cards-elem-3",
+          "precondition": "LLM analytics data has loaded successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Avg Cost/Call"
+            },
+            "label": "Required element for Summary Cards",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Four metric cards at the top of the dashboard showing aggregate LLM usage statistics: Total Cost (formatted as dollars from cents, with provider count subtitle), Total Tokens (input + output with K/M suffixes, with in/out breakdown subtitle), Total Calls (with unique model count subtitle), and Avg Cost/Call (with average duration subtitle when available). These cards give the user an instant overview of LLM spend and usage volume for the selected time range.",
+      "id": "llm-summary-cards",
+      "name": "Summary Cards",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Time Range Selection",
+          "enabled": true,
+          "id": "llm-time-range-selection-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox",
+              "textContent": "Last 7 days"
+            },
+            "label": "Required element for Time Range Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Time Range Selection",
+          "enabled": true,
+          "id": "llm-time-range-selection-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Last 24 hours|Last 7 days|Last 30 days|All time"
+            },
+            "label": "Required element for Time Range Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Time Range Selection",
+          "enabled": true,
+          "id": "llm-time-range-selection-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh analytics"
+            },
+            "label": "Required element for Time Range Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Time Range Selection",
+          "enabled": true,
+          "id": "llm-time-range-selection-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Time Range Selection",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A dropdown selector and refresh button in the dashboard header that controls the time window for all analytics data. Options are 'Last 24 hours' (1d), 'Last 7 days' (7d, default), 'Last 30 days' (30d), and 'All time' (all). Changing the selection triggers a re-fetch of all Tauri-backed queries with the corresponding days parameter. The refresh button manually invalidates all cached queries.",
+      "id": "llm-time-range-selection",
+      "name": "Time Range Selection",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Cost Charts",
+          "enabled": true,
+          "id": "llm-cost-charts-elem-0",
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost Over Time"
+            },
+            "label": "Required element for Cost Charts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Cost Charts",
+          "enabled": true,
+          "id": "llm-cost-charts-elem-1",
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost:|Calls:|Input tokens:|Output tokens:"
+            },
+            "label": "Required element for Cost Charts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Cost Charts",
+          "enabled": true,
+          "id": "llm-cost-charts-elem-2",
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost by Model"
+            },
+            "label": "Required element for Cost Charts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Cost Charts",
+          "enabled": true,
+          "id": "llm-cost-charts-elem-3",
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Avg duration:"
+            },
+            "label": "Required element for Cost Charts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Cost Charts",
+          "enabled": true,
+          "id": "llm-cost-charts-elem-4",
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost by Phase"
+            },
+            "label": "Required element for Cost Charts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Cost Charts",
+          "enabled": true,
+          "id": "llm-cost-charts-elem-5",
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Input tokens:|Output tokens:"
+            },
+            "label": "Required element for Cost Charts",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Three cost visualization charts arranged in a responsive grid: (1) Cost Over Time â€” a Recharts LineChart showing daily LLM cost with date on X-axis and dollar amount on Y-axis, with tooltips showing cost, calls, input/output tokens per day; (2) Cost by Model â€” a horizontal BarChart ranking models by total cost descending, with tooltips showing cost, calls, tokens, and avg duration; (3) Cost by Phase â€” a horizontal BarChart breaking down cost by workflow phase (setup/agentic/completion), sorted by cost descending.",
+      "id": "llm-cost-charts",
+      "name": "Cost Charts",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Cost Trends",
+          "enabled": true,
+          "id": "llm-cost-trends-elem-0",
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost Trends"
+            },
+            "label": "Required element for Cost Trends",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Cost Trends",
+          "enabled": true,
+          "id": "llm-cost-trends-elem-1",
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Total:|Avg/day:|Trend:"
+            },
+            "label": "Required element for Cost Trends",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Cost Trends",
+          "enabled": true,
+          "id": "llm-cost-trends-elem-2",
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Daily Cost"
+            },
+            "label": "Required element for Cost Trends",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Cost Trends",
+          "enabled": true,
+          "id": "llm-cost-trends-elem-3",
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "7-Day Average"
+            },
+            "label": "Required element for Cost Trends",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Cost Trends",
+          "enabled": true,
+          "id": "llm-cost-trends-elem-4",
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Daily cost:|7-day avg:"
+            },
+            "label": "Required element for Cost Trends",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A dedicated cost trend chart that fetches its own data independently from the web backend via useCostTrends (fetch API â†’ PostgreSQL). Shows a Recharts LineChart with two lines: 'Daily Cost' (solid line with dots) and '7-Day Average' (dashed line, computed client-side via 7-day rolling window). Displays summary stats above the chart: Total spend, Avg/day cost, and Trend direction (up/down/flat icon). The trend direction compares the average of the last 7 days against the previous 7 days, with a 5% threshold.",
+      "id": "llm-cost-trends",
+      "name": "Cost Trends",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Provider Latency",
+          "enabled": true,
+          "id": "llm-provider-latency-elem-0",
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Provider Latency"
+            },
+            "label": "Required element for Provider Latency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Provider Latency",
+          "enabled": true,
+          "id": "llm-provider-latency-elem-1",
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Avg|Min|Max"
+            },
+            "label": "Required element for Provider Latency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Provider Latency",
+          "enabled": true,
+          "id": "llm-provider-latency-elem-2",
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Avg:|Min:|Max:|Calls:"
+            },
+            "label": "Required element for Provider Latency",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A grouped bar chart showing response time distribution per LLM provider. Each provider has three bars: Avg (primary color), Min (accent color), and Max (secondary color) latency in milliseconds. Includes a Recharts Legend identifying the three series. Tooltips show provider name, avg/min/max latency, and call count.",
+      "id": "llm-provider-latency",
+      "name": "Provider Latency",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Task Run Cost Table",
+          "enabled": true,
+          "id": "llm-task-run-cost-table-elem-0",
+          "precondition": "At least one task run with LLM cost data exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Task Run Costs"
+            },
+            "label": "Required element for Task Run Cost Table",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Task Run Cost Table",
+          "enabled": true,
+          "id": "llm-task-run-cost-table-elem-1",
+          "precondition": "At least one task run with LLM cost data exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Task Run|Cost|Input|Output|Calls|Started"
+            },
+            "label": "Required element for Task Run Cost Table",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Task Run Cost Table",
+          "enabled": true,
+          "id": "llm-task-run-cost-table-elem-2",
+          "precondition": "At least one task run with LLM cost data exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Sort by Cost"
+            },
+            "label": "Required element for Task Run Cost Table",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Task Run Cost Table",
+          "enabled": true,
+          "id": "llm-task-run-cost-table-elem-3",
+          "precondition": "At least one task run with LLM cost data exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Sort by Calls"
+            },
+            "label": "Required element for Task Run Cost Table",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Task Run Cost Table",
+          "enabled": true,
+          "id": "llm-task-run-cost-table-elem-4",
+          "precondition": "At least one task run with LLM cost data exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Sort by Started"
+            },
+            "label": "Required element for Task Run Cost Table",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Task Run Cost Table",
+          "enabled": true,
+          "id": "llm-task-run-cost-table-elem-5",
+          "precondition": "At least one task run with LLM cost data exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "..."
+            },
+            "label": "Required element for Task Run Cost Table",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A sortable table showing per-task-run LLM cost breakdown, limited to the most recent 50 runs. Columns: Task Run (truncated ID with full ID in title attribute), Cost (sortable, default sort descending), Input tokens, Output tokens, Calls (sortable), and Started (sortable, formatted as 'Mon DD, HH:MM'). Sort toggles between ascending and descending when clicking the same column header. An ArrowUpDown icon appears next to the active sort column.",
+      "id": "llm-task-run-cost-table",
+      "name": "Task Run Cost Table",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Failed to load LLM analytics"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Retry"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No LLM usage data available"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Run some workflows to start collecting LLM analytics"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-5",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No daily cost data available"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-6",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No model cost data available"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-7",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No phase cost data available"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 8 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-8",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No latency data available"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 9 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-9",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No task run cost data available"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 10 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-10",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No cost trend data available"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 11 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-11",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Failed to load cost trends"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 12 for state Dashboard Loading & Error States",
+          "enabled": true,
+          "id": "llm-loading-error-states-elem-12",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost Trends"
+            },
+            "label": "Required element for Dashboard Loading & Error States",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The dashboard handles three non-data states: (1) Loading â€” a centered spinning RefreshCw icon while any Tauri query is in-flight; (2) Error â€” an AlertTriangle icon with 'Failed to load LLM analytics', the error message text, and a 'Retry' button that triggers refresh; (3) Empty â€” a CreditCard icon with 'No LLM usage data available' and 'Run some workflows to start collecting LLM analytics' when summary is null or total_calls is 0. Individual chart components also have their own empty states when their specific data arrays are empty.",
+      "id": "llm-loading-error-states",
+      "name": "Dashboard Loading & Error States",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Data Display",
+          "enabled": true,
+          "id": "llm-data-display-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Total Cost|Total Tokens|Total Calls|Avg Cost/Call"
+            },
+            "label": "Required element for Data Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Data Display",
+          "enabled": true,
+          "id": "llm-data-display-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost Over Time"
+            },
+            "label": "Required element for Data Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Data Display",
+          "enabled": true,
+          "id": "llm-data-display-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost by Model"
+            },
+            "label": "Required element for Data Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Data Display",
+          "enabled": true,
+          "id": "llm-data-display-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Task Run|Cost|Input|Output|Calls|Started"
+            },
+            "label": "Required element for Data Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Data Display",
+          "enabled": true,
+          "id": "llm-data-display-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Daily Cost|7-Day Average"
+            },
+            "label": "Required element for Data Display",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Assertions verifying that data values are rendered with correct formatting, units, axis labels, and proportional representation across summary cards, charts, and tables.",
+      "id": "llm-data-display",
+      "name": "Data Display",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Behavior",
+          "enabled": true,
+          "id": "llm-behavior-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox",
+              "textContent": "Select time range"
+            },
+            "label": "Required element for Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Behavior",
+          "enabled": true,
+          "id": "llm-behavior-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh analytics"
+            },
+            "label": "Required element for Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Behavior",
+          "enabled": true,
+          "id": "llm-behavior-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost Over Time|Cost by Model|Cost Trends"
+            },
+            "label": "Required element for Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Behavior",
+          "enabled": true,
+          "id": "llm-behavior-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost:|Daily cost:|7-day avg:"
+            },
+            "label": "Required element for Behavior",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Assertions verifying interactive behavior: time range filtering, refresh, chart animations, and tooltip interactions.",
+      "id": "llm-behavior",
+      "name": "Behavior",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Navigation",
+          "enabled": true,
+          "id": "llm-navigation-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "LLM Analytics"
+            },
+            "label": "Required element for Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Navigation",
+          "enabled": true,
+          "id": "llm-navigation-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "LLM Analytics"
+            },
+            "label": "Required element for Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Navigation",
+          "enabled": true,
+          "id": "llm-navigation-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Navigation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Assertions verifying dashboard accessibility via tab navigation, state persistence, and scroll behavior.",
+      "id": "llm-navigation",
+      "name": "Navigation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Element Presence",
+          "enabled": true,
+          "id": "llm-element-presence-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Total Cost|Total Tokens|Total Calls|Avg Cost/Call"
+            },
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Element Presence",
+          "enabled": true,
+          "id": "llm-element-presence-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox",
+              "textContent": "Select time range"
+            },
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Element Presence",
+          "enabled": true,
+          "id": "llm-element-presence-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh analytics"
+            },
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Element Presence",
+          "enabled": true,
+          "id": "llm-element-presence-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cost Over Time|Cost by Model|Cost by Phase|Cost Trends|Provider Latency|Task Run Costs"
+            },
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Element Presence",
+          "enabled": true,
+          "id": "llm-element-presence-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Daily Cost|7-Day Average"
+            },
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Assertions verifying that key UI elements are present and visible in the dashboard layout.",
+      "id": "llm-element-presence",
+      "name": "Element Presence",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state UI Bridge Element Registrations",
+          "enabled": true,
+          "id": "llm-ui-bridge-registrations-elem-0",
+          "precondition": "LLM Analytics tab is currently active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "llm-analytics-root"
+            },
+            "label": "Required element for UI Bridge Element Registrations",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state UI Bridge Element Registrations",
+          "enabled": true,
+          "id": "llm-ui-bridge-registrations-elem-1",
+          "precondition": "LLM Analytics tab is currently active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "llm-analytics-refresh"
+            },
+            "label": "Required element for UI Bridge Element Registrations",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state UI Bridge Element Registrations",
+          "enabled": true,
+          "id": "llm-ui-bridge-registrations-elem-2",
+          "precondition": "LLM Analytics tab is currently active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "llm-analytics-time-range"
+            },
+            "label": "Required element for UI Bridge Element Registrations",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state UI Bridge Element Registrations",
+          "enabled": true,
+          "id": "llm-ui-bridge-registrations-elem-3",
+          "precondition": "LLM Analytics tab is currently active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for UI Bridge Element Registrations",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state UI Bridge Element Registrations",
+          "enabled": true,
+          "id": "llm-ui-bridge-registrations-elem-4",
+          "precondition": "LLM Analytics tab is currently active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for UI Bridge Element Registrations",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state UI Bridge Element Registrations",
+          "enabled": true,
+          "id": "llm-ui-bridge-registrations-elem-5",
+          "precondition": "LLM Analytics tab is currently active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "llm-analytics-task-run-cost-table"
+            },
+            "label": "Required element for UI Bridge Element Registrations",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state UI Bridge Element Registrations",
+          "enabled": true,
+          "id": "llm-ui-bridge-registrations-elem-6",
+          "precondition": "LLM Analytics tab is currently active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "llm-analytics-root"
+            },
+            "label": "Required element for UI Bridge Element Registrations",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The dashboard and its summary-cards subcomponent register elements with the UI Bridge SDK so that currentRouteOnly=true snapshots return the page's interactive content (refresh button, time-range selector, metric cards, charts, task-run table), not just sidebar chrome. Exposes stable element ids that automation workflows can target without depending on rendered text. A `page:llm-analytics` component and a `llm-analytics-root` element are always present; the metric-card and chart registrations require the corresponding data branch to have rendered.",
+      "id": "llm-ui-bridge-registrations",
+      "name": "UI Bridge Element Registrations",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "llm-observability",
+    "tags": [
+      "llm-observability",
+      "cost-tracking",
+      "token-analytics",
+      "opik",
+      "tier-2"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "Four metric cards at the top of the dashboard showing aggregate LLM usage statistics: Total Cost (formatted as dollars from cents, with provider count subtitle), Total Tokens (input + output with K/M suffixes, with in/out breakdown subtitle), Total Calls (with unique model count subtitle), and Avg Cost/Call (with average duration subtitle when available). These cards give the user an instant overview of LLM spend and usage volume for the selected time range.",
+        "elements": [
+          {
+            "textContent": "Total Cost"
+          },
+          {
+            "textContent": "Total Tokens"
+          },
+          {
+            "textContent": "Total Calls"
+          },
+          {
+            "textContent": "Avg Cost/Call"
+          }
+        ],
+        "id": "llm-summary-cards",
+        "isInitial": false,
+        "name": "Summary Cards",
+        "transitions": []
+      },
+      {
+        "description": "A dropdown selector and refresh button in the dashboard header that controls the time window for all analytics data. Options are 'Last 24 hours' (1d), 'Last 7 days' (7d, default), 'Last 30 days' (30d), and 'All time' (all). Changing the selection triggers a re-fetch of all Tauri-backed queries with the corresponding days parameter. The refresh button manually invalidates all cached queries.",
+        "elements": [
+          {
+            "role": "combobox",
+            "textContent": "Last 7 days"
+          },
+          {
+            "textContent": "Last 24 hours|Last 7 days|Last 30 days|All time"
+          },
+          {
+            "role": "button",
+            "textContent": "Refresh analytics"
+          },
+          {
+            "role": "combobox"
+          }
+        ],
+        "id": "llm-time-range-selection",
+        "isInitial": false,
+        "name": "Time Range Selection",
+        "transitions": []
+      },
+      {
+        "description": "Three cost visualization charts arranged in a responsive grid: (1) Cost Over Time â€” a Recharts LineChart showing daily LLM cost with date on X-axis and dollar amount on Y-axis, with tooltips showing cost, calls, input/output tokens per day; (2) Cost by Model â€” a horizontal BarChart ranking models by total cost descending, with tooltips showing cost, calls, tokens, and avg duration; (3) Cost by Phase â€” a horizontal BarChart breaking down cost by workflow phase (setup/agentic/completion), sorted by cost descending.",
+        "elements": [
+          {
+            "textContent": "Cost Over Time"
+          },
+          {
+            "textContent": "Cost:|Calls:|Input tokens:|Output tokens:"
+          },
+          {
+            "textContent": "Cost by Model"
+          },
+          {
+            "textContent": "Avg duration:"
+          },
+          {
+            "textContent": "Cost by Phase"
+          },
+          {
+            "textContent": "Input tokens:|Output tokens:"
+          }
+        ],
+        "id": "llm-cost-charts",
+        "isInitial": false,
+        "name": "Cost Charts",
+        "transitions": []
+      },
+      {
+        "description": "A dedicated cost trend chart that fetches its own data independently from the web backend via useCostTrends (fetch API â†’ PostgreSQL). Shows a Recharts LineChart with two lines: 'Daily Cost' (solid line with dots) and '7-Day Average' (dashed line, computed client-side via 7-day rolling window). Displays summary stats above the chart: Total spend, Avg/day cost, and Trend direction (up/down/flat icon). The trend direction compares the average of the last 7 days against the previous 7 days, with a 5% threshold.",
+        "elements": [
+          {
+            "textContent": "Cost Trends"
+          },
+          {
+            "textContent": "Total:|Avg/day:|Trend:"
+          },
+          {
+            "textContent": "Daily Cost"
+          },
+          {
+            "textContent": "7-Day Average"
+          },
+          {
+            "textContent": "Daily cost:|7-day avg:"
+          }
+        ],
+        "id": "llm-cost-trends",
+        "isInitial": false,
+        "name": "Cost Trends",
+        "transitions": []
+      },
+      {
+        "description": "A grouped bar chart showing response time distribution per LLM provider. Each provider has three bars: Avg (primary color), Min (accent color), and Max (secondary color) latency in milliseconds. Includes a Recharts Legend identifying the three series. Tooltips show provider name, avg/min/max latency, and call count.",
+        "elements": [
+          {
+            "textContent": "Provider Latency"
+          },
+          {
+            "textContent": "Avg|Min|Max"
+          },
+          {
+            "textContent": "Avg:|Min:|Max:|Calls:"
+          }
+        ],
+        "id": "llm-provider-latency",
+        "isInitial": false,
+        "name": "Provider Latency",
+        "transitions": []
+      },
+      {
+        "description": "A sortable table showing per-task-run LLM cost breakdown, limited to the most recent 50 runs. Columns: Task Run (truncated ID with full ID in title attribute), Cost (sortable, default sort descending), Input tokens, Output tokens, Calls (sortable), and Started (sortable, formatted as 'Mon DD, HH:MM'). Sort toggles between ascending and descending when clicking the same column header. An ArrowUpDown icon appears next to the active sort column.",
+        "elements": [
+          {
+            "textContent": "Task Run Costs"
+          },
+          {
+            "textContent": "Task Run|Cost|Input|Output|Calls|Started"
+          },
+          {
+            "role": "button",
+            "textContent": "Sort by Cost"
+          },
+          {
+            "role": "button",
+            "textContent": "Sort by Calls"
+          },
+          {
+            "role": "button",
+            "textContent": "Sort by Started"
+          },
+          {
+            "textContent": "..."
+          }
+        ],
+        "id": "llm-task-run-cost-table",
+        "isInitial": false,
+        "name": "Task Run Cost Table",
+        "transitions": []
+      },
+      {
+        "description": "The dashboard handles three non-data states: (1) Loading â€” a centered spinning RefreshCw icon while any Tauri query is in-flight; (2) Error â€” an AlertTriangle icon with 'Failed to load LLM analytics', the error message text, and a 'Retry' button that triggers refresh; (3) Empty â€” a CreditCard icon with 'No LLM usage data available' and 'Run some workflows to start collecting LLM analytics' when summary is null or total_calls is 0. Individual chart components also have their own empty states when their specific data arrays are empty.",
+        "elements": [
+          {},
+          {
+            "textContent": "Failed to load LLM analytics"
+          },
+          {
+            "role": "button",
+            "textContent": "Retry"
+          },
+          {
+            "textContent": "No LLM usage data available"
+          },
+          {
+            "textContent": "Run some workflows to start collecting LLM analytics"
+          },
+          {
+            "textContent": "No daily cost data available"
+          },
+          {
+            "textContent": "No model cost data available"
+          },
+          {
+            "textContent": "No phase cost data available"
+          },
+          {
+            "textContent": "No latency data available"
+          },
+          {
+            "textContent": "No task run cost data available"
+          },
+          {
+            "textContent": "No cost trend data available"
+          },
+          {
+            "textContent": "Failed to load cost trends"
+          },
+          {
+            "textContent": "Cost Trends"
+          }
+        ],
+        "id": "llm-loading-error-states",
+        "isInitial": false,
+        "name": "Dashboard Loading & Error States",
+        "transitions": []
+      },
+      {
+        "description": "Assertions verifying that data values are rendered with correct formatting, units, axis labels, and proportional representation across summary cards, charts, and tables.",
+        "elements": [
+          {
+            "textContent": "Total Cost|Total Tokens|Total Calls|Avg Cost/Call"
+          },
+          {
+            "textContent": "Cost Over Time"
+          },
+          {
+            "textContent": "Cost by Model"
+          },
+          {
+            "textContent": "Task Run|Cost|Input|Output|Calls|Started"
+          },
+          {
+            "textContent": "Daily Cost|7-Day Average"
+          }
+        ],
+        "id": "llm-data-display",
+        "isInitial": false,
+        "name": "Data Display",
+        "transitions": []
+      },
+      {
+        "description": "Assertions verifying interactive behavior: time range filtering, refresh, chart animations, and tooltip interactions.",
+        "elements": [
+          {
+            "role": "combobox",
+            "textContent": "Select time range"
+          },
+          {
+            "role": "button",
+            "textContent": "Refresh analytics"
+          },
+          {
+            "textContent": "Cost Over Time|Cost by Model|Cost Trends"
+          },
+          {
+            "textContent": "Cost:|Daily cost:|7-day avg:"
+          }
+        ],
+        "id": "llm-behavior",
+        "isInitial": false,
+        "name": "Behavior",
+        "transitions": []
+      },
+      {
+        "description": "Assertions verifying dashboard accessibility via tab navigation, state persistence, and scroll behavior.",
+        "elements": [
+          {
+            "textContent": "LLM Analytics"
+          },
+          {
+            "textContent": "LLM Analytics"
+          },
+          {}
+        ],
+        "id": "llm-navigation",
+        "isInitial": false,
+        "name": "Navigation",
+        "transitions": []
+      },
+      {
+        "description": "Assertions verifying that key UI elements are present and visible in the dashboard layout.",
+        "elements": [
+          {
+            "textContent": "Total Cost|Total Tokens|Total Calls|Avg Cost/Call"
+          },
+          {
+            "role": "combobox",
+            "textContent": "Select time range"
+          },
+          {
+            "role": "button",
+            "textContent": "Refresh analytics"
+          },
+          {
+            "textContent": "Cost Over Time|Cost by Model|Cost by Phase|Cost Trends|Provider Latency|Task Run Costs"
+          },
+          {
+            "textContent": "Daily Cost|7-Day Average"
+          }
+        ],
+        "id": "llm-element-presence",
+        "isInitial": false,
+        "name": "Element Presence",
+        "transitions": []
+      },
+      {
+        "description": "The dashboard and its summary-cards subcomponent register elements with the UI Bridge SDK so that currentRouteOnly=true snapshots return the page's interactive content (refresh button, time-range selector, metric cards, charts, task-run table), not just sidebar chrome. Exposes stable element ids that automation workflows can target without depending on rendered text. A `page:llm-analytics` component and a `llm-analytics-root` element are always present; the metric-card and chart registrations require the corresponding data branch to have rendered.",
+        "elements": [
+          {
+            "id": "llm-analytics-root"
+          },
+          {
+            "id": "llm-analytics-refresh"
+          },
+          {
+            "id": "llm-analytics-time-range"
+          },
+          {},
+          {},
+          {
+            "id": "llm-analytics-task-run-cost-table"
+          },
+          {
+            "id": "llm-analytics-root"
+          }
+        ],
+        "id": "llm-ui-bridge-registrations",
+        "isInitial": false,
+        "name": "UI Bridge Element Registrations",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

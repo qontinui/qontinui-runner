@@ -157,6 +157,37 @@ fn storage_round_trip_in_tempdir() {
 }
 
 #[test]
+fn embedded_pages_snapshot_is_populated() {
+    // Section 4 (UI Bridge redesign) — production binaries embed
+    // <runner>/specs/pages at compile time so the Spec API still answers
+    // /spec/page/<id> when shipped without a sibling specs/ directory.
+    //
+    // We assert via the public API: `list_pages` against an empty tempdir
+    // root must fall back to the embedded snapshot and surface at least one
+    // page id (the runner repo currently ships ~95 pages under specs/pages/).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let pages = storage::list_pages(root).unwrap();
+    assert!(
+        !pages.is_empty(),
+        "EMBEDDED_PAGES fallback should surface at least one page when the \
+         filesystem root is empty; got {:?}",
+        pages
+    );
+    // Spot-check that `active` (the canonical existing page id) is among them.
+    assert!(
+        pages.contains(&"active".to_string()),
+        "embedded snapshot should include the `active` page; got {:?}",
+        pages
+    );
+    // The snapshot should be readable end-to-end via read_ir.
+    let doc = storage::read_ir(root, "active")
+        .expect("read_ir should not error on embedded fallback")
+        .expect("active page must be present in the embedded snapshot");
+    assert_eq!(doc.id, "active");
+}
+
+#[test]
 fn storage_path_traversal_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

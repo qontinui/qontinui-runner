@@ -1,0 +1,344 @@
+{
+  "version": "1.0",
+  "id": "llm-observability",
+  "name": "LlmObservabilityDashboard",
+  "states": [
+    {
+      "id": "llm-summary-cards",
+      "name": "Summary Cards",
+      "requiredElements": [
+        {
+          "text": "Total Cost"
+        },
+        {
+          "text": "Total Tokens"
+        },
+        {
+          "text": "Total Calls"
+        },
+        {
+          "text": "Avg Cost/Call"
+        }
+      ],
+      "description": "Four metric cards at the top of the dashboard showing aggregate LLM usage statistics: Total Cost (formatted as dollars from cents, with provider count subtitle), Total Tokens (input + output with K/M suffixes, with in/out breakdown subtitle), Total Calls (with unique model count subtitle), and Avg Cost/Call (with average duration subtitle when available). These cards give the user an instant overview of LLM spend and usage volume for the selected time range.",
+      "precondition": "LLM analytics data has loaded successfully",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-time-range-selection",
+      "name": "Time Range Selection",
+      "requiredElements": [
+        {
+          "role": "combobox",
+          "text": "Last 7 days"
+        },
+        {
+          "text": "Last 24 hours|Last 7 days|Last 30 days|All time"
+        },
+        {
+          "role": "button",
+          "text": "Refresh analytics"
+        },
+        {
+          "role": "combobox"
+        }
+      ],
+      "description": "A dropdown selector and refresh button in the dashboard header that controls the time window for all analytics data. Options are 'Last 24 hours' (1d), 'Last 7 days' (7d, default), 'Last 30 days' (30d), and 'All time' (all). Changing the selection triggers a re-fetch of all Tauri-backed queries with the corresponding days parameter. The refresh button manually invalidates all cached queries.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-cost-charts",
+      "name": "Cost Charts",
+      "requiredElements": [
+        {
+          "text": "Cost Over Time"
+        },
+        {
+          "text": "Cost:|Calls:|Input tokens:|Output tokens:"
+        },
+        {
+          "text": "Cost by Model"
+        },
+        {
+          "text": "Avg duration:"
+        },
+        {
+          "text": "Cost by Phase"
+        },
+        {
+          "text": "Input tokens:|Output tokens:"
+        }
+      ],
+      "description": "Three cost visualization charts arranged in a responsive grid: (1) Cost Over Time â€” a Recharts LineChart showing daily LLM cost with date on X-axis and dollar amount on Y-axis, with tooltips showing cost, calls, input/output tokens per day; (2) Cost by Model â€” a horizontal BarChart ranking models by total cost descending, with tooltips showing cost, calls, tokens, and avg duration; (3) Cost by Phase â€” a horizontal BarChart breaking down cost by workflow phase (setup/agentic/completion), sorted by cost descending.",
+      "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-cost-trends",
+      "name": "Cost Trends",
+      "requiredElements": [
+        {
+          "text": "Cost Trends"
+        },
+        {
+          "text": "Total:|Avg/day:|Trend:"
+        },
+        {
+          "text": "Daily Cost"
+        },
+        {
+          "text": "7-Day Average"
+        },
+        {
+          "text": "Daily cost:|7-day avg:"
+        }
+      ],
+      "description": "A dedicated cost trend chart that fetches its own data independently from the web backend via useCostTrends (fetch API â†’ PostgreSQL). Shows a Recharts LineChart with two lines: 'Daily Cost' (solid line with dots) and '7-Day Average' (dashed line, computed client-side via 7-day rolling window). Displays summary stats above the chart: Total spend, Avg/day cost, and Trend direction (up/down/flat icon). The trend direction compares the average of the last 7 days against the previous 7 days, with a 5% threshold.",
+      "precondition": "Cost trends data has loaded and at least 7 days of data exist",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-provider-latency",
+      "name": "Provider Latency",
+      "requiredElements": [
+        {
+          "text": "Provider Latency"
+        },
+        {
+          "text": "Avg|Min|Max"
+        },
+        {
+          "text": "Avg:|Min:|Max:|Calls:"
+        }
+      ],
+      "description": "A grouped bar chart showing response time distribution per LLM provider. Each provider has three bars: Avg (primary color), Min (accent color), and Max (secondary color) latency in milliseconds. Includes a Recharts Legend identifying the three series. Tooltips show provider name, avg/min/max latency, and call count.",
+      "precondition": "LLM analytics data has loaded successfully (not in loading or error state)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-task-run-cost-table",
+      "name": "Task Run Cost Table",
+      "requiredElements": [
+        {
+          "text": "Task Run Costs"
+        },
+        {
+          "text": "Task Run|Cost|Input|Output|Calls|Started"
+        },
+        {
+          "role": "button",
+          "text": "Sort by Cost"
+        },
+        {
+          "role": "button",
+          "text": "Sort by Calls"
+        },
+        {
+          "role": "button",
+          "text": "Sort by Started"
+        },
+        {
+          "text": "..."
+        }
+      ],
+      "description": "A sortable table showing per-task-run LLM cost breakdown, limited to the most recent 50 runs. Columns: Task Run (truncated ID with full ID in title attribute), Cost (sortable, default sort descending), Input tokens, Output tokens, Calls (sortable), and Started (sortable, formatted as 'Mon DD, HH:MM'). Sort toggles between ascending and descending when clicking the same column header. An ArrowUpDown icon appears next to the active sort column.",
+      "precondition": "At least one task run with LLM cost data exists",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-loading-error-states",
+      "name": "Dashboard Loading & Error States",
+      "requiredElements": [
+        {},
+        {
+          "text": "Failed to load LLM analytics"
+        },
+        {
+          "role": "button",
+          "text": "Retry"
+        },
+        {
+          "text": "No LLM usage data available"
+        },
+        {
+          "text": "Run some workflows to start collecting LLM analytics"
+        },
+        {
+          "text": "No daily cost data available"
+        },
+        {
+          "text": "No model cost data available"
+        },
+        {
+          "text": "No phase cost data available"
+        },
+        {
+          "text": "No latency data available"
+        },
+        {
+          "text": "No task run cost data available"
+        },
+        {
+          "text": "No cost trend data available"
+        },
+        {
+          "text": "Failed to load cost trends"
+        },
+        {
+          "text": "Cost Trends"
+        }
+      ],
+      "description": "The dashboard handles three non-data states: (1) Loading â€” a centered spinning RefreshCw icon while any Tauri query is in-flight; (2) Error â€” an AlertTriangle icon with 'Failed to load LLM analytics', the error message text, and a 'Retry' button that triggers refresh; (3) Empty â€” a CreditCard icon with 'No LLM usage data available' and 'Run some workflows to start collecting LLM analytics' when summary is null or total_calls is 0. Individual chart components also have their own empty states when their specific data arrays are empty.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-data-display",
+      "name": "Data Display",
+      "requiredElements": [
+        {
+          "text": "Total Cost|Total Tokens|Total Calls|Avg Cost/Call"
+        },
+        {
+          "text": "Cost Over Time"
+        },
+        {
+          "text": "Cost by Model"
+        },
+        {
+          "text": "Task Run|Cost|Input|Output|Calls|Started"
+        },
+        {
+          "text": "Daily Cost|7-Day Average"
+        }
+      ],
+      "description": "Assertions verifying that data values are rendered with correct formatting, units, axis labels, and proportional representation across summary cards, charts, and tables.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-behavior",
+      "name": "Behavior",
+      "requiredElements": [
+        {
+          "role": "combobox",
+          "text": "Select time range"
+        },
+        {
+          "role": "button",
+          "text": "Refresh analytics"
+        },
+        {
+          "text": "Cost Over Time|Cost by Model|Cost Trends"
+        },
+        {
+          "text": "Cost:|Daily cost:|7-day avg:"
+        }
+      ],
+      "description": "Assertions verifying interactive behavior: time range filtering, refresh, chart animations, and tooltip interactions.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-navigation",
+      "name": "Navigation",
+      "requiredElements": [
+        {
+          "text": "LLM Analytics"
+        },
+        {
+          "text": "LLM Analytics"
+        },
+        {}
+      ],
+      "description": "Assertions verifying dashboard accessibility via tab navigation, state persistence, and scroll behavior.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-element-presence",
+      "name": "Element Presence",
+      "requiredElements": [
+        {
+          "text": "Total Cost|Total Tokens|Total Calls|Avg Cost/Call"
+        },
+        {
+          "role": "combobox",
+          "text": "Select time range"
+        },
+        {
+          "role": "button",
+          "text": "Refresh analytics"
+        },
+        {
+          "text": "Cost Over Time|Cost by Model|Cost by Phase|Cost Trends|Provider Latency|Task Run Costs"
+        },
+        {
+          "text": "Daily Cost|7-Day Average"
+        }
+      ],
+      "description": "Assertions verifying that key UI elements are present and visible in the dashboard layout.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "llm-ui-bridge-registrations",
+      "name": "UI Bridge Element Registrations",
+      "requiredElements": [
+        {
+          "id": "llm-analytics-root"
+        },
+        {
+          "id": "llm-analytics-refresh"
+        },
+        {
+          "id": "llm-analytics-time-range"
+        },
+        {},
+        {},
+        {
+          "id": "llm-analytics-task-run-cost-table"
+        },
+        {
+          "id": "llm-analytics-root"
+        }
+      ],
+      "description": "The dashboard and its summary-cards subcomponent register elements with the UI Bridge SDK so that currentRouteOnly=true snapshots return the page's interactive content (refresh button, time-range selector, metric cards, charts, task-run table), not just sidebar chrome. Exposes stable element ids that automation workflows can target without depending on rendered text. A `page:llm-analytics` component and a `llm-analytics-root` element are always present; the metric-card and chart registrations require the corresponding data branch to have rendered.",
+      "precondition": "LLM Analytics tab is currently active",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The LLM Observability Dashboard provides analytics for LLM token usage, cost breakdown, and provider performance. Displays summary metric cards, cost-over-time and cost-by-model charts, phase cost breakdown, provider latency distribution, a 7-day moving average cost trend line, and a per-run cost table. Data sourced via Tauri commands (SQLite) and web API (PostgreSQL) with TanStack Query caching.",
+  "metadata": {
+    "tags": [
+      "llm-observability",
+      "cost-tracking",
+      "token-analytics",
+      "opik",
+      "tier-2"
+    ]
+  }
+}

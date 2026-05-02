@@ -1,0 +1,80 @@
+{
+  "version": "1.0",
+  "id": "config-findings",
+  "name": "CategoryManager",
+  "states": [
+    {
+      "id": "findings-category-management",
+      "name": "Category Inventory and Organization",
+      "requiredElements": [
+        {
+          "text": "Finding Categories"
+        },
+        {
+          "text": "Built-in"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "The Finding Categories page is where users define the taxonomy used to organize AI-detected findings from automation runs. Users see a list of all categories (both built-in and custom) with their names, descriptions, icons, color coding, and default action types. Built-in categories are locked and cannot be edited or deleted, but custom categories are fully manageable. The ordering of categories matters because it determines the display order in findings views throughout the application. Users can reorder categories using up/down controls, hide categories they do not want to see in reports, and reset everything to defaults if their customizations become unwieldy.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "findings-category-crud",
+      "name": "Category Creation and Editing",
+      "requiredElements": [
+        {
+          "text": "New Category"
+        },
+        {
+          "text": "Category Name"
+        },
+        {
+          "text": "Auto Fix"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "Users who need categories beyond the built-in set can create custom ones. The creation form includes fields for an auto-generated ID, name, description, icon selection from a visual picker, color selection, and a default action type (auto fix, needs user input, manual, informational). A live preview shows how the category will look before saving. Existing custom categories can be edited with the same form, and deleted when no longer needed (with a warning that associated findings will become uncategorized). The form validates that name and ID are provided before allowing save.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "findings-category-visibility",
+      "name": "Visibility and Reset Controls",
+      "requiredElements": [
+        {
+          "text": "Hidden categories are not shown in reports"
+        },
+        {
+          "text": "Reset"
+        },
+        {
+          "text": "Built-in categories cannot be edited or deleted"
+        }
+      ],
+      "description": "Categories can be hidden from reports and views without being deleted, which is useful for temporarily suppressing categories during focused investigations or when built-in categories are not relevant to the current project. The visibility toggle works independently of the category's existence. A reset button restores all categories to their default configuration, removing custom categories and restoring default ordering. The page footer provides legend information explaining built-in category restrictions and the effect of hiding categories.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Finding Categories configuration page — defines and manages categories used to organize AI-detected findings, with support for custom categories, colors, icons, action types, visibility control, and ordering.",
+  "metadata": {
+    "tags": [
+      "findings",
+      "categories",
+      "configuration",
+      "settings"
+    ]
+  }
+}

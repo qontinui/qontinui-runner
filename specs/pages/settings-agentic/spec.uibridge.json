@@ -1,0 +1,989 @@
+{
+  "description": "The Advanced AI settings page in the qontinui-runner desktop application, accessed via the 'Advanced AI' tab in the Settings sidebar. It configures four agentic subsystems: Memory Compression (token-budget management for AI context windows, preventing overflow by summarizing old knowledge entries), Retry with Feedback (exponential backoff with jitter and error-context injection into retry prompts), Intelligent Task Routing (cost/latency optimization by routing tasks to different Claude models based on file count thresholds), and Post-Run Reflection (automated post-workflow analysis that applies fixes such as knowledge base updates and workflow step rewrites). The first three subsystems are persisted together via the save_agentic_settings Tauri IPC command and loaded via get_agentic_settings. Post-Run Reflection is saved immediately on toggle via PUT /reflection/settings on the runner's HTTP API — it has no separate Save button. All four sections are collapsible and start expanded by default. A 'Reset to Defaults' button restores the first three subsystems in-memory without saving; 'Save Agentic Settings' commits them to disk.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Page Structure",
+          "enabled": true,
+          "id": "aa-page-structure-elem-0",
+          "precondition": "Settings have loaded (loading indicator is gone)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Advanced AI Features"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Page Structure",
+          "enabled": true,
+          "id": "aa-page-structure-elem-1",
+          "precondition": "Settings have loaded (loading indicator is gone)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Configure intelligent agentic features"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Page Structure",
+          "enabled": true,
+          "id": "aa-page-structure-elem-2",
+          "precondition": "Settings have loaded (loading indicator is gone)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Memory Compression"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Page Structure",
+          "enabled": true,
+          "id": "aa-page-structure-elem-3",
+          "precondition": "Settings have loaded (loading indicator is gone)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Advanced AI Features"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Advanced AI tab renders a page header with Brain icon, a descriptive subtitle, four collapsible section panels, and two action buttons at the bottom. This group verifies the top-level structure after settings load.",
+      "id": "aa-page-structure",
+      "name": "Page Structure",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Loading State",
+          "enabled": true,
+          "id": "aa-loading-state-elem-0",
+          "precondition": "Page has just mounted and the get_agentic_settings fetch has not yet completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Loading State",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Loading State",
+          "enabled": true,
+          "id": "aa-loading-state-elem-1",
+          "precondition": "Page has just mounted and the get_agentic_settings fetch has not yet completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Advanced AI Features"
+            },
+            "label": "Required element for Loading State",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "On mount, the page concurrently fetches agentic settings via get_agentic_settings (Tauri IPC) and reflection settings via GET /reflection/settings (HTTP). During the fetch, a loading indicator replaces the full form. This group verifies loading and transition-to-loaded behavior.",
+      "id": "aa-loading-state",
+      "name": "Loading State",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Memory Compression Section",
+          "enabled": true,
+          "id": "aa-memory-compression-elem-0",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Automatically compress context to prevent token overflow"
+            },
+            "label": "Required element for Memory Compression Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Memory Compression Section",
+          "enabled": true,
+          "id": "aa-memory-compression-elem-1",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Threshold (tokens)"
+            },
+            "label": "Required element for Memory Compression Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Memory Compression Section",
+          "enabled": true,
+          "id": "aa-memory-compression-elem-2",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Target (tokens)"
+            },
+            "label": "Required element for Memory Compression Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Memory Compression Section",
+          "enabled": true,
+          "id": "aa-memory-compression-elem-3",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Memory compression prevents context overflow by summarizing"
+            },
+            "label": "Required element for Memory Compression Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Memory Compression Section",
+          "enabled": true,
+          "id": "aa-memory-compression-elem-4",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Memory Compression"
+            },
+            "label": "Required element for Memory Compression Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Memory Compression Section",
+          "enabled": true,
+          "id": "aa-memory-compression-elem-5",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Memory Compression"
+            },
+            "label": "Required element for Memory Compression Section",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A collapsible panel with a toggle switch in the header. When expanded (default), it shows four number inputs in a 2-column grid: Threshold (tokens), Target (tokens), Keep Recent Items, Summarize Batch Size. All inputs are disabled when the toggle is off. An info box explains the behavior. Defaults: enabled=true, threshold=80000, target=60000, keep_recent=5, batch_size=10.",
+      "id": "aa-memory-compression",
+      "name": "Memory Compression Section",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Retry with Feedback Section",
+          "enabled": true,
+          "id": "aa-retry-with-feedback-elem-0",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Automatically retry on transient errors with context injection"
+            },
+            "label": "Required element for Retry with Feedback Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Retry with Feedback Section",
+          "enabled": true,
+          "id": "aa-retry-with-feedback-elem-1",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Max Retries"
+            },
+            "label": "Required element for Retry with Feedback Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Retry with Feedback Section",
+          "enabled": true,
+          "id": "aa-retry-with-feedback-elem-2",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Exponential Base"
+            },
+            "label": "Required element for Retry with Feedback Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Retry with Feedback Section",
+          "enabled": true,
+          "id": "aa-retry-with-feedback-elem-3",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Add Jitter"
+            },
+            "label": "Required element for Retry with Feedback Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Retry with Feedback Section",
+          "enabled": true,
+          "id": "aa-retry-with-feedback-elem-4",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Retry handles transient errors like timeouts, rate limits"
+            },
+            "label": "Required element for Retry with Feedback Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Retry with Feedback Section",
+          "enabled": true,
+          "id": "aa-retry-with-feedback-elem-5",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Retry with Feedback"
+            },
+            "label": "Required element for Retry with Feedback Section",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A collapsible panel with a toggle switch in the header. When expanded (default), it shows four number inputs (Max Retries, Base Delay, Max Delay, Exponential Base) in a 2-column grid, then two toggle rows (Add Jitter, Feedback Injection), then a yellow info box. All inputs and inner toggles are disabled when the master toggle is off. Defaults: enabled=true, max_retries=3, base_delay=1000ms, max_delay=30000ms, exp_base=2.0, jitter=true, feedback_injection=true.",
+      "id": "aa-retry-with-feedback",
+      "name": "Retry with Feedback Section",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Intelligent Task Routing Section",
+          "enabled": true,
+          "id": "aa-task-routing-elem-0",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Route tasks to different models based on complexity"
+            },
+            "label": "Required element for Intelligent Task Routing Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Intelligent Task Routing Section",
+          "enabled": true,
+          "id": "aa-task-routing-elem-1",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Simple Tasks Model"
+            },
+            "label": "Required element for Intelligent Task Routing Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Intelligent Task Routing Section",
+          "enabled": true,
+          "id": "aa-task-routing-elem-2",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Simple Tasks Model"
+            },
+            "label": "Required element for Intelligent Task Routing Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Intelligent Task Routing Section",
+          "enabled": true,
+          "id": "aa-task-routing-elem-3",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Simple Threshold (files)"
+            },
+            "label": "Required element for Intelligent Task Routing Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Intelligent Task Routing Section",
+          "enabled": true,
+          "id": "aa-task-routing-elem-4",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Task routing optimizes cost and latency"
+            },
+            "label": "Required element for Intelligent Task Routing Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Intelligent Task Routing Section",
+          "enabled": true,
+          "id": "aa-task-routing-elem-5",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Intelligent Task Routing"
+            },
+            "label": "Required element for Intelligent Task Routing Section",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A collapsible panel with a toggle switch in the header. When expanded (default), it shows three model select dropdowns (Simple Tasks Model, Medium Tasks Model, Complex Tasks Model) and two file-count threshold number inputs (Simple Threshold, Medium Threshold). All controls are disabled when the master toggle is off. The model dropdowns each contain six Claude model options. Defaults: enabled=false, simple=claude-haiku-4-5-20251001, medium=claude-sonnet-4-20250514, complex=claude-opus-4-20250514, file_count_thresholds=[3, 10].",
+      "id": "aa-task-routing",
+      "name": "Intelligent Task Routing Section",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Post-Run Reflection Section",
+          "enabled": true,
+          "id": "aa-post-run-reflection-elem-0",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Automatically analyze completed workflows to identify systemic issues"
+            },
+            "label": "Required element for Post-Run Reflection Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Post-Run Reflection Section",
+          "enabled": true,
+          "id": "aa-post-run-reflection-elem-1",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "When enabled, the system automatically reviews completed workflow runs"
+            },
+            "label": "Required element for Post-Run Reflection Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Post-Run Reflection Section",
+          "enabled": true,
+          "id": "aa-post-run-reflection-elem-2",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Reflection can apply fixes such as knowledge base updates"
+            },
+            "label": "Required element for Post-Run Reflection Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Post-Run Reflection Section",
+          "enabled": true,
+          "id": "aa-post-run-reflection-elem-3",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Post-Run Reflection"
+            },
+            "label": "Required element for Post-Run Reflection Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Post-Run Reflection Section",
+          "enabled": true,
+          "id": "aa-post-run-reflection-elem-4",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Post-Run Reflection"
+            },
+            "label": "Required element for Post-Run Reflection Section",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A collapsible panel with a toggle switch in the header. Unlike the other three sections, toggling Reflection saves immediately via PUT /reflection/settings to the runner's HTTP API — there is no separate Save button needed. When expanded (default), it shows only a cyan info box explaining the automated analysis behavior. Reflection settings are loaded from GET /reflection/settings (HTTP), not from Tauri IPC.",
+      "id": "aa-post-run-reflection",
+      "name": "Post-Run Reflection Section",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Action Buttons — Save and Reset",
+          "enabled": true,
+          "id": "aa-action-buttons-elem-0",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save Agentic Settings"
+            },
+            "label": "Required element for Action Buttons — Save and Reset",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Action Buttons — Save and Reset",
+          "enabled": true,
+          "id": "aa-action-buttons-elem-1",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Reset to Defaults"
+            },
+            "label": "Required element for Action Buttons — Save and Reset",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Action Buttons — Save and Reset",
+          "enabled": true,
+          "id": "aa-action-buttons-elem-2",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save Agentic Settings"
+            },
+            "label": "Required element for Action Buttons — Save and Reset",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Action Buttons — Save and Reset",
+          "enabled": true,
+          "id": "aa-action-buttons-elem-3",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Reset to Defaults"
+            },
+            "label": "Required element for Action Buttons — Save and Reset",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Two action buttons appear at the bottom of the page in a flex row. 'Reset to Defaults' (left, muted background) restores Memory Compression, Retry, and Routing settings in-memory to their default values without saving. 'Save Agentic Settings' (right, primary background) calls save_agentic_settings and shows three sequential button states: idle with Brain icon, in-flight with spinner + 'Saving...', and success with check icon + 'Saved!'. A green success banner appears above the sections on success. Reset does NOT affect Post-Run Reflection.",
+      "id": "aa-action-buttons",
+      "name": "Action Buttons — Save and Reset",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Feedback Alerts — Error and Success",
+          "enabled": true,
+          "id": "aa-feedback-alerts-elem-0",
+          "precondition": "A save operation has just completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Settings saved successfully!"
+            },
+            "label": "Required element for Feedback Alerts — Error and Success",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Feedback Alerts — Error and Success",
+          "enabled": true,
+          "id": "aa-feedback-alerts-elem-1",
+          "precondition": "A save operation has just completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Advanced AI Features"
+            },
+            "label": "Required element for Feedback Alerts — Error and Success",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The page shows contextual alerts in the form area (above the section panels, below the header) in response to save operations. Success alerts auto-dismiss after 3 seconds. Error alerts persist until the next save attempt clears them.",
+      "id": "aa-feedback-alerts",
+      "name": "Feedback Alerts — Error and Success",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Settings Persistence and Data Model",
+          "enabled": true,
+          "id": "aa-settings-persistence-elem-0",
+          "precondition": "Settings have been saved and the user navigated away and back",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Advanced AI Features"
+            },
+            "label": "Required element for Settings Persistence and Data Model",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Settings Persistence and Data Model",
+          "enabled": true,
+          "id": "aa-settings-persistence-elem-1",
+          "precondition": "Settings have been saved and the user navigated away and back",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Advanced AI Features"
+            },
+            "label": "Required element for Settings Persistence and Data Model",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Settings Persistence and Data Model",
+          "enabled": true,
+          "id": "aa-settings-persistence-elem-2",
+          "precondition": "Settings have been saved and the user navigated away and back",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Advanced AI Features"
+            },
+            "label": "Required element for Settings Persistence and Data Model",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Agentic settings (compression, retry, routing) are persisted via save_agentic_settings Tauri IPC and loaded via get_agentic_settings. The reflection toggle is persisted independently via PUT /reflection/settings HTTP. This group verifies round-trip integrity and the semantic contract of the settings objects.",
+      "id": "aa-settings-persistence",
+      "name": "Settings Persistence and Data Model",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "settings-agentic",
+    "tags": [
+      "settings",
+      "agentic",
+      "memory-compression",
+      "retry",
+      "exponential-backoff",
+      "feedback-injection",
+      "task-routing",
+      "model-selection",
+      "post-run-reflection",
+      "runner"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The Advanced AI tab renders a page header with Brain icon, a descriptive subtitle, four collapsible section panels, and two action buttons at the bottom. This group verifies the top-level structure after settings load.",
+        "elements": [
+          {
+            "textContent": "Advanced AI Features"
+          },
+          {
+            "textContent": "Configure intelligent agentic features"
+          },
+          {
+            "textContent": "Memory Compression"
+          },
+          {
+            "textContent": "Advanced AI Features"
+          }
+        ],
+        "id": "aa-page-structure",
+        "isInitial": false,
+        "name": "Page Structure",
+        "transitions": []
+      },
+      {
+        "description": "On mount, the page concurrently fetches agentic settings via get_agentic_settings (Tauri IPC) and reflection settings via GET /reflection/settings (HTTP). During the fetch, a loading indicator replaces the full form. This group verifies loading and transition-to-loaded behavior.",
+        "elements": [
+          {},
+          {
+            "textContent": "Advanced AI Features"
+          }
+        ],
+        "id": "aa-loading-state",
+        "isInitial": false,
+        "name": "Loading State",
+        "transitions": []
+      },
+      {
+        "description": "A collapsible panel with a toggle switch in the header. When expanded (default), it shows four number inputs in a 2-column grid: Threshold (tokens), Target (tokens), Keep Recent Items, Summarize Batch Size. All inputs are disabled when the toggle is off. An info box explains the behavior. Defaults: enabled=true, threshold=80000, target=60000, keep_recent=5, batch_size=10.",
+        "elements": [
+          {
+            "textContent": "Automatically compress context to prevent token overflow"
+          },
+          {
+            "textContent": "Threshold (tokens)"
+          },
+          {
+            "textContent": "Target (tokens)"
+          },
+          {
+            "textContent": "Memory compression prevents context overflow by summarizing"
+          },
+          {
+            "textContent": "Memory Compression"
+          },
+          {
+            "textContent": "Memory Compression"
+          }
+        ],
+        "id": "aa-memory-compression",
+        "isInitial": false,
+        "name": "Memory Compression Section",
+        "transitions": []
+      },
+      {
+        "description": "A collapsible panel with a toggle switch in the header. When expanded (default), it shows four number inputs (Max Retries, Base Delay, Max Delay, Exponential Base) in a 2-column grid, then two toggle rows (Add Jitter, Feedback Injection), then a yellow info box. All inputs and inner toggles are disabled when the master toggle is off. Defaults: enabled=true, max_retries=3, base_delay=1000ms, max_delay=30000ms, exp_base=2.0, jitter=true, feedback_injection=true.",
+        "elements": [
+          {
+            "textContent": "Automatically retry on transient errors with context injection"
+          },
+          {
+            "textContent": "Max Retries"
+          },
+          {
+            "textContent": "Exponential Base"
+          },
+          {
+            "textContent": "Add Jitter"
+          },
+          {
+            "textContent": "Retry handles transient errors like timeouts, rate limits"
+          },
+          {
+            "textContent": "Retry with Feedback"
+          }
+        ],
+        "id": "aa-retry-with-feedback",
+        "isInitial": false,
+        "name": "Retry with Feedback Section",
+        "transitions": []
+      },
+      {
+        "description": "A collapsible panel with a toggle switch in the header. When expanded (default), it shows three model select dropdowns (Simple Tasks Model, Medium Tasks Model, Complex Tasks Model) and two file-count threshold number inputs (Simple Threshold, Medium Threshold). All controls are disabled when the master toggle is off. The model dropdowns each contain six Claude model options. Defaults: enabled=false, simple=claude-haiku-4-5-20251001, medium=claude-sonnet-4-20250514, complex=claude-opus-4-20250514, file_count_thresholds=[3, 10].",
+        "elements": [
+          {
+            "textContent": "Route tasks to different models based on complexity"
+          },
+          {
+            "textContent": "Simple Tasks Model"
+          },
+          {
+            "textContent": "Simple Tasks Model"
+          },
+          {
+            "textContent": "Simple Threshold (files)"
+          },
+          {
+            "textContent": "Task routing optimizes cost and latency"
+          },
+          {
+            "textContent": "Intelligent Task Routing"
+          }
+        ],
+        "id": "aa-task-routing",
+        "isInitial": false,
+        "name": "Intelligent Task Routing Section",
+        "transitions": []
+      },
+      {
+        "description": "A collapsible panel with a toggle switch in the header. Unlike the other three sections, toggling Reflection saves immediately via PUT /reflection/settings to the runner's HTTP API — there is no separate Save button needed. When expanded (default), it shows only a cyan info box explaining the automated analysis behavior. Reflection settings are loaded from GET /reflection/settings (HTTP), not from Tauri IPC.",
+        "elements": [
+          {
+            "textContent": "Automatically analyze completed workflows to identify systemic issues"
+          },
+          {
+            "textContent": "When enabled, the system automatically reviews completed workflow runs"
+          },
+          {
+            "textContent": "Reflection can apply fixes such as knowledge base updates"
+          },
+          {
+            "textContent": "Post-Run Reflection"
+          },
+          {
+            "textContent": "Post-Run Reflection"
+          }
+        ],
+        "id": "aa-post-run-reflection",
+        "isInitial": false,
+        "name": "Post-Run Reflection Section",
+        "transitions": []
+      },
+      {
+        "description": "Two action buttons appear at the bottom of the page in a flex row. 'Reset to Defaults' (left, muted background) restores Memory Compression, Retry, and Routing settings in-memory to their default values without saving. 'Save Agentic Settings' (right, primary background) calls save_agentic_settings and shows three sequential button states: idle with Brain icon, in-flight with spinner + 'Saving...', and success with check icon + 'Saved!'. A green success banner appears above the sections on success. Reset does NOT affect Post-Run Reflection.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Save Agentic Settings"
+          },
+          {
+            "role": "button",
+            "textContent": "Reset to Defaults"
+          },
+          {
+            "role": "button",
+            "textContent": "Save Agentic Settings"
+          },
+          {
+            "role": "button",
+            "textContent": "Reset to Defaults"
+          }
+        ],
+        "id": "aa-action-buttons",
+        "isInitial": false,
+        "name": "Action Buttons — Save and Reset",
+        "transitions": []
+      },
+      {
+        "description": "The page shows contextual alerts in the form area (above the section panels, below the header) in response to save operations. Success alerts auto-dismiss after 3 seconds. Error alerts persist until the next save attempt clears them.",
+        "elements": [
+          {
+            "textContent": "Settings saved successfully!"
+          },
+          {
+            "textContent": "Advanced AI Features"
+          }
+        ],
+        "id": "aa-feedback-alerts",
+        "isInitial": false,
+        "name": "Feedback Alerts — Error and Success",
+        "transitions": []
+      },
+      {
+        "description": "Agentic settings (compression, retry, routing) are persisted via save_agentic_settings Tauri IPC and loaded via get_agentic_settings. The reflection toggle is persisted independently via PUT /reflection/settings HTTP. This group verifies round-trip integrity and the semantic contract of the settings objects.",
+        "elements": [
+          {
+            "textContent": "Advanced AI Features"
+          },
+          {
+            "textContent": "Advanced AI Features"
+          },
+          {
+            "textContent": "Advanced AI Features"
+          }
+        ],
+        "id": "aa-settings-persistence",
+        "isInitial": false,
+        "name": "Settings Persistence and Data Model",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

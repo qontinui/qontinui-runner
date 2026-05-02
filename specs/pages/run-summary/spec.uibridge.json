@@ -1,0 +1,787 @@
+{
+  "description": "Run Summary page — the primary post-run analysis view where users understand what happened during a workflow run. Combines AI-generated summaries, status banners, token usage, failure details, and tabbed deep-dive sections (Timeline, Verification, Knowledge, Context, Canvas, Diffs & Replay, Phase Timeline, Feedback Scores, LLM Costs, Errors).",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Run Outcome at a Glance",
+          "enabled": true,
+          "id": "summary-run-outcome-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "status",
+              "textContent": "complete|failed|stopped"
+            },
+            "label": "Required element for Run Outcome at a Glance",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Run Outcome at a Glance",
+          "enabled": true,
+          "id": "summary-run-outcome-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Summary"
+            },
+            "label": "Required element for Run Outcome at a Glance",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Run Outcome at a Glance",
+          "enabled": true,
+          "id": "summary-run-outcome-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Goal"
+            },
+            "label": "Required element for Run Outcome at a Glance",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Run Outcome at a Glance",
+          "enabled": true,
+          "id": "summary-run-outcome-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "session"
+            },
+            "label": "Required element for Run Outcome at a Glance",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When a user navigates to the Summary page after a workflow completes, they need to immediately understand the outcome. The page should communicate whether the run succeeded, failed, or was stopped, along with the AI-generated narrative of what was accomplished. This is the most critical information on the page because it determines whether the user needs to take further action or can move on to another task.",
+      "id": "summary-run-outcome",
+      "name": "Run Outcome at a Glance",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Failure Analysis and Recovery",
+          "enabled": true,
+          "id": "summary-failure-analysis-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Failure|Error|failed"
+            },
+            "label": "Required element for Failure Analysis and Recovery",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Failure Analysis and Recovery",
+          "enabled": true,
+          "id": "summary-failure-analysis-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Continue"
+            },
+            "label": "Required element for Failure Analysis and Recovery",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Failure Analysis and Recovery",
+          "enabled": true,
+          "id": "summary-failure-analysis-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "usage|token|cost"
+            },
+            "label": "Required element for Failure Analysis and Recovery",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When a workflow run fails, users need to understand what went wrong and have options for recovery. The Summary page should prominently display failure details for failed runs and offer a way to continue the run with additional iterations. This is essential for iterative development workflows where partial progress is common and users want to pick up where they left off rather than starting over.",
+      "id": "summary-failure-analysis",
+      "name": "Failure Analysis and Recovery",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Tabbed Deep-Dive Sections",
+          "enabled": true,
+          "id": "summary-tabbed-deep-dives-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Timeline"
+            },
+            "label": "Required element for Tabbed Deep-Dive Sections",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Tabbed Deep-Dive Sections",
+          "enabled": true,
+          "id": "summary-tabbed-deep-dives-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Verification"
+            },
+            "label": "Required element for Tabbed Deep-Dive Sections",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Tabbed Deep-Dive Sections",
+          "enabled": true,
+          "id": "summary-tabbed-deep-dives-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Knowledge"
+            },
+            "label": "Required element for Tabbed Deep-Dive Sections",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Tabbed Deep-Dive Sections",
+          "enabled": true,
+          "id": "summary-tabbed-deep-dives-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Context"
+            },
+            "label": "Required element for Tabbed Deep-Dive Sections",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Tabbed Deep-Dive Sections",
+          "enabled": true,
+          "id": "summary-tabbed-deep-dives-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Canvas"
+            },
+            "label": "Required element for Tabbed Deep-Dive Sections",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Tabbed Deep-Dive Sections",
+          "enabled": true,
+          "id": "summary-tabbed-deep-dives-elem-5",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Phase Timeline"
+            },
+            "label": "Required element for Tabbed Deep-Dive Sections",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Beyond the top-level summary, users need to drill into specific aspects of the run. The tabbed interface provides organized access to the execution timeline, verification results, knowledge entries, context variables, canvas artifacts, and error monitoring. Each tab serves a distinct analytical purpose, and users should be able to switch between them fluidly to build a complete picture of what happened.",
+      "id": "summary-tabbed-deep-dives",
+      "name": "Tabbed Deep-Dive Sections",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Phase Timeline Tab — Content & Structure",
+          "enabled": true,
+          "id": "phase-timeline-content-elem-0",
+          "precondition": "Phase Timeline tab is active and at least one phase_result row exists for the selected run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Phase Timeline"
+            },
+            "label": "Required element for Phase Timeline Tab — Content & Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Phase Timeline Tab — Content & Structure",
+          "enabled": true,
+          "id": "phase-timeline-content-elem-1",
+          "precondition": "Phase Timeline tab is active and at least one phase_result row exists for the selected run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "step"
+            },
+            "label": "Required element for Phase Timeline Tab — Content & Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Phase Timeline Tab — Content & Structure",
+          "enabled": true,
+          "id": "phase-timeline-content-elem-2",
+          "precondition": "Phase Timeline tab is active and at least one phase_result row exists for the selected run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Iteration"
+            },
+            "label": "Required element for Phase Timeline Tab — Content & Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Phase Timeline Tab — Content & Structure",
+          "enabled": true,
+          "id": "phase-timeline-content-elem-3",
+          "precondition": "Phase Timeline tab is active and at least one phase_result row exists for the selected run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Step Breakdown"
+            },
+            "label": "Required element for Phase Timeline Tab — Content & Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Phase Timeline Tab — Content & Structure",
+          "enabled": true,
+          "id": "phase-timeline-content-elem-4",
+          "precondition": "Phase Timeline tab is active and at least one phase_result row exists for the selected run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Failure Context"
+            },
+            "label": "Required element for Phase Timeline Tab — Content & Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Phase Timeline Tab — Content & Structure",
+          "enabled": true,
+          "id": "phase-timeline-content-elem-5",
+          "precondition": "Phase Timeline tab is active and at least one phase_result row exists for the selected run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No phase results yet for this run"
+            },
+            "label": "Required element for Phase Timeline Tab — Content & Structure",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When the Phase Timeline tab is active, the user sees one collapsible card per PhaseResult row. Each card shows the phase name (Setup / Verification / Agentic / Completion), optional iteration number, optional stage index, a success/failure badge, the phase duration, step count (successful/total), and an optional abbreviated 8-char commit hash. Iteration separators appear between cards whenever the iteration field changes, so multi-iteration runs read chronologically. The tab is backed by the get_phase_results Tauri command reading from the runner.phase_results PG table (plan: restate-port-part-a-compensation-and-phase-results.md §2.5).",
+      "id": "phase-timeline-content",
+      "name": "Phase Timeline Tab — Content & Structure",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Phase Timeline — PhaseResult Data Correctness",
+          "enabled": true,
+          "id": "phase-timeline-correctness-elem-0",
+          "precondition": "Phase Timeline tab is active with at least one card",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Setup"
+            },
+            "label": "Required element for Phase Timeline — PhaseResult Data Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Phase Timeline — PhaseResult Data Correctness",
+          "enabled": true,
+          "id": "phase-timeline-correctness-elem-1",
+          "precondition": "Phase Timeline tab is active with at least one card",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Phase Timeline"
+            },
+            "label": "Required element for Phase Timeline — PhaseResult Data Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Phase Timeline — PhaseResult Data Correctness",
+          "enabled": true,
+          "id": "phase-timeline-correctness-elem-2",
+          "precondition": "Phase Timeline tab is active with at least one card",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Agentic"
+            },
+            "label": "Required element for Phase Timeline — PhaseResult Data Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Phase Timeline — PhaseResult Data Correctness",
+          "enabled": true,
+          "id": "phase-timeline-correctness-elem-3",
+          "precondition": "Phase Timeline tab is active with at least one card",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "steps"
+            },
+            "label": "Required element for Phase Timeline — PhaseResult Data Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Phase Timeline — PhaseResult Data Correctness",
+          "enabled": true,
+          "id": "phase-timeline-correctness-elem-4",
+          "precondition": "Phase Timeline tab is active with at least one card",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Phase Timeline"
+            },
+            "label": "Required element for Phase Timeline — PhaseResult Data Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Phase Timeline — PhaseResult Data Correctness",
+          "enabled": true,
+          "id": "phase-timeline-correctness-elem-5",
+          "precondition": "Phase Timeline tab is active with at least one card",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Phase Timeline"
+            },
+            "label": "Required element for Phase Timeline — PhaseResult Data Correctness",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Phase Timeline is a window into the loop controller's structured PhaseResult output. The controller builds one PhaseResult after each phase executor returns (setup, verification, agentic, completion) at four insertion points in loop_controller.rs and loop_handlers.rs, persists it via save_phase_result, and emits it on the Tauri 'phase-result' event. Persistence and emit both key on get_parent_task_id(&config.execution_id) so composed-run children surface under their parent task_run. Correctness assertions describe what the persisted data must look like on the page — deviations indicate bugs in the loop controller's mapping logic, not the UI.",
+      "id": "phase-timeline-correctness",
+      "name": "Phase Timeline — PhaseResult Data Correctness",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Empty and Loading States",
+          "enabled": true,
+          "id": "summary-empty-and-loading-states-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loading"
+            },
+            "label": "Required element for Empty and Loading States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Empty and Loading States",
+          "enabled": true,
+          "id": "summary-empty-and-loading-states-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a run"
+            },
+            "label": "Required element for Empty and Loading States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Empty and Loading States",
+          "enabled": true,
+          "id": "summary-empty-and-loading-states-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Failed to load"
+            },
+            "label": "Required element for Empty and Loading States",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Summary page must gracefully handle states where data is not yet available. When a run is loading, the user should see clear progress indication. When no run is selected or no recap data exists, the page should guide the user toward selecting a run or initiating one. These states prevent confusion and ensure the user always knows what to do next.",
+      "id": "summary-empty-and-loading-states",
+      "name": "Empty and Loading States",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Verification Results Pagination",
+          "enabled": true,
+          "id": "summary-verification-pagination-elem-0",
+          "precondition": "A task run with >20 verification iterations is selected and Verification tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Show more"
+            },
+            "label": "Required element for Verification Results Pagination",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Verification Results Pagination",
+          "enabled": true,
+          "id": "summary-verification-pagination-elem-1",
+          "precondition": "A task run with >20 verification iterations is selected and Verification tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Iteration"
+            },
+            "label": "Required element for Verification Results Pagination",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Verification Results Pagination",
+          "enabled": true,
+          "id": "summary-verification-pagination-elem-2",
+          "precondition": "A task run with >20 verification iterations is selected and Verification tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Output"
+            },
+            "label": "Required element for Verification Results Pagination",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Verification tab paginates iteration results (20 per page) to handle runs with many verification iterations. The latest visible iteration is auto-expanded. A 'Show more' button loads additional iterations.",
+      "id": "summary-verification-pagination",
+      "name": "Verification Results Pagination",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "run-summary",
+    "tags": [
+      "run-summary",
+      "recap",
+      "post-run-analysis",
+      "observe",
+      "pagination",
+      "memory-protection",
+      "phase-timeline"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "When a user navigates to the Summary page after a workflow completes, they need to immediately understand the outcome. The page should communicate whether the run succeeded, failed, or was stopped, along with the AI-generated narrative of what was accomplished. This is the most critical information on the page because it determines whether the user needs to take further action or can move on to another task.",
+        "elements": [
+          {
+            "role": "status",
+            "textContent": "complete|failed|stopped"
+          },
+          {
+            "textContent": "Summary"
+          },
+          {
+            "textContent": "Goal"
+          },
+          {
+            "textContent": "session"
+          }
+        ],
+        "id": "summary-run-outcome",
+        "isInitial": false,
+        "name": "Run Outcome at a Glance",
+        "transitions": []
+      },
+      {
+        "description": "When a workflow run fails, users need to understand what went wrong and have options for recovery. The Summary page should prominently display failure details for failed runs and offer a way to continue the run with additional iterations. This is essential for iterative development workflows where partial progress is common and users want to pick up where they left off rather than starting over.",
+        "elements": [
+          {
+            "textContent": "Failure|Error|failed"
+          },
+          {
+            "role": "button",
+            "textContent": "Continue"
+          },
+          {
+            "textContent": "usage|token|cost"
+          }
+        ],
+        "id": "summary-failure-analysis",
+        "isInitial": false,
+        "name": "Failure Analysis and Recovery",
+        "transitions": []
+      },
+      {
+        "description": "Beyond the top-level summary, users need to drill into specific aspects of the run. The tabbed interface provides organized access to the execution timeline, verification results, knowledge entries, context variables, canvas artifacts, and error monitoring. Each tab serves a distinct analytical purpose, and users should be able to switch between them fluidly to build a complete picture of what happened.",
+        "elements": [
+          {
+            "textContent": "Timeline"
+          },
+          {
+            "textContent": "Verification"
+          },
+          {
+            "textContent": "Knowledge"
+          },
+          {
+            "textContent": "Context"
+          },
+          {
+            "textContent": "Canvas"
+          },
+          {
+            "textContent": "Phase Timeline"
+          }
+        ],
+        "id": "summary-tabbed-deep-dives",
+        "isInitial": false,
+        "name": "Tabbed Deep-Dive Sections",
+        "transitions": []
+      },
+      {
+        "description": "When the Phase Timeline tab is active, the user sees one collapsible card per PhaseResult row. Each card shows the phase name (Setup / Verification / Agentic / Completion), optional iteration number, optional stage index, a success/failure badge, the phase duration, step count (successful/total), and an optional abbreviated 8-char commit hash. Iteration separators appear between cards whenever the iteration field changes, so multi-iteration runs read chronologically. The tab is backed by the get_phase_results Tauri command reading from the runner.phase_results PG table (plan: restate-port-part-a-compensation-and-phase-results.md §2.5).",
+        "elements": [
+          {
+            "textContent": "Phase Timeline"
+          },
+          {
+            "textContains": "step"
+          },
+          {
+            "textContains": "Iteration"
+          },
+          {
+            "textContent": "Step Breakdown"
+          },
+          {
+            "textContent": "Failure Context"
+          },
+          {
+            "textContent": "No phase results yet for this run"
+          }
+        ],
+        "id": "phase-timeline-content",
+        "isInitial": false,
+        "name": "Phase Timeline Tab — Content & Structure",
+        "transitions": []
+      },
+      {
+        "description": "The Phase Timeline is a window into the loop controller's structured PhaseResult output. The controller builds one PhaseResult after each phase executor returns (setup, verification, agentic, completion) at four insertion points in loop_controller.rs and loop_handlers.rs, persists it via save_phase_result, and emits it on the Tauri 'phase-result' event. Persistence and emit both key on get_parent_task_id(&config.execution_id) so composed-run children surface under their parent task_run. Correctness assertions describe what the persisted data must look like on the page — deviations indicate bugs in the loop controller's mapping logic, not the UI.",
+        "elements": [
+          {
+            "textContains": "Setup"
+          },
+          {
+            "textContent": "Phase Timeline"
+          },
+          {
+            "textContent": "Agentic"
+          },
+          {
+            "textContains": "steps"
+          },
+          {
+            "textContent": "Phase Timeline"
+          },
+          {
+            "textContent": "Phase Timeline"
+          }
+        ],
+        "id": "phase-timeline-correctness",
+        "isInitial": false,
+        "name": "Phase Timeline — PhaseResult Data Correctness",
+        "transitions": []
+      },
+      {
+        "description": "The Summary page must gracefully handle states where data is not yet available. When a run is loading, the user should see clear progress indication. When no run is selected or no recap data exists, the page should guide the user toward selecting a run or initiating one. These states prevent confusion and ensure the user always knows what to do next.",
+        "elements": [
+          {
+            "textContent": "Loading"
+          },
+          {
+            "textContent": "Select a run"
+          },
+          {
+            "textContent": "Failed to load"
+          }
+        ],
+        "id": "summary-empty-and-loading-states",
+        "isInitial": false,
+        "name": "Empty and Loading States",
+        "transitions": []
+      },
+      {
+        "description": "The Verification tab paginates iteration results (20 per page) to handle runs with many verification iterations. The latest visible iteration is auto-expanded. A 'Show more' button loads additional iterations.",
+        "elements": [
+          {
+            "textContains": "Show more"
+          },
+          {
+            "textContains": "Iteration"
+          },
+          {
+            "textContains": "Output"
+          }
+        ],
+        "id": "summary-verification-pagination",
+        "isInitial": false,
+        "name": "Verification Results Pagination",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

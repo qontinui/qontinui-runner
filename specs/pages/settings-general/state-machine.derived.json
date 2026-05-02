@@ -1,0 +1,173 @@
+{
+  "version": "1.0",
+  "id": "settings-general",
+  "name": "GeneralSettings",
+  "description": "General settings tab within the runner Settings panel. Displays application-level preferences for startup behavior and workflow builder defaults. Contains two sections: 'Application' (Auto-load Last Configuration on Startup, Launch on System Startup) and 'Workflow Builder' (Include AI Summary in New Workflows). All three settings are boolean toggle switches that persist via Tauri IPC commands. Toggling uses optimistic UI updates with rollback on failure. The Launch on System Startup toggle is backed by the OS autostart mechanism (Windows Registry Run key, macOS LaunchAgent, Linux .desktop) and reconciles against the actual OS state after each toggle.",
+  "metadata": {
+    "tags": [
+      "settings",
+      "general",
+      "startup",
+      "autostart",
+      "workflow-builder",
+      "toggle"
+    ]
+  },
+  "provenance": {
+    "source": "migrated"
+  },
+  "states": [
+    {
+      "id": "gen-page-structure",
+      "name": "Page Structure",
+      "description": "The General settings tab renders a SectionHeader with title 'General' and a description, followed by two card sections: 'Application' and 'Workflow Builder'. There are no sub-tabs or nested navigation within this tab.",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "General"
+        },
+        {
+          "text": "Application-level preferences that control startup behavior and defaults."
+        },
+        {
+          "text": "General"
+        }
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gen-application-section",
+      "name": "Application Section",
+      "description": "The 'Application' card contains two toggle rows: 'Auto-load Last Configuration on Startup' and 'Launch on System Startup'. A tip banner below both toggles explains the auto-load behavior.",
+      "requiredElements": [
+        {
+          "text": "Application"
+        },
+        {
+          "text": "Auto-load Last Configuration on Startup"
+        },
+        {
+          "text": "Launch on System Startup"
+        },
+        {
+          "text": "Tip:"
+        }
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gen-workflow-builder-section",
+      "name": "Workflow Builder Section",
+      "description": "The 'Workflow Builder' card contains one toggle row: 'Include AI Summary in New Workflows'. A FileText icon appears next to the section heading. A tip banner explains that the AI Summary step runs at the end of the completion phase.",
+      "requiredElements": [
+        {
+          "text": "Workflow Builder"
+        },
+        {
+          "text": "Include AI Summary in New Workflows"
+        },
+        {
+          "text": "AI Summary step generates"
+        }
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gen-toggle-buttons",
+      "name": "Toggle Button Elements",
+      "description": "Each setting row contains a pill-shaped toggle button. When a setting is ON, the toggle background uses the primary color and the indicator is translated to the right. When OFF, the background is muted and the indicator is at the left.",
+      "requiredElements": [
+        {
+          "role": "button"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gen-autoload-behavior",
+      "name": "Auto-load Toggle Behavior",
+      "description": "The 'Auto-load Last Configuration on Startup' toggle immediately updates its visual state (optimistic), then calls the Tauri command save_auto_load_last_config. On success, a success log message appears. On failure, the toggle reverts to its prior state.",
+      "requiredElements": [
+        {
+          "text": "Auto-load Last Configuration on Startup"
+        },
+        {
+          "text": "Automatically load the last used configuration file and workflow when the application starts"
+        }
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gen-autostart-behavior",
+      "name": "Launch on System Startup Toggle Behavior",
+      "description": "The 'Launch on System Startup' toggle writes to the OS autostart mechanism (Windows Registry Run key, macOS LaunchAgent, Linux .desktop). Unlike the other toggles, the Rust backend reads back the actual OS state after the write and returns it — the UI reconciles its display against this actual value rather than trusting the optimistic update.",
+      "requiredElements": [
+        {
+          "text": "Launch on System Startup"
+        },
+        {
+          "text": "Launch on System Startup"
+        },
+        {
+          "text": "Auto-start the runner at user login so scheduled tasks fire reliably"
+        }
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gen-summary-step-behavior",
+      "name": "Include AI Summary Toggle Behavior",
+      "description": "The 'Include AI Summary in New Workflows' toggle controls whether a completion-phase AI Summary step is automatically added when new workflows are created. This is a saved preference, not a live workflow modification.",
+      "requiredElements": [
+        {
+          "text": "Include AI Summary in New Workflows"
+        },
+        {
+          "text": "Automatically add an AI Summary step to the completion phase of new workflows"
+        },
+        {
+          "text": "Include AI Summary in New Workflows"
+        }
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gen-settings-persistence",
+      "name": "Settings Persistence Model",
+      "description": "All three settings are stored in the runner's settings.json file at {config_dir}/com.qontinui.runner/settings.json. Settings are loaded asynchronously on mount via three independent Tauri IPC calls. Each setting persists independently — there is no batch Save button. Changes take effect immediately after the toggle click resolves.",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Save"
+        },
+        {
+          "text": "General"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": []
+}

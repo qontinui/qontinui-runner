@@ -50,6 +50,9 @@ fn convert_criteria(criteria: &IrElementCriteria) -> Value {
     if let Some(role) = &criteria.role {
         out.insert("role".to_string(), Value::String(role.clone()));
     }
+    if let Some(tag_name) = &criteria.tag_name {
+        out.insert("tagName".to_string(), Value::String(tag_name.clone()));
+    }
     if let Some(text) = &criteria.text {
         out.insert("textContent".to_string(), Value::String(text.clone()));
     }
@@ -59,7 +62,10 @@ fn convert_criteria(criteria: &IrElementCriteria) -> Value {
             Value::String(text_contains.clone()),
         );
     }
-    if let Some(aria_label) = &criteria.aria_label {
+    // Prefer explicit accessibleName when present; fall back to ariaLabel.
+    if let Some(name) = &criteria.accessible_name {
+        out.insert("accessibleName".to_string(), Value::String(name.clone()));
+    } else if let Some(aria_label) = &criteria.aria_label {
         out.insert(
             "accessibleName".to_string(),
             Value::String(aria_label.clone()),
@@ -108,7 +114,7 @@ fn build_assertion(
         source: "ai-generated".to_string(),
         reviewed: false,
         enabled: true,
-        precondition: None,
+        precondition: state.precondition.clone(),
     }
 }
 

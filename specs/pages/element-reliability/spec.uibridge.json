@@ -1,0 +1,568 @@
+{
+  "description": "Element Reliability Dashboard — shows the stability and success rates of UI elements across automated interactions, helping users identify flaky elements that may cause automation failures.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Reliability Overview Statistics",
+          "enabled": true,
+          "id": "element-reliability-overview-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Element Reliability"
+            },
+            "label": "Required element for Reliability Overview Statistics",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Reliability Overview Statistics",
+          "enabled": true,
+          "id": "element-reliability-overview-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Stable"
+            },
+            "label": "Required element for Reliability Overview Statistics",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Reliability Overview Statistics",
+          "enabled": true,
+          "id": "element-reliability-overview-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Flaky"
+            },
+            "label": "Required element for Reliability Overview Statistics",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Reliability Overview Statistics",
+          "enabled": true,
+          "id": "element-reliability-overview-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Unreliable"
+            },
+            "label": "Required element for Reliability Overview Statistics",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users need summary statistics showing how many elements are stable vs flaky vs unreliable, providing a quick assessment of automation health across all tracked elements.",
+      "id": "element-reliability-overview",
+      "name": "Reliability Overview Statistics",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Elements by Reliability",
+          "enabled": true,
+          "id": "element-reliability-list-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Elements by Reliability"
+            },
+            "label": "Required element for Elements by Reliability",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Elements by Reliability",
+          "enabled": true,
+          "id": "element-reliability-list-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "%"
+            },
+            "label": "Required element for Elements by Reliability",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Elements by Reliability",
+          "enabled": true,
+          "id": "element-reliability-list-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "interactions"
+            },
+            "label": "Required element for Elements by Reliability",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users need to see individual elements sorted by reliability, with success rates and interaction counts, to identify which specific elements need attention or alternative selectors.",
+      "id": "element-reliability-list",
+      "name": "Elements by Reliability",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Loading, Error, and Empty States",
+          "enabled": true,
+          "id": "element-reliability-states-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loading element data..."
+            },
+            "label": "Required element for Loading, Error, and Empty States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Loading, Error, and Empty States",
+          "enabled": true,
+          "id": "element-reliability-states-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Failed to load"
+            },
+            "label": "Required element for Loading, Error, and Empty States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Loading, Error, and Empty States",
+          "enabled": true,
+          "id": "element-reliability-states-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No element reliability data yet"
+            },
+            "label": "Required element for Loading, Error, and Empty States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Loading, Error, and Empty States",
+          "enabled": true,
+          "id": "element-reliability-states-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Run some automations to build up element history"
+            },
+            "label": "Required element for Loading, Error, and Empty States",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users need clear feedback during loading, error, and empty states so they understand the system status.",
+      "id": "element-reliability-states",
+      "name": "Loading, Error, and Empty States",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Reliability Color-Coded Badges",
+          "enabled": true,
+          "id": "element-reliability-badges-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Stable"
+            },
+            "label": "Required element for Reliability Color-Coded Badges",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Reliability Color-Coded Badges",
+          "enabled": true,
+          "id": "element-reliability-badges-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Flaky"
+            },
+            "label": "Required element for Reliability Color-Coded Badges",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Reliability Color-Coded Badges",
+          "enabled": true,
+          "id": "element-reliability-badges-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Unreliable"
+            },
+            "label": "Required element for Reliability Color-Coded Badges",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Reliability badges use color coding to quickly communicate element health: green for stable (>=95%), yellow for flaky (>=80%), red for unreliable (<80%).",
+      "id": "element-reliability-badges",
+      "name": "Reliability Color-Coded Badges",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Element Data Rendering",
+          "enabled": true,
+          "id": "element-reliability-data-display-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "%"
+            },
+            "label": "Required element for Element Data Rendering",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Element Data Rendering",
+          "enabled": true,
+          "id": "element-reliability-data-display-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "interactions"
+            },
+            "label": "Required element for Element Data Rendering",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Element Data Rendering",
+          "enabled": true,
+          "id": "element-reliability-data-display-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "success"
+            },
+            "label": "Required element for Element Data Rendering",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Each element row must render its element ID, total interaction count, and success rate percentage accurately from the API data. The summary cards must show correct counts of stable (>=95%), flaky (>=80%), and unreliable (<80%) elements computed from the success_rate field.",
+      "id": "element-reliability-data-display",
+      "name": "Element Data Rendering",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Required UI Elements",
+          "enabled": true,
+          "id": "element-reliability-presence-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Element Reliability"
+            },
+            "label": "Required element for Required UI Elements",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Required UI Elements",
+          "enabled": true,
+          "id": "element-reliability-presence-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Stable"
+            },
+            "label": "Required element for Required UI Elements",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "All structural elements must be present for the dashboard to function: the Shield header icon, the 3-column summary grid, the scrollable element list container, and reliability badge components.",
+      "id": "element-reliability-presence",
+      "name": "Required UI Elements",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state State Transitions",
+          "enabled": true,
+          "id": "element-reliability-state-consistency-elem-0",
+          "precondition": "Page has just loaded and is fetching from /ui-bridge/history/flaky",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loading element data"
+            },
+            "label": "Required element for State Transitions",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state State Transitions",
+          "enabled": true,
+          "id": "element-reliability-state-consistency-elem-1",
+          "precondition": "Page has just loaded and is fetching from /ui-bridge/history/flaky",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Elements by Reliability"
+            },
+            "label": "Required element for State Transitions",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The dashboard transitions cleanly between loading, error, empty, and data states. Summary card counts must be mathematically consistent with the element list (stable + flaky + unreliable = total elements).",
+      "id": "element-reliability-state-consistency",
+      "name": "State Transitions",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "element-reliability",
+    "tags": [
+      "knowledge-graph",
+      "element-reliability",
+      "ui-bridge",
+      "quality",
+      "runner-only"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "Users need summary statistics showing how many elements are stable vs flaky vs unreliable, providing a quick assessment of automation health across all tracked elements.",
+        "elements": [
+          {
+            "textContent": "Element Reliability"
+          },
+          {
+            "textContent": "Stable"
+          },
+          {
+            "textContent": "Flaky"
+          },
+          {
+            "textContent": "Unreliable"
+          }
+        ],
+        "id": "element-reliability-overview",
+        "isInitial": false,
+        "name": "Reliability Overview Statistics",
+        "transitions": []
+      },
+      {
+        "description": "Users need to see individual elements sorted by reliability, with success rates and interaction counts, to identify which specific elements need attention or alternative selectors.",
+        "elements": [
+          {
+            "textContent": "Elements by Reliability"
+          },
+          {
+            "textContent": "%"
+          },
+          {
+            "textContent": "interactions"
+          }
+        ],
+        "id": "element-reliability-list",
+        "isInitial": false,
+        "name": "Elements by Reliability",
+        "transitions": []
+      },
+      {
+        "description": "Users need clear feedback during loading, error, and empty states so they understand the system status.",
+        "elements": [
+          {
+            "textContent": "Loading element data..."
+          },
+          {
+            "textContent": "Failed to load"
+          },
+          {
+            "textContent": "No element reliability data yet"
+          },
+          {
+            "textContent": "Run some automations to build up element history"
+          }
+        ],
+        "id": "element-reliability-states",
+        "isInitial": false,
+        "name": "Loading, Error, and Empty States",
+        "transitions": []
+      },
+      {
+        "description": "Reliability badges use color coding to quickly communicate element health: green for stable (>=95%), yellow for flaky (>=80%), red for unreliable (<80%).",
+        "elements": [
+          {
+            "textContent": "Stable"
+          },
+          {
+            "textContent": "Flaky"
+          },
+          {
+            "textContent": "Unreliable"
+          }
+        ],
+        "id": "element-reliability-badges",
+        "isInitial": false,
+        "name": "Reliability Color-Coded Badges",
+        "transitions": []
+      },
+      {
+        "description": "Each element row must render its element ID, total interaction count, and success rate percentage accurately from the API data. The summary cards must show correct counts of stable (>=95%), flaky (>=80%), and unreliable (<80%) elements computed from the success_rate field.",
+        "elements": [
+          {
+            "textContent": "%"
+          },
+          {
+            "textContent": "interactions"
+          },
+          {
+            "textContent": "success"
+          }
+        ],
+        "id": "element-reliability-data-display",
+        "isInitial": false,
+        "name": "Element Data Rendering",
+        "transitions": []
+      },
+      {
+        "description": "All structural elements must be present for the dashboard to function: the Shield header icon, the 3-column summary grid, the scrollable element list container, and reliability badge components.",
+        "elements": [
+          {
+            "textContent": "Element Reliability"
+          },
+          {
+            "textContent": "Stable"
+          }
+        ],
+        "id": "element-reliability-presence",
+        "isInitial": false,
+        "name": "Required UI Elements",
+        "transitions": []
+      },
+      {
+        "description": "The dashboard transitions cleanly between loading, error, empty, and data states. Summary card counts must be mathematically consistent with the element list (stable + flaky + unreliable = total elements).",
+        "elements": [
+          {
+            "textContent": "Loading element data"
+          },
+          {
+            "textContent": "Elements by Reliability"
+          }
+        ],
+        "id": "element-reliability-state-consistency",
+        "isInitial": false,
+        "name": "State Transitions",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

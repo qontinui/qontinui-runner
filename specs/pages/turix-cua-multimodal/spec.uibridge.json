@@ -1,0 +1,953 @@
+{
+  "description": "The TuriX-CUA Multimodal Vision Pipeline adds visual AI capabilities to qontinui's agentic verification loop. When users run workflows with agentic verification architecture, the system can capture screenshots, annotate them with numbered element markers, and send annotated images to vision-capable LLMs (Claude API, Gemini API) for screen analysis. A two-phase Brain/Actor pattern splits expensive vision reasoning from cheap action execution. This spec covers the pages where these capabilities are configured (Settings > AI, Run Options Dialog), where results are displayed (Run Summary, Active Dashboard, AI Output), and where supporting features surface (Skills page for playbooks, action executor for click highlights). Data flows from the Rust backend through Tauri IPC commands to the React frontend.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Vision Feature Page Reachability",
+          "enabled": true,
+          "id": "nav-vision-pages-elem-0",
+          "precondition": "A workflow exists in the workflow list and the user has opened the Run Options Dialog for it",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "AI Provider"
+            },
+            "label": "Required element for Vision Feature Page Reachability",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Vision Feature Page Reachability",
+          "enabled": true,
+          "id": "nav-vision-pages-elem-1",
+          "precondition": "A workflow exists in the workflow list and the user has opened the Run Options Dialog for it",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Agentic Verification"
+            },
+            "label": "Required element for Vision Feature Page Reachability",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Vision Feature Page Reachability",
+          "enabled": true,
+          "id": "nav-vision-pages-elem-2",
+          "precondition": "A workflow exists in the workflow list and the user has opened the Run Options Dialog for it",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Summary|complete|failed"
+            },
+            "label": "Required element for Vision Feature Page Reachability",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users access vision pipeline configuration and results across several existing pages. The AI provider settings page is where multimodal support is configured. The Run Options Dialog is where agentic verification architecture (including Brain/Actor) is selected before running a workflow. Run detail pages show the results. These are all existing pages that now carry additional data from the vision pipeline.",
+      "id": "nav-vision-pages",
+      "name": "Vision Feature Page Reachability",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state AI Provider Settings Elements",
+          "enabled": true,
+          "id": "presence-ai-settings-elem-0",
+          "precondition": "An API provider (Claude API or Gemini API) is selected as the active provider",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Claude Code CLI"
+            },
+            "label": "Required element for AI Provider Settings Elements",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state AI Provider Settings Elements",
+          "enabled": true,
+          "id": "presence-ai-settings-elem-1",
+          "precondition": "An API provider (Claude API or Gemini API) is selected as the active provider",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Claude API"
+            },
+            "label": "Required element for AI Provider Settings Elements",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state AI Provider Settings Elements",
+          "enabled": true,
+          "id": "presence-ai-settings-elem-2",
+          "precondition": "An API provider (Claude API or Gemini API) is selected as the active provider",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "textbox",
+              "textContent": "API Key|key"
+            },
+            "label": "Required element for AI Provider Settings Elements",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state AI Provider Settings Elements",
+          "enabled": true,
+          "id": "presence-ai-settings-elem-3",
+          "precondition": "An API provider (Claude API or Gemini API) is selected as the active provider",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Model"
+            },
+            "label": "Required element for AI Provider Settings Elements",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state AI Provider Settings Elements",
+          "enabled": true,
+          "id": "presence-ai-settings-elem-4",
+          "precondition": "An API provider (Claude API or Gemini API) is selected as the active provider",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Test|Verify|Check"
+            },
+            "label": "Required element for AI Provider Settings Elements",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Settings > AI page contains controls for selecting the AI provider and configuring API keys. The provider choice determines whether multimodal (vision) prompts are supported. Data is read and written via Tauri IPC commands (get_ai_settings, save_ai_settings) backed by settings.rs in the Rust backend. API keys are stored in the OS keychain via the keyring crate.",
+      "id": "presence-ai-settings",
+      "name": "AI Provider Settings Elements",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state AI Provider Settings Interactions",
+          "enabled": true,
+          "id": "interaction-ai-settings-elem-0",
+          "precondition": "An API provider is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Claude API|Gemini API"
+            },
+            "label": "Required element for AI Provider Settings Interactions",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state AI Provider Settings Interactions",
+          "enabled": true,
+          "id": "interaction-ai-settings-elem-1",
+          "precondition": "An API provider is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
+            "label": "Required element for AI Provider Settings Interactions",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state AI Provider Settings Interactions",
+          "enabled": true,
+          "id": "interaction-ai-settings-elem-2",
+          "precondition": "An API provider is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Test|Verify"
+            },
+            "label": "Required element for AI Provider Settings Interactions",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users interact with the AI settings to configure which provider powers their automation. Switching providers affects whether multimodal vision features work (API providers support images, CLI providers fall back to text-only).",
+      "id": "interaction-ai-settings",
+      "name": "AI Provider Settings Interactions",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Workflow Architecture Selection",
+          "enabled": true,
+          "id": "presence-run-options-architecture-elem-0",
+          "precondition": "The Run Options Dialog is open for a workflow",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Traditional|Agentic Verification|Multi-Agent Pipeline"
+            },
+            "label": "Required element for Workflow Architecture Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Workflow Architecture Selection",
+          "enabled": true,
+          "id": "presence-run-options-architecture-elem-1",
+          "precondition": "The Run Options Dialog is open for a workflow",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "AI verifier"
+            },
+            "label": "Required element for Workflow Architecture Selection",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When launching a workflow, users choose the execution architecture from the Run Options Dialog. The 'Agentic Verification' architecture enables the verification-agent/worker-agent loop where the Brain/Actor vision pipeline operates. The architecture choice is stored in the workflow's LoopConfig and sent to the Rust backend via the /run Tauri command.",
+      "id": "presence-run-options-architecture",
+      "name": "Workflow Architecture Selection",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Agentic Verification Run Results Display",
+          "enabled": true,
+          "id": "data-display-run-results-elem-0",
+          "precondition": "At least one agentic verification workflow run has completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "complete|failed|stopped|achieved"
+            },
+            "label": "Required element for Agentic Verification Run Results Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Agentic Verification Run Results Display",
+          "enabled": true,
+          "id": "data-display-run-results-elem-1",
+          "precondition": "At least one agentic verification workflow run has completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Pass|Fail|Partial|%"
+            },
+            "label": "Required element for Agentic Verification Run Results Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Agentic Verification Run Results Display",
+          "enabled": true,
+          "id": "data-display-run-results-elem-2",
+          "precondition": "At least one agentic verification workflow run has completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "worker|Worker|action"
+            },
+            "label": "Required element for Agentic Verification Run Results Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Agentic Verification Run Results Display",
+          "enabled": true,
+          "id": "data-display-run-results-elem-3",
+          "precondition": "At least one agentic verification workflow run has completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Visual Analysis|Brain Agent|Brain Analysis"
+            },
+            "label": "Required element for Agentic Verification Run Results Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Agentic Verification Run Results Display",
+          "enabled": true,
+          "id": "data-display-run-results-elem-4",
+          "precondition": "At least one agentic verification workflow run has completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "\\[1\\]|\\[2\\]|Screen Elements"
+            },
+            "label": "Required element for Agentic Verification Run Results Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Agentic Verification Run Results Display",
+          "enabled": true,
+          "id": "data-display-run-results-elem-5",
+          "precondition": "At least one agentic verification workflow run has completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "token|cost|usage"
+            },
+            "label": "Required element for Agentic Verification Run Results Display",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "After an agentic verification workflow completes, the Run Summary page displays per-iteration results. Each iteration shows the verification verdict (Pass/Fail/Partial with confidence percentage), worker summary, and timing. When Brain/Actor mode was active, iterations additionally show the Brain's screen analysis and action plan injected into the worker context. Data is fetched via Tauri IPC commands (get_task_run, get_task_run_events) reading from the PostgreSQL task_runs and task_run_events tables.",
+      "id": "data-display-run-results",
+      "name": "Agentic Verification Run Results Display",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Agentic Verification Loop Behavior",
+          "enabled": true,
+          "id": "behavior-agentic-loop-elem-0",
+          "precondition": "An agentic verification workflow is currently running",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "iteration|Iteration|verif"
+            },
+            "label": "Required element for Agentic Verification Loop Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Agentic Verification Loop Behavior",
+          "enabled": true,
+          "id": "behavior-agentic-loop-elem-1",
+          "precondition": "An agentic verification workflow is currently running",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Stop|stop"
+            },
+            "label": "Required element for Agentic Verification Loop Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Agentic Verification Loop Behavior",
+          "enabled": true,
+          "id": "behavior-agentic-loop-elem-2",
+          "precondition": "An agentic verification workflow is currently running",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "achieved|complete|Pass"
+            },
+            "label": "Required element for Agentic Verification Loop Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Agentic Verification Loop Behavior",
+          "enabled": true,
+          "id": "behavior-agentic-loop-elem-3",
+          "precondition": "An agentic verification workflow is currently running",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "max iterations|Max Iterations|iterations reached"
+            },
+            "label": "Required element for Agentic Verification Loop Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Agentic Verification Loop Behavior",
+          "enabled": true,
+          "id": "behavior-agentic-loop-elem-4",
+          "precondition": "An agentic verification workflow is currently running",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "CLI|text-only|fallback"
+            },
+            "label": "Required element for Agentic Verification Loop Behavior",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The agentic verification loop runs iterations of verification-agent followed by worker-agent until the goal is achieved or max_iterations is reached. Key automatic behaviors include: progressive iteration history compression (keeps context under 4000 chars), consecutive pass tracking (requires N passes before declaring success), and stop-signal responsiveness. When Brain/Actor mode is enabled, the Brain is invoked with multimodal prompts when should_invoke_brain() returns true (first iteration, cache expired, or RequestContext signal). The loop is orchestrated by LoopController in unified_workflow_executor/agentic_verification_loop.rs.",
+      "id": "behavior-agentic-loop",
+      "name": "Agentic Verification Loop Behavior",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Configuration-to-Execution State Consistency",
+          "enabled": true,
+          "id": "state-consistency-config-execution-elem-0",
+          "precondition": "At least one workflow run has completed with the current provider configuration",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Claude|Gemini|provider"
+            },
+            "label": "Required element for Configuration-to-Execution State Consistency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Configuration-to-Execution State Consistency",
+          "enabled": true,
+          "id": "state-consistency-config-execution-elem-1",
+          "precondition": "At least one workflow run has completed with the current provider configuration",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Agentic|Traditional|verdict|confidence"
+            },
+            "label": "Required element for Configuration-to-Execution State Consistency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Configuration-to-Execution State Consistency",
+          "enabled": true,
+          "id": "state-consistency-config-execution-elem-2",
+          "precondition": "At least one workflow run has completed with the current provider configuration",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "iteration|Iteration"
+            },
+            "label": "Required element for Configuration-to-Execution State Consistency",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The UI must accurately reflect the relationship between configuration state (which provider is active, whether Brain/Actor is enabled) and execution results (whether multimodal was used, whether Brain analysis appears). Mismatches indicate bugs in the config propagation through the Tauri IPC layer.",
+      "id": "state-consistency-config-execution",
+      "name": "Configuration-to-Execution State Consistency",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Run Detail Interactions",
+          "enabled": true,
+          "id": "interaction-run-detail-elem-0",
+          "precondition": "A completed run's summary page is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "tab|tablist",
+              "textContent": "Timeline|Verification|Knowledge"
+            },
+            "label": "Required element for Run Detail Interactions",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Run Detail Interactions",
+          "enabled": true,
+          "id": "interaction-run-detail-elem-1",
+          "precondition": "A completed run's summary page is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Continue"
+            },
+            "label": "Required element for Run Detail Interactions",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Run Detail Interactions",
+          "enabled": true,
+          "id": "interaction-run-detail-elem-2",
+          "precondition": "A completed run's summary page is open",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "AI Output|AI Data|output"
+            },
+            "label": "Required element for Run Detail Interactions",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users interact with run detail pages to inspect iteration results, view AI output, and continue failed runs. The Run Summary page uses tabs (Timeline, Verification, Knowledge, Context, Canvas, Errors) for deep dives. Data is fetched from the Rust backend via get_task_run and get_task_run_events Tauri commands.",
+      "id": "interaction-run-detail",
+      "name": "Run Detail Interactions",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Vision Pipeline Purpose and Mental Model",
+          "enabled": true,
+          "id": "semantic-vision-pipeline-elem-0",
+          "precondition": "An agentic verification run with 3+ iterations has completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Agentic Verification"
+            },
+            "label": "Required element for Vision Pipeline Purpose and Mental Model",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Vision Pipeline Purpose and Mental Model",
+          "enabled": true,
+          "id": "semantic-vision-pipeline-elem-1",
+          "precondition": "An agentic verification run with 3+ iterations has completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Previous Attempts|iteration|approach"
+            },
+            "label": "Required element for Vision Pipeline Purpose and Mental Model",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Vision Pipeline Purpose and Mental Model",
+          "enabled": true,
+          "id": "semantic-vision-pipeline-elem-2",
+          "precondition": "An agentic verification run with 3+ iterations has completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Skill|skill|playbook|Playbook"
+            },
+            "label": "Required element for Vision Pipeline Purpose and Mental Model",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The vision pipeline serves two user needs: (1) for developers automating their own web apps (UI Bridge white-box), it provides rich element data for intelligent verification without fragile selectors; (2) for automating third-party desktop apps (visual GUI black-box), it provides screenshot-based element detection with LLM vision reasoning. Users should understand which mode is active and why the system chose it.",
+      "id": "semantic-vision-pipeline",
+      "name": "Vision Pipeline Purpose and Mental Model",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Click Highlight Visual Design",
+          "enabled": true,
+          "id": "design-click-highlights-elem-0",
+          "precondition": "An action (click, type, etc.) has been executed via the UI Bridge action executor within the last 600ms",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "presentation"
+            },
+            "label": "Required element for Click Highlight Visual Design",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Click Highlight Visual Design",
+          "enabled": true,
+          "id": "design-click-highlights-elem-1",
+          "precondition": "An action (click, type, etc.) has been executed via the UI Bridge action executor within the last 600ms",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "presentation"
+            },
+            "label": "Required element for Click Highlight Visual Design",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "During automation execution, brief visual highlights appear at action locations (click, type, scroll targets). For UI Bridge apps, this is a CSS overlay injected by showClickHighlight() in debug/click-highlight.ts, called from action-executor.ts after each performAction() succeeds. Highlights use position:fixed, pointer-events:none, z-index:999999 to avoid interfering with the page. The animation is a pulsing circle that scales from 0.5 to 1.2 and fades from opacity 1 to 0 over 600ms.",
+      "id": "design-click-highlights",
+      "name": "Click Highlight Visual Design",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "turix-cua-multimodal",
+    "tags": [
+      "turix-cua",
+      "multimodal",
+      "vision",
+      "brain-actor",
+      "annotation",
+      "playbook",
+      "click-highlight",
+      "compression",
+      "agentic-verification"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "Users access vision pipeline configuration and results across several existing pages. The AI provider settings page is where multimodal support is configured. The Run Options Dialog is where agentic verification architecture (including Brain/Actor) is selected before running a workflow. Run detail pages show the results. These are all existing pages that now carry additional data from the vision pipeline.",
+        "elements": [
+          {
+            "textContent": "AI Provider"
+          },
+          {
+            "textContent": "Agentic Verification"
+          },
+          {
+            "textContent": "Summary|complete|failed"
+          }
+        ],
+        "id": "nav-vision-pages",
+        "isInitial": false,
+        "name": "Vision Feature Page Reachability",
+        "transitions": []
+      },
+      {
+        "description": "The Settings > AI page contains controls for selecting the AI provider and configuring API keys. The provider choice determines whether multimodal (vision) prompts are supported. Data is read and written via Tauri IPC commands (get_ai_settings, save_ai_settings) backed by settings.rs in the Rust backend. API keys are stored in the OS keychain via the keyring crate.",
+        "elements": [
+          {
+            "textContent": "Claude Code CLI"
+          },
+          {
+            "textContent": "Claude API"
+          },
+          {
+            "role": "textbox",
+            "textContent": "API Key|key"
+          },
+          {
+            "textContent": "Model"
+          },
+          {
+            "role": "button",
+            "textContent": "Test|Verify|Check"
+          }
+        ],
+        "id": "presence-ai-settings",
+        "isInitial": false,
+        "name": "AI Provider Settings Elements",
+        "transitions": []
+      },
+      {
+        "description": "Users interact with the AI settings to configure which provider powers their automation. Switching providers affects whether multimodal vision features work (API providers support images, CLI providers fall back to text-only).",
+        "elements": [
+          {
+            "textContent": "Claude API|Gemini API"
+          },
+          {
+            "role": "button",
+            "textContent": "Save"
+          },
+          {
+            "role": "button",
+            "textContent": "Test|Verify"
+          }
+        ],
+        "id": "interaction-ai-settings",
+        "isInitial": false,
+        "name": "AI Provider Settings Interactions",
+        "transitions": []
+      },
+      {
+        "description": "When launching a workflow, users choose the execution architecture from the Run Options Dialog. The 'Agentic Verification' architecture enables the verification-agent/worker-agent loop where the Brain/Actor vision pipeline operates. The architecture choice is stored in the workflow's LoopConfig and sent to the Rust backend via the /run Tauri command.",
+        "elements": [
+          {
+            "textContent": "Traditional|Agentic Verification|Multi-Agent Pipeline"
+          },
+          {
+            "textContent": "AI verifier"
+          }
+        ],
+        "id": "presence-run-options-architecture",
+        "isInitial": false,
+        "name": "Workflow Architecture Selection",
+        "transitions": []
+      },
+      {
+        "description": "After an agentic verification workflow completes, the Run Summary page displays per-iteration results. Each iteration shows the verification verdict (Pass/Fail/Partial with confidence percentage), worker summary, and timing. When Brain/Actor mode was active, iterations additionally show the Brain's screen analysis and action plan injected into the worker context. Data is fetched via Tauri IPC commands (get_task_run, get_task_run_events) reading from the PostgreSQL task_runs and task_run_events tables.",
+        "elements": [
+          {
+            "textContent": "complete|failed|stopped|achieved"
+          },
+          {
+            "textContent": "Pass|Fail|Partial|%"
+          },
+          {
+            "textContent": "worker|Worker|action"
+          },
+          {
+            "textContent": "Visual Analysis|Brain Agent|Brain Analysis"
+          },
+          {
+            "textContent": "\\[1\\]|\\[2\\]|Screen Elements"
+          },
+          {
+            "textContent": "token|cost|usage"
+          }
+        ],
+        "id": "data-display-run-results",
+        "isInitial": false,
+        "name": "Agentic Verification Run Results Display",
+        "transitions": []
+      },
+      {
+        "description": "The agentic verification loop runs iterations of verification-agent followed by worker-agent until the goal is achieved or max_iterations is reached. Key automatic behaviors include: progressive iteration history compression (keeps context under 4000 chars), consecutive pass tracking (requires N passes before declaring success), and stop-signal responsiveness. When Brain/Actor mode is enabled, the Brain is invoked with multimodal prompts when should_invoke_brain() returns true (first iteration, cache expired, or RequestContext signal). The loop is orchestrated by LoopController in unified_workflow_executor/agentic_verification_loop.rs.",
+        "elements": [
+          {
+            "textContent": "iteration|Iteration|verif"
+          },
+          {
+            "role": "button",
+            "textContent": "Stop|stop"
+          },
+          {
+            "textContent": "achieved|complete|Pass"
+          },
+          {
+            "textContent": "max iterations|Max Iterations|iterations reached"
+          },
+          {
+            "textContent": "CLI|text-only|fallback"
+          }
+        ],
+        "id": "behavior-agentic-loop",
+        "isInitial": false,
+        "name": "Agentic Verification Loop Behavior",
+        "transitions": []
+      },
+      {
+        "description": "The UI must accurately reflect the relationship between configuration state (which provider is active, whether Brain/Actor is enabled) and execution results (whether multimodal was used, whether Brain analysis appears). Mismatches indicate bugs in the config propagation through the Tauri IPC layer.",
+        "elements": [
+          {
+            "textContent": "Claude|Gemini|provider"
+          },
+          {
+            "textContent": "Agentic|Traditional|verdict|confidence"
+          },
+          {
+            "textContent": "iteration|Iteration"
+          }
+        ],
+        "id": "state-consistency-config-execution",
+        "isInitial": false,
+        "name": "Configuration-to-Execution State Consistency",
+        "transitions": []
+      },
+      {
+        "description": "Users interact with run detail pages to inspect iteration results, view AI output, and continue failed runs. The Run Summary page uses tabs (Timeline, Verification, Knowledge, Context, Canvas, Errors) for deep dives. Data is fetched from the Rust backend via get_task_run and get_task_run_events Tauri commands.",
+        "elements": [
+          {
+            "role": "tab|tablist",
+            "textContent": "Timeline|Verification|Knowledge"
+          },
+          {
+            "role": "button",
+            "textContent": "Continue"
+          },
+          {
+            "textContent": "AI Output|AI Data|output"
+          }
+        ],
+        "id": "interaction-run-detail",
+        "isInitial": false,
+        "name": "Run Detail Interactions",
+        "transitions": []
+      },
+      {
+        "description": "The vision pipeline serves two user needs: (1) for developers automating their own web apps (UI Bridge white-box), it provides rich element data for intelligent verification without fragile selectors; (2) for automating third-party desktop apps (visual GUI black-box), it provides screenshot-based element detection with LLM vision reasoning. Users should understand which mode is active and why the system chose it.",
+        "elements": [
+          {
+            "textContent": "Agentic Verification"
+          },
+          {
+            "textContent": "Previous Attempts|iteration|approach"
+          },
+          {
+            "textContent": "Skill|skill|playbook|Playbook"
+          }
+        ],
+        "id": "semantic-vision-pipeline",
+        "isInitial": false,
+        "name": "Vision Pipeline Purpose and Mental Model",
+        "transitions": []
+      },
+      {
+        "description": "During automation execution, brief visual highlights appear at action locations (click, type, scroll targets). For UI Bridge apps, this is a CSS overlay injected by showClickHighlight() in debug/click-highlight.ts, called from action-executor.ts after each performAction() succeeds. Highlights use position:fixed, pointer-events:none, z-index:999999 to avoid interfering with the page. The animation is a pulsing circle that scales from 0.5 to 1.2 and fades from opacity 1 to 0 over 600ms.",
+        "elements": [
+          {
+            "role": "presentation"
+          },
+          {
+            "role": "presentation"
+          }
+        ],
+        "id": "design-click-highlights",
+        "isInitial": false,
+        "name": "Click Highlight Visual Design",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

@@ -1,0 +1,135 @@
+{
+  "version": "1.0",
+  "id": "graph-insights",
+  "name": "ReflectionDashboard",
+  "states": [
+    {
+      "id": "graph-insights-section",
+      "name": "Graph Insights Section in Reflection Dashboard",
+      "requiredElements": [
+        {
+          "text": "Graph Insights"
+        },
+        {
+          "text": "Cross-Run Patterns"
+        },
+        {
+          "text": "Rule Influence"
+        }
+      ],
+      "description": "The Reflection Dashboard includes a 'Graph Insights' section that embeds CrossRunPatternsPanel, RuleInfluencePanel, PipelineEventsTimeline, StepProvenanceTimeline, and WorkflowVersionLineage as sub-panels within the existing reflection view.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "active-dashboard-widget",
+      "name": "Active Dashboard Top Patterns Widget",
+      "requiredElements": [
+        {
+          "text": "Cross-Run Patterns"
+        },
+        {
+          "text": "recurring"
+        },
+        {
+          "text": "oscillation"
+        }
+      ],
+      "description": "The Active Dashboard shows a compact TopPatternsWidget that summarizes active cross-run patterns (recurring findings and fix oscillations), auto-hiding when no patterns exist.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "history-pattern-indicator",
+      "name": "Run History Pattern Indicator",
+      "requiredElements": [
+        {
+          "role": "status"
+        }
+      ],
+      "description": "Run history rows show a small orange badge with the count of active cross-run patterns for each workflow, helping users spot problematic workflows at a glance.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "graph-insights-data-flow",
+      "name": "Graph Data Flow Architecture",
+      "requiredElements": [
+        {
+          "role": "region"
+        }
+      ],
+      "description": "All graph panels consume data from the /graph/* MCP endpoints via React Query hooks (useGraphAnalytics.ts) with 30-second stale time and 60-second polling interval. Event-driven refresh (useGraphDataRefresh.ts) invalidates queries when tasks or reflections complete.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "graph-insights-navigation",
+      "name": "Graph Insights Navigation",
+      "requiredElements": [
+        {
+          "text": "Graph Insights"
+        },
+        {
+          "text": "Element Reliability"
+        }
+      ],
+      "description": "Graph insight panels are accessible through multiple navigation paths: embedded in the Reflection Dashboard tab, as standalone tabs (element-reliability, pipeline-events, rule-influence, unified-search, workflow-versions), and via the global Cmd+K palette.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "graph-insights-behavior",
+      "name": "Data Refresh Behavior",
+      "requiredElements": [
+        {
+          "text": "Cross-Run Patterns"
+        },
+        {
+          "text": "pattern"
+        },
+        {
+          "text": "Cross-Run Patterns"
+        }
+      ],
+      "description": "Graph data refreshes on two cadences: React Query polling (30s stale, 60s interval) and event-driven invalidation via useGraphDataRefresh when tasks or reflections complete. The TopPatternsWidget auto-hides when no active patterns exist.",
+      "precondition": "No active cross-run patterns exist",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "graph-insights-state-consistency",
+      "name": "Cross-Panel State Consistency",
+      "requiredElements": [
+        {
+          "text": "recurring finding"
+        }
+      ],
+      "description": "The pattern count shown in TopPatternsWidget (Active Dashboard) must match the data shown in CrossRunPatternsPanel (Reflection Dashboard) since both consume the same useCrossRunPatterns hook. Similarly, PatternIndicator badges in run history must reflect the same pattern counts.",
+      "precondition": "Both TopPatternsWidget and CrossRunPatternsPanel are visible (active patterns exist)",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Graph Insights — embedded knowledge graph panels within the Reflection Dashboard showing cross-run patterns, rule influence, pipeline events, step provenance, and workflow version lineage. Also includes a compact patterns widget on the Active Dashboard and pattern indicators in run history.",
+  "metadata": {
+    "tags": [
+      "knowledge-graph",
+      "cross-run-patterns",
+      "dashboard",
+      "integration",
+      "runner-only"
+    ]
+  }
+}

@@ -1,0 +1,274 @@
+{
+  "version": "1.0",
+  "id": "online-learning",
+  "name": "OnlineLearningDashboard",
+  "states": [
+    {
+      "id": "ol-page-structure",
+      "name": "Page Structure & Layout",
+      "requiredElements": [
+        {
+          "text": "Online Learning"
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        },
+        {
+          "textContains": "Loading"
+        }
+      ],
+      "description": "The page has a fixed header with title and refresh button, a sub-tab bar with 6 tabs, and a scrollable content area. The background is dark (#0a0a0f). The layout is a vertical flex column filling the available height.",
+      "precondition": "Data is being fetched (initial load or refresh in progress)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-tab-navigation",
+      "name": "Sub-Tab Navigation",
+      "requiredElements": [
+        {
+          "text": "Overview"
+        },
+        {
+          "textContains": "Model Routing"
+        },
+        {
+          "text": "Overview"
+        },
+        {
+          "textContains": "Drift Detection"
+        },
+        {
+          "textContains": "Drift Detection"
+        }
+      ],
+      "description": "Six sub-tabs allow switching between dashboard views: Overview, Model Routing, Drift Detection, Step Credits, Strategies, and Experiences. The active tab is highlighted with blue styling. The Drift Detection tab shows a badge count when drift signals are present.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-overview-stats",
+      "name": "Overview — Stat Cards",
+      "requiredElements": [
+        {
+          "textContains": "Routing Entries"
+        },
+        {
+          "textContains": "Drift Signals"
+        },
+        {
+          "textContains": "Step Types Scored"
+        },
+        {
+          "textContains": "Strategies"
+        }
+      ],
+      "description": "The Overview tab displays 4 stat cards in a 4-column grid showing: Routing Entries count, Drift Signals count, Step Types Scored count, and Strategies count. Each card has a large number, a label, and a sub-label with additional context.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-overview-drift-alerts",
+      "name": "Overview — Drift Alert Banner",
+      "requiredElements": [
+        {
+          "textContains": "Active Drift Signals"
+        },
+        {
+          "textContains": "Active Drift Signals"
+        },
+        {
+          "textContains": "Active Drift Signals"
+        }
+      ],
+      "description": "When drift signals exist, an amber-bordered alert banner appears below the stat cards showing up to 5 recent drift signals with their metric name, context key, and mean shift values.",
+      "precondition": "At least one unacknowledged drift signal exists in the database",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-model-routing-table",
+      "name": "Model Routing — Q-Table Display",
+      "requiredElements": [
+        {
+          "textContains": "claude-"
+        },
+        {
+          "textContains": "Context"
+        },
+        {
+          "textContains": "No model routing data yet"
+        },
+        {
+          "tagName": "table"
+        }
+      ],
+      "description": "The Model Routing tab shows the full bandit Q-table: every (context, model) pair with its learned Q-value and visit count. Available models are listed as badges above the table. The table is sorted by Q-value descending. Model names are truncated for readability.",
+      "precondition": "Model routing data has been loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-drift-detection-tab",
+      "name": "Drift Detection — Signals Table",
+      "requiredElements": [
+        {
+          "textContains": "ADWIN + DDM + Page-Hinkley"
+        },
+        {
+          "textContains": "Level"
+        },
+        {
+          "textContains": "No drift signals"
+        }
+      ],
+      "description": "The Drift Detection tab shows a status line with detector count and algorithm names, plus a table of all unacknowledged drift signals with severity, metric, context, detector type, and pre/post drift means.",
+      "precondition": "Drift Detection tab is active and drift monitor is initialized",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-step-credits-tab",
+      "name": "Step Credits — Attribution Scorecard",
+      "requiredElements": [
+        {
+          "textContains": "Step Type"
+        },
+        {
+          "tagName": "table"
+        },
+        {
+          "textContains": "No step credits yet"
+        }
+      ],
+      "description": "The Step Credits tab shows aggregated credit attribution across all runs, grouped by step type. Each row shows the step type, average normalized credit, average raw credit, observation count, and a horizontal bar visualizing the credit magnitude.",
+      "precondition": "Step Credits tab is active and credit data exists",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-strategies-tab",
+      "name": "Strategies — Evolvable Strategy Bank",
+      "requiredElements": [
+        {
+          "textContains": "Selected:"
+        },
+        {
+          "textContains": "active"
+        },
+        {
+          "textContains": "No strategies yet"
+        }
+      ],
+      "description": "The Strategies tab shows cards for each active or candidate strategy. Each card displays the strategy name, status badge, description, and performance stats. Strategies are created by extracting configurations from P90+ performing runs.",
+      "precondition": "Strategies tab is active and at least one strategy exists",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-experiences-tab",
+      "name": "Experiences — Run Summaries",
+      "requiredElements": [
+        {
+          "textContains": "decisions"
+        },
+        {
+          "textContains": "No experience summaries yet"
+        }
+      ],
+      "description": "The Experiences tab shows cards for recent experience summaries extracted after each workflow run. Each card shows the outcome badge, domain, complexity tier, truncated task run ID, and counts of key decisions, failure points, and effective patterns.",
+      "precondition": "Experiences tab is active and at least one experience exists",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-visual-design",
+      "name": "Visual Design & Dark Theme",
+      "requiredElements": [
+        {
+          "text": "Online Learning"
+        },
+        {
+          "text": "Online Learning"
+        },
+        {
+          "textContains": "Routing Entries"
+        },
+        {
+          "tagName": "table"
+        }
+      ],
+      "description": "The dashboard uses a dark theme consistent with the runner's design system. All text must be legible against dark backgrounds. Cards use subtle borders and transparency.",
+      "precondition": "Overview tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-data-freshness",
+      "name": "Data Freshness & Real-Time Updates",
+      "requiredElements": [
+        {
+          "text": "Online Learning"
+        },
+        {
+          "textContains": "Drift Detection"
+        }
+      ],
+      "description": "The dashboard subscribes to the 'drift-detected' Tauri event for real-time drift notification and polls all endpoints every 60 seconds. This ensures the dashboard reflects the current state of the online learning system without manual refresh.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ol-algorithm-correctness",
+      "name": "Algorithm Output Correctness",
+      "requiredElements": [
+        {
+          "tagName": "table"
+        },
+        {
+          "tagName": "table"
+        },
+        {
+          "textContains": "Extracted"
+        }
+      ],
+      "description": "The dashboard displays outputs from several online learning algorithms. These assertions verify that the displayed data is internally consistent and reflects correct algorithm behavior.",
+      "precondition": "Model Routing tab is active and Q-table has data",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Online Learning Dashboard — monitors the continual learning system that operates after every workflow run. Displays bandit-based model routing Q-tables, performance drift detection signals, ADCA step credit attribution scorecards, evolvable strategy bank contents, and post-run experience summaries. Data is fetched from 8 MCP API endpoints under /online-learning/* and auto-refreshes on drift-detected Tauri events + 60s polling.",
+  "metadata": {
+    "tags": [
+      "online-learning",
+      "bandit",
+      "drift-detection",
+      "credit-assignment",
+      "strategy-bank",
+      "model-routing",
+      "dashboard"
+    ]
+  }
+}

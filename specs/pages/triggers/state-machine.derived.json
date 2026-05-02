@@ -1,0 +1,190 @@
+{
+  "version": "1.0",
+  "id": "triggers",
+  "name": "TriggersTab",
+  "states": [
+    {
+      "id": "triggers-overview",
+      "name": "Trigger Inventory and System Status",
+      "requiredElements": [
+        {
+          "text": "Triggers"
+        },
+        {
+          "text": "enabled"
+        },
+        {
+          "text": "New Trigger"
+        }
+      ],
+      "description": "The Triggers page shows all configured event-driven workflow triggers along with the health status of the trigger system itself. Users need to see at a glance how many triggers exist, how many are enabled vs disabled, whether any are currently executing, and if any events have been dropped due to system overload. This status information is critical for understanding whether the event-driven automation layer is functioning correctly. The header provides system-wide status indicators and quick access to creating new triggers and refreshing the list.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "triggers-list-management",
+      "name": "Trigger List and Operations",
+      "requiredElements": [
+        {
+          "text": "All Triggers"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "Test Result"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "The trigger list shows each configured trigger with its name, type, associated workflow, and enabled state. Users need to perform common operations directly from the list: editing a trigger's configuration, deleting it (with confirmation), toggling it enabled/disabled, testing it to verify it would fire correctly, and viewing its execution history. The sub-tab navigation lets users switch between the trigger list view and the history view for a selected trigger. These operations must be responsive and provide clear feedback through toast notifications.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "triggers-history",
+      "name": "Trigger Execution History",
+      "requiredElements": [
+        {
+          "text": "History"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "Refresh"
+        }
+      ],
+      "description": "Users need to review the execution history of their triggers to understand whether they are firing as expected, how often they execute, and whether the associated workflow runs succeeded. The History sub-tab shows a filterable log of trigger executions for the selected trigger, including timestamps, execution outcomes, and any errors encountered. This historical view is essential for debugging triggers that fire too often, not often enough, or at the wrong times, and for correlating trigger executions with workflow outcomes.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "triggers-editor-form",
+      "name": "Trigger Editor Form",
+      "requiredElements": [
+        {
+          "text": "Name *"
+        },
+        {
+          "text": "Target Workflow"
+        },
+        {
+          "text": "Trigger Type"
+        },
+        {
+          "text": "Debounce"
+        },
+        {
+          "role": "button",
+          "text": "Create"
+        }
+      ],
+      "description": "The trigger editor form allows users to create new triggers or edit existing ones. It includes required fields (name, target workflow dropdown), optional fields (description), a trigger type selector offering webhook, file_watch, workflow_chain, git_event, health_check, and schedule types, type-specific configuration sections that appear based on the selected type, an overrides JSON editor, conditions, and advanced settings for debounce, cooldown, and retry. Inline validation highlights invalid fields with red borders.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "triggers-test-modal",
+      "name": "Test Result Modal",
+      "requiredElements": [
+        {
+          "text": "Test Result"
+        },
+        {
+          "text": "execute"
+        },
+        {
+          "text": "Workflow"
+        },
+        {
+          "text": "Close"
+        }
+      ],
+      "description": "When a user tests a trigger via dry run, a modal overlay displays the test result showing whether the trigger would or wouldn't execute, the trigger name, the action status, and the target workflow ID. The modal can be dismissed with a Close button.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "triggers-webhook-details",
+      "name": "Webhook Details and Trigger Type Badges",
+      "requiredElements": [
+        {
+          "text": "webhook"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "webhook"
+        }
+      ],
+      "description": "Webhook-type triggers display a generated webhook URL that users can copy to their clipboard for use in external integrations. A Copied! feedback message confirms the copy action. Each trigger row also displays a type badge label indicating the trigger type (webhook, file_watch, schedule, etc.).",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "triggers-actions-row",
+      "name": "Per-Trigger Actions Row",
+      "requiredElements": [
+        {
+          "text": "ON"
+        },
+        {
+          "text": "Test"
+        },
+        {
+          "text": "Edit"
+        },
+        {
+          "text": "Delete"
+        }
+      ],
+      "description": "Each trigger in the list has an actions row containing an ON/OFF toggle for enabling/disabling the trigger, a Test button for dry-run execution, a History button to view execution history, an Edit button to open the editor, and a Delete button with confirmation. The toggle provides visual feedback reflecting the current enabled state.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "triggers-notifications",
+      "name": "Toast Notifications",
+      "requiredElements": [
+        {
+          "text": "success"
+        },
+        {
+          "text": "error"
+        },
+        {
+          "role": "alert"
+        }
+      ],
+      "description": "The Triggers page displays toast notifications in the bottom-right corner to provide feedback on user actions. Success toasts confirm operations like trigger creation, update, deletion, and toggle changes. Error toasts alert users to failures such as network errors or validation issues. Toasts are dismissible and auto-expire after a brief duration.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Triggers page — configures event-driven workflow triggers that automatically execute workflows in response to schedules, webhooks, filesystem changes, and other events.",
+  "metadata": {
+    "tags": [
+      "triggers",
+      "event-driven",
+      "automation",
+      "webhooks",
+      "dev-only",
+      "runner-only"
+    ]
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "version": "1.0",
+  "id": "run-statistics",
+  "name": "StatisticsTab",
+  "states": [
+    {
+      "id": "statistics-overview-dashboard",
+      "name": "Overview Dashboard",
+      "requiredElements": [
+        {
+          "text": "Statistics|Health"
+        },
+        {
+          "text": "flaky|Flaky|unreliable"
+        },
+        {
+          "text": "history|runs|recent"
+        },
+        {
+          "text": "error|pattern"
+        }
+      ],
+      "description": "The Overview view provides a high-level health assessment of the workflow configuration. Users see a grid of panels showing config health metrics, a list of flaky items (elements or actions with inconsistent success rates), recent run history, and recurring error patterns. This view helps users understand whether their workflow configuration is reliable over time, identify items that need attention, and spot trends in execution quality.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "statistics-performance-view",
+      "name": "Performance Dashboard",
+      "requiredElements": [
+        {
+          "text": "Overview|Performance"
+        },
+        {
+          "text": "Performance|timing|duration"
+        },
+        {
+          "role": "button",
+          "text": "Refresh|refresh"
+        }
+      ],
+      "description": "The Performance view provides deeper metrics on execution timing and success rates. Users can analyze action timing distributions, success trends over time, and transition reliability between states. This view is valuable for optimizing workflow performance — identifying slow actions, understanding where time is spent, and measuring how improvements to the configuration translate into better execution metrics.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "statistics-run-details-drilldown",
+      "name": "Run Details Drill-Down",
+      "requiredElements": [
+        {
+          "role": "button"
+        },
+        {
+          "role": "button",
+          "text": "Close"
+        }
+      ],
+      "description": "From the run history panel, users can click on any individual run to see its details in a slide-out panel. This provides a quick way to inspect specific runs without leaving the statistics context. The drill-down shows run-level metrics and helps correlate specific executions with the aggregate statistics shown in the main panels.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "statistics-empty-and-loading-states",
+      "name": "Empty and Loading States",
+      "requiredElements": [
+        {
+          "text": "Load a configuration|No Run Selected"
+        },
+        {
+          "text": "No statistics|Run some workflows"
+        },
+        {
+          "role": "status"
+        }
+      ],
+      "description": "The Statistics page requires a loaded configuration to display data. When no configuration is loaded, no run is selected, or statistics data is still loading, the page must communicate these states clearly. It also handles the case where no statistics have been collected yet, guiding the user to run workflows to generate data.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Run Statistics page — displays execution performance metrics for a workflow configuration. Provides two views: Overview (config health, flaky items, run history, error patterns) and Performance (action timing, success trends, transition reliability). Shows config-level automation statistics rather than individual task run statistics.",
+  "metadata": {
+    "tags": [
+      "run-statistics",
+      "performance",
+      "config-health",
+      "analytics",
+      "observe"
+    ]
+  }
+}

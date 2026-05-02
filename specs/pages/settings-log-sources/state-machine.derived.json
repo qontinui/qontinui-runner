@@ -1,0 +1,268 @@
+{
+  "version": "1.0",
+  "id": "settings-log-sources",
+  "name": "LogSourcesSettings",
+  "states": [
+    {
+      "id": "ls-page-structure",
+      "name": "Page Structure",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Log Sources"
+        },
+        {
+          "text": "Configure global log sources shared across all projects"
+        },
+        {},
+        {
+          "role": "img"
+        }
+      ],
+      "description": "The Log Sources tab renders a SectionHeader followed by an action row (Import from Projects + Save Changes), then three collapsible card sections: AI Source Selection, Log Sources, and Profiles. All sections are expanded by default on load.",
+      "precondition": "Settings are being fetched from the Tauri backend",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-action-buttons",
+      "name": "Page Action Buttons",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Save Changes"
+        },
+        {
+          "role": "button",
+          "text": "Import from Projects"
+        },
+        {
+          "role": "button",
+          "text": "Save Changes"
+        },
+        {
+          "role": "button",
+          "text": "Import from Projects"
+        }
+      ],
+      "description": "The action bar below the SectionHeader contains two buttons: 'Import from Projects' on the left and 'Save Changes' on the right. Save Changes persists all pending source/profile/settings changes via save_global_log_sources IPC. Changes are NOT auto-saved; they accumulate in local state until Save is clicked.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-ai-selection-section",
+      "name": "AI Source Selection Section",
+      "requiredElements": [
+        {},
+        {},
+        {
+          "role": "radio"
+        },
+        {}
+      ],
+      "description": "The AI Source Selection section controls how the AI picks relevant log sources during workflow execution. It contains three radio button options: Dynamic (re-evaluate each verification round), Static (select once at workflow start), Disabled (use profiles or all enabled sources). The section is collapsible via its header button. The Sparkles icon accompanies the heading.",
+      "precondition": "AI Source Selection section is expanded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-sources-section",
+      "name": "Log Sources Section",
+      "requiredElements": [
+        {},
+        {
+          "role": "button",
+          "text": "Add Source"
+        },
+        {
+          "text": "No log sources configured"
+        },
+        {},
+        {}
+      ],
+      "description": "The Log Sources section lists all configured global log sources. The heading shows the count: 'Log Sources (N)'. Each source row shows a color dot, enable/disable checkbox, name, path, format/parser badges, type badge, and category badge, plus Edit and Delete icon buttons. When empty, a placeholder message is shown. An 'Add Source' button opens the SourceEditor modal.",
+      "precondition": "The sources list is empty",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-profiles-section",
+      "name": "Profiles Section",
+      "requiredElements": [
+        {},
+        {
+          "text": "No profiles configured"
+        },
+        {},
+        {
+          "role": "button",
+          "text": "Set Default"
+        }
+      ],
+      "description": "The Profiles section lists named groups of log sources. The heading shows 'Profiles (N)'. Each profile row shows the profile name, a 'Default' badge if it is the active default, and an enabled/total source count (e.g. '3/5 sources enabled'). Row actions include 'Set Default' (only shown for non-default profiles), Edit, and Delete. When empty, a placeholder message is shown. An 'Add Profile' button opens the ProfileEditor modal.",
+      "precondition": "The profiles list is empty",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-add-source-modal",
+      "name": "Add Source Modal",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Add Source"
+        },
+        {
+          "role": "button",
+          "text": "Add"
+        },
+        {
+          "role": "heading",
+          "text": "Add Source"
+        },
+        {
+          "text": "Error Monitoring"
+        },
+        {
+          "role": "button",
+          "text": "Add"
+        }
+      ],
+      "description": "The SourceEditor modal opens when 'Add Source' is clicked. The modal title reads 'Add Source'. It contains required fields Name and Path, plus optional: Description, Category (select with 9 options), Type (select: File/Glob/Directory), Tail Lines (10-10000), Color, Keywords (comma-separated). An 'Error Monitoring' collapsible subsection contains Format, Parser, Timestamp Pattern, Timezone, Poll Interval, and three pattern textareas. The 'Add' submit button is disabled until Name and Path are both non-empty.",
+      "precondition": "The Add Source modal is open",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-edit-source-modal",
+      "name": "Edit Source Modal",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Edit Source"
+        },
+        {
+          "role": "button",
+          "text": "Update"
+        },
+        {
+          "role": "button",
+          "text": "Cancel"
+        }
+      ],
+      "description": "The SourceEditor modal opens in edit mode when the pencil icon on a source row is clicked. The title reads 'Edit Source'. All fields are pre-populated with the source's current values. The submit button reads 'Update'. Saving replaces the existing source in the list without changing its position.",
+      "precondition": "The Edit Source modal is open",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-add-profile-modal",
+      "name": "Add/Edit Profile Modal",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Add Profile"
+        },
+        {
+          "role": "heading",
+          "text": "Add Profile"
+        },
+        {
+          "role": "button",
+          "text": "Add"
+        }
+      ],
+      "description": "The ProfileEditor modal opens when 'Add Profile' or a profile's edit icon is clicked. Add mode title: 'Add Profile'; edit mode: 'Edit Profile'. Fields: Name* (required), Description (optional), and a scrollable sources checklist. Category quick-select buttons '+ frontend', '+ backend', '+ mobile' add all sources of that category without removing existing selections. The submit button ('Add' or 'Update') is disabled until Name is non-empty.",
+      "precondition": "The Add Profile modal is open",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-delete-confirmation-modal",
+      "name": "Delete Confirmation Modal",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Delete Source"
+        },
+        {
+          "role": "heading",
+          "text": "Delete Profile"
+        },
+        {
+          "role": "button",
+          "text": "Delete"
+        }
+      ],
+      "description": "When the trash icon is clicked on any source row or profile row, a confirmation modal appears. The modal title reads 'Delete Source' or 'Delete Profile' respectively. The body names the item in bold and warns. Two buttons: 'Cancel' (dismisses modal, no change) and 'Delete' (red background). The change is held in local state until 'Save Changes' is clicked.",
+      "precondition": "The delete confirmation modal is open for a source",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-ai-selection-semantics",
+      "name": "AI Source Selection — Runtime Semantics",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "The AI selection mode setting controls how the runner backend selects which log sources to include during workflow execution. This group specifies the expected behavior of each mode as it manifests in the UI and in workflow execution outcomes.",
+      "precondition": "AI Source Selection section is expanded and Dynamic is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-profile-default-semantics",
+      "name": "Profile Default and Count Semantics",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "The default profile determines which sources are active when ai_selection_mode is 'disabled' and a default is set. This group specifies the expected data-model behavior of profile default management and source count accuracy.",
+      "precondition": "At least one profile is configured",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ls-source-data-model",
+      "name": "Log Source Data Model",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "Each log source is a configuration record with required fields (id, name, path, category, type) and optional error-monitoring fields. This group specifies how source data fields are rendered in the UI and what correct source configuration looks like.",
+      "precondition": "At least one source with non-plaintext format or non-generic parser is configured",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Log Sources settings tab within the runner Settings panel. Provides global log source configuration shared across all projects. Contains three collapsible sections: 'AI Source Selection' (radio buttons for Dynamic/Static/Disabled modes), 'Log Sources' (list of file/glob/directory sources with enable/disable, edit, delete), and 'Profiles' (named groups of sources). Source changes are held in local state and persisted only when 'Save Changes' is clicked. Two modals are available: SourceEditor (for add/edit of individual sources with basic fields and an optional Error Monitoring subsection) and ProfileEditor (for creating named profiles that group sources). A delete confirmation modal guards destructive operations. An 'Import from Projects' button migrates per-project sources to global settings. All settings are stored via Tauri IPC (get_global_log_sources / save_global_log_sources).",
+  "metadata": {
+    "tags": [
+      "settings",
+      "log-sources",
+      "runner",
+      "ai-selection",
+      "profiles"
+    ]
+  }
+}

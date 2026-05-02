@@ -20,6 +20,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # qontinui-runner has cross-repo deps to two sibling repos:
+      #   - frontend eslint config imports `@qontinui/ui-bridge-eslint-plugin`
+      #     (link: protocol via pnpm, points at ../ui-bridge/packages/...)
+      #   - src-tauri/Cargo.toml has `qontinui-types = { path = "../../qontinui-schemas/rust" }`
+      # CI must clone both as siblings before pnpm install / cargo build.
+      # Both repos are public; no auth needed.
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+        shell: bash
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -104,6 +117,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # cargo audit walks the workspace and resolves path: deps. The runner's
+      # src-tauri/Cargo.toml depends on `qontinui-types` from a sibling repo.
+      # Same multi-checkout pattern as the test job.
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
 
       - name: Run security audit on Rust dependencies
         run: |

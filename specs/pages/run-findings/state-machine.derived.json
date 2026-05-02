@@ -1,0 +1,101 @@
+{
+  "version": "1.0",
+  "id": "run-findings",
+  "name": "ExecutionReport",
+  "states": [
+    {
+      "id": "findings-overview-and-summary",
+      "name": "Findings Overview and Summary",
+      "requiredElements": [
+        {
+          "text": "Total"
+        },
+        {
+          "text": "Execution Report|Report"
+        },
+        {
+          "text": "Severity|critical|high"
+        }
+      ],
+      "description": "When users navigate to the Findings page, they need an immediate understanding of the overall issue landscape. The page header presents aggregate statistics — total findings count, actionable items, items needing user input, resolved items, and informational entries. This summary enables the user to quickly prioritize their attention: if there are critical actionable findings they need to address first, or if everything has been resolved. The report title and execution status round out the context.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "findings-filtering-and-navigation",
+      "name": "Filtering and Navigation",
+      "requiredElements": [
+        {
+          "text": "All Findings|Actionable"
+        },
+        {
+          "text": "Severity"
+        },
+        {
+          "text": "Category"
+        },
+        {
+          "text": "Clear"
+        }
+      ],
+      "description": "With potentially dozens of findings across multiple categories, users need robust filtering to focus on what matters. The page provides three independent filter dimensions — mode (all, actionable, needs input, resolved), severity (critical through info), and category (code bug, security, test issue, etc.). Users can combine these filters and clear them all at once. This filtering capability is essential for large reports where scanning every finding linearly would be impractical.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "findings-actions-and-autofix",
+      "name": "Actions and Auto-Fix",
+      "requiredElements": [
+        {
+          "text": "Auto-Fix"
+        },
+        {
+          "role": "button",
+          "text": "Fix All"
+        },
+        {
+          "text": "Clear"
+        }
+      ],
+      "description": "Findings are not just informational — they are actionable. Users can analyze individual findings, dismiss irrelevant ones, provide input when requested, and resolve issues. The auto-fix feature is a key differentiator: users can toggle automatic fixing of eligible issues (code bugs, security, tests, documentation) and trigger a bulk fix operation that sends all auto-fixable findings to AI for resolution. This transforms the findings page from a passive report into an active issue resolution workflow.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "findings-categorized-display",
+      "name": "Categorized Findings Display",
+      "requiredElements": [
+        {
+          "text": "bug|security|test|documentation"
+        },
+        {
+          "text": "finding|issue"
+        },
+        {
+          "text": "No Findings"
+        }
+      ],
+      "description": "Findings are organized into category sections (code bugs, security issues, test issues, documentation, performance, etc.), each with its own header, icon, and collapsible list of individual findings. This organization helps users work through issues domain by domain rather than facing an undifferentiated list. Each finding within a category shows its title, severity, description, and available actions (analyze, resolve, dismiss, provide input).",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Run Findings page — displays AI-detected issues and findings from a workflow run, organized by category with severity levels, filtering, auto-fix capabilities, and actionable recommendations.",
+  "metadata": {
+    "tags": [
+      "run-findings",
+      "execution-report",
+      "issues",
+      "auto-fix",
+      "observe"
+    ]
+  }
+}

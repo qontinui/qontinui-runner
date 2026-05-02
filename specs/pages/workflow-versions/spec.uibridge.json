@@ -1,0 +1,410 @@
+{
+  "description": "Workflow Version Lineage — shows how a workflow evolved over time through generations, reflection fixes, and manual edits, with version numbers, trigger types, timestamps, and diff summaries.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Version Timeline",
+          "enabled": true,
+          "id": "workflow-versions-timeline-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Workflow Version Lineage"
+            },
+            "label": "Required element for Version Timeline",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Version Timeline",
+          "enabled": true,
+          "id": "workflow-versions-timeline-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "v"
+            },
+            "label": "Required element for Version Timeline",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Version Timeline",
+          "enabled": true,
+          "id": "workflow-versions-timeline-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "listitem"
+            },
+            "label": "Required element for Version Timeline",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Version Timeline",
+          "enabled": true,
+          "id": "workflow-versions-timeline-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": ":"
+            },
+            "label": "Required element for Version Timeline",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users need a timeline of workflow versions showing version numbers, what triggered each version (generation, reflection, manual edit, fix), and when it was created.",
+      "id": "workflow-versions-timeline",
+      "name": "Version Timeline",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Version Diff Summaries",
+          "enabled": true,
+          "id": "workflow-versions-diffs-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "article"
+            },
+            "label": "Required element for Version Diff Summaries",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users need diff summaries explaining what changed between versions to understand workflow evolution without reading raw JSON.",
+      "id": "workflow-versions-diffs",
+      "name": "Version Diff Summaries",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Trigger Type Color Coding",
+          "enabled": true,
+          "id": "workflow-versions-triggers-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "listitem"
+            },
+            "label": "Required element for Trigger Type Color Coding",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Trigger types are color-coded: green for generation, purple for reflection, blue for manual, orange for fix.",
+      "id": "workflow-versions-triggers",
+      "name": "Trigger Type Color Coding",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Selection, Loading, and Empty States",
+          "enabled": true,
+          "id": "workflow-versions-states-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a workflow to view version history"
+            },
+            "label": "Required element for Selection, Loading, and Empty States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Selection, Loading, and Empty States",
+          "enabled": true,
+          "id": "workflow-versions-states-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loading versions..."
+            },
+            "label": "Required element for Selection, Loading, and Empty States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Selection, Loading, and Empty States",
+          "enabled": true,
+          "id": "workflow-versions-states-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No version history available"
+            },
+            "label": "Required element for Selection, Loading, and Empty States",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When no workflow is selected or no versions exist, clear messages guide the user.",
+      "id": "workflow-versions-states",
+      "name": "Selection, Loading, and Empty States",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Version Data Rendering",
+          "enabled": true,
+          "id": "workflow-versions-data-display-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "v"
+            },
+            "label": "Required element for Version Data Rendering",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Version Data Rendering",
+          "enabled": true,
+          "id": "workflow-versions-data-display-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "generation|reflection|manual|fix"
+            },
+            "label": "Required element for Version Data Rendering",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Version Data Rendering",
+          "enabled": true,
+          "id": "workflow-versions-data-display-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Workflow Version Lineage"
+            },
+            "label": "Required element for Version Data Rendering",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Each version node must accurately render the version number, trigger type badge, formatted timestamp, and diff summary text from the API response.",
+      "id": "workflow-versions-data-display",
+      "name": "Version Data Rendering",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Version Timeline Behavior",
+          "enabled": true,
+          "id": "workflow-versions-behavior-elem-0",
+          "precondition": "No workflow is selected in the execution context",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select a workflow to view version history"
+            },
+            "label": "Required element for Version Timeline Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Version Timeline Behavior",
+          "enabled": true,
+          "id": "workflow-versions-behavior-elem-1",
+          "precondition": "No workflow is selected in the execution context",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Workflow Version Lineage"
+            },
+            "label": "Required element for Version Timeline Behavior",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The version timeline scrolls when versions exceed the visible area, and requires a workflow to be selected via the execution context before displaying data.",
+      "id": "workflow-versions-behavior",
+      "name": "Version Timeline Behavior",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "workflow-versions",
+    "tags": [
+      "knowledge-graph",
+      "workflow",
+      "versioning",
+      "lineage",
+      "runner-only"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "Users need a timeline of workflow versions showing version numbers, what triggered each version (generation, reflection, manual edit, fix), and when it was created.",
+        "elements": [
+          {
+            "textContent": "Workflow Version Lineage"
+          },
+          {
+            "textContent": "v"
+          },
+          {
+            "role": "listitem"
+          },
+          {
+            "textContent": ":"
+          }
+        ],
+        "id": "workflow-versions-timeline",
+        "isInitial": false,
+        "name": "Version Timeline",
+        "transitions": []
+      },
+      {
+        "description": "Users need diff summaries explaining what changed between versions to understand workflow evolution without reading raw JSON.",
+        "elements": [
+          {
+            "role": "article"
+          }
+        ],
+        "id": "workflow-versions-diffs",
+        "isInitial": false,
+        "name": "Version Diff Summaries",
+        "transitions": []
+      },
+      {
+        "description": "Trigger types are color-coded: green for generation, purple for reflection, blue for manual, orange for fix.",
+        "elements": [
+          {
+            "role": "listitem"
+          }
+        ],
+        "id": "workflow-versions-triggers",
+        "isInitial": false,
+        "name": "Trigger Type Color Coding",
+        "transitions": []
+      },
+      {
+        "description": "When no workflow is selected or no versions exist, clear messages guide the user.",
+        "elements": [
+          {
+            "textContent": "Select a workflow to view version history"
+          },
+          {
+            "textContent": "Loading versions..."
+          },
+          {
+            "textContent": "No version history available"
+          }
+        ],
+        "id": "workflow-versions-states",
+        "isInitial": false,
+        "name": "Selection, Loading, and Empty States",
+        "transitions": []
+      },
+      {
+        "description": "Each version node must accurately render the version number, trigger type badge, formatted timestamp, and diff summary text from the API response.",
+        "elements": [
+          {
+            "textContent": "v"
+          },
+          {
+            "textContent": "generation|reflection|manual|fix"
+          },
+          {
+            "textContent": "Workflow Version Lineage"
+          }
+        ],
+        "id": "workflow-versions-data-display",
+        "isInitial": false,
+        "name": "Version Data Rendering",
+        "transitions": []
+      },
+      {
+        "description": "The version timeline scrolls when versions exceed the visible area, and requires a workflow to be selected via the execution context before displaying data.",
+        "elements": [
+          {
+            "textContent": "Select a workflow to view version history"
+          },
+          {
+            "textContent": "Workflow Version Lineage"
+          }
+        ],
+        "id": "workflow-versions-behavior",
+        "isInitial": false,
+        "name": "Version Timeline Behavior",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

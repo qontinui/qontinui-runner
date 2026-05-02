@@ -1,0 +1,97 @@
+{
+  "version": "1.0",
+  "id": "reflection",
+  "name": "ReflectionDashboard",
+  "states": [
+    {
+      "id": "reflection-overview",
+      "name": "Effectiveness Overview and Metrics",
+      "requiredElements": [
+        {
+          "text": "Reflection Effectiveness"
+        },
+        {
+          "text": "Total Fixes"
+        },
+        {
+          "text": "Effective"
+        },
+        {
+          "text": "Effectiveness Rate"
+        }
+      ],
+      "description": "The Reflection Dashboard provides users with a high-level view of how well the AI's self-healing capabilities are performing. Users need to see aggregate statistics including the total number of fixes applied, how many were effective vs ineffective, whether any caused regressions, and the overall effectiveness rate as a percentage. These summary cards give users confidence (or concern) about the reliability of the reflection system, helping them decide whether to continue relying on automated fixes or intervene with manual corrections. The data should be scoped to a specific workflow, since effectiveness patterns vary significantly between different automation tasks.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "reflection-workflow-scope",
+      "name": "Workflow-Scoped Analysis",
+      "requiredElements": [
+        {
+          "role": "combobox"
+        },
+        {
+          "text": "No reflection fixes found"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "Since reflection effectiveness varies greatly between workflows, users need to scope their analysis to a specific workflow. The dashboard should provide a workflow selector populated with names from recent task runs, and automatically load data for the selected workflow. Users should be able to switch between workflows to compare effectiveness patterns and identify which automations benefit most from self-healing. When no reflection data exists for a selected workflow, a clear message should explain that fixes will appear after workflow executions occur.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "reflection-run-history",
+      "name": "Reflection Run History",
+      "requiredElements": [
+        {
+          "text": "Recent Reflection Runs"
+        },
+        {
+          "text": "complete"
+        }
+      ],
+      "description": "Beyond aggregate metrics, users need to see the timeline of individual reflection runs. The history section shows recent reflection executions with their task run IDs, completion status (complete, running, failed), fix counts, and timestamps. This chronological view helps users understand the cadence of self-healing activity, identify runs that produced many fixes (potentially indicating systemic issues), and correlate reflection outcomes with specific workflow execution attempts.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "reflection-fix-details",
+      "name": "Individual Fix Analysis",
+      "requiredElements": [
+        {
+          "text": "All Fixes"
+        },
+        {
+          "text": "Old value"
+        },
+        {
+          "text": "Knowledge Update"
+        }
+      ],
+      "description": "For deeper investigation, users need to drill into individual fixes to understand exactly what the reflection system changed. Each fix entry shows the fix type (knowledge update, step rewrite, selector fix, tool config, context addition, instruction clarification), a description, confidence level, and effectiveness assessment. Expanding a fix reveals the file changed, old and new values, application timestamp, and effectiveness evidence. This level of detail is essential for users who want to audit the AI's self-healing decisions, validate that fixes are appropriate, or learn from the patterns of successful vs unsuccessful corrections.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Reflection Dashboard page — evaluates the effectiveness of AI self-healing fixes across workflow executions, providing aggregated metrics, run history, and individual fix analysis.",
+  "metadata": {
+    "tags": [
+      "reflection",
+      "self-healing",
+      "effectiveness",
+      "dev-only",
+      "runner-only"
+    ]
+  }
+}

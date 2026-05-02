@@ -1,0 +1,324 @@
+{
+  "version": "1.0",
+  "id": "settings-mcp",
+  "name": "McpSettings",
+  "states": [
+    {
+      "id": "mcp-page-structure",
+      "name": "Page Structure",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "MCP Servers"
+        },
+        {
+          "text": "Configure external MCP (Model Context Protocol) servers"
+        },
+        {
+          "text": "Configured Servers"
+        },
+        {
+          "text": "What is MCP?"
+        }
+      ],
+      "description": "The MCP Servers tab renders a SectionHeader with title 'MCP Servers' and a description. Below it is a 'Configured Servers' subsection with an 'Add Server' button. At the bottom is a 'What is MCP?' info box. The form and delete confirmation modal overlay the list when active.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-add-server-button",
+      "name": "Add Server Button",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Add Server"
+        },
+        {
+          "role": "button",
+          "text": "Add Server"
+        }
+      ],
+      "description": "The 'Add Server' button appears in the header row of the Configured Servers section. Clicking it shows the add form. The button is always visible regardless of how many servers exist.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-empty-state",
+      "name": "Empty State — No Servers",
+      "requiredElements": [
+        {
+          "text": "No MCP servers configured"
+        },
+        {
+          "text": "Add a server to extend runner capabilities"
+        },
+        {
+          "text": "Configured Servers"
+        }
+      ],
+      "description": "When no MCP servers have been configured, the server list area shows an empty state with a message and hint text. This is the initial state for a fresh runner installation.",
+      "precondition": "No MCP servers have been added",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-server-card-structure",
+      "name": "Server Card Structure",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "Each configured server renders as a card with a header row containing expand/collapse toggle, transport icon, server name, status badges, endpoint text, connection status indicator, and three action buttons (connect/disconnect, edit, delete). Cards can be expanded to reveal the available tools list.",
+      "precondition": "At least one MCP server is configured",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-connection-status",
+      "name": "Connection Status Indicators",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "description": "Each server card shows a colored connection status indicator with three possible states: Connected (green pulsing dot), Error (red dot), or Disconnected (gray dot). The status is fetched via get_mcp_servers_status on mount and after each connect/disconnect operation.",
+      "precondition": "At least one MCP server is in the connected state",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-server-badges",
+      "name": "Server Status Badges",
+      "requiredElements": [
+        {
+          "text": "Disabled"
+        },
+        {
+          "text": "Auto-start"
+        },
+        {
+          "text": "Disabled"
+        }
+      ],
+      "description": "Server cards optionally show 'Disabled' and 'Auto-start' badges in the header row. These reflect the server's enabled and autoStart configuration fields.",
+      "precondition": "At least one MCP server has enabled=false",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-connect-disconnect",
+      "name": "Connect / Disconnect Actions",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "Each server card has a connect/disconnect button (Power icon). When a server is disconnected or in error state, clicking it calls connect_mcp_server. When connected, clicking it calls disconnect_mcp_server. During the operation a spinning RefreshCw icon replaces the Power icon and the button is disabled.",
+      "precondition": "At least one MCP server is in the disconnected state",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-expanded-tools",
+      "name": "Expanded Server Tools List",
+      "requiredElements": [
+        {},
+        {},
+        {
+          "text": "Connect to see available tools"
+        },
+        {}
+      ],
+      "description": "Clicking the chevron button on a server card expands it to reveal a tools grid. Each tool shows a Wrench icon, the tool name in monospace with data-content-label='tool name', and an optional description. If connected but no tools exist, shows 'No tools available'. If disconnected, shows 'Connect to see available tools'. If in error state, shows the error message.",
+      "precondition": "A server card is expanded and the server is connected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-add-form-structure",
+      "name": "Add / Edit Form Structure",
+      "requiredElements": [
+        {
+          "role": "textbox"
+        },
+        {
+          "text": "Run as subprocess"
+        },
+        {
+          "role": "button",
+          "text": "Cancel"
+        },
+        {
+          "role": "button",
+          "text": "Create"
+        }
+      ],
+      "description": "The add/edit form replaces the server list when active. It contains: title ('Add New Server' or 'Edit Server'), Name (required), Description (optional), transport selection (Stdio / HTTP radio cards), transport-specific fields, and common settings (timeout, enabled, auto-start). Actions are Cancel and Create/Update.",
+      "precondition": "The add or edit form is visible",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-transport-fields",
+      "name": "Transport-Specific Fields",
+      "requiredElements": [
+        {
+          "text": "Server URL"
+        },
+        {
+          "text": "Command"
+        },
+        {
+          "text": "Stdio transport is not yet fully implemented"
+        },
+        {
+          "text": "Run as subprocess"
+        }
+      ],
+      "description": "The form shows different fields depending on the selected transport type. Stdio shows Command, Arguments, and Working Directory. HTTP shows Server URL and Headers. Switching transport hides the previous transport's fields. A warning banner appears when Stdio is selected.",
+      "precondition": "The form is visible and HTTP transport is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-form-common-settings",
+      "name": "Form Common Settings",
+      "requiredElements": [
+        {
+          "text": "Timeout"
+        },
+        {
+          "text": "Server can be connected"
+        },
+        {
+          "text": "Connect automatically when runner launches"
+        }
+      ],
+      "description": "Below the transport-specific fields, the form shows three settings that apply to both transport types: Timeout (number input, 1-300 seconds), Enabled checkbox, and Auto-start checkbox. These settings are always visible regardless of transport selection.",
+      "precondition": "The add or edit form is visible",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-form-create-behavior",
+      "name": "Form Create and Update Behavior",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Create"
+        },
+        {
+          "role": "button",
+          "text": "Update"
+        },
+        {
+          "text": "Headers"
+        }
+      ],
+      "description": "Submitting the form calls create_mcp_server (new) or update_mcp_server (edit). On success, the form closes and the server list refreshes. The form processes arguments (split by newline) and headers (JSON or key:value lines) before sending to the backend.",
+      "precondition": "The add form is visible with a valid server name entered",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-edit-flow",
+      "name": "Edit Server Flow",
+      "requiredElements": [
+        {},
+        {
+          "text": "Edit Server"
+        }
+      ],
+      "description": "Clicking the Edit (pencil) button on a server card populates the form with the server's existing values and shows it in edit mode. The form title reads 'Edit Server' and the submit button reads 'Update'.",
+      "precondition": "At least one MCP server is configured",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-delete-confirmation",
+      "name": "Delete Confirmation Modal",
+      "requiredElements": [
+        {
+          "text": "Delete Server"
+        },
+        {
+          "text": "This cannot be undone."
+        },
+        {
+          "text": "This cannot be undone."
+        }
+      ],
+      "description": "Clicking the Delete (trash) button on a server card opens a confirmation modal with a dark overlay. The modal shows a title 'Delete Server', a message naming the server being deleted, and two buttons: Cancel and Delete (red).",
+      "precondition": "A server delete button has been clicked",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-info-box",
+      "name": "What is MCP Info Box",
+      "requiredElements": [
+        {
+          "text": "What is MCP?"
+        },
+        {
+          "text": "When connected, their tools become available as workflow steps."
+        }
+      ],
+      "description": "A light-blue info box at the bottom of the tab explains the Model Context Protocol to users who may not be familiar with it.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "mcp-data-model",
+      "name": "MCP Server Data Model",
+      "requiredElements": [
+        {
+          "text": "Configured Servers"
+        },
+        {},
+        {
+          "text": "Configured Servers"
+        }
+      ],
+      "description": "McpServerConfig is the canonical data structure for a configured MCP server. It is stored in the runner's PostgreSQL database and returned by list_mcp_servers and create/update commands. Understanding this model is essential for verifying that form submissions, CRUD operations, and status displays are correct.",
+      "precondition": "At least one MCP server is configured",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "MCP Servers settings tab within the runner Settings panel. Allows users to configure external Model Context Protocol servers that extend the runner's capabilities with additional tools. Supports two transport types: stdio (subprocess) and HTTP. Each server can be connected/disconnected on demand, and when connected its tools are listed and become available as workflow steps. The tab manages the full server lifecycle: list (with connection status), create, update, delete, connect, disconnect, and tool discovery. Server configurations are stored in the runner's PostgreSQL database via Tauri IPC commands (list_mcp_servers, create_mcp_server, update_mcp_server, delete_mcp_server, connect_mcp_server, disconnect_mcp_server, get_mcp_servers_status).",
+  "metadata": {
+    "tags": [
+      "settings",
+      "mcp",
+      "servers",
+      "tools",
+      "http",
+      "stdio",
+      "connect",
+      "workflow-steps"
+    ]
+  }
+}

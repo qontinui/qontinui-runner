@@ -1,0 +1,155 @@
+{
+  "version": "1.0",
+  "id": "element-reliability",
+  "name": "ElementReliabilityDashboard",
+  "states": [
+    {
+      "id": "element-reliability-overview",
+      "name": "Reliability Overview Statistics",
+      "requiredElements": [
+        {
+          "text": "Element Reliability"
+        },
+        {
+          "text": "Stable"
+        },
+        {
+          "text": "Flaky"
+        },
+        {
+          "text": "Unreliable"
+        }
+      ],
+      "description": "Users need summary statistics showing how many elements are stable vs flaky vs unreliable, providing a quick assessment of automation health across all tracked elements.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "element-reliability-list",
+      "name": "Elements by Reliability",
+      "requiredElements": [
+        {
+          "text": "Elements by Reliability"
+        },
+        {
+          "text": "%"
+        },
+        {
+          "text": "interactions"
+        }
+      ],
+      "description": "Users need to see individual elements sorted by reliability, with success rates and interaction counts, to identify which specific elements need attention or alternative selectors.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "element-reliability-states",
+      "name": "Loading, Error, and Empty States",
+      "requiredElements": [
+        {
+          "text": "Loading element data..."
+        },
+        {
+          "text": "Failed to load"
+        },
+        {
+          "text": "No element reliability data yet"
+        },
+        {
+          "text": "Run some automations to build up element history"
+        }
+      ],
+      "description": "Users need clear feedback during loading, error, and empty states so they understand the system status.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "element-reliability-badges",
+      "name": "Reliability Color-Coded Badges",
+      "requiredElements": [
+        {
+          "text": "Stable"
+        },
+        {
+          "text": "Flaky"
+        },
+        {
+          "text": "Unreliable"
+        }
+      ],
+      "description": "Reliability badges use color coding to quickly communicate element health: green for stable (>=95%), yellow for flaky (>=80%), red for unreliable (<80%).",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "element-reliability-data-display",
+      "name": "Element Data Rendering",
+      "requiredElements": [
+        {
+          "text": "%"
+        },
+        {
+          "text": "interactions"
+        },
+        {
+          "text": "success"
+        }
+      ],
+      "description": "Each element row must render its element ID, total interaction count, and success rate percentage accurately from the API data. The summary cards must show correct counts of stable (>=95%), flaky (>=80%), and unreliable (<80%) elements computed from the success_rate field.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "element-reliability-presence",
+      "name": "Required UI Elements",
+      "requiredElements": [
+        {
+          "text": "Element Reliability"
+        },
+        {
+          "text": "Stable"
+        }
+      ],
+      "description": "All structural elements must be present for the dashboard to function: the Shield header icon, the 3-column summary grid, the scrollable element list container, and reliability badge components.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "element-reliability-state-consistency",
+      "name": "State Transitions",
+      "requiredElements": [
+        {
+          "text": "Loading element data"
+        },
+        {
+          "text": "Elements by Reliability"
+        }
+      ],
+      "description": "The dashboard transitions cleanly between loading, error, empty, and data states. Summary card counts must be mathematically consistent with the element list (stable + flaky + unreliable = total elements).",
+      "precondition": "Page has just loaded and is fetching from /ui-bridge/history/flaky",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Element Reliability Dashboard — shows the stability and success rates of UI elements across automated interactions, helping users identify flaky elements that may cause automation failures.",
+  "metadata": {
+    "tags": [
+      "knowledge-graph",
+      "element-reliability",
+      "ui-bridge",
+      "quality",
+      "runner-only"
+    ]
+  }
+}

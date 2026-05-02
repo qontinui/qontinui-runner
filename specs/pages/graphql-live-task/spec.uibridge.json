@@ -1,0 +1,581 @@
+{
+  "description": "GraphQL Live Task Panel — real-time task monitoring component embedded in the Run Summary page. Appears only when the selected task run is in 'running' status. Uses GraphQL WebSocket subscriptions for zero-polling updates. Includes inline lifecycle controls backed by GraphQL mutations.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Task Status Display",
+          "enabled": true,
+          "id": "graphql-live-status-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Task Status Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Task Status Display",
+          "enabled": true,
+          "id": "graphql-live-status-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "running|paused|complete|failed|stopped"
+            },
+            "label": "Required element for Task Status Display",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The live panel header shows task identity and current status. Status updates are pushed via WebSocket subscription, not polled.",
+      "id": "graphql-live-status",
+      "name": "Task Status Display",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Task Metadata",
+          "enabled": true,
+          "id": "graphql-live-metadata-elem-0",
+          "precondition": "Task run was created from a workflow",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Sessions"
+            },
+            "label": "Required element for Task Metadata",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Task Metadata",
+          "enabled": true,
+          "id": "graphql-live-metadata-elem-1",
+          "precondition": "Task run was created from a workflow",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Workflow"
+            },
+            "label": "Required element for Task Metadata",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Task Metadata",
+          "enabled": true,
+          "id": "graphql-live-metadata-elem-2",
+          "precondition": "Task run was created from a workflow",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Created"
+            },
+            "label": "Required element for Task Metadata",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Below the header, a metadata grid shows key task run properties.",
+      "id": "graphql-live-metadata",
+      "name": "Task Metadata",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Live Progress Indicator",
+          "enabled": true,
+          "id": "graphql-live-events-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Step:|Status:|Phase:"
+            },
+            "label": "Required element for Live Progress Indicator",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Live Progress Indicator",
+          "enabled": true,
+          "id": "graphql-live-events-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Live Progress Indicator",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A progress indicator shows the most recent event from the WebSocket subscription. Updates automatically as steps execute.",
+      "id": "graphql-live-events",
+      "name": "Live Progress Indicator",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Lifecycle Controls",
+          "enabled": true,
+          "id": "graphql-live-controls-elem-0",
+          "precondition": "Task status is 'running'",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Lifecycle Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Lifecycle Controls",
+          "enabled": true,
+          "id": "graphql-live-controls-elem-1",
+          "precondition": "Task status is 'running'",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Lifecycle Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Lifecycle Controls",
+          "enabled": true,
+          "id": "graphql-live-controls-elem-2",
+          "precondition": "Task status is 'running'",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Lifecycle Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Lifecycle Controls",
+          "enabled": true,
+          "id": "graphql-live-controls-elem-3",
+          "precondition": "Task status is 'running'",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Lifecycle Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Lifecycle Controls",
+          "enabled": true,
+          "id": "graphql-live-controls-elem-4",
+          "precondition": "Task status is 'running'",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Lifecycle Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Lifecycle Controls",
+          "enabled": true,
+          "id": "graphql-live-controls-elem-5",
+          "precondition": "Task status is 'running'",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Lifecycle Controls",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Inline buttons for managing the task. Controls are context-sensitive to current status. Backed by GraphQL mutations with automatic cache update.",
+      "id": "graphql-live-controls",
+      "name": "Lifecycle Controls",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Error Display",
+          "enabled": true,
+          "id": "graphql-live-error-elem-0",
+          "precondition": "Task has a non-null error_message",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "error|Error"
+            },
+            "label": "Required element for Error Display",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Error messages from failed tasks are displayed prominently.",
+      "id": "graphql-live-error",
+      "name": "Error Display",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Loading State",
+          "enabled": true,
+          "id": "graphql-live-loading-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loading task run"
+            },
+            "label": "Required element for Loading State",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Initial data fetch shows a loading indicator.",
+      "id": "graphql-live-loading",
+      "name": "Loading State",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Panel Visibility Rules",
+          "enabled": true,
+          "id": "graphql-live-visibility-elem-0",
+          "precondition": "Selected task run has status 'running'",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "running"
+            },
+            "label": "Required element for Panel Visibility Rules",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Panel Visibility Rules",
+          "enabled": true,
+          "id": "graphql-live-visibility-elem-1",
+          "precondition": "Selected task run has status 'running'",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loading task run"
+            },
+            "label": "Required element for Panel Visibility Rules",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The live panel conditionally renders based on task status.",
+      "id": "graphql-live-visibility",
+      "name": "Panel Visibility Rules",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Real-Time Update Behavior",
+          "enabled": true,
+          "id": "graphql-live-realtime-elem-0",
+          "precondition": "Task is actively executing steps",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "stopped|complete|failed"
+            },
+            "label": "Required element for Real-Time Update Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Real-Time Update Behavior",
+          "enabled": true,
+          "id": "graphql-live-realtime-elem-1",
+          "precondition": "Task is actively executing steps",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Step:|Phase:"
+            },
+            "label": "Required element for Real-Time Update Behavior",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Status and progress updates arrive via WebSocket push within seconds, not via HTTP polling.",
+      "id": "graphql-live-realtime",
+      "name": "Real-Time Update Behavior",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Visual Style",
+          "enabled": true,
+          "id": "graphql-live-style-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "running|complete|failed"
+            },
+            "label": "Required element for Visual Style",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The panel follows the runner's dark theme design system.",
+      "id": "graphql-live-style",
+      "name": "Visual Style",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "graphql-live-task"
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The live panel header shows task identity and current status. Status updates are pushed via WebSocket subscription, not polled.",
+        "elements": [
+          {},
+          {
+            "textContent": "running|paused|complete|failed|stopped"
+          }
+        ],
+        "id": "graphql-live-status",
+        "isInitial": false,
+        "name": "Task Status Display",
+        "transitions": []
+      },
+      {
+        "description": "Below the header, a metadata grid shows key task run properties.",
+        "elements": [
+          {
+            "textContent": "Sessions"
+          },
+          {
+            "textContent": "Workflow"
+          },
+          {
+            "textContent": "Created"
+          }
+        ],
+        "id": "graphql-live-metadata",
+        "isInitial": false,
+        "name": "Task Metadata",
+        "transitions": []
+      },
+      {
+        "description": "A progress indicator shows the most recent event from the WebSocket subscription. Updates automatically as steps execute.",
+        "elements": [
+          {
+            "textContent": "Step:|Status:|Phase:"
+          },
+          {}
+        ],
+        "id": "graphql-live-events",
+        "isInitial": false,
+        "name": "Live Progress Indicator",
+        "transitions": []
+      },
+      {
+        "description": "Inline buttons for managing the task. Controls are context-sensitive to current status. Backed by GraphQL mutations with automatic cache update.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "graphql-live-controls",
+        "isInitial": false,
+        "name": "Lifecycle Controls",
+        "transitions": []
+      },
+      {
+        "description": "Error messages from failed tasks are displayed prominently.",
+        "elements": [
+          {
+            "textContent": "error|Error"
+          }
+        ],
+        "id": "graphql-live-error",
+        "isInitial": false,
+        "name": "Error Display",
+        "transitions": []
+      },
+      {
+        "description": "Initial data fetch shows a loading indicator.",
+        "elements": [
+          {
+            "textContent": "Loading task run"
+          }
+        ],
+        "id": "graphql-live-loading",
+        "isInitial": false,
+        "name": "Loading State",
+        "transitions": []
+      },
+      {
+        "description": "The live panel conditionally renders based on task status.",
+        "elements": [
+          {
+            "textContent": "running"
+          },
+          {
+            "textContent": "Loading task run"
+          }
+        ],
+        "id": "graphql-live-visibility",
+        "isInitial": false,
+        "name": "Panel Visibility Rules",
+        "transitions": []
+      },
+      {
+        "description": "Status and progress updates arrive via WebSocket push within seconds, not via HTTP polling.",
+        "elements": [
+          {
+            "textContent": "stopped|complete|failed"
+          },
+          {
+            "textContent": "Step:|Phase:"
+          }
+        ],
+        "id": "graphql-live-realtime",
+        "isInitial": false,
+        "name": "Real-Time Update Behavior",
+        "transitions": []
+      },
+      {
+        "description": "The panel follows the runner's dark theme design system.",
+        "elements": [
+          {
+            "textContent": "running|complete|failed"
+          }
+        ],
+        "id": "graphql-live-style",
+        "isInitial": false,
+        "name": "Visual Style",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

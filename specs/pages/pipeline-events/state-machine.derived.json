@@ -1,0 +1,157 @@
+{
+  "version": "1.0",
+  "id": "pipeline-events",
+  "name": "PipelineEventsTimeline",
+  "states": [
+    {
+      "id": "pipeline-events-timeline",
+      "name": "Pipeline Events Timeline",
+      "requiredElements": [
+        {
+          "text": "Pipeline Events"
+        },
+        {
+          "role": "listitem"
+        },
+        {
+          "text": ":"
+        }
+      ],
+      "description": "Users need a chronological timeline of generation pipeline events showing what happened during each phase of workflow generation.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pipeline-events-metrics",
+      "name": "Per-Event Metrics",
+      "requiredElements": [
+        {
+          "text": "ms"
+        },
+        {
+          "text": "tokens"
+        },
+        {
+          "text": "errors:"
+        }
+      ],
+      "description": "Users need to see per-event metrics including duration in milliseconds, token counts, and validation error deltas to identify bottlenecks and measure improvement.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pipeline-events-phases",
+      "name": "Phase Color Coding",
+      "requiredElements": [
+        {
+          "role": "listitem"
+        }
+      ],
+      "description": "Each pipeline phase is color-coded for quick identification: blue for discovery, green for generation, yellow for validation, orange for fixing, purple for hardening, cyan for reflection.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pipeline-events-states",
+      "name": "Loading and Empty States",
+      "requiredElements": [
+        {
+          "text": "Loading events..."
+        },
+        {
+          "text": "No pipeline events recorded"
+        }
+      ],
+      "description": "Empty and loading states communicate pipeline status clearly.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pipeline-events-data-display",
+      "name": "Event Data Rendering",
+      "requiredElements": [
+        {
+          "text": ":"
+        },
+        {
+          "text": "ms"
+        },
+        {
+          "text": "errors:"
+        }
+      ],
+      "description": "Each event row must accurately render the event type, phase, timestamp (HH:mm:ss format), duration in milliseconds, token count, and validation error delta from the API response.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pipeline-events-behavior",
+      "name": "Timeline Behavior",
+      "requiredElements": [
+        {
+          "text": "Pipeline Events"
+        },
+        {
+          "text": "Pipeline Events"
+        }
+      ],
+      "description": "The timeline is scrollable when events exceed the visible area (max-h-96), events are ordered chronologically by created_at, and the timeline connector lines visually link sequential events.",
+      "precondition": "More events exist than fit in the max-h-96 container",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pipeline-events-presence",
+      "name": "Required Timeline Elements",
+      "requiredElements": [
+        {
+          "text": "Pipeline Events"
+        }
+      ],
+      "description": "Each event row must contain a phase color dot, event type label, and timeline connector line. The header must show the Zap icon.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pipeline-events-virtualization",
+      "name": "Virtualized Rendering and Pagination",
+      "requiredElements": [
+        {
+          "textContains": "of"
+        },
+        {
+          "textContains": "Load more"
+        },
+        {
+          "textContains": "Pipeline Events"
+        }
+      ],
+      "description": "The Pipeline Events timeline uses react-window virtualized rendering to handle large event lists efficiently. Events are paginated client-side (50 per page) with a 'Load more' button. The header shows a count indicator like '50 of 8297'. Only visible event rows plus a 10-row overscan buffer are rendered in the DOM.",
+      "precondition": "More than 50 pipeline events exist for the task run",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Pipeline Events Timeline — shows the sequence of events during workflow generation, including phase durations, token usage, and validation error changes, helping developers understand and debug the generation pipeline.",
+  "metadata": {
+    "tags": [
+      "knowledge-graph",
+      "pipeline",
+      "generation",
+      "telemetry",
+      "runner-only"
+    ]
+  }
+}

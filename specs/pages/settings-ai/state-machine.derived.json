@@ -1,0 +1,315 @@
+{
+  "version": "1.0",
+  "id": "settings-ai",
+  "name": "AiSettings",
+  "states": [
+    {
+      "id": "ai-page-structure",
+      "name": "Page Structure and Header",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "AI Provider"
+        },
+        {
+          "text": "Configure how the runner connects to AI"
+        },
+        {}
+      ],
+      "description": "The AI Provider settings page renders a scrollable column with a Bot icon, heading, description, and tutorial link. A loading spinner is shown while the initial get_ai_settings Tauri command is in flight.",
+      "precondition": "Page is navigating to AI settings for the first time",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-provider-selection",
+      "name": "Provider Selection",
+      "requiredElements": [
+        {
+          "role": "radio"
+        },
+        {
+          "role": "radio"
+        },
+        {
+          "role": "radio"
+        },
+        {
+          "role": "radio"
+        },
+        {
+          "role": "radio"
+        }
+      ],
+      "description": "A radio button group with four mutually exclusive provider options. Selecting a provider immediately shows that provider's configuration section and hides the others. Each option includes a label and short description of the billing model.",
+      "precondition": "Settings page has loaded with claude_cli provider selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-provider-health",
+      "name": "Provider Health Status (Circuit Breakers)",
+      "requiredElements": [
+        {
+          "text": "Closed"
+        },
+        {
+          "text": "Open"
+        },
+        {
+          "text": "Closed"
+        }
+      ],
+      "description": "When one or more providers have had activity since the runner started, a health status row appears showing a badge per active provider. Each badge reflects its circuit breaker state. This section is absent on a fresh runner with no AI activity.",
+      "precondition": "At least one AI provider has been used since runner started",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-claude-cli-section",
+      "name": "Claude CLI Provider Configuration",
+      "requiredElements": [
+        {
+          "role": "combobox"
+        },
+        {
+          "text": "Authenticated"
+        },
+        {
+          "role": "button",
+          "text": "Re-authenticate"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "role": "spinbutton"
+        }
+      ],
+      "description": "Visible only when claude_cli provider is selected. Contains authentication status banner, execution mode dropdown, optional custom executable path, Claude account management, selection mode, and timeout input.",
+      "precondition": "claude_cli provider radio button is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-claude-cli-accounts",
+      "name": "Claude CLI Account Management",
+      "requiredElements": [
+        {
+          "text": "No accounts configured"
+        },
+        {
+          "role": "button",
+          "text": "Add Directory"
+        },
+        {
+          "role": "button",
+          "text": "Auto-Detect"
+        },
+        {
+          "role": "button",
+          "text": "Check Usage"
+        },
+        {
+          "text": "Active"
+        },
+        {
+          "role": "button",
+          "text": "Least Usage"
+        }
+      ],
+      "description": "Manages multiple Claude config directories for rate-limit failover. Users can add directories via file picker, auto-detect them, check usage quotas, switch active accounts, configure per-account launch commands, and choose between Manual and Least Usage selection modes.",
+      "precondition": "claude_cli provider is selected and no account directories are configured",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-claude-api-section",
+      "name": "Claude API Provider Configuration",
+      "requiredElements": [
+        {
+          "role": "combobox"
+        },
+        {},
+        {
+          "role": "button",
+          "text": "Save Key"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "text": "per-token costs"
+        }
+      ],
+      "description": "Visible only when claude_api provider is selected. Manages Claude API key storage in the OS keychain, model selection from four Claude model options, max tokens limit, and displays a per-token cost warning.",
+      "precondition": "claude_api provider radio button is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-gemini-cli-section",
+      "name": "Gemini CLI Provider Configuration",
+      "requiredElements": [
+        {
+          "role": "combobox"
+        },
+        {
+          "role": "radio"
+        },
+        {
+          "role": "radio"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "text": "npm install -g @google/gemini-cli"
+        }
+      ],
+      "description": "Visible only when gemini_cli provider is selected. Configures authentication method (OAuth for Google account free tier, or API key), model selection from five Gemini models, execution mode, and timeout. Includes an npm install tip.",
+      "precondition": "gemini_cli provider radio button is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-gemini-api-section",
+      "name": "Gemini API Provider Configuration",
+      "requiredElements": [
+        {
+          "role": "combobox"
+        },
+        {},
+        {
+          "role": "button",
+          "text": "Save Key"
+        },
+        {
+          "role": "spinbutton"
+        },
+        {
+          "text": "Cost Savings"
+        }
+      ],
+      "description": "Visible only when gemini_api provider is selected. Manages Gemini API key in the OS keychain, model selection, max output tokens, and temperature (creativity). Includes a cost savings note comparing Gemini Flash to Claude for simple tasks.",
+      "precondition": "gemini_api provider radio button is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-auto-refine-defaults",
+      "name": "Auto-Refine Defaults",
+      "requiredElements": [
+        {
+          "text": "Include Video After Iterations"
+        },
+        {
+          "role": "spinbutton"
+        },
+        {
+          "role": "spinbutton"
+        },
+        {
+          "text": "Video frames use significantly more tokens"
+        }
+      ],
+      "description": "Global setting controlling how many failed AI analysis iterations occur before the system escalates to include video frames in the prompt. Setting 0 disables video escalation entirely. Applies as the default for new scripts across all providers.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-session-mode",
+      "name": "Session Mode Configuration",
+      "requiredElements": [
+        {
+          "role": "button"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "message queuing"
+        }
+      ],
+      "description": "A toggle controlling whether AI CLI sessions use interactive (bidirectional, multi-turn, message queuing) or one-shot (inline) execution mode. Affects how the runner communicates with the AI CLI during workflow execution.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-test-connection",
+      "name": "Test Connection",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Test Connection"
+        },
+        {
+          "role": "button",
+          "text": "Test Connection"
+        },
+        {
+          "role": "button",
+          "text": "Test Connection"
+        }
+      ],
+      "description": "A card allowing users to verify the current provider configuration is functional before saving. Calls test_ai_connection Tauri command and displays a success or failure result with the backend's message.",
+      "precondition": "claude_api or gemini_api provider is selected and no API key is configured",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-save-settings",
+      "name": "Save Settings",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Save AI Settings"
+        },
+        {
+          "role": "button",
+          "text": "Save AI Settings"
+        },
+        {
+          "text": "Settings saved successfully"
+        },
+        {
+          "role": "button",
+          "text": "Save AI Settings"
+        }
+      ],
+      "description": "The Save button at the bottom of the page persists all AI settings. It calls save_ai_settings for Claude provider fields and save_gemini_settings for Gemini fields. Provides animated feedback for saving, success, and error states.",
+      "precondition": "Save operation completed successfully",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The AI Provider settings page configures how the runner connects to AI for automation analysis. It supports four providers: Claude Code CLI (subscription-based, recommended), Claude API (direct per-token billing), Gemini CLI (Google CLI with OAuth or API key), and Gemini API (direct Gemini billing). Each provider has a conditionally rendered configuration section. The page also manages auto-refine video escalation defaults, interactive session mode, connection testing, and circuit breaker health status. Settings are persisted via Tauri IPC to the OS keychain (API keys) and runner config store.",
+  "metadata": {
+    "tags": [
+      "settings",
+      "ai",
+      "provider",
+      "claude",
+      "gemini",
+      "api-key",
+      "circuit-breaker",
+      "configuration"
+    ]
+  }
+}

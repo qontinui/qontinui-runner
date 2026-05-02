@@ -1,0 +1,322 @@
+{
+  "version": "1.0",
+  "id": "workflows",
+  "name": "WorkflowBuilderTab",
+  "states": [
+    {
+      "id": "wf-ai-generation",
+      "name": "AI Workflow Generation",
+      "requiredElements": [
+        {
+          "text": "Generate Workflow with AI"
+        },
+        {
+          "role": "button",
+          "text": "Generate"
+        },
+        {
+          "text": "Generate & Run"
+        },
+        {
+          "text": "Spec"
+        },
+        {
+          "text": "Provider"
+        }
+      ],
+      "description": "The default landing experience centers on AI-powered workflow generation. When no workflow is selected, users see a prominent panel inviting them to describe what they want to automate in natural language. The system generates a complete multi-phase workflow from the description, optionally incorporating page specs for spec-driven verification, attached contexts for additional AI guidance, and generation templates for common patterns. Users can select the AI provider and model, configure advanced options like max iterations and discovery mode, and choose between Generate (create and review) or Generate & Run (create and immediately execute). The prompt text persists across sessions via localStorage so users can refine their description over time.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "wf-sidebar-library",
+      "name": "Workflow Sidebar Library",
+      "requiredElements": [
+        {
+          "role": "searchbox"
+        },
+        {
+          "role": "button",
+          "text": "New"
+        },
+        {
+          "text": "Workflows"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "The sidebar provides a persistent library of all saved workflows, allowing users to browse, search, create, duplicate, and delete workflows. It serves as the primary navigation mechanism for switching between workflows in the editor. Users can search by name to quickly locate a specific workflow, create new blank workflows, and manage their collection. The sidebar shows workflow names and metadata, and selecting a workflow loads it into the main editor panel. The sidebar can be toggled to maximize editor space.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "wf-phase-editor",
+      "name": "Phase Editor — Multi-Phase Workflow Editing",
+      "requiredElements": [
+        {
+          "text": "Setup"
+        },
+        {
+          "text": "Verification"
+        },
+        {
+          "text": "Agentic"
+        },
+        {
+          "text": "Completion"
+        },
+        {
+          "role": "button",
+          "text": "Add"
+        }
+      ],
+      "description": "When a workflow is loaded, the main content area displays a structured editor organized into four execution phases: Setup (environment preparation commands), Verification (checks and tests run between AI iterations), Agentic (AI prompts and instructions that drive the automation), and Completion (cleanup and finalization steps). Each phase section supports adding, removing, reordering, and configuring individual steps with type-specific editors. Users can expand and collapse phase sections to focus on the phase they are editing. The phase structure ensures workflows follow a predictable execution pattern.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "wf-execution-controls",
+      "name": "Workflow Execution and Persistence",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Run"
+        },
+        {
+          "role": "button",
+          "text": "Save"
+        },
+        {
+          "role": "button",
+          "text": "Export"
+        }
+      ],
+      "description": "The editor toolbar provides essential workflow lifecycle controls. Users can run the currently loaded workflow directly from the editor, save changes back to the library, export the workflow as a JSON file for sharing or backup, and import previously exported workflows. The Run button launches workflow execution and transitions the view to show execution progress. Save persists all step configurations, settings, and metadata. Export produces a portable JSON file that can be imported into another runner instance.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "wf-settings-configuration",
+      "name": "Workflow Settings and Configuration",
+      "requiredElements": [
+        {
+          "text": "Name"
+        },
+        {
+          "text": "Max Iterations"
+        },
+        {
+          "text": "Reflection"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "Each workflow has configurable settings that control execution behavior. Users can name and describe the workflow, select the AI provider and model, set max iterations for the verification loop, enable or disable reflection mode for self-improving workflows, configure timeouts, enable health checks for target services, and toggle various execution options. Settings are organized into logical sections and use toggle switches, dropdowns, and number inputs appropriate for each setting type. The settings panel is accessible via a gear icon when a workflow is loaded.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "wf-htn-planning",
+      "name": "HTN Planning Configuration",
+      "requiredElements": [
+        {
+          "text": "HTN Planning"
+        },
+        {
+          "text": "HTN Planning"
+        },
+        {
+          "text": "Enable HTN Planning"
+        },
+        {
+          "role": "switch"
+        },
+        {
+          "text": "HTN Planning"
+        },
+        {
+          "text": "Enable HTN Planning"
+        },
+        {},
+        {},
+        {
+          "text": "HTN Planning"
+        },
+        {
+          "text": "HTN Planning"
+        }
+      ],
+      "description": "The HTN (Hierarchical Task Network) Planning section within workflow settings allows users to enable structured plan-based fixes that run before the AI agentic session. When enabled, the verification loop attempts to find and execute a deterministic plan using a state machine and method library before falling back to AI. The section has three controls: an enable toggle (off by default), a UI Bridge URL text input (for connecting to the target app's UI Bridge during plan execution), and a state machine path input (for specifying a custom state machine JSON file; defaults to the bundled runner state machine). The URL and path inputs are conditionally visible — they only appear when HTN is enabled.",
+      "precondition": "Settings panel is open (gear icon clicked)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "wf-step-configuration",
+      "name": "Step Configuration and Library Integration",
+      "requiredElements": [
+        {
+          "text": "Setup"
+        },
+        {
+          "text": "Workflows"
+        },
+        {
+          "text": "Setup"
+        }
+      ],
+      "description": "Individual workflow steps can be configured with type-specific settings. Command steps have shell commands, working directories, and timeouts. Prompt steps have AI instruction text and context attachments. Check and check group steps reference items from the check library. Playwright test steps reference saved test scripts. Users can also pick steps from library pickers that show saved prompts, shell commands, checks, check groups, tests, and MCP server tools. The step configuration panel opens when a step is selected, showing all relevant fields for that step type. This tight integration with the asset library enables reuse across workflows.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [
+    {
+      "id": "phase-editor-to-settings",
+      "name": "Open settings panel",
+      "fromStates": [
+        "wf-phase-editor"
+      ],
+      "activateStates": [
+        "wf-settings-open"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "role": "button",
+            "accessibleName": "Settings"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 500
+          }
+        }
+      ],
+      "exitStates": [],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "phase-editor-to-constraints",
+      "name": "Open constraints panel",
+      "fromStates": [
+        "wf-phase-editor"
+      ],
+      "activateStates": [
+        "wf-constraints-open"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "role": "button",
+            "accessibleName": "Constraints"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 500
+          }
+        }
+      ],
+      "exitStates": [],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "phase-editor-to-step-config",
+      "name": "Select a step to configure",
+      "fromStates": [
+        "wf-phase-editor"
+      ],
+      "activateStates": [
+        "wf-step-config-open"
+      ],
+      "actions": [],
+      "exitStates": [],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "phase-editor-to-executing",
+      "name": "Run workflow",
+      "fromStates": [
+        "wf-phase-editor"
+      ],
+      "activateStates": [
+        "wf-executing"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "role": "button",
+            "text": "Run"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 2000
+          }
+        }
+      ],
+      "exitStates": [],
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "phase-editor-to-ai-generate",
+      "name": "Reset to new (empty) workflow",
+      "fromStates": [
+        "wf-phase-editor"
+      ],
+      "activateStates": [
+        "wf-ai-generate"
+      ],
+      "actions": [
+        {
+          "type": "click",
+          "target": {
+            "role": "button",
+            "text": "New"
+          },
+          "waitAfter": {
+            "type": "idle",
+            "timeout": 1000
+          }
+        }
+      ],
+      "exitStates": [
+        "wf-phase-editor"
+      ],
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Workflow Builder page -- the core authoring environment where users create, edit, and manage multi-phase AI automation workflows. Users can generate complete workflows from natural language prompts using AI, manually build workflows step-by-step across four phases (setup, verification, agentic, completion), manage a sidebar library of saved workflows, configure individual steps, run workflows directly, and export/import workflows as JSON. The default landing state shows the AI Generate panel with a prompt textarea and spec source section; selecting a workflow reveals the full phase editor with Run, Save, and Export controls.",
+  "metadata": {
+    "tags": [
+      "workflow-builder",
+      "ai-generation",
+      "multi-phase",
+      "editor",
+      "tier-1"
+    ]
+  }
+}

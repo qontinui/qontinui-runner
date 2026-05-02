@@ -1,0 +1,234 @@
+{
+  "version": "1.0",
+  "id": "settings-updates",
+  "name": "UpdateSettings",
+  "states": [
+    {
+      "id": "upd-page-structure",
+      "name": "Page Structure",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Updates"
+        },
+        {
+          "text": "Check for and install application updates to get the latest features and bug fixes."
+        },
+        {
+          "text": "Tip: Updates are checked automatically"
+        },
+        {
+          "role": "heading",
+          "text": "Updates"
+        }
+      ],
+      "description": "The Updates tab renders a SectionHeader with a Download icon, title 'Updates', and a description line. Below it are two always-visible structural elements: the current version card and the info tip box. A third conditional card appears after a check completes.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-current-version-card",
+      "name": "Current Version Card",
+      "requiredElements": [
+        {},
+        {},
+        {
+          "role": "button",
+          "text": "Check for Updates"
+        },
+        {}
+      ],
+      "description": "A card that is always visible showing the currently installed application version and when updates were last checked. Also contains the 'Check for Updates' button.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-check-button-interaction",
+      "name": "Check for Updates Button Interaction",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Check for Updates"
+        },
+        {
+          "role": "button",
+          "text": "Checking..."
+        },
+        {
+          "role": "button",
+          "text": "Check for Updates"
+        }
+      ],
+      "description": "The 'Check for Updates' button triggers an update check via the Tauri `check_for_updates` command. During the check the button is disabled and shows a spinner. After the check completes the status card is updated and the last-checked timestamp is refreshed.",
+      "precondition": "Page is in idle state (no check or install in progress)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-auto-check-on-load",
+      "name": "Automatic Check on Tab Load",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Checking..."
+        },
+        {}
+      ],
+      "description": "The UpdateSettings component automatically triggers a `check_for_updates` call via useEffect when it first mounts. The user does not need to click anything — the check runs immediately and the status card populates once it completes.",
+      "precondition": "The Updates settings tab has just been opened for the first time in this session",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-dev-mode-state",
+      "name": "Development Mode Status Card",
+      "requiredElements": [
+        {},
+        {
+          "text": "Update checking is disabled in development builds."
+        },
+        {
+          "role": "button",
+          "text": "Download and Install Update"
+        }
+      ],
+      "description": "In debug/development builds the `check_for_updates` command returns `{ available: false, development: true }`. The component renders a 'Development Mode' status card with an informational message explaining that update checking is disabled in development builds.",
+      "precondition": "Running a debug/development build and a check has completed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-update-available-state",
+      "name": "Update Available Status Card",
+      "requiredElements": [
+        {},
+        {},
+        {
+          "text": "Release Notes"
+        },
+        {
+          "role": "button",
+          "text": "Download and Install Update"
+        },
+        {
+          "text": "The application will restart automatically after the update is installed."
+        }
+      ],
+      "description": "When `check_for_updates` returns `{ available: true, version, current_version, notes }`, the component renders an 'Update Available' card showing the new version, optional release notes, and a 'Download and Install Update' button.",
+      "precondition": "check_for_updates returned available=true",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-install-flow",
+      "name": "Install Update Flow",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Download and Install Update"
+        },
+        {
+          "role": "button",
+          "text": "Installing Update..."
+        },
+        {
+          "role": "button",
+          "text": "Download and Install Update"
+        }
+      ],
+      "description": "Clicking 'Download and Install Update' invokes the Tauri `install_update` command, which downloads the update package and restarts the application. During install, the button is disabled and shows an 'Installing Update...' label with a spinner.",
+      "precondition": "Update available card is shown and status is not 'installing'",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-up-to-date-state",
+      "name": "Up to Date Status Card",
+      "requiredElements": [
+        {},
+        {
+          "text": "You're running the latest version of Qontinui Runner."
+        },
+        {
+          "role": "button",
+          "text": "Download and Install Update"
+        }
+      ],
+      "description": "When `check_for_updates` returns `{ available: false }` without the development flag, the component renders an 'Up to Date' card with a green CheckCircle icon confirming the user is on the latest version.",
+      "precondition": "check_for_updates returned available=false without development=true",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-error-state",
+      "name": "Error State",
+      "requiredElements": [
+        {},
+        {},
+        {
+          "role": "button",
+          "text": "Check for Updates"
+        }
+      ],
+      "description": "If `check_for_updates` or `install_update` throws an exception, the component stores the error message in state and renders an error card with an AlertCircle icon and the error text. The status card is not shown when an error card is displayed.",
+      "precondition": "check_for_updates or install_update threw an error",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-state-mutual-exclusion",
+      "name": "Status Card Mutual Exclusion",
+      "requiredElements": [
+        {},
+        {
+          "role": "button",
+          "text": "Checking..."
+        }
+      ],
+      "description": "Only one status card variant can be shown at a time. The four possible status card states (development mode, update available, up to date, and nothing) are mutually exclusive — they are driven by a single `updateInfo` nullable value and a single `error` nullable string. The error card and status card are also mutually exclusive.",
+      "precondition": "A check has completed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "upd-ipc-data-model",
+      "name": "IPC Response Data Model",
+      "requiredElements": [
+        {},
+        {
+          "role": "button",
+          "text": "Download and Install Update"
+        }
+      ],
+      "description": "The page relies on two Tauri IPC commands. Their response shapes determine which UI state is shown. Both commands behave differently in debug vs release builds, which is critical for verifying behavior in the correct build context.",
+      "precondition": "Update available card is shown",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Updates settings tab within the runner Settings panel. Allows users to check for and install application updates. The page auto-checks for updates on mount via the Tauri `check_for_updates` IPC command. It renders a permanent 'current version' card (showing the installed version and last-checked timestamp) and a conditional status card that shows one of four states: checking/idle (no card), development mode (update checking disabled), update available (with release notes and install button), or up to date. A separate error card appears if a check or install fails. An informational tip box is always visible at the bottom.",
+  "metadata": {
+    "tags": [
+      "settings",
+      "updates",
+      "tauri",
+      "ipc",
+      "auto-update"
+    ]
+  }
+}

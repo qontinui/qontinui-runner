@@ -1,0 +1,108 @@
+{
+  "version": "1.0",
+  "id": "gui-automation",
+  "name": "ExecuteTab",
+  "states": [
+    {
+      "id": "gui-config-loading",
+      "name": "Configuration Loading",
+      "requiredElements": [
+        {
+          "text": "Config"
+        },
+        {
+          "role": "button",
+          "text": "Load"
+        },
+        {
+          "role": "button",
+          "text": "Last"
+        }
+      ],
+      "description": "Before any GUI automation can run, users must load a configuration file that defines the visual automation environment: image targets, states, transitions, workflows, and monitors. The header area shows the current configuration status with an animated indicator when a config is loaded. Users can load a new configuration from a file picker or reload the last-used configuration. The configuration status indicator provides visual feedback (animated ping, active badge) so users immediately know whether a valid config is loaded and which one it is.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gui-workflow-runner",
+      "name": "Workflow Runner Panel",
+      "requiredElements": [
+        {
+          "text": "Workflow"
+        },
+        {
+          "text": "Monitor"
+        },
+        {
+          "role": "button",
+          "text": "Start"
+        },
+        {
+          "text": "minimize"
+        },
+        {
+          "text": "Initial"
+        }
+      ],
+      "description": "The main panel (left 2/3) is the workflow runner where users select and start GUI automation workflows. It includes a searchable workflow dropdown populated from the loaded config, monitor selection controls for choosing which state monitors to activate, an auto-minimize toggle for the runner window during execution, state initialization overrides for testing specific starting states, and a large start/stop button for execution control. The panel is disabled when no configuration is loaded, and users must select at least one workflow and monitor combination before starting.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gui-toolkit-sidebar",
+      "name": "Automation Toolkit Sidebar",
+      "requiredElements": [
+        {
+          "text": "Macro"
+        },
+        {
+          "text": "Quick"
+        },
+        {
+          "text": "Refresh"
+        }
+      ],
+      "description": "The right sidebar (1/3 width) provides the automation toolkit with quick actions and saved macros. Quick actions are one-click convenience operations for common automation tasks. Macros are saved sequences of automation steps that can be executed independently of full workflows -- useful for repetitive setup tasks, quick verifications, or testing specific interaction sequences. Users can run macros directly from the sidebar, with loading states and result feedback shown inline. The sidebar also includes a refresh control for reloading the macro list from the runner backend.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "gui-two-column-layout",
+      "name": "Page Layout and Navigation",
+      "requiredElements": [
+        {
+          "text": "GUI Automation"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "Toolkit"
+        }
+      ],
+      "description": "The GUI Automation page uses a responsive two-column grid layout: the workflow runner occupies 2/3 of the width and the automation toolkit sidebar takes the remaining 1/3. A header bar at the top shows the configuration status and load controls. The page is a dev-only feature hidden in production, accessible through the runner's navigation system. A tutorial menu provides contextual help for new users. The page scrolls vertically when content exceeds viewport height, with the header remaining visible.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "GUI Automation page -- a dev-only legacy execution interface for model-based GUI automation configs. Users load GUI automation configuration files that define visual states, transitions, and image recognition targets, then select workflows and monitors to execute. The page features a two-column layout with a workflow runner panel (2/3 width) and an automation toolkit sidebar (1/3 width) containing quick actions and macros. This page is hidden in production and serves as the original GUI automation executor before unified workflows were introduced.",
+  "metadata": {
+    "tags": [
+      "gui-automation",
+      "legacy",
+      "dev-only",
+      "macros",
+      "visual-automation",
+      "run-group",
+      "tier-2"
+    ]
+  }
+}

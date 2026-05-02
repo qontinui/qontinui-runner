@@ -24,11 +24,15 @@ pub struct IrElementCriteria {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_contains: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aria_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessible_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// HTML attributes to check (exact string match). Stored as a `BTreeMap`
@@ -157,6 +161,8 @@ pub struct IrState {
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precondition: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element_ids: Option<Vec<String>>,

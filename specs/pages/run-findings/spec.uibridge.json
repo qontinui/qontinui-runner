@@ -1,0 +1,354 @@
+{
+  "description": "Run Findings page — displays AI-detected issues and findings from a workflow run, organized by category with severity levels, filtering, auto-fix capabilities, and actionable recommendations.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Findings Overview and Summary",
+          "enabled": true,
+          "id": "findings-overview-and-summary-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Total"
+            },
+            "label": "Required element for Findings Overview and Summary",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Findings Overview and Summary",
+          "enabled": true,
+          "id": "findings-overview-and-summary-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Execution Report|Report"
+            },
+            "label": "Required element for Findings Overview and Summary",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Findings Overview and Summary",
+          "enabled": true,
+          "id": "findings-overview-and-summary-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Severity|critical|high"
+            },
+            "label": "Required element for Findings Overview and Summary",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When users navigate to the Findings page, they need an immediate understanding of the overall issue landscape. The page header presents aggregate statistics — total findings count, actionable items, items needing user input, resolved items, and informational entries. This summary enables the user to quickly prioritize their attention: if there are critical actionable findings they need to address first, or if everything has been resolved. The report title and execution status round out the context.",
+      "id": "findings-overview-and-summary",
+      "name": "Findings Overview and Summary",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Filtering and Navigation",
+          "enabled": true,
+          "id": "findings-filtering-and-navigation-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "All Findings|Actionable"
+            },
+            "label": "Required element for Filtering and Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Filtering and Navigation",
+          "enabled": true,
+          "id": "findings-filtering-and-navigation-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Severity"
+            },
+            "label": "Required element for Filtering and Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Filtering and Navigation",
+          "enabled": true,
+          "id": "findings-filtering-and-navigation-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Category"
+            },
+            "label": "Required element for Filtering and Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Filtering and Navigation",
+          "enabled": true,
+          "id": "findings-filtering-and-navigation-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Clear"
+            },
+            "label": "Required element for Filtering and Navigation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "With potentially dozens of findings across multiple categories, users need robust filtering to focus on what matters. The page provides three independent filter dimensions — mode (all, actionable, needs input, resolved), severity (critical through info), and category (code bug, security, test issue, etc.). Users can combine these filters and clear them all at once. This filtering capability is essential for large reports where scanning every finding linearly would be impractical.",
+      "id": "findings-filtering-and-navigation",
+      "name": "Filtering and Navigation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Actions and Auto-Fix",
+          "enabled": true,
+          "id": "findings-actions-and-autofix-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Auto-Fix"
+            },
+            "label": "Required element for Actions and Auto-Fix",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Actions and Auto-Fix",
+          "enabled": true,
+          "id": "findings-actions-and-autofix-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Fix All"
+            },
+            "label": "Required element for Actions and Auto-Fix",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Actions and Auto-Fix",
+          "enabled": true,
+          "id": "findings-actions-and-autofix-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Clear"
+            },
+            "label": "Required element for Actions and Auto-Fix",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Findings are not just informational — they are actionable. Users can analyze individual findings, dismiss irrelevant ones, provide input when requested, and resolve issues. The auto-fix feature is a key differentiator: users can toggle automatic fixing of eligible issues (code bugs, security, tests, documentation) and trigger a bulk fix operation that sends all auto-fixable findings to AI for resolution. This transforms the findings page from a passive report into an active issue resolution workflow.",
+      "id": "findings-actions-and-autofix",
+      "name": "Actions and Auto-Fix",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Categorized Findings Display",
+          "enabled": true,
+          "id": "findings-categorized-display-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "bug|security|test|documentation"
+            },
+            "label": "Required element for Categorized Findings Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Categorized Findings Display",
+          "enabled": true,
+          "id": "findings-categorized-display-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "finding|issue"
+            },
+            "label": "Required element for Categorized Findings Display",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Categorized Findings Display",
+          "enabled": true,
+          "id": "findings-categorized-display-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No Findings"
+            },
+            "label": "Required element for Categorized Findings Display",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Findings are organized into category sections (code bugs, security issues, test issues, documentation, performance, etc.), each with its own header, icon, and collapsible list of individual findings. This organization helps users work through issues domain by domain rather than facing an undifferentiated list. Each finding within a category shows its title, severity, description, and available actions (analyze, resolve, dismiss, provide input).",
+      "id": "findings-categorized-display",
+      "name": "Categorized Findings Display",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "run-findings",
+    "tags": [
+      "run-findings",
+      "execution-report",
+      "issues",
+      "auto-fix",
+      "observe"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "When users navigate to the Findings page, they need an immediate understanding of the overall issue landscape. The page header presents aggregate statistics — total findings count, actionable items, items needing user input, resolved items, and informational entries. This summary enables the user to quickly prioritize their attention: if there are critical actionable findings they need to address first, or if everything has been resolved. The report title and execution status round out the context.",
+        "elements": [
+          {
+            "textContent": "Total"
+          },
+          {
+            "textContent": "Execution Report|Report"
+          },
+          {
+            "textContent": "Severity|critical|high"
+          }
+        ],
+        "id": "findings-overview-and-summary",
+        "isInitial": false,
+        "name": "Findings Overview and Summary",
+        "transitions": []
+      },
+      {
+        "description": "With potentially dozens of findings across multiple categories, users need robust filtering to focus on what matters. The page provides three independent filter dimensions — mode (all, actionable, needs input, resolved), severity (critical through info), and category (code bug, security, test issue, etc.). Users can combine these filters and clear them all at once. This filtering capability is essential for large reports where scanning every finding linearly would be impractical.",
+        "elements": [
+          {
+            "textContent": "All Findings|Actionable"
+          },
+          {
+            "textContent": "Severity"
+          },
+          {
+            "textContent": "Category"
+          },
+          {
+            "textContent": "Clear"
+          }
+        ],
+        "id": "findings-filtering-and-navigation",
+        "isInitial": false,
+        "name": "Filtering and Navigation",
+        "transitions": []
+      },
+      {
+        "description": "Findings are not just informational — they are actionable. Users can analyze individual findings, dismiss irrelevant ones, provide input when requested, and resolve issues. The auto-fix feature is a key differentiator: users can toggle automatic fixing of eligible issues (code bugs, security, tests, documentation) and trigger a bulk fix operation that sends all auto-fixable findings to AI for resolution. This transforms the findings page from a passive report into an active issue resolution workflow.",
+        "elements": [
+          {
+            "textContent": "Auto-Fix"
+          },
+          {
+            "role": "button",
+            "textContent": "Fix All"
+          },
+          {
+            "textContent": "Clear"
+          }
+        ],
+        "id": "findings-actions-and-autofix",
+        "isInitial": false,
+        "name": "Actions and Auto-Fix",
+        "transitions": []
+      },
+      {
+        "description": "Findings are organized into category sections (code bugs, security issues, test issues, documentation, performance, etc.), each with its own header, icon, and collapsible list of individual findings. This organization helps users work through issues domain by domain rather than facing an undifferentiated list. Each finding within a category shows its title, severity, description, and available actions (analyze, resolve, dismiss, provide input).",
+        "elements": [
+          {
+            "textContent": "bug|security|test|documentation"
+          },
+          {
+            "textContent": "finding|issue"
+          },
+          {
+            "textContent": "No Findings"
+          }
+        ],
+        "id": "findings-categorized-display",
+        "isInitial": false,
+        "name": "Categorized Findings Display",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

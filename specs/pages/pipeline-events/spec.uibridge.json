@@ -1,0 +1,529 @@
+{
+  "description": "Pipeline Events Timeline — shows the sequence of events during workflow generation, including phase durations, token usage, and validation error changes, helping developers understand and debug the generation pipeline.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Pipeline Events Timeline",
+          "enabled": true,
+          "id": "pipeline-events-timeline-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Pipeline Events"
+            },
+            "label": "Required element for Pipeline Events Timeline",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Pipeline Events Timeline",
+          "enabled": true,
+          "id": "pipeline-events-timeline-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "listitem"
+            },
+            "label": "Required element for Pipeline Events Timeline",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Pipeline Events Timeline",
+          "enabled": true,
+          "id": "pipeline-events-timeline-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": ":"
+            },
+            "label": "Required element for Pipeline Events Timeline",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users need a chronological timeline of generation pipeline events showing what happened during each phase of workflow generation.",
+      "id": "pipeline-events-timeline",
+      "name": "Pipeline Events Timeline",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Per-Event Metrics",
+          "enabled": true,
+          "id": "pipeline-events-metrics-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "ms"
+            },
+            "label": "Required element for Per-Event Metrics",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Per-Event Metrics",
+          "enabled": true,
+          "id": "pipeline-events-metrics-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "tokens"
+            },
+            "label": "Required element for Per-Event Metrics",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Per-Event Metrics",
+          "enabled": true,
+          "id": "pipeline-events-metrics-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "errors:"
+            },
+            "label": "Required element for Per-Event Metrics",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users need to see per-event metrics including duration in milliseconds, token counts, and validation error deltas to identify bottlenecks and measure improvement.",
+      "id": "pipeline-events-metrics",
+      "name": "Per-Event Metrics",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Phase Color Coding",
+          "enabled": true,
+          "id": "pipeline-events-phases-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "listitem"
+            },
+            "label": "Required element for Phase Color Coding",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Each pipeline phase is color-coded for quick identification: blue for discovery, green for generation, yellow for validation, orange for fixing, purple for hardening, cyan for reflection.",
+      "id": "pipeline-events-phases",
+      "name": "Phase Color Coding",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Loading and Empty States",
+          "enabled": true,
+          "id": "pipeline-events-states-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loading events..."
+            },
+            "label": "Required element for Loading and Empty States",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Loading and Empty States",
+          "enabled": true,
+          "id": "pipeline-events-states-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No pipeline events recorded"
+            },
+            "label": "Required element for Loading and Empty States",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Empty and loading states communicate pipeline status clearly.",
+      "id": "pipeline-events-states",
+      "name": "Loading and Empty States",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Event Data Rendering",
+          "enabled": true,
+          "id": "pipeline-events-data-display-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": ":"
+            },
+            "label": "Required element for Event Data Rendering",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Event Data Rendering",
+          "enabled": true,
+          "id": "pipeline-events-data-display-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "ms"
+            },
+            "label": "Required element for Event Data Rendering",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Event Data Rendering",
+          "enabled": true,
+          "id": "pipeline-events-data-display-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "errors:"
+            },
+            "label": "Required element for Event Data Rendering",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Each event row must accurately render the event type, phase, timestamp (HH:mm:ss format), duration in milliseconds, token count, and validation error delta from the API response.",
+      "id": "pipeline-events-data-display",
+      "name": "Event Data Rendering",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Timeline Behavior",
+          "enabled": true,
+          "id": "pipeline-events-behavior-elem-0",
+          "precondition": "More events exist than fit in the max-h-96 container",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Pipeline Events"
+            },
+            "label": "Required element for Timeline Behavior",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Timeline Behavior",
+          "enabled": true,
+          "id": "pipeline-events-behavior-elem-1",
+          "precondition": "More events exist than fit in the max-h-96 container",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Pipeline Events"
+            },
+            "label": "Required element for Timeline Behavior",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The timeline is scrollable when events exceed the visible area (max-h-96), events are ordered chronologically by created_at, and the timeline connector lines visually link sequential events.",
+      "id": "pipeline-events-behavior",
+      "name": "Timeline Behavior",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Required Timeline Elements",
+          "enabled": true,
+          "id": "pipeline-events-presence-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Pipeline Events"
+            },
+            "label": "Required element for Required Timeline Elements",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Each event row must contain a phase color dot, event type label, and timeline connector line. The header must show the Zap icon.",
+      "id": "pipeline-events-presence",
+      "name": "Required Timeline Elements",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Virtualized Rendering and Pagination",
+          "enabled": true,
+          "id": "pipeline-events-virtualization-elem-0",
+          "precondition": "More than 50 pipeline events exist for the task run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "of"
+            },
+            "label": "Required element for Virtualized Rendering and Pagination",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Virtualized Rendering and Pagination",
+          "enabled": true,
+          "id": "pipeline-events-virtualization-elem-1",
+          "precondition": "More than 50 pipeline events exist for the task run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Load more"
+            },
+            "label": "Required element for Virtualized Rendering and Pagination",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Virtualized Rendering and Pagination",
+          "enabled": true,
+          "id": "pipeline-events-virtualization-elem-2",
+          "precondition": "More than 50 pipeline events exist for the task run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Pipeline Events"
+            },
+            "label": "Required element for Virtualized Rendering and Pagination",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Pipeline Events timeline uses react-window virtualized rendering to handle large event lists efficiently. Events are paginated client-side (50 per page) with a 'Load more' button. The header shows a count indicator like '50 of 8297'. Only visible event rows plus a 10-row overscan buffer are rendered in the DOM.",
+      "id": "pipeline-events-virtualization",
+      "name": "Virtualized Rendering and Pagination",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "pipeline-events",
+    "tags": [
+      "knowledge-graph",
+      "pipeline",
+      "generation",
+      "telemetry",
+      "runner-only"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "Users need a chronological timeline of generation pipeline events showing what happened during each phase of workflow generation.",
+        "elements": [
+          {
+            "textContent": "Pipeline Events"
+          },
+          {
+            "role": "listitem"
+          },
+          {
+            "textContent": ":"
+          }
+        ],
+        "id": "pipeline-events-timeline",
+        "isInitial": false,
+        "name": "Pipeline Events Timeline",
+        "transitions": []
+      },
+      {
+        "description": "Users need to see per-event metrics including duration in milliseconds, token counts, and validation error deltas to identify bottlenecks and measure improvement.",
+        "elements": [
+          {
+            "textContent": "ms"
+          },
+          {
+            "textContent": "tokens"
+          },
+          {
+            "textContent": "errors:"
+          }
+        ],
+        "id": "pipeline-events-metrics",
+        "isInitial": false,
+        "name": "Per-Event Metrics",
+        "transitions": []
+      },
+      {
+        "description": "Each pipeline phase is color-coded for quick identification: blue for discovery, green for generation, yellow for validation, orange for fixing, purple for hardening, cyan for reflection.",
+        "elements": [
+          {
+            "role": "listitem"
+          }
+        ],
+        "id": "pipeline-events-phases",
+        "isInitial": false,
+        "name": "Phase Color Coding",
+        "transitions": []
+      },
+      {
+        "description": "Empty and loading states communicate pipeline status clearly.",
+        "elements": [
+          {
+            "textContent": "Loading events..."
+          },
+          {
+            "textContent": "No pipeline events recorded"
+          }
+        ],
+        "id": "pipeline-events-states",
+        "isInitial": false,
+        "name": "Loading and Empty States",
+        "transitions": []
+      },
+      {
+        "description": "Each event row must accurately render the event type, phase, timestamp (HH:mm:ss format), duration in milliseconds, token count, and validation error delta from the API response.",
+        "elements": [
+          {
+            "textContent": ":"
+          },
+          {
+            "textContent": "ms"
+          },
+          {
+            "textContent": "errors:"
+          }
+        ],
+        "id": "pipeline-events-data-display",
+        "isInitial": false,
+        "name": "Event Data Rendering",
+        "transitions": []
+      },
+      {
+        "description": "The timeline is scrollable when events exceed the visible area (max-h-96), events are ordered chronologically by created_at, and the timeline connector lines visually link sequential events.",
+        "elements": [
+          {
+            "textContent": "Pipeline Events"
+          },
+          {
+            "textContent": "Pipeline Events"
+          }
+        ],
+        "id": "pipeline-events-behavior",
+        "isInitial": false,
+        "name": "Timeline Behavior",
+        "transitions": []
+      },
+      {
+        "description": "Each event row must contain a phase color dot, event type label, and timeline connector line. The header must show the Zap icon.",
+        "elements": [
+          {
+            "textContent": "Pipeline Events"
+          }
+        ],
+        "id": "pipeline-events-presence",
+        "isInitial": false,
+        "name": "Required Timeline Elements",
+        "transitions": []
+      },
+      {
+        "description": "The Pipeline Events timeline uses react-window virtualized rendering to handle large event lists efficiently. Events are paginated client-side (50 per page) with a 'Load more' button. The header shows a count indicator like '50 of 8297'. Only visible event rows plus a 10-row overscan buffer are rendered in the DOM.",
+        "elements": [
+          {
+            "textContains": "of"
+          },
+          {
+            "textContains": "Load more"
+          },
+          {
+            "textContains": "Pipeline Events"
+          }
+        ],
+        "id": "pipeline-events-virtualization",
+        "isInitial": false,
+        "name": "Virtualized Rendering and Pagination",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

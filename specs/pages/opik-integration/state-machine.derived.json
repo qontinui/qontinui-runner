@@ -1,0 +1,175 @@
+{
+  "version": "1.0",
+  "id": "opik-integration",
+  "name": "OpikDashboard",
+  "states": [
+    {
+      "id": "opik-architecture",
+      "name": "Architecture — Data Flow & Integration Design",
+      "requiredElements": [],
+      "description": "How the Opik integration is structured. Data flows in one primary direction: the runner records execution_spans and phase_token_usage in PostgreSQL during workflow execution, then a background OpikSyncService pushes batches to Opik every 10 seconds. Observations are mapped to Opik feedback scores. The frontend queries Opik directly for the trace viewer and falls back to local analytics endpoints when Opik is unreachable. MCP tools (opik_traces, opik_trace_detail, opik_feedback, opik_evaluate, opik_sync_status) expose trace data to AI agents.\n\nData model mapping:\n- task_run → Opik project (project_name = workflow_name)\n- execution_spans (root, parent_span_id=NULL) → Opik trace\n- execution_spans (child) → Opik span (preserves parent_span_id hierarchy)\n- phase_token_usage → span.usage + span.model + span.provider + span.total_estimated_cost\n- observations → feedback_score (name=observation_type, value=1.0 for learning / 0.0 for bugfix, reason=content)\n- agentic_metric_scores → feedback_score (name=metric_type, value=score, reason=rationale)\n\nSync is idempotent via trace_id (UUIDv7). On restart, sync resumes from last_synced_at timestamp. Retry uses exponential backoff (1s→2s→4s→8s, max 60s). Unsent traces queue in memory (max 10,000) and overflow to PostgreSQL.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "opik-semantic",
+      "name": "Semantic — Purpose & Communication",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "LLM Traces"
+        },
+        {},
+        {},
+        {}
+      ],
+      "description": "What the dashboard communicates to users. The page heading, status indicators, and summary cards orient users immediately: Is Opik connected? How many traces exist? What's the total cost? Each trace row provides a scannable summary (name, cost, tokens, duration, quality) so users can spot expensive or failing AI calls without clicking into details.",
+      "precondition": "At least one workflow has been executed and synced to Opik",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "opik-element-presence",
+      "name": "Element Presence — Required UI Controls",
+      "requiredElements": [
+        {},
+        {
+          "role": "searchbox"
+        },
+        {},
+        {},
+        {},
+        {},
+        {
+          "role": "button"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "All interactive controls that must exist for the dashboard to be functional. These elements are always present regardless of data state — they represent the page's chrome, not its content.",
+      "precondition": "A trace row has been selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "opik-data-display",
+      "name": "Data Display — Formatting & Presentation",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {}
+      ],
+      "description": "How trace, span, cost, and feedback data is formatted for readability. Users scanning the trace list need to compare costs and durations quickly, so consistent formatting is essential. The span tree needs visual hierarchy to show the execution chain clearly.",
+      "precondition": "At least one trace exists with cost data",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "opik-interaction",
+      "name": "Interaction — User Actions & Responses",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {}
+      ],
+      "description": "How users interact with the dashboard — searching, filtering, selecting traces, navigating the span tree, and adding feedback. Each interaction should feel responsive (<2s for local actions, <5s for Opik API calls).",
+      "precondition": "At least one trace exists in the list",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "opik-behavior",
+      "name": "Behavior — Loading, Empty, Error, & Auto-refresh States",
+      "requiredElements": [
+        {
+          "textContains": "No traces yet"
+        },
+        {},
+        {},
+        {}
+      ],
+      "description": "Automatic behaviors and edge case handling. The dashboard must handle: first-time use (no data), Opik being unreachable, slow API responses, and ongoing data arrival from background sync.",
+      "precondition": "No workflows have been executed, or Opik has no trace data for the current time range",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "opik-state-consistency",
+      "name": "State Consistency — Local ↔ Opik Data Agreement",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "The dashboard shows data from two sources: Opik (primary) and the runner's local database (fallback). These must agree when both are available, and the fallback must be seamless when Opik is down.",
+      "precondition": "At least one trace exists",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "opik-navigation",
+      "name": "Navigation — Page Access & Internal Navigation",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "LLM Traces"
+        },
+        {},
+        {}
+      ],
+      "description": "How users reach the Opik dashboard and navigate within it. The page is a tab in the OBSERVE sidebar group. Internal navigation is panel-based (trace list + detail panel), not route-based.",
+      "precondition": "A trace row has been selected and the detail panel is open",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "opik-style",
+      "name": "Style — Visual Design & Theming",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "The Opik dashboard must visually integrate with the runner's existing dark theme and design system. No Opik-branded colors or styles should leak through — it should feel native to the runner.",
+      "precondition": "At least 2 traces exist in the list",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Opik LLM Traces Dashboard — shows every LLM API call made during automation workflows as structured traces with hierarchical spans, cost attribution, token counts, latency, and quality feedback scores. Users come here to answer: What did the AI do? How much did it cost? Was it effective? Data arrives from two sources: (1) the Opik REST API at OPIK_BASE_URL/v1/private/traces for trace/span data stored in ClickHouse, and (2) the runner's own /analytics/token-usage endpoints as a fallback when Opik is unavailable. A background sync service in the Rust backend pushes execution_spans and phase_token_usage records to Opik as traces/spans, and syncs observations and agentic_metric_scores as feedback scores. Opik runs as a self-hosted Docker stack (backend, ClickHouse, MySQL, Redis, MinIO) managed by the supervisor.",
+  "metadata": {
+    "tags": [
+      "opik",
+      "llm-observability",
+      "tracing",
+      "evaluation",
+      "feedback",
+      "cost-tracking",
+      "spans",
+      "opentelemetry",
+      "integration"
+    ]
+  }
+}

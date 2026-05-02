@@ -1,0 +1,581 @@
+{
+  "description": "Convergence Widget — a compact dashboard widget that visualizes how the verification-agentic loop is converging (or not) across iterations. Displayed on the active dashboard during workflow runs, it provides real-time visual feedback on whether the AI is making progress fixing verification failures. Shows a mini bar chart of failed step counts per iteration, a trend indicator (Improving/Stalled/Regressing), and a summary line with delta information. Data arrives via the Tauri 'iteration-metrics' event emitted by EventBroadcaster after each verification phase. The widget resets when the active task run changes. The related 'blame-attribution' event provides complementary data about which iterations caused which failures, enabling future integration of oscillation/blame overlays onto the convergence chart.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Widget Identity and Visibility",
+          "enabled": true,
+          "id": "convergence-identity-elem-0",
+          "precondition": "At least one iteration-metrics event has been received for the current task run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Convergence"
+            },
+            "label": "Required element for Widget Identity and Visibility",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Widget Identity and Visibility",
+          "enabled": true,
+          "id": "convergence-identity-elem-1",
+          "precondition": "At least one iteration-metrics event has been received for the current task run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Convergence"
+            },
+            "label": "Required element for Widget Identity and Visibility",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Convergence widget appears on the active dashboard when a workflow run is in progress and has completed at least one verification iteration. It should be immediately recognizable as a convergence monitor and not confused with other metric widgets. The widget renders nothing (returns null) when no metrics have been received yet, avoiding visual noise before the first iteration completes.",
+      "id": "convergence-identity",
+      "name": "Widget Identity and Visibility",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Trend Indicator",
+          "enabled": true,
+          "id": "convergence-trend-indicator-elem-0",
+          "precondition": "At least 2 iterations have been received, and latest.failedStepCount < previous.failedStepCount",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Improving"
+            },
+            "label": "Required element for Trend Indicator",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Trend Indicator",
+          "enabled": true,
+          "id": "convergence-trend-indicator-elem-1",
+          "precondition": "At least 2 iterations have been received, and latest.failedStepCount < previous.failedStepCount",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Stalled"
+            },
+            "label": "Required element for Trend Indicator",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Trend Indicator",
+          "enabled": true,
+          "id": "convergence-trend-indicator-elem-2",
+          "precondition": "At least 2 iterations have been received, and latest.failedStepCount < previous.failedStepCount",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Regressing"
+            },
+            "label": "Required element for Trend Indicator",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Trend Indicator",
+          "enabled": true,
+          "id": "convergence-trend-indicator-elem-3",
+          "precondition": "At least 2 iterations have been received, and latest.failedStepCount < previous.failedStepCount",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "img"
+            },
+            "label": "Required element for Trend Indicator",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The trend indicator shows the current convergence direction based on the latest two iterations. It uses a color-coded icon and label: green TrendingDown arrow for 'Improving' (fewer failures than previous iteration), amber Minus for 'Stalled' (same failure count or isStalled flag), red TrendingUp arrow for 'Regressing' (more failures than previous iteration). The trend is the most important at-a-glance signal — it tells the user whether to keep waiting or intervene.",
+      "id": "convergence-trend-indicator",
+      "name": "Trend Indicator",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Mini Bar Chart",
+          "enabled": true,
+          "id": "convergence-bar-chart-elem-0",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "\\d+"
+            },
+            "label": "Required element for Mini Bar Chart",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Mini Bar Chart",
+          "enabled": true,
+          "id": "convergence-bar-chart-elem-1",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Mini Bar Chart",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Mini Bar Chart",
+          "enabled": true,
+          "id": "convergence-bar-chart-elem-2",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Mini Bar Chart",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Mini Bar Chart",
+          "enabled": true,
+          "id": "convergence-bar-chart-elem-3",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Iteration \\d+:.*failed.*passed"
+            },
+            "label": "Required element for Mini Bar Chart",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Mini Bar Chart",
+          "enabled": true,
+          "id": "convergence-bar-chart-elem-4",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Mini Bar Chart",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A CSS-based bar chart showing failed step counts per iteration. Each bar represents one iteration, with height proportional to the number of failed steps (minimum 2px, maximum 80px, scaled to the highest failure count). Bar colors encode the change direction: green (bg-emerald-500) for zero failures, amber (bg-amber-500) for no change or improvement, red (bg-red-500) for regression. The chart displays the last 20 iterations (MAX_VISIBLE_ITERATIONS) and scrolls horizontally if more exist. Each bar has a tooltip showing 'Iteration N: X failed, Y passed'.",
+      "id": "convergence-bar-chart",
+      "name": "Mini Bar Chart",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Summary Text and Counts",
+          "enabled": true,
+          "id": "convergence-summary-elem-0",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Iteration \\d+"
+            },
+            "label": "Required element for Summary Text and Counts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Summary Text and Counts",
+          "enabled": true,
+          "id": "convergence-summary-elem-1",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "\\d+ failing"
+            },
+            "label": "Required element for Summary Text and Counts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Summary Text and Counts",
+          "enabled": true,
+          "id": "convergence-summary-elem-2",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "(down|up) \\d+ from \\d+"
+            },
+            "label": "Required element for Summary Text and Counts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Summary Text and Counts",
+          "enabled": true,
+          "id": "convergence-summary-elem-3",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "\\d+ passed"
+            },
+            "label": "Required element for Summary Text and Counts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Summary Text and Counts",
+          "enabled": true,
+          "id": "convergence-summary-elem-4",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "\\d+ failed"
+            },
+            "label": "Required element for Summary Text and Counts",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Summary Text and Counts",
+          "enabled": true,
+          "id": "convergence-summary-elem-5",
+          "precondition": "At least one iteration-metrics event has been received",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "\\d+ skipped"
+            },
+            "label": "Required element for Summary Text and Counts",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Below the bar chart, a summary text line and pass/fail counts provide precise numbers for the latest iteration. The summary includes the current iteration number, the number of failing steps, the delta from the previous iteration (e.g., 'down 2 from 5'), and counts of new vs repeated failures. The pass/fail/skipped counts below use color coding: green for passed, red for failed, grey for skipped.",
+      "id": "convergence-summary",
+      "name": "Summary Text and Counts",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Real-Time Event Handling",
+          "enabled": true,
+          "id": "convergence-real-time-elem-0",
+          "precondition": "Multiple iteration-metrics events have been received for the current task run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "\\d+"
+            },
+            "label": "Required element for Real-Time Event Handling",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Real-Time Event Handling",
+          "enabled": true,
+          "id": "convergence-real-time-elem-1",
+          "precondition": "Multiple iteration-metrics events have been received for the current task run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Convergence"
+            },
+            "label": "Required element for Real-Time Event Handling",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Real-Time Event Handling",
+          "enabled": true,
+          "id": "convergence-real-time-elem-2",
+          "precondition": "Multiple iteration-metrics events have been received for the current task run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Iteration"
+            },
+            "label": "Required element for Real-Time Event Handling",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The widget subscribes to the Tauri 'iteration-metrics' event via @tauri-apps/api/event.listen(). Each event payload contains task_run_id, iteration, failed_step_count, passed_step_count, skipped_step_count, new_failures, repeated_failures, and is_stalled. The widget filters events to only the current task run (from useCurrentTaskRunId context) and appends new metrics to its state array. When the task run changes, the metrics array is reset to empty. The event is emitted by EventBroadcaster::iteration_metrics() in handle_evaluate_verification() after each verification phase completes.",
+      "id": "convergence-real-time",
+      "name": "Real-Time Event Handling",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Blame Attribution Integration",
+          "enabled": true,
+          "id": "convergence-blame-integration-elem-0",
+          "precondition": "A verification iteration completed with failures and the blame engine produced attributions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "blame|oscillat"
+            },
+            "label": "Required element for Blame Attribution Integration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Blame Attribution Integration",
+          "enabled": true,
+          "id": "convergence-blame-integration-elem-1",
+          "precondition": "A verification iteration completed with failures and the blame engine produced attributions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "oscillat"
+            },
+            "label": "Required element for Blame Attribution Integration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The convergence widget currently tracks iteration-metrics events only. The blame engine emits a complementary 'blame-attribution' event with the same task_run_id and iteration number. A future enhancement could overlay blame signals onto the convergence chart — for example, marking bars with an oscillation icon when the blame engine detects file oscillation, or coloring bars differently when the escalation policy's rethink prompt is injected. This group documents the architectural connection between the convergence widget and the blame system.",
+      "id": "convergence-blame-integration",
+      "name": "Blame Attribution Integration",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "convergence-widget",
+    "tags": [
+      "convergence",
+      "verification-loop",
+      "real-time",
+      "dashboard-widget",
+      "bar-chart",
+      "trend-indicator",
+      "blame-integration",
+      "observe"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The Convergence widget appears on the active dashboard when a workflow run is in progress and has completed at least one verification iteration. It should be immediately recognizable as a convergence monitor and not confused with other metric widgets. The widget renders nothing (returns null) when no metrics have been received yet, avoiding visual noise before the first iteration completes.",
+        "elements": [
+          {
+            "textContent": "Convergence"
+          },
+          {
+            "textContent": "Convergence"
+          }
+        ],
+        "id": "convergence-identity",
+        "isInitial": false,
+        "name": "Widget Identity and Visibility",
+        "transitions": []
+      },
+      {
+        "description": "The trend indicator shows the current convergence direction based on the latest two iterations. It uses a color-coded icon and label: green TrendingDown arrow for 'Improving' (fewer failures than previous iteration), amber Minus for 'Stalled' (same failure count or isStalled flag), red TrendingUp arrow for 'Regressing' (more failures than previous iteration). The trend is the most important at-a-glance signal — it tells the user whether to keep waiting or intervene.",
+        "elements": [
+          {
+            "textContent": "Improving"
+          },
+          {
+            "textContent": "Stalled"
+          },
+          {
+            "textContent": "Regressing"
+          },
+          {
+            "role": "img"
+          }
+        ],
+        "id": "convergence-trend-indicator",
+        "isInitial": false,
+        "name": "Trend Indicator",
+        "transitions": []
+      },
+      {
+        "description": "A CSS-based bar chart showing failed step counts per iteration. Each bar represents one iteration, with height proportional to the number of failed steps (minimum 2px, maximum 80px, scaled to the highest failure count). Bar colors encode the change direction: green (bg-emerald-500) for zero failures, amber (bg-amber-500) for no change or improvement, red (bg-red-500) for regression. The chart displays the last 20 iterations (MAX_VISIBLE_ITERATIONS) and scrolls horizontally if more exist. Each bar has a tooltip showing 'Iteration N: X failed, Y passed'.",
+        "elements": [
+          {
+            "textContent": "\\d+"
+          },
+          {},
+          {},
+          {
+            "textContent": "Iteration \\d+:.*failed.*passed"
+          },
+          {}
+        ],
+        "id": "convergence-bar-chart",
+        "isInitial": false,
+        "name": "Mini Bar Chart",
+        "transitions": []
+      },
+      {
+        "description": "Below the bar chart, a summary text line and pass/fail counts provide precise numbers for the latest iteration. The summary includes the current iteration number, the number of failing steps, the delta from the previous iteration (e.g., 'down 2 from 5'), and counts of new vs repeated failures. The pass/fail/skipped counts below use color coding: green for passed, red for failed, grey for skipped.",
+        "elements": [
+          {
+            "textContent": "Iteration \\d+"
+          },
+          {
+            "textContent": "\\d+ failing"
+          },
+          {
+            "textContent": "(down|up) \\d+ from \\d+"
+          },
+          {
+            "textContent": "\\d+ passed"
+          },
+          {
+            "textContent": "\\d+ failed"
+          },
+          {
+            "textContent": "\\d+ skipped"
+          }
+        ],
+        "id": "convergence-summary",
+        "isInitial": false,
+        "name": "Summary Text and Counts",
+        "transitions": []
+      },
+      {
+        "description": "The widget subscribes to the Tauri 'iteration-metrics' event via @tauri-apps/api/event.listen(). Each event payload contains task_run_id, iteration, failed_step_count, passed_step_count, skipped_step_count, new_failures, repeated_failures, and is_stalled. The widget filters events to only the current task run (from useCurrentTaskRunId context) and appends new metrics to its state array. When the task run changes, the metrics array is reset to empty. The event is emitted by EventBroadcaster::iteration_metrics() in handle_evaluate_verification() after each verification phase completes.",
+        "elements": [
+          {
+            "textContent": "\\d+"
+          },
+          {
+            "textContent": "Convergence"
+          },
+          {
+            "textContent": "Iteration"
+          }
+        ],
+        "id": "convergence-real-time",
+        "isInitial": false,
+        "name": "Real-Time Event Handling",
+        "transitions": []
+      },
+      {
+        "description": "The convergence widget currently tracks iteration-metrics events only. The blame engine emits a complementary 'blame-attribution' event with the same task_run_id and iteration number. A future enhancement could overlay blame signals onto the convergence chart — for example, marking bars with an oscillation icon when the blame engine detects file oscillation, or coloring bars differently when the escalation policy's rethink prompt is injected. This group documents the architectural connection between the convergence widget and the blame system.",
+        "elements": [
+          {
+            "textContent": "blame|oscillat"
+          },
+          {
+            "textContent": "oscillat"
+          }
+        ],
+        "id": "convergence-blame-integration",
+        "isInitial": false,
+        "name": "Blame Attribution Integration",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}
