@@ -128,10 +128,12 @@ jobs:
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
 
       - name: Run security audit on Rust dependencies
+        # Cargo.lock lives at the workspace root (./Cargo.lock), not under
+        # src-tauri/. cargo-audit doesn't auto-walk to the workspace root,
+        # so passing --file points it at the right lockfile.
         run: |
           cargo install cargo-audit
-          cd src-tauri
-          cargo audit
+          cargo audit --file Cargo.lock
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
