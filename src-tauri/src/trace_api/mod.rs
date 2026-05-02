@@ -65,7 +65,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/trace/health", get(handlers::get_health))
         .route("/trace/list", get(handlers::get_list))
-        .route("/trace/session/{recording_session_id}", get(handlers::get_session))
+        .route(
+            "/trace/session/{recording_session_id}",
+            get(handlers::get_session),
+        )
         .route(
             "/trace/event/{id}/causal-chain",
             get(handlers::get_causal_chain),

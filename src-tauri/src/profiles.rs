@@ -176,7 +176,12 @@ fn load_inner() -> Result<ResolvedProfile> {
         .database_url
         .clone()
         .or_else(|| std::env::var("RUNNER_DATABASE_URL").ok())
-        .ok_or_else(|| anyhow!("Profile '{}' has no database_url and RUNNER_DATABASE_URL is unset", active))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "Profile '{}' has no database_url and RUNNER_DATABASE_URL is unset",
+                active
+            )
+        })?;
 
     debug!("Loaded profile '{}' from {}", active, path.display());
 

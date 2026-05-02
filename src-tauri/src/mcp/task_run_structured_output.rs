@@ -287,7 +287,10 @@ fn parse_stage_segment(name: String, segment: &str) -> StructuredStage {
         let Some(step_name) = cap.get(1).map(|m| m.as_str().to_string()) else {
             continue;
         };
-        let body = cap.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let body = cap
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         // Try to parse as a UnifiedWorkflow JSON. If it looks like one
         // (`deterministic_steps` array present), surface as the stage's
         // `generated_workflow_json` (first one wins).
@@ -303,9 +306,7 @@ fn parse_stage_segment(name: String, segment: &str) -> StructuredStage {
 
     // -------- 2. Parse the `--- Stage N Setup ---` block. --------
     if let Some(header_cap) = RE_STAGE_SETUP_HEADER.captures(segment) {
-        success = header_cap
-            .get(3)
-            .map(|m| m.as_str() == "true");
+        success = header_cap.get(3).map(|m| m.as_str() == "true");
 
         // Bullets follow the header. Find the byte offset of the line after
         // the header and walk bullet lines until we hit one that doesn't
@@ -567,7 +568,12 @@ mod tests {
             \n--- Verification (Iteration 1): PASSED (3 passed, 0 failed, 3 total) ---\n";
 
         let parsed = parse_structured_output(raw);
-        assert_eq!(parsed.stages.len(), 1, "expected 1 stage, got {}", parsed.stages.len());
+        assert_eq!(
+            parsed.stages.len(),
+            1,
+            "expected 1 stage, got {}",
+            parsed.stages.len()
+        );
         let stage = &parsed.stages[0];
         assert_eq!(stage.name, "Stage 1/1: Use the test-wrapper");
         assert_eq!(stage.success, Some(true));
@@ -578,7 +584,10 @@ mod tests {
         assert!(step.success);
         assert_eq!(step.duration_ms, Some(1234));
         assert!(
-            step.output.as_deref().unwrap_or("").contains("agentic_steps"),
+            step.output
+                .as_deref()
+                .unwrap_or("")
+                .contains("agentic_steps"),
             "expected step output to carry the AI Setup Output body"
         );
         assert!(
@@ -613,7 +622,10 @@ mod tests {
         assert_eq!(stage.success, Some(false));
         assert_eq!(stage.steps.len(), 1);
         assert!(!stage.steps[0].success);
-        assert!(stage.steps[0].output.is_some(), "output body should still be attached");
+        assert!(
+            stage.steps[0].output.is_some(),
+            "output body should still be attached"
+        );
         assert!(
             stage.generated_workflow_json.is_none(),
             "malformed JSON must not surface as generated_workflow_json"

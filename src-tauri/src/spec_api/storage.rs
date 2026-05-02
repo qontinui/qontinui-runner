@@ -135,9 +135,8 @@ pub fn read_ir(root: &Path, page_id: &str) -> Result<Option<IrDocument>, String>
     // Embedded fallback.
     let embedded_rel = format!("{}/state-machine.derived.json", page_id);
     if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-        let doc: IrDocument = serde_json::from_slice(file.contents()).map_err(|e| {
-            format!("parse embedded {} failed: {}", file.path().display(), e)
-        })?;
+        let doc: IrDocument = serde_json::from_slice(file.contents())
+            .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
         return Ok(Some(doc));
     }
     Ok(None)
@@ -157,9 +156,8 @@ pub fn read_projection(root: &Path, page_id: &str) -> Result<Option<serde_json::
     }
     let embedded_rel = format!("{}/spec.uibridge.json", page_id);
     if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-        let v: serde_json::Value = serde_json::from_slice(file.contents()).map_err(|e| {
-            format!("parse embedded {} failed: {}", file.path().display(), e)
-        })?;
+        let v: serde_json::Value = serde_json::from_slice(file.contents())
+            .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
         return Ok(Some(v));
     }
     Ok(None)
@@ -183,9 +181,8 @@ pub fn read_notes(root: &Path, page_id: &str) -> Result<Option<String>, String> 
     }
     let embedded_rel = format!("{}/notes.md", page_id);
     if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-        let s = std::str::from_utf8(file.contents()).map_err(|e| {
-            format!("parse embedded {} failed: {}", file.path().display(), e)
-        })?;
+        let s = std::str::from_utf8(file.contents())
+            .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
         let trimmed = s.trim().to_string();
         return if trimmed.is_empty() {
             Ok(None)

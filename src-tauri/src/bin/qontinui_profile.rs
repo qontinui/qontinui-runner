@@ -476,9 +476,15 @@ fn cmd_machine_init() -> ExitCode {
         return ExitCode::from(2);
     }
     if was_new {
-        println!("wrote machine.json: {} (host={})", file.machine_id, file.hostname);
+        println!(
+            "wrote machine.json: {} (host={})",
+            file.machine_id, file.hostname
+        );
     } else {
-        println!("re-using existing machine.json: {} (host={})", file.machine_id, file.hostname);
+        println!(
+            "re-using existing machine.json: {} (host={})",
+            file.machine_id, file.hostname
+        );
     }
 
     // Register with coord by UPSERTing coord.machines on the active profile's
