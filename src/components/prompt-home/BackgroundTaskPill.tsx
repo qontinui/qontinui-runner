@@ -84,6 +84,7 @@ export function BackgroundTaskPill() {
   // poller as soon as the user dismisses the pill.
   useEffect(() => {
     if (!backgroundTask) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on task end is intentional
       setPipelinePhase(null);
       return;
     }
@@ -99,6 +100,7 @@ export function BackgroundTaskPill() {
   // refresh seconds.
   useEffect(() => {
     if (!backgroundTask) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- prime elapsed-time display
     setNow(Date.now());
     const id = window.setInterval(() => setNow(Date.now()), ELAPSED_TICK_MS);
     return () => window.clearInterval(id);

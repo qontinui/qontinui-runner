@@ -92,6 +92,7 @@ export function PromptExecutionProvider({ children }: { children: ReactNode }) {
     const instruction = lastStep?.instruction ?? "";
     if (!UI_BRIDGE_GENERATE_INSTRUCTION_RE.test(instruction)) return;
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: register pill on phase transition
     setBackgroundTask({
       kind: "ui-bridge-generation",
       promptText: execution.lastPrompt ?? "",
