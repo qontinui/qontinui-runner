@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from "react";
-import { useUIBridge } from "@qontinui/ui-bridge";
+import { useUIBridge, type ControlActionRequest } from "@qontinui/ui-bridge";
 import { tracedFetch } from "@/lib/traced-fetch";
 import { getApiBase } from "@/lib/runner-api";
 import { isValidTabId, type MainTabId } from "@/components/app/tab-types";
@@ -161,28 +161,53 @@ export function usePromptExecution(): UsePromptExecutionReturn {
             // Wait for page to settle
             await new Promise((r) => setTimeout(r, 500));
           } else if (step.type === "action" && step.instruction) {
-            // Use NLActionExecutor on current page DOM
-            const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
-            const discovered = await bridge.discover({ includeHidden: false });
-            const executor = new NLActionExecutor();
-            executor.updateElements(discovered.elements);
-            executor.setActionExecutor(bridge as never);
-
-            // P18A — capture pre-action state for "<verb> element <id>" forms.
-            // The id-routing path takes a deterministic registry lookup (no
-            // fuzzy text match), so a state snapshot before/after the action
-            // is meaningful. Free-text instructions go through fuzzy search
-            // and may be re-resolved between calls, so we skip the toggle
-            // check there and rely on the action executor's own success flag.
-            const idMatch = step.instruction.match(/^(?:click|check|uncheck) element ([\w-]+)$/i);
-            const targetId = idMatch ? idMatch[1] : null;
+            // P20 — direct dispatch for "<verb> element <id>" forms.
+            //
+            // The NL path (NLActionExecutor) takes a discover() snapshot,
+            // updates a SearchEngine, then resolves by id and forwards to
+            // bridge.executeAction. When the id is already known, that detour
+            // is wasted work AND introduces a subtle staleness window: the
+            // discovered RegisteredElement DOM ref can be a node React has
+            // since replaced, and clicks on detached nodes succeed silently
+            // (no error, no toggle). The disclosure-toggle regression in P20
+            // was reproduced from exactly that path. The HTTP handler that
+            // backs the direct SDK call doesn't take that detour — it dispatches
+            // straight against the live registry — and worked correctly in
+            // isolation. Bypassing the executor for known-id instructions
+            // converges both paths onto the same dispatch and removes the
+            // staleness window.
+            //
+            // The free-text NL path (fuzzy search) remains as the fallback
+            // for instructions that don't match the deterministic regex set.
+            const directIdMatch = parseDirectIdInstruction(step.instruction);
+            const targetId = directIdMatch?.targetId ?? null;
             const preState = targetId ? bridge.getElementState(targetId) : undefined;
 
-            const result = await executor.execute({ instruction: step.instruction });
-            if (!result.success) {
-              throw new Error(
-                `Step ${i + 1} failed: ${result.error ?? result.errorCode ?? "action failed"} — could not ${step.instruction}`,
+            if (directIdMatch) {
+              // Direct path — same code path as Path A (HTTP handler).
+              const directResult = await bridge.executeAction(
+                directIdMatch.targetId,
+                directIdMatch.actionRequest,
               );
+              if (!directResult.success) {
+                throw new Error(
+                  `Step ${i + 1} failed: ${directResult.error ?? "action failed"} — could not ${step.instruction}`,
+                );
+              }
+            } else {
+              // Free-text fallback — full NL pipeline with fuzzy search.
+              const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
+              const discovered = await bridge.discover({ includeHidden: false });
+              const executor = new NLActionExecutor();
+              executor.updateElements(discovered.elements);
+              executor.setActionExecutor(bridge as never);
+
+              const result = await executor.execute({ instruction: step.instruction });
+              if (!result.success) {
+                throw new Error(
+                  `Step ${i + 1} failed: ${result.error ?? result.errorCode ?? "action failed"} — could not ${step.instruction}`,
+                );
+              }
             }
 
             // Wait for action to settle before observing post-state. The
@@ -266,6 +291,68 @@ const PIPELINE_TRIGGER_IDS = new Set<string>([
   "ui-bridge-analyze-button",
   "ui-bridge-generate-button",
 ]);
+
+/**
+ * Result of parsing a direct-id instruction. When non-null, the caller
+ * dispatches `bridge.executeAction(targetId, actionRequest)` directly,
+ * bypassing the NL search pipeline entirely.
+ */
+interface DirectIdInstruction {
+  targetId: string;
+  actionRequest: ControlActionRequest;
+}
+
+/**
+ * Standard wait options applied to every direct-dispatch action. Mirrors
+ * the defaults NLActionExecutor uses internally so the two paths share
+ * identical pre-action gating semantics.
+ */
+const DIRECT_WAIT_OPTIONS = { visible: true, enabled: true, timeout: 5000 };
+
+/**
+ * Parse instructions of the form `<verb> element <id>` (and the typed
+ * variant `type "<text>" in element <id>`) into a deterministic
+ * dispatch payload.
+ *
+ * Returns null for free-text instructions that don't match the regex set —
+ * those fall through to the NL fuzzy-search pipeline.
+ *
+ * Verb → standardAction map (matches NLActionExecutor's actionMap):
+ *   click   → click
+ *   check   → check
+ *   uncheck → uncheck
+ *   type    → type   (with `params: {text, clear: true}` mirroring the
+ *                     "type means replace, not append" semantics the NL
+ *                     path enforces; see nl-action-executor.ts:382-383)
+ */
+function parseDirectIdInstruction(instruction: string): DirectIdInstruction | null {
+  const trimmed = instruction.trim();
+
+  // click | check | uncheck — single id, no params
+  const verbMatch = trimmed.match(/^(click|check|uncheck) element ([\w-]+)$/i);
+  if (verbMatch) {
+    const verb = verbMatch[1].toLowerCase() as "click" | "check" | "uncheck";
+    return {
+      targetId: verbMatch[2],
+      actionRequest: { action: verb, waitOptions: DIRECT_WAIT_OPTIONS },
+    };
+  }
+
+  // type "<text>" in element <id>  (single or double quotes)
+  const typeMatch = trimmed.match(/^type ['"]([^'"]+)['"] in element ([\w-]+)$/i);
+  if (typeMatch) {
+    return {
+      targetId: typeMatch[2],
+      actionRequest: {
+        action: "type",
+        params: { text: typeMatch[1], clear: true },
+        waitOptions: DIRECT_WAIT_OPTIONS,
+      },
+    };
+  }
+
+  return null;
+}
 
 /**
  * Poll the ProjectCoordinator's `data-pipeline-phase` attribute for a
