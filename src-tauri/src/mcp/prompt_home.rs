@@ -109,7 +109,7 @@ The runner has these pages (state machine states):
 - page-gui-automation: Workflows — select and run automation workflows
 - page-active: Active Dashboard — monitor running executions
 - page-workflow-queue: Workflow Queue — scheduled workflow runs
-- page-terminal: Terminal — Claude Code sessions, workflow generation, plan implementation
+- page-terminal: Terminal — interactive shells and AI coding sessions (Claude Code, etc.); use ONLY when the user explicitly wants a terminal or an AI coding session. For creating workflows use page-unified-workflow-builder; for running existing workflows use page-gui-automation.
 - page-orchestration-loop: Orchestration — iterative build/reflect/fix pipeline
 - page-runs: Runs — list of past executions
 - page-run-recap: Run Recap — review past execution results
