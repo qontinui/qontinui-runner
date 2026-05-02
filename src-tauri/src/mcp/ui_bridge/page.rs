@@ -254,6 +254,7 @@ const VALID_TAB_IDS: &[&str] = &[
     "online-learning",
     "dag-workflow-editor",
     "project-explainer",
+    "wrappers",
     "productivity",
 ];
 
@@ -1503,6 +1504,21 @@ mod tab_activate_tests {
             "specs",
             "validate_tab_id should trim whitespace"
         );
+    }
+
+    /// Regression: when a new `MainTabId` is added to
+    /// `src/components/app/tab-types.ts`, the Rust mirror must be updated too —
+    /// otherwise `/control/tabs` advertises the tab while `tab/activate`
+    /// rejects it as `unknown_tab`. (Surfaced 2026-05-02 for `"wrappers"`.)
+    #[test]
+    fn recently_added_tabs_are_accepted() {
+        for id in &["wrappers", "productivity"] {
+            validate_tab_id(id).unwrap_or_else(|_| {
+                panic!(
+                    "tab '{id}' missing from VALID_TAB_IDS — sync with src/components/app/tab-types.ts",
+                )
+            });
+        }
     }
 
     #[test]
