@@ -839,8 +839,12 @@
           {
             "id": "opik-loading-to-empty",
             "name": "No Traces Found",
-            "activateStates": ["opik-empty"],
-            "deactivateStates": ["opik-loading"],
+            "activateStates": [
+              "opik-empty"
+            ],
+            "deactivateStates": [
+              "opik-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -858,8 +862,12 @@
           {
             "id": "opik-loading-to-trace-list",
             "name": "Traces Loaded",
-            "activateStates": ["opik-trace-list"],
-            "deactivateStates": ["opik-loading"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
+            "deactivateStates": [
+              "opik-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -877,8 +885,12 @@
           {
             "id": "opik-loading-to-fallback",
             "name": "Opik Unreachable — Fallback to Local Data",
-            "activateStates": ["opik-fallback"],
-            "deactivateStates": ["opik-loading"],
+            "activateStates": [
+              "opik-fallback"
+            ],
+            "deactivateStates": [
+              "opik-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -903,10 +915,6 @@
           {
             "role": "status",
             "accessibleName": "No traces yet"
-          },
-          {
-            "role": "combobox",
-            "accessibleName": "Time range selector"
           }
         ],
         "isInitial": false,
@@ -914,8 +922,12 @@
           {
             "id": "opik-empty-to-trace-list",
             "name": "Traces Arrive via Auto-Refresh",
-            "activateStates": ["opik-trace-list"],
-            "deactivateStates": ["opik-empty"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
+            "deactivateStates": [
+              "opik-empty"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -933,8 +945,12 @@
           {
             "id": "opik-empty-to-loading",
             "name": "Change Time Range",
-            "activateStates": ["opik-loading"],
-            "deactivateStates": ["opik-empty"],
+            "activateStates": [
+              "opik-loading"
+            ],
+            "deactivateStates": [
+              "opik-empty"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -971,10 +987,6 @@
           {
             "role": "searchbox",
             "accessibleName": "Trace search input"
-          },
-          {
-            "role": "combobox",
-            "accessibleName": "Time range selector"
           }
         ],
         "isInitial": false,
@@ -982,7 +994,9 @@
           {
             "id": "opik-trace-list-to-detail",
             "name": "Select a Trace",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -1001,7 +1015,9 @@
           {
             "id": "opik-trace-list-search",
             "name": "Search Traces",
-            "activateStates": ["opik-trace-list"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -1030,8 +1046,12 @@
           {
             "id": "opik-trace-list-change-range",
             "name": "Change Time Range",
-            "activateStates": ["opik-loading"],
-            "deactivateStates": ["opik-trace-list"],
+            "activateStates": [
+              "opik-loading"
+            ],
+            "deactivateStates": [
+              "opik-trace-list"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -1049,8 +1069,12 @@
           {
             "id": "opik-trace-list-to-fallback",
             "name": "Opik Connection Lost",
-            "activateStates": ["opik-fallback"],
-            "deactivateStates": ["opik-trace-list"],
+            "activateStates": [
+              "opik-fallback"
+            ],
+            "deactivateStates": [
+              "opik-trace-list"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -1094,7 +1118,9 @@
           {
             "id": "opik-detail-switch-tab",
             "name": "Switch Detail Tab",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -1113,7 +1139,9 @@
           {
             "id": "opik-detail-select-span",
             "name": "Select a Span",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -1132,7 +1160,9 @@
           {
             "id": "opik-detail-add-feedback",
             "name": "Add Feedback Score",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -1151,8 +1181,12 @@
           {
             "id": "opik-detail-dismiss",
             "name": "Close Detail Panel",
-            "activateStates": ["opik-trace-list"],
-            "deactivateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
+            "deactivateStates": [
+              "opik-trace-detail"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -1170,7 +1204,9 @@
           {
             "id": "opik-detail-select-different-trace",
             "name": "Select a Different Trace",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
@@ -1211,8 +1247,12 @@
           {
             "id": "opik-fallback-to-trace-list",
             "name": "Opik Connection Restored",
-            "activateStates": ["opik-trace-list"],
-            "deactivateStates": ["opik-fallback"],
+            "activateStates": [
+              "opik-trace-list"
+            ],
+            "deactivateStates": [
+              "opik-fallback"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -1230,7 +1270,9 @@
           {
             "id": "opik-fallback-to-detail",
             "name": "Select a Trace (Local Data)",
-            "activateStates": ["opik-trace-detail"],
+            "activateStates": [
+              "opik-trace-detail"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [

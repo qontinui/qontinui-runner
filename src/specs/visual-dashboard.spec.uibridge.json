@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "task name" },
+            "criteria": {
+              "dataContentLabel": "task name"
+            },
             "label": "Task name label in control bar"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "elapsed time" },
+            "criteria": {
+              "dataContentLabel": "elapsed time"
+            },
             "label": "Elapsed time metric in bottom bar"
           },
           "assertionType": "exists",
@@ -45,7 +49,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "connection status" },
+            "criteria": {
+              "dataContentLabel": "connection status"
+            },
             "label": "Connection status badge"
           },
           "assertionType": "exists",
@@ -60,7 +66,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "region" },
+            "criteria": {
+              "role": "region"
+            },
             "label": "Dashboard content area"
           },
           "assertionType": "semantic",
@@ -85,7 +93,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "No Active Workflow" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "No Active Workflow"
+            },
             "label": "Idle state heading"
           },
           "assertionType": "exists",
@@ -101,7 +112,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Run Last Workflow" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Run Last Workflow"
+            },
             "label": "Run Last Workflow button"
           },
           "assertionType": "exists",
@@ -117,7 +131,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "No Active Workflow" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "No Active Workflow"
+            },
             "label": "Idle state heading (should be absent)"
           },
           "assertionType": "notExists",
@@ -133,7 +150,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Run Last Workflow" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Run Last Workflow"
+            },
             "label": "Run Last Workflow button"
           },
           "assertionType": "behavior",
@@ -158,7 +178,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "task name" },
+            "criteria": {
+              "dataContentLabel": "task name"
+            },
             "label": "Task name label"
           },
           "assertionType": "exists",
@@ -174,7 +196,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "task name" },
+            "criteria": {
+              "dataContentLabel": "task name"
+            },
             "label": "Task name label"
           },
           "assertionType": "semantic",
@@ -190,7 +214,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "activity type" },
+            "criteria": {
+              "dataContentLabel": "activity type"
+            },
             "label": "Activity/phase badge in control bar"
           },
           "assertionType": "semantic",
@@ -215,7 +241,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "setup stage" },
+            "criteria": {
+              "dataContentLabel": "setup stage"
+            },
             "label": "Setup stage pill"
           },
           "assertionType": "exists",
@@ -231,7 +259,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "agentic stage" },
+            "criteria": {
+              "dataContentLabel": "agentic stage"
+            },
             "label": "Agentic stage pill"
           },
           "assertionType": "exists",
@@ -247,7 +277,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "agentic stage" },
+            "criteria": {
+              "dataContentLabel": "agentic stage"
+            },
             "label": "Stage pill group"
           },
           "assertionType": "semantic",
@@ -263,7 +295,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Iteration" },
+            "criteria": {
+              "textContent": "Iteration"
+            },
             "label": "Iteration counter badge"
           },
           "assertionType": "semantic",
@@ -288,7 +322,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Stop" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Stop"
+            },
             "label": "Stop execution button"
           },
           "assertionType": "exists",
@@ -303,7 +340,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Stop" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Stop"
+            },
             "label": "Stop button"
           },
           "assertionType": "disabled",
@@ -319,7 +359,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Pause" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Pause"
+            },
             "label": "Pause button (visible when running)"
           },
           "assertionType": "behavior",
@@ -335,7 +378,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Stop" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Stop"
+            },
             "label": "Stop button"
           },
           "assertionType": "behavior",
@@ -351,7 +397,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Auto-continue toggle"
           },
           "assertionType": "semantic",
@@ -375,7 +423,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "elapsed time" },
+            "criteria": {
+              "dataContentLabel": "elapsed time"
+            },
             "label": "Elapsed time metric"
           },
           "assertionType": "semantic",
@@ -391,7 +441,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "connection status" },
+            "criteria": {
+              "dataContentLabel": "connection status"
+            },
             "label": "Connection status badge"
           },
           "assertionType": "semantic",
@@ -406,7 +458,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "data freshness" },
+            "criteria": {
+              "dataContentLabel": "data freshness"
+            },
             "label": "Data freshness metric"
           },
           "assertionType": "semantic",
@@ -421,7 +475,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "activity type" },
+            "criteria": {
+              "dataContentLabel": "activity type"
+            },
             "label": "Activity type label"
           },
           "assertionType": "semantic",
@@ -437,7 +493,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "orchestrator agent" },
+            "criteria": {
+              "dataContentLabel": "orchestrator agent"
+            },
             "label": "Orchestrator agent badge"
           },
           "assertionType": "semantic",
@@ -462,7 +520,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI Conversation" },
+            "criteria": {
+              "textContent": "AI Conversation"
+            },
             "label": "AI Conversation widget header"
           },
           "assertionType": "exists",
@@ -478,7 +538,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "region" },
+            "criteria": {
+              "role": "region"
+            },
             "label": "Active widget container"
           },
           "assertionType": "semantic",
@@ -494,7 +556,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Compact summary widget card"
           },
           "assertionType": "behavior",
@@ -510,7 +574,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Execution Timeline" },
+            "criteria": {
+              "textContent": "Execution Timeline"
+            },
             "label": "Execution Timeline widget"
           },
           "assertionType": "semantic",
@@ -535,7 +601,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Workflow Completed" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Workflow Completed"
+            },
             "label": "Workflow Completed heading"
           },
           "assertionType": "exists",
@@ -551,7 +620,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Workflow Failed" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Workflow Failed"
+            },
             "label": "Workflow Failed heading"
           },
           "assertionType": "exists",
@@ -567,7 +639,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Dismiss" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Dismiss"
+            },
             "label": "Dismiss button"
           },
           "assertionType": "exists",
@@ -583,7 +658,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Success Rate" },
+            "criteria": {
+              "textContent": "Success Rate"
+            },
             "label": "Completion stats grid"
           },
           "assertionType": "semantic",
@@ -599,7 +676,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Dismiss" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Dismiss"
+            },
             "label": "Dismiss button"
           },
           "assertionType": "behavior",
@@ -624,7 +704,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Breakpoint" },
+            "criteria": {
+              "textContent": "Breakpoint"
+            },
             "label": "Breakpoint badge"
           },
           "assertionType": "exists",
@@ -640,7 +722,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "breakpoint step" },
+            "criteria": {
+              "dataContentLabel": "breakpoint step"
+            },
             "label": "Breakpoint step name"
           },
           "assertionType": "exists",
@@ -656,7 +740,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Inspect" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Inspect"
+            },
             "label": "Inspect button"
           },
           "assertionType": "behavior",
@@ -672,7 +759,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Resume" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Resume"
+            },
             "label": "Resume from breakpoint button"
           },
           "assertionType": "behavior",
@@ -688,7 +778,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Breakpoint" },
+            "criteria": {
+              "textContent": "Breakpoint"
+            },
             "label": "Breakpoint badge (should be absent)"
           },
           "assertionType": "notExists",
@@ -713,7 +805,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Breakpoint Inspector" },
+            "criteria": {
+              "textContent": "Breakpoint Inspector"
+            },
             "label": "Inspector panel heading"
           },
           "assertionType": "exists",
@@ -729,7 +823,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Close inspector" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Close inspector"
+            },
             "label": "Close inspector button"
           },
           "assertionType": "exists",
@@ -745,7 +842,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Variables" },
+            "criteria": {
+              "textContent": "Variables"
+            },
             "label": "Variables section heading"
           },
           "assertionType": "semantic",
@@ -761,7 +860,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "ago" },
+            "criteria": {
+              "textContent": "ago"
+            },
             "label": "Freshness timestamp"
           },
           "assertionType": "semantic",
@@ -786,7 +887,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Approval Required" },
+            "criteria": {
+              "textContent": "Approval Required"
+            },
             "label": "Approval Required heading"
           },
           "assertionType": "exists",
@@ -802,7 +905,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Approve" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Approve"
+            },
             "label": "Approve button"
           },
           "assertionType": "exists",
@@ -818,7 +924,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Approve" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Approve"
+            },
             "label": "Approve button"
           },
           "assertionType": "behavior",
@@ -843,7 +952,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Active Runs" },
+            "criteria": {
+              "textContent": "Active Runs"
+            },
             "label": "Active runs bar heading"
           },
           "assertionType": "notExists",
@@ -859,7 +970,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "New Run" },
+            "criteria": {
+              "role": "button",
+              "textContent": "New Run"
+            },
             "label": "New Run button"
           },
           "assertionType": "exists",
@@ -875,7 +989,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Run card in ActiveRunsBar"
           },
           "assertionType": "behavior",
@@ -900,7 +1016,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Keyboard Shortcuts" },
+            "criteria": {
+              "textContent": "Keyboard Shortcuts"
+            },
             "label": "Keyboard Shortcuts modal heading"
           },
           "assertionType": "behavior",
@@ -916,7 +1034,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "data freshness" },
+            "criteria": {
+              "dataContentLabel": "data freshness"
+            },
             "label": "Data freshness (refreshed by Ctrl+R)"
           },
           "assertionType": "behavior",
@@ -931,7 +1051,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "role": "region" },
+            "criteria": {
+              "role": "region"
+            },
             "label": "Widget layout container"
           },
           "assertionType": "behavior",
@@ -950,20 +1072,33 @@
         "id": "idle",
         "name": "Idle — No Active Workflow",
         "description": "No workflow is running. The IdleState component shows 'No Active Workflow' heading and optional action buttons.",
-        "elements": [{ "textContent": "No Active Workflow" }],
+        "elements": [
+          {
+            "textContent": "No Active Workflow"
+          }
+        ],
         "isInitial": true,
         "transitions": [
           {
             "id": "idle-to-running",
             "name": "Start a workflow via Run Last Workflow button",
-            "activateStates": ["running"],
-            "deactivateStates": ["idle"],
+            "activateStates": [
+              "running"
+            ],
+            "deactivateStates": [
+              "idle"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Run Last Workflow" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "textContent": "Run Last Workflow"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           }
@@ -974,51 +1109,78 @@
         "name": "Running — Workflow Executing",
         "description": "A workflow is actively executing. ControlBar shows task name, phase/stage indicators, and a Pause button (not Play). BottomBar activity-type label updates in real time.",
         "elements": [
-          { "role": "button", "textContent": "Stop" },
-          { "dataContentLabel": "activity type" }
+          {
+            "dataContentLabel": "activity type"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "running-to-paused",
             "name": "Pause workflow execution",
-            "activateStates": ["paused"],
-            "deactivateStates": ["running"],
+            "activateStates": [
+              "paused"
+            ],
+            "deactivateStates": [
+              "running"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "accessibleName": "Pause" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "button",
+                  "accessibleName": "Pause"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
           {
             "id": "running-to-idle-stop",
             "name": "Stop workflow via Stop button",
-            "activateStates": ["idle"],
-            "deactivateStates": ["running"],
+            "activateStates": [
+              "idle"
+            ],
+            "deactivateStates": [
+              "running"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Stop" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Stop"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           },
           {
             "id": "running-to-completion",
             "name": "Workflow finishes (automatic — no user action)",
-            "activateStates": ["completion-overlay"],
-            "deactivateStates": ["running"],
+            "activateStates": [
+              "completion-overlay"
+            ],
+            "deactivateStates": [
+              "running"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "running-to-approval",
             "name": "Workflow pauses for human approval (automatic)",
-            "activateStates": ["approval-dialog"],
+            "activateStates": [
+              "approval-dialog"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": []
@@ -1026,22 +1188,35 @@
           {
             "id": "running-to-breakpoint",
             "name": "Workflow pauses at a breakpoint step (automatic)",
-            "activateStates": ["breakpoint-paused"],
-            "deactivateStates": ["running"],
+            "activateStates": [
+              "breakpoint-paused"
+            ],
+            "deactivateStates": [
+              "running"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "running-to-shortcuts",
             "name": "Open keyboard shortcuts modal",
-            "activateStates": ["shortcuts-modal"],
+            "activateStates": [
+              "shortcuts-modal"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "keyboard",
-                "params": { "keys": ["?"] },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "params": {
+                  "keys": [
+                    "?"
+                  ]
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1052,36 +1227,58 @@
         "name": "Paused — User Paused Execution",
         "description": "Workflow is suspended. ControlBar shows a Play (resume) button instead of Pause. Activity-type label in BottomBar stops updating.",
         "elements": [
-          { "role": "button", "accessibleName": "Play" },
-          { "role": "button", "textContent": "Stop" }
+          {
+            "role": "button",
+            "accessibleName": "Play"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "paused-to-running",
             "name": "Resume workflow execution",
-            "activateStates": ["running"],
-            "deactivateStates": ["paused"],
+            "activateStates": [
+              "running"
+            ],
+            "deactivateStates": [
+              "paused"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "accessibleName": "Play" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "button",
+                  "accessibleName": "Play"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
           {
             "id": "paused-to-idle-stop",
             "name": "Stop the workflow while paused",
-            "activateStates": ["idle"],
-            "deactivateStates": ["paused"],
+            "activateStates": [
+              "idle"
+            ],
+            "deactivateStates": [
+              "paused"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Stop" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Stop"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           }
@@ -1092,36 +1289,59 @@
         "name": "Breakpoint Paused",
         "description": "Execution is suspended at a breakpoint step. ControlBar shows the amber Breakpoint badge, step name, Inspect button, and Resume button.",
         "elements": [
-          { "textContent": "Breakpoint" },
-          { "role": "button", "textContent": "Resume" }
+          {
+            "textContent": "Breakpoint"
+          },
+          {
+            "role": "button",
+            "textContent": "Resume"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "bp-resume",
             "name": "Resume execution from breakpoint",
-            "activateStates": ["running"],
-            "deactivateStates": ["breakpoint-paused"],
+            "activateStates": [
+              "running"
+            ],
+            "deactivateStates": [
+              "breakpoint-paused"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Resume" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Resume"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           },
           {
             "id": "bp-open-inspector",
             "name": "Open Breakpoint Inspector panel",
-            "activateStates": ["breakpoint-inspector-open"],
+            "activateStates": [
+              "breakpoint-inspector-open"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Inspect" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Inspect"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1132,8 +1352,13 @@
         "name": "Breakpoint Inspector Panel Open",
         "description": "The 384px BreakpointInspector side panel is visible on the right of the screen. Dashboard remains visible behind it.",
         "elements": [
-          { "textContent": "Breakpoint Inspector" },
-          { "role": "button", "textContent": "Close inspector" }
+          {
+            "textContent": "Breakpoint Inspector"
+          },
+          {
+            "role": "button",
+            "textContent": "Close inspector"
+          }
         ],
         "isInitial": false,
         "transitions": [
@@ -1141,27 +1366,46 @@
             "id": "inspector-close",
             "name": "Close the inspector panel",
             "activateStates": [],
-            "deactivateStates": ["breakpoint-inspector-open"],
+            "deactivateStates": [
+              "breakpoint-inspector-open"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Close inspector" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Close inspector"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "inspector-resume",
             "name": "Resume execution while inspector is open",
-            "activateStates": ["running"],
-            "deactivateStates": ["breakpoint-inspector-open", "breakpoint-paused"],
+            "activateStates": [
+              "running"
+            ],
+            "deactivateStates": [
+              "breakpoint-inspector-open",
+              "breakpoint-paused"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Resume" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Resume"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           }
@@ -1172,23 +1416,40 @@
         "name": "Completion Summary Overlay",
         "description": "CompletionSummary overlay visible after workflow finishes. Shows 'Workflow Completed' or 'Workflow Failed' heading, stats grid, and Dismiss button. Auto-dismisses in 15 s.",
         "elements": [
-          { "role": "button", "textContent": "Dismiss" },
-          { "textContent": "Workflow Completed" },
-          { "textContent": "Workflow Failed" }
+          {
+            "role": "button",
+            "textContent": "Dismiss"
+          },
+          {
+            "textContent": "Workflow Completed"
+          },
+          {
+            "textContent": "Workflow Failed"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "completion-dismiss",
             "name": "Dismiss the completion overlay",
-            "activateStates": ["idle"],
-            "deactivateStates": ["completion-overlay"],
+            "activateStates": [
+              "idle"
+            ],
+            "deactivateStates": [
+              "completion-overlay"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Dismiss" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Dismiss"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1199,50 +1460,85 @@
         "name": "Approval Dialog Overlay",
         "description": "ApprovalDialog modal visible when a workflow step requests human approval. Shows 'Approval Required', context, comment textarea, Approve / Reject / Abort Workflow buttons. Dashboard visible behind the backdrop.",
         "elements": [
-          { "textContent": "Approval Required" },
-          { "role": "button", "textContent": "Approve" }
+          {
+            "textContent": "Approval Required"
+          },
+          {
+            "role": "button",
+            "textContent": "Approve"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "approval-approve",
             "name": "Approve — resume workflow",
-            "activateStates": ["running"],
-            "deactivateStates": ["approval-dialog"],
+            "activateStates": [
+              "running"
+            ],
+            "deactivateStates": [
+              "approval-dialog"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Approve" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Approve"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           },
           {
             "id": "approval-reject",
             "name": "Reject — continue to next iteration",
-            "activateStates": ["running"],
-            "deactivateStates": ["approval-dialog"],
+            "activateStates": [
+              "running"
+            ],
+            "deactivateStates": [
+              "approval-dialog"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Reject" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Reject"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           },
           {
             "id": "approval-abort",
             "name": "Abort workflow from approval dialog",
-            "activateStates": ["idle"],
-            "deactivateStates": ["approval-dialog"],
+            "activateStates": [
+              "idle"
+            ],
+            "deactivateStates": [
+              "approval-dialog"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Abort Workflow" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Abort Workflow"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           }
@@ -1252,20 +1548,33 @@
         "id": "shortcuts-modal",
         "name": "Keyboard Shortcuts Modal",
         "description": "ShortcutsModal dialog listing available keyboard shortcuts overlays the dashboard. Dashboard remains visible.",
-        "elements": [{ "textContent": "Keyboard Shortcuts" }],
+        "elements": [
+          {
+            "textContent": "Keyboard Shortcuts"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "shortcuts-close-escape",
             "name": "Close shortcuts modal via Escape",
             "activateStates": [],
-            "deactivateStates": ["shortcuts-modal"],
+            "deactivateStates": [
+              "shortcuts-modal"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "keyboard",
-                "params": { "keys": ["Escape"] },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "params": {
+                  "keys": [
+                    "Escape"
+                  ]
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }

@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "dag-workflow-editor" },
+            "criteria": {
+              "dataContentLabel": "dag-workflow-editor"
+            },
             "label": "DAG Workflow Editor page container"
           },
           "assertionType": "exists",
@@ -30,7 +32,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "textbox", "aria-label": "Workflow name" },
+            "criteria": {
+              "role": "textbox",
+              "aria-label": "Workflow name"
+            },
             "label": "Workflow name input"
           },
           "assertionType": "exists",
@@ -45,7 +50,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "YAML Editor" },
+            "criteria": {
+              "textContent": "YAML Editor"
+            },
             "label": "YAML Editor pane header"
           },
           "assertionType": "exists",
@@ -60,7 +67,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "DAG Graph" },
+            "criteria": {
+              "textContent": "DAG Graph"
+            },
             "label": "DAG Graph pane header"
           },
           "assertionType": "exists",
@@ -75,7 +84,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "DAG Workflow Editor" },
+            "criteria": {
+              "textContent": "DAG Workflow Editor"
+            },
             "label": "Status bar fixed label"
           },
           "assertionType": "exists",
@@ -99,7 +110,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "textbox" },
+            "criteria": {
+              "role": "textbox"
+            },
             "label": "Workflow name input"
           },
           "assertionType": "exists",
@@ -114,7 +127,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Import" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Import"
+            },
             "label": "Import button"
           },
           "assertionType": "exists",
@@ -129,7 +145,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Export" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Export"
+            },
             "label": "Export button"
           },
           "assertionType": "exists",
@@ -144,7 +163,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Valid" },
+            "criteria": {
+              "textContent": "Valid"
+            },
             "label": "Valid status badge"
           },
           "assertionType": "exists",
@@ -160,7 +181,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "textbox" },
+            "criteria": {
+              "role": "textbox"
+            },
             "label": "Workflow name input"
           },
           "assertionType": "semantic",
@@ -185,7 +208,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "textbox" },
+            "criteria": {
+              "role": "textbox"
+            },
             "label": "Workflow name input"
           },
           "assertionType": "hasValue",
@@ -202,7 +227,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "3 nodes" },
+            "criteria": {
+              "textContent": "3 nodes"
+            },
             "label": "Node count display"
           },
           "assertionType": "exists",
@@ -218,7 +245,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "3 nodes · workflow valid" },
+            "criteria": {
+              "textContent": "3 nodes · workflow valid"
+            },
             "label": "Status bar validity text"
           },
           "assertionType": "exists",
@@ -243,7 +272,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checking..." },
+            "criteria": {
+              "textContent": "Checking..."
+            },
             "label": "Validating badge"
           },
           "assertionType": "exists",
@@ -259,7 +290,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Errors" },
+            "criteria": {
+              "textContent": "Errors"
+            },
             "label": "Errors validation badge"
           },
           "assertionType": "exists",
@@ -275,7 +308,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "detected" },
+            "criteria": {
+              "textContent": "detected"
+            },
             "label": "Error count in status bar"
           },
           "assertionType": "exists",
@@ -291,7 +326,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Valid" },
+            "criteria": {
+              "textContent": "Valid"
+            },
             "label": "Valid validation badge"
           },
           "assertionType": "behavior",
@@ -316,7 +353,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Write a workflow in the editor to see the graph" },
+            "criteria": {
+              "textContent": "Write a workflow in the editor to see the graph"
+            },
             "label": "Graph empty state message"
           },
           "assertionType": "exists",
@@ -332,7 +371,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Fix YAML errors to see the graph" },
+            "criteria": {
+              "textContent": "Fix YAML errors to see the graph"
+            },
             "label": "Graph error overlay message"
           },
           "assertionType": "exists",
@@ -348,7 +389,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Parsing workflow..." },
+            "criteria": {
+              "textContent": "Parsing workflow..."
+            },
             "label": "Graph parsing state message"
           },
           "assertionType": "exists",
@@ -364,7 +407,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div", "textContent": "DAG Graph" },
+            "criteria": {
+              "tagName": "div",
+              "textContent": "DAG Graph"
+            },
             "label": "DAG Graph pane with rendered graph"
           },
           "assertionType": "semantic",
@@ -389,7 +435,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Install dependencies" },
+            "criteria": {
+              "textContent": "Install dependencies"
+            },
             "label": "Node label from 'name' field"
           },
           "assertionType": "exists",
@@ -405,7 +453,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "span" },
+            "criteria": {
+              "tagName": "span"
+            },
             "label": "Trigger rule badge inside node"
           },
           "assertionType": "semantic",
@@ -421,7 +471,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div" },
+            "criteria": {
+              "tagName": "div"
+            },
             "label": "ReactFlow node canvas"
           },
           "assertionType": "semantic",
@@ -437,7 +489,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div" },
+            "criteria": {
+              "tagName": "div"
+            },
             "label": "ReactFlow graph canvas"
           },
           "assertionType": "semantic",
@@ -462,7 +516,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div" },
+            "criteria": {
+              "tagName": "div"
+            },
             "label": "ReactFlow controls panel"
           },
           "assertionType": "semantic",
@@ -478,7 +534,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div" },
+            "criteria": {
+              "tagName": "div"
+            },
             "label": "ReactFlow minimap"
           },
           "assertionType": "semantic",
@@ -494,7 +552,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div" },
+            "criteria": {
+              "tagName": "div"
+            },
             "label": "ReactFlow graph"
           },
           "assertionType": "semantic",
@@ -519,7 +579,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div" },
+            "criteria": {
+              "tagName": "div"
+            },
             "label": "Resize handle divider"
           },
           "assertionType": "semantic",
@@ -535,7 +597,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div" },
+            "criteria": {
+              "tagName": "div"
+            },
             "label": "Resize handle"
           },
           "assertionType": "behavior",
@@ -560,7 +624,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Import" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Import"
+            },
             "label": "Import button"
           },
           "assertionType": "behavior",
@@ -575,7 +642,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Export" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Export"
+            },
             "label": "Export button"
           },
           "assertionType": "behavior",
@@ -591,7 +661,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Saved" },
+            "criteria": {
+              "textContent": "Saved"
+            },
             "label": "Last saved timestamp"
           },
           "assertionType": "exists",
@@ -616,7 +688,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Errors" },
+            "criteria": {
+              "textContent": "Errors"
+            },
             "label": "Errors badge"
           },
           "assertionType": "semantic",
@@ -632,7 +706,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Errors" },
+            "criteria": {
+              "textContent": "Errors"
+            },
             "label": "Errors badge"
           },
           "assertionType": "semantic",
@@ -648,7 +724,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Errors" },
+            "criteria": {
+              "textContent": "Errors"
+            },
             "label": "Errors badge"
           },
           "assertionType": "semantic",
@@ -664,7 +742,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Errors" },
+            "criteria": {
+              "textContent": "Errors"
+            },
             "label": "Errors badge"
           },
           "assertionType": "semantic",
@@ -689,7 +769,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Approval Required" },
+            "criteria": {
+              "textContent": "Approval Required"
+            },
             "label": "Approval Required heading"
           },
           "assertionType": "notExists",
@@ -705,7 +787,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Approval Required" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Approval Required"
+            },
             "label": "Approval Required heading"
           },
           "assertionType": "exists",
@@ -721,7 +806,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Approve" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Approve"
+            },
             "label": "Approve button"
           },
           "assertionType": "exists",
@@ -737,7 +825,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Node:" },
+            "criteria": {
+              "textContent": "Node:"
+            },
             "label": "Node name in approval dialog"
           },
           "assertionType": "exists",
@@ -753,7 +843,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Approve" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Approve"
+            },
             "label": "Approve button"
           },
           "assertionType": "behavior",
@@ -778,7 +871,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "nodes" },
+            "criteria": {
+              "textContent": "nodes"
+            },
             "label": "Node count badge"
           },
           "assertionType": "semantic",
@@ -794,7 +889,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div" },
+            "criteria": {
+              "tagName": "div"
+            },
             "label": "ReactFlow graph canvas"
           },
           "assertionType": "semantic",
@@ -810,7 +907,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "tagName": "div" },
+            "criteria": {
+              "tagName": "div"
+            },
             "label": "ReactFlow graph canvas"
           },
           "assertionType": "semantic",
@@ -843,21 +942,34 @@
         "id": "editor-idle",
         "name": "Editor Idle — Default Content",
         "description": "Page loaded with default YAML template. Validation has completed and the badge shows 'Valid'. The graph renders a 3-node linear chain.",
-        "elements": [{ "textContent": "Valid" }, { "textContent": "3 nodes · workflow valid" }],
+        "elements": [
+          {
+            "textContent": "3 nodes · workflow valid"
+          }
+        ],
         "isInitial": true,
         "transitions": [
           {
             "id": "idle-to-editing",
             "name": "Start editing YAML",
             "description": "User types in the Monaco YAML editor, triggering validation debounce",
-            "activateStates": ["editor-validating"],
-            "deactivateStates": ["editor-idle"],
+            "activateStates": [
+              "editor-validating"
+            ],
+            "deactivateStates": [
+              "editor-idle"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "YAML Editor" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "textContent": "YAML Editor"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
@@ -865,14 +977,22 @@
             "id": "idle-to-import",
             "name": "Click Import",
             "description": "User clicks the Import button to open file picker",
-            "activateStates": ["editor-idle"],
+            "activateStates": [
+              "editor-idle"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Import" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Import"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           }
@@ -882,21 +1002,34 @@
         "id": "editor-validating",
         "name": "Editor Validating",
         "description": "YAML content has changed and the validation debounce is active or the Tauri command is in-flight. Badge shows 'Checking...'.",
-        "elements": [{ "textContent": "Checking..." }],
+        "elements": [
+          {
+            "textContent": "Checking..."
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "validating-to-valid",
             "name": "Validation succeeds",
             "description": "Backend returns valid=true, badge transitions to 'Valid'",
-            "activateStates": ["editor-valid"],
-            "deactivateStates": ["editor-validating"],
+            "activateStates": [
+              "editor-valid"
+            ],
+            "deactivateStates": [
+              "editor-validating"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "textContent": "Valid" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "textContent": "Valid"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -904,14 +1037,23 @@
             "id": "validating-to-error",
             "name": "Validation fails",
             "description": "Backend returns errors or js-yaml throws, badge transitions to 'Errors'",
-            "activateStates": ["editor-error"],
-            "deactivateStates": ["editor-validating"],
+            "activateStates": [
+              "editor-error"
+            ],
+            "deactivateStates": [
+              "editor-validating"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "textContent": "Errors" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "textContent": "Errors"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -921,21 +1063,29 @@
         "id": "editor-valid",
         "name": "Editor Valid",
         "description": "YAML has passed validation. Badge shows 'Valid'. Graph pane renders nodes and edges. Status bar shows '{N} nodes · workflow valid'.",
-        "elements": [{ "textContent": "Valid" }],
+        "elements": [],
         "isInitial": false,
         "transitions": [
           {
             "id": "valid-to-export",
             "name": "Export workflow",
             "description": "User clicks Export to save the current YAML to disk",
-            "activateStates": ["editor-exported"],
+            "activateStates": [
+              "editor-exported"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Export" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Export"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           }
@@ -946,8 +1096,12 @@
         "name": "Editor Has Errors",
         "description": "YAML contains validation errors. Badge shows 'Errors'. First error message snippet is visible in toolbar. Graph pane shows 'Fix YAML errors to see the graph' overlay. Status bar shows 'N error(s) detected'.",
         "elements": [
-          { "textContent": "Errors" },
-          { "textContent": "Fix YAML errors to see the graph" }
+          {
+            "textContent": "Errors"
+          },
+          {
+            "textContent": "Fix YAML errors to see the graph"
+          }
         ],
         "isInitial": false,
         "transitions": [
@@ -955,14 +1109,23 @@
             "id": "error-to-validating",
             "name": "User fixes YAML",
             "description": "User edits the YAML to correct errors, triggering new validation",
-            "activateStates": ["editor-validating"],
-            "deactivateStates": ["editor-error"],
+            "activateStates": [
+              "editor-validating"
+            ],
+            "deactivateStates": [
+              "editor-error"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "YAML Editor" },
-                "waitAfter": { "type": "idle", "timeout": 600 }
+                "target": {
+                  "textContent": "YAML Editor"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 600
+                }
               }
             ]
           }
@@ -972,7 +1135,11 @@
         "id": "editor-exported",
         "name": "Workflow Exported",
         "description": "User has successfully exported the workflow. Status bar shows 'Saved HH:MM' timestamp on the right side.",
-        "elements": [{ "textContent": "Saved" }],
+        "elements": [
+          {
+            "textContent": "Saved"
+          }
+        ],
         "isInitial": false,
         "transitions": []
       },
@@ -981,9 +1148,17 @@
         "name": "Approval Dialog Visible",
         "description": "An approval node in a running DAG workflow has paused execution and the 'dag:approval-requested' event was received. The full-screen overlay is visible with 'Approval Required' heading and Approve/Reject buttons. The background page (including the YAML editor) remains visible but non-interactive behind the overlay.",
         "elements": [
-          { "textContent": "Approval Required" },
-          { "role": "button", "textContent": "Approve" },
-          { "role": "button", "textContent": "Reject" }
+          {
+            "textContent": "Approval Required"
+          },
+          {
+            "role": "button",
+            "textContent": "Approve"
+          },
+          {
+            "role": "button",
+            "textContent": "Reject"
+          }
         ],
         "isInitial": false,
         "transitions": [
@@ -991,14 +1166,24 @@
             "id": "approval-approve",
             "name": "User approves",
             "description": "User clicks Approve, respond_dag_approval is invoked with approved=true, dialog closes",
-            "activateStates": ["editor-valid"],
-            "deactivateStates": ["approval-dialog-open"],
+            "activateStates": [
+              "editor-valid"
+            ],
+            "deactivateStates": [
+              "approval-dialog-open"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Approve" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Approve"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -1006,14 +1191,24 @@
             "id": "approval-reject",
             "name": "User rejects",
             "description": "User clicks Reject, respond_dag_approval is invoked with approved=false, dialog closes",
-            "activateStates": ["editor-valid"],
-            "deactivateStates": ["approval-dialog-open"],
+            "activateStates": [
+              "editor-valid"
+            ],
+            "deactivateStates": [
+              "approval-dialog-open"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Reject" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Reject"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -1031,23 +1226,43 @@
             "id": "validation-valid-default",
             "name": "Default template validates as valid",
             "description": "Load the page, wait for validation to complete, assert 'Valid' badge and '3 nodes' count",
-            "groupIds": ["dag-validation-states", "dag-default-content"],
+            "groupIds": [
+              "dag-validation-states",
+              "dag-default-content"
+            ],
             "difficulty": "easy",
             "steps": [
-              { "type": "navigate", "url": "dag-workflow-editor" },
+              {
+                "type": "navigate",
+                "url": "dag-workflow-editor"
+              },
               {
                 "type": "wait",
                 "condition": "element",
-                "target": { "type": "search", "criteria": { "textContent": "Valid" } },
+                "target": {
+                  "type": "search",
+                  "criteria": {
+                    "textContent": "Valid"
+                  }
+                },
                 "timeoutMs": 3000
               },
-              { "type": "assert", "assertionId": "dag-validation-badge" },
-              { "type": "assert", "assertionId": "dag-default-node-count" }
+              {
+                "type": "assert",
+                "assertionId": "dag-validation-badge"
+              },
+              {
+                "type": "assert",
+                "assertionId": "dag-default-node-count"
+              }
             ],
             "teardown": [],
             "requiresRealBackend": true,
             "hasTiming": true,
-            "retryStrategy": { "maxAttempts": 2, "delayMs": 500 }
+            "retryStrategy": {
+              "maxAttempts": 2,
+              "delayMs": 500
+            }
           },
           {
             "id": "validation-error-missing-discriminator",
@@ -1060,20 +1275,37 @@
             ],
             "difficulty": "medium",
             "steps": [
-              { "type": "navigate", "url": "dag-workflow-editor" },
+              {
+                "type": "navigate",
+                "url": "dag-workflow-editor"
+              },
               {
                 "type": "wait",
                 "condition": "element",
-                "target": { "type": "search", "criteria": { "textContent": "Valid" } },
+                "target": {
+                  "type": "search",
+                  "criteria": {
+                    "textContent": "Valid"
+                  }
+                },
                 "timeoutMs": 3000
               },
-              { "type": "assert", "assertionId": "dag-error-badge-shown" },
-              { "type": "assert", "assertionId": "dag-graph-error-message" }
+              {
+                "type": "assert",
+                "assertionId": "dag-error-badge-shown"
+              },
+              {
+                "type": "assert",
+                "assertionId": "dag-graph-error-message"
+              }
             ],
             "teardown": [],
             "requiresRealBackend": true,
             "hasTiming": true,
-            "retryStrategy": { "maxAttempts": 2, "delayMs": 500 }
+            "retryStrategy": {
+              "maxAttempts": 2,
+              "delayMs": 500
+            }
           }
         ],
         "asyncStrategies": {
@@ -1083,7 +1315,12 @@
             "description": "Wait for validation badge to leave 'Checking...' state"
           }
         },
-        "beforeEach": [{ "type": "navigate", "url": "dag-workflow-editor" }],
+        "beforeEach": [
+          {
+            "type": "navigate",
+            "url": "dag-workflow-editor"
+          }
+        ],
         "afterEach": [],
         "requiresInfrastructure": {
           "pty": false,
@@ -1102,19 +1339,36 @@
             "id": "approval-dialog-shown-on-event",
             "name": "Approval dialog appears when dag:approval-requested event fires",
             "description": "Simulate a dag:approval-requested Tauri event and verify the overlay appears with correct content",
-            "groupIds": ["dag-approval-dialog"],
+            "groupIds": [
+              "dag-approval-dialog"
+            ],
             "difficulty": "hard",
             "hardnessReason": "Requires real Tauri event emission from backend, cannot be simulated with DOM fixtures alone",
             "steps": [
-              { "type": "navigate", "url": "dag-workflow-editor" },
-              { "type": "assert", "assertionId": "dag-approval-dialog-hidden-by-default" },
-              { "type": "assert", "assertionId": "dag-approval-dialog-heading" },
-              { "type": "assert", "assertionId": "dag-approval-dialog-buttons" }
+              {
+                "type": "navigate",
+                "url": "dag-workflow-editor"
+              },
+              {
+                "type": "assert",
+                "assertionId": "dag-approval-dialog-hidden-by-default"
+              },
+              {
+                "type": "assert",
+                "assertionId": "dag-approval-dialog-heading"
+              },
+              {
+                "type": "assert",
+                "assertionId": "dag-approval-dialog-buttons"
+              }
             ],
             "teardown": [],
             "requiresRealBackend": true,
             "hasTiming": true,
-            "retryStrategy": { "maxAttempts": 1, "delayMs": 0 }
+            "retryStrategy": {
+              "maxAttempts": 1,
+              "delayMs": 0
+            }
           }
         ],
         "asyncStrategies": {
@@ -1135,7 +1389,9 @@
           "tauriEvents": true
         },
         "automationCoverage": 40,
-        "manualAssertions": ["dag-approval-dialog-behavior"],
+        "manualAssertions": [
+          "dag-approval-dialog-behavior"
+        ],
         "notes": "Full approval flow testing requires a live DAG workflow with an approval node to be running. The dialog hidden-by-default check is easy and fully automatable."
       }
     }
