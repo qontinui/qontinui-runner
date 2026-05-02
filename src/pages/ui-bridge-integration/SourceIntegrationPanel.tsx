@@ -14,6 +14,7 @@ import {
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { ProjectAnalysis, IntegrationResult, FileModification, ApiResponse } from "./types";
 import { getApiBase } from "@/lib/runner-api";
+import { useSourceIntegrationPanelRegistrations } from "@/lib/ui-bridge/pages/sourceintegrationpanel-registrations";
 import { HookGenerationPanel } from "./HookGenerationPanel";
 import { PageSelectionPanel } from "./PageSelectionPanel";
 import type {
@@ -29,6 +30,7 @@ interface SourceIntegrationPanelProps {
 }
 
 export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegrationPanelProps = {}) {
+  const { projectPathInputRef, analyzeButtonRef } = useSourceIntegrationPanelRegistrations();
   const [projectPath, setProjectPath] = useState(initialProjectPath || "");
   const [analysis, setAnalysis] = useState<ProjectAnalysis | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -243,6 +245,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
           <div className="flex-1 relative">
             <FolderOpen className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
             <input
+              ref={projectPathInputRef}
               type="text"
               value={projectPath}
               onChange={(e) => setProjectPath(e.target.value)}
@@ -252,6 +255,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
             />
           </div>
           <button
+            ref={analyzeButtonRef}
             onClick={analyze}
             disabled={analyzing || !projectPath.trim()}
             className="flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded

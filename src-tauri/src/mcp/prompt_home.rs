@@ -165,24 +165,27 @@ The runner has these pages (state machine states):
 Each page has interactive elements (buttons, inputs, dropdowns) that can be targeted with natural language instructions.
 
 === Integration workflow on page-config-ui-bridge ===
-To integrate a project with UI Bridge and/or generate documentation/tutorials for it, always navigate to page-config-ui-bridge. The page has a HookGenerationPanel with these generation toggles (checkboxes):
-  - Generate Registrations — useUIElement() calls for every interactive element
-  - Generate Page IDs — data-page-id attributes for page discovery
-  - Generate Specs — UI Bridge .spec.uibridge.json files per page
-  - Generate Tutorials — interactive per-page tutorials
-  - Generate Architecture Diagrams — Mermaid flowcharts per page
-  - Generate Demo Videos — automated demo scripts
-  - Generate Product Tours — click-through feature tours
-  - Generate Project Explainer — hierarchical navigable docs
+To integrate a project with UI Bridge and/or generate documentation/tutorials for it, always navigate to page-config-ui-bridge. The Advanced disclosure reveals a project-path input, an Analyze button, and a generation-options checklist with these toggles (registered ids in backticks — use them verbatim with the `element <id>` form so NLActionExecutor routes directly via `/control/element/<id>/action`):
+  - `ui-bridge-generate-registrations-checkbox` — useUIElement() calls for every interactive element
+  - `ui-bridge-generate-page-ids-checkbox` — data-page-id attributes for page discovery
+  - `ui-bridge-generate-specs-checkbox` — UI Bridge .spec.uibridge.json files per page
+  - `ui-bridge-generate-tutorials-checkbox` — interactive per-page tutorials
+  - `ui-bridge-generate-architecture-diagrams-checkbox` — Mermaid flowcharts per page
+  - `ui-bridge-generate-demo-videos-checkbox` — automated demo scripts
+  - `ui-bridge-generate-product-tours-checkbox` — click-through feature tours
+  - `ui-bridge-generate-project-explainer-checkbox` — hierarchical navigable docs
 
 Typical action sequence when the user wants to integrate a project:
   1. action: "click element ui-bridge-advanced-disclosure" — opens the Advanced
      per-stage controls panel via direct id routing (see Disclosure widgets
      section below for the rationale)
-  2. action: "type '<PROJECT PATH>' in the project path input"
-  3. action: "click the Analyze button in the advanced panel"
-  4. action: "check the 'Generate <X>' checkbox" — once per requested generation type
-  5. action: "click the Generate button"
+  2. action: "type '<PROJECT PATH>' in element ui-bridge-project-path-input"
+  3. action: "click element ui-bridge-analyze-button"
+  4. action: "check element ui-bridge-generate-<X>-checkbox" — once per requested
+     generation type, using the registered ids listed above (e.g.
+     "check element ui-bridge-generate-tutorials-checkbox",
+     "check element ui-bridge-generate-project-explainer-checkbox")
+  5. action: "click element ui-bridge-generate-button"
 
 Pick only the checkboxes the user asked for — do not toggle options they didn't request.
 
