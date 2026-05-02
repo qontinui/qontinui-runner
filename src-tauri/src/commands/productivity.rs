@@ -601,7 +601,18 @@ http://localhost:{port}/coordinator/state and /coordinator/act.{plan_line}\n",
     // Double any literal single quotes per PS escape rules (rare on
     // temp paths but cheap defense).
     let escaped_path = path.to_string_lossy().replace('\'', "''");
-    Ok(format!("claude (Get-Content -Raw '{}')", escaped_path))
+    // --dangerously-skip-permissions is required for the Coordinator to
+    // run its observe→decide→act loop autonomously. The /coordinate
+    // skill is a trusted built-in role (see qontinui-claude-config/
+    // .claude/commands/coordinate.md): cheap rules cover most cases,
+    // destructive actions (kill-session, force-promote-to-worktree)
+    // are server-enforced as advisory regardless of the agent's claim
+    // (mcp/coordinator.rs::must_advise_only). Per the project CLAUDE.md
+    // the flag now bypasses prompts for writes to .claude/, .git/, etc.
+    Ok(format!(
+        "claude --dangerously-skip-permissions (Get-Content -Raw '{}')",
+        escaped_path
+    ))
 }
 
 /// Auto-numbered "Worker N" title — finds the highest existing N across
@@ -727,8 +738,11 @@ pub async fn spawn_worker_session(
     // PowerShell 5.1 doesn't accept `&&`, and the pty already starts
     // with `working_dir = Some(repo_path)` — no `cd` needed. Worker tabs
     // sit idle at the Claude prompt; Coordinator dispatches via
-    // assign-task → POST /sessions/<id>/message.
-    let initial_command = "claude".to_string();
+    // assign-task → POST /sessions/<id>/message. The
+    // --dangerously-skip-permissions flag lets the worker run the
+    // dispatched task without per-tool approval prompts (matches the
+    // Coordinator's flag for the same reason).
+    let initial_command = "claude --dangerously-skip-permissions".to_string();
 
     let info = terminal_manager.create(
         Some(title),
