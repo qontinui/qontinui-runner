@@ -171,10 +171,7 @@ pub async fn get_recording_session(
 /// Walk the `caused_by_event_id` chain backwards starting from `event_id`.
 /// Returns rows in root-first order — i.e. the requested event is the last
 /// entry. Returns an empty vector if `event_id` is not present.
-pub async fn get_causal_chain(
-    pg: &Arc<PgDb>,
-    event_id: i64,
-) -> Result<Vec<TraceEvent>, String> {
+pub async fn get_causal_chain(pg: &Arc<PgDb>, event_id: i64) -> Result<Vec<TraceEvent>, String> {
     let conn = pg
         .pool()
         .get()

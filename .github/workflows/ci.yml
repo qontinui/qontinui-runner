@@ -12,6 +12,11 @@ env:
 jobs:
   test:
     strategy:
+      # Surface platform-specific failures independently. Default fail-fast
+      # cancels ubuntu/windows the moment macos clippy trips, masking
+      # whether the linux/win build is actually OK. Now blocked only by
+      # genuine per-platform failures.
+      fail-fast: false
       matrix:
         platform: [ubuntu-22.04, macos-latest, windows-latest]
 
@@ -128,10 +133,20 @@ jobs:
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
 
       - name: Run security audit on Rust dependencies
+        # Cargo.lock lives at the workspace root (./Cargo.lock), not under
+        # src-tauri/. cargo-audit doesn't auto-walk to the workspace root,
+        # so --file points it at the right lockfile.
+        #
+        # --ignore RUSTSEC-2023-0071: Marvin Attack timing sidechannel in
+        # rsa 0.9.x, pulled in transitively by adb_client v3 (ADB device
+        # auth). Upstream advisory says "No fixed upgrade is available!".
+        # Threat model is mitigated for desktop ADB host-side use:
+        # attacker would need physical/local access AND the ability to
+        # drive many timing-measured auth attempts. Revisit when rsa
+        # ships a fix or adb_client switches RSA implementations.
         run: |
           cargo install cargo-audit
-          cd src-tauri
-          cargo audit
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

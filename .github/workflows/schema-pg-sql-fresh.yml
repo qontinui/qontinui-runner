@@ -51,13 +51,21 @@ jobs:
       - name: Checkout qontinui-web (sibling)
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/qontinui-web
+          # Hardcoded to jspinak/qontinui-web because the repo was
+          # transferred from the qontinui org to the jspinak account.
+          # `${{ github.repository_owner }}/qontinui-web` resolved to
+          # `qontinui/qontinui-web` (since this repo lives in the
+          # qontinui org) and the HTTPS clone returns 404 — GitHub's
+          # repo-rename redirect doesn't help when the cross-repo token
+          # only has access to jspinak/*.
+          repository: jspinak/qontinui-web
           path: qontinui-web
           # Use the same branch name if it exists in qontinui-web,
           # otherwise main. Avoids drift when both repos move together.
           ref: ${{ github.head_ref || github.ref_name }}
-          # Token in the workflow secrets to allow cross-repo checkout.
-          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          # CROSS_REPO_TOKEN must have Contents:Read on jspinak/qontinui-web
+          # (qontinui-web is private). Falling back to github.token will fail.
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -309,7 +309,7 @@ export function usePromptExecution(): UsePromptExecutionReturn {
  * ProjectCoordinator's `data-pipeline-phase` attribute. Adding new entries
  * here opts those clicks into the 30s phase-transition gate.
  */
-const PIPELINE_TRIGGER_IDS = new Set<string>([
+const _PIPELINE_TRIGGER_IDS = new Set<string>([
   "ui-bridge-analyze-button",
   "ui-bridge-generate-button",
 ]);
@@ -459,7 +459,7 @@ async function awaitElementRegistered(
 // attribute lives on ProjectCoordinator and only tracks the one-click "Integrate
 // this Project" flow — not the Advanced/SourceIntegrationPanel/PageSelectionPanel
 // path the home-prompt planner actually drives.
-async function awaitPipelinePhaseTransition(
+async function _awaitPipelinePhaseTransition(
   stepNumber: number,
   triggerId: string,
   timeoutMs = 30000,

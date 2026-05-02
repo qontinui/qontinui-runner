@@ -69,10 +69,7 @@ pub struct ListQuery {
     pub limit: Option<i64>,
 }
 
-pub async fn get_list(
-    State(_state): State<Arc<ApiState>>,
-    Query(q): Query<ListQuery>,
-) -> Response {
+pub async fn get_list(State(_state): State<Arc<ApiState>>, Query(q): Query<ListQuery>) -> Response {
     let pg = match require_pg() {
         Ok(p) => p,
         Err(r) => return r,
@@ -187,7 +184,11 @@ pub async fn get_causal_chain(
                 event_id: id,
                 chain,
             };
-            (StatusCode::OK, Json(json!({ "ok": true, "payload": payload }))).into_response()
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "payload": payload })),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -246,15 +247,8 @@ pub async fn post_save(
             .as_ref()
             .and_then(|cid| client_to_db.get(cid).copied());
 
-        match storage::insert_causal_event(
-            &pg,
-            event,
-            &session_id,
-            sequence,
-            timestamp,
-            caused_by,
-        )
-        .await
+        match storage::insert_causal_event(&pg, event, &session_id, sequence, timestamp, caused_by)
+            .await
         {
             Ok(db_id) => {
                 if let Some(client_id) = event.client_id.as_ref() {
