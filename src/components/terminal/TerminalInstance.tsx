@@ -483,8 +483,32 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         outputUnsub = unsub;
         if (disposed) return;
 
-        // If reconnecting: fetch scrollback buffer, write it, then open the gate
+        // Bootstrap: replay PTY scrollback into the freshly-mounted xterm.
+        // Always runs (initial mount + reconnect) so the init burst that
+        // arrived before `listen()` was wired up is replayed.
+        //
+        // Two correctness rules learned the hard way:
+        //   1. Wait for the canvas to actually composite before writing.
+        //      `backend.open(container)` is synchronous but the WebGL/canvas
+        //      renderer doesn't paint until the next paint frame. Writing
+        //      alt-screen sequences (`\x1b[?1049h` …) into an un-painted
+        //      canvas drops them — the bytes process internally but the
+        //      rendered output is the pre-alt-screen state. Two rAFs is the
+        //      tiniest reliable "after first paint" signal in browsers.
+        //   2. Chunk the replay across paint frames. xterm-canvas processes
+        //      alt-screen state-changes incrementally between frames; a
+        //      single big synchronous `write()` of the full backlog can
+        //      collapse them to a final state with the visible canvas
+        //      stuck on the start state.
         if (gate) {
+          // Wait two animation frames so backend.open()'s canvas is composited.
+          await new Promise<void>((resolve) => {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => resolve());
+            });
+          });
+          if (disposed) return;
+
           try {
             const result = await invoke<{
               success: boolean;
@@ -498,17 +522,32 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
                 bytes[i] = raw.charCodeAt(i);
               }
               if (bytes.length > 0) {
-                try {
-                  backend.write(bytes);
-                } catch (e) {
-                  console.error(`[Terminal ${terminalId}] scrollback write error:`, e);
+                // Chunk the replay across rAFs so alt-screen state-changes
+                // get a paint cycle each. 8 KB is roughly one Claude Code
+                // banner draw — small enough that any single chunk is one
+                // logical screen update; large enough to not drown rAFs.
+                const CHUNK = 8 * 1024;
+                for (let off = 0; off < bytes.length; off += CHUNK) {
+                  if (disposed) return;
+                  const slice = bytes.subarray(off, Math.min(off + CHUNK, bytes.length));
+                  try {
+                    backend.write(slice);
+                  } catch (e) {
+                    console.error(`[Terminal ${terminalId}] scrollback write error:`, e);
+                  }
+                  bytesReceivedRef.current += slice.length;
+                  if (off + CHUNK < bytes.length) {
+                    await new Promise<void>((resolve) =>
+                      requestAnimationFrame(() => resolve()),
+                    );
+                  }
                 }
-                bytesReceivedRef.current += bytes.length;
               }
             }
           } catch (err) {
             console.warn(`[Terminal ${terminalId}] Failed to fetch scrollback:`, err);
           }
+          if (disposed) return;
 
           // Open the gate and flush queued live events
           gate.open = true;
