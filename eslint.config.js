@@ -60,7 +60,12 @@ export default [
       "react-hooks/immutability": "warn",
       "react-hooks/purity": "warn",
       "react-hooks/preserve-manual-memoization": "warn",
-      "@qontinui/ui-bridge/require-state-annotation": "warn",
+      // UI Bridge Section 3 / Phase B5d: plugin is wired but the rule is
+      // intentionally OFF until the codebase is progressively annotated with
+      // <State> wrappers. The runner's `lint` script uses `--max-warnings 0`,
+      // so a 'warn' setting (1355 unannotated sites) breaks CI for unrelated
+      // PRs. Flip this to 'warn' once the per-page annotation pass lands.
+      "@qontinui/ui-bridge/require-state-annotation": "off",
     },
   },
   {
