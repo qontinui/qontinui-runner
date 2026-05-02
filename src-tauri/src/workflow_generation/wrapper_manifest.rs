@@ -362,6 +362,7 @@ mod tests {
             } else {
                 None
             },
+            keep_alive_ms: None,
         }
     }
 
@@ -437,6 +438,7 @@ mod tests {
                 None,
                 AppTransport::Websocket,
                 Some(1),
+                None,
             )
             .await;
         // One HTTP app — must be filtered out.
@@ -445,6 +447,7 @@ mod tests {
                 sample_app("http-app", "HTTP App"),
                 None,
                 AppTransport::Http,
+                None,
                 None,
             )
             .await;

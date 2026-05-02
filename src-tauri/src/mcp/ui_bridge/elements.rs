@@ -2817,6 +2817,7 @@ mod ws_dispatch_selection_tests {
                 None,
                 AppTransport::Websocket,
                 Some(7),
+                None,
             )
             .await;
         let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
@@ -2885,6 +2886,7 @@ mod ws_dispatch_selection_tests {
                 None,
                 AppTransport::Websocket,
                 Some(99),
+                None,
             )
             .await;
         let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
@@ -2926,7 +2928,7 @@ mod ws_dispatch_selection_tests {
         // through to its IPC path — proving the WS-wins rule applies only
         // to true WS-transport registrations, not to any registered id.
         registry
-            .upsert(sample_app("terminal"), None, AppTransport::Http, None)
+            .upsert(sample_app("terminal"), None, AppTransport::Http, None, None)
             .await;
         let none_outcome = try_ws_dispatch_for_app(
             &registry,
@@ -2962,6 +2964,7 @@ mod ws_dispatch_selection_tests {
                 None,
                 AppTransport::Websocket,
                 Some(13),
+                None,
             )
             .await;
         let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
@@ -2998,15 +3001,33 @@ mod ws_dispatch_selection_tests {
         let (_a_conn, mut a_rx) = ws.test_register("alpha").await;
         let (_b_conn, mut b_rx) = ws.test_register("beta").await;
         registry
-            .upsert(sample_app("alpha"), None, AppTransport::Websocket, Some(1))
+            .upsert(
+                sample_app("alpha"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
             .await;
         registry
-            .upsert(sample_app("beta"), None, AppTransport::Websocket, Some(2))
+            .upsert(
+                sample_app("beta"),
+                None,
+                AppTransport::Websocket,
+                Some(2),
+                None,
+            )
             .await;
         // An HTTP-transport entry should be ignored entirely by
         // `ws_collect_components`.
         registry
-            .upsert(sample_app("legacy-http"), None, AppTransport::Http, None)
+            .upsert(
+                sample_app("legacy-http"),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
             .await;
 
         let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
