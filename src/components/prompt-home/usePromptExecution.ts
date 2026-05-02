@@ -240,14 +240,20 @@ export function usePromptExecution(): UsePromptExecutionReturn {
               }
             }
 
-            // P18B — pipeline-phase poll for the two known phase-changing
-            // triggers. After clicking Analyze or Generate, the
-            // ProjectCoordinator's `data-pipeline-phase` must transition out
-            // of "idle" within 30s; staying at idle means the click reached
-            // the DOM but the React handler didn't fire (button gated,
-            // double-click guard, project not selected, etc).
-            if (targetId && PIPELINE_TRIGGER_IDS.has(targetId)) {
-              await awaitPipelinePhaseTransition(i + 1, targetId);
+            // P18B/P21 — post-action effect verification for the integration
+            // flow's two phase-changing buttons. These click the Advanced
+            // SourceIntegrationPanel's Analyze button or the PageSelectionPanel's
+            // Generate button — neither updates ProjectCoordinator's
+            // data-pipeline-phase (that attribute only tracks the OUTER
+            // one-click "Integrate this Project" flow). Instead, wait for the
+            // next-step's target element to appear in the registered DOM:
+            // Analyze success → PageSelectionPanel mounts → ui-bridge-generate-button
+            //                   registers, proving Analyze + Discover ran.
+            // Generate success → preview panel renders → Apply/Discard buttons
+            //                   appear.
+            const postActionWait = POST_ACTION_WAITS.get(targetId ?? "");
+            if (postActionWait) {
+              await awaitElementRegistered(i + 1, targetId!, postActionWait);
             }
           }
         }
@@ -363,6 +369,80 @@ function parseDirectIdInstruction(instruction: string): DirectIdInstruction | nu
  * "applied", "no-pages"). Throws if it stays at "idle" past `timeoutMs`,
  * or transitions to "failed" at any point.
  */
+interface PostActionWait {
+  /** Element id we expect to appear in the live DOM after the trigger. */
+  expectId: string;
+  /** Plain-English description for the timeout error. */
+  description: string;
+  timeoutMs?: number;
+}
+
+/**
+ * Map from trigger element id to the post-action UI signal we expect.
+ * Used by P18B/P21: after an action that fires a long-running handler,
+ * wait for the handler's visible effect (next-step target element appearing)
+ * rather than relying on a phase attribute that may not be wired up.
+ */
+const POST_ACTION_WAITS: Map<string, PostActionWait> = new Map([
+  [
+    "ui-bridge-analyze-button",
+    {
+      expectId: "ui-bridge-generate-button",
+      description: "PageSelectionPanel did not mount (Analyze + Discover did not produce pages)",
+      timeoutMs: 30000,
+    },
+  ],
+  // Note: ui-bridge-generate-button intentionally has NO post-action wait.
+  // Generate kicks off a 5-15 min AI session; the executor's job is to fire
+  // the click, not block until completion. The BackgroundTaskPill (P19A)
+  // handles the long-running visibility, and the user fire-and-forgets.
+]);
+
+/**
+ * Wait for `expectId` to be present in the document's registered-element
+ * registry (as `[data-ui-bridge-id="..."]`) within `timeoutMs`. MutationObserver
+ * captures every DOM change without polling, so it doesn't miss fast appearances.
+ *
+ * Throws if the element doesn't appear within the timeout — that's the loud
+ * "your trigger click had no observable effect" signal.
+ */
+async function awaitElementRegistered(
+  stepNumber: number,
+  triggerId: string,
+  wait: PostActionWait,
+): Promise<void> {
+  const timeoutMs = wait.timeoutMs ?? 30000;
+  const selector = `[data-ui-bridge-id="${wait.expectId}"]`;
+
+  // Already present? Skip the observer entirely.
+  if (document.querySelector(selector)) return;
+
+  return new Promise<void>((resolve, reject) => {
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    const observer = new MutationObserver(() => {
+      if (document.querySelector(selector)) {
+        observer.disconnect();
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+        resolve();
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    timeoutHandle = setTimeout(() => {
+      observer.disconnect();
+      reject(
+        new Error(
+          `Step ${stepNumber} failed: ${wait.description} — expected element "${wait.expectId}" did not appear within ${Math.round(timeoutMs / 1000)} s after clicking ${triggerId}`,
+        ),
+      );
+    }, timeoutMs);
+  });
+}
+
+// Kept for reference; no longer called by the executor. The data-pipeline-phase
+// attribute lives on ProjectCoordinator and only tracks the one-click "Integrate
+// this Project" flow — not the Advanced/SourceIntegrationPanel/PageSelectionPanel
+// path the home-prompt planner actually drives.
 async function awaitPipelinePhaseTransition(
   stepNumber: number,
   triggerId: string,
