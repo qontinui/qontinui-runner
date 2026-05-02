@@ -206,7 +206,9 @@
           "expected": "Format 'v{N}' where N is the version_number integer",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "v" },
+            "criteria": {
+              "textContent": "v"
+            },
             "label": "Version number label"
           },
           "source": "manual",
@@ -222,7 +224,9 @@
           "expected": "One of: generation (green), reflection (purple), manual (blue), fix (orange)",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "generation|reflection|manual|fix" },
+            "criteria": {
+              "textContent": "generation|reflection|manual|fix"
+            },
             "label": "Trigger type badge"
           },
           "source": "manual",
@@ -238,7 +242,9 @@
           "expected": "Free-text summary of changes, clamped to 2 lines, in muted background — may be absent for first version",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Workflow Version Lineage" },
+            "criteria": {
+              "textContent": "Workflow Version Lineage"
+            },
             "label": "Version lineage container"
           },
           "source": "manual",
@@ -263,7 +269,9 @@
           "precondition": "No workflow is selected in the execution context",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Select a workflow to view version history" },
+            "criteria": {
+              "textContent": "Select a workflow to view version history"
+            },
             "label": "No selection guidance"
           },
           "source": "manual",
@@ -278,7 +286,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Workflow Version Lineage" },
+            "criteria": {
+              "textContent": "Workflow Version Lineage"
+            },
             "label": "Scrollable version list"
           },
           "source": "manual",
@@ -295,15 +305,23 @@
         "id": "wf-ver-no-selection",
         "name": "No Selection — No Workflow Selected",
         "description": "No workflow has been selected in the execution context. The panel displays a guidance message prompting the user to select a workflow to view version history.",
-        "elements": [{ "textContent": "Select a workflow to view version history" }],
+        "elements": [
+          {
+            "textContent": "Select a workflow to view version history"
+          }
+        ],
         "isInitial": true,
         "transitions": [
           {
             "id": "no-selection-to-loading",
             "name": "Select a workflow",
             "description": "User selects a workflow from the execution context, triggering a data fetch for version history",
-            "activateStates": ["wf-ver-loading"],
-            "deactivateStates": ["wf-ver-no-selection"],
+            "activateStates": [
+              "wf-ver-loading"
+            ],
+            "deactivateStates": [
+              "wf-ver-no-selection"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -313,14 +331,22 @@
         "id": "wf-ver-loading",
         "name": "Loading — Fetching Version History",
         "description": "A workflow is selected and version history data is being fetched from the backend. A loading indicator is displayed to prevent confusion about a blank timeline.",
-        "elements": [{ "textContent": "Loading versions..." }],
+        "elements": [
+          {
+            "textContent": "Loading versions..."
+          }
+        ],
         "transitions": [
           {
             "id": "loading-to-empty",
             "name": "No versions exist",
             "description": "Data fetch completes but no version history exists for the selected workflow",
-            "activateStates": ["wf-ver-empty"],
-            "deactivateStates": ["wf-ver-loading"],
+            "activateStates": [
+              "wf-ver-empty"
+            ],
+            "deactivateStates": [
+              "wf-ver-loading"
+            ],
             "staysVisible": false,
             "process": []
           },
@@ -328,8 +354,12 @@
             "id": "loading-to-timeline",
             "name": "Versions found",
             "description": "Data fetch completes and one or more versions are returned, displaying the version timeline",
-            "activateStates": ["wf-ver-timeline"],
-            "deactivateStates": ["wf-ver-loading"],
+            "activateStates": [
+              "wf-ver-timeline"
+            ],
+            "deactivateStates": [
+              "wf-ver-loading"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -340,16 +370,21 @@
         "name": "Empty — No Version History Available",
         "description": "A workflow is selected but it has no version history. A clear message explains that no versions exist yet.",
         "elements": [
-          { "textContent": "Workflow Version Lineage" },
-          { "textContent": "No version history available" }
+          {
+            "textContent": "No version history available"
+          }
         ],
         "transitions": [
           {
             "id": "empty-to-no-selection",
             "name": "Deselect workflow",
             "description": "User deselects or switches away from the current workflow, returning to the no-selection state",
-            "activateStates": ["wf-ver-no-selection"],
-            "deactivateStates": ["wf-ver-empty"],
+            "activateStates": [
+              "wf-ver-no-selection"
+            ],
+            "deactivateStates": [
+              "wf-ver-empty"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -359,14 +394,22 @@
         "id": "wf-ver-timeline",
         "name": "Timeline — Version History Displayed",
         "description": "The version timeline is displayed with version nodes showing version numbers (v1, v2, etc.), color-coded trigger badges (generation/reflection/manual/fix), formatted timestamps, and diff summaries. The list scrolls vertically when versions exceed the visible area.",
-        "elements": [{ "textContent": "Workflow Version Lineage" }, { "role": "listitem" }],
+        "elements": [
+          {
+            "role": "listitem"
+          }
+        ],
         "transitions": [
           {
             "id": "timeline-to-no-selection",
             "name": "Deselect workflow",
             "description": "User deselects or switches away from the current workflow, returning to the no-selection state",
-            "activateStates": ["wf-ver-no-selection"],
-            "deactivateStates": ["wf-ver-timeline"],
+            "activateStates": [
+              "wf-ver-no-selection"
+            ],
+            "deactivateStates": [
+              "wf-ver-timeline"
+            ],
             "staysVisible": false,
             "process": []
           },
@@ -374,8 +417,12 @@
             "id": "timeline-to-loading",
             "name": "Select a different workflow",
             "description": "User selects a different workflow, triggering a new data fetch",
-            "activateStates": ["wf-ver-loading"],
-            "deactivateStates": ["wf-ver-timeline"],
+            "activateStates": [
+              "wf-ver-loading"
+            ],
+            "deactivateStates": [
+              "wf-ver-timeline"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -390,7 +437,13 @@
     "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/workflow-versions",
     "elementSource": "sdk",
-    "tags": ["knowledge-graph", "workflow", "versioning", "lineage", "runner-only"],
+    "tags": [
+      "knowledge-graph",
+      "workflow",
+      "versioning",
+      "lineage",
+      "runner-only"
+    ],
     "preconditions": [
       "Requires a workflow to be selected in the execution context (useExecution hook)",
       "Version history only exists for workflows generated after instrumentation was added",

@@ -573,25 +573,34 @@
         "id": "pw-unmodified",
         "name": "Settings Loaded — No Changes",
         "description": "The Playwright settings form has loaded its values from the backend. No field has been modified. The Save Settings button is disabled (grey, cursor-not-allowed).",
-        "elements": [
-          { "role": "button", "textContent": "Save Settings" },
-          { "textContent": "Playwright Tests" }
-        ],
+        "elements": [],
         "isInitial": true,
         "transitions": [
           {
             "id": "pw-unmodified-to-modified",
             "name": "Modify a field",
             "description": "Type in the username, password, or base URL input, or click the Skip Web Server toggle to enable changes",
-            "activateStates": ["pw-modified"],
-            "deactivateStates": ["pw-unmodified"],
+            "activateStates": [
+              "pw-modified"
+            ],
+            "deactivateStates": [
+              "pw-unmodified"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "type",
-                "target": { "idPattern": "^test-username$", "tagName": "input" },
-                "params": { "text": "testuser" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "idPattern": "^test-username$",
+                  "tagName": "input"
+                },
+                "params": {
+                  "text": "testuser"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -601,24 +610,31 @@
         "id": "pw-modified",
         "name": "Settings Modified — Unsaved Changes",
         "description": "At least one field has been modified since the last save or page load. The Save Settings button is enabled (primary color, clickable).",
-        "elements": [
-          { "role": "button", "textContent": "Save Settings" },
-          { "textContent": "Playwright Tests" }
-        ],
+        "elements": [],
         "isInitial": false,
         "transitions": [
           {
             "id": "pw-modified-to-saving",
             "name": "Click Save Settings",
             "description": "Click the enabled Save Settings button to trigger the save IPC call",
-            "activateStates": ["pw-saving"],
-            "deactivateStates": ["pw-modified"],
+            "activateStates": [
+              "pw-saving"
+            ],
+            "deactivateStates": [
+              "pw-modified"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Save Settings" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Save Settings"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -628,21 +644,36 @@
         "id": "pw-saving",
         "name": "Saving in Progress",
         "description": "The save IPC call is in progress. The button shows 'Saving...' text and is disabled. Transitions automatically to pw-unmodified on success, or back to pw-modified on error.",
-        "elements": [{ "role": "button", "textContent": "Saving..." }],
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Saving..."
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "pw-saving-to-unmodified",
             "name": "Save completes successfully",
             "description": "After the IPC call returns success, the button reverts to 'Save Settings' (disabled) and hasChanges resets to false",
-            "activateStates": ["pw-unmodified"],
-            "deactivateStates": ["pw-saving"],
+            "activateStates": [
+              "pw-unmodified"
+            ],
+            "deactivateStates": [
+              "pw-saving"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Save Settings" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Save Settings"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           }
