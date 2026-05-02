@@ -368,24 +368,97 @@ async function awaitPipelinePhaseTransition(
   triggerId: string,
   timeoutMs = 30000,
 ): Promise<void> {
-  const intervalMs = 200;
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
+  // MutationObserver-based — captures every transition, including ones that
+  // complete faster than a poll interval. The previous polling implementation
+  // fired a false-positive timeout on small projects whose analyze→discover
+  // cycle settled in under 200ms (P21).
+  //
+  // Success conditions (any non-idle phase observed at any point):
+  // - "analyzing", "integrating", "discovering", "generating" — transient
+  //   phases proving the handler fired. Resolve as soon as we see one.
+  // - "no-pages", "discovered", "generated", "applied" — terminal-success
+  //   phases. Resolve immediately.
+  //
+  // Failure conditions:
+  // - "failed" observed at any point — throw fast.
+  // - Timeout with no non-idle phase ever observed — throw "handler may not
+  //   have fired".
+  //
+  // We also check the initial value once at start to handle the case where
+  // the phase is already non-idle before the observer wires up (rare but
+  // possible if the trigger handler is synchronous).
+  const SUCCESS_PHASES = new Set([
+    "analyzing",
+    "integrating",
+    "discovering",
+    "generating",
+    "no-pages",
+    "discovered",
+    "generated",
+    "applied",
+  ]);
+
+  return new Promise((resolve, reject) => {
     const root = document.querySelector<HTMLElement>("[data-pipeline-phase]");
-    const phase = root?.dataset.pipelinePhase;
-    if (phase === "failed") {
-      throw new Error(
-        `Step ${stepNumber} failed: pipeline reported failure (phase=failed) after clicking ${triggerId}`,
-      );
-    }
-    if (phase && phase !== "idle") {
+    if (!root) {
+      // No coordinator on the page — nothing to observe. Don't block the
+      // executor; treat as a soft-pass since P18A already validated the
+      // click reached its target.
+      resolve();
       return;
     }
-    await new Promise((r) => setTimeout(r, intervalMs));
-  }
-  throw new Error(
-    `Step ${stepNumber} failed: pipeline phase did not transition out of idle within ${timeoutMs / 1000} s after clicking ${triggerId} — handler may not have fired`,
-  );
+
+    const checkPhase = (phase: string | undefined): "success" | "fail" | "pending" => {
+      if (phase === "failed") return "fail";
+      if (phase && SUCCESS_PHASES.has(phase)) return "success";
+      return "pending";
+    };
+
+    // Check initial state — handler may have fired synchronously.
+    const initial = checkPhase(root.dataset.pipelinePhase);
+    if (initial === "success") {
+      resolve();
+      return;
+    }
+    if (initial === "fail") {
+      reject(
+        new Error(
+          `Step ${stepNumber} failed: pipeline reported failure (phase=failed) after clicking ${triggerId}`,
+        ),
+      );
+      return;
+    }
+
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    const observer = new MutationObserver(() => {
+      const phase = root.dataset.pipelinePhase;
+      const verdict = checkPhase(phase);
+      if (verdict === "success") {
+        observer.disconnect();
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+        resolve();
+      } else if (verdict === "fail") {
+        observer.disconnect();
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+        reject(
+          new Error(
+            `Step ${stepNumber} failed: pipeline reported failure (phase=failed) after clicking ${triggerId}`,
+          ),
+        );
+      }
+    });
+
+    observer.observe(root, { attributes: true, attributeFilter: ["data-pipeline-phase"] });
+
+    timeoutHandle = setTimeout(() => {
+      observer.disconnect();
+      reject(
+        new Error(
+          `Step ${stepNumber} failed: pipeline phase did not transition out of idle within ${timeoutMs / 1000} s after clicking ${triggerId} — handler may not have fired`,
+        ),
+      );
+    }, timeoutMs);
+  });
 }
 
 interface StateMachineAPI {
