@@ -1532,6 +1532,15 @@ pub fn create_router(
         // outside `/ui-bridge/...` because the surface is consumed
         // differently (IR + projection storage, not page-control RPC).
         .merge(crate::spec_api::routes())
+        // Section 5b of UI Bridge redesign — `/trace/...` Trace API. Gated
+        // on `settings.trace_api.enabled` (default false) because it
+        // depends on the Alembic migration `section_5b_01_ui_bridge_causal_columns`
+        // being applied to the shared Postgres host.
+        .merge(if crate::settings::load_settings().trace_api.enabled {
+            crate::trace_api::routes()
+        } else {
+            axum::Router::new()
+        })
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))

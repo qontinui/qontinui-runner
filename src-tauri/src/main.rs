@@ -115,6 +115,7 @@ mod skills;
 mod slash_commands;
 mod spawn_placement;
 mod spec_api;
+mod trace_api;
 mod spec_experimentation;
 mod spec_utils;
 mod startup_panic;
