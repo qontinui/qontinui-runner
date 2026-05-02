@@ -121,7 +121,7 @@ jobs:
         with:
           node-version: "20"
           cache: "pnpm"
-          cache-dependency-path: qontinui-runner/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -143,9 +143,7 @@ jobs:
             librsvg2-dev
 
       - name: Install frontend dependencies
-        run: |
-          cd qontinui-runner
-          pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       # Download bundled Python executor if it was built
       - name: Download Python executor
@@ -204,9 +202,7 @@ jobs:
         # env:
         #   TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          cd qontinui-runner
-          pnpm run tauri build -- --target ${{ matrix.target }}
+        run: pnpm run tauri build -- --target ${{ matrix.target }}
 
       # - name: Sign Windows executable
       #   if: runner.os == 'Windows'
