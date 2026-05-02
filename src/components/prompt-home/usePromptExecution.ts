@@ -184,6 +184,22 @@ export function usePromptExecution(): UsePromptExecutionReturn {
             const preState = targetId ? bridge.getElementState(targetId) : undefined;
 
             if (directIdMatch) {
+              // Auto-scroll registered targets into view before acting.
+              // The SDK's wait-for-conditions rejects elements whose rect
+              // doesn't intersect the viewport, and PageSelectionPanel's
+              // checkboxes / Generate button live ~1700px down the page —
+              // far below a typical 800px viewport. Without this, the
+              // executor times out at "Timeout waiting for conditions
+              // after 5000ms" on every off-screen registered target.
+              // Best-effort: ignore failures so a non-existent target still
+              // surfaces via the action call's own error.
+              try {
+                await bridge.executeAction(directIdMatch.targetId, {
+                  action: "scrollIntoView",
+                });
+              } catch {
+                /* fall through — primary action will report the real error */
+              }
               // Direct path — same code path as Path A (HTTP handler).
               const directResult = await bridge.executeAction(
                 directIdMatch.targetId,
