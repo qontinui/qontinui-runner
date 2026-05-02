@@ -292,18 +292,35 @@ export default KnowledgeBrowser;
  * Hook that toggles a state value when the user presses Ctrl+Shift+K
  * anywhere in the app. Mounted once at the App.tsx level (or wherever
  * we want the global shortcut to live). Returns `[open, setOpen]`.
+ *
+ * UI Bridge automation can also trigger the modal by dispatching a
+ * `productivity-open-knowledge-modal` CustomEvent on `window`, since
+ * synthetic KeyboardEvents from `/control/page/evaluate` carry
+ * `isTrusted=false` and may be filtered out by browser-level checks.
  */
 export function useKnowledgeBrowserHotkey(): [boolean, (v: boolean) => void] {
   const [open, setOpen] = useState(false);
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
+    const keyHandler = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.shiftKey && (e.key === "K" || e.key === "k")) {
         e.preventDefault();
         setOpen((v) => !v);
       }
     };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
+    const eventHandler = (e: Event) => {
+      const detail = (e as CustomEvent<{ open?: boolean }>).detail;
+      if (detail && typeof detail.open === "boolean") {
+        setOpen(detail.open);
+      } else {
+        setOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", keyHandler);
+    window.addEventListener("productivity-open-knowledge-modal", eventHandler);
+    return () => {
+      window.removeEventListener("keydown", keyHandler);
+      window.removeEventListener("productivity-open-knowledge-modal", eventHandler);
+    };
   }, []);
   return [open, setOpen];
 }

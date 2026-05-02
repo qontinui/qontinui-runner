@@ -178,11 +178,15 @@ function PlansList({
 }: PlansListProps) {
   return (
     <div
+      role="region"
+      aria-labelledby="productivity-plan-list-heading"
       className="flex flex-col h-full border-r border-border bg-card/30"
       data-ui-bridge-id="productivity.plan-list"
     >
       <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <h2 className="text-sm font-semibold text-foreground">Plans</h2>
+        <h2 id="productivity-plan-list-heading" className="text-sm font-semibold text-foreground">
+          Plans
+        </h2>
         <div className="flex items-center gap-2">
           <label
             className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
@@ -359,11 +363,16 @@ function TasksList({
 
   return (
     <div
+      role="region"
+      aria-labelledby="productivity-task-list-heading"
       className="flex flex-col h-full border-r border-border bg-background"
       data-ui-bridge-id="productivity.task-list"
     >
       <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <h2 className="text-sm font-semibold text-foreground truncate">
+        <h2
+          id="productivity-task-list-heading"
+          className="text-sm font-semibold text-foreground truncate"
+        >
           {plan ? `Tasks · ${plan.title ?? plan.markdownPath}` : "Tasks"}
         </h2>
         <button
@@ -430,9 +439,19 @@ interface TaskDetailPanelProps {
 
 function TaskDetailPanel({ detail, loading, error }: TaskDetailPanelProps) {
   return (
-    <div className="flex flex-col h-full bg-card/20" data-ui-bridge-id="productivity.task-detail">
+    <div
+      role="region"
+      aria-labelledby="productivity-task-detail-heading"
+      className="flex flex-col h-full bg-card/20"
+      data-ui-bridge-id="productivity.task-detail"
+    >
       <div className="px-3 py-2 border-b border-border">
-        <h2 className="text-sm font-semibold text-foreground">Task Detail</h2>
+        <h2
+          id="productivity-task-detail-heading"
+          className="text-sm font-semibold text-foreground"
+        >
+          Task Detail
+        </h2>
       </div>
       <div className="flex-1 overflow-y-auto p-3 space-y-4">
         {!detail && !loading && !error ? (
