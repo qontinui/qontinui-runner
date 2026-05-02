@@ -563,7 +563,7 @@ export function ProjectCoordinator({
   // =========================================================================
 
   return (
-    <div className="flex flex-col gap-4" data-pipeline-phase={phase}>
+    <div className="flex flex-col gap-4" data-pipeline-phase={phase} data-task-phase={phase}>
       {/* ----- Project picker ----- */}
       <div className="p-4 rounded-lg border border-border bg-card/50">
         <div className="flex items-center justify-between mb-2">

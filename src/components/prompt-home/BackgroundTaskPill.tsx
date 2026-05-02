@@ -7,34 +7,59 @@ import { usePromptExecutionContext } from "./PromptExecutionContext";
  * any tab. Mounted in App.tsx inside `PromptExecutionProvider` but outside
  * `<TabContent>` so it survives tab switches.
  *
- * Phase A scope: shows the prompt label, a colored phase badge polled from
- * the in-page `[data-pipeline-phase]` attribute, elapsed time, and a manual
- * dismiss button. Phases B/C/D (click-to-jump, terminal-state toast,
- * multi-task array) are deferred.
+ * Phase A scope: shows the prompt label, a colored phase badge sourced from
+ * any in-page `[data-task-phase]` element (legacy `[data-pipeline-phase]`
+ * also honoured), elapsed time, and a manual dismiss button. Phases B/C/D
+ * (click-to-jump, terminal-state toast, multi-task array) are deferred.
+ *
+ * Phase-source convention: any component that owns a long-running operation
+ * exposes `data-task-phase="<phase>"` on its root element. The pill scans
+ * every such element on every poll/mutation and picks the first non-idle
+ * phase it finds. Multiple panels (ProjectCoordinator's one-click flow,
+ * HookGenerationPanel's per-page generation) can coexist; whichever is
+ * actually working at the moment wins.
  */
 
 const POLL_INTERVAL_MS = 500;
 const ELAPSED_TICK_MS = 1000;
 const PROMPT_LABEL_MAX = 40;
 
-const TERMINAL_SUCCESS_PHASES: ReadonlySet<string> = new Set(["applied", "generated"]);
+const TERMINAL_SUCCESS_PHASES: ReadonlySet<string> = new Set([
+  "applied",
+  "generated",
+  "preview", // HookGenerationPanel's "ready to apply" state
+]);
 const TERMINAL_ERROR_PHASES: ReadonlySet<string> = new Set(["failed"]);
-const IN_PROGRESS_PHASES: ReadonlySet<string> = new Set([
+const IN_PROGRESS_PHASE_PREFIXES: readonly string[] = [
   "analyzing",
   "integrating",
   "discovering",
-  "generating",
-]);
+  "generating", // catches HookGenerationPanel's "generating-page-tutorial" etc.
+  "applying",
+];
+const IDLE_PHASES: ReadonlySet<string> = new Set(["idle", "no-pages"]);
 
-function readPipelinePhase(): string | null {
+/**
+ * Scan every `[data-task-phase]` (canonical) and `[data-pipeline-phase]`
+ * (legacy) element on the page. Return the first non-idle phase value
+ * encountered, or the first idle one if everything is idle, or null if
+ * no phase-emitting element is mounted.
+ */
+function readActiveTaskPhase(): string | null {
   if (typeof document === "undefined") return null;
-  const el = document.querySelector("[data-pipeline-phase]");
-  if (!el) return null;
-  // dataset is only typed on HTMLElement, so narrow before reading.
-  if (el instanceof HTMLElement) {
-    return el.dataset.pipelinePhase ?? null;
+  const selectors = "[data-task-phase], [data-pipeline-phase]";
+  const elements = document.querySelectorAll<HTMLElement>(selectors);
+  let firstIdle: string | null = null;
+  for (const el of elements) {
+    const phase = el.dataset.taskPhase ?? el.dataset.pipelinePhase ?? null;
+    if (!phase) continue;
+    if (!IDLE_PHASES.has(phase)) {
+      // Active surface — prefer it.
+      return phase;
+    }
+    if (firstIdle === null) firstIdle = phase;
   }
-  return el.getAttribute("data-pipeline-phase");
+  return firstIdle;
 }
 
 function formatElapsed(startedAt: number, now: number): string {
@@ -54,9 +79,11 @@ type Tone = "in-progress" | "success" | "error" | "muted";
 
 function classifyPhase(phase: string | null): Tone {
   if (!phase) return "muted";
-  if (TERMINAL_SUCCESS_PHASES.has(phase)) return "success";
   if (TERMINAL_ERROR_PHASES.has(phase)) return "error";
-  if (IN_PROGRESS_PHASES.has(phase)) return "in-progress";
+  if (TERMINAL_SUCCESS_PHASES.has(phase)) return "success";
+  if (IN_PROGRESS_PHASE_PREFIXES.some((p) => phase === p || phase.startsWith(`${p}-`))) {
+    return "in-progress";
+  }
   return "muted";
 }
 
@@ -76,20 +103,24 @@ const BORDER_TONE_CLASSES: Record<Tone, string> = {
 
 export function BackgroundTaskPill() {
   const { backgroundTask, clearBackgroundTask } = usePromptExecutionContext();
-  const [pipelinePhase, setPipelinePhase] = useState<string | null>(null);
+  const [activePhase, setActivePhase] = useState<string | null>(null);
   const [now, setNow] = useState<number>(() => Date.now());
 
-  // Poll `data-pipeline-phase` while a task is in flight. Restarting the
-  // interval whenever `backgroundTask` changes ensures we tear down the
-  // poller as soon as the user dismisses the pill.
+  // Poll `[data-task-phase]` / `[data-pipeline-phase]` while a task is in
+  // flight. We use a polling interval rather than MutationObserver because
+  // the phase-emitting element may not exist at pill-mount (panels mount
+  // lazily mid-flow), so the observer would need to re-attach on body
+  // mutations anyway — equivalent cost. Restarting the interval whenever
+  // `backgroundTask` changes ensures we tear down the poller as soon as
+  // the user dismisses the pill.
   useEffect(() => {
     if (!backgroundTask) {
-      setPipelinePhase(null);
+      setActivePhase(null);
       return;
     }
-    setPipelinePhase(readPipelinePhase());
+    setActivePhase(readActiveTaskPhase());
     const id = window.setInterval(() => {
-      setPipelinePhase(readPipelinePhase());
+      setActivePhase(readActiveTaskPhase());
     }, POLL_INTERVAL_MS);
     return () => window.clearInterval(id);
   }, [backgroundTask]);
@@ -106,8 +137,8 @@ export function BackgroundTaskPill() {
 
   if (!backgroundTask) return null;
 
-  const tone = classifyPhase(pipelinePhase);
-  const badgeLabel = pipelinePhase ?? "starting…";
+  const tone = classifyPhase(activePhase);
+  const badgeLabel = activePhase ?? "starting…";
   const promptLabel = truncatePrompt(backgroundTask.promptText) || "(no prompt text)";
 
   return (

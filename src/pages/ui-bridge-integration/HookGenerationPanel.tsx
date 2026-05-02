@@ -1880,7 +1880,7 @@ export function HookGenerationPanel({
   }, {});
 
   return (
-    <div className="p-4 rounded-lg border border-border bg-card/50">
+    <div className="p-4 rounded-lg border border-border bg-card/50" data-task-phase={phase}>
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-medium flex items-center gap-1.5">
           <Sparkles className="w-3.5 h-3.5 text-purple-400" />
