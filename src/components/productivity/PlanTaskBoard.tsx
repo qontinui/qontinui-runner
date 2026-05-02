@@ -741,37 +741,6 @@ export function PlanTaskBoard() {
     return () => window.removeEventListener("productivity-select-plan", onSelectPlan);
   }, []);
 
-  // Listen for cross-component task-selection events (e.g. from the
-  // Recommendations queue's "Open task" button on the Coordinator
-  // dashboard). The task may belong to a plan that isn't yet selected,
-  // so we fetch the task detail to discover its parent plan, switch to
-  // that plan, then highlight the task.
-  useEffect(() => {
-    function onSelectTask(e: Event) {
-      const detail = (e as CustomEvent<{ taskId?: string }>).detail;
-      const taskId = detail?.taskId;
-      if (!taskId) return;
-      let cancelled = false;
-      void (async () => {
-        try {
-          const td = await getTaskDetail(taskId);
-          if (cancelled) return;
-          setSelectedPlanId(td.task.planId);
-          setSelectedTaskId(taskId);
-        } catch {
-          // Best-effort: silently ignore. The Coordinator dashboard
-          // already navigated to the Plans sub-view; user can pick
-          // the task by hand.
-        }
-      })();
-      return () => {
-        cancelled = true;
-      };
-    }
-    window.addEventListener("productivity-select-task", onSelectTask);
-    return () => window.removeEventListener("productivity-select-task", onSelectTask);
-  }, []);
-
   const selectedPlan = useMemo(
     () => plans.find((p) => p.id === selectedPlanId) ?? null,
     [plans, selectedPlanId],
@@ -800,8 +769,6 @@ export function PlanTaskBoard() {
             <button
               type="button"
               onClick={handleReflectionToggle}
-              data-ui-bridge-id="productivity.reflection-toggle"
-              data-plan-id={selectedPlan.id}
               className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
               aria-expanded={reflectionOpen}
             >
