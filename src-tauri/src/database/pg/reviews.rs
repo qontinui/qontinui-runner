@@ -188,7 +188,10 @@ impl PgDb {
 
         let row = conn
             .query_opt(
-                &format!("SELECT {} FROM coord.reviews WHERE id = $1::uuid", SELECT_COLS),
+                &format!(
+                    "SELECT {} FROM coord.reviews WHERE id = $1::uuid",
+                    SELECT_COLS
+                ),
                 &[&review_id],
             )
             .await

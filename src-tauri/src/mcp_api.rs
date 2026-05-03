@@ -996,6 +996,32 @@ pub fn create_router(
         });
     }
 
+    // Productivity Coordinator (Rust) scheduler — Phase 1b of
+    // `productivity-coordinator-rust-promotion.md`. Default-OFF; flip on
+    // per-instance via QONTINUI_COORDINATOR_RUST_SCHEDULER=1 once Phase 2
+    // (LLM callout) ships. While disabled, the existing `/coordinate`
+    // Claude session keeps owning the lease.
+    {
+        let coord_config = crate::coordinator::config::CoordinatorSchedulerConfig::from_env();
+        if coord_config.rust_scheduler_enabled {
+            tracing::info!(
+                "Coordinator (Rust) scheduler enabled via env: interval={}s",
+                coord_config.interval_secs
+            );
+            // Handle is intentionally dropped — same pattern as
+            // `start_memory_scheduler` / `start_dreamer_scheduler`. The
+            // task lives until the runner exits.
+            let _h = crate::coordinator::scheduler::start_coordinator_scheduler(
+                api_state.clone(),
+                coord_config,
+            );
+        } else {
+            tracing::debug!(
+                "Coordinator (Rust) scheduler disabled (set QONTINUI_COORDINATOR_RUST_SCHEDULER=1 to enable)"
+            );
+        }
+    }
+
     // Physical device USB scanner (30-second interval)
     // Discovers ADB-attached Android devices and registers them with PhysicalDeviceRegistry.
     {

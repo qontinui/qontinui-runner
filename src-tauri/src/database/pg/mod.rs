@@ -195,9 +195,7 @@ impl PgDb {
 
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 
-        let db = Self {
-            pool,
-        };
+        let db = Self { pool };
         Ok(db)
     }
 
@@ -312,4 +310,3 @@ impl PgDb {
         std::sync::Arc::new(Self { pool })
     }
 }
-
