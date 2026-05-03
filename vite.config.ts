@@ -192,8 +192,18 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {
-    // Tauri uses Chromium on Windows and WebKit on macOS and Linux
-    target: process.env.TAURI_PLATFORM == "windows" ? "chrome105" : "safari13",
+    // Tauri uses Chromium on Windows and WebKit on macOS and Linux. When
+    // `npm run build` is invoked outside `tauri build` (e.g. by an agent
+    // pre-staging dist/ before a supervisor spawn), TAURI_PLATFORM is unset
+    // — fall back to the host's process.platform so we don't silently pick
+    // safari13 on Windows hosts, which fails esbuild's destructuring
+    // transform and leaves dist/ empty with a misleading exit 0.
+    target: (() => {
+      const tauriPlatform = process.env.TAURI_PLATFORM;
+      if (tauriPlatform === "windows") return "chrome105";
+      if (tauriPlatform === "darwin") return "safari13";
+      return process.platform === "darwin" ? "safari13" : "chrome105";
+    })(),
     // don't minify for debug builds
     minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
     // produce sourcemaps for debug builds
