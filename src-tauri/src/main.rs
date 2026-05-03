@@ -34,6 +34,7 @@ mod config_storage;
 mod constraint_engine;
 mod container;
 mod context;
+mod coordinator;
 mod cost_management;
 mod crash_dumps;
 mod database;
@@ -158,6 +159,7 @@ mod video_recorder;
 mod vision;
 mod wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
 mod window_manager;
+mod window_placement;
 mod workflow;
 mod workflow_event_bus;
 mod workflow_generation;
@@ -1482,8 +1484,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // If Tauri's Win32 event loop exits immediately without any window, fall back
                     // to a hidden 0x0 tool window here. See plan Phase 1.5 validation.
                 } else {
+                    use crate::window_placement::WindowPlacement;
+
                     let url = tauri::WebviewUrl::App("index.html".into());
-                    let env_pos = {
+
+                    // ── Resolve placement + decorations ────────────────
+                    //
+                    // Three input paths funnel into one `WindowPlacement`:
+                    //   1. Supervisor env vars (QONTINUI_WINDOW_X/Y/W/H/DECORATIONS)
+                    //      — set for temp runners (test-*).
+                    //   2. Named-instance config (settings.json
+                    //      `runner_instances[name].spawn_placement`) — used
+                    //      when QONTINUI_INSTANCE_NAME is set without env-var
+                    //      coords.
+                    //   3. Default — primary maximizes; bare secondary uses
+                    //      the (100, 100) fallback so the window is on-screen.
+                    let env_pos: Option<(f64, f64)> = {
                         let x = std::env::var("QONTINUI_WINDOW_X")
                             .ok()
                             .and_then(|s| s.parse::<f64>().ok());
@@ -1495,7 +1511,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             _ => None,
                         }
                     };
-                    let env_size = {
+                    let env_size: Option<(f64, f64)> = {
                         let w = std::env::var("QONTINUI_WINDOW_WIDTH")
                             .ok()
                             .and_then(|s| s.parse::<f64>().ok());
@@ -1507,15 +1523,76 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             _ => None,
                         }
                     };
-                    let initial_size = env_size.unwrap_or((1400.0, 800.0));
-                    // QONTINUI_WINDOW_DECORATIONS=0 forces a borderless
-                    // window; default is true (Tauri's default chrome).
-                    // Borderless lets a placement land flush with the
-                    // monitor's edge — the few-pixel right-of-edge inset
-                    // people see with chrome on is the OS window border.
                     let env_decorations = std::env::var("QONTINUI_WINDOW_DECORATIONS")
                         .ok()
                         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")));
+
+                    // Named-instance fallback: only kicks in when the
+                    // supervisor didn't push a placement via env vars.
+                    let named_placement = if env_pos.is_none() && is_secondary {
+                        std::env::var("QONTINUI_INSTANCE_NAME").ok().and_then(|name| {
+                            crate::settings::get_runner_instances()
+                                .into_iter()
+                                .find(|c| c.name == name)
+                                .and_then(|c| c.spawn_placement)
+                                .and_then(|p| {
+                                    match crate::spawn_placement::resolve_to_global_physical(
+                                        app.handle(),
+                                        &p,
+                                    ) {
+                                        Ok(r) => {
+                                            info!(
+                                                "Named runner '{}' resolving own placement: {} → ({}, {}) {}x{}",
+                                                name, r.monitor_label, r.global_x, r.global_y, r.width, r.height,
+                                            );
+                                            Some((r, p.decorations))
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Named runner '{}' placement resolution failed: {}",
+                                                name, e
+                                            );
+                                            None
+                                        }
+                                    }
+                                })
+                        })
+                    } else {
+                        None
+                    };
+
+                    let resolved_pos = env_pos.or_else(|| {
+                        named_placement
+                            .as_ref()
+                            .map(|(r, _)| (r.global_x as f64, r.global_y as f64))
+                    });
+                    let resolved_size = env_size.or_else(|| {
+                        named_placement
+                            .as_ref()
+                            .map(|(r, _)| (r.width as f64, r.height as f64))
+                    });
+                    let resolved_decorations = env_decorations.or_else(|| {
+                        named_placement.as_ref().and_then(|(_, d)| *d)
+                    });
+
+                    let initial_size = resolved_size.unwrap_or((1400.0, 800.0));
+
+                    let placement = if let Some((x, y)) = resolved_pos {
+                        info!(
+                            "Window placement: positioned at ({}, {}) size ({}, {})",
+                            x, y, initial_size.0, initial_size.1
+                        );
+                        WindowPlacement::Positioned {
+                            x: x as i32,
+                            y: y as i32,
+                            w: initial_size.0 as u32,
+                            h: initial_size.1 as u32,
+                        }
+                    } else if is_secondary {
+                        WindowPlacement::SecondaryDefault
+                    } else {
+                        WindowPlacement::Maximized
+                    };
 
                     let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
                         .title("Qontinui Runner")
@@ -1523,7 +1600,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         .min_inner_size(1200.0, 700.0)
                         .fullscreen(false)
                         .resizable(true)
-                        .decorations(env_decorations.unwrap_or(true))
+                        .decorations(resolved_decorations.unwrap_or(true))
                         // Phase P2.2 of `tmp_plans/sw-cache-invalidation.md`:
                         // mark the embedded index.html as `no-store` so a
                         // webview that survives a binary swap can't serve a
@@ -1537,43 +1614,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         builder = builder.data_directory(std::path::PathBuf::from(dir));
                     }
 
-                    if let Some((x, y)) = env_pos {
-                        info!(
-                            "Positioning runner window via env vars at ({}, {}) size ({}, {})",
-                            x, y, initial_size.0, initial_size.1
-                        );
-                        builder = builder.position(x, y);
-                    } else if is_secondary {
-                        builder = builder.position(100.0, 100.0);
-                    } else {
-                        builder = builder.maximized(true);
-                    }
+                    builder = placement.configure_builder(builder);
 
                     match builder.build() {
                         Ok(win) => {
-                            // tauri-plugin-window-state restores saved size/position
-                            // on window creation, which overrides .position()/.inner_size()
-                            // from the builder. When the supervisor explicitly tells us
-                            // where to land via env vars, force-apply those after build
-                            // to win against the plugin's restore.
-                            if let Some((x, y)) = env_pos {
-                                let pos = tauri::PhysicalPosition::new(x as i32, y as i32);
-                                if let Err(e) = win.set_position(pos) {
-                                    warn!("Failed to apply env-var window position: {}", e);
-                                }
-                                let size = tauri::PhysicalSize::new(
-                                    initial_size.0 as u32,
-                                    initial_size.1 as u32,
-                                );
-                                if let Err(e) = win.set_size(size) {
-                                    warn!("Failed to apply env-var window size: {}", e);
-                                }
-                            }
+                            placement.finalize(&win);
                             let _ = win.show();
                             let _ = win.set_focus();
                             info!(
-                                "Main window created (secondary={}, isolated={})",
-                                is_secondary, data_dir.is_some()
+                                "Main window created (secondary={}, isolated={}, placement={:?})",
+                                is_secondary,
+                                data_dir.is_some(),
+                                placement
                             );
                         }
                         Err(e) => {
