@@ -94,7 +94,10 @@ impl AtspiAdapter {
 
     /// Build an AccessibleProxy for a given address. Uses `CacheProperties::No`
     /// to avoid stale D-Bus property caches for dynamic UI elements.
-    async fn accessible_proxy(&self, addr: &AtspiAddress) -> anyhow::Result<AccessibleProxy<'_>> {
+    async fn accessible_proxy<'a>(
+        &self,
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<AccessibleProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = AccessibleProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -107,7 +110,10 @@ impl AtspiAdapter {
     }
 
     /// Build an ActionProxy for the given address.
-    async fn action_proxy(&self, addr: &AtspiAddress) -> anyhow::Result<ActionProxy<'_>> {
+    async fn action_proxy<'a>(
+        &self,
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<ActionProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = ActionProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -120,7 +126,10 @@ impl AtspiAdapter {
     }
 
     /// Build a ComponentProxy for the given address.
-    async fn component_proxy(&self, addr: &AtspiAddress) -> anyhow::Result<ComponentProxy<'_>> {
+    async fn component_proxy<'a>(
+        &self,
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<ComponentProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = ComponentProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -133,10 +142,10 @@ impl AtspiAdapter {
     }
 
     /// Build an EditableTextProxy for the given address.
-    async fn editable_text_proxy(
+    async fn editable_text_proxy<'a>(
         &self,
-        addr: &AtspiAddress,
-    ) -> anyhow::Result<EditableTextProxy<'_>> {
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<EditableTextProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = EditableTextProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -149,7 +158,10 @@ impl AtspiAdapter {
     }
 
     /// Build a ValueProxy for the given address.
-    async fn value_proxy(&self, addr: &AtspiAddress) -> anyhow::Result<ValueProxy<'_>> {
+    async fn value_proxy<'a>(
+        &self,
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<ValueProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = ValueProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -162,10 +174,10 @@ impl AtspiAdapter {
     }
 
     /// Build an ApplicationProxy for the given address (used for PID lookup).
-    async fn application_proxy(
+    async fn application_proxy<'a>(
         &self,
-        addr: &AtspiAddress,
-    ) -> anyhow::Result<atspi::proxy::application::ApplicationProxy<'_>> {
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<atspi::proxy::application::ApplicationProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = atspi::proxy::application::ApplicationProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
