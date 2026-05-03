@@ -15,7 +15,7 @@ use atspi::proxy::action::ActionProxy;
 use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::value::ValueProxy;
-use atspi::{AccessibilityConnection, CoordType, Interface, Role, State};
+use atspi::{AccessibilityConnection, CoordType, Interface, InterfaceSet, Role, State};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, trace, warn};
 use zbus::proxy::CacheProperties;
@@ -161,6 +161,22 @@ impl AtspiAdapter {
         Ok(proxy)
     }
 
+    /// Build an ApplicationProxy for the given address (used for PID lookup).
+    async fn application_proxy(
+        &self,
+        addr: &AtspiAddress,
+    ) -> anyhow::Result<atspi::proxy::application::ApplicationProxy<'_>> {
+        let conn = self.zbus_conn()?;
+        let proxy = atspi::proxy::application::ApplicationProxy::builder(conn)
+            .destination(addr.bus_name.as_str())?
+            .path(addr.object_path.as_str())?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .context("Failed to build ApplicationProxy")?;
+        Ok(proxy)
+    }
+
     /// Recursively capture the accessibility tree starting from an address.
     async fn capture_node(
         &self,
@@ -189,7 +205,10 @@ impl AtspiAdapter {
         let description = proxy.description().await.ok().filter(|d| !d.is_empty());
         let role = proxy.get_role().await.unwrap_or(Role::Invalid);
         let state_set = proxy.get_state().await.unwrap_or_default();
-        let interfaces = proxy.get_interfaces().await.unwrap_or_default();
+        let interfaces = proxy
+            .get_interfaces()
+            .await
+            .unwrap_or_else(|_| InterfaceSet::empty());
 
         // Convert AT-SPI states.
         let is_hidden = state_set.contains(State::Defunct)
@@ -342,22 +361,14 @@ impl AtspiAdapter {
                 bus_name: child_ref.name.to_string(),
                 object_path: child_ref.path.to_string(),
             };
-            if let Ok(proxy) = self.accessible_proxy(&child_addr).await {
+            if let Ok(_proxy) = self.accessible_proxy(&child_addr).await {
                 // AT-SPI applications expose get_id() or we can check the Application interface.
                 // The accessible application proxy has a method to get the PID.
-                if let Ok(app_proxy) =
-                    atspi::proxy::application::ApplicationProxy::builder(self.zbus_conn()?)
-                        .destination(child_addr.bus_name.as_str())
-                        .ok()
-                        .and_then(|b| b.path(child_addr.object_path.as_str()).ok())
-                        .map(|b| b.cache_properties(CacheProperties::No))
-                {
-                    if let Ok(app) = app_proxy.build().await {
-                        // The `id` property on Application interface is the PID.
-                        if let Ok(app_id) = app.id().await {
-                            if app_id as u32 == pid {
-                                return Ok(child_addr);
-                            }
+                if let Ok(app) = self.application_proxy(&child_addr).await {
+                    // The `id` property on Application interface is the PID.
+                    if let Ok(app_id) = app.id().await {
+                        if app_id as u32 == pid {
+                            return Ok(child_addr);
                         }
                     }
                 }
@@ -492,8 +503,15 @@ impl PlatformAdapter for AtspiAdapter {
                 "type='signal',interface='org.a11y.atspi.Event.Object',member='ChildrenChanged'";
 
             for rule in &[focus_rule, object_rule, children_rule] {
-                if let Err(e) = proxy.add_match(rule).await {
-                    warn!("Failed to add match rule {rule}: {e}");
+                match zbus::MatchRule::try_from(*rule) {
+                    Ok(match_rule) => {
+                        if let Err(e) = proxy.add_match_rule(match_rule).await {
+                            warn!("Failed to add match rule {rule}: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse match rule {rule}: {e}");
+                    }
                 }
             }
 
@@ -501,6 +519,16 @@ impl PlatformAdapter for AtspiAdapter {
             let mut stream = zbus::MessageStream::from(&zconn);
 
             while let Some(msg) = stream.next().await {
+                // zbus 4 yields `Result<Message, Error>` from MessageStream rather
+                // than the bare `Arc<Message>` of zbus 3. Drop transient errors and
+                // continue listening.
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("AT-SPI message stream error: {e}");
+                        continue;
+                    }
+                };
                 let header = msg.header();
                 let interface = header.interface().map(|i| i.as_str().to_string());
                 let member = header.member().map(|m| m.as_str().to_string());
@@ -672,7 +700,7 @@ impl PlatformAdapter for AtspiAdapter {
                 match self.action_proxy(&addr).await {
                     Ok(action) => {
                         // Try to find a "select" action by name.
-                        let n_actions = action.n_actions().await.unwrap_or(0);
+                        let n_actions = action.nactions().await.unwrap_or(0);
                         let mut select_idx: Option<i32> = None;
                         for i in 0..n_actions {
                             if let Ok(name) = action.get_name(i).await {
@@ -719,7 +747,7 @@ impl PlatformAdapter for AtspiAdapter {
                 // AT-SPI doesn't have a dedicated scroll interface; use Action "scroll".
                 match self.action_proxy(&addr).await {
                     Ok(action) => {
-                        let n_actions = action.n_actions().await.unwrap_or(0);
+                        let n_actions = action.nactions().await.unwrap_or(0);
                         let mut scroll_idx: Option<i32> = None;
                         for i in 0..n_actions {
                             if let Ok(name) = action.get_name(i).await {
@@ -834,8 +862,11 @@ fn map_atspi_role(role: Role) -> UnifiedRole {
         Role::ScrollPane => UnifiedRole::Pane,
         Role::Viewport => UnifiedRole::Region,
         Role::PasswordText => UnifiedRole::Textbox,
-        Role::EditBar => UnifiedRole::Edit,
-        Role::Glass => UnifiedRole::Pane,
+        // NOTE: atspi 0.22 renamed these variants — `EditBar` → `Editbar`
+        // (lowercase b) and `Glass` → `GlassPane`. The original mappings
+        // (Edit / Pane) are preserved.
+        Role::Editbar => UnifiedRole::Edit,
+        Role::GlassPane => UnifiedRole::Pane,
         Role::Extended => UnifiedRole::Custom,
         _ => UnifiedRole::Unknown,
     }
@@ -877,22 +908,25 @@ fn convert_atspi_state(state_set: &atspi::StateSet) -> UnifiedState {
 }
 
 /// Determine which interaction patterns are supported based on AT-SPI interfaces.
-fn determine_patterns(interfaces: &[Interface]) -> Vec<InteractionPattern> {
+///
+/// Takes `&InterfaceSet` (atspi's bitflag-based interface bag) rather than a slice.
+/// `InterfaceSet::contains` accepts the `Interface` enum by value.
+fn determine_patterns(interfaces: &InterfaceSet) -> Vec<InteractionPattern> {
     let mut patterns = Vec::new();
 
-    if interfaces.contains(&Interface::Action) {
+    if interfaces.contains(Interface::Action) {
         patterns.push(InteractionPattern::Invoke);
     }
-    if interfaces.contains(&Interface::EditableText) {
+    if interfaces.contains(Interface::EditableText) {
         patterns.push(InteractionPattern::Value);
     }
-    if interfaces.contains(&Interface::Value) {
+    if interfaces.contains(Interface::Value) {
         patterns.push(InteractionPattern::RangeValue);
     }
-    if interfaces.contains(&Interface::Selection) {
+    if interfaces.contains(Interface::Selection) {
         patterns.push(InteractionPattern::Selection);
     }
-    if interfaces.contains(&Interface::Component) {
+    if interfaces.contains(Interface::Component) {
         patterns.push(InteractionPattern::CoordinateClick);
     }
 
