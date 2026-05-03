@@ -26,7 +26,7 @@ import {
   type TransitionDefinition,
   type TransitionAction as EngineTransitionAction,
   type ElementQuery,
-} from "@qontinui/ui-bridge-auto";
+} from "@qontinui/ui-bridge-auto/runtime";
 // Import from main entry to share the same globalRegistry singleton as UIBridgeProvider.
 // Importing from "@qontinui/ui-bridge/core" resolves to a separate dist bundle with
 // its own isolated globalRegistry variable, causing elements to be invisible to the engine.

@@ -27,7 +27,7 @@ import type {
   TransitionAction as EngineTransitionAction,
   ElementQuery,
   PersistedStateMachine,
-} from "@qontinui/ui-bridge-auto";
+} from "@qontinui/ui-bridge-auto/runtime";
 
 // ---------------------------------------------------------------------------
 // Provenance types and thresholds
