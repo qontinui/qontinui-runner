@@ -19,9 +19,7 @@
     "ignoreDeprecations": "6.0",
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"],
-      "@qontinui/workflow-utils": ["../qontinui-workflow-utils/dist/index.d.ts"],
-      "@qontinui/shared-types/*": ["../qontinui-schemas/ts/dist/*"]
+      "@/*": ["src/*"]
     }
   },
   "include": ["src"],
