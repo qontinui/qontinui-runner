@@ -4,15 +4,24 @@ name: Spec Pairing Gate
 # under `specs/pages/<id>/`, and that the pairing round-trips cleanly
 # (group count + ids + assertion total match the IR's forward projection).
 #
-# Currently warn-only: runner has one intentional drift (`active.spec`)
-# from section 2 of the UI Bridge redesign — the IR is hand-authored
-# against a 4-state canonical model, while the legacy spec follows the
-# 9-group convention. Block mode would fail every PR until either:
-#   (a) `active.spec` is harmonized with its IR, or
-#   (b) check-spec-pairing grows a per-page exclusion mechanism.
-# At that point flip `--mode=warn` to `--mode=block`.
+# Block mode: the job fails the PR on any missing or mismatched
+# pairing that isn't covered by an IR's `pairingPolicy.acceptDrift`.
 #
-# Local snapshot at workflow creation: paired: 94, missing: 0, mismatched: 1.
+# `active.spec` carries an `acceptDrift` policy (see
+# `specs/pages/active/state-machine.derived.json`) — section 2 of the
+# UI Bridge redesign hand-authored its IR against a 4-state canonical
+# model rather than the legacy 9-group convention. The policy expires
+# 2026-10-15, after which this gate will start failing the PR until
+# the policy is renewed or `active`'s IR is harmonized.
+#
+# Local snapshot after policy lands: paired: 94, accepted-drift: 1,
+# missing: 0, mismatched: 0.
+#
+# Requires `@qontinui/ui-bridge-auto >= 0.1.2` for `pairingPolicy`
+# support. The on-registry 0.1.1 was published from a checkout that
+# missed the policy-reader commit, so 0.1.2 is the first version that
+# actually honors `acceptDrift`. Older versions ignore the field and
+# would still flag `active` as a mismatch.
 
 on:
   pull_request:
@@ -42,5 +51,5 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Run pairing check (warn-only)
-        run: npx --yes -p @qontinui/ui-bridge-auto check-spec-pairing --root . --mode=warn
+      - name: Run pairing check (block mode)
+        run: npx --yes -p @qontinui/ui-bridge-auto@^0.1.2 check-spec-pairing --root . --mode=block

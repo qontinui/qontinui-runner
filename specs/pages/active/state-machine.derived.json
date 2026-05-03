@@ -7,6 +7,14 @@
     "purpose": "ActiveDashboardPage",
     "tags": ["active-dashboard", "monitoring", "real-time", "tier-1"]
   },
+  "pairingPolicy": {
+    "acceptDrift": {
+      "axes": ["groupCount", "groupIds", "assertionCount"],
+      "reason": "Section 2 of the UI Bridge redesign hand-authored this IR against a 4-state canonical model (idle / running / paused / completion-overlay) rather than the legacy spec's 9-group convention. Harmonizing them would lose the section-2 worked sample. Honored by check-spec-pairing >= 0.1.1.",
+      "since": "2026-04-15",
+      "expiresAt": "2026-10-15"
+    }
+  },
   "states": [
     {
       "id": "idle",
