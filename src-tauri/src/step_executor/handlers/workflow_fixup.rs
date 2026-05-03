@@ -258,7 +258,9 @@ impl WorkflowFixupHandler {
             .filter(|c| c.method != VerificationMethod::Manual)
             .count();
 
-        let coverage_pct = (covered * 100).checked_div(automatable_count).unwrap_or(100);
+        let coverage_pct = (covered * 100)
+            .checked_div(automatable_count)
+            .unwrap_or(100);
 
         if missing_criteria.is_empty() {
             StepHandlerResult::success_with_data(serde_json::json!({
