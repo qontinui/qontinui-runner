@@ -168,14 +168,17 @@ async fn decompose_plan(
 
     // 2. Replace tasks for this plan. The cascade-on-delete also removes
     //    any review/snapshot rows once those tables exist (later phases).
-    txn.execute("DELETE FROM coord.tasks WHERE plan_id = $1::uuid", &[&plan_id])
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("delete prior tasks failed: {}", e),
-            )
-        })?;
+    txn.execute(
+        "DELETE FROM coord.tasks WHERE plan_id = $1::uuid",
+        &[&plan_id],
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("delete prior tasks failed: {}", e),
+        )
+    })?;
 
     // 3. Insert tasks in two passes so depends_on_indices can be resolved
     //    against the previously-allocated UUIDs.

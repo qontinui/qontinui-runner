@@ -174,23 +174,7 @@
       "source": "migrated"
     },
     {
-      "assertions": [
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
-          "description": "Required element 0 for state Resolver Inventory",
-          "enabled": true,
-          "id": "graphql-resolver-inventory-elem-0",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {},
-            "label": "Required element for Resolver Inventory",
-            "type": "search"
-          }
-        }
-      ],
+      "assertions": [],
       "category": "element-presence",
       "description": "30 query resolvers: 18 UI Bridge (elements, snapshot, components, windows, consoleErrors, networkRequests, forms, idleStatus, keyboardShortcuts, renderLog, undoState, specs, diagnostics, health, rawQuery) + 12 domain (taskRuns, taskRun, taskRunOutput, runningTaskRuns, childTaskRuns, workflows, workflow, findings, findingSummary, runnerStatus, orchestrationLoopStatus, sdkConnections). 23 mutation resolvers: 14 UI Bridge (executeAction, pageNavigate, pageRefresh, pageBack, pageForward, fillForm, querySelector, evaluate, undo, redo, clearConsoleErrors, resetCircuitBreaker, rawCommand, ping) + 9 domain (createTaskRun, stopTaskRun, pauseTaskRun, unpauseTaskRun, deleteTaskRun, updateFindingStatus, respondToFinding, runWorkflow, deleteWorkflow). 5 subscription resolvers: uiBridgeHealthStream, runnerEvents, taskRunProgress, findingUpdates, orchestrationLoopStatusStream.",
       "id": "graphql-resolver-inventory",
@@ -267,23 +251,7 @@
       "source": "migrated"
     },
     {
-      "assertions": [
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
-          "description": "Required element 0 for state Frontend Hooks Library",
-          "enabled": true,
-          "id": "graphql-frontend-hooks-elem-0",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {},
-            "label": "Required element for Frontend Hooks Library",
-            "type": "search"
-          }
-        }
-      ],
+      "assertions": [],
       "category": "element-presence",
       "description": "27 typed hooks in src/hooks/graphql/: 11 query hooks (useTaskRunsGql, useTaskRunGql, useTaskRunOutputGql, useRunningTaskRunsGql, useTaskRunsLazyGql, useWorkflowsGql, useWorkflowGql, useFindingsGql, useFindingSummaryGql, useRunnerStatusGql, useOrchestrationLoopStatusGql, useUiBridgeHealthGql), 9 mutation hooks (useStopTaskRunGql, usePauseTaskRunGql, useUnpauseTaskRunGql, useDeleteTaskRunGql, useCreateTaskRunGql, useRunWorkflowGql, useUpdateFindingStatusGql, useRespondToFindingGql, useDeleteWorkflowGql), 5 subscription hooks (useHealthStream, useRunnerEvents, useTaskRunProgress, useFindingUpdates, useOrchestrationLoopStream), 2 composite hooks (useTaskRunControls: stop/pause/unpause/remove with error handling; useTaskRunLive: combines query + 2 subscriptions + paginated output into a single real-time view with 500-event ring buffer).",
       "id": "graphql-frontend-hooks",
@@ -291,23 +259,7 @@
       "source": "migrated"
     },
     {
-      "assertions": [
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
-          "description": "Required element 0 for state Type Generation Pipeline",
-          "enabled": true,
-          "id": "graphql-codegen-elem-0",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {},
-            "label": "Required element for Type Generation Pipeline",
-            "type": "search"
-          }
-        }
-      ],
+      "assertions": [],
       "category": "element-presence",
       "description": "Schema SDL is auto-exported by Rust test (schema_exports_valid_sdl) to src-tauri/src/graphql/schema.graphql (722 lines). GraphQL Code Generator reads the SDL + src/hooks/graphql/documents.ts and outputs src/generated/graphql.ts (855 lines) with all type definitions. Scripts: 'npm run graphql:schema' exports SDL, 'npm run graphql:codegen' generates TypeScript, 'npm run graphql:check' validates codegen output is up-to-date via git diff. Codegen uses typescript + typescript-operations plugins with enumsAsConst and JSON scalar mapped to unknown.",
       "id": "graphql-codegen",

@@ -192,3 +192,82 @@ WHERE element_id IS NOT NULL
 GROUP BY element_id
 HAVING COUNT(*) >= :min_interactions
 ORDER BY interaction_count DESC;
+
+-- ============================================================================
+-- SECTION 5B: causal-chain queries (require migration
+--             section_5b_01_ui_bridge_causal_columns)
+-- ----------------------------------------------------------------------------
+-- These queries depend on two new columns on `project.ui_bridge_events`:
+--   recording_session_id text
+--   caused_by_event_id   bigint REFERENCES project.ui_bridge_events(id)
+-- Plus a partial index:
+--   ui_bridge_events_recording_session_idx
+--     ON project.ui_bridge_events(recording_session_id)
+--     WHERE recording_session_id IS NOT NULL
+--
+-- Until that Alembic migration is applied on the spaceship Postgres host
+-- (and `schema.pg.sql.generated` is regenerated from there), Clorinde will
+-- reject these queries against the locally-cached schema. The runner-side
+-- trace_api module uses raw `tokio_postgres` execution and DOES NOT depend
+-- on the bindings these queries would generate. After the migration applies
+-- and the generated schema catches up, these definitions can be enabled and
+-- the trace_api storage layer can be converted over.
+--
+-- NOTE: the build's Clorinde codegen step may silently drop these query
+-- blocks when validation runs against the pre-migration schema; the
+-- definitions are kept in source so they're trivially rehydrated post-
+-- migration without rewriting the SQL by hand.
+-- ============================================================================
+
+--! insert_causal_event (task_run_id?, element_id?, state_id?, transition_id?, action?, params?, result?, duration_ms?, error_message?, metadata?, recording_session_id?, caused_by_event_id?)
+INSERT INTO ui_bridge_events
+    (task_run_id, timestamp, sequence, event_type, element_id,
+     state_id, transition_id, action, params, result,
+     duration_ms, success, error_message, metadata,
+     recording_session_id, caused_by_event_id)
+VALUES (:task_run_id, :timestamp, :sequence, :event_type, :element_id,
+        :state_id, :transition_id, :action, :params, :result,
+        :duration_ms, :success, :error_message, :metadata,
+        :recording_session_id, :caused_by_event_id)
+RETURNING id;
+
+--! list_recording_sessions
+SELECT recording_session_id,
+       COUNT(*)::bigint AS event_count,
+       MIN(timestamp)::bigint AS started_at,
+       MAX(timestamp)::bigint AS ended_at
+FROM ui_bridge_events
+WHERE recording_session_id IS NOT NULL
+GROUP BY recording_session_id
+ORDER BY MIN(timestamp) DESC
+LIMIT :limit;
+
+--! get_recording_session : UiBridgeEventRow
+SELECT id, task_run_id, timestamp, sequence, event_type,
+       element_id, state_id, transition_id, action, params,
+       result, duration_ms, success, error_message, metadata
+FROM ui_bridge_events
+WHERE recording_session_id = :recording_session_id
+ORDER BY sequence ASC;
+
+--! get_causal_chain : UiBridgeEventRow
+WITH RECURSIVE chain AS (
+    SELECT id, task_run_id, timestamp, sequence, event_type,
+           element_id, state_id, transition_id, action, params,
+           result, duration_ms, success, error_message, metadata,
+           caused_by_event_id, 0 AS depth
+    FROM ui_bridge_events
+    WHERE id = :event_id
+    UNION ALL
+    SELECT p.id, p.task_run_id, p.timestamp, p.sequence, p.event_type,
+           p.element_id, p.state_id, p.transition_id, p.action, p.params,
+           p.result, p.duration_ms, p.success, p.error_message, p.metadata,
+           p.caused_by_event_id, c.depth + 1
+    FROM ui_bridge_events p
+    JOIN chain c ON p.id = c.caused_by_event_id
+)
+SELECT id, task_run_id, timestamp, sequence, event_type,
+       element_id, state_id, transition_id, action, params,
+       result, duration_ms, success, error_message, metadata
+FROM chain
+ORDER BY depth DESC;

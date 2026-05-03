@@ -171,6 +171,7 @@ export function ProcessManagerTab() {
         await loadProcesses();
       } catch (err) {
         console.error("Failed to start:", err);
+        alert(`Failed to start process: ${err}`);
       }
     },
     [loadProcesses],

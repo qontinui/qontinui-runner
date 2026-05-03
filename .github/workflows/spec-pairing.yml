@@ -1,27 +1,28 @@
 name: Spec Pairing Gate
 
-# Phase B5e — Verify every legacy `*.spec.uibridge.json` is paired with an IR
-# file under `specs/pages/<id>/`, and that the pairing round-trips cleanly
+# Verify every legacy `*.spec.uibridge.json` is paired with an IR file
+# under `specs/pages/<id>/`, and that the pairing round-trips cleanly
 # (group count + ids + assertion total match the IR's forward projection).
 #
-# Currently warn-only: the job logs missing/mismatched pairings but never
-# fails the PR. The plan is to flip to `--mode=block` after one week of
-# warn-only running has confirmed no false positives.
+# Currently warn-only: runner has one intentional drift (`active.spec`)
+# from section 2 of the UI Bridge redesign — the IR is hand-authored
+# against a 4-state canonical model, while the legacy spec follows the
+# 9-group convention. Block mode would fail every PR until either:
+#   (a) `active.spec` is harmonized with its IR, or
+#   (b) check-spec-pairing grows a per-page exclusion mechanism.
+# At that point flip `--mode=warn` to `--mode=block`.
 #
-# The shared check script ships in `@qontinui/ui-bridge-auto` on npm, so
-# this workflow no longer needs to clone sibling repos or build the CLI
-# from source. `npx @qontinui/ui-bridge-auto` resolves the published CLI
-# bin (`check-spec-pairing`).
+# Local snapshot at workflow creation: paired: 94, missing: 0, mismatched: 1.
 
 on:
   pull_request:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - "**/*.spec.uibridge.json"
       - "**/specs/pages/**"
       - ".github/workflows/spec-pairing.yml"
   push:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - "**/*.spec.uibridge.json"
       - "**/specs/pages/**"
@@ -33,7 +34,8 @@ jobs:
     name: Check spec <-> IR pairing
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout qontinui-runner
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -41,8 +43,4 @@ jobs:
           node-version: "20"
 
       - name: Run pairing check (warn-only)
-        run: |
-          npx --yes @qontinui/ui-bridge-auto check-spec-pairing \
-            --root . \
-            --app qontinui-runner \
-            --mode=warn
+        run: npx --yes -p @qontinui/ui-bridge-auto check-spec-pairing --root . --mode=warn

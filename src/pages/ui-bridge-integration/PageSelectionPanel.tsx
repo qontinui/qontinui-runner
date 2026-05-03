@@ -15,6 +15,7 @@ import type {
   ApiResponse,
 } from "./types";
 import { getApiBase } from "@/lib/runner-api";
+import { usePageSelectionPanelRegistrations } from "@/lib/ui-bridge/pages/pageselectionpanel-registrations";
 
 interface PageSelectionPanelProps {
   projectPath: string;
@@ -27,6 +28,17 @@ export function PageSelectionPanel({
   onStartGeneration,
   disabled,
 }: PageSelectionPanelProps) {
+  const {
+    generateRegistrationsRef,
+    generatePageIdsRef,
+    generateSpecsRef,
+    generateTutorialsRef,
+    generateArchitectureDiagramsRef,
+    generateDemoVideosRef,
+    generateProductToursRef,
+    generateProjectExplainerRef,
+    generateButtonRef,
+  } = usePageSelectionPanelRegistrations();
   const [pages, setPages] = useState<PageComponent[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -238,6 +250,7 @@ export function PageSelectionPanel({
                 }
               >
                 <input
+                  ref={generateRegistrationsRef}
                   type="checkbox"
                   checked={options.generateRegistrations}
                   onChange={(e) =>
@@ -258,6 +271,7 @@ export function PageSelectionPanel({
                 }
               >
                 <input
+                  ref={generatePageIdsRef}
                   type="checkbox"
                   checked={options.generateDataPageIds}
                   onChange={(e) =>
@@ -281,6 +295,7 @@ export function PageSelectionPanel({
                 }
               >
                 <input
+                  ref={generateSpecsRef}
                   type="checkbox"
                   checked={options.generateSpecs}
                   onChange={(e) => setOptions({ ...options, generateSpecs: e.target.checked })}
@@ -299,6 +314,7 @@ export function PageSelectionPanel({
                 }
               >
                 <input
+                  ref={generateTutorialsRef}
                   type="checkbox"
                   checked={options.generateTutorials}
                   onChange={(e) =>
@@ -322,6 +338,7 @@ export function PageSelectionPanel({
                 }
               >
                 <input
+                  ref={generateArchitectureDiagramsRef}
                   type="checkbox"
                   checked={options.generateArchitectureDiagrams}
                   onChange={(e) =>
@@ -342,6 +359,7 @@ export function PageSelectionPanel({
                 }
               >
                 <input
+                  ref={generateDemoVideosRef}
                   type="checkbox"
                   checked={options.generateDemoVideos}
                   onChange={(e) =>
@@ -363,6 +381,7 @@ export function PageSelectionPanel({
                 }
               >
                 <input
+                  ref={generateProductToursRef}
                   type="checkbox"
                   checked={options.generateProductTours}
                   onChange={(e) =>
@@ -386,6 +405,7 @@ export function PageSelectionPanel({
                 }
               >
                 <input
+                  ref={generateProjectExplainerRef}
                   type="checkbox"
                   checked={options.generateProjectExplainer}
                   onChange={(e) =>
@@ -403,6 +423,7 @@ export function PageSelectionPanel({
 
           {/* Generate button */}
           <button
+            ref={generateButtonRef}
             onClick={() => onStartGeneration(selectedPages, options)}
             disabled={
               disabled ||

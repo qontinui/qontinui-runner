@@ -139,6 +139,7 @@ mod test_orchestrator;
 mod ticket_system;
 mod tiered_info;
 mod timeout_config;
+mod trace_api;
 mod tracing_layers;
 mod trigger_system;
 mod tunnel;

@@ -40,9 +40,7 @@ use tauri::http::{
 /// but currently absent from this runner's `dist/` — we keep the predicate
 /// tight to avoid over-invalidating if more assets are added later.
 fn is_index_document(request: &Request<Vec<u8>>) -> bool {
-    if request.uri().scheme_str() != Some("tauri")
-        && request.uri().scheme_str() != Some("http")
-    {
+    if request.uri().scheme_str() != Some("tauri") && request.uri().scheme_str() != Some("http") {
         // Only target the runner's own embedded scheme. On Windows Tauri
         // rewrites `tauri://` to `http://tauri.localhost/...`; on Linux the
         // raw `tauri` scheme reaches the handler. Both paths land here.
@@ -113,10 +111,7 @@ mod tests {
     #[test]
     fn stamps_explicit_index_html() {
         let mut resp = make_response();
-        stamp_no_store_on_index(
-            make_request("http://tauri.localhost/index.html"),
-            &mut resp,
-        );
+        stamp_no_store_on_index(make_request("http://tauri.localhost/index.html"), &mut resp);
         assert_eq!(
             resp.headers().get(CACHE_CONTROL).unwrap(),
             "no-store, no-cache, must-revalidate"
@@ -130,7 +125,10 @@ mod tests {
             make_request("http://tauri.localhost/assets/index-abc123.js"),
             &mut resp,
         );
-        assert_eq!(resp.headers().get(CACHE_CONTROL).unwrap(), "max-age=31536000");
+        assert_eq!(
+            resp.headers().get(CACHE_CONTROL).unwrap(),
+            "max-age=31536000"
+        );
         assert!(resp.headers().get(PRAGMA).is_none());
     }
 
@@ -141,6 +139,9 @@ mod tests {
             make_request("https://api.anthropic.com/v1/messages"),
             &mut resp,
         );
-        assert_eq!(resp.headers().get(CACHE_CONTROL).unwrap(), "max-age=31536000");
+        assert_eq!(
+            resp.headers().get(CACHE_CONTROL).unwrap(),
+            "max-age=31536000"
+        );
     }
 }

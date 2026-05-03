@@ -122,6 +122,7 @@ pub mod step_type_metadata_api;
 pub mod streaming;
 pub mod task_run_inspection;
 pub mod task_run_queries;
+pub mod task_run_structured_output;
 pub mod task_run_workflow_state;
 pub mod task_runs;
 pub mod tauri_proxy;

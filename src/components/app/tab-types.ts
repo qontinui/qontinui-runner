@@ -393,6 +393,33 @@ export function isValidTabId(candidate: string): candidate is MainTabId {
 /** Read the runner's last-persisted active tab from instance-scoped storage. */
 export const ACTIVE_TAB_STORAGE_KEY = "qontinui-main-active-tab";
 
+/**
+ * Atomic-set-and-persist helper. Calls `setActiveTab` (the React state setter
+ * passed in by `useAppNavigation`) AND writes the new tab id to the
+ * port-namespaced instanceStorage in the same synchronous tick.
+ *
+ * Why this exists: the `useEffect([activeTab])` writer in `useAppNavigation`
+ * is a backstop — it fires after the next React render. Readers that consult
+ * `instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY)` directly (the F4
+ * `tabs_list` handler, route-aware UI Bridge handlers, anything that bypasses
+ * the React state) would otherwise see a stale value between the moment a
+ * user click / Tauri event flips React state and the moment the effect
+ * commits. Persisting synchronously inside the handler makes the storage
+ * write atomic with the state change so post-handler probes always see the
+ * new tab.
+ *
+ * Callers must still pass the React `setActiveTab` setter so React reconciles
+ * normally — this helper does NOT bypass React.
+ */
+export function setActiveTabAndPersist(
+  setActiveTab: (tab: MainTabId) => void,
+  storage: { setItem: (key: string, value: string) => void },
+  tab: MainTabId,
+): void {
+  setActiveTab(tab);
+  storage.setItem(ACTIVE_TAB_STORAGE_KEY, tab);
+}
+
 export function migrateTabId(stored: string | null): MainTabId {
   if (!stored) return "prompt-home";
 

@@ -1,13 +1,79 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { Search, Loader2, CheckCircle2, XCircle, Sparkles, ChevronRight } from "lucide-react";
+import {
+  Search,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Sparkles,
+  ChevronRight,
+  LogIn,
+} from "lucide-react";
 import { PromptSuggestions, savePromptToHistory } from "./PromptSuggestions";
 import { usePromptExecutionContext } from "./PromptExecutionContext";
+import { useAuth } from "../AuthProvider";
+
+/**
+ * Banner rendered when sign-in is required, either because the planner
+ * endpoint returned 401/403 (errorKind === "auth-required") or because
+ * the AuthProvider reports the user is not authenticated (P11). The
+ * literal text "Sign-in required to run prompts." is relied on by
+ * probe-driven tests reading document.body.innerText.
+ */
+function AuthRequiredBanner({ onDismiss }: { onDismiss?: () => void }) {
+  return (
+    <div
+      role="alert"
+      className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300 space-y-2"
+    >
+      <div className="flex items-center gap-2 font-medium">
+        <LogIn className="w-4 h-4" />
+        Sign-in required to run prompts.
+      </div>
+      <p className="text-xs text-red-600/80 dark:text-red-300/80">
+        Your session has expired. Reload the runner to sign in again.
+      </p>
+      <div className="flex gap-3 pt-1">
+        <button
+          onClick={() => window.location.reload()}
+          className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
+        >
+          Reload
+        </button>
+        {onDismiss && (
+          <button
+            onClick={onDismiss}
+            className="text-sm text-muted-foreground hover:underline"
+          >
+            Dismiss
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 export function PromptHomePage() {
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-  const { phase, plan, progress, error, submit, reset, explain, setExplain } =
+  const { phase, plan, progress, error, errorKind, submit, reset, explain, setExplain } =
     usePromptExecutionContext();
+  const auth = useAuth();
+
+  // P11: render the auth-required banner whenever the auth provider reports
+  // an unauthenticated state, even before the user has attempted to submit.
+  // Conditions:
+  //   - auth check has completed (loading === false)
+  //   - dev auto-login is not still in flight (devAutoLoginPending === false)
+  //   - mount-time check happened (authStatus !== null) — avoids flash on
+  //     cold mount
+  //   - AND either authStatus.authenticated === false OR there is a
+  //     non-empty error string from the auth provider
+  const isUnauthenticated =
+    !auth.loading &&
+    !auth.devAutoLoginPending &&
+    auth.authStatus !== null &&
+    (auth.authStatus.authenticated === false ||
+      (auth.error !== null && auth.error.length > 0));
 
   // Focus input on mount
   useEffect(() => {
@@ -42,6 +108,9 @@ export function PromptHomePage() {
 
   const isActive = phase !== "idle";
   const isWorking = phase === "planning" || phase === "executing";
+  // P11: also disable the input/submit when the user is unauthenticated —
+  // submitting a prompt would just fail at the planner endpoint.
+  const formDisabled = isWorking || isUnauthenticated;
 
   return (
     <div className="h-full flex flex-col items-center justify-center px-4">
@@ -50,6 +119,14 @@ export function PromptHomePage() {
         <Sparkles className="w-6 h-6" />
         <span className="text-lg font-medium tracking-wide">qontinui</span>
       </div>
+
+      {/* P11: auth-required banner shown above the form whenever the user
+          is not authenticated, even before any submit attempt. */}
+      {isUnauthenticated && !(phase === "error" && errorKind === "auth-required") && (
+        <div className="w-full max-w-xl mb-4">
+          <AuthRequiredBanner />
+        </div>
+      )}
 
       {/* Search input */}
       <form onSubmit={handleSubmit} className="w-full max-w-xl">
@@ -72,10 +149,10 @@ export function PromptHomePage() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder="What would you like to do?"
-            disabled={isWorking}
+            disabled={formDisabled}
             className="flex-1 bg-transparent outline-none text-base placeholder:text-muted-foreground/50"
           />
-          {input.trim() && !isWorking && (
+          {input.trim() && !formDisabled && (
             <button type="submit" className="p-1 rounded-lg hover:bg-accent transition-colors">
               <ChevronRight className="w-5 h-5 text-primary" />
             </button>
@@ -159,8 +236,16 @@ export function PromptHomePage() {
             </div>
           )}
 
-          {/* Error state */}
-          {phase === "error" && (
+          {/* Auth-required banner — distinct affordance for expired JWT.
+              Also shown above the form via P11 when the auth provider
+              already reports unauthenticated; here it covers the
+              post-submit 401/403 path. */}
+          {phase === "error" && errorKind === "auth-required" && (
+            <AuthRequiredBanner onDismiss={handleReset} />
+          )}
+
+          {/* Generic error state */}
+          {phase === "error" && errorKind !== "auth-required" && (
             <div className="text-center space-y-3">
               <div className="flex items-center gap-2 text-sm text-red-500 justify-center">
                 <XCircle className="w-4 h-4" />

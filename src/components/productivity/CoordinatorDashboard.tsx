@@ -112,13 +112,20 @@ function RecommendationsPanel({
 
   return (
     <section
+      role="region"
+      aria-labelledby="productivity-coord-recommendations-heading"
       className="flex flex-col rounded-lg border border-border bg-card/30 p-4 gap-3"
       data-ui-bridge-id="productivity.coord-recommendations"
     >
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <ListChecks className="w-4 h-4 text-muted-foreground" />
-          <h2 className="text-sm font-semibold text-foreground">Recommendations queue</h2>
+          <h2
+            id="productivity-coord-recommendations-heading"
+            className="text-sm font-semibold text-foreground"
+          >
+            Recommendations queue
+          </h2>
           <span className="text-xs text-muted-foreground">{rows.length} pending</span>
         </div>
         <button
@@ -265,13 +272,20 @@ function EscalationsPanel({ rows, loading, error, onRefresh, onResolve }: Escala
 
   return (
     <section
+      role="region"
+      aria-labelledby="productivity-coord-escalations-heading"
       className="flex flex-col rounded-lg border border-border bg-card/30 p-4 gap-3"
       data-ui-bridge-id="productivity.coord-escalations"
     >
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <AlertTriangle className="w-4 h-4 text-amber-400" />
-          <h2 className="text-sm font-semibold text-foreground">Escalations</h2>
+          <h2
+            id="productivity-coord-escalations-heading"
+            className="text-sm font-semibold text-foreground"
+          >
+            Escalations
+          </h2>
           <span className="text-xs text-muted-foreground">{rows.length} open</span>
         </div>
         <button
@@ -382,13 +396,20 @@ function AdvisoriesPanel({ rows, loading, error, onRefresh, onAcknowledge }: Adv
 
   return (
     <section
+      role="region"
+      aria-labelledby="productivity-coord-advisories-heading"
       className="flex flex-col rounded-lg border border-border bg-card/30 p-4 gap-3"
       data-ui-bridge-id="productivity.coord-advisories"
     >
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <ListChecks className="w-4 h-4 text-purple-400" />
-          <h2 className="text-sm font-semibold text-foreground">Advisories</h2>
+          <h2
+            id="productivity-coord-advisories-heading"
+            className="text-sm font-semibold text-foreground"
+          >
+            Advisories
+          </h2>
           <span className="text-xs text-muted-foreground">{rows.length} unread</span>
         </div>
         <button
@@ -484,13 +505,20 @@ function DecisionLogPanel({
 }: DecisionLogPanelProps) {
   return (
     <section
+      role="region"
+      aria-labelledby="productivity-coord-decision-log-heading"
       className="flex flex-col rounded-lg border border-border bg-card/30 p-4 gap-3 min-h-0"
       data-ui-bridge-id="productivity.coord-decision-log"
     >
       <header className="flex items-center justify-between flex-wrap gap-2">
         <div className="flex items-center gap-2">
           <ScrollText className="w-4 h-4 text-muted-foreground" />
-          <h2 className="text-sm font-semibold text-foreground">Decision log</h2>
+          <h2
+            id="productivity-coord-decision-log-heading"
+            className="text-sm font-semibold text-foreground"
+          >
+            Decision log
+          </h2>
           <span className="text-xs text-muted-foreground">last {DECISION_LOG_LIMIT} rows</span>
         </div>
         <div className="flex items-center gap-2">
@@ -852,6 +880,15 @@ export function CoordinatorDashboard() {
           </p>
         </header>
 
+        {/*
+         * Panel order is part of the productivity-stack spec
+         * (productivity-stack.md §6, productivity.spec.uibridge.json
+         * group `productivity-coordinator-panels:order-invariant`):
+         * PlanRecommendations → Recommendations → Advisories →
+         * Escalations → Decision Log. Spec assertions read this
+         * order top-to-bottom. Don't reorder without updating the
+         * spec assertion in the same PR.
+         */}
         <PlanRecommendations />
 
         <RecommendationsPanel

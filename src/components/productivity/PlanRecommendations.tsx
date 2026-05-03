@@ -53,13 +53,20 @@ export function PlanRecommendations() {
 
   return (
     <section
+      role="region"
+      aria-labelledby="productivity-plan-recommendations-heading"
       className="flex flex-col rounded-lg border border-border bg-card/30 p-4 gap-3"
       data-ui-bridge-id="productivity.plan-recommendations"
     >
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Sparkles className="w-4 h-4 text-purple-400" />
-          <h2 className="text-sm font-semibold text-foreground">Coordinator suggests next plan</h2>
+          <h2
+            id="productivity-plan-recommendations-heading"
+            className="text-sm font-semibold text-foreground"
+          >
+            Coordinator suggests next plan
+          </h2>
           <span className="text-xs text-muted-foreground">top {rows.length}</span>
         </div>
         <button

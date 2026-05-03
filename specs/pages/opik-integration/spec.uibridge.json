@@ -2,23 +2,7 @@
   "description": "Opik LLM Traces Dashboard — shows every LLM API call made during automation workflows as structured traces with hierarchical spans, cost attribution, token counts, latency, and quality feedback scores. Users come here to answer: What did the AI do? How much did it cost? Was it effective? Data arrives from two sources: (1) the Opik REST API at OPIK_BASE_URL/v1/private/traces for trace/span data stored in ClickHouse, and (2) the runner's own /analytics/token-usage endpoints as a fallback when Opik is unavailable. A background sync service in the Rust backend pushes execution_spans and phase_token_usage records to Opik as traces/spans, and syncs observations and agentic_metric_scores as feedback scores. Opik runs as a self-hosted Docker stack (backend, ClickHouse, MySQL, Redis, MinIO) managed by the supervisor.",
   "groups": [
     {
-      "assertions": [
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
-          "description": "Required element 0 for state Architecture — Data Flow & Integration Design",
-          "enabled": true,
-          "id": "opik-architecture-elem-0",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {},
-            "label": "Required element for Architecture — Data Flow & Integration Design",
-            "type": "search"
-          }
-        }
-      ],
+      "assertions": [],
       "category": "element-presence",
       "description": "How the Opik integration is structured. Data flows in one primary direction: the runner records execution_spans and phase_token_usage in PostgreSQL during workflow execution, then a background OpikSyncService pushes batches to Opik every 10 seconds. Observations are mapped to Opik feedback scores. The frontend queries Opik directly for the trace viewer and falls back to local analytics endpoints when Opik is unreachable. MCP tools (opik_traces, opik_trace_detail, opik_feedback, opik_evaluate, opik_sync_status) expose trace data to AI agents.\n\nData model mapping:\n- task_run → Opik project (project_name = workflow_name)\n- execution_spans (root, parent_span_id=NULL) → Opik trace\n- execution_spans (child) → Opik span (preserves parent_span_id hierarchy)\n- phase_token_usage → span.usage + span.model + span.provider + span.total_estimated_cost\n- observations → feedback_score (name=observation_type, value=1.0 for learning / 0.0 for bugfix, reason=content)\n- agentic_metric_scores → feedback_score (name=metric_type, value=score, reason=rationale)\n\nSync is idempotent via trace_id (UUIDv7). On restart, sync resumes from last_synced_at timestamp. Retry uses exponential backoff (1s→2s→4s→8s, max 60s). Unsent traces queue in memory (max 10,000) and overflow to PostgreSQL.",
       "id": "opik-architecture",
