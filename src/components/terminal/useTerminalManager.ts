@@ -26,18 +26,24 @@ export interface TerminalTab {
   claudeConfigDir?: string;
 }
 
+// Mirrors `qontinui-schemas/rust/src/terminal.rs::TerminalInfo`, which uses
+// `#[serde(rename_all = "camelCase")]`. Tauri's wire format ships these keys
+// as camelCase regardless of the Rust field names, so reading snake_case
+// (e.g. `event.payload.is_alive`) silently evaluates to `undefined`. See
+// memory `proj_tauri_event_payload_camelcase.md` and the sibling fix in
+// commit ed1b45d56 (TerminalInstance.tsx).
 interface TerminalInfo {
   id: string;
   title: string;
   pid: number | null;
   cols: number;
   rows: number;
-  working_dir: string;
-  is_alive: boolean;
-  exit_code: number | null;
-  created_at: number;
-  total_bytes_produced: number;
-  page_id?: string;
+  workingDir: string;
+  isAlive: boolean;
+  exitCode: number | null;
+  createdAt: number;
+  totalBytesProduced: number;
+  pageId?: string;
 }
 
 export function useTerminalManager(pageId: string = "default") {
@@ -61,10 +67,10 @@ export function useTerminalManager(pageId: string = "default") {
             id: info.id,
             title: info.title,
             pid: info.pid ?? null,
-            isAlive: info.is_alive,
-            exitCode: info.exit_code ?? null,
-            workingDir: info.working_dir || undefined,
-            createdAt: info.created_at,
+            isAlive: info.isAlive,
+            exitCode: info.exitCode ?? null,
+            workingDir: info.workingDir || undefined,
+            createdAt: info.createdAt,
           },
         ];
       });
@@ -89,11 +95,11 @@ export function useTerminalManager(pageId: string = "default") {
       if (!terminals || terminals.length === 0) return null;
 
       // Filter to terminals belonging to this page
-      const pageTerminals = terminals.filter((t) => (t.page_id || "default") === pageId);
+      const pageTerminals = terminals.filter((t) => (t.pageId || "default") === pageId);
 
       // Only reconnect to alive sessions; silently close dead ones
-      const dead = pageTerminals.filter((t) => !t.is_alive);
-      const alive = pageTerminals.filter((t) => t.is_alive);
+      const dead = pageTerminals.filter((t) => !t.isAlive);
+      const alive = pageTerminals.filter((t) => t.isAlive);
 
       for (const t of dead) {
         invoke("terminal_close", { terminalId: t.id }).catch(() => {});
@@ -108,10 +114,10 @@ export function useTerminalManager(pageId: string = "default") {
         id: info.id,
         title: info.title,
         pid: info.pid ?? null,
-        isAlive: info.is_alive,
-        exitCode: info.exit_code ?? null,
-        workingDir: info.working_dir || undefined,
-        createdAt: info.created_at,
+        isAlive: info.isAlive,
+        exitCode: info.exitCode ?? null,
+        workingDir: info.workingDir || undefined,
+        createdAt: info.createdAt,
         isReconnecting: true,
       }));
 
@@ -155,10 +161,10 @@ export function useTerminalManager(pageId: string = "default") {
           id: info.id,
           title: info.title,
           pid: info.pid ?? null,
-          isAlive: info.is_alive,
-          exitCode: info.exit_code ?? null,
-          workingDir: info.working_dir || undefined,
-          createdAt: info.created_at,
+          isAlive: info.isAlive,
+          exitCode: info.exitCode ?? null,
+          workingDir: info.workingDir || undefined,
+          createdAt: info.createdAt,
         };
 
         setTabs((prev) => {
