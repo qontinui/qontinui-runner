@@ -83,6 +83,12 @@ export interface ITerminalBackend {
   open(container: HTMLElement): void;
   /** Tear down the terminal and release all resources. */
   dispose(): void;
+  /**
+   * Reset terminal state (clear screen + scrollback + cursor home + reset SGR).
+   * Used only on hard reconnect — Layer 2 of the bootstrap does NOT call
+   * reset(), see paintGrid.
+   */
+  reset(): void;
   /** Focus the terminal input. */
   focus(): void;
 
