@@ -599,11 +599,23 @@ Each transition is a **process** — an ordered sequence of actions.
   - \`params\`: action-specific parameters (e.g., \`{ "text": "search query" }\` for type)
   - \`waitAfter\`: optional wait after this action
 
-### CRITICAL RULE: Per-state element uniqueness
+### CRITICAL RULE: Per-state element uniqueness AND non-emptiness
 
 Each element listed under a state's \`elements\` array MUST appear in **at most one state** of this spec. Elements are state-discriminating identifiers — what makes the runtime engine and the VGA visual grounder say "we are in state X right now". Repeating an element across states breaks that signal.
 
 **If an element is visible in every state of this page (page header, persistent toolbar button, persistent sidebar item) DO NOT include it in any state's \`elements\` array.** Page-persistent elements are not state-discriminating and don't belong here.
+
+**Every state MUST have at least one element in its \`elements\` array, and that element MUST be unique to this state within this spec.** A state with zero elements cannot be matched at runtime — the engine has no way to know it's active. If after removing page-persistent elements you have nothing left, look harder: every distinct UI configuration has *something* unique to it. Common state-discriminating signals to look for:
+
+- An empty-state placeholder (\`"No items found"\`, \`"Get started by..."\`)
+- A loading spinner or skeleton (\`role="progressbar"\`, \`"Loading..."\`)
+- An error banner (\`role="alert"\`, \`"Failed to..."\`)
+- A toolbar button that is *only* enabled/visible in this state (e.g. \`"Save"\` only when there are unsaved changes; \`"Stop"\` only when running)
+- A row or list item count that distinguishes empty from populated
+- A selected-row highlight (\`aria-selected="true"\`) when something is selected vs. not
+- A specific provider/tab/section label that identifies the active sub-mode (e.g. for \`ai-provider-claude-cli\`, the visible text \`"Claude Code CLI"\` or a section heading)
+
+If you genuinely cannot find a state-discriminating element in the page's existing JSX, the page is missing a probe — flag it in the spec's \`metadata.notes\` rather than leave \`elements\` empty. Do not include filler that's also visible in other states.
 
 #### Bad (page header reused across states — quarantines compilation)
 

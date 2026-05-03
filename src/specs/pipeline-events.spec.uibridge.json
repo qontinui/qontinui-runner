@@ -206,7 +206,9 @@
           "expected": "HH:mm:ss format derived from ISO 8601 created_at",
           "target": {
             "type": "search",
-            "criteria": { "textContent": ":" },
+            "criteria": {
+              "textContent": ":"
+            },
             "label": "Formatted timestamp"
           },
           "source": "manual",
@@ -222,7 +224,9 @@
           "expected": "Integer suffixed with 'ms', e.g. '1234ms'",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "ms" },
+            "criteria": {
+              "textContent": "ms"
+            },
             "label": "Duration in milliseconds"
           },
           "source": "manual",
@@ -238,7 +242,9 @@
           "expected": "Format 'errors: N → M' where N=validation_errors_before, M=validation_errors_after",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "errors:" },
+            "criteria": {
+              "textContent": "errors:"
+            },
             "label": "Validation error delta"
           },
           "source": "manual",
@@ -263,7 +269,9 @@
           "precondition": "More events exist than fit in the max-h-96 container",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Pipeline Events" },
+            "criteria": {
+              "textContent": "Pipeline Events"
+            },
             "label": "Scrollable events container"
           },
           "source": "manual",
@@ -279,7 +287,9 @@
           "precondition": "Multiple events exist for the task run",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Pipeline Events" },
+            "criteria": {
+              "textContent": "Pipeline Events"
+            },
             "label": "Chronological event ordering"
           },
           "source": "manual",
@@ -303,7 +313,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Pipeline Events" },
+            "criteria": {
+              "textContent": "Pipeline Events"
+            },
             "label": "Phase indicator dots"
           },
           "source": "manual",
@@ -328,7 +340,9 @@
           "precondition": "More than 50 pipeline events exist for the task run",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "of" },
+            "criteria": {
+              "textContains": "of"
+            },
             "label": "Event count indicator"
           },
           "source": "ai-generated",
@@ -344,7 +358,9 @@
           "precondition": "More than 50 pipeline events exist",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Load more" },
+            "criteria": {
+              "textContains": "Load more"
+            },
             "label": "Load more events button"
           },
           "source": "ai-generated",
@@ -360,7 +376,9 @@
           "precondition": "200+ pipeline events are loaded",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Pipeline Events" },
+            "criteria": {
+              "textContains": "Pipeline Events"
+            },
             "label": "Virtualized event list"
           },
           "source": "ai-generated",
@@ -377,34 +395,57 @@
         "id": "pipe-loading",
         "name": "Loading Pipeline Events",
         "description": "The component is fetching pipeline event data from the API. A loading indicator is shown to prevent confusion about a blank timeline.",
-        "elements": [{ "role": "status", "accessibleName": "Loading events..." }],
+        "elements": [
+          {
+            "role": "status",
+            "accessibleName": "Loading events..."
+          }
+        ],
         "isInitial": true,
         "transitions": [
           {
             "id": "pipe-loading-to-empty",
             "name": "No Events Found",
-            "activateStates": ["pipe-empty"],
-            "deactivateStates": ["pipe-loading"],
+            "activateStates": [
+              "pipe-empty"
+            ],
+            "deactivateStates": [
+              "pipe-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "API returns empty array" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "condition": "API returns empty array"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           },
           {
             "id": "pipe-loading-to-timeline",
             "name": "Events Loaded",
-            "activateStates": ["pipe-timeline"],
-            "deactivateStates": ["pipe-loading"],
+            "activateStates": [
+              "pipe-timeline"
+            ],
+            "deactivateStates": [
+              "pipe-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "API returns events array with entries" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "condition": "API returns events array with entries"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           }
@@ -414,20 +455,34 @@
         "id": "pipe-empty",
         "name": "Empty State — No Events Recorded",
         "description": "No pipeline events exist for the current task run. The component shows an informative empty state message explaining that events appear after workflow generation runs.",
-        "elements": [{ "role": "status", "accessibleName": "No pipeline events recorded" }],
+        "elements": [
+          {
+            "role": "status",
+            "accessibleName": "No pipeline events recorded"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "pipe-empty-to-loading",
             "name": "Refresh or New Task Run",
-            "activateStates": ["pipe-loading"],
-            "deactivateStates": ["pipe-empty"],
+            "activateStates": [
+              "pipe-loading"
+            ],
+            "deactivateStates": [
+              "pipe-empty"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "task_run_id changes or component remounts" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "condition": "task_run_id changes or component remounts"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           }
@@ -438,37 +493,60 @@
         "name": "Timeline View — Events Displayed",
         "description": "Pipeline events are rendered chronologically in a scrollable timeline. Each event row shows a phase color dot, event type, timestamp (HH:mm:ss), duration (ms), token count, and validation error delta (N -> M). The header shows a count indicator when paginated (e.g., '50 of 8297'). Only visible rows plus a 10-row overscan buffer are rendered via react-window.",
         "elements": [
-          { "role": "heading", "accessibleName": "Pipeline Events" },
-          { "role": "list", "accessibleName": "Event timeline" },
-          { "role": "listitem", "accessibleName": "Event row with phase badge" }
+          {
+            "role": "list",
+            "accessibleName": "Event timeline"
+          },
+          {
+            "role": "listitem",
+            "accessibleName": "Event row with phase badge"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "pipe-timeline-to-paginated",
             "name": "Load More Events",
-            "activateStates": ["pipe-paginated"],
-            "deactivateStates": ["pipe-timeline"],
+            "activateStates": [
+              "pipe-paginated"
+            ],
+            "deactivateStates": [
+              "pipe-timeline"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Load more" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "textContent": "Load more"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           },
           {
             "id": "pipe-timeline-to-loading",
             "name": "Refresh or Task Run Change",
-            "activateStates": ["pipe-loading"],
-            "deactivateStates": ["pipe-timeline"],
+            "activateStates": [
+              "pipe-loading"
+            ],
+            "deactivateStates": [
+              "pipe-timeline"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "task_run_id changes or component remounts" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "condition": "task_run_id changes or component remounts"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           }
@@ -479,51 +557,81 @@
         "name": "Paginated View — Additional Events Loaded",
         "description": "Additional events have been loaded beyond the initial 50-event page. The count indicator updates (e.g., '100 of 8297'). The Load more button remains if more events exist, or disappears when all events are loaded. Virtualized rendering ensures smooth scrolling even with hundreds of loaded events.",
         "elements": [
-          { "role": "heading", "accessibleName": "Pipeline Events" },
-          { "role": "list", "accessibleName": "Event timeline with additional pages" },
-          { "role": "button", "accessibleName": "Load more events" }
+          {
+            "role": "list",
+            "accessibleName": "Event timeline with additional pages"
+          },
+          {
+            "role": "button",
+            "accessibleName": "Load more events"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "pipe-paginated-to-paginated",
             "name": "Load Even More Events",
-            "activateStates": ["pipe-paginated"],
+            "activateStates": [
+              "pipe-paginated"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Load more" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "textContent": "Load more"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           },
           {
             "id": "pipe-paginated-to-timeline",
             "name": "All Events Loaded",
-            "activateStates": ["pipe-timeline"],
-            "deactivateStates": ["pipe-paginated"],
+            "activateStates": [
+              "pipe-timeline"
+            ],
+            "deactivateStates": [
+              "pipe-paginated"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "all events loaded, Load more button disappears" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "condition": "all events loaded, Load more button disappears"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
           {
             "id": "pipe-paginated-to-loading",
             "name": "Refresh or Task Run Change",
-            "activateStates": ["pipe-loading"],
-            "deactivateStates": ["pipe-paginated"],
+            "activateStates": [
+              "pipe-loading"
+            ],
+            "deactivateStates": [
+              "pipe-paginated"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "condition": "task_run_id changes or component remounts" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "condition": "task_run_id changes or component remounts"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           }
@@ -538,7 +646,13 @@
     "updatedAt": "2026-03-26T00:00:00.000Z",
     "pageUrl": "/pipeline-events",
     "elementSource": "sdk",
-    "tags": ["knowledge-graph", "pipeline", "generation", "telemetry", "runner-only"],
+    "tags": [
+      "knowledge-graph",
+      "pipeline",
+      "generation",
+      "telemetry",
+      "runner-only"
+    ],
     "preconditions": [
       "Requires at least one workflow generation with instrumented generator — generation_pipeline_events table must have entries",
       "Events are per-task-run — the component needs a task_run_id from execution context or props",

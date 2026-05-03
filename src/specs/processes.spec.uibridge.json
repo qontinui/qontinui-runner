@@ -647,8 +647,12 @@
         "name": "Process List — No Selection",
         "description": "The Process Manager is open but no process is selected. The right panel shows the 'Select a process to view its output' placeholder.",
         "elements": [
-          { "textContent": "Select a process to view its output" },
-          { "textContent": "Process Manager" }
+          {
+            "textContent": "Select a process to view its output"
+          },
+          {
+            "textContent": "Process Manager"
+          }
         ],
         "isInitial": true,
         "transitions": [
@@ -656,14 +660,24 @@
             "id": "pm-select-first-process",
             "name": "Select a process",
             "description": "Click a process row in the list to load its output viewer",
-            "activateStates": ["pm-live-view"],
-            "deactivateStates": ["pm-no-selection"],
+            "activateStates": [
+              "pm-live-view"
+            ],
+            "deactivateStates": [
+              "pm-no-selection"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContains": "(FastAPI)" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "role": "button",
+                  "textContains": "(FastAPI)"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           }
@@ -674,23 +688,33 @@
         "name": "Live Output View",
         "description": "A process is selected and the output viewer is showing the live ring buffer. The session picker shows 'Live' as the selected value. The 'All sessions' toggle is off; search input placeholder is 'Search output...'.",
         "elements": [
-          { "placeholder": "Search output..." },
-          { "textContent": "All sessions" },
-          { "tagName": "select" }
+          {
+            "textContent": "All sessions"
+          }
         ],
         "transitions": [
           {
             "id": "pm-live-to-search-all",
             "name": "Enable cross-session search",
             "description": "Click the 'All sessions' toggle to switch to cross-session DB search",
-            "activateStates": ["pm-search-all-view"],
-            "deactivateStates": ["pm-live-view"],
+            "activateStates": [
+              "pm-search-all-view"
+            ],
+            "deactivateStates": [
+              "pm-live-view"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "All sessions" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "All sessions"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
@@ -698,15 +722,26 @@
             "id": "pm-live-to-historical",
             "name": "Select a historical session",
             "description": "Change the session picker dropdown to a historical entry",
-            "activateStates": ["pm-historical-view"],
-            "deactivateStates": ["pm-live-view"],
+            "activateStates": [
+              "pm-historical-view"
+            ],
+            "deactivateStates": [
+              "pm-live-view"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "select",
-                "target": { "tagName": "select" },
-                "params": { "byIndex": 1 },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "tagName": "select"
+                },
+                "params": {
+                  "byIndex": 1
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -717,22 +752,36 @@
         "name": "Cross-Session Search View",
         "description": "The 'All sessions' toggle is active (cyan highlight). The search input placeholder is 'Search all sessions...'. Typing triggers search_process_logs; results appear as a hits panel. The normal virtualized output list is hidden.",
         "elements": [
-          { "placeholder": "Search all sessions..." },
-          { "textContains": "hits across sessions" }
+          {
+            "placeholder": "Search all sessions..."
+          },
+          {
+            "textContains": "hits across sessions"
+          }
         ],
         "transitions": [
           {
             "id": "pm-search-all-to-live",
             "name": "Toggle off All sessions",
             "description": "Click the 'All sessions' button again to return to live view",
-            "activateStates": ["pm-live-view"],
-            "deactivateStates": ["pm-search-all-view"],
+            "activateStates": [
+              "pm-live-view"
+            ],
+            "deactivateStates": [
+              "pm-search-all-view"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "All sessions" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "role": "button",
+                  "textContent": "All sessions"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -742,21 +791,32 @@
         "id": "pm-historical-view",
         "name": "Historical Session View",
         "description": "A historical session is selected in the picker. The output area shows the persisted lines from that session (batch fetch, not live stream). The Tauri process-output event subscription is paused for this process ID.",
-        "elements": [{ "placeholder": "Search output..." }, { "tagName": "select" }],
+        "elements": [],
         "transitions": [
           {
             "id": "pm-historical-to-live",
             "name": "Return to Live",
             "description": "Select 'Live' in the session picker to re-subscribe to the live stream",
-            "activateStates": ["pm-live-view"],
-            "deactivateStates": ["pm-historical-view"],
+            "activateStates": [
+              "pm-live-view"
+            ],
+            "deactivateStates": [
+              "pm-historical-view"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "select",
-                "target": { "tagName": "select" },
-                "params": { "value": "__live__" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "tagName": "select"
+                },
+                "params": {
+                  "value": "__live__"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }

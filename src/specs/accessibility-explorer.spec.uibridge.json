@@ -16,7 +16,10 @@
           "assertionType": "containsText",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContains": "Accessibility Explorer" },
+            "criteria": {
+              "role": "heading",
+              "textContains": "Accessibility Explorer"
+            },
             "label": "Page title heading"
           },
           "source": "ai-generated",
@@ -31,7 +34,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Tree View" },
+            "criteria": {
+              "textContains": "Tree View"
+            },
             "label": "Tree view column"
           },
           "precondition": "Connected to a target with a captured tree",
@@ -47,7 +52,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Connect to an application" },
+            "criteria": {
+              "textContains": "Connect to an application"
+            },
             "label": "Empty state message"
           },
           "precondition": "Not connected to any target",
@@ -72,7 +79,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "placeholder": "Window title, pid:1234, or 'Desktop'" },
+            "criteria": {
+              "placeholder": "Window title, pid:1234, or 'Desktop'"
+            },
             "label": "Target input field"
           },
           "precondition": "Not connected",
@@ -88,7 +97,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Connect" },
+            "criteria": {
+              "textContains": "Connect"
+            },
             "label": "Connect button"
           },
           "precondition": "Not connected",
@@ -104,7 +115,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Connect" },
+            "criteria": {
+              "textContains": "Connect"
+            },
             "label": "Connect button"
           },
           "source": "ai-generated",
@@ -119,7 +132,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Disconnected" },
+            "criteria": {
+              "textContains": "Disconnected"
+            },
             "label": "Connection status badge"
           },
           "precondition": "Not connected",
@@ -135,7 +150,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Disconnect" },
+            "criteria": {
+              "textContains": "Disconnect"
+            },
             "label": "Disconnect button"
           },
           "precondition": "Connected to a target",
@@ -151,7 +168,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "selector": ".text-red-400" },
+            "criteria": {
+              "selector": ".text-red-400"
+            },
             "label": "Connection error message"
           },
           "precondition": "Connection attempt failed",
@@ -176,7 +195,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "nodes" },
+            "criteria": {
+              "textContains": "nodes"
+            },
             "label": "Node count display"
           },
           "precondition": "Connected with a captured tree",
@@ -192,7 +213,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "interactive" },
+            "criteria": {
+              "textContains": "interactive"
+            },
             "label": "Interactive count display"
           },
           "precondition": "Connected with a captured tree",
@@ -208,7 +231,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Gen" },
+            "criteria": {
+              "textContains": "Gen"
+            },
             "label": "Generation counter"
           },
           "precondition": "Connected with a captured tree",
@@ -233,7 +258,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Tree View" },
+            "criteria": {
+              "textContains": "Tree View"
+            },
             "label": "Tree view card header"
           },
           "precondition": "Connected with a captured tree",
@@ -249,7 +276,9 @@
           "assertionType": "attribute",
           "target": {
             "type": "search",
-            "criteria": { "role": "tree" },
+            "criteria": {
+              "role": "tree"
+            },
             "label": "Tree container"
           },
           "attributeName": "role",
@@ -267,7 +296,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "role": "treeitem" },
+            "criteria": {
+              "role": "treeitem"
+            },
             "label": "Tree node with children"
           },
           "precondition": "Connected with a captured tree that has nested nodes",
@@ -283,7 +314,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "role": "treeitem" },
+            "criteria": {
+              "role": "treeitem"
+            },
             "label": "Selectable tree node"
           },
           "precondition": "Connected with a captured tree",
@@ -299,7 +332,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "role": "treeitem" },
+            "criteria": {
+              "role": "treeitem"
+            },
             "label": "Tree node role badges"
           },
           "precondition": "Connected with a captured tree",
@@ -315,7 +350,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "role": "treeitem" },
+            "criteria": {
+              "role": "treeitem"
+            },
             "label": "Interactive node indicator"
           },
           "precondition": "Connected with a tree containing interactive elements",
@@ -331,7 +368,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Refresh" },
+            "criteria": {
+              "textContains": "Refresh"
+            },
             "label": "Refresh button"
           },
           "precondition": "Connected to a target",
@@ -356,7 +395,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Details" },
+            "criteria": {
+              "textContains": "Details"
+            },
             "label": "Details card header"
           },
           "precondition": "Connected with a captured tree",
@@ -372,7 +413,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Select a node to view details" },
+            "criteria": {
+              "textContains": "Select a node to view details"
+            },
             "label": "Details empty state"
           },
           "precondition": "Connected with no node selected",
@@ -388,7 +431,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Ref ID" },
+            "criteria": {
+              "textContains": "Ref ID"
+            },
             "label": "Ref ID with copy button"
           },
           "precondition": "A node is selected",
@@ -404,7 +449,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "State" },
+            "criteria": {
+              "textContains": "State"
+            },
             "label": "State flags section"
           },
           "precondition": "A node is selected",
@@ -420,7 +467,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Click" },
+            "criteria": {
+              "textContains": "Click"
+            },
             "label": "Click action button"
           },
           "precondition": "A node is selected",
@@ -436,7 +485,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Focus" },
+            "criteria": {
+              "textContains": "Focus"
+            },
             "label": "Focus action button"
           },
           "precondition": "A node is selected",
@@ -452,7 +503,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Type" },
+            "criteria": {
+              "textContains": "Type"
+            },
             "label": "Type action button"
           },
           "precondition": "A node is selected",
@@ -468,7 +521,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Action" },
+            "criteria": {
+              "textContains": "Action"
+            },
             "label": "Action result message"
           },
           "precondition": "An action was just executed",
@@ -493,7 +548,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "tab", "textContains": "Query" },
+            "criteria": {
+              "role": "tab",
+              "textContains": "Query"
+            },
             "label": "Query tab trigger"
           },
           "precondition": "Connected with a captured tree",
@@ -509,7 +567,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Any role" },
+            "criteria": {
+              "textContains": "Any role"
+            },
             "label": "Role filter dropdown"
           },
           "precondition": "Connected, Query tab active",
@@ -525,7 +585,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "placeholder": "Label contains..." },
+            "criteria": {
+              "placeholder": "Label contains..."
+            },
             "label": "Label filter input"
           },
           "precondition": "Connected, Query tab active",
@@ -541,7 +603,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Interactive only" },
+            "criteria": {
+              "textContains": "Interactive only"
+            },
             "label": "Interactive only filter"
           },
           "precondition": "Connected, Query tab active",
@@ -557,7 +621,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Search" },
+            "criteria": {
+              "textContains": "Search"
+            },
             "label": "Query search button"
           },
           "precondition": "Connected, Query tab active",
@@ -582,7 +648,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "tab", "textContains": "AI Context" },
+            "criteria": {
+              "role": "tab",
+              "textContains": "AI Context"
+            },
             "label": "AI Context tab trigger"
           },
           "precondition": "Connected with a captured tree",
@@ -598,7 +667,9 @@
           "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Generate AI Context" },
+            "criteria": {
+              "textContains": "Generate AI Context"
+            },
             "label": "Generate AI Context button"
           },
           "precondition": "Connected, AI Context tab active",
@@ -614,7 +685,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Copy" },
+            "criteria": {
+              "textContains": "Copy"
+            },
             "label": "Copy AI context button"
           },
           "precondition": "AI context has been generated",
@@ -639,7 +712,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "role": "textbox" },
+            "criteria": {
+              "role": "textbox"
+            },
             "label": "Styled input fields"
           },
           "source": "ai-generated",
@@ -654,7 +729,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading" },
+            "criteria": {
+              "role": "heading"
+            },
             "label": "Page heading text"
           },
           "source": "ai-generated",
@@ -669,7 +746,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Tree View" },
+            "criteria": {
+              "textContains": "Tree View"
+            },
             "label": "Card header styling"
           },
           "precondition": "Connected with a captured tree",
@@ -694,7 +773,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "role": "treeitem" },
+            "criteria": {
+              "role": "treeitem"
+            },
             "label": "Keyboard-navigable tree node"
           },
           "precondition": "Connected with a captured tree",
@@ -710,7 +791,9 @@
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "accessibleName": "Expand" },
+            "criteria": {
+              "accessibleName": "Expand"
+            },
             "label": "Expand button with aria-label"
           },
           "precondition": "Connected with a tree that has collapsed nodes",
@@ -729,30 +812,42 @@
         "name": "Disconnected",
         "description": "The initial state when the page loads. The header with 'Accessibility Explorer' title and 'Disconnected' badge is visible, the connection bar with target input and Connect button is shown, and the main area displays the empty-state message 'Connect to an application to explore its accessibility tree'. No tree, details, stats bar, or bottom tabs are visible.",
         "elements": [
-          { "textContains": "Accessibility Explorer" },
-          { "textContains": "Disconnected" },
-          { "placeholder": "Window title, pid:1234, or 'Desktop'" },
-          { "textContains": "Connect" },
-          { "textContains": "Connect to an application" }
+          {
+            "textContains": "Disconnected"
+          },
+          {
+            "textContains": "Connect to an application"
+          }
         ],
         "isInitial": true,
         "transitions": [
           {
             "id": "disconnected-to-connecting",
             "name": "User clicks Connect or presses Enter with a non-empty target",
-            "activateStates": ["connecting"],
-            "deactivateStates": ["disconnected"],
+            "activateStates": [
+              "connecting"
+            ],
+            "deactivateStates": [
+              "disconnected"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "type",
-                "target": { "placeholder": "Window title, pid:1234, or 'Desktop'" },
+                "target": {
+                  "placeholder": "Window title, pid:1234, or 'Desktop'"
+                },
                 "value": "Notepad"
               },
               {
                 "action": "click",
-                "target": { "textContains": "Connect" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "textContains": "Connect"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -762,22 +857,34 @@
         "id": "connecting",
         "name": "Connecting",
         "description": "The Connect button shows 'Connecting...' while the a11y_connect and a11y_capture Tauri commands are in flight. The target input remains visible but the user cannot submit again until the attempt resolves.",
-        "elements": [{ "textContains": "Connecting" }],
+        "elements": [
+          {
+            "textContains": "Connecting"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "connecting-to-connected",
             "name": "Connection and tree capture succeed",
-            "activateStates": ["connected-no-selection"],
-            "deactivateStates": ["connecting"],
+            "activateStates": [
+              "connected-no-selection"
+            ],
+            "deactivateStates": [
+              "connecting"
+            ],
             "staysVisible": false,
             "process": []
           },
           {
             "id": "connecting-to-connection-error",
             "name": "Connection fails (target not found or backend error)",
-            "activateStates": ["connection-error"],
-            "deactivateStates": ["connecting"],
+            "activateStates": [
+              "connection-error"
+            ],
+            "deactivateStates": [
+              "connecting"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -788,24 +895,32 @@
         "name": "Connection Error",
         "description": "The connection attempt failed. The page remains in disconnected layout but a red error message appears below the connection bar with the error text. The target input and Connect button remain available for retry.",
         "elements": [
-          { "textContains": "Accessibility Explorer" },
-          { "placeholder": "Window title, pid:1234, or 'Desktop'" },
-          { "textContains": "Connect" },
-          { "selector": ".text-red-400" }
+          {
+            "selector": ".text-red-400"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "connection-error-to-connecting",
             "name": "User retries connection with a new or same target",
-            "activateStates": ["connecting"],
-            "deactivateStates": ["connection-error"],
+            "activateStates": [
+              "connecting"
+            ],
+            "deactivateStates": [
+              "connection-error"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Connect" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "textContains": "Connect"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -816,56 +931,89 @@
         "name": "Connected (No Selection)",
         "description": "Successfully connected to a target. The status badge shows the backend name (e.g., 'UIA'). The connection bar is hidden; Refresh and Disconnect buttons appear in the header. The stats bar shows node count, interactive count, and generation number. The two-column layout is visible: the tree view on the left with expandable nodes, and the details panel on the right showing 'Select a node to view details'. The bottom Query and AI Context tabs are available.",
         "elements": [
-          { "textContains": "Tree View" },
-          { "textContains": "Details" },
-          { "textContains": "Select a node to view details" },
-          { "textContains": "nodes" },
-          { "textContains": "Refresh" },
-          { "textContains": "Disconnect" },
-          { "role": "tab", "textContains": "Query" },
-          { "role": "tab", "textContains": "AI Context" }
+          {
+            "textContains": "Select a node to view details"
+          },
+          {
+            "textContains": "nodes"
+          },
+          {
+            "role": "tab",
+            "textContains": "Query"
+          },
+          {
+            "role": "tab",
+            "textContains": "AI Context"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "connected-to-node-selected",
             "name": "User clicks a tree node",
-            "activateStates": ["connected-node-selected"],
-            "deactivateStates": ["connected-no-selection"],
+            "activateStates": [
+              "connected-node-selected"
+            ],
+            "deactivateStates": [
+              "connected-no-selection"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "treeitem" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "treeitem"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "connected-no-selection-to-refreshing",
             "name": "User clicks Refresh to re-capture the tree",
-            "activateStates": ["refreshing"],
-            "deactivateStates": ["connected-no-selection"],
+            "activateStates": [
+              "refreshing"
+            ],
+            "deactivateStates": [
+              "connected-no-selection"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Refresh" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "textContains": "Refresh"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
           {
             "id": "connected-no-selection-to-disconnected",
             "name": "User clicks Disconnect",
-            "activateStates": ["disconnected"],
-            "deactivateStates": ["connected-no-selection"],
+            "activateStates": [
+              "disconnected"
+            ],
+            "deactivateStates": [
+              "connected-no-selection"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Disconnect" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContains": "Disconnect"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -875,14 +1023,18 @@
         "id": "refreshing",
         "name": "Refreshing Tree",
         "description": "The Refresh button's icon is spinning while a11y_capture re-captures the accessibility tree. The tree view and stats bar remain visible but will be replaced when the capture completes.",
-        "elements": [{ "textContains": "Tree View" }, { "textContains": "Refresh" }],
+        "elements": [],
         "isInitial": false,
         "transitions": [
           {
             "id": "refreshing-to-connected-no-selection",
             "name": "Tree capture completes successfully",
-            "activateStates": ["connected-no-selection"],
-            "deactivateStates": ["refreshing"],
+            "activateStates": [
+              "connected-no-selection"
+            ],
+            "deactivateStates": [
+              "refreshing"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -892,99 +1044,142 @@
         "id": "connected-node-selected",
         "name": "Connected (Node Selected)",
         "description": "A tree node is selected (highlighted with primary ring). The details panel shows the selected node's properties organized in sections: Identity (Role, Name, Value, Description, Ref ID with copy button, Source), Bounds (x, y, width, height), State (green/outline badges), Supported Patterns (purple badges), and Actions (Click, Focus, Type buttons). The tree view, stats bar, Refresh, and Disconnect buttons remain visible.",
-        "elements": [
-          { "textContains": "Tree View" },
-          { "textContains": "Details" },
-          { "textContains": "Ref ID" },
-          { "textContains": "Click" },
-          { "textContains": "Focus" },
-          { "textContains": "Type" },
-          { "textContains": "Refresh" },
-          { "textContains": "Disconnect" }
-        ],
+        "elements": [],
         "isInitial": false,
         "transitions": [
           {
             "id": "node-selected-to-different-node",
             "name": "User clicks a different tree node",
-            "activateStates": ["connected-node-selected"],
+            "activateStates": [
+              "connected-node-selected"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "treeitem" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "treeitem"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "node-selected-click-action",
             "name": "User clicks the Click action button",
-            "activateStates": ["action-result"],
-            "deactivateStates": ["connected-node-selected"],
+            "activateStates": [
+              "action-result"
+            ],
+            "deactivateStates": [
+              "connected-node-selected"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Click" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContains": "Click"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "node-selected-focus-action",
             "name": "User clicks the Focus action button",
-            "activateStates": ["action-result"],
-            "deactivateStates": ["connected-node-selected"],
+            "activateStates": [
+              "action-result"
+            ],
+            "deactivateStates": [
+              "connected-node-selected"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Focus" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContains": "Focus"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "node-selected-to-typing",
             "name": "User clicks the Type... button to reveal the text input",
-            "activateStates": ["typing-action"],
-            "deactivateStates": ["connected-node-selected"],
+            "activateStates": [
+              "typing-action"
+            ],
+            "deactivateStates": [
+              "connected-node-selected"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Type" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "textContains": "Type"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "node-selected-to-refreshing",
             "name": "User clicks Refresh to re-capture the tree",
-            "activateStates": ["refreshing"],
-            "deactivateStates": ["connected-node-selected"],
+            "activateStates": [
+              "refreshing"
+            ],
+            "deactivateStates": [
+              "connected-node-selected"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Refresh" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "textContains": "Refresh"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
           {
             "id": "node-selected-to-disconnected",
             "name": "User clicks Disconnect",
-            "activateStates": ["disconnected"],
-            "deactivateStates": ["connected-node-selected"],
+            "activateStates": [
+              "disconnected"
+            ],
+            "deactivateStates": [
+              "connected-node-selected"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Disconnect" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContains": "Disconnect"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -995,23 +1190,32 @@
         "name": "Typing Action Input",
         "description": "The Type... button was clicked and a text input field with a Send button is now visible below the action buttons. The user can enter text and press Send or Enter to invoke a11y_type_text. The rest of the connected+selected UI remains visible.",
         "elements": [
-          { "textContains": "Details" },
-          { "textContains": "Ref ID" },
-          { "textContains": "Send" }
+          {
+            "textContains": "Send"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "typing-to-action-result",
             "name": "User enters text and clicks Send or presses Enter",
-            "activateStates": ["action-result"],
-            "deactivateStates": ["typing-action"],
+            "activateStates": [
+              "action-result"
+            ],
+            "deactivateStates": [
+              "typing-action"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Send" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContains": "Send"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1021,54 +1225,73 @@
         "id": "action-result",
         "name": "Action Result Displayed",
         "description": "An action (Click, Focus, or Type) has been executed and the result message is shown inline below the action buttons. A green message ('Action succeeded') on success or a red message with the error text on failure. The node remains selected. Selecting a different node clears this message and returns to the connected-node-selected state.",
-        "elements": [
-          { "textContains": "Details" },
-          { "textContains": "Ref ID" },
-          { "textContains": "Click" },
-          { "textContains": "Focus" },
-          { "textContains": "Type" }
-        ],
+        "elements": [],
         "isInitial": false,
         "transitions": [
           {
             "id": "action-result-to-node-selected",
             "name": "User selects a different tree node, clearing the action message",
-            "activateStates": ["connected-node-selected"],
-            "deactivateStates": ["action-result"],
+            "activateStates": [
+              "connected-node-selected"
+            ],
+            "deactivateStates": [
+              "action-result"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "treeitem" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "treeitem"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "action-result-click-again",
             "name": "User executes another Click action on the same node",
-            "activateStates": ["action-result"],
+            "activateStates": [
+              "action-result"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Click" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContains": "Click"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "action-result-to-disconnected",
             "name": "User clicks Disconnect",
-            "activateStates": ["disconnected"],
-            "deactivateStates": ["action-result"],
+            "activateStates": [
+              "disconnected"
+            ],
+            "deactivateStates": [
+              "action-result"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContains": "Disconnect" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContains": "Disconnect"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }

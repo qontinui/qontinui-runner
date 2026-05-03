@@ -15,7 +15,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Specs" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Specs"
+            },
             "label": "Specs page title"
           },
           "assertionType": "exists",
@@ -30,7 +33,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "viewer" },
+            "criteria": {
+              "textContent": "viewer"
+            },
             "label": "Mode badge (viewer)"
           },
           "assertionType": "exists",
@@ -45,7 +50,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Editor" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Editor"
+            },
             "label": "Editor view mode button"
           },
           "assertionType": "exists",
@@ -60,7 +68,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Contracts" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Contracts"
+            },
             "label": "Contracts view mode button"
           },
           "assertionType": "exists",
@@ -75,7 +86,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Experimentation" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Experimentation"
+            },
             "label": "Experimentation view mode button"
           },
           "assertionType": "exists",
@@ -90,7 +104,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Contracts" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Contracts"
+            },
             "label": "Contracts view mode button"
           },
           "assertionType": "behavior",
@@ -114,7 +131,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-bundled" },
+            "criteria": {
+              "idPattern": "specs-btn-bundled"
+            },
             "label": "Load bundled specs button"
           },
           "assertionType": "exists",
@@ -129,7 +148,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-file" },
+            "criteria": {
+              "idPattern": "specs-btn-file"
+            },
             "label": "Load from file button"
           },
           "assertionType": "exists",
@@ -144,7 +165,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-input-url" },
+            "criteria": {
+              "idPattern": "specs-input-url"
+            },
             "label": "App URL input"
           },
           "assertionType": "exists",
@@ -159,7 +182,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-discover" },
+            "criteria": {
+              "idPattern": "specs-btn-discover"
+            },
             "label": "Discover button"
           },
           "assertionType": "exists",
@@ -174,7 +199,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-bundled" },
+            "criteria": {
+              "idPattern": "specs-btn-bundled"
+            },
             "label": "Load bundled specs button"
           },
           "assertionType": "behavior",
@@ -189,7 +216,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-discover" },
+            "criteria": {
+              "idPattern": "specs-btn-discover"
+            },
             "label": "Discover button"
           },
           "assertionType": "behavior",
@@ -213,7 +242,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-edit" },
+            "criteria": {
+              "idPattern": "specs-btn-edit"
+            },
             "label": "Edit/Done toggle button"
           },
           "assertionType": "exists",
@@ -229,7 +260,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-ai-toggle" },
+            "criteria": {
+              "idPattern": "specs-ai-toggle"
+            },
             "label": "AI spec-generation toggle switch"
           },
           "assertionType": "exists",
@@ -244,7 +277,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-build-workflow" },
+            "criteria": {
+              "idPattern": "specs-btn-build-workflow"
+            },
             "label": "Build Workflow button"
           },
           "assertionType": "exists",
@@ -260,7 +295,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-sync-all" },
+            "criteria": {
+              "idPattern": "specs-btn-sync-all"
+            },
             "label": "Sync All Specs button"
           },
           "assertionType": "exists",
@@ -275,7 +312,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-compile-sm" },
+            "criteria": {
+              "idPattern": "specs-btn-compile-sm"
+            },
             "label": "Compile State Machine button"
           },
           "assertionType": "exists",
@@ -290,7 +329,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "specs" },
+            "criteria": {
+              "textContent": "specs"
+            },
             "label": "Stats row (N specs / M groups / K assertions)"
           },
           "assertionType": "exists",
@@ -315,7 +356,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Connecting" },
+            "criteria": {
+              "textContent": "Connecting"
+            },
             "label": "Connecting status indicator"
           },
           "assertionType": "exists",
@@ -331,7 +374,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Connected" },
+            "criteria": {
+              "textContent": "Connected"
+            },
             "label": "Connected status with app name"
           },
           "assertionType": "exists",
@@ -356,7 +401,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Analyzing specs" },
+            "criteria": {
+              "textContent": "Analyzing specs"
+            },
             "label": "Sync analyzing phase banner"
           },
           "assertionType": "exists",
@@ -372,7 +419,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Sync complete" },
+            "criteria": {
+              "textContent": "Sync complete"
+            },
             "label": "Sync complete phase banner"
           },
           "assertionType": "exists",
@@ -388,7 +437,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-sync-all" },
+            "criteria": {
+              "idPattern": "specs-btn-sync-all"
+            },
             "label": "Sync All Specs button"
           },
           "assertionType": "behavior",
@@ -413,7 +464,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Specifications sidebar heading"
           },
           "assertionType": "exists",
@@ -428,7 +481,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No specs loaded" },
+            "criteria": {
+              "textContent": "No specs loaded"
+            },
             "label": "Empty tree state message"
           },
           "assertionType": "exists",
@@ -444,7 +499,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Spec tree node"
           },
           "assertionType": "behavior",
@@ -460,7 +517,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Expandable page spec node"
           },
           "assertionType": "behavior",
@@ -476,7 +535,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Spec tree grouping semantics"
           },
           "assertionType": "semantic",
@@ -501,7 +562,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Generate Spec" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Generate Spec"
+            },
             "label": "Generate Spec button"
           },
           "assertionType": "exists",
@@ -517,7 +581,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Generate Spec" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Generate Spec"
+            },
             "label": "Generate Spec button"
           },
           "assertionType": "behavior",
@@ -542,7 +609,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Assertions" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Assertions"
+            },
             "label": "Assertions tab"
           },
           "assertionType": "exists",
@@ -558,7 +628,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Issues" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Issues"
+            },
             "label": "Issues tab"
           },
           "assertionType": "exists",
@@ -574,7 +647,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Triage" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Triage"
+            },
             "label": "Triage tab"
           },
           "assertionType": "exists",
@@ -590,7 +666,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Issues" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Issues"
+            },
             "label": "Issues tab"
           },
           "assertionType": "behavior",
@@ -615,7 +694,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Groups" },
+            "criteria": {
+              "textContent": "Groups"
+            },
             "label": "Groups section heading"
           },
           "assertionType": "exists",
@@ -631,7 +712,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Categories" },
+            "criteria": {
+              "textContent": "Categories"
+            },
             "label": "Categories section"
           },
           "assertionType": "exists",
@@ -647,7 +730,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Groups" },
+            "criteria": {
+              "textContent": "Groups"
+            },
             "label": "Group row navigation"
           },
           "assertionType": "behavior",
@@ -672,7 +757,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "critical" },
+            "criteria": {
+              "textContent": "critical"
+            },
             "label": "Assertion severity badge in group detail"
           },
           "assertionType": "exists",
@@ -688,7 +775,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "critical" },
+            "criteria": {
+              "textContent": "critical"
+            },
             "label": "Assertion type distribution in group"
           },
           "assertionType": "semantic",
@@ -713,7 +802,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "editor" },
+            "criteria": {
+              "textContent": "editor"
+            },
             "label": "Editor mode badge"
           },
           "assertionType": "exists",
@@ -729,7 +820,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Done" },
+            "criteria": {
+              "textContent": "Done"
+            },
             "label": "Assertion eye toggle in edit mode"
           },
           "assertionType": "behavior",
@@ -745,7 +838,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Add assertion" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Add assertion"
+            },
             "label": "Add assertion button"
           },
           "assertionType": "behavior",
@@ -761,7 +857,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Add group" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Add group"
+            },
             "label": "Add group button"
           },
           "assertionType": "behavior",
@@ -786,7 +885,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI Chat" },
+            "criteria": {
+              "textContent": "AI Chat"
+            },
             "label": "AI Chat panel heading"
           },
           "assertionType": "exists",
@@ -801,7 +902,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "New" },
+            "criteria": {
+              "role": "button",
+              "textContent": "New"
+            },
             "label": "New session button"
           },
           "assertionType": "exists",
@@ -816,7 +920,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Apply as" },
+            "criteria": {
+              "textContent": "Apply as"
+            },
             "label": "Apply spec JSON action button"
           },
           "assertionType": "behavior",
@@ -832,7 +938,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI Chat" },
+            "criteria": {
+              "textContent": "AI Chat"
+            },
             "label": "AI Chat context injection"
           },
           "assertionType": "semantic",
@@ -857,7 +965,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Review" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Review"
+            },
             "label": "Review mode toggle"
           },
           "assertionType": "exists",
@@ -872,7 +983,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Create" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Create"
+            },
             "label": "Create mode toggle"
           },
           "assertionType": "exists",
@@ -887,7 +1001,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Review spec quality" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Review spec quality"
+            },
             "label": "Review spec quality quick action"
           },
           "assertionType": "behavior",
@@ -903,7 +1020,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Build verification workflow" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Build verification workflow"
+            },
             "label": "Build verification workflow quick action"
           },
           "assertionType": "exists",
@@ -919,7 +1039,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "New Page Spec" },
+            "criteria": {
+              "role": "button",
+              "textContent": "New Page Spec"
+            },
             "label": "New Page Spec template button"
           },
           "assertionType": "behavior",
@@ -944,7 +1067,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-build-workflow" },
+            "criteria": {
+              "idPattern": "specs-btn-build-workflow"
+            },
             "label": "Build Workflow button (AI path)"
           },
           "assertionType": "behavior",
@@ -960,7 +1085,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-build-workflow" },
+            "criteria": {
+              "idPattern": "specs-btn-build-workflow"
+            },
             "label": "Build Workflow button (deterministic path)"
           },
           "assertionType": "behavior",
@@ -976,7 +1103,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-build-workflow" },
+            "criteria": {
+              "idPattern": "specs-btn-build-workflow"
+            },
             "label": "Build Workflow (non-page spec)"
           },
           "assertionType": "semantic",
@@ -1001,7 +1130,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Drift" },
+            "criteria": {
+              "textContent": "Check Drift"
+            },
             "label": "Check Drift button"
           },
           "assertionType": "exists",
@@ -1016,7 +1147,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Drift" },
+            "criteria": {
+              "textContent": "Check Drift"
+            },
             "label": "Check Drift report modal"
           },
           "assertionType": "behavior",
@@ -1040,7 +1173,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-compile-sm" },
+            "criteria": {
+              "idPattern": "specs-btn-compile-sm"
+            },
             "label": "Compile State Machine button"
           },
           "assertionType": "behavior",
@@ -1056,7 +1191,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-compile-sm" },
+            "criteria": {
+              "idPattern": "specs-btn-compile-sm"
+            },
             "label": "Compile State Machine semantics"
           },
           "assertionType": "semantic",
@@ -1080,7 +1217,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-file" },
+            "criteria": {
+              "idPattern": "specs-btn-file"
+            },
             "label": "File load kind detection"
           },
           "assertionType": "semantic",
@@ -1095,7 +1234,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-file" },
+            "criteria": {
+              "idPattern": "specs-btn-file"
+            },
             "label": "File load auto-select behavior"
           },
           "assertionType": "behavior",
@@ -1110,7 +1251,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-btn-save" },
+            "criteria": {
+              "idPattern": "specs-btn-save"
+            },
             "label": "Save to file button"
           },
           "assertionType": "behavior",
@@ -1135,7 +1278,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-ai-toggle", "role": "switch" },
+            "criteria": {
+              "idPattern": "specs-ai-toggle",
+              "role": "switch"
+            },
             "label": "AI generation toggle default state"
           },
           "assertionType": "attribute",
@@ -1151,7 +1297,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "idPattern": "specs-ai-toggle" },
+            "criteria": {
+              "idPattern": "specs-ai-toggle"
+            },
             "label": "AI generation toggle click"
           },
           "assertionType": "behavior",
@@ -1166,7 +1314,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Generating" },
+            "criteria": {
+              "textContent": "Generating"
+            },
             "label": "Generating loading state"
           },
           "assertionType": "behavior",
@@ -1185,21 +1335,34 @@
         "id": "specs-empty",
         "name": "Empty — No Specs Loaded",
         "description": "No specs have been loaded. The spec tree shows 'No specs loaded.' with guidance. The detail panel shows GlobalIssuesPanel. Mode badge shows 'viewer'.",
-        "elements": [{ "textContent": "No specs loaded" }],
+        "elements": [
+          {
+            "textContent": "No specs loaded"
+          }
+        ],
         "isInitial": true,
         "transitions": [
           {
             "id": "specs-empty-to-loaded",
             "name": "Load bundled specs",
             "description": "Click Bundled to load all bundled specs from the registry",
-            "activateStates": ["specs-loaded-no-selection"],
-            "deactivateStates": ["specs-empty"],
+            "activateStates": [
+              "specs-loaded-no-selection"
+            ],
+            "deactivateStates": [
+              "specs-empty"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "idPattern": "specs-btn-bundled" },
-                "waitAfter": { "type": "idle", "timeout": 3000 }
+                "target": {
+                  "idPattern": "specs-btn-bundled"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 3000
+                }
               }
             ]
           },
@@ -1207,14 +1370,23 @@
             "id": "specs-empty-to-discovering",
             "name": "Start app discovery",
             "description": "Click Discover to connect to a running app",
-            "activateStates": ["specs-discovering"],
-            "deactivateStates": ["specs-empty"],
+            "activateStates": [
+              "specs-discovering"
+            ],
+            "deactivateStates": [
+              "specs-empty"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "idPattern": "specs-btn-discover" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "idPattern": "specs-btn-discover"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           }
@@ -1224,14 +1396,22 @@
         "id": "specs-discovering",
         "name": "Discovering — Connecting to App",
         "description": "Discovery is in flight. The connection status row shows a cyan Loader2 spinner and 'Connecting…'.",
-        "elements": [{ "textContent": "Connecting" }],
+        "elements": [
+          {
+            "textContent": "Connecting"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-discovering-to-loaded",
             "name": "Discovery succeeds (automatic)",
-            "activateStates": ["specs-loaded-no-selection"],
-            "deactivateStates": ["specs-discovering"],
+            "activateStates": [
+              "specs-loaded-no-selection"
+            ],
+            "deactivateStates": [
+              "specs-discovering"
+            ],
             "staysVisible": false,
             "process": []
           }
@@ -1241,48 +1421,81 @@
         "id": "specs-loaded-no-selection",
         "name": "Specs Loaded — No Selection",
         "description": "Specs are visible in the tree grouped by app. No spec is selected. Mode badge shows 'viewer'. Detail panel shows GlobalIssuesPanel.",
-        "elements": [{ "textContent": "Specifications" }, { "textContent": "viewer" }],
+        "elements": [
+          {
+            "textContent": "Specifications"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-loaded-to-spec-selected",
             "name": "Click a spec node in the tree",
-            "activateStates": ["specs-spec-selected-viewer"],
-            "deactivateStates": ["specs-loaded-no-selection"],
+            "activateStates": [
+              "specs-spec-selected-viewer"
+            ],
+            "deactivateStates": [
+              "specs-loaded-no-selection"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Specifications" },
-                "waitAfter": { "type": "idle", "timeout": 1000 }
+                "target": {
+                  "textContent": "Specifications"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 1000
+                }
               }
             ]
           },
           {
             "id": "specs-loaded-to-contracts",
             "name": "Switch to Contracts view",
-            "activateStates": ["specs-contracts-view"],
-            "deactivateStates": ["specs-loaded-no-selection"],
+            "activateStates": [
+              "specs-contracts-view"
+            ],
+            "deactivateStates": [
+              "specs-loaded-no-selection"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Contracts" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Contracts"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "specs-loaded-to-experimentation",
             "name": "Switch to Experimentation view",
-            "activateStates": ["specs-experimentation-view"],
-            "deactivateStates": ["specs-loaded-no-selection"],
+            "activateStates": [
+              "specs-experimentation-view"
+            ],
+            "deactivateStates": [
+              "specs-loaded-no-selection"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Experimentation" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Experimentation"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1293,79 +1506,128 @@
         "name": "Spec Selected — Viewer Mode",
         "description": "A spec is selected. Center panel shows spec details: for page-spec, the tabbed view (Assertions/Issues/Triage) with Assertions active; for other types, specialized overviews. Mode badge shows 'viewer'. Save and Build Workflow buttons are visible. For page-specs, the Edit button is also visible.",
         "elements": [
-          { "textContent": "viewer" },
-          { "textContent": "Save" },
-          { "textContent": "Build Workflow" }
+          {
+            "textContent": "Save"
+          },
+          {
+            "textContent": "Build Workflow"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-viewer-to-editor",
             "name": "Toggle edit mode",
-            "activateStates": ["specs-spec-selected-editor"],
-            "deactivateStates": ["specs-spec-selected-viewer"],
+            "activateStates": [
+              "specs-spec-selected-editor"
+            ],
+            "deactivateStates": [
+              "specs-spec-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "idPattern": "specs-btn-edit" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "idPattern": "specs-btn-edit"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "specs-viewer-to-group",
             "name": "Select a group node",
-            "activateStates": ["specs-group-selected-viewer"],
-            "deactivateStates": ["specs-spec-selected-viewer"],
+            "activateStates": [
+              "specs-group-selected-viewer"
+            ],
+            "deactivateStates": [
+              "specs-spec-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Groups" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "textContent": "Groups"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "specs-viewer-to-issues-tab",
             "name": "Switch to Issues tab",
-            "activateStates": ["specs-issues-tab"],
-            "deactivateStates": ["specs-spec-selected-viewer"],
+            "activateStates": [
+              "specs-issues-tab"
+            ],
+            "deactivateStates": [
+              "specs-spec-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Issues" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Issues"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "specs-viewer-to-triage-tab",
             "name": "Switch to Triage tab",
-            "activateStates": ["specs-triage-tab"],
-            "deactivateStates": ["specs-spec-selected-viewer"],
+            "activateStates": [
+              "specs-triage-tab"
+            ],
+            "deactivateStates": [
+              "specs-spec-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Triage" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Triage"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "specs-viewer-to-chat-review",
             "name": "Activate AI chat review mode",
-            "activateStates": ["specs-ai-chat-review"],
+            "activateStates": [
+              "specs-ai-chat-review"
+            ],
             "deactivateStates": [],
             "staysVisible": true,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Review" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Review"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1376,37 +1638,55 @@
         "name": "Spec Selected — Editor Mode",
         "description": "A page-spec is selected with edit mode active. Mode badge shows 'editor'. 'Done' button replaces 'Edit' with amber styling. Spec overview shows groups with trash icons and 'Add group' area.",
         "elements": [
-          { "textContent": "editor" },
-          { "textContent": "Done" },
-          { "textContent": "Add group" }
+          {
+            "textContent": "Add group"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-editor-to-viewer",
             "name": "Exit edit mode via Done",
-            "activateStates": ["specs-spec-selected-viewer"],
-            "deactivateStates": ["specs-spec-selected-editor"],
+            "activateStates": [
+              "specs-spec-selected-viewer"
+            ],
+            "deactivateStates": [
+              "specs-spec-selected-editor"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "idPattern": "specs-btn-edit" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "idPattern": "specs-btn-edit"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "specs-editor-to-group-editor",
             "name": "Select a group while in edit mode",
-            "activateStates": ["specs-group-selected-editor"],
-            "deactivateStates": ["specs-spec-selected-editor"],
+            "activateStates": [
+              "specs-group-selected-editor"
+            ],
+            "deactivateStates": [
+              "specs-spec-selected-editor"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Groups" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "textContent": "Groups"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1416,34 +1696,56 @@
         "id": "specs-group-selected-viewer",
         "name": "Group Selected — Viewer Mode",
         "description": "A group within a page-spec is selected. Center panel shows GroupDetail: group name heading with category badge, description, and assertion rows. Mode badge shows 'viewer'. Eye icons and type badges are read-only.",
-        "elements": [{ "textContent": "viewer" }, { "textContent": "critical" }],
+        "elements": [
+          {
+            "textContent": "critical"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-group-viewer-to-editor",
             "name": "Toggle edit mode on group",
-            "activateStates": ["specs-group-selected-editor"],
-            "deactivateStates": ["specs-group-selected-viewer"],
+            "activateStates": [
+              "specs-group-selected-editor"
+            ],
+            "deactivateStates": [
+              "specs-group-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "idPattern": "specs-btn-edit" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "idPattern": "specs-btn-edit"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "specs-group-viewer-to-spec",
             "name": "Click the parent spec node",
-            "activateStates": ["specs-spec-selected-viewer"],
-            "deactivateStates": ["specs-group-selected-viewer"],
+            "activateStates": [
+              "specs-spec-selected-viewer"
+            ],
+            "deactivateStates": [
+              "specs-group-selected-viewer"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Specifications" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "textContent": "Specifications"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1454,37 +1756,55 @@
         "name": "Group Selected — Editor Mode",
         "description": "A group is selected with edit mode active. Assertion rows show clickable eye icons and trash icons. 'Add assertion' button visible at the bottom. Mode badge shows 'editor'. Done button visible.",
         "elements": [
-          { "textContent": "editor" },
-          { "textContent": "Done" },
-          { "textContent": "Add assertion" }
+          {
+            "textContent": "Add assertion"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-group-editor-to-viewer",
             "name": "Exit edit mode",
-            "activateStates": ["specs-group-selected-viewer"],
-            "deactivateStates": ["specs-group-selected-editor"],
+            "activateStates": [
+              "specs-group-selected-viewer"
+            ],
+            "deactivateStates": [
+              "specs-group-selected-editor"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "idPattern": "specs-btn-edit" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "idPattern": "specs-btn-edit"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "specs-group-editor-to-spec-editor",
             "name": "Click the parent spec node while in edit mode",
-            "activateStates": ["specs-spec-selected-editor"],
-            "deactivateStates": ["specs-group-selected-editor"],
+            "activateStates": [
+              "specs-spec-selected-editor"
+            ],
+            "deactivateStates": [
+              "specs-group-selected-editor"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "textContent": "Specifications" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "textContent": "Specifications"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1494,34 +1814,58 @@
         "id": "specs-issues-tab",
         "name": "Issues Tab Active",
         "description": "The Issues tab is selected for a page-spec. SpecIssuesPanel renders showing known issues filtered by specId and pageUrl.",
-        "elements": [{ "textContent": "Issues" }],
+        "elements": [
+          {
+            "textContent": "Issues"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-issues-to-assertions",
             "name": "Switch back to Assertions tab",
-            "activateStates": ["specs-spec-selected-viewer"],
-            "deactivateStates": ["specs-issues-tab"],
+            "activateStates": [
+              "specs-spec-selected-viewer"
+            ],
+            "deactivateStates": [
+              "specs-issues-tab"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Assertions" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Assertions"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
           {
             "id": "specs-issues-to-triage",
             "name": "Switch to Triage tab",
-            "activateStates": ["specs-triage-tab"],
-            "deactivateStates": ["specs-issues-tab"],
+            "activateStates": [
+              "specs-triage-tab"
+            ],
+            "deactivateStates": [
+              "specs-issues-tab"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Triage" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Triage"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1531,20 +1875,34 @@
         "id": "specs-triage-tab",
         "name": "Triage Tab Active",
         "description": "The Triage tab is selected for a page-spec. SpecTriageView renders for regression triage.",
-        "elements": [{ "textContent": "Triage" }],
+        "elements": [
+          {
+            "textContent": "Triage"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-triage-to-assertions",
             "name": "Switch back to Assertions tab",
-            "activateStates": ["specs-spec-selected-viewer"],
-            "deactivateStates": ["specs-triage-tab"],
+            "activateStates": [
+              "specs-spec-selected-viewer"
+            ],
+            "deactivateStates": [
+              "specs-triage-tab"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Assertions" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Assertions"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1554,20 +1912,37 @@
         "id": "specs-ai-chat-review",
         "name": "AI Chat — Review Mode",
         "description": "Review mode is active in the AI chat panel. Quick-action buttons visible: 'Review spec quality', 'Find gaps', 'Suggest improvements', 'Generate assertions'. For page-specs: 'Build verification workflow' also present.",
-        "elements": [{ "textContent": "Review spec quality" }, { "textContent": "Find gaps" }],
+        "elements": [
+          {
+            "textContent": "Review spec quality"
+          },
+          {
+            "textContent": "Find gaps"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-chat-review-to-create",
             "name": "Switch to create mode",
-            "activateStates": ["specs-ai-chat-create"],
-            "deactivateStates": ["specs-ai-chat-review"],
+            "activateStates": [
+              "specs-ai-chat-create"
+            ],
+            "deactivateStates": [
+              "specs-ai-chat-review"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Create" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Create"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
@@ -1575,13 +1950,21 @@
             "id": "specs-chat-review-deactivate",
             "name": "Deactivate review mode",
             "activateStates": [],
-            "deactivateStates": ["specs-ai-chat-review"],
+            "deactivateStates": [
+              "specs-ai-chat-review"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Review" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Review"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1592,22 +1975,36 @@
         "name": "AI Chat — Create Mode",
         "description": "Create mode is active in the AI chat panel. Template buttons visible: 'New Page Spec', 'New Architecture Spec', 'New API Spec', 'New Data Spec'. Input placeholder says 'Describe the spec you want to create…'.",
         "elements": [
-          { "textContent": "New Page Spec" },
-          { "textContent": "New Architecture Spec" }
+          {
+            "textContent": "New Page Spec"
+          },
+          {
+            "textContent": "New Architecture Spec"
+          }
         ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-chat-create-to-review",
             "name": "Switch to review mode",
-            "activateStates": ["specs-ai-chat-review"],
-            "deactivateStates": ["specs-ai-chat-create"],
+            "activateStates": [
+              "specs-ai-chat-review"
+            ],
+            "deactivateStates": [
+              "specs-ai-chat-create"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Review" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Review"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           },
@@ -1615,13 +2012,21 @@
             "id": "specs-chat-create-deactivate",
             "name": "Deactivate create mode",
             "activateStates": [],
-            "deactivateStates": ["specs-ai-chat-create"],
+            "deactivateStates": [
+              "specs-ai-chat-create"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Create" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Create"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1631,20 +2036,34 @@
         "id": "specs-contracts-view",
         "name": "Contracts View",
         "description": "View mode is 'Contracts'. ContractBuilder replaces the three-panel editor. The 'Contracts' header button has zinc-700 highlight styling.",
-        "elements": [{ "textContent": "Contracts" }],
+        "elements": [
+          {
+            "textContent": "Contracts"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-contracts-to-editor",
             "name": "Switch back to Editor view",
-            "activateStates": ["specs-loaded-no-selection"],
-            "deactivateStates": ["specs-contracts-view"],
+            "activateStates": [
+              "specs-loaded-no-selection"
+            ],
+            "deactivateStates": [
+              "specs-contracts-view"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Editor" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Editor"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
@@ -1654,20 +2073,37 @@
         "id": "specs-experimentation-view",
         "name": "Experimentation View",
         "description": "View mode is 'Experimentation'. SpecExperimentationDashboard renders with tabs: Compliance, Accuracy, Coverage, Consistency, Freshness. The 'Experimentation' header button has zinc-700 highlight.",
-        "elements": [{ "textContent": "Experimentation" }, { "textContent": "Compliance" }],
+        "elements": [
+          {
+            "textContent": "Experimentation"
+          },
+          {
+            "textContent": "Compliance"
+          }
+        ],
         "isInitial": false,
         "transitions": [
           {
             "id": "specs-experimentation-to-editor",
             "name": "Switch back to Editor view",
-            "activateStates": ["specs-loaded-no-selection"],
-            "deactivateStates": ["specs-experimentation-view"],
+            "activateStates": [
+              "specs-loaded-no-selection"
+            ],
+            "deactivateStates": [
+              "specs-experimentation-view"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "button", "textContent": "Editor" },
-                "waitAfter": { "type": "idle", "timeout": 500 }
+                "target": {
+                  "role": "button",
+                  "textContent": "Editor"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 500
+                }
               }
             ]
           }
