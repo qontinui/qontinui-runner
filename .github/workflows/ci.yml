@@ -94,6 +94,13 @@ jobs:
       - name: Lint frontend code
         run: pnpm run lint
 
+      # Build the frontend before any cargo step. tauri::generate_context!()
+      # in src-tauri/src/lib.rs reads tauri.conf.json at compile time and
+      # panics if frontendDist (../dist) is missing — which broke `Clippy
+      # check`, `Run Rust tests`, and `Build Tauri app` on every platform.
+      - name: Build frontend
+        run: pnpm run build
+
       - name: Format Rust code check
         run: |
           cd src-tauri
@@ -110,9 +117,6 @@ jobs:
         run: |
           cd src-tauri
           cargo test --verbose
-
-      - name: Build frontend
-        run: pnpm run build
 
       - name: Build Tauri app (development)
         run: pnpm run tauri build -- --debug
