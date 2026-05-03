@@ -1,3 +1,15 @@
 [workspace]
 members = ["src-tauri", "src-tauri/clorinde"]
 resolver = "2"
+
+# Workspace-level profile overrides. Cargo only honors [profile.*] in the
+# workspace root — the per-package Cargo.toml's [profile.dev] / [profile.test]
+# tables are ignored once a workspace exists. Tests force debuginfo=2 by
+# default; that trips Windows link.exe OOM (STATUS_ILLEGAL_INSTRUCTION
+# 0xc000001d). Override here.
+[profile.dev]
+debug = 0
+split-debuginfo = "packed"
+
+[profile.test]
+debug = 0

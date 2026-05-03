@@ -255,10 +255,5 @@ regex_creation_in_loops = "allow"
 [dev-dependencies]
 tempfile = "3"
 
-[profile.dev]
-debug = 0  # No debug info — prevents LLVM OOM during linking
-split-debuginfo = "packed"
-
-[profile.test]
-debug = 0  # Tests inherit dev's debug=0 to avoid Windows link.exe OOM
-            # (cargo otherwise forces debuginfo=2 for tests).
+## Profile overrides moved to the workspace root Cargo.toml — cargo
+## ignores [profile.*] in package manifests when a workspace exists.
