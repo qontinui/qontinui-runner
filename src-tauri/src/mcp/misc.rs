@@ -1951,6 +1951,13 @@ struct SpawnPlacementPreviewResponse {
     /// Always `"configured"` for now — kept as a discriminator for
     /// future supervisor-side fallback sources.
     source: &'static str,
+    /// Per-placement window decorations toggle. `None` means "use the
+    /// runner's default" (chrome on). Forwarded by the supervisor as
+    /// `QONTINUI_WINDOW_DECORATIONS=0|1` so a borderless placement
+    /// lands flush with the configured rect (no OS window border
+    /// inset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decorations: Option<bool>,
 }
 
 /// `GET /spawn-placement/preview?slot=N[&overflow=wrap|default]`
@@ -2108,6 +2115,7 @@ async fn preview_spawn_placement_route(
         slot_index: effective_slot,
         slot_label,
         source: "configured",
+        decorations: placement.decorations,
     })))
 }
 
@@ -2240,6 +2248,7 @@ async fn lookup_temp_spawn_placement(
         slot_index: resolved_index,
         slot_label: format!("temp[{}]", resolved_index),
         source: "temp",
+        decorations: placement.decorations,
     })))
 }
 
