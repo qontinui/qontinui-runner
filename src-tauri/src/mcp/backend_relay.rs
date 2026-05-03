@@ -361,7 +361,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let port = api_state.app_state.api_port.load(Ordering::Relaxed);
-    let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+    let instance_name = crate::instance::instance_name();
     let hostname = hostname::get()
         .ok()
         .map(|h| h.to_string_lossy().to_string());

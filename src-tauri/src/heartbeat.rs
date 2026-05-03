@@ -112,7 +112,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
-        let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+        let instance_name = crate::instance::instance_name();
 
         let os = if cfg!(target_os = "windows") {
             "windows"
