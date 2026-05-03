@@ -184,125 +184,132 @@ impl AtspiAdapter {
     }
 
     /// Recursively capture the accessibility tree starting from an address.
-    async fn capture_node(
-        &self,
-        addr: &AtspiAddress,
+    ///
+    /// Returns a `BoxFuture` rather than `async fn` because the function calls
+    /// itself recursively for child nodes, and Rust requires explicit boxing
+    /// to give the resulting future a known size (E0733).
+    fn capture_node<'a>(
+        &'a self,
+        addr: &'a AtspiAddress,
         current_depth: u32,
         max_depth: Option<u32>,
         include_hidden: bool,
-    ) -> anyhow::Result<Option<UnifiedNode>> {
-        // Depth limit check.
-        if let Some(max) = max_depth {
-            if current_depth > max {
-                return Ok(None);
-            }
-        }
-
-        let proxy = match self.accessible_proxy(addr).await {
-            Ok(p) => p,
-            Err(e) => {
-                trace!("Skipping inaccessible node {}: {e}", addr.object_path);
-                return Ok(None);
-            }
-        };
-
-        // Fetch properties concurrently where possible.
-        let name = proxy.name().await.unwrap_or_default();
-        let description = proxy.description().await.ok().filter(|d| !d.is_empty());
-        let role = proxy.get_role().await.unwrap_or(Role::Invalid);
-        let state_set = proxy.get_state().await.unwrap_or_default();
-        let interfaces = proxy
-            .get_interfaces()
-            .await
-            .unwrap_or_else(|_| InterfaceSet::empty());
-
-        // Convert AT-SPI states.
-        let is_hidden = state_set.contains(State::Defunct)
-            || (!state_set.contains(State::Showing) && !state_set.contains(State::Visible));
-
-        // Skip hidden nodes unless requested.
-        if is_hidden && !include_hidden {
-            return Ok(None);
-        }
-
-        let unified_role = map_atspi_role(role);
-        let state = convert_atspi_state(&state_set);
-
-        // Fetch bounds via Component interface (if available).
-        let bounds = if interfaces.contains(Interface::Component) {
-            match self.component_proxy(addr).await {
-                Ok(comp) => match comp.get_extents(CoordType::Screen).await {
-                    Ok((x, y, w, h)) => Some(UnifiedBounds {
-                        x,
-                        y,
-                        width: w,
-                        height: h,
-                    }),
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-        // Determine supported interaction patterns from interfaces.
-        let supported_patterns = determine_patterns(&interfaces);
-        let is_interactive = unified_role.is_interactive_role() || !supported_patterns.is_empty();
-
-        // Register handle for this element.
-        let handle = self.register_handle(addr.clone()).await;
-
-        // Recurse into children.
-        let children_addrs = match proxy.get_children().await {
-            Ok(children) => children,
-            Err(e) => {
-                trace!("Could not get children for {}: {e}", addr.object_path);
-                vec![]
-            }
-        };
-
-        let mut children_nodes = Vec::new();
-        for child_obj_ref in &children_addrs {
-            let child_addr = AtspiAddress {
-                bus_name: child_obj_ref.name.to_string(),
-                object_path: child_obj_ref.path.to_string(),
-            };
-            match self
-                .capture_node(&child_addr, current_depth + 1, max_depth, include_hidden)
-                .await
-            {
-                Ok(Some(node)) => children_nodes.push(node),
-                Ok(None) => {} // hidden or depth-limited
-                Err(e) => {
-                    trace!("Error capturing child {}: {e}", child_addr.object_path);
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<Option<UnifiedNode>>> {
+        Box::pin(async move {
+            // Depth limit check.
+            if let Some(max) = max_depth {
+                if current_depth > max {
+                    return Ok(None);
                 }
             }
-        }
 
-        let node = UnifiedNode {
-            ref_id: self.alloc_ref(),
-            role: unified_role,
-            name: if name.is_empty() { None } else { Some(name) },
-            value: None,
-            description,
-            bounds,
-            state,
-            is_interactive,
-            level: None,
-            automation_id: None,
-            class_name: None,
-            html_tag: None,
-            url: None,
-            source: NodeSource::Atspi,
-            platform_handle: Some(handle),
+            let proxy = match self.accessible_proxy(addr).await {
+                Ok(p) => p,
+                Err(e) => {
+                    trace!("Skipping inaccessible node {}: {e}", addr.object_path);
+                    return Ok(None);
+                }
+            };
 
-            supported_patterns,
-            generation: 0,
-            children: children_nodes,
-        };
+            // Fetch properties concurrently where possible.
+            let name = proxy.name().await.unwrap_or_default();
+            let description = proxy.description().await.ok().filter(|d| !d.is_empty());
+            let role = proxy.get_role().await.unwrap_or(Role::Invalid);
+            let state_set = proxy.get_state().await.unwrap_or_default();
+            let interfaces = proxy
+                .get_interfaces()
+                .await
+                .unwrap_or_else(|_| InterfaceSet::empty());
 
-        Ok(Some(node))
+            // Convert AT-SPI states.
+            let is_hidden = state_set.contains(State::Defunct)
+                || (!state_set.contains(State::Showing) && !state_set.contains(State::Visible));
+
+            // Skip hidden nodes unless requested.
+            if is_hidden && !include_hidden {
+                return Ok(None);
+            }
+
+            let unified_role = map_atspi_role(role);
+            let state = convert_atspi_state(&state_set);
+
+            // Fetch bounds via Component interface (if available).
+            let bounds = if interfaces.contains(Interface::Component) {
+                match self.component_proxy(addr).await {
+                    Ok(comp) => match comp.get_extents(CoordType::Screen).await {
+                        Ok((x, y, w, h)) => Some(UnifiedBounds {
+                            x,
+                            y,
+                            width: w,
+                            height: h,
+                        }),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            // Determine supported interaction patterns from interfaces.
+            let supported_patterns = determine_patterns(&interfaces);
+            let is_interactive =
+                unified_role.is_interactive_role() || !supported_patterns.is_empty();
+
+            // Register handle for this element.
+            let handle = self.register_handle(addr.clone()).await;
+
+            // Recurse into children.
+            let children_addrs = match proxy.get_children().await {
+                Ok(children) => children,
+                Err(e) => {
+                    trace!("Could not get children for {}: {e}", addr.object_path);
+                    vec![]
+                }
+            };
+
+            let mut children_nodes = Vec::new();
+            for child_obj_ref in &children_addrs {
+                let child_addr = AtspiAddress {
+                    bus_name: child_obj_ref.name.to_string(),
+                    object_path: child_obj_ref.path.to_string(),
+                };
+                match self
+                    .capture_node(&child_addr, current_depth + 1, max_depth, include_hidden)
+                    .await
+                {
+                    Ok(Some(node)) => children_nodes.push(node),
+                    Ok(None) => {} // hidden or depth-limited
+                    Err(e) => {
+                        trace!("Error capturing child {}: {e}", child_addr.object_path);
+                    }
+                }
+            }
+
+            let node = UnifiedNode {
+                ref_id: self.alloc_ref(),
+                role: unified_role,
+                name: if name.is_empty() { None } else { Some(name) },
+                value: None,
+                description,
+                bounds,
+                state,
+                is_interactive,
+                level: None,
+                automation_id: None,
+                class_name: None,
+                html_tag: None,
+                url: None,
+                source: NodeSource::Atspi,
+                platform_handle: Some(handle),
+
+                supported_patterns,
+                generation: 0,
+                children: children_nodes,
+            };
+
+            Ok(Some(node))
+        })
     }
 
     /// Find a child application on the desktop by window title (partial, case-insensitive).
