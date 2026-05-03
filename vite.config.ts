@@ -225,24 +225,10 @@ export default defineConfig({
       { find: /^react\/(.+)$/, replacement: path.resolve(__dirname, "node_modules/react/$1") },
       { find: "@", replacement: path.resolve(__dirname, "./src") },
       { find: "@qontinui/schemas", replacement: path.resolve(__dirname, "../qontinui-schemas/generated/typescript") },
-      // Explicit subpath aliases for symlinked packages (Vite can't resolve
-      // exports maps from within file:-linked sibling packages)
-      { find: /^@qontinui\/shared-types\/(.+)$/, replacement: path.resolve(__dirname, "../qontinui-schemas/ts/dist/$1.js") },
-      { find: "@qontinui/shared-types", replacement: path.resolve(__dirname, "../qontinui-schemas/ts/dist/index.js") },
-      { find: "@qontinui/workflow-utils", replacement: path.resolve(__dirname, "../qontinui-workflow-utils/dist/index.js") },
-      // @qontinui/ui-bridge subpath imports must resolve to dist/ (not the SDK's
-      // source) so the runner and the SDK share a single module instance. Without
-      // this, import-map resolution can walk into the SDK's own src/ tree through
-      // its package.json `main`/`exports` entries, creating duplicate copies of
-      // singletons like the global registry and spec store.
-      { find: /^@qontinui\/ui-bridge\/(.+)$/, replacement: path.resolve(__dirname, "../ui-bridge/packages/ui-bridge/dist/$1/index.mjs") },
-      { find: "@qontinui/ui-bridge", replacement: path.resolve(__dirname, "../ui-bridge/packages/ui-bridge/dist/index.mjs") },
-      // ui-bridge-auto resolves to source (Vite transpiles TS on the fly)
-      { find: "@qontinui/ui-bridge-auto", replacement: path.resolve(__dirname, "../ui-bridge-auto/src/index.ts") },
-      // workflow-ui subpaths resolve to source (Vite transpiles TSX on the fly)
-      { find: "@qontinui/workflow-ui/state-machine", replacement: path.resolve(__dirname, "../qontinui-workflow-ui/src/components/state-machine/index.ts") },
-      { find: "@qontinui/workflow-ui/chat", replacement: path.resolve(__dirname, "../qontinui-workflow-ui/src/components/chat/index.ts") },
-      { find: /^@qontinui\/workflow-ui\/(.+)$/, replacement: path.resolve(__dirname, "../qontinui-workflow-ui/src/$1/index.ts") },
+      // @qontinui/* TS packages are now consumed from npm (^x.y.z ranges
+      // in package.json). Vite resolves them via node_modules + package
+      // exports maps; no per-package alias is needed. This block previously
+      // hard-coded sibling-relative paths back when the deps were file:/link:.
     ],
     // Prevent duplicate React/library instances from symlinked packages
     dedupe: ["react", "react-dom", "@xyflow/react", "@xyflow/system"],
