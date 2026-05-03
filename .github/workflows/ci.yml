@@ -153,10 +153,15 @@ jobs:
           # Cloned siblings no longer ship dist/, but the runner's
           # eslint.config.js imports @qontinui/ui-bridge-eslint-plugin
           # which expects dist/index.js. Build it in CI.
+          #
+          # ui-bridge is a workspace monorepo — install deps at the ROOT
+          # so workspace deps + hoisted toolchain (typescript, tsup) all
+          # land in ui-bridge/node_modules where the package's build can
+          # find them. Then build just the eslint-plugin package.
           echo "::group::build ui-bridge-eslint-plugin (dist no longer in git)"
-          cd "$GITHUB_WORKSPACE/../ui-bridge/packages/ui-bridge-eslint-plugin"
-          npm install --no-audit --no-fund --legacy-peer-deps
-          npm run build
+          cd "$GITHUB_WORKSPACE/../ui-bridge"
+          npm install --no-audit --no-fund --legacy-peer-deps --ignore-scripts
+          npm run build --workspace=@qontinui/ui-bridge-eslint-plugin
           echo "::endgroup::"
 
       - name: Lint frontend code
