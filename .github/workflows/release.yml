@@ -178,9 +178,13 @@ jobs:
           for sibling in ui-bridge-auto qontinui-workflow-ui; do
             echo "::group::npm ci in $sibling"
             cd "$GITHUB_WORKSPACE/../$sibling"
-            npm ci --no-audit --no-fund --legacy-peer-deps
+            npm ci --no-audit --no-fund
             echo "::endgroup::"
           done
+          echo "::group::install lucide-react in qontinui-workflow-ui (peer dep)"
+          cd "$GITHUB_WORKSPACE/../qontinui-workflow-ui"
+          npm install --no-audit --no-fund --no-save lucide-react
+          echo "::endgroup::"
 
       # Download bundled Python executor if it was built
       - name: Download Python executor

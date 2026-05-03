@@ -122,10 +122,12 @@ jobs:
       # Other @qontinui/* aliases point at committed dist/ files, so
       # they don't need their own node_modules.
       #
-      # --legacy-peer-deps avoids ERESOLVE failures from upstream eslint
-      # version drift we don't care about (these installs are only
-      # needed to satisfy vite's resolver during bundling, not to run
-      # any sibling's own tooling).
+      # qontinui-workflow-ui declares lucide-react as a peerDependency
+      # (and only there — not in dependencies or devDependencies). npm
+      # ci does not install peer deps that aren't otherwise pulled in,
+      # so we install lucide-react explicitly. Other peers (@xyflow/react,
+      # react, react-window) are already in workflow-ui's devDependencies;
+      # mermaid is marked optional in peerDependenciesMeta so we skip it.
       - name: Install sibling dependencies (source-aliased only)
         shell: bash
         run: |
@@ -133,9 +135,13 @@ jobs:
           for sibling in ui-bridge-auto qontinui-workflow-ui; do
             echo "::group::npm ci in $sibling"
             cd "$GITHUB_WORKSPACE/../$sibling"
-            npm ci --no-audit --no-fund --legacy-peer-deps
+            npm ci --no-audit --no-fund
             echo "::endgroup::"
           done
+          echo "::group::install lucide-react in qontinui-workflow-ui (peer dep)"
+          cd "$GITHUB_WORKSPACE/../qontinui-workflow-ui"
+          npm install --no-audit --no-fund --no-save lucide-react
+          echo "::endgroup::"
 
       - name: Lint frontend code
         run: pnpm run lint
