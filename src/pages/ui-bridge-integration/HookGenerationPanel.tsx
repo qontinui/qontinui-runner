@@ -458,6 +458,8 @@ export function HookGenerationPanel({
   // where no fresh specs were generated).
   const originalPagesRef = useRef<PageComponent[]>([]);
 
+  const effectiveAnalysisRef = useRef<ProjectAnalysis | null>(null);
+
   const pageOptionsRef = useRef<PageGenerationOptions>({
     generateRegistrations: true,
     generateDataPageIds: true,
@@ -1296,7 +1298,7 @@ export function HookGenerationPanel({
             source.imported_sources,
             page.component_name,
             page.route,
-            analysis.framework,
+            (effectiveAnalysisRef.current ?? analysis).framework,
             existingRegs || undefined,
             // Inline `useUIElement` / `useUIComponent` calls the page already
             // contains. Without this, the side-file the LLM emits would
@@ -1563,8 +1565,11 @@ export function HookGenerationPanel({
       pages: PageComponent[],
       options: PageGenerationOptions,
       previewOnly: boolean = false,
+      analysisOverride: ProjectAnalysis | null = null,
     ) => {
       if (pages.length === 0) return;
+      const effectiveAnalysis: ProjectAnalysis = analysisOverride ?? analysis;
+      effectiveAnalysisRef.current = effectiveAnalysis;
 
       // Guard: the Project Explainer phase runs AFTER per-page generation
       // and composes the just-generated specs + architecture diagrams. If
@@ -1647,7 +1652,7 @@ export function HookGenerationPanel({
               pSource.imported_sources,
               p.component_name,
               p.route,
-              analysis.framework,
+              effectiveAnalysis.framework,
               undefined,
               extractInlineRegistrations(pSource.main_source),
             );
@@ -1747,7 +1752,7 @@ export function HookGenerationPanel({
           source.imported_sources,
           firstPage.component_name,
           firstPage.route,
-          analysis.framework,
+          effectiveAnalysis.framework,
           undefined,
           // Inline `useUIElement` / `useUIComponent` calls the page already
           // contains. Prevents duplicate registrations in the side-file.
@@ -1842,10 +1847,16 @@ export function HookGenerationPanel({
             pages: PageComponent[];
             options: PageGenerationOptions;
             previewOnly?: boolean;
+            analysis?: ProjectAnalysis | null;
           }
         | undefined;
       if (detail) {
-        handleGeneratePages(detail.pages, detail.options, detail.previewOnly ?? false);
+        handleGeneratePages(
+          detail.pages,
+          detail.options,
+          detail.previewOnly ?? false,
+          detail.analysis ?? null,
+        );
       }
     };
     window.addEventListener("ui-bridge-generate-pages", handler);

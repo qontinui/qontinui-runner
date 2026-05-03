@@ -375,11 +375,16 @@ export function ProjectCoordinator({
   );
 
   const kickOffGeneration = useCallback(
-    (pages: PageComponent[], options: PageGenerationOptions, previewOnly: boolean = false) => {
+    (
+      pages: PageComponent[],
+      options: PageGenerationOptions,
+      previewOnly: boolean = false,
+      analysisForRun: ProjectAnalysis | null = null,
+    ) => {
       // Reuse HookGenerationPanel's existing start event — no new machinery.
       window.dispatchEvent(
         new CustomEvent("ui-bridge-generate-pages", {
-          detail: { pages, options, previewOnly },
+          detail: { pages, options, previewOnly, analysis: analysisForRun },
         }),
       );
     },
@@ -442,7 +447,7 @@ export function ProjectCoordinator({
             ? `Building prompts for ${pages.length} page${pages.length !== 1 ? "s" : ""}...`
             : `Generating for ${pages.length} page${pages.length !== 1 ? "s" : ""}...`,
         );
-        kickOffGeneration(pages, defaultGenerationOptions, isPreview);
+        kickOffGeneration(pages, defaultGenerationOptions, isPreview, a);
         // From here on, the HookGenerationPanel drives phase via the three
         // CustomEvents we subscribed to in the useEffect above.
       } catch (err) {
@@ -473,8 +478,8 @@ export function ProjectCoordinator({
     );
     setFailedSteps([]);
     setErrorMessage(null);
-    kickOffGeneration(pagesToRetry, defaultGenerationOptions, isPreview);
-  }, [failedSteps, discoveredPages, kickOffGeneration, defaultGenerationOptions]);
+    kickOffGeneration(pagesToRetry, defaultGenerationOptions, isPreview, analysis);
+  }, [failedSteps, discoveredPages, kickOffGeneration, defaultGenerationOptions, analysis]);
 
   // =========================================================================
   // Dropdown handlers
