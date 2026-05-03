@@ -394,7 +394,7 @@ function convertTransition(
  * Engine queries use:
  *   { role, text, ariaLabel, tagName, attributes, placeholder }
  */
-function convertElementCriteria(criteria: Record<string, unknown>): ElementQuery {
+export function convertElementCriteria(criteria: Record<string, unknown>): ElementQuery {
   const query: ElementQuery = {};
 
   if (criteria.role) query.role = criteria.role as string;
@@ -685,8 +685,12 @@ function collectElementCollisions(
  * the uniqueness pass. We prefer the opaque fingerprint attribute (exact
  * artifact-level match) before falling back to the loose role/name/tag
  * triple.
+ *
+ * Exported so static spec validators (see `src/specs/specs.compile.test.ts`)
+ * can apply the SAME canonical form the runtime compiler uses — otherwise
+ * a static check could pass while the runtime quarantines the same specs.
  */
-function elementQueryKey(q: ElementQuery): string {
+export function elementQueryKey(q: ElementQuery): string {
   const fp = q.attributes?.["data-fingerprint"];
   if (fp) return `fp:${fp}`;
   const role = q.role ?? "";
