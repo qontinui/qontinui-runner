@@ -110,10 +110,7 @@ impl AtspiAdapter {
     }
 
     /// Build an ActionProxy for the given address.
-    async fn action_proxy<'a>(
-        &self,
-        addr: &'a AtspiAddress,
-    ) -> anyhow::Result<ActionProxy<'a>> {
+    async fn action_proxy<'a>(&self, addr: &'a AtspiAddress) -> anyhow::Result<ActionProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = ActionProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -158,10 +155,7 @@ impl AtspiAdapter {
     }
 
     /// Build a ValueProxy for the given address.
-    async fn value_proxy<'a>(
-        &self,
-        addr: &'a AtspiAddress,
-    ) -> anyhow::Result<ValueProxy<'a>> {
+    async fn value_proxy<'a>(&self, addr: &'a AtspiAddress) -> anyhow::Result<ValueProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = ValueProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
