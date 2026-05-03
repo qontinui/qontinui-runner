@@ -245,6 +245,8 @@ same_item_push = "allow"
 result_large_err = "allow"
 unnecessary_literal_unwrap = "allow"
 regex_creation_in_loops = "allow"
+unnecessary_sort_by = "allow"
+manual_checked_ops = "allow"
 
 [dev-dependencies]
 tempfile = "3"
