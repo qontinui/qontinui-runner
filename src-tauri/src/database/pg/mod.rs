@@ -251,7 +251,12 @@ impl PgDb {
              CREATE INDEX IF NOT EXISTS regression_assertion_executions_kind_status_idx \
                  ON regression_assertion_executions(assertion_kind, status); \
              CREATE INDEX IF NOT EXISTS regression_assertion_executions_failures_idx \
-                 ON regression_assertion_executions(case_id, assertion_id) WHERE status = 'fail';",
+                 ON regression_assertion_executions(case_id, assertion_id) WHERE status = 'fail'; \
+             \
+             ALTER TABLE regression_runs \
+                 ADD COLUMN IF NOT EXISTS drift_report_json JSONB; \
+             CREATE INDEX IF NOT EXISTS regression_runs_run_id_idx \
+                 ON regression_runs(run_id);",
         )
         .await
         .map_err(|e| format!("Failed to bootstrap runner schema/extension: {}", e))?;

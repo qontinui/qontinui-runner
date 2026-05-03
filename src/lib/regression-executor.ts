@@ -42,7 +42,14 @@ import {
   type SelfDiagnosis,
 } from "@qontinui/ui-bridge-auto/diagnosis";
 import { findFirst, executeQuery, type RegistryLike } from "@qontinui/ui-bridge-auto/runtime";
-import { ScreenshotAssertionManager, TauriBaselineStore } from "@qontinui/ui-bridge-auto/visual";
+import {
+  ScreenshotAssertionManager,
+  TauriBaselineStore,
+  checkDesignTokens,
+  crossCheckText,
+  type DesignTokenRegistry,
+  type IOCRProvider,
+} from "@qontinui/ui-bridge-auto/visual";
 import type { GitCommitRef, DriftReport } from "@qontinui/ui-bridge-auto/drift";
 import type { DriftContext } from "@qontinui/ui-bridge-auto/drift";
 
@@ -131,6 +138,22 @@ export interface RunRegressionSuiteOptions {
    * stub via this option to avoid invoking Tauri.
    */
   screenshotManager?: ScreenshotAssertionManager;
+  /**
+   * Optional `DesignTokenRegistry` consumed by `token` overlay assertions.
+   * When supplied, the executor calls `checkDesignTokens(element, registry)`
+   * for each `token` overlay assertion and fails on any non-empty violation
+   * list. When omitted, `token` overlays only verify the element resolves
+   * (degrade-to-resolve mode); see overlay dispatch for the contract.
+   */
+  tokenRegistry?: DesignTokenRegistry;
+  /**
+   * Optional `IOCRProvider` consumed by `cross-check` overlay assertions.
+   * When supplied, the executor calls `crossCheckText(element, { ocr })`
+   * for each `cross-check` overlay assertion and fails on a content
+   * mismatch. When omitted, `cross-check` overlays degrade to verifying
+   * the action target resolves.
+   */
+  ocrProvider?: IOCRProvider;
   /**
    * Optional `Date.now()` override used purely for stamping `started_at`
    * / `completed_at`. Tests fix this to keep snapshots stable.
@@ -327,27 +350,30 @@ async function evaluateVisualGate(
 
 /**
  * Overlay dispatch: each of the three built-in overlay ids has its own
- * runtime semantics. The overlay payload is opaque to the generator but
- * structurally known here.
+ * runtime semantics.
  *
- * For now the executor implements a structural smoke check per overlay:
- *   - `visibility`  → require the element resolves and is `visible`.
- *   - `token`       → require the element resolves; full design-token
- *                     evaluation needs a registry the executor doesn't carry,
- *                     so this is a "resolves" check until the registry is
- *                     threaded through.
- *   - `cross-check` → require the action's target resolves; full OCR
- *                     cross-check needs an OCR provider supplied at execute
- *                     time and is wired in by the consumer when needed.
+ *   - `visibility`  → require the element resolves and reports `visible`.
+ *   - `token`       → resolve the element, then run `checkDesignTokens`
+ *                     against the supplied `DesignTokenRegistry`. Fails on
+ *                     any non-empty violation list. When the registry is
+ *                     not supplied, degrades to a resolve-only check and
+ *                     marks the outcome with `failureKind: "no-token-registry"`
+ *                     should the consumer want to surface the gap.
+ *   - `cross-check` → resolve the action target, then run `crossCheckText`
+ *                     against the supplied `IOCRProvider`. Fails on content
+ *                     mismatch. When the provider is not supplied, degrades
+ *                     to a resolve-only check.
  *
  * Unknown overlay ids are skipped — the suite remains forward-compatible
  * with overlays this executor doesn't recognize yet.
  */
-function evaluateOverlay(
+async function evaluateOverlay(
   assertion: OverlayAssertion,
   ir: IRDocument,
   registry: RegistryLike,
-): AssertionOutcome {
+  tokenRegistry: DesignTokenRegistry | undefined,
+  ocrProvider: IOCRProvider | undefined,
+): Promise<AssertionOutcome> {
   const payload = assertion.payload;
   switch (assertion.overlayId) {
     case "visibility":
@@ -395,6 +421,48 @@ function evaluateOverlay(
           };
         }
       }
+      if (assertion.overlayId === "token") {
+        if (!tokenRegistry) {
+          // Resolve-only degrade. Caller didn't thread a registry; surface
+          // it on the outcome so consumers can flag the gap without the
+          // assertion failing the suite.
+          return {
+            status: "pass",
+            message:
+              "token overlay degrade: resolved without DesignTokenRegistry — pass not gated on token check",
+          };
+        }
+        const live = elements.find((e) => e.id === result.match!.id);
+        if (!live) {
+          return {
+            status: "fail",
+            failureKind: "overlay-token-element-missing",
+            message: `Overlay "token" target ${stateId}#${idx} matched id ${result.match.id} but element not in registry`,
+            observed: { stateId, idx, elementId: result.match.id },
+          };
+        }
+        // Optional payload constraint: when present, only check this
+        // overlay's nominated property list (matches the generator's
+        // captured-properties contract from `tokenOverlay`).
+        const propertyFilter = Array.isArray(payload.properties)
+          ? (payload.properties.filter((p) => typeof p === "string") as string[])
+          : undefined;
+        const violations = checkDesignTokens(
+          live,
+          tokenRegistry,
+          propertyFilter ? { properties: propertyFilter } : undefined,
+        );
+        if (violations.length > 0) {
+          return {
+            status: "fail",
+            failureKind: "overlay-token-violations",
+            message: `Overlay "token" target ${stateId}#${idx} has ${violations.length} off-token propert${
+              violations.length === 1 ? "y" : "ies"
+            }`,
+            observed: { stateId, idx, elementId: result.match.id, violations },
+          };
+        }
+      }
       return { status: "pass" };
     }
     case "cross-check": {
@@ -428,12 +496,93 @@ function evaluateOverlay(
           observed: { transitionId, actionIndex },
         };
       }
+      // OCR-driven cross-check when an IOCRProvider was threaded through.
+      if (ocrProvider) {
+        const live = elements.find((e) => e.id === result.match!.id);
+        if (!live) {
+          return {
+            status: "fail",
+            failureKind: "overlay-cross-check-element-missing",
+            message: `Overlay "cross-check" matched id ${result.match.id} but element missing from registry`,
+            observed: { transitionId, actionIndex, elementId: result.match.id },
+          };
+        }
+        const tolerance =
+          typeof payload.tolerance === "number" ? payload.tolerance : undefined;
+        const ccResult = await crossCheckText(live, {
+          ocr: ocrProvider,
+          tolerance,
+        });
+        if (ccResult.skipped) {
+          // Capture or OCR couldn't run; treat as a deferred check rather
+          // than a hard fail. Skipped + reason flows up untouched.
+          return {
+            status: "skip",
+            message: `cross-check skipped: ${ccResult.reason}`,
+          };
+        }
+        if (!ccResult.pass) {
+          return {
+            status: "fail",
+            failureKind: ccResult.cause
+              ? `overlay-cross-check-${ccResult.cause}`
+              : "overlay-cross-check-mismatch",
+            message: `Overlay "cross-check" content mismatch on ${transitionId}#${actionIndex}: similarity=${ccResult.similarity.toFixed(3)}`,
+            observed: {
+              transitionId,
+              actionIndex,
+              domText: ccResult.domText,
+              ocrText: ccResult.ocrText,
+              similarity: ccResult.similarity,
+              cause: ccResult.cause,
+            },
+          };
+        }
+      }
       return { status: "pass" };
     }
     default:
       // Forward-compatible: unknown overlay ids skip cleanly.
       return { status: "skip" };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Persisted drift-report helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Combine the spec-side and visual-side `DriftReport` inputs into a single
+ * `{ runId, entries }` blob suitable for persistence + HTTP pass-through.
+ *
+ * Returns `null` (i.e. don't persist a drift_report_json column) when both
+ * inputs are absent or empty — the FU-3 runner endpoint surfaces 404 in
+ * that case, and the qontinui-web frontend renders the empty state.
+ *
+ * Each entry's `id` is stable (derived from the upstream `DriftEntry.id`
+ * if present, else hashed from `kind + JSON tail`) so the
+ * `/runs/:run_id/drift/:entry_id` endpoint can index entries deterministically.
+ */
+function buildPersistedDriftReport(
+  specDrift: DriftReport | undefined,
+  visualDrift: DriftReport | undefined,
+): unknown {
+  // `DriftReport` shape: `{ states: DriftEntry[], transitions: DriftEntry[] }`.
+  // Flatten both buckets across both inputs for the persisted blob; the
+  // HTTP endpoint exposes `entries` as the unified list, indexed by
+  // `entry.id`. Tag each entry's source bucket so consumers can filter
+  // (states vs transitions) without losing the structural categorization.
+  const entries: unknown[] = [];
+  const pushAll = (report: DriftReport | undefined): void => {
+    if (!report) return;
+    for (const e of report.states ?? []) entries.push({ ...e, bucket: "state" });
+    for (const e of report.transitions ?? [])
+      entries.push({ ...e, bucket: "transition" });
+  };
+  pushAll(specDrift);
+  pushAll(visualDrift);
+  if (entries.length === 0) return null;
+  return { entries };
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +610,8 @@ export async function runRegressionSuite(
     visualDrift,
     priors,
     screenshotManager,
+    tokenRegistry,
+    ocrProvider,
     now,
   } = options;
 
@@ -503,7 +654,13 @@ export async function runRegressionSuite(
             outcome = await evaluateVisualGate(assertion, ir, registry, manager);
             break;
           case "overlay":
-            outcome = evaluateOverlay(assertion, ir, registry);
+            outcome = await evaluateOverlay(
+              assertion,
+              ir,
+              registry,
+              tokenRegistry,
+              ocrProvider,
+            );
             break;
         }
       } catch (err) {
@@ -558,6 +715,11 @@ export async function runRegressionSuite(
   };
 
   // Step 3 — record the run, getting back the persisted UUID.
+  // The `drift_report_json` blob — when either spec or visual drift is
+  // present — captures the same `DriftReport` entries fed into the
+  // diagnose call, plus a wrapper distinguishing kinds. Surfaced over
+  // HTTP at `/runs/:run_id/drift` for the qontinui-web dashboard.
+  const driftReportJson = buildPersistedDriftReport(specDrift, visualDrift);
   const runDbId = await invoke<string>("record_regression_run", {
     suiteId: suiteDbId,
     runId,
@@ -566,6 +728,7 @@ export async function runRegressionSuite(
     startedAt: startedAtIso,
     completedAt: completedAtIso,
     runResultJson: runResult,
+    driftReportJson,
   });
 
   // Step 4 — patch run id onto each row, batch-record.

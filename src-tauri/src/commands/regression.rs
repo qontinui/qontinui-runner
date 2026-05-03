@@ -17,7 +17,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::compartments::StorageCompartment;
-use crate::database::pg::regression::{AssertionExecutionRow, DiagnosisRow};
+use crate::database::pg::regression::{
+    AssertionExecutionRow, DiagnosisRow, RunSummaryRow, SuiteFullRow, SuiteRow,
+};
 
 // =============================================================================
 // Helpers
@@ -48,7 +50,9 @@ pub async fn save_regression_suite(
 }
 
 /// Record a regression-run summary. Returns the new run UUID as a hyphenated
-/// string.
+/// string. `drift_report_json` is optional — when supplied, the runner
+/// `/runs/:run_id/drift` HTTP endpoint can later surface those entries to
+/// the qontinui-web drift dashboard.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn record_regression_run(
@@ -59,6 +63,7 @@ pub async fn record_regression_run(
     started_at: String,
     completed_at: String,
     run_result_json: serde_json::Value,
+    drift_report_json: Option<serde_json::Value>,
     storage: State<'_, StorageCompartment>,
 ) -> Result<String, String> {
     let suite_uuid = parse_uuid("suite_id", &suite_id)?;
@@ -72,6 +77,7 @@ pub async fn record_regression_run(
             &started_at,
             &completed_at,
             &run_result_json,
+            drift_report_json.as_ref(),
         )
         .await?;
     info!(
@@ -146,6 +152,41 @@ pub async fn get_recent_diagnoses_for_suite(
         .await
 }
 
+/// Catalog of every persisted regression suite, newest first. `limit` caps
+/// the returned rows; defaults to 50, hard cap 1000.
+#[tauri::command]
+pub async fn list_regression_suites(
+    limit: Option<u32>,
+    storage: State<'_, StorageCompartment>,
+) -> Result<Vec<SuiteRow>, String> {
+    storage.pg_db().list_regression_suites(limit).await
+}
+
+/// Fetch a single suite by id (with its serialized RegressionSuite blob).
+/// Returns `None` if the suite is not in the catalog.
+#[tauri::command]
+pub async fn get_regression_suite_by_id(
+    suite_id: String,
+    storage: State<'_, StorageCompartment>,
+) -> Result<Option<SuiteFullRow>, String> {
+    let suite_uuid = parse_uuid("suite_id", &suite_id)?;
+    storage.pg_db().get_regression_suite_by_id(suite_uuid).await
+}
+
+/// Recent runs for a suite (newest first). `limit` defaults to 25.
+#[tauri::command]
+pub async fn list_regression_runs_for_suite(
+    suite_id: String,
+    limit: Option<u32>,
+    storage: State<'_, StorageCompartment>,
+) -> Result<Vec<RunSummaryRow>, String> {
+    let suite_uuid = parse_uuid("suite_id", &suite_id)?;
+    storage
+        .pg_db()
+        .list_regression_runs_for_suite(suite_uuid, limit)
+        .await
+}
+
 /// Build the Tauri plugin that registers this module's command handlers.
 ///
 /// The runner currently uses the central `tauri::generate_handler![...]`
@@ -160,6 +201,9 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             record_assertion_executions_batch,
             query_assertion_executions_for_suite,
             get_recent_diagnoses_for_suite,
+            list_regression_suites,
+            get_regression_suite_by_id,
+            list_regression_runs_for_suite,
         ])
         .build()
 }

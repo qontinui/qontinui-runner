@@ -98,6 +98,7 @@ mod runtime_env;
 mod safe_lock;
 mod saved_api_requests;
 mod scenarios;
+mod regression_api;
 mod scheduler;
 mod scheduler_service;
 mod schema_registry;
@@ -1150,6 +1151,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::rag::start_rag_processing,
             commands::recap::get_task_run_recap,
             commands::regression::get_recent_diagnoses_for_suite,
+            commands::regression::get_regression_suite_by_id,
+            commands::regression::list_regression_runs_for_suite,
+            commands::regression::list_regression_suites,
             commands::regression::query_assertion_executions_for_suite,
             commands::regression::record_assertion_executions_batch,
             commands::regression::record_regression_diagnosis,

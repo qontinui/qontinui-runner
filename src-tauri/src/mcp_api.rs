@@ -1616,6 +1616,12 @@ pub fn create_router(
         // webview to combine with the live registry. Both load the IR
         // through the same `spec_api::storage` layer.
         .merge(crate::scenarios::routes())
+        // Section 11 follow-up FU-3 — `/runs/:run_id/drift[/:entry_id]`
+        // drift report endpoints. Pass-through of `regression_runs.drift_report_json`
+        // for the qontinui-web drift dashboard proxy. Reads only — the
+        // executor writes drift reports via the `record_regression_run`
+        // Tauri command.
+        .merge(crate::regression_api::routes())
         // Section 5b of UI Bridge redesign — `/trace/...` Trace API. Gated
         // on `settings.trace_api.enabled` (default false) because it
         // depends on the Alembic migration `section_5b_01_ui_bridge_causal_columns`
