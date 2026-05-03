@@ -56,7 +56,7 @@ interface ApiEnvelope<T> {
 }
 
 /** Throw if the response isn't OK, surfacing the body for debugging. */
-async function ensureOk(res: Response, ctx: string): Promise<Response> {
+export async function ensureOk(res: Response, ctx: string): Promise<Response> {
   if (res.ok) return res;
   let detail = "";
   try {
@@ -72,7 +72,7 @@ async function ensureOk(res: Response, ctx: string): Promise<Response> {
  * `data` value. Throws on `success: false` so callers don't have to
  * branch — failures surface as exceptions just like network errors.
  */
-async function unwrapEnvelope<T>(res: Response, ctx: string): Promise<T> {
+export async function unwrapEnvelope<T>(res: Response, ctx: string): Promise<T> {
   const body = (await res.json()) as ApiEnvelope<T>;
   if (body && body.success === false) {
     throw new Error(`${ctx} failed: ${body.error ?? "unknown error"}`);

@@ -54,6 +54,7 @@ mod exploration;
 mod findings;
 mod fixer;
 mod flow_control;
+mod fs_atomic;
 mod follow_up;
 mod graphql;
 mod health_monitor;

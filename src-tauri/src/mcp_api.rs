@@ -459,6 +459,13 @@ pub fn create_router(
     // the bootstrap on secondaries eliminates the cross-runner `notify`
     // watcher / `pnpm install` contention (`os error 32`).
     if !crate::process_capture::primary_proxy::is_secondary() {
+        match crate::wrappers::launcher::ensure_launcher_installed() {
+            Ok(path) => tracing::info!(
+                "wrappers: launcher installed at {}",
+                path.display()
+            ),
+            Err(e) => tracing::warn!("wrappers: launcher install failed: {}", e),
+        }
         let cell = app_state.wrapper_state.clone();
         tokio::spawn(async move {
             let ws = crate::wrappers::WrapperState::new_default().await;

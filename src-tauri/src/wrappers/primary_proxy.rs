@@ -22,6 +22,7 @@ use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use super::clients::{AiClientId, ClientInfo};
 use super::dispatch::DispatchResponse;
 use super::install::{InstallRequest, InstallResponse};
 use super::manager::WrapperStatus;
@@ -364,6 +365,46 @@ pub async fn set_credential(id: &str, name: &str, value: &str) -> Result<String,
 pub async fn delete_credential(id: &str, name: &str) -> Result<String, ProxyError> {
     let url = format!("{}/wrappers/{}/credentials/{}", base_url(), id, name);
     delete_json::<String>(&url).await
+}
+
+// ---------------------------------------------------------------------------
+// AI client proxies
+// ---------------------------------------------------------------------------
+
+/// Render an `AiClientId` as its kebab-case URL segment.
+fn client_id_segment(id: AiClientId) -> String {
+    serde_json::to_value(id)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .expect("AiClientId serializes as a string via kebab-case rename")
+}
+
+/// Proxy: `GET /wrappers/clients`.
+pub async fn list_clients() -> Result<Vec<ClientInfo>, ProxyError> {
+    let url = format!("{}/wrappers/clients", base_url());
+    get_json::<Vec<ClientInfo>>(&url).await
+}
+
+/// Proxy: `POST /wrappers/clients/{id}/connect`.
+pub async fn connect_client(id: AiClientId) -> Result<(), ProxyError> {
+    let url = format!(
+        "{}/wrappers/clients/{}/connect",
+        base_url(),
+        client_id_segment(id)
+    );
+    let _: String = post_json::<String, ()>(&url, None).await?;
+    Ok(())
+}
+
+/// Proxy: `POST /wrappers/clients/{id}/disconnect`.
+pub async fn disconnect_client(id: AiClientId) -> Result<(), ProxyError> {
+    let url = format!(
+        "{}/wrappers/clients/{}/disconnect",
+        base_url(),
+        client_id_segment(id)
+    );
+    let _: String = post_json::<String, ()>(&url, None).await?;
+    Ok(())
 }
 
 /// Proxy: `POST /wrappers/{id}/dispatch`.
