@@ -1351,7 +1351,7 @@ async fn handle_component(
                 Some(c) => Json(serde_json::json!({ "success": true, "data": c })),
                 None => Json(serde_json::json!({
                     "success": false,
-                    "error": format!("Component '{}' not found", id),
+                    "error": build_component_not_found_message(&id, &snapshot),
                 })),
             };
         }
@@ -1364,6 +1364,13 @@ async fn handle_component(
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
 }
+
+// Phase 1.1 (plan 2026-05-03) — `build_component_not_found_message` was
+// extracted to `mcp::ui_bridge::component_errors` so the runner's two
+// component-not-found code paths (this `/ui-bridge/sdk/component/:id`
+// wrapper and the inner `/ui-bridge/control/component/:id` handler in
+// `mcp/ui_bridge/elements.rs`) emit byte-identical error bodies.
+use crate::mcp::ui_bridge::component_errors::build_component_not_found_message;
 
 /// GET /ui-bridge/sdk/console-errors — Get console errors from SDK app
 async fn handle_console_errors(
@@ -4897,6 +4904,28 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/terminal/sessions/{session_id}/grid",
             get(crate::mcp::sdk_terminal_buffer::handle_terminal_grid),
+        )
+        // Terminal text snapshot — compact text-only view for verifiers
+        // (the agentic verification module's primary terminal-state
+        // input) and external tools that don't need cell colors.
+        .route(
+            "/ui-bridge/sdk/terminal/sessions/{session_id}/text",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_text),
+        )
+        // Terminal grid search — substring or regex match across one
+        // session (?session_id=...) or all active sessions (omit it).
+        // Powers cell-content assertions in UI Bridge specs and any
+        // automated test that needs to find rendered text.
+        .route(
+            "/ui-bridge/sdk/terminal/search",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_search),
+        )
+        // Cross-session terminal diff — row-by-row added/removed/modified
+        // between two grids. Use case: split-pane parity assertions,
+        // before/after action snapshots in agentic verification.
+        .route(
+            "/ui-bridge/sdk/terminal/sessions/{a_id}/diff/{b_id}",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_diff),
         )
         // Components
         .route("/ui-bridge/sdk/components", get(handle_components))

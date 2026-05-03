@@ -251,7 +251,8 @@ impl Grid {
             if src <= bottom {
                 let src_start = src * cols;
                 let dst_start = r * cols;
-                self.cells.copy_within(src_start..src_start + cols, dst_start);
+                self.cells
+                    .copy_within(src_start..src_start + cols, dst_start);
             } else {
                 let dst_start = r * cols;
                 for cell in &mut self.cells[dst_start..dst_start + cols] {
@@ -400,6 +401,178 @@ pub struct GridSnapshot {
     pub cells: Vec<Cell>,
 }
 
+// ---- Text snapshot, search, diff ----------------------------------------
+//
+// Higher-level helpers that operate on the rendered grid as text. These
+// are what consumers (the agentic verifier, automated tests, the UI Bridge
+// cell-content test pattern) should reach for instead of poking at cells
+// or replaying byte streams.
+
+/// Compact text-only view of a grid. Stable wire shape — safe to consume
+/// from the verification module, mobile bridge, automated tests.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextSnapshot {
+    pub cols: u16,
+    pub rows: u16,
+    /// Each row's rendered text, trimmed-right.
+    pub lines: Vec<String>,
+    /// Lines joined with `\n`, suitable for pasting into a verifier prompt.
+    pub text: String,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// One match from `Grid::search`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+    /// The full row text (trimmed-right) where the match was found.
+    pub line: String,
+}
+
+/// Errors `Grid::search` can return when the caller passes a regex.
+#[derive(Debug, thiserror::Error)]
+pub enum SearchError {
+    #[error("invalid regex: {0}")]
+    InvalidRegex(String),
+}
+
+/// One row-level change between two grids.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LineChange {
+    /// Row exists in `b` but not `a` (rows added on the larger grid).
+    Added { row: u16, after: String },
+    /// Row exists in `a` but not `b` (rows removed on the smaller grid).
+    Removed { row: u16, before: String },
+    /// Row index exists in both but the rendered text differs.
+    Modified {
+        row: u16,
+        before: String,
+        after: String,
+    },
+}
+
+/// Result of `Grid::diff_lines`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GridDiff {
+    pub a_rows: u16,
+    pub b_rows: u16,
+    pub changes: Vec<LineChange>,
+}
+
+impl Grid {
+    /// Cheap text-only view for verifiers / external tools. The
+    /// `lines` and `text` fields contain the same data in two shapes:
+    /// `lines` for row-level access, `text` for prompt insertion.
+    pub fn text_snapshot(&self) -> TextSnapshot {
+        let lines = self.lines();
+        let text = lines.join("\n");
+        TextSnapshot {
+            cols: self.cols,
+            rows: self.rows,
+            lines,
+            text,
+            cursor_row: self.cursor.row,
+            cursor_col: self.cursor.col,
+            title: self.title.clone(),
+        }
+    }
+
+    /// Search the rendered grid for `needle`. When `regex` is true, the
+    /// needle is compiled as a regex; otherwise it's a case-sensitive
+    /// substring match. Returns at most one hit per row (the leftmost),
+    /// matching how a user would scan the screen.
+    pub fn search(&self, needle: &str, regex: bool) -> Result<Vec<SearchHit>, SearchError> {
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut hits = Vec::new();
+        if regex {
+            let re = regex::Regex::new(needle)
+                .map_err(|e| SearchError::InvalidRegex(e.to_string()))?;
+            for row in 0..self.rows {
+                let line = self.row_text(row);
+                if let Some(m) = re.find(&line) {
+                    // Byte offsets → char-column offsets. Row text is
+                    // typically ASCII for terminal output, but be safe.
+                    let start_col = line[..m.start()].chars().count() as u16;
+                    let end_col = line[..m.end()].chars().count() as u16;
+                    hits.push(SearchHit {
+                        row,
+                        start_col,
+                        end_col,
+                        line,
+                    });
+                }
+            }
+        } else {
+            for row in 0..self.rows {
+                let line = self.row_text(row);
+                if let Some(byte_idx) = line.find(needle) {
+                    let start_col = line[..byte_idx].chars().count() as u16;
+                    let end_col = start_col + needle.chars().count() as u16;
+                    hits.push(SearchHit {
+                        row,
+                        start_col,
+                        end_col,
+                        line,
+                    });
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Row-by-row diff of two grids. Identical rows are omitted; only
+    /// rows that differ — added, removed, or modified — show up in the
+    /// `changes` list.
+    pub fn diff_lines(&self, other: &Grid) -> GridDiff {
+        let a_lines = self.lines();
+        let b_lines = other.lines();
+        let common = a_lines.len().min(b_lines.len());
+        let mut changes = Vec::new();
+
+        for row in 0..common {
+            if a_lines[row] != b_lines[row] {
+                changes.push(LineChange::Modified {
+                    row: row as u16,
+                    before: a_lines[row].clone(),
+                    after: b_lines[row].clone(),
+                });
+            }
+        }
+        if a_lines.len() > common {
+            for row in common..a_lines.len() {
+                changes.push(LineChange::Removed {
+                    row: row as u16,
+                    before: a_lines[row].clone(),
+                });
+            }
+        } else if b_lines.len() > common {
+            for row in common..b_lines.len() {
+                changes.push(LineChange::Added {
+                    row: row as u16,
+                    after: b_lines[row].clone(),
+                });
+            }
+        }
+
+        GridDiff {
+            a_rows: self.rows,
+            b_rows: other.rows,
+            changes,
+        }
+    }
+}
+
 // ---- 256-color palette ---------------------------------------------------
 
 fn ansi_color_16(idx: u8, bright: bool) -> u32 {
@@ -510,13 +683,7 @@ impl<'a> Perform for GridPerformer<'a> {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let private = intermediates.first() == Some(&b'?');
         match action {
             'H' | 'f' => {
@@ -814,5 +981,104 @@ mod tests {
         assert_eq!(snap.cells[0].ch, 'b');
         assert_eq!(snap.cells[80].ch, 'c');
         assert_eq!(snap.cells[160].ch, 'd');
+    }
+
+    // ---- text_snapshot / search / diff -----------------------------------
+
+    #[test]
+    fn text_snapshot_joins_lines_with_newline() {
+        let mut grid = Grid::new(20, 3);
+        feed(&mut grid, b"hello\r\nworld");
+        let snap = grid.text_snapshot();
+        assert_eq!(snap.lines.len(), 3);
+        assert_eq!(snap.lines[0], "hello");
+        assert_eq!(snap.lines[1], "world");
+        assert_eq!(snap.lines[2], "");
+        assert_eq!(snap.text, "hello\nworld\n");
+        assert_eq!(snap.cursor_row, 1);
+        assert_eq!(snap.cursor_col, 5);
+    }
+
+    #[test]
+    fn search_substring_returns_one_hit_per_row() {
+        let mut grid = Grid::new(20, 4);
+        feed(&mut grid, b"foo bar foo\r\nclaude\r\nfoo");
+        let hits = grid.search("foo", false).unwrap();
+        assert_eq!(hits.len(), 2, "two rows contain 'foo'");
+        assert_eq!(hits[0].row, 0);
+        assert_eq!(hits[0].start_col, 0);
+        assert_eq!(hits[0].end_col, 3);
+        assert_eq!(hits[0].line, "foo bar foo");
+        assert_eq!(hits[1].row, 2);
+    }
+
+    #[test]
+    fn search_regex_compiles_and_matches() {
+        let mut grid = Grid::new(40, 3);
+        feed(&mut grid, b"build #42 ok\r\nbuild #007 fail");
+        let hits = grid.search(r"#(\d+)", true).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].row, 0);
+        assert_eq!(hits[1].row, 1);
+    }
+
+    #[test]
+    fn search_invalid_regex_returns_error() {
+        let grid = Grid::new(20, 2);
+        let err = grid.search("(unclosed", true);
+        assert!(matches!(err, Err(SearchError::InvalidRegex(_))));
+    }
+
+    #[test]
+    fn search_empty_needle_returns_empty() {
+        let mut grid = Grid::new(20, 2);
+        feed(&mut grid, b"anything");
+        assert!(grid.search("", false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_lines_modified_only() {
+        let mut a = Grid::new(20, 3);
+        let mut b = Grid::new(20, 3);
+        feed(&mut a, b"hello\r\nworld\r\nbye");
+        feed(&mut b, b"hello\r\nWORLD\r\nbye");
+        let d = a.diff_lines(&b);
+        assert_eq!(d.changes.len(), 1);
+        match &d.changes[0] {
+            LineChange::Modified { row, before, after } => {
+                assert_eq!(*row, 1);
+                assert_eq!(before, "world");
+                assert_eq!(after, "WORLD");
+            }
+            other => panic!("expected Modified, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn diff_lines_added_and_removed() {
+        let mut a = Grid::new(20, 2);
+        let mut b = Grid::new(20, 4);
+        feed(&mut a, b"hi");
+        feed(&mut b, b"hi\r\n\r\nadded1\r\nadded2");
+        let d = a.diff_lines(&b);
+        // a has 2 rows of which row 1 is empty in both -> only Added entries.
+        let added: Vec<_> = d
+            .changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Added { .. }))
+            .collect();
+        assert_eq!(added.len(), 2);
+
+        let mut c = Grid::new(20, 4);
+        feed(&mut c, b"hi\r\n\r\nlost1\r\nlost2");
+        let mut shorter = Grid::new(20, 2);
+        feed(&mut shorter, b"hi");
+        let d2 = c.diff_lines(&shorter);
+        let removed: Vec<_> = d2
+            .changes
+            .iter()
+            .filter(|x| matches!(x, LineChange::Removed { .. }))
+            .collect();
+        assert_eq!(removed.len(), 2);
     }
 }

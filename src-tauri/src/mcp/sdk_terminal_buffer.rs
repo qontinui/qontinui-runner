@@ -22,7 +22,7 @@ use tauri::Manager;
 use tracing::info;
 
 use super::types::{api_error, ApiResponse, ApiState};
-use crate::terminal::grid::GridSnapshot;
+use crate::terminal::grid::{GridDiff, GridSnapshot, SearchHit, TextSnapshot};
 use crate::terminal::TerminalManager;
 
 /// Hard cap on the number of returned lines, regardless of the `lines` query
@@ -101,7 +101,10 @@ pub async fn handle_terminal_buffer(
     };
 
     let total_lines = all_lines.len();
-    let cap = query.lines.unwrap_or(MAX_RETURNED_LINES).min(MAX_RETURNED_LINES);
+    let cap = query
+        .lines
+        .unwrap_or(MAX_RETURNED_LINES)
+        .min(MAX_RETURNED_LINES);
     let lines = if total_lines > cap {
         all_lines[total_lines - cap..].to_vec()
     } else {
@@ -150,4 +153,170 @@ pub async fn handle_terminal_grid(
     };
 
     Ok(Json(ApiResponse::success(snapshot)))
+}
+
+/// `GET /ui-bridge/sdk/terminal/sessions/:session_id/text` — compact
+/// text-only view for verifiers and external tools.
+pub async fn handle_terminal_text(
+    State(state): State<Arc<ApiState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<ApiResponse<TextSnapshot>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "UI Bridge API: terminal text snapshot (session_id={})",
+        session_id
+    );
+    let tm = lookup_terminal_manager(&state)?;
+    let session = tm.get(&session_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!(
+                "terminal session '{}' not found",
+                session_id
+            ))),
+        )
+    })?;
+    let snapshot = {
+        let grid = session.grid();
+        let g = grid.lock().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Grid lock poisoned: {}", e))),
+            )
+        })?;
+        g.text_snapshot()
+    };
+    Ok(Json(ApiResponse::success(snapshot)))
+}
+
+/// Query parameters for the search endpoint.
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    /// Pattern to look for. Required.
+    pub q: String,
+    /// `true` → compile as regex; `false` (default) → case-sensitive substring.
+    #[serde(default)]
+    pub regex: bool,
+    /// Restrict to one session. When omitted, search ALL active sessions.
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResultPerSession {
+    pub session_id: String,
+    pub hits: Vec<SearchHit>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResponseBody {
+    pub query: String,
+    pub regex: bool,
+    pub results: Vec<SearchResultPerSession>,
+    pub total_hits: usize,
+}
+
+/// `GET /ui-bridge/sdk/terminal/search?q=&regex=&session_id=`
+pub async fn handle_terminal_search(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<ApiResponse<SearchResponseBody>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "UI Bridge API: terminal grid search (q={:?}, regex={}, session_id={:?})",
+        q.q, q.regex, q.session_id
+    );
+    if q.q.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("query 'q' is required and must be non-empty")),
+        ));
+    }
+    let tm = lookup_terminal_manager(&state)?;
+
+    let pairs: Vec<(String, Arc<crate::terminal::session::TerminalSession>)> = match &q.session_id {
+        Some(id) => {
+            let sess = tm.get(id).ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(api_error(format!("terminal session '{}' not found", id))),
+                )
+            })?;
+            vec![(id.clone(), sess)]
+        }
+        None => tm.sessions_snapshot(),
+    };
+
+    let mut results: Vec<SearchResultPerSession> = Vec::new();
+    let mut total = 0usize;
+    for (sid, sess) in pairs {
+        let hits = {
+            let grid = sess.grid();
+            let g = grid.lock().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Grid lock poisoned: {}", e))),
+                )
+            })?;
+            g.search(&q.q, q.regex).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(e.to_string())),
+                )
+            })?
+        };
+        if !hits.is_empty() {
+            total += hits.len();
+            results.push(SearchResultPerSession {
+                session_id: sid,
+                hits,
+            });
+        }
+    }
+
+    Ok(Json(ApiResponse::success(SearchResponseBody {
+        query: q.q,
+        regex: q.regex,
+        results,
+        total_hits: total,
+    })))
+}
+
+/// `GET /ui-bridge/sdk/terminal/sessions/:a/diff/:b` — row-by-row diff
+/// between two terminals' rendered grids.
+pub async fn handle_terminal_diff(
+    State(state): State<Arc<ApiState>>,
+    Path((a_id, b_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<GridDiff>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: terminal grid diff (a={}, b={})", a_id, b_id);
+    let tm = lookup_terminal_manager(&state)?;
+    let a = tm.get(&a_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("terminal session '{}' not found", a_id))),
+        )
+    })?;
+    let b = tm.get(&b_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("terminal session '{}' not found", b_id))),
+        )
+    })?;
+    let diff = {
+        let a_grid = a.grid();
+        let b_grid = b.grid();
+        let ag = a_grid.lock().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Grid A lock poisoned: {}", e))),
+            )
+        })?;
+        let bg = b_grid.lock().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Grid B lock poisoned: {}", e))),
+            )
+        })?;
+        ag.diff_lines(&bg)
+    };
+    Ok(Json(ApiResponse::success(diff)))
 }
