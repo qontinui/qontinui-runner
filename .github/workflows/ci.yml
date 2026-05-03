@@ -109,34 +109,33 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # The runner's vite.config.ts:243-245 has aliases that resolve
-      # @qontinui/workflow-ui (and other siblings) to their SOURCE files
-      # (e.g. ../qontinui-workflow-ui/src/...) rather than their built dist/
-      # output. When vite bundles those source files it walks their
-      # transitive imports — including peer deps like lucide-react — and
-      # needs them resolvable inside each sibling's own node_modules.
-      # `pnpm install` above only populates the runner's own node_modules,
-      # not its cloned siblings'. Without this step, vite/rolldown fails
-      # with "Failed to resolve import 'lucide-react'" from inside a
-      # sibling's source. Each sibling has its own package-lock.json, so
-      # `npm ci` is the right call.
+      # The runner's vite.config.ts has aliases that resolve a few
+      # @qontinui/* sibling packages to their SOURCE files rather than
+      # built dist/ output. When vite bundles that source it walks
+      # transitive imports — including peer deps like lucide-react —
+      # which must be resolvable inside the sibling's own node_modules.
+      # `pnpm install` above only populates the runner's own node_modules.
       #
-      # qontinui-web is intentionally excluded — the runner only imports
-      # static .spec.uibridge.json files from it, no transitive code.
-      - name: Install sibling dependencies
+      # Only TWO siblings have source-aliases that need this:
+      #   - ui-bridge-auto       (../ui-bridge-auto/src/index.ts)
+      #   - qontinui-workflow-ui (../qontinui-workflow-ui/src/...)
+      # Other @qontinui/* aliases point at committed dist/ files, so
+      # they don't need their own node_modules.
+      #
+      # --legacy-peer-deps avoids ERESOLVE failures from upstream eslint
+      # version drift we don't care about (these installs are only
+      # needed to satisfy vite's resolver during bundling, not to run
+      # any sibling's own tooling).
+      - name: Install sibling dependencies (source-aliased only)
         shell: bash
         run: |
           set -e
-          for sibling in ui-bridge ui-bridge-auto qontinui-workflow-ui qontinui-workflow-utils qontinui-navigation; do
+          for sibling in ui-bridge-auto qontinui-workflow-ui; do
             echo "::group::npm ci in $sibling"
             cd "$GITHUB_WORKSPACE/../$sibling"
-            npm ci --no-audit --no-fund
+            npm ci --no-audit --no-fund --legacy-peer-deps
             echo "::endgroup::"
           done
-          echo "::group::npm ci in qontinui-schemas/ts"
-          cd "$GITHUB_WORKSPACE/../qontinui-schemas/ts"
-          npm ci --no-audit --no-fund
-          echo "::endgroup::"
 
       - name: Lint frontend code
         run: pnpm run lint

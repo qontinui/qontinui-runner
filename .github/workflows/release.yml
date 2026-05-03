@@ -168,24 +168,19 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # Install transitive deps inside cloned siblings — vite resolves
-      # @qontinui/* from sibling source via aliases (vite.config.ts:243-245),
-      # so each sibling needs its own node_modules to satisfy peer deps.
-      # See ci.yml's identical step for full rationale.
-      - name: Install sibling dependencies
+      # Install transitive deps inside the two siblings whose vite
+      # aliases point at SOURCE (not dist). See ci.yml's identical step
+      # for full rationale.
+      - name: Install sibling dependencies (source-aliased only)
         shell: bash
         run: |
           set -e
-          for sibling in ui-bridge ui-bridge-auto qontinui-workflow-ui qontinui-workflow-utils qontinui-navigation; do
+          for sibling in ui-bridge-auto qontinui-workflow-ui; do
             echo "::group::npm ci in $sibling"
             cd "$GITHUB_WORKSPACE/../$sibling"
-            npm ci --no-audit --no-fund
+            npm ci --no-audit --no-fund --legacy-peer-deps
             echo "::endgroup::"
           done
-          echo "::group::npm ci in qontinui-schemas/ts"
-          cd "$GITHUB_WORKSPACE/../qontinui-schemas/ts"
-          npm ci --no-audit --no-fund
-          echo "::endgroup::"
 
       # Download bundled Python executor if it was built
       - name: Download Python executor
