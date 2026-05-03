@@ -178,12 +178,17 @@ jobs:
           for sibling in ui-bridge-auto qontinui-workflow-ui; do
             echo "::group::npm ci in $sibling"
             cd "$GITHUB_WORKSPACE/../$sibling"
-            npm ci --no-audit --no-fund
+            # --legacy-peer-deps to avoid upstream ERESOLVE conflicts
+            # (ui-bridge-auto has eslint@10 vs @eslint/js@10's peer constraint)
+            npm ci --no-audit --no-fund --legacy-peer-deps
             echo "::endgroup::"
           done
+          # --legacy-peer-deps above skipped peer-dep install. lucide-react
+          # is workflow-ui's only peer that isn't satisfied by its dev/regular
+          # deps and that the runner actually exercises during build.
           echo "::group::install lucide-react in qontinui-workflow-ui (peer dep)"
           cd "$GITHUB_WORKSPACE/../qontinui-workflow-ui"
-          npm install --no-audit --no-fund --no-save lucide-react
+          npm install --no-audit --no-fund --no-save --legacy-peer-deps lucide-react
           echo "::endgroup::"
 
       # Download bundled Python executor if it was built
