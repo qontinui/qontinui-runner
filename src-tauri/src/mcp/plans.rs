@@ -17,6 +17,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::mcp::types::ApiState;
 
@@ -165,17 +166,31 @@ async fn decompose_plan(
         })?;
     let plan_id: String = plan_row.get(0);
     let plan_version_hash: String = plan_row.get(1);
+    // tokio-postgres needs a Uuid-typed parameter for UUID columns; the
+    // RETURNING id::text on the upsert hands back a String, so parse once
+    // here and reuse for every $1::uuid below. Passing the String directly
+    // failed with "error serializing parameter 0" because String::to_sql
+    // refuses to encode for UUID type.
+    let plan_uuid: Uuid = plan_id.parse().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("plan_id is not a valid UUID: {}", e),
+        )
+    })?;
 
     // 2. Replace tasks for this plan. The cascade-on-delete also removes
     //    any review/snapshot rows once those tables exist (later phases).
-    txn.execute("DELETE FROM coord.tasks WHERE plan_id = $1::uuid", &[&plan_id])
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("delete prior tasks failed: {}", e),
-            )
-        })?;
+    txn.execute(
+        "DELETE FROM coord.tasks WHERE plan_id = $1::uuid",
+        &[&plan_uuid],
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("delete prior tasks failed: {}", e),
+        )
+    })?;
 
     // 3. Insert tasks in two passes so depends_on_indices can be resolved
     //    against the previously-allocated UUIDs.
@@ -194,7 +209,7 @@ async fn decompose_plan(
                 RETURNING id::text
                 "#,
                 &[
-                    &plan_id,
+                    &plan_uuid,
                     &plan_version_hash,
                     &t.phase_name,
                     &t.sequence_in_phase,
@@ -224,6 +239,12 @@ async fn decompose_plan(
             .iter()
             .map(|&d| allocated_ids[d].clone())
             .collect();
+        let task_uuid: Uuid = allocated_ids[i].parse().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task[{}] id is not a valid UUID: {}", i, e),
+            )
+        })?;
         txn.execute(
             r#"
             UPDATE coord.tasks
@@ -234,7 +255,7 @@ async fn decompose_plan(
                 updated_at = NOW()
             WHERE id = $1::uuid
             "#,
-            &[&allocated_ids[i], &dep_ids],
+            &[&task_uuid, &dep_ids],
         )
         .await
         .map_err(|e| {
@@ -255,7 +276,7 @@ async fn decompose_plan(
           AND status = 'pending'
           AND cardinality(depends_on) = 0
         "#,
-        &[&plan_id],
+        &[&plan_uuid],
     )
     .await
     .map_err(|e| {
