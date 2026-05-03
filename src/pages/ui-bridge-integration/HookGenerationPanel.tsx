@@ -1303,6 +1303,26 @@ export function HookGenerationPanel({
             // duplicate them and runtime would double-register.
             extractInlineRegistrations(source.main_source),
           );
+          if (typeof window !== "undefined") {
+            const w = window as unknown as {
+              __qontinuiPreviewPrompts?: Array<{
+                pageRoute: string;
+                pageName: string;
+                prompt: string;
+                timestamp: number;
+              }>;
+            };
+            w.__qontinuiPreviewPrompts = w.__qontinuiPreviewPrompts ?? [];
+            w.__qontinuiPreviewPrompts.unshift({
+              pageRoute: page.route,
+              pageName: page.component_name,
+              prompt,
+              timestamp: Date.now(),
+            });
+            if (w.__qontinuiPreviewPrompts.length > 20) {
+              w.__qontinuiPreviewPrompts.length = 20;
+            }
+          }
           await sendMessage(
             `Analyze the page at ${page.route} and generate UI Bridge registrations.\n\n` + prompt,
           );
@@ -1539,7 +1559,11 @@ export function HookGenerationPanel({
 
   // Start per-page AI generation (called from PageSelectionPanel via window event)
   const handleGeneratePages = useCallback(
-    async (pages: PageComponent[], options: PageGenerationOptions) => {
+    async (
+      pages: PageComponent[],
+      options: PageGenerationOptions,
+      previewOnly: boolean = false,
+    ) => {
       if (pages.length === 0) return;
 
       // Guard: the Project Explainer phase runs AFTER per-page generation
@@ -1590,6 +1614,85 @@ export function HookGenerationPanel({
       demoVideoScriptsRef.current = [];
       productToursRef.current = [];
       lastSpecJsonRef.current = "";
+
+      if (previewOnly && options.generateRegistrations) {
+        const doneLabels: string[] = [];
+        const failedLabels: string[] = [];
+        for (let i = 0; i < pages.length; i++) {
+          const p = pages[i];
+          setStepStatuses((prev) =>
+            prev.map((s, idx) => (idx === i ? { ...s, state: "active" } : s)),
+          );
+          try {
+            const resp = await fetch(`${getApiBase()}/ui-bridge/integration/read-page-source`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                project_path: projectPath,
+                component_path: p.component_path,
+                max_depth: 2,
+              }),
+            });
+            const pData: ApiResponse<ReadPageSourceResult> = await resp.json();
+            if (!pData.success || !pData.data) {
+              failedLabels.push(`${p.route} (preview: source unavailable)`);
+              setStepStatuses((prev) =>
+                prev.map((s, idx) => (idx === i ? { ...s, state: "error" } : s)),
+              );
+              continue;
+            }
+            const pSource = pData.data;
+            const pPrompt = buildRegistrationPrompt(
+              pSource.main_source,
+              pSource.imported_sources,
+              p.component_name,
+              p.route,
+              analysis.framework,
+              undefined,
+              extractInlineRegistrations(pSource.main_source),
+            );
+            const w = window as unknown as {
+              __qontinuiPreviewPrompts?: Array<{
+                pageRoute: string;
+                pageName: string;
+                prompt: string;
+                timestamp: number;
+              }>;
+            };
+            w.__qontinuiPreviewPrompts = w.__qontinuiPreviewPrompts ?? [];
+            w.__qontinuiPreviewPrompts.unshift({
+              pageRoute: p.route,
+              pageName: p.component_name,
+              prompt: pPrompt,
+              timestamp: Date.now(),
+            });
+            if (w.__qontinuiPreviewPrompts.length > 20) {
+              w.__qontinuiPreviewPrompts.length = 20;
+            }
+            doneLabels.push(`${p.route} (preview)`);
+            setStepStatuses((prev) =>
+              prev.map((s, idx) => (idx === i ? { ...s, state: "done" } : s)),
+            );
+          } catch {
+            failedLabels.push(`${p.route} (preview: fetch failed)`);
+            setStepStatuses((prev) =>
+              prev.map((s, idx) => (idx === i ? { ...s, state: "error" } : s)),
+            );
+          }
+        }
+        pageQueueRef.current = [];
+        window.dispatchEvent(
+          new CustomEvent("ui-bridge-generate-pages-complete", {
+            detail: {
+              filesGenerated: 0,
+              doneSteps: doneLabels,
+              failedSteps: failedLabels,
+            },
+          }),
+        );
+        setPhase("idle");
+        return;
+      }
 
       // Close existing session
       if (session.taskRunId) {
@@ -1650,6 +1753,26 @@ export function HookGenerationPanel({
           // contains. Prevents duplicate registrations in the side-file.
           extractInlineRegistrations(source.main_source),
         );
+        if (typeof window !== "undefined") {
+          const w = window as unknown as {
+            __qontinuiPreviewPrompts?: Array<{
+              pageRoute: string;
+              pageName: string;
+              prompt: string;
+              timestamp: number;
+            }>;
+          };
+          w.__qontinuiPreviewPrompts = w.__qontinuiPreviewPrompts ?? [];
+          w.__qontinuiPreviewPrompts.unshift({
+            pageRoute: firstPage.route,
+            pageName: firstPage.component_name,
+            prompt,
+            timestamp: Date.now(),
+          });
+          if (w.__qontinuiPreviewPrompts.length > 20) {
+            w.__qontinuiPreviewPrompts.length = 20;
+          }
+        }
         await session.sendMessage(
           `Analyze the page at ${firstPage.route} and generate UI Bridge registrations.\n\n` +
             prompt,
@@ -1718,10 +1841,11 @@ export function HookGenerationPanel({
         | {
             pages: PageComponent[];
             options: PageGenerationOptions;
+            previewOnly?: boolean;
           }
         | undefined;
       if (detail) {
-        handleGeneratePages(detail.pages, detail.options);
+        handleGeneratePages(detail.pages, detail.options, detail.previewOnly ?? false);
       }
     };
     window.addEventListener("ui-bridge-generate-pages", handler);

@@ -95,6 +95,7 @@ type CoordinatorPhase =
   | "no-pages"
   | "generating"
   | "generated" // files ready, HookGenerationPanel is in preview
+  | "previewed" // preview-mode run finished; prompts cached, no LLM dispatch
   | "applied" // files written to disk
   | "failed";
 
@@ -167,6 +168,11 @@ export function ProjectCoordinator({
   const [filesGenerated, setFilesGenerated] = useState<number>(0);
   const [filesWritten, setFilesWritten] = useState<string[]>([]);
   const [rebuildCopied, setRebuildCopied] = useState(false);
+  const [previewMode, setPreviewMode] = useState<boolean>(false);
+  const previewModeRef = useRef<boolean>(false);
+  useEffect(() => {
+    previewModeRef.current = previewMode;
+  }, [previewMode]);
   // Guards against external analyze() races starting a run mid-flow.
   const runIdRef = useRef(0);
 
@@ -279,7 +285,7 @@ export function ProjectCoordinator({
       // "generated" = files ready in HookGenerationPanel's preview. The user
       // still has to click Apply there (in Advanced) to write to disk — we
       // tell them that below.
-      setPhase("generated");
+      setPhase(previewModeRef.current ? "previewed" : "generated");
     };
     const onApplied = (e: Event) => {
       const detail = (e as CustomEvent).detail as AppliedDetail | undefined;
@@ -369,10 +375,12 @@ export function ProjectCoordinator({
   );
 
   const kickOffGeneration = useCallback(
-    (pages: PageComponent[], options: PageGenerationOptions) => {
+    (pages: PageComponent[], options: PageGenerationOptions, previewOnly: boolean = false) => {
       // Reuse HookGenerationPanel's existing start event — no new machinery.
       window.dispatchEvent(
-        new CustomEvent("ui-bridge-generate-pages", { detail: { pages, options } }),
+        new CustomEvent("ui-bridge-generate-pages", {
+          detail: { pages, options, previewOnly },
+        }),
       );
     },
     [],
@@ -428,10 +436,13 @@ export function ProjectCoordinator({
 
         // Step 4 — Pre-select all pages and start generation with defaults.
         setPhase("generating");
+        const isPreview = previewModeRef.current;
         setProgressMessage(
-          `Generating for ${pages.length} page${pages.length !== 1 ? "s" : ""}...`,
+          isPreview
+            ? `Building prompts for ${pages.length} page${pages.length !== 1 ? "s" : ""}...`
+            : `Generating for ${pages.length} page${pages.length !== 1 ? "s" : ""}...`,
         );
-        kickOffGeneration(pages, defaultGenerationOptions);
+        kickOffGeneration(pages, defaultGenerationOptions, isPreview);
         // From here on, the HookGenerationPanel drives phase via the three
         // CustomEvents we subscribed to in the useEffect above.
       } catch (err) {
@@ -454,12 +465,15 @@ export function ProjectCoordinator({
       return;
     }
     setPhase("generating");
+    const isPreview = previewModeRef.current;
     setProgressMessage(
-      `Retrying ${pagesToRetry.length} page${pagesToRetry.length !== 1 ? "s" : ""}...`,
+      isPreview
+        ? `Rebuilding prompts for ${pagesToRetry.length} page${pagesToRetry.length !== 1 ? "s" : ""}...`
+        : `Retrying ${pagesToRetry.length} page${pagesToRetry.length !== 1 ? "s" : ""}...`,
     );
     setFailedSteps([]);
     setErrorMessage(null);
-    kickOffGeneration(pagesToRetry, defaultGenerationOptions);
+    kickOffGeneration(pagesToRetry, defaultGenerationOptions, isPreview);
   }, [failedSteps, discoveredPages, kickOffGeneration, defaultGenerationOptions]);
 
   // =========================================================================
@@ -552,11 +566,11 @@ export function ProjectCoordinator({
       case "discovering":
         return "Discovering";
       case "generating":
-        return "Generating";
+        return previewMode ? "Building prompts" : "Generating";
       default:
         return null;
     }
-  }, [phase]);
+  }, [phase, previewMode]);
 
   // =========================================================================
   // Render
@@ -672,6 +686,22 @@ export function ProjectCoordinator({
           Runs analyze, install SDK (if needed), discover pages, and generate registrations + page
           IDs for every page. For specs, tutorials, or videos, open Advanced below.
         </p>
+        <label className="mt-2 flex items-start gap-2 text-[11px] text-muted-foreground cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={previewMode}
+            onChange={(e) => setPreviewMode(e.target.checked)}
+            disabled={pipelineRunning}
+            className="mt-0.5 h-3 w-3 rounded border-border bg-background accent-purple-400 disabled:opacity-50"
+          />
+          <span>
+            <span className="font-medium text-foreground">Preview prompts only (no LLM)</span>
+            <span className="block text-[10px] text-muted-foreground">
+              Build the prompts that would be sent and stop. Useful for smoke tests and prompt
+              iteration.
+            </span>
+          </span>
+        </label>
       </div>
 
       {/* ----- Analysis summary (visible once Analyze has completed) ----- */}
@@ -701,7 +731,11 @@ export function ProjectCoordinator({
       )}
 
       {/* ----- Unified progress view ----- */}
-      {(pipelineRunning || phase === "generated" || phase === "applied" || phase === "failed") && (
+      {(pipelineRunning ||
+        phase === "generated" ||
+        phase === "previewed" ||
+        phase === "applied" ||
+        phase === "failed") && (
         <div className="p-4 rounded-lg border border-border bg-card/50">
           <PhaseBanner
             phase={phase}
@@ -714,6 +748,7 @@ export function ProjectCoordinator({
 
           {(phase === "generating" ||
             phase === "generated" ||
+            phase === "previewed" ||
             phase === "applied" ||
             phase === "failed") &&
             (doneSteps.length > 0 || failedSteps.length > 0) && (
@@ -889,6 +924,23 @@ function PhaseBanner({
           </p>
           <p className="text-[11px] text-muted-foreground mt-0.5">
             Review and apply from the Advanced section below, then rebuild.
+          </p>
+        </div>
+      </div>
+    );
+  }
+  if (phase === "previewed") {
+    return (
+      <div className="flex items-start gap-2">
+        <CheckCircle2 className="w-4 h-4 text-purple-400 shrink-0 mt-0.5" />
+        <div>
+          <p className="text-sm font-medium">
+            Built prompt{failedCount === 0 ? "(s) — no LLM calls made" : "s"}
+            {failedCount > 0 ? ` — ${failedCount} failed` : ""}.
+          </p>
+          <p className="text-[11px] text-muted-foreground mt-0.5">
+            Use UI Bridge action <code className="px-1 rounded bg-white/10">get-last-prompt</code>{" "}
+            on this page to inspect the cached prompt(s).
           </p>
         </div>
       </div>

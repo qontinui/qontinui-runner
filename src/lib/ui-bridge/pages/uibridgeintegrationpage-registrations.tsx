@@ -43,6 +43,33 @@ export function useUIBridgeIntegrationPageRegistrations() {
           return { phase: root?.dataset.pipelinePhase ?? "unknown" };
         },
       },
+      {
+        id: "get-last-prompt",
+        label: "Read the most recently constructed registration prompt(s) from the integration pipeline",
+        handler: () => {
+          // Pipeline writes to window.__qontinuiPreviewPrompts (most-recent-first, capped at 20 entries).
+          // Each entry: { pageRoute, pageName, prompt, timestamp }.
+          const w = window as unknown as {
+            __qontinuiPreviewPrompts?: Array<{
+              pageRoute: string;
+              pageName: string;
+              prompt: string;
+              timestamp: number;
+            }>;
+          };
+          const prompts = w.__qontinuiPreviewPrompts ?? [];
+          return {
+            count: prompts.length,
+            prompts: prompts.map((p) => ({
+              pageRoute: p.pageRoute,
+              pageName: p.pageName,
+              prompt: p.prompt,
+              promptLength: p.prompt.length,
+              timestamp: p.timestamp,
+            })),
+          };
+        },
+      },
     ],
   });
 
