@@ -252,13 +252,6 @@ pub struct ApiState {
     /// responses. The `ui-bridge:evaluate-response` Tauri listener in
     /// `mcp_api.rs` fires the sender on arrival.
     pub ui_bridge_evaluate_store: Arc<crate::ui_bridge_evaluate::EvaluateRequestStore>,
-    /// Pending terminal-buffer readback requests for the
-    /// `GET /ui-bridge/sdk/terminal/sessions/:session_id/buffer` route.
-    /// Mirrors `ui_bridge_evaluate_store` — keyed by request_id so concurrent
-    /// callers never interleave responses. The
-    /// `ui-bridge:terminal-buffer-response` Tauri listener in `mcp_api.rs`
-    /// fires the sender on arrival.
-    pub terminal_buffer_store: Arc<crate::terminal_buffer::TerminalBufferRequestStore>,
 }
 
 /// Response for API endpoints

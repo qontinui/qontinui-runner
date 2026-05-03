@@ -16,6 +16,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tauri::{AppHandle, Emitter};
 use tracing::{debug, info, warn};
 
+use super::grid::{Grid, GridPerformer};
 use super::interceptor::OutputInterceptor;
 use super::types::{TerminalExitEvent, TerminalId, TerminalInfo, TerminalOutputEvent};
 
@@ -73,6 +74,8 @@ pub struct TerminalSession {
     created_at: u64,
     /// Broadcast channel for HTTP/SSE subscribers to receive base64-encoded output chunks.
     output_tx: broadcast::Sender<String>,
+    /// Server-side cell grid produced by the VT parser tee in the reader thread.
+    grid: Arc<Mutex<Grid>>,
 }
 
 impl TerminalSession {
@@ -170,6 +173,7 @@ impl TerminalSession {
         let bytes_acked = Arc::new(AtomicU64::new(0));
         let scrollback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
         let total_bytes_produced = Arc::new(AtomicU64::new(0));
+        let grid = Arc::new(Mutex::new(Grid::new(cols, rows)));
         let (output_tx, _) = broadcast::channel::<String>(256);
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -191,9 +195,11 @@ impl TerminalSession {
         let reader_scrollback = scrollback_buffer.clone();
         let reader_total_bytes = total_bytes_produced.clone();
         let reader_output_tx = output_tx.clone();
+        let reader_grid = grid.clone();
         let reader_handle = thread::Builder::new()
             .name(format!("terminal-reader-{}", &id))
             .spawn(move || {
+                let mut parser = vte::Parser::new();
                 let mut buf = [0u8; 8192];
                 loop {
                     if !reader_alive.load(Ordering::Relaxed) {
@@ -227,6 +233,12 @@ impl TerminalSession {
                                 }
                             }
                             reader_total_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+
+                            // Tee through the VT parser into the per-session cell grid.
+                            if let Ok(mut g) = reader_grid.lock() {
+                                let mut perf = GridPerformer::new(&mut g);
+                                parser.advance(&mut perf, &data);
+                            }
 
                             let encoded = STANDARD.encode(&data);
                             // Broadcast to HTTP/SSE subscribers (ignore if no receivers)
@@ -353,6 +365,7 @@ impl TerminalSession {
             total_bytes_produced,
             created_at,
             output_tx,
+            grid,
         })
     }
 
@@ -439,6 +452,9 @@ impl TerminalSession {
             .map_err(|e| format!("Failed to resize PTY: {}", e))?;
         self.cols.store(cols, Ordering::Relaxed);
         self.rows.store(rows, Ordering::Relaxed);
+        if let Ok(mut g) = self.grid.lock() {
+            g.resize(cols, rows);
+        }
         Ok(())
     }
 
@@ -486,6 +502,11 @@ impl TerminalSession {
     /// Returns a receiver that yields base64-encoded output chunks.
     pub fn subscribe_output(&self) -> broadcast::Receiver<String> {
         self.output_tx.subscribe()
+    }
+
+    /// Clone the per-session grid handle so callers can snapshot or read text.
+    pub fn grid(&self) -> Arc<Mutex<Grid>> {
+        self.grid.clone()
     }
 
     /// Check if the shell process is still alive.

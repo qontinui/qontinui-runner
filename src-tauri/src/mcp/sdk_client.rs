@@ -4885,12 +4885,18 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Screenshot (monitor capture for SDK apps that can't self-screenshot)
         .route("/ui-bridge/sdk/screenshot", get(handle_screenshot))
-        // Terminal buffer readback — returns the rendered text of an
-        // xterm.js Terminal session, so callers can verify content of
+        // Terminal buffer readback — returns the rendered text rows from
+        // the server-side cell grid, so callers can verify content of
         // canvas-rendered terminals without taking a screenshot.
         .route(
             "/ui-bridge/sdk/terminal/sessions/{session_id}/buffer",
             get(crate::mcp::sdk_terminal_buffer::handle_terminal_buffer),
+        )
+        // Terminal grid snapshot — full cell-level state for callers that
+        // want fg/bg/attrs alongside the rendered text.
+        .route(
+            "/ui-bridge/sdk/terminal/sessions/{session_id}/grid",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_grid),
         )
         // Components
         .route("/ui-bridge/sdk/components", get(handle_components))
@@ -6313,8 +6319,8 @@ mod tests {
     // Per-app-id payload selection (Item A — `?app_id=` query param)
     // ------------------------------------------------------------------
 
-    use crate::mcp::app_registry::{AppRegistry, AppTransport};
     use crate::mcp::app_discovery::DiscoveredApp;
+    use crate::mcp::app_registry::{AppRegistry, AppTransport};
 
     fn sample_discovered(app_id: &str) -> DiscoveredApp {
         DiscoveredApp {

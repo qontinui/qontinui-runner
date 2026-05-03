@@ -36,7 +36,6 @@ import {
   UIBridgeEventHandler,
   UIBridgeInvokeHandler,
   UIBridgeEvaluateHandler,
-  TerminalBufferIpcHandler,
   SpecExecutionHandler,
 } from "./hooks";
 import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
@@ -811,7 +810,6 @@ export default function App() {
         <UIBridgeEventHandler />
         <UIBridgeInvokeHandler />
         <UIBridgeEvaluateHandler />
-        <TerminalBufferIpcHandler />
         <SpecExecutionHandler />
         <BundledSpecsLoader />
         <CtrAutoPopulator />

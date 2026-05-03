@@ -148,6 +148,41 @@ pub fn terminal_get_buffer(
     })
 }
 
+/// Get the server-side cell grid snapshot for a terminal session.
+///
+/// Returns the parsed `GridSnapshot` rather than raw scrollback bytes, so the
+/// frontend can paint the final visible state in one synchronous write.
+/// See `plans/terminal-grid-snapshot.md`.
+#[tauri::command]
+pub fn terminal_get_grid(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+
+    let grid_handle = session.grid();
+    let snapshot = {
+        let g = grid_handle
+            .lock()
+            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
+        g.snapshot()
+    };
+    let value = serde_json::to_value(&snapshot).map_err(|e| {
+        String::from(AppError::EncodingError(format!(
+            "Failed to serialize grid snapshot: {}",
+            e
+        )))
+    })?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(value),
+    })
+}
+
 /// Acknowledge bytes received by the frontend (flow control).
 #[tauri::command]
 pub fn terminal_ack(

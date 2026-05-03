@@ -135,7 +135,6 @@ mod storage;
 pub(crate) mod str_utils;
 mod summary_generator;
 mod terminal;
-mod terminal_buffer;
 mod test_executor;
 mod test_orchestrator;
 mod ticket_system;
@@ -1275,6 +1274,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_collect_session_metadata,
             commands::terminal::terminal_create,
             commands::terminal::terminal_get_buffer,
+            commands::terminal::terminal_get_grid,
             commands::terminal::terminal_get_saved_scrollback,
             commands::terminal::terminal_list,
             commands::terminal::terminal_resize,
