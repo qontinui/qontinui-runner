@@ -148,6 +148,16 @@ jobs:
           cd "$GITHUB_WORKSPACE/../qontinui-workflow-ui"
           npm install --no-audit --no-fund --no-save --legacy-peer-deps lucide-react
           echo "::endgroup::"
+          # ui-bridge upstream commit aecd63f (#5, 2026-05-03) removed dist/
+          # from git tracking in favor of a tag-triggered publish workflow.
+          # Cloned siblings no longer ship dist/, but the runner's
+          # eslint.config.js imports @qontinui/ui-bridge-eslint-plugin
+          # which expects dist/index.js. Build it in CI.
+          echo "::group::build ui-bridge-eslint-plugin (dist no longer in git)"
+          cd "$GITHUB_WORKSPACE/../ui-bridge/packages/ui-bridge-eslint-plugin"
+          npm install --no-audit --no-fund --legacy-peer-deps
+          npm run build
+          echo "::endgroup::"
 
       - name: Lint frontend code
         run: pnpm run lint
