@@ -36,12 +36,15 @@ jobs:
       #     qontinui-web/frontend/src/app at typecheck/build time. These are
       #     cross-repo file imports rather than npm deps, so the redesign
       #     doesn't migrate them.
-      # Both repos are public; no auth needed.
+      # qontinui-schemas is public; qontinui-web is private and lives under
+      # jspinak/, so cloning it needs CROSS_REPO_TOKEN (PAT with read access).
       - name: Checkout sibling repos
+        env:
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         run: |
           cd "$GITHUB_WORKSPACE/.."
           git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
-          git clone --depth 1 https://github.com/qontinui/qontinui-web.git
+          git clone --depth 1 "https://x-access-token:${CROSS_REPO_TOKEN}@github.com/jspinak/qontinui-web.git"
         shell: bash
 
       - name: Setup pnpm
