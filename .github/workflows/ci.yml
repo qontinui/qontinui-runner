@@ -143,10 +143,14 @@ jobs:
           # --legacy-peer-deps above skipped peer-dep install. lucide-react
           # is workflow-ui's only peer that isn't satisfied by its dev/regular
           # deps and that the runner actually exercises during build, so
-          # install it explicitly.
+          # install it explicitly. Note: --no-save + --legacy-peer-deps
+          # together caused npm to no-op (it saw lucide-react in
+          # peerDependencies and considered the request "satisfied"
+          # without actually placing the package in node_modules), so we
+          # drop both. workflow-ui has no peer-dep conflicts of its own.
           echo "::group::install lucide-react in qontinui-workflow-ui (peer dep)"
           cd "$GITHUB_WORKSPACE/../qontinui-workflow-ui"
-          npm install --no-audit --no-fund --no-save --legacy-peer-deps lucide-react
+          npm install --no-audit --no-fund lucide-react
           echo "::endgroup::"
           # ui-bridge upstream commit aecd63f (#5, 2026-05-03) removed dist/
           # from git tracking in favor of a tag-triggered publish workflow.
@@ -158,8 +162,18 @@ jobs:
           # so workspace deps + hoisted toolchain (typescript, tsup) all
           # land in ui-bridge/node_modules where the package's build can
           # find them. Then build just the eslint-plugin package.
+          #
+          # rm package-lock.json before install: works around npm/cli#4828
+          # where `npm install` from a lockfile generated on platform A
+          # silently drops platform B's optional native binaries (rollup
+          # native bins in this case). On macOS arm64 / Linux x64 the
+          # eslint-plugin build then crashes with "Cannot find module
+          # @rollup/rollup-darwin-arm64". Removing the lockfile forces
+          # npm to resolve fresh and pick up the current platform's
+          # optionalDependencies.
           echo "::group::build ui-bridge-eslint-plugin (dist no longer in git)"
           cd "$GITHUB_WORKSPACE/../ui-bridge"
+          rm -f package-lock.json
           npm install --no-audit --no-fund --legacy-peer-deps --ignore-scripts
           npm run build --workspace=@qontinui/ui-bridge-eslint-plugin
           echo "::endgroup::"
