@@ -38,6 +38,8 @@ use super::super::traits::{
 /// Opaque handle to an AXUIElement. This is a CFTypeRef under the hood.
 type AXUIElementRef = *const c_void;
 type AXError = i32;
+// Mirrors libc's `pid_t` to match the AX FFI signature; intentional snake_case.
+#[allow(non_camel_case_types)]
 type pid_t = i32;
 
 const AX_ERROR_SUCCESS: AXError = 0;
@@ -188,7 +190,7 @@ fn ax_string_attr(element: AXUIElementRef, attr_name: &str) -> Option<String> {
     // value is a CFStringRef — attempt to downcast
     let cf_type: CFType = unsafe { TCFType::wrap_under_create_rule(value) };
     // Try to interpret as CFString
-    if cf_type.type_of() == unsafe { core_foundation::string::CFString::type_id() } {
+    if cf_type.type_of() == core_foundation::string::CFString::type_id() {
         let s: CFString = unsafe { TCFType::wrap_under_get_rule(value as CFStringRef) };
         Some(s.to_string())
     } else {
@@ -307,7 +309,10 @@ fn ax_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
     let count = array.len();
     let mut children = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let child = unsafe { *array.get(i) };
+        // core-foundation 0.10: CFArray::get returns Option<ItemRef<'_, T>>; deref ItemRef to recover T.
+        let Some(child) = array.get(i).map(|r| *r) else {
+            continue;
+        };
         if !child.is_null() {
             // Retain so that the child outlives the parent array
             unsafe { CFRetain(child as CFTypeRef) };
@@ -538,7 +543,10 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
     let title_lower = title.to_lowercase();
 
     for i in 0..array.len() {
-        let dict_ref = unsafe { *array.get(i) };
+        // core-foundation 0.10: CFArray::get returns Option<ItemRef<'_, T>>; deref ItemRef to recover T.
+        let Some(dict_ref) = array.get(i).map(|r| *r) else {
+            continue;
+        };
         if dict_ref.is_null() {
             continue;
         }
@@ -547,15 +555,17 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
         let pid_key = CFString::new("kCGWindowOwnerPID");
         let name_key = CFString::new("kCGWindowName");
 
-        let pid_val = unsafe {
+        // Explicit K/V annotation: without it, the find() + map(|r| *r) chain below leaves V
+        // ambiguous in core-foundation 0.10 (E0282).
+        let pid_val: core_foundation::dictionary::CFDictionary<*const c_void, *const c_void> = unsafe {
             core_foundation::dictionary::CFDictionary::wrap_under_get_rule(dict_ref as *const _)
         };
 
-        // Use find() on the dictionary
-        let maybe_pid = pid_val.find(pid_key.as_CFTypeRef());
-        let maybe_name = pid_val.find(name_key.as_CFTypeRef());
+        // core-foundation 0.10: CFDictionary::find returns Option<ItemRef<'_, V>>; collapse to inner pointer.
+        let maybe_pid = pid_val.find(pid_key.as_CFTypeRef()).map(|r| *r);
+        let maybe_name = pid_val.find(name_key.as_CFTypeRef()).map(|r| *r);
 
-        if let (Some(&pid_ref), Some(&name_ref)) = (maybe_pid, maybe_name) {
+        if let (Some(pid_ref), Some(name_ref)) = (maybe_pid, maybe_name) {
             // Extract window name
             if name_ref.is_null() {
                 continue;
@@ -592,7 +602,10 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
                         unsafe { CFArray::wrap_under_create_rule(windows_val as *const _) };
 
                     for j in 0..windows.len() {
-                        let win = unsafe { *windows.get(j) };
+                        // core-foundation 0.10: CFArray::get returns Option<ItemRef<'_, T>>; deref ItemRef to recover T.
+                        let Some(win) = windows.get(j).map(|r| *r) else {
+                            continue;
+                        };
                         if win.is_null() {
                             continue;
                         }
