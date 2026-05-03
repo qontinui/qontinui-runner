@@ -66,6 +66,7 @@ mod iteration_bundle;
 mod job_object;
 mod knowledge_acquisition;
 mod known_issues;
+mod launch_env;
 mod log_consolidation;
 mod logging;
 mod macros;
@@ -221,6 +222,12 @@ fn main() {
 }
 
 fn run_app() -> Result<(), Box<dyn std::error::Error>> {
+    // Read every QONTINUI_* / WEBVIEW2_* env var that influences startup
+    // exactly once. All downstream code reads from this snapshot via the
+    // Tauri-managed `Arc<RunnerLaunchEnv>` instead of re-parsing env vars.
+    // See `launch_env.rs` for the full list and rationale.
+    let launch_env: launch_env::SharedLaunchEnv = Arc::new(launch_env::RunnerLaunchEnv::read());
+
     // Read persisted OTel settings so the tracing pipeline uses saved config
     let otel_config = crate::settings::get_otel_settings();
     let logging_result = init_logging(LoggingConfig {
@@ -383,9 +390,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // via the Settings UI; a headless deploy can set
     // `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN` and get the same
     // behavior without touching settings.
-    let server_mode_is_on = std::env::var("QONTINUI_SERVER_MODE")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
+    let server_mode_is_on = launch_env.server_mode;
     let web_integration_settings = crate::settings::load_settings().web_integration.clone();
     let initial_server_mode_state: Option<crate::server_mode::ServerModeState> =
         crate::server_mode::ServerModeConfig::from_settings(&web_integration_settings).map(|cfg| {
@@ -1389,6 +1394,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::worktrees::merge_worktree_force
         ])
         .manage(shared_app_state)
+        .manage(launch_env.clone()) // Item 3: typed startup env snapshot, read once in run_app()
         .manage(bridge_compartment)
         .manage(execution_compartment)
         .manage(integration_compartment)
@@ -1433,9 +1439,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            let server_mode = std::env::var("QONTINUI_SERVER_MODE")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false);
+            // Pull the typed startup-env snapshot (managed onto state above)
+            // so this closure can read launch env vars without re-parsing.
+            let setup_launch_env: tauri::State<launch_env::SharedLaunchEnv> = app.state();
+            let setup_launch_env = setup_launch_env.inner().clone();
+
+            let server_mode = setup_launch_env.server_mode;
             if server_mode {
                 info!("QONTINUI_SERVER_MODE is set - running as headless server (no window, Restate forced on)");
             }
@@ -1458,7 +1467,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             {
                 use tauri::Manager;
 
-                let data_dir = std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok();
+                let data_dir: Option<String> = setup_launch_env
+                    .webview2_user_data_dir
+                    .as_ref()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()));
                 let is_secondary = instance::is_secondary();
 
                 if let Some(ref dir) = data_dir {
@@ -1479,29 +1491,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // to a hidden 0x0 tool window here. See plan Phase 1.5 validation.
                 } else {
                     let url = tauri::WebviewUrl::App("index.html".into());
-                    let env_pos = {
-                        let x = std::env::var("QONTINUI_WINDOW_X")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        let y = std::env::var("QONTINUI_WINDOW_Y")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        match (x, y) {
-                            (Some(x), Some(y)) => Some((x, y)),
-                            _ => None,
-                        }
+                    let window_hints = &setup_launch_env.window;
+                    let env_pos = match (window_hints.x, window_hints.y) {
+                        (Some(x), Some(y)) => Some((x as f64, y as f64)),
+                        _ => None,
                     };
-                    let env_size = {
-                        let w = std::env::var("QONTINUI_WINDOW_WIDTH")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        let h = std::env::var("QONTINUI_WINDOW_HEIGHT")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        match (w, h) {
-                            (Some(w), Some(h)) => Some((w, h)),
-                            _ => None,
-                        }
+                    let env_size = match (window_hints.width, window_hints.height) {
+                        (Some(w), Some(h)) => Some((w as f64, h as f64)),
+                        _ => None,
                     };
                     let initial_size = env_size.unwrap_or((1400.0, 800.0));
                     // QONTINUI_WINDOW_DECORATIONS=0 forces a borderless
@@ -1509,9 +1506,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // Borderless lets a placement land flush with the
                     // monitor's edge — the few-pixel right-of-edge inset
                     // people see with chrome on is the OS window border.
-                    let env_decorations = std::env::var("QONTINUI_WINDOW_DECORATIONS")
-                        .ok()
-                        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")));
+                    let env_decorations = window_hints.decorations;
 
                     let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
                         .title("Qontinui Runner")

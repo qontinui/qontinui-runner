@@ -653,7 +653,7 @@ pub async fn get_status(
         .unwrap_or_default()
         .is_empty();
 
-    let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+    let instance_name = crate::instance::instance_name();
     let api_port = state
         .app_state
         .api_port
@@ -699,7 +699,7 @@ pub async fn get_instances(
         .app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
-    let self_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+    let self_name = crate::instance::instance_name();
 
     let mut instances = vec![DiscoveredInstance {
         name: self_name,
@@ -1849,9 +1849,7 @@ async fn list_runners(State(state): State<Arc<ApiState>>) -> Json<serde_json::Va
         .app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
-    let self_name = std::env::var("QONTINUI_INSTANCE_NAME")
-        .ok()
-        .unwrap_or_else(|| "primary".to_string());
+    let self_name = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
     let is_primary = !crate::instance::is_secondary();
 
     let mut runners = Vec::new();

@@ -257,7 +257,7 @@ pub async fn get_runner_identity(
     health: State<'_, HealthCompartment>,
 ) -> Result<serde_json::Value, String> {
     let is_secondary = crate::process_capture::primary_proxy::is_secondary();
-    let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+    let instance_name = crate::instance::instance_name();
     let primary_port = crate::process_capture::primary_proxy::primary_port();
     let own_port = health.api_port().load(std::sync::atomic::Ordering::Relaxed);
 
