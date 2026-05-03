@@ -73,7 +73,7 @@ pub struct DiscoveryResult {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegisterAppRequest {
     pub app_id: String,
     pub app_name: String,
@@ -788,10 +788,7 @@ async fn register_app(
     let keep_alive_ms: Option<i64> = match validate_keep_alive_secs(req.keep_alive_secs) {
         Ok(v) => v,
         Err(msg) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::error(msg)),
-            ));
+            return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(msg))));
         }
     };
 
@@ -909,6 +906,13 @@ pub struct WaitForAppResponse {
     pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timed_out: Option<bool>,
+    /// The matched registry entry. Populated when `satisfied: true` AND
+    /// `present: true` — the app the caller was waiting for is now visible
+    /// and they typically want to act on its `transport`/`url` immediately.
+    /// Omitted on disappearance waits (`present: false`) since there is no
+    /// entry to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<RegisterAppResponse>,
 }
 
 /// Validate the request and run the polling loop. Extracted so tests can
@@ -961,13 +965,29 @@ pub(crate) async fn wait_for_app_inner(
         }
     };
 
+    // Build the matched-app payload only on present:true satisfactions —
+    // disappearance waits have no entry to surface.
+    let pick_app = |live: &[crate::mcp::app_registry::RegisteredApp]| -> Option<RegisterAppResponse> {
+        if !req.present {
+            return None;
+        }
+        live.iter()
+            .find(|e| e.app.app_id == req.app_id)
+            .map(|e| RegisterAppResponse {
+                app: e.app.clone(),
+                transport: e.transport,
+            })
+    };
+
     loop {
         let live = registry.list_live().await;
         if evaluate(&live) {
+            let app = pick_app(&live);
             return Ok(WaitForAppResponse {
                 satisfied: true,
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 timed_out: None,
+                app,
             });
         }
 
@@ -980,16 +1000,19 @@ pub(crate) async fn wait_for_app_inner(
             tokio::time::sleep(deadline.saturating_duration_since(now)).await;
             let live = registry.list_live().await;
             if evaluate(&live) {
+                let app = pick_app(&live);
                 return Ok(WaitForAppResponse {
                     satisfied: true,
                     elapsed_ms: start.elapsed().as_millis() as u64,
                     timed_out: None,
+                    app,
                 });
             }
             return Ok(WaitForAppResponse {
                 satisfied: false,
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 timed_out: Some(true),
+                app: None,
             });
         }
 
@@ -1472,8 +1495,7 @@ mod tests {
             action: "anything".into(),
             params: serde_json::json!({}),
         };
-        let (status, body) =
-            dispatch_to_app_inner(&registry, &dispatcher, "ghost-app", &req).await;
+        let (status, body) = dispatch_to_app_inner(&registry, &dispatcher, "ghost-app", &req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body.success, false);
         assert_eq!(body.error.as_deref(), Some("app not registered"));
@@ -1560,24 +1582,22 @@ mod tests {
         let hits_for_handler = hits.clone();
         let app = Router::new().route(
             "/dispatch",
-            post(
-                move |req: axum::extract::Request<axum::body::Body>| {
-                    let body_slot = body_for_handler.clone();
-                    let path_slot = path_for_handler.clone();
-                    let hits = hits_for_handler.clone();
-                    async move {
-                        hits.fetch_add(1, Ordering::SeqCst);
-                        *path_slot.lock().await = req.uri().path().to_string();
-                        let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
-                            .await
-                            .unwrap_or_default();
-                        let parsed: serde_json::Value =
-                            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-                        *body_slot.lock().await = parsed;
-                        Json(serde_json::json!({"echoed": true}))
-                    }
-                },
-            ),
+            post(move |req: axum::extract::Request<axum::body::Body>| {
+                let body_slot = body_for_handler.clone();
+                let path_slot = path_for_handler.clone();
+                let hits = hits_for_handler.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *path_slot.lock().await = req.uri().path().to_string();
+                    let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    let parsed: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                    *body_slot.lock().await = parsed;
+                    Json(serde_json::json!({"echoed": true}))
+                }
+            }),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1603,8 +1623,7 @@ mod tests {
             action: "doThing".into(),
             params: serde_json::json!({"alpha": 42}),
         };
-        let (status, body) =
-            dispatch_to_app_inner(&registry, &dispatcher, "happ", &req).await;
+        let (status, body) = dispatch_to_app_inner(&registry, &dispatcher, "happ", &req).await;
 
         assert_eq!(status, StatusCode::OK);
         assert!(body.success);
