@@ -252,3 +252,13 @@ tempfile = "3"
 [profile.dev]
 debug = 0  # No debug info — prevents LLVM OOM during linking
 split-debuginfo = "packed"
+
+# Tests inherit from dev by default but cargo test forces `debuginfo=2`
+# unless explicitly overridden. On Windows CI the test binary's link
+# step crashes with STATUS_ILLEGAL_INSTRUCTION (0xc000001d) at the
+# final link of qontinui_runner — almost certainly link.exe OOM
+# under the combined size of debug info across ~100 dependency rlibs.
+# Mirror the dev profile's debug=0.
+[profile.test]
+debug = 0
+split-debuginfo = "packed"
