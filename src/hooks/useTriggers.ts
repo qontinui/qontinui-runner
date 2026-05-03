@@ -279,8 +279,16 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
 
-    listen<{ task_run_id: string; status: string }>("task-run-update", (event) => {
-      const { status: taskStatus } = event.payload;
+    // Wire shape: AppEvent::TaskRunUpdate is serialized via
+    //   #[serde(tag = "event_type", content = "data")]
+    // so the payload looks like
+    //   { event_type: "TaskRunUpdate", data: { task_run_id, status, iteration, details, timestamp } }
+    // Reading `event.payload.status` directly silently evaluates to undefined.
+    listen<{
+      event_type: "TaskRunUpdate";
+      data: { task_run_id: string; status: string };
+    }>("task-run-update", (event) => {
+      const taskStatus = event.payload.data?.status;
       // Refresh triggers when a task run completes/fails (could update trigger_count, last_triggered_at)
       if (taskStatus === "completed" || taskStatus === "failed") {
         refreshRef.current();

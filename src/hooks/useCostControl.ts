@@ -99,24 +99,41 @@ export function useCostControl() {
     }, 300);
   }, [queryClient]);
 
-  // Listen for Tauri events
+  // Listen for Tauri events.
+  //
+  // Wire shape: cost-update / budget-warning / cost-anomaly are emitted via
+  // `EventBroadcaster::cost_update()` etc., which serialize an `AppEvent`
+  // tagged with `#[serde(tag = "event_type", content = "data")]`. The wire
+  // payload therefore looks like `{ event_type: "CostUpdate", data: {…} }`.
+  // The downstream `CostUpdateEvent` / `BudgetWarningEvent` / `CostAnomalyEvent`
+  // types are flat snake_case (matching the inner `data` object), so we unwrap
+  // the envelope here before storing.
   useEffect(() => {
     const unlisteners: (() => void)[] = [];
 
-    listen<CostUpdateEvent>("cost-update", (event) => {
+    listen<{ event_type: "CostUpdate"; data: CostUpdateEvent }>("cost-update", (event) => {
+      const inner = event.payload?.data;
+      if (!inner) return;
       setCostEvents((prev) => {
-        const next = [event.payload, ...prev];
+        const next = [inner, ...prev];
         return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
       });
       scheduleInvalidation();
     }).then((unlisten) => unlisteners.push(unlisten));
 
-    listen<BudgetWarningEvent>("budget-warning", (event) => {
-      setBudgetWarnings((prev) => [event.payload, ...prev]);
-    }).then((unlisten) => unlisteners.push(unlisten));
+    listen<{ event_type: "BudgetWarning"; data: BudgetWarningEvent }>(
+      "budget-warning",
+      (event) => {
+        const inner = event.payload?.data;
+        if (!inner) return;
+        setBudgetWarnings((prev) => [inner, ...prev]);
+      },
+    ).then((unlisten) => unlisteners.push(unlisten));
 
-    listen<CostAnomalyEvent>("cost-anomaly", (event) => {
-      setAnomalies((prev) => [event.payload, ...prev]);
+    listen<{ event_type: "CostAnomaly"; data: CostAnomalyEvent }>("cost-anomaly", (event) => {
+      const inner = event.payload?.data;
+      if (!inner) return;
+      setAnomalies((prev) => [inner, ...prev]);
     }).then((unlisten) => unlisteners.push(unlisten));
 
     return () => {
