@@ -144,6 +144,18 @@ export async function loadDiscoveredSpecs(): Promise<DiscoveredSpec[]> {
   return promise;
 }
 
+/**
+ * Single-spec async accessor for non-React contexts. Reuses the
+ * module-singleton cache via `loadDiscoveredSpecs()`. Resolves to `null`
+ * if no spec with the given id is loaded.
+ */
+export async function loadDiscoveredSpec(
+  id: string
+): Promise<DiscoveredSpec | null> {
+  const specs = await loadDiscoveredSpecs();
+  return specs.find((s) => s.specId === id) ?? null;
+}
+
 // =============================================================================
 // React hook
 // =============================================================================
@@ -193,4 +205,35 @@ export function useDiscoveredSpecs(): UseDiscoveredSpecsResult {
     error: lastError,
     refresh,
   };
+}
+
+/**
+ * Single-spec React hook. Subscribes to the same module-scoped cache
+ * used by `useDiscoveredSpecs`, so it re-renders on cache updates and
+ * SSE-driven `spec.changed` invalidations. Returns `null` while loading
+ * or if the id is not present in the cache.
+ */
+export function useDiscoveredSpec(id: string): DiscoveredSpec | null {
+  const [, setVersion] = useState(0);
+
+  useEffect(() => {
+    const bump = () => setVersion((v) => v + 1);
+    subscribers.add(bump);
+
+    // Trigger the load on first mount. Errors are captured into the
+    // module-scoped `lastError` state and surfaced via the subscriber
+    // bump — no need to handle here.
+    if (cachedSpecs === null && inFlight === null) {
+      void loadDiscoveredSpecs().catch(() => {
+        // Already handled by the loader; the bump will surface the error.
+      });
+    }
+
+    return () => {
+      subscribers.delete(bump);
+    };
+  }, []);
+
+  if (cachedSpecs === null) return null;
+  return cachedSpecs.find((s) => s.specId === id) ?? null;
 }

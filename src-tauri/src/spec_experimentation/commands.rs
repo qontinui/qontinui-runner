@@ -129,14 +129,18 @@ pub fn analyze_spec_freshness(
     specs_dir: String,
     components_dir: String,
 ) -> Result<Vec<(String, accuracy::FreshnessResult)>, String> {
-    let specs_path = std::path::Path::new(&specs_dir);
+    // `specs_dir` is retained for backwards compatibility with the frontend
+    // call site but ignored — page projections now live under the Spec API
+    // storage root (`<runner>/specs/pages/<id>/`), which `analyze_all_freshness`
+    // resolves via `crate::spec_api::storage::resolve_specs_root`.
+    let _ = specs_dir;
     let components_path = std::path::Path::new(&components_dir);
 
-    if !specs_path.exists() {
-        return Err(format!("Specs directory not found: {}", specs_dir));
-    }
-
-    Ok(accuracy::analyze_all_freshness(specs_path, components_path))
+    let specs_root = crate::spec_api::storage::resolve_specs_root();
+    Ok(accuracy::analyze_all_freshness(
+        &specs_root,
+        components_path,
+    ))
 }
 
 #[tauri::command]

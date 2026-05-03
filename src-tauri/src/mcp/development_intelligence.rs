@@ -191,35 +191,34 @@ struct SpecAssertion {
     enabled: Option<bool>,
 }
 
-fn load_specs(project_path: &Path) -> Vec<SpecFile> {
-    let spec_dir = project_path.join("src").join("specs");
-    if !spec_dir.exists() {
-        warn!("Specs directory not found: {:?}", spec_dir);
-        return vec![];
-    }
+fn load_specs(_project_path: &Path) -> Vec<SpecFile> {
+    let specs_root = crate::spec_api::storage::resolve_specs_root();
+    let page_ids = match crate::spec_api::storage::list_pages(&specs_root) {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!("Failed to list pages under {:?}: {}", specs_root, e);
+            return vec![];
+        }
+    };
 
     let mut specs = vec![];
-    if let Ok(entries) = std::fs::read_dir(&spec_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .map(|f| f.ends_with(".spec.uibridge.json"))
-                .unwrap_or(false)
-            {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => match serde_json::from_str::<SpecFile>(&content) {
-                        Ok(spec) => specs.push(spec),
-                        Err(e) => warn!("Failed to parse spec {:?}: {}", path, e),
-                    },
-                    Err(e) => warn!("Failed to read spec {:?}: {}", path, e),
-                }
-            }
+    for page_id in &page_ids {
+        match crate::spec_api::storage::read_projection(&specs_root, page_id) {
+            Ok(Some(value)) => match serde_json::from_value::<SpecFile>(value) {
+                Ok(spec) => specs.push(spec),
+                Err(e) => warn!("Failed to parse spec for page {}: {}", page_id, e),
+            },
+            Ok(None) => {}
+            Err(e) => warn!("Failed to read projection for page {}: {}", page_id, e),
         }
     }
 
-    info!("Loaded {} spec files from {:?}", specs.len(), spec_dir);
+    info!(
+        "Loaded {} spec files from {} pages under {:?}",
+        specs.len(),
+        page_ids.len(),
+        specs_root,
+    );
     specs
 }
 
@@ -731,8 +730,9 @@ pub async fn feature_health(
                 let route = spec.metadata.page_url.as_deref().unwrap_or("/").to_string();
                 let component = spec.metadata.component.as_deref().unwrap_or("").to_string();
 
-                // Get spec file path
-                let spec_file = format!("src/specs/{}.spec.uibridge.json", page_id);
+                // Spec file path within the runner repo, used for git history lookup.
+                // Reflects the Spec API storage layout under <runner>/specs/pages/.
+                let spec_file = format!("specs/pages/{}/spec.uibridge.json", page_id);
 
                 // Component path (best guess)
                 let component_path = format!("src/components/{}", page_id);

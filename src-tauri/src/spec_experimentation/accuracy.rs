@@ -505,35 +505,37 @@ pub fn analyze_freshness(spec_file_path: &Path, component_paths: &[PathBuf]) -> 
 }
 
 /// Analyze freshness for all spec files.
+///
+/// `specs_root` is the Spec API storage root (e.g. `<runner>/specs/`); page
+/// projections live at `<specs_root>/pages/<id>/spec.uibridge.json`.
 pub fn analyze_all_freshness(
-    specs_dir: &Path,
+    specs_root: &Path,
     components_dir: &Path,
 ) -> Vec<(String, FreshnessResult)> {
     let mut results = Vec::new();
 
-    // Find all spec files
-    if let Ok(entries) = std::fs::read_dir(specs_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with(".spec.uibridge.json"))
-                .unwrap_or(false)
-            {
-                let spec_name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .replace(".spec.uibridge", "");
+    let page_ids = match crate::spec_api::storage::list_pages(specs_root) {
+        Ok(ids) => ids,
+        Err(_) => return results,
+    };
 
-                // Heuristically find component files
-                let component_paths = find_component_files(&spec_name, components_dir);
-
-                let result = analyze_freshness(&path, &component_paths);
-                results.push((spec_name, result));
-            }
+    for page_id in page_ids {
+        let projection_path = specs_root
+            .join("pages")
+            .join(&page_id)
+            .join("spec.uibridge.json");
+        if !projection_path.exists() {
+            // Page exists only in the embedded snapshot — no on-disk mtime to
+            // compare against, so skip it for freshness analysis.
+            continue;
         }
+
+        // Heuristically find component files using the page id (same convention
+        // as the legacy filename without the `.spec.uibridge` suffix).
+        let component_paths = find_component_files(&page_id, components_dir);
+
+        let result = analyze_freshness(&projection_path, &component_paths);
+        results.push((page_id, result));
     }
 
     results
