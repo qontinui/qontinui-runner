@@ -38,6 +38,8 @@ use super::super::traits::{
 /// Opaque handle to an AXUIElement. This is a CFTypeRef under the hood.
 type AXUIElementRef = *const c_void;
 type AXError = i32;
+// Mirrors libc's `pid_t` to match the AX FFI signature; intentional snake_case.
+#[allow(non_camel_case_types)]
 type pid_t = i32;
 
 const AX_ERROR_SUCCESS: AXError = 0;
@@ -188,7 +190,7 @@ fn ax_string_attr(element: AXUIElementRef, attr_name: &str) -> Option<String> {
     // value is a CFStringRef — attempt to downcast
     let cf_type: CFType = unsafe { TCFType::wrap_under_create_rule(value) };
     // Try to interpret as CFString
-    if cf_type.type_of() == unsafe { core_foundation::string::CFString::type_id() } {
+    if cf_type.type_of() == core_foundation::string::CFString::type_id() {
         let s: CFString = unsafe { TCFType::wrap_under_get_rule(value as CFStringRef) };
         Some(s.to_string())
     } else {
@@ -553,7 +555,9 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
         let pid_key = CFString::new("kCGWindowOwnerPID");
         let name_key = CFString::new("kCGWindowName");
 
-        let pid_val = unsafe {
+        // Explicit K/V annotation: without it, the find() + map(|r| *r) chain below leaves V
+        // ambiguous in core-foundation 0.10 (E0282).
+        let pid_val: core_foundation::dictionary::CFDictionary<*const c_void, *const c_void> = unsafe {
             core_foundation::dictionary::CFDictionary::wrap_under_get_rule(dict_ref as *const _)
         };
 
