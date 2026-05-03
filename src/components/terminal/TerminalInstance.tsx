@@ -50,13 +50,13 @@ interface TerminalInstanceProps {
 }
 
 interface TerminalOutputEvent {
-  terminal_id: string;
+  terminalId: string;
   data: string; // base64
 }
 
 interface TerminalExitEvent {
-  terminal_id: string;
-  exit_code: number | null;
+  terminalId: string;
+  exitCode: number | null;
 }
 
 /** Encode a Uint8Array to base64 without stack overflow on large buffers. */
@@ -218,6 +218,63 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       // quiet for IDLE_REPAINT_MS we re-fetch the Rust grid and overlay
       // it via paintGrid so xterm and the grid stay in sync.
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      // Bytes received before the backend finishes async init. Tauri does
+      // NOT queue events before listen() resolves, and createTerminalBackend
+      // (WASM load + open + key handlers + UI Bridge registration) takes
+      // ~200ms; without this buffer we'd silently drop everything Claude
+      // emits in that window and xterm would freeze on whatever the grid
+      // contained at bootstrap snapshot time.
+      let pendingBytes: Uint8Array[] = [];
+      let backendReady = false;
+      // Assigned once the backend exists (see Bug A note above). Until then
+      // the listener buffers bytes; we can't schedule a repaint that needs
+      // the backend.
+      let scheduleIdleRepaint: (() => void) | null = null;
+
+      // Attach the live `terminal-output` listener IMMEDIATELY — before any
+      // awaits — so we don't lose bytes during the backend's async init.
+      // Bytes arriving before backendReady are buffered into pendingBytes
+      // and drained once the backend is ready.
+      (async () => {
+        const unsub = await listen<TerminalOutputEvent>("terminal-output", (event) => {
+          if (event.payload.terminalId !== terminalId) return;
+          const raw = atob(event.payload.data);
+          const bytes = new Uint8Array(raw.length);
+          for (let i = 0; i < raw.length; i++) {
+            bytes[i] = raw.charCodeAt(i);
+          }
+
+          if (!backendReady) {
+            // Backend not yet created — buffer the bytes; they'll be drained
+            // (and the idle timer primed) once the backend init completes.
+            pendingBytes.push(bytes);
+            return;
+          }
+
+          const b = backendRef.current;
+          if (!b) return;
+          try {
+            b.write(bytes);
+          } catch (e) {
+            console.error(`[Terminal ${terminalId}] write error:`, e);
+          }
+          if (onOutputRef.current) {
+            try {
+              const text = outputDecoderRef.current.decode(bytes, { stream: true });
+              onOutputRef.current(text);
+            } catch {
+              /* ignore decode errors */
+            }
+          }
+          bytesReceivedRef.current += bytes.length;
+          scheduleIdleRepaint?.();
+        });
+        if (disposed) {
+          unsub();
+          return;
+        }
+        outputUnsub = unsub;
+      })();
 
       // Async init because backend creation may require WASM loading
       (async () => {
@@ -417,22 +474,36 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         );
 
         // Layer 2 bootstrap (live-first):
-        //   1. Attach the live `terminal-output` listener IMMEDIATELY. Bytes
-        //      go straight to xterm — no gate, no queue. Anything that
-        //      arrives before this attach is dropped by Tauri (events
-        //      aren't queued before listen() resolves) but lives in the
-        //      Rust grid; paintGrid below fills the gap.
-        //   2. Every received byte resets a 200ms idle timer. On idle we
-        //      re-fetch the grid and paint — Claude's TUI repaints always
-        //      end with [?2026l + silence, so paint-on-idle reconciles
-        //      any divergence accumulated during the previous burst.
-        //   3. After one rAF (canvas composited), fit + terminal_resize +
-        //      brief 50ms wait for SIGWINCH, then fetch the GridSnapshot
-        //      and paintGrid. paintGrid uses absolute CUP per row inside
-        //      a DECAWM-off bracket — safe to write concurrently with
-        //      live bytes.
+        //   1. The live `terminal-output` listener was attached at the very
+        //      top of this effect, BEFORE createTerminalBackend. Bytes that
+        //      arrived during async init were buffered into pendingBytes —
+        //      drain them here now that the backend exists.
+        //   2. Every received byte resets a 200ms idle timer (defined
+        //      below). On idle we re-fetch the grid and paint — Claude's
+        //      TUI repaints always end with [?2026l + silence, so paint-
+        //      on-idle reconciles divergence accumulated during the burst.
+        //   3. After waiting for the container to have non-zero dims, fit
+        //      + terminal_resize + brief 50ms wait for SIGWINCH, then
+        //      fetch the GridSnapshot and paintGrid. paintGrid uses
+        //      absolute CUP per row inside a DECAWM-off bracket — safe to
+        //      write concurrently with live bytes.
+        for (const buffered of pendingBytes) {
+          try {
+            backend.write(buffered);
+          } catch (e) {
+            console.error(`[Terminal ${terminalId}] drain write error:`, e);
+          }
+          bytesReceivedRef.current += buffered.length;
+        }
+        pendingBytes = [];
+        backendReady = true;
+
+        // Define the idle repaint scheduler now that the backend exists.
+        // The early-attached listener has been writing into pendingBytes
+        // and reading scheduleIdleRepaint via closure — we wire the
+        // implementation here.
         const IDLE_REPAINT_MS = 200;
-        const scheduleIdleRepaint = () => {
+        scheduleIdleRepaint = () => {
           if (idleTimer) clearTimeout(idleTimer);
           idleTimer = setTimeout(async () => {
             if (disposed) return;
@@ -451,46 +522,65 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           }, IDLE_REPAINT_MS);
         };
 
-        const unsub = await listen<TerminalOutputEvent>("terminal-output", (event) => {
-          if (event.payload.terminal_id !== terminalId) return;
-          const raw = atob(event.payload.data);
-          const bytes = new Uint8Array(raw.length);
-          for (let i = 0; i < raw.length; i++) {
-            bytes[i] = raw.charCodeAt(i);
-          }
-
-          try {
-            backend.write(bytes);
-          } catch (e) {
-            console.error(`[Terminal ${terminalId}] write error:`, e);
-          }
-          if (onOutputRef.current) {
-            try {
-              const text = outputDecoderRef.current.decode(bytes, { stream: true });
-              onOutputRef.current(text);
-            } catch {
-              /* ignore decode errors */
-            }
-          }
-          bytesReceivedRef.current += bytes.length;
-          scheduleIdleRepaint();
-        });
-        outputUnsub = unsub;
-        if (disposed) return;
+        // Wait for the container to have non-zero dimensions before
+        // fitting. On fast initial mount the layout is already done; on
+        // slow mount (off-screen tab, second pane in a not-yet-laid-out
+        // grid) we need to wait. Without this guard, fitAddon computes
+        // ~10x5 from a 0x0 box and the subsequent terminal_resize
+        // SIGWINCHes Claude into a 10x5 redraw — the Rust grid is then
+        // destructively resized and stays at 10x5 forever.
+        const waitForLayout = async (): Promise<boolean> => {
+          const c = containerRef.current;
+          if (!c) return false;
+          if (c.clientWidth > 0 && c.clientHeight > 0) return true;
+          return new Promise<boolean>((resolve) => {
+            const ro = new ResizeObserver(() => {
+              if (disposed) {
+                ro.disconnect();
+                resolve(false);
+                return;
+              }
+              const cc = containerRef.current;
+              if (cc && cc.clientWidth > 0 && cc.clientHeight > 0) {
+                ro.disconnect();
+                resolve(true);
+              }
+            });
+            ro.observe(c);
+            // Safety timeout — give up after 1s and try anyway.
+            setTimeout(() => {
+              ro.disconnect();
+              resolve(true);
+            }, 1000);
+          });
+        };
 
         // Wait one paint frame so backend.cols/rows are valid after open().
         await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
         if (disposed) return;
+        const laidOut = await waitForLayout();
+        if (disposed) return;
 
         try {
-          backend.fit();
-          await invoke("terminal_resize", {
-            terminalId,
-            cols: backend.cols,
-            rows: backend.rows,
-          });
-          // Brief wait for SIGWINCH to propagate to the child process.
-          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+          if (laidOut) {
+            backend.fit();
+            // Sanity check: refuse to ship a tiny resize that would wipe
+            // the grid. Claude's TUI requires a non-trivial viewport;
+            // anything below this is almost certainly a measurement error.
+            if (backend.cols >= 20 && backend.rows >= 5) {
+              await invoke("terminal_resize", {
+                terminalId,
+                cols: backend.cols,
+                rows: backend.rows,
+              });
+              // Brief wait for SIGWINCH to propagate to the child process.
+              await new Promise<void>((resolve) => setTimeout(resolve, 50));
+            } else {
+              console.warn(
+                `[Terminal ${terminalId}] skipping bootstrap resize: too small (${backend.cols}x${backend.rows})`,
+              );
+            }
+          }
           if (disposed) return;
           const result = await invoke<{ success: boolean; data: GridSnapshot | null }>(
             "terminal_get_grid",
@@ -504,6 +594,12 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         }
         if (disposed) return;
 
+        // Prime the idle re-paint heartbeat once after bootstrap, so the
+        // timer ticks even when zero live events arrive (e.g. Claude
+        // already finished its initial render before the listener
+        // attached and no further bytes are coming for a while).
+        scheduleIdleRepaint?.();
+
         // Reconnect callback fires only on actual reconnects (not first
         // mount), preserving the prior semantic.
         if (isReconnecting) {
@@ -512,11 +608,11 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
 
         // Listen for process exit
         exitUnsub = await listen<TerminalExitEvent>("terminal-exit", (event) => {
-          if (event.payload.terminal_id !== terminalId) return;
+          if (event.payload.terminalId !== terminalId) return;
           backend.write(
-            `\r\n\x1b[90m[Process exited with code ${event.payload.exit_code ?? "unknown"}]\x1b[0m\r\n`,
+            `\r\n\x1b[90m[Process exited with code ${event.payload.exitCode ?? "unknown"}]\x1b[0m\r\n`,
           );
-          onExitRef.current?.(event.payload.exit_code);
+          onExitRef.current?.(event.payload.exitCode);
         });
         if (disposed) return;
 
