@@ -17,9 +17,11 @@ name: Spec Pairing Gate
 # Local snapshot after policy lands: paired: 94, accepted-drift: 1,
 # missing: 0, mismatched: 0.
 #
-# Requires `@qontinui/ui-bridge-auto >= 0.1.1` for `pairingPolicy`
-# support — older versions ignore the field and would still flag
-# `active` as a mismatch.
+# Requires `@qontinui/ui-bridge-auto >= 0.1.2` for `pairingPolicy`
+# support. The on-registry 0.1.1 was published from a checkout that
+# missed the policy-reader commit, so 0.1.2 is the first version that
+# actually honors `acceptDrift`. Older versions ignore the field and
+# would still flag `active` as a mismatch.
 
 on:
   pull_request:
@@ -50,4 +52,4 @@ jobs:
           node-version: "20"
 
       - name: Run pairing check (block mode)
-        run: npx --yes -p @qontinui/ui-bridge-auto@^0.1.1 check-spec-pairing --root . --mode=block
+        run: npx --yes -p @qontinui/ui-bridge-auto@^0.1.2 check-spec-pairing --root . --mode=block
