@@ -3368,7 +3368,7 @@ impl PgDb {
                 r.percentage = 100.0 * r.count as f64 / total_abort as f64;
             }
         }
-        abort_reasons.sort_by(|a, b| b.count.cmp(&a.count));
+        abort_reasons.sort_by_key(|r| std::cmp::Reverse(r.count));
 
         // Verification failures
         let mut verification_failures = Vec::new();

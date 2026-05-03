@@ -49,6 +49,12 @@ pub struct AtspiAdapter {
     connected: AtomicBool,
 }
 
+impl Default for AtspiAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AtspiAdapter {
     pub fn new() -> Self {
         Self {
