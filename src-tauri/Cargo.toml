@@ -258,3 +258,7 @@ tempfile = "3"
 [profile.dev]
 debug = 0  # No debug info — prevents LLVM OOM during linking
 split-debuginfo = "packed"
+
+[profile.test]
+debug = 0  # Tests inherit dev's debug=0 to avoid Windows link.exe OOM
+            # (cargo otherwise forces debuginfo=2 for tests).

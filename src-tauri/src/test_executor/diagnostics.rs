@@ -228,14 +228,11 @@ fn check_browser_process_running() -> bool {
         Err(e) => {
             warn!("Failed to check browser process: {}", e);
             // Try alternative with ps
-            match crate::process_helpers::no_window("ps")
+            crate::process_helpers::no_window("ps")
                 .args(["aux"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains("chrome"))
-            {
-                Ok(found) => found,
-                Err(_) => false,
-            }
+                .unwrap_or_default()
         }
     }
 }
