@@ -26,32 +26,74 @@ const EXPLAIN_KEY = "prompt-home-explain";
  */
 const UI_BRIDGE_GENERATE_INSTRUCTION_RE = /click element ui-bridge-generate-button/i;
 
-export type BackgroundTask = {
-  kind: "ui-bridge-generation";
+export type BackgroundTaskKind = "ui-bridge-generation";
+
+export interface BackgroundTask {
+  /** Stable id used for keying React lists and targeting per-task dismiss. */
+  id: string;
+  kind: BackgroundTaskKind;
   /** Original user prompt that kicked off the generation. */
   promptText: string;
   /** Date.now() captured when the background task was first detected. */
   startedAt: number;
+}
+
+/**
+ * Per-kind metadata shared between the context and the pill. The pill uses
+ * this to (a) decide which tab to activate when the body is clicked, (b)
+ * classify observed phases into terminal-success/terminal-error/in-progress,
+ * and (c) build the human-readable label injected into the success/error
+ * toast.
+ *
+ * Centralizing it here keeps the pill component generic — any future
+ * background-task kind only needs an entry here plus a detection rule in
+ * the spawn useEffect below.
+ */
+export interface BackgroundTaskKindMeta {
+  /** Tab id to activate when the pill body is clicked. */
+  jumpTabId: string;
+  /** Phase values that mean "done — success". Pill flips to success tone + fires success toast. */
+  terminalSuccess: ReadonlySet<string>;
+  /** Phase values that mean "done — error". Pill flips to error tone + fires error toast. */
+  terminalError: ReadonlySet<string>;
+  /** Human-readable label fragment used in the success/error toast text. */
+  label: string;
+}
+
+export const BACKGROUND_TASK_KIND_META: Record<BackgroundTaskKind, BackgroundTaskKindMeta> = {
+  "ui-bridge-generation": {
+    jumpTabId: "config-ui-bridge",
+    terminalSuccess: new Set(["applied", "generated", "preview"]),
+    terminalError: new Set(["failed"]),
+    label: "UI Bridge integration",
+  },
 };
 
 type PromptExecutionValue = ReturnType<typeof usePromptExecution> & {
   explain: boolean;
   setExplain: (value: boolean) => void;
-  backgroundTask: BackgroundTask | null;
-  clearBackgroundTask: () => void;
+  backgroundTasks: BackgroundTask[];
+  clearBackgroundTask: (id: string) => void;
 };
 
 const PromptExecutionContext = createContext<PromptExecutionValue | null>(null);
 
+function generateTaskId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function PromptExecutionProvider({ children }: { children: ReactNode }) {
   const execution = usePromptExecution();
   const [explain, setExplain] = useState(() => instanceStorage.getItem(EXPLAIN_KEY) === "true");
-  const [backgroundTask, setBackgroundTask] = useState<BackgroundTask | null>(null);
+  const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([]);
 
   // Track the last `phase` we observed so we only react on the rising edge of
   // the "done" transition. Without this, every re-render while phase==="done"
-  // would re-evaluate the detection rule and could overwrite a user-dismissed
-  // backgroundTask the moment the inner hook re-rendered.
+  // would re-evaluate the detection rule and re-append a duplicate task —
+  // and dismissing one would just respawn the same task on the next render.
   const lastPhaseRef = useRef(execution.phase);
 
   useEffect(() => {
@@ -66,16 +108,17 @@ export function PromptExecutionProvider({ children }: { children: ReactNode }) {
     execution.plan?.summary,
   );
 
-  const clearBackgroundTask = useCallback(() => {
-    setBackgroundTask(null);
+  const clearBackgroundTask = useCallback((id: string) => {
+    setBackgroundTasks((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
   // Detect the long-running UI Bridge generation. We only care about the
   // moment the executor flips to "done" — the planner has already issued the
   // click, so the in-page pipeline state machine (data-pipeline-phase) takes
   // over. Inspect the last executed step's instruction; if it matches the
-  // generate-button click pattern, register a backgroundTask. The pill is
-  // dismissed exclusively via clearBackgroundTask() (Phase A scope).
+  // generate-button click pattern, append a backgroundTask. The rising-edge
+  // guard ensures we don't re-append the same task on subsequent renders
+  // (which would also defeat dismiss).
   useEffect(() => {
     const prevPhase = lastPhaseRef.current;
     lastPhaseRef.current = execution.phase;
@@ -92,19 +135,22 @@ export function PromptExecutionProvider({ children }: { children: ReactNode }) {
     const instruction = lastStep?.instruction ?? "";
     if (!UI_BRIDGE_GENERATE_INSTRUCTION_RE.test(instruction)) return;
 
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: register pill on phase transition
-    setBackgroundTask({
-      kind: "ui-bridge-generation",
-      promptText: execution.lastPrompt ?? "",
-      startedAt: Date.now(),
-    });
+    setBackgroundTasks((prev) => [
+      ...prev,
+      {
+        id: generateTaskId(),
+        kind: "ui-bridge-generation",
+        promptText: execution.lastPrompt ?? "",
+        startedAt: Date.now(),
+      },
+    ]);
   }, [execution.phase, execution.plan, execution.lastPrompt]);
 
   const value: PromptExecutionValue = {
     ...execution,
     explain,
     setExplain,
-    backgroundTask,
+    backgroundTasks,
     clearBackgroundTask,
   };
 
