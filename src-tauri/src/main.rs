@@ -55,8 +55,8 @@ mod exploration;
 mod findings;
 mod fixer;
 mod flow_control;
-mod fs_atomic;
 mod follow_up;
+mod fs_atomic;
 mod graphql;
 mod health_monitor;
 mod heartbeat;
@@ -88,6 +88,7 @@ mod planning_bridge;
 mod playwright;
 mod process_capture;
 mod process_helpers;
+mod productivity;
 mod prompt_snippets;
 mod prompts;
 mod rag;
@@ -582,6 +583,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::activity_timeline::get_activity_timeline_range,
             commands::activity_timeline::get_activity_timeline_stats,
             commands::activity_timeline::get_scripted_output_stats,
+            commands::activity_timeline::get_oneshot_stats,
             commands::activity_timeline::insert_activity_entry,
             commands::activity_timeline::search_activity_timeline,
             commands::activity_timeline::search_activity_timeline_filtered,
@@ -1117,7 +1119,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::acknowledge_advisory,
             commands::productivity::approve_recommendation,
             commands::productivity::archive_plan,
+            commands::productivity::auto_review_task,
             commands::productivity::check_path_claims,
+            commands::productivity::decompose_plan,
             commands::productivity::get_coordinator_decisions,
             commands::productivity::get_coordinator_leader,
             commands::productivity::get_escalations,
@@ -1132,8 +1136,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::list_plans_filtered,
             commands::productivity::reject_recommendation,
             commands::productivity::resolve_escalation,
+            commands::productivity::rewind_session,
             commands::productivity::search_knowledge,
             commands::productivity::spawn_worker_session,
+            commands::productivity::stop_coordinator_session,
+            commands::productivity::summarize_session,
             commands::productivity::unarchive_plan,
             commands::project_logs::append_project_log,
             commands::project_logs::delete_project_config,
@@ -1277,6 +1284,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_create,
             commands::terminal::terminal_get_grid,
             commands::terminal::terminal_get_saved_scrollback,
+            commands::terminal::terminal_grid_diff,
+            commands::terminal::terminal_grid_search,
+            commands::terminal::terminal_grid_text,
             commands::terminal::terminal_list,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_save_scrollback,

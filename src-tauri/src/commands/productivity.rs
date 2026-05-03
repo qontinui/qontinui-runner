@@ -372,11 +372,11 @@ pub async fn approve_recommendation(
                     review.task_id, e
                 );
             }
-            let payload = serde_json::json!({
-                "reviewId": review.id,
-                "taskId": review.task_id,
-                "userDecision": "approved",
-            });
+            let payload = qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
+                review_id: review.id,
+                task_id: review.task_id,
+                user_decision: "approved".to_string(),
+            };
             if let Err(e) = app_handle.emit("review-approved", &payload) {
                 warn!("approve_recommendation: emit failed: {}", e);
             }
@@ -402,11 +402,11 @@ pub async fn reject_recommendation(
 
     if updated {
         if let Some(review) = app_state.pg_db.get_review_by_id(&review_id).await? {
-            let payload = serde_json::json!({
-                "reviewId": review.id,
-                "taskId": review.task_id,
-                "userDecision": "rejected",
-            });
+            let payload = qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
+                review_id: review.id,
+                task_id: review.task_id,
+                user_decision: "rejected".to_string(),
+            };
             if let Err(e) = app_handle.emit("review-rejected", &payload) {
                 warn!("reject_recommendation: emit failed: {}", e);
             }
@@ -946,4 +946,253 @@ pub async fn spawn_worker_session(
         mode: "worker".to_string(),
         terminal_id: Some(info.id),
     })
+}
+
+// ============================================================================
+// Decompose Plan — Phase 3 (in-product replacement for /decompose-plan)
+// ============================================================================
+//
+// Promotes the personal `qontinui-claude-config/.claude/commands/decompose-
+// plan.md` slash command to a Tauri command so any qontinui user can run
+// it from the UI without depending on the Claude CLI. Underlying
+// implementation lives at `crate::productivity::decompose`.
+
+/// Hint surfaced in the UI when the active LLM provider is unconfigured.
+/// Same string for `Disabled` and `NoCredentials` — both flow through the
+/// same Settings -> AI affordance.
+const DECOMPOSE_PROVIDER_HINT: &str =
+    "Configure an LLM provider in Settings → AI to use Decompose Plan.";
+
+/// Decompose a plan markdown into a structured task graph + populate the
+/// upcoming-file claim registry. Wraps the in-process `OneshotLlm` call
+/// followed by a loopback POST to `/plans/decompose`.
+///
+/// Returns a structured payload with `planId` + `taskCount` so the UI can
+/// render a success toast. On `OneshotError::Disabled` /
+/// `OneshotError::NoCredentials`, returns the error string
+/// [`DECOMPOSE_PROVIDER_HINT`] so the modal can show the affordance + a
+/// link to Settings.
+#[tauri::command]
+pub async fn decompose_plan(
+    app_handle: tauri::AppHandle,
+    plan_path: String,
+) -> Result<crate::productivity::decompose::DecomposeResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+
+    let llm = crate::ai_provider::oneshot::oneshot_for_settings();
+
+    crate::productivity::decompose::decompose_plan_in_product(
+        &pg,
+        llm.as_ref(),
+        &plan_path,
+        runner_port,
+    )
+    .await
+    .map_err(|e| match e {
+        crate::productivity::decompose::DecomposeError::LlmDisabled
+        | crate::productivity::decompose::DecomposeError::LlmNoCredentials => {
+            DECOMPOSE_PROVIDER_HINT.to_string()
+        }
+        other => other.to_string(),
+    })
+}
+
+// ============================================================================
+// Auto-Review — Phase 4 (in-product replacement for /auto-review)
+// ============================================================================
+//
+// Manual trigger for `productivity::review::auto_review_in_product`. The
+// scheduler also fires reviews automatically on task completion (see
+// `coordinator/scheduler.rs`); this Tauri command is for the per-row "Review
+// now" button next to ReviewBadge on the Productivity tab and the terminal
+// tab bar.
+
+/// Hint surfaced in the UI when the active LLM provider is unconfigured.
+/// Mirrors `DECOMPOSE_PROVIDER_HINT` so the modal can render a single
+/// "configure LLM" affordance in either flow.
+const REVIEW_PROVIDER_HINT: &str =
+    "LLM provider not configured; review queued as 'user must verify' — go to Settings → AI to enable auto-review.";
+
+/// Stable identifier the manual-trigger path uses as the reviewer's
+/// `reviewer_session_id`. We don't have a real second session here (the
+/// review is being fired from the dashboard, not from another worker), so
+/// we hardcode an in-product identity. This passes the `/reviews` self-
+/// review check as long as no worker has the same id.
+const RUST_AUTO_REVIEWER_ID: &str = "rust-auto-reviewer";
+
+/// Run an auto-review against `task_id` and persist the verdict.
+///
+/// On `OneshotError::Disabled` / `OneshotError::NoCredentials`, inserts a
+/// stub `escalate / confidence=0` review row so the dashboard surfaces it,
+/// and returns [`REVIEW_PROVIDER_HINT`] as the error string. The frontend
+/// distinguishes "queued for user" from a real failure by the prefix
+/// `"LLM provider not configured"`.
+#[tauri::command]
+pub async fn auto_review_task(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+) -> Result<crate::productivity::review::ReviewResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+    let llm = crate::ai_provider::oneshot::oneshot_for_settings();
+
+    let result = crate::productivity::review::auto_review_in_product(
+        &pg,
+        llm.as_ref(),
+        runner_port,
+        &task_id,
+        RUST_AUTO_REVIEWER_ID,
+    )
+    .await;
+
+    match result {
+        Ok(r) => {
+            // Best-effort: emit `review-completed` so the dashboard /
+            // ReviewBadge picks it up without polling. The pg insert path
+            // doesn't emit (the HTTP route does); we add the emit here so
+            // the manual-trigger UX matches the slash-command POST path.
+            let _ = app_handle.emit(
+                "review-completed",
+                serde_json::json!({
+                    "id": r.review_id,
+                    "taskId": task_id,
+                    "reviewerSessionId": RUST_AUTO_REVIEWER_ID,
+                    "verdict": r.verdict,
+                    "confidence": r.confidence,
+                }),
+            );
+            Ok(r)
+        }
+        Err(crate::productivity::review::ReviewError::LlmDisabled(_)) => {
+            // Queue a stub row so the dashboard reflects "user must verify"
+            // — same UX as the DECOMPOSE flow's "no provider" path.
+            let task = pg
+                .get_task_by_id(&task_id)
+                .await
+                .map_err(|e| format!("get_task_by_id failed: {}", e))?
+                .ok_or_else(|| format!("task {} not found", task_id))?;
+            let reviewed_session_id = task.assigned_session_id.clone().ok_or_else(|| {
+                format!(
+                    "task {} has no assigned worker session — cannot queue stub review",
+                    task_id
+                )
+            })?;
+            // Skip the stub-row insert if the only candidate reviewer is
+            // the worker itself — the SelfReview check would 409 anyway.
+            if reviewed_session_id == RUST_AUTO_REVIEWER_ID {
+                return Err(REVIEW_PROVIDER_HINT.to_string());
+            }
+            match crate::productivity::review::insert_disabled_stub_review(
+                &pg,
+                &task_id,
+                RUST_AUTO_REVIEWER_ID,
+                &reviewed_session_id,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        "auto_review_task: stub-row insert failed for {}: {}",
+                        task_id, e
+                    );
+                }
+            }
+            Err(REVIEW_PROVIDER_HINT.to_string())
+        }
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+// ============================================================================
+// Summarize / Rewind Session — Phase 5 (in-product replacements for
+// /summarize-session and /rewind-session)
+// ============================================================================
+//
+// Promotes the personal `qontinui-claude-config/.claude/commands/
+// {summarize,rewind}-session.md` slash commands to Tauri commands so any
+// qontinui user can run them from the UI without depending on the Claude
+// CLI. Underlying implementations live at
+// `crate::productivity::{summarize, rewind}`.
+
+/// Summarize a finished AI session: extract learnings via the configured
+/// `OneshotLlm` and persist them to `productivity_knowledge`. The slash
+/// command's §1 verdict-driven Outcome-tag rule is enforced server-side
+/// via the system prompt (see `productivity::summarize`).
+///
+/// On `OneshotError::Disabled` / `OneshotError::NoCredentials`, falls
+/// back to inserting a single placeholder knowledge row (`area="other"`,
+/// `body="LLM provider not configured; manual summary required."`) so
+/// the user has a UI affordance and the session still surfaces in the
+/// knowledge browser.
+#[tauri::command]
+pub async fn summarize_session(
+    app_handle: tauri::AppHandle,
+    task_run_id: String,
+) -> Result<crate::productivity::summarize::SummarizeResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+
+    let llm = crate::ai_provider::oneshot::oneshot_for_settings();
+
+    match crate::productivity::summarize::summarize_session_in_product(
+        &pg,
+        llm.as_ref(),
+        runner_port,
+        &task_run_id,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(crate::productivity::summarize::SummarizeError::LlmDisabled)
+        | Err(crate::productivity::summarize::SummarizeError::LlmNoCredentials) => {
+            // No LLM provider configured — write a single placeholder
+            // knowledge row so the user sees the session in the
+            // knowledge browser with a "manual summary required" hint.
+            crate::productivity::summarize::write_placeholder_summary(runner_port, &task_run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// Rewind a failed AI session: restore the pre-edit file snapshots, kill
+/// the failed worker, and (by default) spawn a replacement with
+/// failure-context prepended. `no_replay = Some(true)` flips this to
+/// "revert + leave tab empty for manual re-prompt" per the slash
+/// command's `--no-replay` flag.
+///
+/// File-restore + kill are LLM-independent so a disabled provider
+/// doesn't break them; the summarize step (which builds the
+/// failure-context block) silently skips when no LLM is configured.
+#[tauri::command]
+pub async fn rewind_session(
+    app_handle: tauri::AppHandle,
+    task_run_id: String,
+    no_replay: Option<bool>,
+) -> Result<crate::productivity::rewind::RewindResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+
+    let llm = crate::ai_provider::oneshot::oneshot_for_settings();
+
+    let options = crate::productivity::rewind::RewindOptions {
+        replay: !no_replay.unwrap_or(false),
+    };
+
+    crate::productivity::rewind::rewind_session_in_product(
+        &pg,
+        llm.as_ref(),
+        runner_port,
+        &task_run_id,
+        options,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }

@@ -26,6 +26,14 @@ pub struct CoordinatorSchedulerConfig {
     /// Master switch. `false` (the default) leaves the existing
     /// `/coordinate` Claude session in charge.
     pub rust_scheduler_enabled: bool,
+    /// Phase 4 auto-trigger: when `true`, the scheduler fires
+    /// [`crate::productivity::review::auto_review_in_product`] for each
+    /// task it observes in `review` status that doesn't already have a
+    /// reviews row. Defaults to `true`; the runtime path additionally
+    /// gates on whether [`crate::ai_provider::oneshot::oneshot_for_settings`]
+    /// returns a non-disabled provider so the loop can't spam the
+    /// dashboard with stub rows when no LLM is configured.
+    pub auto_review_enabled: bool,
 }
 
 impl Default for CoordinatorSchedulerConfig {
@@ -35,6 +43,7 @@ impl Default for CoordinatorSchedulerConfig {
             initial_delay_secs: 10,
             max_llm_calls_per_hour: 10,
             rust_scheduler_enabled: false,
+            auto_review_enabled: true,
         }
     }
 }
@@ -67,6 +76,9 @@ impl CoordinatorSchedulerConfig {
                 cfg.max_llm_calls_per_hour = n;
             }
         }
+        if let Ok(v) = std::env::var("QONTINUI_COORDINATOR_AUTO_REVIEW_ENABLED") {
+            cfg.auto_review_enabled = parse_bool_flag(&v);
+        }
 
         cfg
     }
@@ -90,6 +102,10 @@ mod tests {
         assert_eq!(cfg.interval_secs, 5);
         assert_eq!(cfg.initial_delay_secs, 10);
         assert_eq!(cfg.max_llm_calls_per_hour, 10);
+        // auto_review defaults on so completed tasks get a verdict; it
+        // self-disables at runtime when the active LLM provider has no
+        // credentials.
+        assert!(cfg.auto_review_enabled);
     }
 
     #[test]

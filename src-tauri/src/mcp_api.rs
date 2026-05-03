@@ -460,10 +460,7 @@ pub fn create_router(
     // watcher / `pnpm install` contention (`os error 32`).
     if !crate::process_capture::primary_proxy::is_secondary() {
         match crate::wrappers::launcher::ensure_launcher_installed() {
-            Ok(path) => tracing::info!(
-                "wrappers: launcher installed at {}",
-                path.display()
-            ),
+            Ok(path) => tracing::info!("wrappers: launcher installed at {}", path.display()),
             Err(e) => tracing::warn!("wrappers: launcher install failed: {}", e),
         }
         let cell = app_state.wrapper_state.clone();
@@ -997,29 +994,30 @@ pub fn create_router(
     }
 
     // Productivity Coordinator (Rust) scheduler — Phase 1b of
-    // `productivity-coordinator-rust-promotion.md`. Default-OFF; flip on
-    // per-instance via QONTINUI_COORDINATOR_RUST_SCHEDULER=1 once Phase 2
-    // (LLM callout) ships. While disabled, the existing `/coordinate`
-    // Claude session keeps owning the lease.
+    // `productivity-coordinator-rust-promotion.md`, with Phase 1.5
+    // (`productivity-stack-product-readiness.md`) runtime toggle.
+    //
+    // The scheduler ALWAYS starts at boot now. Whether it does work each
+    // tick is governed by an Arc<AtomicBool> flag wrapped in
+    // `CoordinatorSchedulerHandle`. The flag's initial value still comes
+    // from the env var (`QONTINUI_COORDINATOR_RUST_SCHEDULER`) for first
+    // boot, but the `launch_coordinator_session` /
+    // `stop_coordinator_session` Tauri commands flip it at runtime via
+    // the handle stashed in Tauri state — no process restart needed.
     {
         let coord_config = crate::coordinator::config::CoordinatorSchedulerConfig::from_env();
-        if coord_config.rust_scheduler_enabled {
-            tracing::info!(
-                "Coordinator (Rust) scheduler enabled via env: interval={}s",
-                coord_config.interval_secs
-            );
-            // Handle is intentionally dropped — same pattern as
-            // `start_memory_scheduler` / `start_dreamer_scheduler`. The
-            // task lives until the runner exits.
-            let _h = crate::coordinator::scheduler::start_coordinator_scheduler(
-                api_state.clone(),
-                coord_config,
-            );
-        } else {
-            tracing::debug!(
-                "Coordinator (Rust) scheduler disabled (set QONTINUI_COORDINATOR_RUST_SCHEDULER=1 to enable)"
-            );
-        }
+        tracing::info!(
+            "Coordinator (Rust) scheduler starting: initial_enabled={} interval={}s",
+            coord_config.rust_scheduler_enabled,
+            coord_config.interval_secs,
+        );
+        let scheduler_handle = crate::coordinator::scheduler::start_coordinator_scheduler(
+            api_state.clone(),
+            coord_config,
+        );
+        // Stash the runtime-toggle handle so launch_coordinator_session
+        // can flip the flag without a process restart.
+        app_handle.manage(scheduler_handle);
     }
 
     // Physical device USB scanner (30-second interval)
@@ -1432,7 +1430,7 @@ pub fn create_router(
         )
         .layer(tower::limit::ConcurrencyLimitLayer::new(20));
 
-    Router::new()
+    let base_router = Router::new()
         // GraphQL endpoints (typed API alongside REST)
         .merge(graphql_routes)
         .route_service(
@@ -1564,7 +1562,18 @@ pub fn create_router(
         // Section 2 of UI Bridge redesign — `/spec/...` Spec API. Mounted
         // outside `/ui-bridge/...` because the surface is consumed
         // differently (IR + projection storage, not page-control RPC).
-        .merge(crate::spec_api::routes())
+        .merge(crate::spec_api::routes());
+
+    // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:
+    // debug-only `/ui-bridge/test/inject-session` + `/ui-bridge/test/clear-sessions`
+    // for SessionCard manual-render tests. The cfg gate matches the one on
+    // the `mcp::test_fixtures` module declaration in `mcp/mod.rs`, so
+    // production release builds without the `test-fixtures` feature compile
+    // away both the module and the merge call entirely.
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    let base_router = base_router.merge(crate::mcp::test_fixtures::routes());
+
+    base_router
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))

@@ -38,7 +38,9 @@ import {
   launchCoordinatorSession,
   resolveEscalation,
   spawnWorkerSession,
+  stopCoordinatorSession,
   type CoordinatorDecision,
+  type CoordinatorLaunchMode,
   type CoordinatorLeaderRow,
   type Escalation,
   type LeaderResponse,
@@ -941,18 +943,53 @@ export function CoordinatorDashboard() {
     handler?.("terminal");
   }, []);
 
-  const handleLaunchCoordinator = useCallback(async () => {
+  // Phase 1.5: launch the Rust scheduler by default. The "rust" mode
+  // flips an in-process AtomicBool flag — no pty, no terminal tab to
+  // reveal. The legacy "claude_skill" mode (Joshua's debug surface) still
+  // spawns a pty and we focus the terminal tab afterwards.
+  const handleLaunchCoordinator = useCallback(
+    async (mode: CoordinatorLaunchMode = "rust") => {
+      setLaunchError(null);
+      try {
+        const result = await launchCoordinatorSession({
+          mode,
+          planPath: null,
+          titleHint: null,
+        });
+        await loadLease();
+        // Only reveal the terminal tab when a pty was actually opened.
+        if (result.terminalId) {
+          revealTerminalTab();
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error("Failed to launch Coordinator:", err);
+        setLaunchError(`Failed to launch Coordinator: ${msg}`);
+      }
+    },
+    [loadLease, revealTerminalTab],
+  );
+
+  const handleStartCoordinatorRust = useCallback(
+    () => handleLaunchCoordinator("rust"),
+    [handleLaunchCoordinator],
+  );
+  const handleStartCoordinatorClaudeSkill = useCallback(
+    () => handleLaunchCoordinator("claude_skill"),
+    [handleLaunchCoordinator],
+  );
+
+  const handleStopCoordinator = useCallback(async () => {
     setLaunchError(null);
     try {
-      await launchCoordinatorSession({ planPath: null, titleHint: null });
+      await stopCoordinatorSession();
       await loadLease();
-      revealTerminalTab();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error("Failed to launch Coordinator:", err);
-      setLaunchError(`Failed to launch Coordinator: ${msg}`);
+      console.error("Failed to stop Coordinator:", err);
+      setLaunchError(`Failed to stop Coordinator: ${msg}`);
     }
-  }, [loadLease, revealTerminalTab]);
+  }, [loadLease]);
 
   const handleSpawnWorker = useCallback(async () => {
     setLaunchError(null);
@@ -1007,14 +1044,40 @@ export function CoordinatorDashboard() {
         <div className="flex items-center justify-between mb-2">
           <CoordinatorLeaseStatusPill status={leaseStatus} leader={leader} />
           <div className="flex gap-2">
+            {/* Phase 1.5 — primary Start button drives the in-process Rust
+                scheduler via mode: "rust". Stop button flips the flag back
+                off. The "Force-takeover" label only kicks in when an
+                external lease holder has gone stale. */}
             <button
               type="button"
               className={leaseStatus === "active" ? outlineBtnClass : primaryBtnClass}
               disabled={leaseStatus === "active"}
-              onClick={handleLaunchCoordinator}
+              onClick={handleStartCoordinatorRust}
               data-ui-bridge-id="productivity.launch-coordinator"
             >
               {leaseStatus === "stale" ? "Force-takeover Coordinator" : "Start Coordinator"}
+            </button>
+            <button
+              type="button"
+              className={outlineBtnClass}
+              disabled={leaseStatus !== "active"}
+              onClick={handleStopCoordinator}
+              data-ui-bridge-id="productivity.stop-coordinator"
+            >
+              Stop Coordinator
+            </button>
+            {/* Debug surface — kept around so Joshua can still spawn the
+                Claude pty `/coordinate` session for hand-debugging the
+                slash command. Most users never click this. */}
+            <button
+              type="button"
+              className={outlineBtnClass}
+              disabled={leaseStatus === "active"}
+              onClick={handleStartCoordinatorClaudeSkill}
+              data-ui-bridge-id="productivity.launch-coordinator-claude-skill"
+              title="Debug: spawn /coordinate Claude pty (legacy)"
+            >
+              Start (Claude pty)
             </button>
             <button
               type="button"

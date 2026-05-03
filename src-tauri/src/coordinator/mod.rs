@@ -13,3 +13,5 @@ mod decide;
 mod llm_decide;
 mod observe;
 pub mod scheduler;
+
+pub use scheduler::CoordinatorSchedulerHandle;
