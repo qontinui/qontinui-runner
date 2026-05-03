@@ -47,6 +47,13 @@ interface TerminalInstanceProps {
   onShellIntegration?: (event: ShellIntegrationEvent) => void;
   /** Called with decoded text whenever PTY output is received. */
   onOutput?: (text: string) => void;
+  /**
+   * Called with the latest OSC 0 / OSC 2 title observed by the Rust grid.
+   * Fires after each `paintGrid` whenever the snapshot's `title` field
+   * differs from the previous value. Layer 4 polish wiring per
+   * `plans/terminal-grid-bootstrap-redesign.md`.
+   */
+  onTitleChange?: (title: string) => void;
 }
 
 interface TerminalOutputEvent {
@@ -119,6 +126,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       onFirstInput,
       onShellIntegration,
       onOutput,
+      onTitleChange,
     },
     ref,
   ) {
@@ -144,6 +152,13 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     onShellIntegrationRef.current = onShellIntegration;
     const onOutputRef = useRef(onOutput);
     onOutputRef.current = onOutput;
+    const onTitleChangeRef = useRef(onTitleChange);
+    onTitleChangeRef.current = onTitleChange;
+    /**
+     * Most-recently reported title — guards `onTitleChange` against firing on
+     * every paintGrid (200ms idle cadence) when the title is unchanged.
+     */
+    const lastTitleRef = useRef<string | null>(null);
     const outputDecoderRef = useRef(new TextDecoder());
     const firstInputReportedRef = useRef(false);
     const inputAccumulatorRef = useRef("");
@@ -231,12 +246,25 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       // the backend.
       let scheduleIdleRepaint: (() => void) | null = null;
 
-      // Attach the live `terminal-output` listener IMMEDIATELY — before any
-      // awaits — so we don't lose bytes during the backend's async init.
-      // Bytes arriving before backendReady are buffered into pendingBytes
-      // and drained once the backend is ready.
-      (async () => {
-        const unsub = await listen<TerminalOutputEvent>("terminal-output", (event) => {
+      /**
+       * Emit `onTitleChange` if the snapshot's OSC 0/2 title is non-empty AND
+       * differs from the last reported value. Called after every paintGrid
+       * (initial bootstrap + every idle repaint) so the latest title from the
+       * Rust grid flows up to the tab title without spamming the callback.
+       */
+      const reportTitleFromSnapshot = (title: string | undefined | null) => {
+        if (!title) return;
+        if (title === lastTitleRef.current) return;
+        lastTitleRef.current = title;
+        try {
+          onTitleChangeRef.current?.(title);
+        } catch (e) {
+          console.warn(`[Terminal ${terminalId}] onTitleChange handler error:`, e);
+        }
+      };
+
+      const buildOutputListener = () =>
+        listen<TerminalOutputEvent>("terminal-output", (event) => {
           if (event.payload.terminalId !== terminalId) return;
           const raw = atob(event.payload.data);
           const bytes = new Uint8Array(raw.length);
@@ -269,12 +297,27 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           bytesReceivedRef.current += bytes.length;
           scheduleIdleRepaint?.();
         });
-        if (disposed) {
-          unsub();
-          return;
-        }
-        outputUnsub = unsub;
-      })();
+
+      // Cold-mount path: attach the live `terminal-output` listener IMMEDIATELY
+      // — before any awaits — so we don't lose bytes during the backend's
+      // async init. Bytes arriving before backendReady are buffered into
+      // pendingBytes and drained once the backend is ready.
+      //
+      // Reconnect path (Layer 4 polish): the PTY survived the page reload and
+      // the Rust grid already holds the full state. Live bytes during the
+      // catch-up window would race with paintGrid, so we DEFER the listener
+      // attach until after the bootstrap paintGrid resolves. See
+      // `plans/terminal-grid-bootstrap-redesign.md` Layer 4.
+      if (!isReconnecting) {
+        (async () => {
+          const unsub = await buildOutputListener();
+          if (disposed) {
+            unsub();
+            return;
+          }
+          outputUnsub = unsub;
+        })();
+      }
 
       // Async init because backend creation may require WASM loading
       (async () => {
@@ -515,6 +558,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
               const b = backendRef.current;
               if (r.success && r.data && b && !disposed) {
                 paintGrid(b, r.data);
+                reportTitleFromSnapshot(r.data.title);
               }
             } catch {
               /* idle repaint best-effort; ignore failures */
@@ -588,9 +632,29 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           );
           if (result.success && result.data && !disposed) {
             paintGrid(backend, result.data);
+            reportTitleFromSnapshot(result.data.title);
           }
         } catch (err) {
           console.warn(`[Terminal ${terminalId}] grid bootstrap failed:`, err);
+        }
+        if (disposed) return;
+
+        // Layer 4 polish: on the reconnect path the live `terminal-output`
+        // listener was deferred so it wouldn't race with the bootstrap
+        // paintGrid above. Attach it NOW that the grid has landed. The
+        // pendingBytes drain below is a no-op since nothing buffered while
+        // the listener wasn't attached, but the structure stays uniform.
+        if (isReconnecting && !outputUnsub) {
+          try {
+            const unsub = await buildOutputListener();
+            if (disposed) {
+              unsub();
+            } else {
+              outputUnsub = unsub;
+            }
+          } catch (e) {
+            console.warn(`[Terminal ${terminalId}] reconnect listener attach failed:`, e);
+          }
         }
         if (disposed) return;
 

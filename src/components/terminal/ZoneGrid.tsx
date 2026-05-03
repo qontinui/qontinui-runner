@@ -116,6 +116,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
     terminalRefs: terminalRefsRef,
     pageId,
     markReconnected,
+    renameTab,
   } = useTerminalCore();
   // terminalRefsRef holds a stable Map<tabId, ref> — it's a per-tab ref cache
   // that's written by TerminalInstance's ref callbacks, not state that drives
@@ -137,6 +138,24 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
   const activityData = stateTracking.activityData;
   const onOutput = stateTracking.handleOutput;
   const onReconnected = markReconnected;
+  /**
+   * Layer 4 polish (OSC 0/2 title): plumb the latest title from the Rust
+   * grid up to the tab title via `renameTab`. The title field is already
+   * surfaced in `GridSnapshot` (parsed by `vte::Perform::osc_dispatch` in
+   * `src-tauri/src/terminal/grid.rs`); this is the wire-up.
+   *
+   * Skip empty / whitespace-only titles defensively. The TerminalInstance
+   * de-dupes against its last-reported value, so this fires at most once
+   * per real title change despite the 200ms idle repaint cadence.
+   */
+  const onTitleChange = useCallback(
+    (tabId: string, title: string) => {
+      const trimmed = title.trim();
+      if (!trimmed) return;
+      renameTab(tabId, trimmed);
+    },
+    [renameTab],
+  );
   const { labelsAndTags, incrementMetric: _incrementMetric } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;
   const onSetZoneLabel = labelsAndTags.setZoneLabel;
@@ -276,6 +295,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
         onShellIntegration={onShellIntegration}
         onOutput={onOutput}
         onReconnected={onReconnected}
+        onTitleChange={onTitleChange}
       />
     ));
 
@@ -332,6 +352,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
                   onFirstInput={(input) => onFirstInput(zoneTab.id, input)}
                   onShellIntegration={(event) => onShellIntegration(zoneTab.id, event)}
                   onOutput={(text) => onOutput(zoneTab.id, text)}
+                  onTitleChange={(title) => onTitleChange(zoneTab.id, title)}
                 />
               )}
             </div>
@@ -376,6 +397,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
           onShellIntegration={onShellIntegration}
           onOutput={onOutput}
           onReconnected={onReconnected}
+          onTitleChange={onTitleChange}
           onAssignTab={onAssignTab}
           flashingTabs={flashingTabs}
           stateDurations={stateDurations}
@@ -595,6 +617,7 @@ function ZoneCell({
   onShellIntegration,
   onOutput,
   onReconnected,
+  onTitleChange,
   onAssignTab,
   flashingTabs,
   stateDurations,
@@ -647,6 +670,7 @@ function ZoneCell({
   onShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
   onOutput: (tabId: string, text: string) => void;
   onReconnected: (tabId: string) => void;
+  onTitleChange: (tabId: string, title: string) => void;
   onAssignTab?: (zoneIndex: number, tabId: string) => void;
   flashingTabs?: Set<string>;
   stateDurations?: Record<string, string>;
@@ -1015,6 +1039,7 @@ function ZoneCell({
                   onFirstInput={(input) => onFirstInput(tab.id, input)}
                   onShellIntegration={(event) => onShellIntegration(tab.id, event)}
                   onOutput={(text) => onOutput(tab.id, text)}
+                  onTitleChange={(title) => onTitleChange(tab.id, title)}
                 />
               )}
             </div>
